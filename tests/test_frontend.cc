@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <pthread.h>
+#include <stdlib.h>
 #include <unistd.h>
 using namespace rut;
 
@@ -40124,7 +40125,6 @@ TEST(frontend, upstream_grpc_message_limits_reach_runtime_config) {
     CHECK_EQ(cfg.upstreams[0].max_response_message_bytes, 0xffffffffu);
     rir.destroy();
 }
-
 TEST(frontend, upstream_grpc_message_limits_reject_invalid_configuration) {
     const char* fields[] = {"max_request_message_bytes: 0",
                             "max_request_message_bytes: 4294967296",
@@ -40149,4 +40149,106 @@ TEST(frontend, upstream_grpc_message_limits_reject_invalid_configuration) {
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     CHECK(!analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, jwt_decode_requires_two_unwrapped_strings) {
+    const char* cases[] = {
+        "route POST \"/\" { let x = jwtDecode(\"t\") return 200 }",
+        "route POST \"/\" { let x = jwtDecode(1, \"s\") return 200 }",
+        "route POST \"/\" { let x = jwtDecode(\"t\", 1) return 200 }",
+        "route POST \"/\" { let x = jwtDecode(req.header(\"x\"), \"s\") return 200 }",
+    };
+    for (const char* source : cases) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(!hir);
+    }
+    auto tokens =
+        lex(lit("route POST \"/\" { let x = jwtDecode(\"t\", \"s\") guard let c = x else { "
+                "return 401 } return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, jwt_auth_example_policy_lowers) {
+    const char* src = R"rut(
+listen :8080
+upstream api at "127.0.0.1:9000"
+struct Claims { sub: str role: str exp: Json }
+route GET "/admin" {
+    let token = req.header("X-JWT").or("")
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
+        return 401
+    }
+    guard let claims = json.decode(Claims, document) else { return 401 }
+    guard let expires = json.int(claims.exp) else { return 401 }
+    guard expires * i64(1000000) > time.nowMicros() else { return 401 }
+    guard claims.role == "admin" else { return 403 }
+    return forward(api)
+}
+)rut";
+    REQUIRE_EQ(setenv("JWT_SECRET", "s3cr3t", 1), 0);
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+    unsetenv("JWT_SECRET");
+}
+
+TEST(frontend, env_is_resolved_at_analysis_time) {
+    REQUIRE_EQ(setenv("RUT_TEST_ENV_SECRET", "s3cr3t", 1), 0);
+    const char* src = "route GET \"/x\" { let s = env(\"RUT_TEST_ENV_SECRET\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].init.str_value.eq(lit_str("s3cr3t")));
+    unsetenv("RUT_TEST_ENV_SECRET");
+}
+
+TEST(frontend, env_requires_a_literal_name_and_a_set_variable) {
+    const char* cases[] = {
+        "route GET \"/x\" { let name = \"RUT_TEST_ENV_MISSING\" let s = env(name) return 200 }",
+        "route GET \"/x\" { let s = env(\"RUT_TEST_ENV_MISSING\") return 200 }",
+        "route GET \"/x\" { let s = env(\"\") return 200 }",
+        "route GET \"/x\" { let s = env() return 200 }",
+    };
+    for (const char* source : cases) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(!hir);
+    }
+}
+
+TEST(frontend, env_decodes_literal_name_before_lookup) {
+    REQUIRE_EQ(setenv("RUT_TEST_ENV_SECRET", "decoded", 1), 0);
+    const char* source =
+        "route GET \"/x\" { let s = env(\"RUT_TEST\\u{5f}ENV\\u{5f}SECRET\") return 200 }";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].locals[0].init.str_value.eq(lit_str("decoded")));
+    unsetenv("RUT_TEST_ENV_SECRET");
 }

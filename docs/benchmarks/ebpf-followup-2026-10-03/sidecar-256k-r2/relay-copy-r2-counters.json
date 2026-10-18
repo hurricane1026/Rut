@@ -1,0 +1,14 @@
+{
+  "accepts": 72,
+  "reads": 1267207,
+  "writes": 750819,
+  "read_bytes": 32082611473,
+  "written_bytes": 32082607821,
+  "waits": 127814,
+  "events": 258311,
+  "setup_failures": 0,
+  "io_failures": 22,
+  "kernel_bytes": 0,
+  "retirement_failures": 0,
+  "admission_peer_closes": 0
+}

@@ -1,0 +1,370 @@
+[
+  {
+    "connection": "close",
+    "concurrency": 1,
+    "baseline_rut": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2200.142084526745,
+      "p99_ms": 0.5315000000000001,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "baseline_nginx": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2233.9336095413064,
+      "p99_ms": 0.531,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "index_rut": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2179.2340521039,
+      "p99_ms": 0.5715,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "index_nginx": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2267.6325177203807,
+      "p99_ms": 0.515,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    }
+  },
+  {
+    "connection": "close",
+    "concurrency": 128,
+    "baseline_rut": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2119.820702674985,
+      "p99_ms": 68.168,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "baseline_nginx": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2974.363676760833,
+      "p99_ms": 50.4025,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "index_rut": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2152.0360880492567,
+      "p99_ms": 67.7915,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "index_nginx": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2858.6989229198953,
+      "p99_ms": 50.91,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    }
+  },
+  {
+    "connection": "keepalive",
+    "concurrency": 1,
+    "baseline_rut": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2492.874508914728,
+      "p99_ms": 0.536,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "baseline_nginx": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2285.4761837181786,
+      "p99_ms": 0.5925,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "index_rut": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2509.253724025869,
+      "p99_ms": 0.512,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "index_nginx": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2291.6372112044946,
+      "p99_ms": 0.536,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    }
+  },
+  {
+    "connection": "keepalive",
+    "concurrency": 128,
+    "baseline_rut": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2272.651067956683,
+      "p99_ms": 61.4165,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "baseline_nginx": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2270.6557062644406,
+      "p99_ms": 73.701,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "index_rut": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2266.9046171968366,
+      "p99_ms": 62.188,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    },
+    "index_nginx": {
+      "samples": 2,
+      "valid": true,
+      "rps": 2286.762511409417,
+      "p99_ms": 71.167,
+      "errors": [
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        },
+        {
+          "connect": 0,
+          "read": 0,
+          "write": 0,
+          "status": 0,
+          "timeout": 0
+        }
+      ]
+    }
+  }
+]

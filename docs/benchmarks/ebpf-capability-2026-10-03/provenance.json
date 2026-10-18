@@ -1,0 +1,13 @@
+{
+  "head": "1e460cf7a9b0a5d69640de50b7ee5f8e7eddf730",
+  "source_sha256": {
+    "bench/bench_sockmap_probe.cc": "6bedf44633f917fa26d243f46101ba8482d0cfc1b3d245f000b568f3a0e1f822",
+    "scripts/ebpf_capability_probe.py": "0a25c1efc05cdf9ad785ae54ca2ded60a931e9389242c979b8a2591de573b5be",
+    "tests/test_sockmap_probe.py": "b699221dfd47cb4617914dde35e1df960d4a01fe5d29117cad84f5bda14512c8",
+    "CMakeLists.txt": "b1370d2093a219ed836b7888b1b6662f3b9455beba3668ff385031c5912978cb",
+    "bench/CMakeLists.txt": "aa497dbba9a628bd51269c29f78e225568b0e40446968028cec8fbac9df5ebc4",
+    "tests/CMakeLists.txt": "47012e773dca815a34e55188f1c33ab75d7b4ba9f572be8473869e630196ce25"
+  },
+  "binary_sha256": "cdc492c3a0dbf0ef8914c11aa70537a11f8bd0f12d1c93d78810ce2aad4bdc69",
+  "production_runtime_modified": false
+}

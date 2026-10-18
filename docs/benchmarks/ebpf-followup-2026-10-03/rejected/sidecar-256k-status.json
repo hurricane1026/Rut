@@ -1,0 +1,5 @@
+{
+  "complete": false,
+  "valid": false,
+  "error": "RuntimeError('relay did not stop cleanly: relay-ebpf-r2, exit=1')"
+}

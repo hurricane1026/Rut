@@ -39,6 +39,7 @@ This is intentionally coarse-grained. It exists to separate "designed" from
 | RIR data model + builder + printer | **Implemented** | RIR is real and exercised by tests |
 | LLVM ORC JIT integration | **Implemented** | Userspace handler JIT engine and codegen paths exist |
 | `firewall {}` → eBPF / XDP compilation target | **Designed** | Packet-level kernel path is a first-class compilation target in this design |
+| RIR → eBPF body-transfer plans / bytecode export | **Experimental, implemented** | Opt-in `RUT_ENABLE_EBPF`; diagnostic/export only, no live socket offload; see [docs/ebpf.md](docs/ebpf.md) |
 | Offline manifest → RIR → JIT simulate flow | **Implemented** | Current compile-like path is intentionally narrow |
 | Full Rutlang lexer / parser / type checker | **Partial / in progress** | Token surface is declared, but the front-end is not yet complete |
 | Route conflict analysis and full diagnostics | **Designed** | Mentioned throughout this doc, not fully enforced end-to-end today |
@@ -1637,13 +1638,14 @@ Two types of middleware, distinguished by whether the signature contains `Respon
 `guard ... else { respond ... }` is the idiomatic way to express "check or reject".
 
 ```swift
-func auth(_ req: Request, role: string) -> User {
-    let token = req.authorization.or("")
-    guard token.hasPrefix("Bearer ") else { respond 401 }
+struct Claims { sub: string, role: string }
 
-    let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard let claims else { respond 401 }
-    guard claims.exp >= now() else { respond 401, "token expired" }
+func auth(_ req: Request, role: string) -> User {
+    let token = req.header("X-JWT").or("")
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
+        respond 401
+    }
+    guard let claims = json.decode(Claims, document) else { respond 401 }
     guard claims.role == role else { respond 403 }
 
     req.set("X-User-ID", claims.sub)
@@ -3520,11 +3522,11 @@ hmacSha256(key, data)         // string (hex)
 hmacSha384(key, data)         // string (hex)
 hmacSha512(key, data)         // string (hex)
 
-// --- JWT (multi-algorithm, backed by BoringSSL) ---
-jwtDecode(token, secret: key)               // error-capable Claims decode — HS256/384/512
-jwtDecode(token, publicKey: pem)            // error-capable Claims decode — RS256/384/512, ES256/384/512
-jwtEncode(claims, secret: key, alg: .HS256) // string — sign with HMAC
-jwtEncode(claims, privateKey: pem, alg: .RS256)  // string — sign with RSA/ECDSA
+// --- JWT (HMAC slice implemented; asymmetric forms are roadmap) ---
+jwtDecode(token, secret)                    // Json? — verified HS256/384/512 claims
+// ⏳ jwtDecode(token, publicKey: pem)       // RS256/384/512, ES256/384/512
+// ⏳ jwtEncode(claims, secret: key, alg: .HS256)
+// ⏳ jwtEncode(claims, privateKey: pem, alg: .RS256)
 
 // --- Encryption ---
 aesGcmEncrypt(key, plaintext, nonce)        // [u8] — AES-256-GCM authenticated encryption
@@ -3570,7 +3572,8 @@ time(string)                  // parse time string
 Duration arithmetic           // now() - req.ifModifiedSince > 1h
 
 // --- Utility ---
-env(key)                      // environment variable (compile-time resolved)
+env(key)                      // environment variable (compile-time resolved;
+                              // literal name, missing variable is a compile error)
 log.info(msg, key: val)       // structured logging (named parameters)
 log.warn(msg, key: val)
 log.error(msg, key: val)
@@ -3687,7 +3690,7 @@ removed from the language instead of documented as a variation.
 
 | Feature | Example | Why |
 |---------|---------|-----|
-| `guard let ... else` | `guard let claims = jwtDecode(token, secret: key) else { respond 401 }` | Middleware "reject or continue"; Swift-identical, incl. the `guard let x else` shorthand |
+| `guard let ... else` | `guard let claims = jwtDecode(token, key) else { respond 401 }` | Middleware "reject or continue"; Swift-identical, incl. the `guard let x else` shorthand |
 | `if let` | `if let cached = cache.get(key) { return 200, cached }` | Swift-identical optional binding |
 | Boolean operators | `a && b`, `a \|\| b`, `!a` | Identical to Swift — no `and`/`or`/`not` near-miss |
 | `break` / `continue` | loop control inside `for ... in` | Swift-identical; only shortens iteration, bound preserved |
@@ -3755,6 +3758,11 @@ struct User {
     role: string
 }
 
+struct Claims {
+    sub: string
+    role: string
+}
+
 struct Order {
     items: [OrderItem]
 }
@@ -3773,13 +3781,13 @@ let userCache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
 // ---------- Middleware ----------
 
 func auth(_ req: Request, role: string) {
-    let token = req.authorization.or("")
+    let token = req.header("X-JWT").or("")
     guard !token.isEmpty else { respond 401 }
-    guard token.hasPrefix("Bearer ") else { respond 401 }
 
-    let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard let claims else { respond 401 }
-    guard claims.exp >= now() else { respond 401, "token expired" }
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
+        respond 401
+    }
+    guard let claims = json.decode(Claims, document) else { respond 401 }
     guard claims.role == role else { respond 403 }
 
     req.ctx.userId = claims.sub
@@ -3904,7 +3912,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 
 | Feature Category | DSL Capability |
 |-----------------|----------------|
-| JWT auth | `jwtDecode()` built-in |
+| JWT auth | `jwtDecode(tok, secret)` built-in (HS256/384/512); RS/ES and `jwtEncode` are roadmap |
 | HMAC auth | `hmacSha256()` built-in |
 | Basic auth | `base64` decode + string compare |
 | API key auth | header/query access + compare |

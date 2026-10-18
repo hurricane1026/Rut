@@ -1,0 +1,2 @@
+READY mode=splice batch=65536 capacity=512 tcp_nodelay=1
+COUNTERS {"accepts":73543,"reads":756709,"writes":424578,"read_bytes":16885165047,"written_bytes":16884837367,"waits":156525,"events":172356,"setup_failures":73506,"io_failures":6,"kernel_bytes":0,"retirement_failures":0}

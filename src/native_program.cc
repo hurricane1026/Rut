@@ -1,6 +1,7 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_artifact.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/ebpf_plan.h"
 #include "rut/runtime/response_body_files.h"
 
 #include <dlfcn.h>
@@ -143,10 +144,16 @@ void NativeProgram::destroy() {
     has_listener = false;
     listener = {};
     access_log = {};
+    has_ebpf_plan = false;
+    ebpf_plan = ebpf::Plan{};
 }
 
-bool load_native_program(
-    const char* source, NativeProgram& out, char* error, u32 error_size, u8 opt) {
+bool load_native_program(const char* source,
+                         NativeProgram& out,
+                         char* error,
+                         u32 error_size,
+                         u8 opt,
+                         bool request_ebpf_plan) {
     if (!error || !error_size) return false;
     error[0] = '\0';
     auto fail = [&](const char* message) {
@@ -160,6 +167,9 @@ bool load_native_program(
     }
     StartupSignalScope startup_signals;
     if (!startup_signals.ready()) return fail("cannot install startup signal handlers");
+#if !RUT_ENABLE_EBPF
+    if (request_ebpf_plan) return fail("eBPF plans require RUT_ENABLE_EBPF=ON");
+#endif
     if (opt > 3) return fail("invalid optimization level");
     char compiler[4096];
     if (!compiler_path(compiler, sizeof(compiler)))
@@ -193,7 +203,10 @@ bool load_native_program(
             fcntl(STDOUT_FILENO, F_SETFD, descriptor_flags & ~FD_CLOEXEC) != 0)
             _exit(127);
         if (channel[1] != STDOUT_FILENO) close(channel[1]);
-        execl(compiler, compiler, source, level, nullptr);
+        if (request_ebpf_plan)
+            execl(compiler, compiler, source, level, "--ebpf-plan", nullptr);
+        else
+            execl(compiler, compiler, source, level, nullptr);
         const char message[] = "Cannot execute sibling rut-compile\n";
         (void)write(2, message, sizeof(message) - 1);
         _exit(127);
@@ -364,6 +377,8 @@ bool load_native_program(
         (h.dispatch != RouteConfig::DispatchKind::ArtJit &&
          h.dispatch != RouteConfig::DispatchKind::SegmentTrie))
         return fail("native configuration ABI mismatch");
+    if (h.ebpf_plan_size != (request_ebpf_plan ? sizeof(ebpf::Plan) : 0))
+        return fail("native eBPF plan framing mismatch");
     u64 pos = sizeof(h);
     auto take = [&](u64 n) -> const u8* {
         if (n > h.size - pos) return nullptr;
@@ -376,7 +391,8 @@ bool load_native_program(
     const u8* reloc_data = take(sizeof(native::Relocation) * h.relocation_count);
     const u8* symbol_data = take(sizeof(native::Symbol) * h.symbol_count);
     const u8* regex_data = take(sizeof(native::Regex) * h.regex_count);
-    if (!routes || !metadata || !reloc_data || !symbol_data || !regex_data)
+    const u8* ebpf_data = take(h.ebpf_plan_size);
+    if (!routes || !metadata || !reloc_data || !symbol_data || !regex_data || !ebpf_data)
         return fail("truncated native configuration");
     memcpy(static_cast<void*>(c.routes),
            static_cast<const void*>(routes),
@@ -447,6 +463,14 @@ bool load_native_program(
         c.route_count++;
     }
     if (!c.strict_local_response_table_is_valid()) return fail("invalid native response metadata");
+    if (h.ebpf_plan_size) {
+        memcpy(&out.ebpf_plan, ebpf_data, sizeof(out.ebpf_plan));
+        if (!validate_ebpf_plan(out.ebpf_plan, c)) return fail("invalid native eBPF plan");
+        if (h.has_listener && h.listener.transport == ListenerTransport::Tls &&
+            out.ebpf_plan.candidate_count)
+            return fail("TLS cannot use sockmap body plans");
+        out.has_ebpf_plan = true;
+    }
     attach_response_body_files(c);
     out.has_listener = h.has_listener;
     out.listener = h.listener;

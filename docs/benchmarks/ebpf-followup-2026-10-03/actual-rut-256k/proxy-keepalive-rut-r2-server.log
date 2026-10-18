@@ -1,0 +1,5 @@
+Loaded program: /home/hurricane/private/code/rut-ebpf-20261003/actual-rut-256k/proxy.rut (opt O2)
+Backend: io_uring
+Listening on port 8087 with 1 shard(s)
+Draining connections (1s)...
+Shutdown complete.
