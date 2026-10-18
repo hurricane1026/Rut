@@ -3451,11 +3451,6 @@ TEST(grpc_proxy, grpc_web_reset_uses_downstream_staged_message_boundary) {
             memcpy(x.download, staged, staged_len);
             x.download_len = staged_len;
         }
-        if (received_len) {
-            memcpy(x.download, received, received_len);
-            x.download_len = received_len;
-            (void)x.response_message.feed(received, received_len, false);
-        }
         if (size_failure) x.response_message.init(2);
         REQUIRE(grpc_attach(upstream_h2, &x));
         REQUIRE(grpc_attach(downstream_h2, &x));
@@ -3471,6 +3466,14 @@ TEST(grpc_proxy, grpc_web_reset_uses_downstream_staged_message_boundary) {
                 (void)grpc_pump_downstream(&loop, downstream, output, sizeof(output));
             x.upstream = &upstream;
         }
+        if (received_len) {
+            memcpy(x.download + x.download_len, received, received_len);
+            x.download_len += received_len;
+            (void)x.response_message.feed(received, received_len, false);
+        }
+        up_stream->manual_window = true;
+        up_stream->recv_unconsumed = x.download_len;
+        const u32 expected_reset_credit = x.download_len;
         GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
         if (size_failure) {
             const u8 too_large[] = {0, 0, 0, 0, 3};
@@ -3480,6 +3483,10 @@ TEST(grpc_proxy, grpc_web_reset_uses_downstream_staged_message_boundary) {
             grpc_response_reset<GrpcDriveFixture>(&dispatch, upstream_h2, 1, reset_error);
         }
         CHECK_EQ(x.web_response_invalid, expect_invalid);
+        if (!size_failure) {
+            CHECK_EQ(up_stream->recv_unconsumed, 0u);
+            CHECK_EQ(upstream_h2.conn_recv_credit, expected_reset_credit);
+        }
         if (expect_invalid && mode == GrpcWebContentType::Binary) {
             CHECK_EQ(x.download_len, staged_len > send_window ? staged_len - send_window : 0u);
         } else if (!expect_invalid) {
@@ -3538,6 +3545,25 @@ TEST(grpc_proxy, grpc_web_reset_uses_downstream_staged_message_boundary) {
         GrpcWebContentType::Text,
         nullptr,
         0,
+        Http2Error::Cancel,
+        false,
+        false);
+    const u8 next_message_partial[] = {0, 0, 0, 0, 3, 0x11, 0x22};
+    run(message,
+        sizeof(message),
+        1000,
+        GrpcWebContentType::Binary,
+        next_message_partial,
+        sizeof(next_message_partial),
+        Http2Error::Cancel,
+        false,
+        false);
+    run(message,
+        sizeof(message),
+        1000,
+        GrpcWebContentType::Text,
+        next_message_partial,
+        sizeof(next_message_partial),
         Http2Error::Cancel,
         false,
         false);

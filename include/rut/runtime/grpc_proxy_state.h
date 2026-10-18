@@ -36,7 +36,9 @@ struct GrpcExchange {
     u64 request_bytes;
     GrpcMessageLimit request_message;
     GrpcMessageLimit response_message;
+    GrpcMessageLimit web_encoded_message;
     GrpcMessageLimit staged_response_message;
+    GrpcMessageLimit web_pending_staged_message;
     GrpcWebBase64Decoder request_base64;
     GrpcWebBase64Encoder response_base64;
     u32 expected_request_bytes;
@@ -62,6 +64,8 @@ struct GrpcExchange {
     u32 response_trailers_offset;
     u32 upload_raw_credit;
     bool web_trailer_queued;
+    bool web_trailer_encoding;
+    bool web_pending_staged_valid;
     bool web_body_flushed;
     bool web_trailer_flushed;
     bool web_h1;
@@ -96,7 +100,9 @@ struct GrpcExchange {
         deadline_us = request_bytes = 0;
         request_message.init();
         response_message.init();
+        web_encoded_message.init(0xffffffffu);
         staged_response_message.init(0xffffffffu);
+        web_pending_staged_message.init(0xffffffffu);
         request_base64.init();
         response_base64.init();
         expected_request_bytes = 0;
@@ -110,7 +116,8 @@ struct GrpcExchange {
         request_headers_len = request_trailers_len = 0;
         response_headers_len = response_trailers_len = 0;
         response_trailers_offset = upload_raw_credit = 0;
-        web_trailer_queued = web_body_flushed = web_trailer_flushed = false;
+        web_trailer_queued = web_trailer_encoding = web_pending_staged_valid = false;
+        web_body_flushed = web_trailer_flushed = false;
         web_h1 = false;
         web_response_invalid = false;
         skip_rpc_log = false;

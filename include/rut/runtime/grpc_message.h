@@ -15,6 +15,13 @@ struct GrpcMessageLimit {
         remaining = 0;
         header_bytes = 0;
     }
+    // Limit a source chunk to the next gRPC envelope boundary. While reading
+    // the five-byte header, stop at the header; once it is complete, stop at
+    // the end of that message's payload.
+    u32 next_span(u32 available) const {
+        const u32 until_boundary = header_bytes < 5 ? 5u - header_bytes : remaining;
+        return available < until_boundary ? available : until_boundary;
+    }
     // gRPC status: RESOURCE_EXHAUSTED for size, INTERNAL for invalid/truncated framing.
     u8 feed(const u8* data, u32 len, bool end) {
         if (!limit) return 0;
