@@ -605,7 +605,8 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     SliceArena arena;
     REQUIRE(arena.init(&pool));
 
-    auto decode = [&](const char* secret) {
+    auto decode = [&](const char* secret, const char* jwt = nullptr) {
+        if (jwt == nullptr) jwt = token;
         u8 has = 0;
         const char* out = nullptr;
         u32 len = 0;
@@ -613,8 +614,8 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
         rut_helper_json(nullptr,
                         &arena,
                         static_cast<u32>(json::Op::JwtDecode),
-                        token,
-                        static_cast<u32>(__builtin_strlen(token)),
+                        jwt,
+                        static_cast<u32>(__builtin_strlen(jwt)),
                         secret,
                         static_cast<u32>(__builtin_strlen(secret)),
                         nullptr,
@@ -632,6 +633,30 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     CHECK(ok.second.eq({payload, static_cast<u32>(__builtin_strlen(payload))}));
     CHECK_FALSE(decode("wrong-secret").first);
     CHECK_FALSE(decode("").first);
+
+    const char* hs384 =
+        "eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiJvayJ9."
+        "cZs_Wk2VoNrX8sTen4A9Yq6gOB4YtDtIxbe_uxxEgP6uvDdDJNJ1kNRtlF7Lbq0C";
+    const char* hs512 =
+        "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJvayJ9."
+        "p_rhc57EpVQ9_ZGxlTT895mw-_gpUswNyGkwXVkzD4zD0TctOZPa3wahaqakkp3-rteIrBsD3UiLrk36-2J8GA";
+    const std::string hs256_key(32, 'x');
+    const std::string hs384_key(48, 'x');
+    const std::string hs512_key(64, 'x');
+    CHECK(
+        decode(hs256_key.c_str(),
+               "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.IfR5W5USO_w4xSkuH-3bkLY-rSj9vIYL4V9jUdcNv4U")
+            .first);
+    CHECK(decode(hs384_key.c_str(), hs384).first);
+    CHECK(decode(hs512_key.c_str(), hs512).first);
+    CHECK_FALSE(decode(std::string(31, 'x').c_str()).first);
+    CHECK_FALSE(decode(std::string(47, 'x').c_str(), hs384).first);
+    CHECK_FALSE(decode(std::string(63, 'x').c_str(), hs512).first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsInh4eHh4eHh4eHh4eHh4eHh4IjoxfQ.e30.AA")
+            .first);
+    CHECK_FALSE(decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsImNyaXQiOlsiZXhwIl19.e30.AA").first);
+    CHECK_FALSE(decode(hs256_key.c_str(), "eyJjcml0IjpbImV4cCJdLCJhbGciOiJIUzI1NiJ9.e30.AA").first);
 
     arena.destroy();
     pool.destroy();
