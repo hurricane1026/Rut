@@ -310,6 +310,13 @@ struct Compiler {
                          Str{symbol->name.ptr, kFirst.len}.eq(kFirst)))
                         shadowed = true;
                 }
+                for (const Source* package = sources; package; package = package->next) {
+                    if (package->package.eq(kFirst) ||
+                        (package->package.len > kFirst.len &&
+                         package->package.ptr[kFirst.len] == '.' &&
+                         Str{package->package.ptr, kFirst.len}.eq(kFirst)))
+                        shadowed = true;
+                }
                 if (found.ptr || shadowed || item->name.ptr[0] == '.' || !scope.len) break;
                 u32 n = scope.len;
                 while (n && scope.ptr[n - 1] != '.') --n;
@@ -795,12 +802,16 @@ core::Expected<Schema, SourceError> load_proto_source(Arena<MmapBackend>& arena,
     if (!bytes)
         return core::make_unexpected(SourceError{SourceError::Kind::Allocation, {}, 1, 1, {}});
     auto schema = load_descriptor_set(arena, bytes, set.size, limits);
-    if (!schema)
-        return core::make_unexpected(SourceError{SourceError::Kind::Schema,
+    if (!schema) {
+        const SourceError::Kind kind = schema.error() == SchemaError::Allocation
+                                           ? SourceError::Kind::Allocation
+                                           : SourceError::Kind::Schema;
+        return core::make_unexpected(SourceError{kind,
                                                  compiler.sources ? compiler.sources->name : kName,
                                                  1,
                                                  1,
                                                  lit_str("invalid/unsupported protobuf schema")});
+    }
     return schema.value();
 }
 }  // namespace rut::protobuf
