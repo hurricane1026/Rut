@@ -419,7 +419,9 @@ supported. The bridge preserves opaque protobuf payloads and converts backend
 trailers into the final gRPC-Web body envelope. The incremental base64 request
 decoder accepts independently padded flush blocks. HTTP/1.1 accepts
 Content-Length or chunked uploads and closes after the response; it does not
-provide keep-alive or pipelining for these RPCs. Browser CORS requires
+provide keep-alive or pipelining for these RPCs. The HTTP/1.1 bridge rejects
+routes configured with downstream `throttle` until response pacing is integrated
+with the bridge. Browser CORS requires
 explicit OPTIONS routes and response headers; see [the browser
 example](../examples/grpc-web.rut) and [its
 instructions](../examples/grpc/README.md#browser-grpc-web-example).
