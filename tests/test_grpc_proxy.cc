@@ -998,6 +998,32 @@ struct SyncCloseGrpcDriveFixture : GrpcDriveFixture {
         closed = true;
     }
 };
+struct GrpcConnectRetirementFixture : GrpcDriveFixture {
+    const RouteConfig** config_ptr = nullptr;
+    u32 connect_submissions = 0;
+    bool submit_connect(Connection& conn, const void*, u32) {
+        connect_submissions++;
+        conn.upstream_connect_armed = true;
+        conn.pending_ops = 1;
+        return true;
+    }
+    void close_released_upstream(Connection& conn) {
+        if (conn.upstream_fd >= 0) close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+    bool retire_pending_upstream_connect(Connection& conn) {
+        if (!conn.upstream_connect_armed || conn.pending_ops != 1) return false;
+        conn.upstream_retiring_episode = conn.upstream_episode;
+        conn.upstream_episode++;
+        conn.upstream_retirement_active = true;
+        conn.upstream_retirement_target_owned = kUpstreamOpConnect;
+        conn.upstream_retirement_cancel_owned = kUpstreamOpConnect;
+        conn.upstream_connect_armed = false;
+        conn.pending_ops = 2;
+        return true;
+    }
+    void close_conn(Connection&) { closed = true; }
+};
 struct HeldSendGrpcDriveFixture : GrpcDriveFixture {
     CaptureRing* capture_ring = nullptr;
     const u8* pending_send = nullptr;
@@ -2769,7 +2795,7 @@ TEST(grpc_proxy, first_large_streaming_rpc_iouring) {
     streaming_case<IoUringEventLoop>(_tc, false, false, false, true);
 }
 template <typename Loop>
-void grpc_connect_failover_case(rut::test::TestCase* _tc, bool tls) {
+void grpc_connect_failover_case(rut::test::TestCase* _tc, bool tls, bool timeout_first = false) {
     (void)_tc;
     GrpcBackendHealthReset health_reset{};
     Loop loop;
@@ -2815,18 +2841,78 @@ void grpc_connect_failover_case(rut::test::TestCase* _tc, bool tls) {
                                 &cfg.upstreams[0].addrs[conn->upstream_backend_idx],
                                 sizeof(cfg.upstreams[0].addrs[0])));
 
-    IoEvent events[16];
     u32 failed_attempts = 1;
-    for (u32 wait = 0; wait < 8 && conn->h2; wait++) {
+    bool timeout_successor_observed = false;
+    const u8 timed_out_backend = conn->upstream_backend_idx;
+    const u32 timed_out_episode = conn->upstream_episode;
+    // Force the first pending connect past its timeout without sleeping. This
+    // exercises timeout failover before its normal completion event is handled.
+    if (timeout_first) {
+        conn->h2->grpc.connected_at_us =
+            monotonic_us() - static_cast<u64>(loop.upstream_timeout) * 1000000 - 1;
+        grpc_tick(&loop, *conn);
+        if (!conn->h2->grpc.connect_retry_pending) {
+            CHECK_EQ(conn->h2->grpc.connect_attempts, 2u);
+            CHECK_EQ(__builtin_popcount(conn->h2->grpc.connect_tried_mask), 2);
+            CHECK_GT(conn->h2->grpc.connected_at_us, 123u);
+            CHECK(conn->h2->grpc.connecting);
+            CHECK_EQ(conn->h2->grpc.streams[0], &exchange);
+            CHECK(exchange.upstream == conn);
+            REQUIRE(backend_health(0, timed_out_backend) != nullptr);
+            CHECK_EQ(backend_health(0, timed_out_backend)->fails, 1u);
+            failed_attempts = conn->h2->grpc.connect_attempts;
+        }
+    }
+
+    IoEvent events[16];
+    for (u32 wait = 0; wait < 16 && conn->h2; wait++) {
         const u8 previous_mask = conn->h2->grpc.connect_tried_mask;
         const u32 count = loop.backend.wait(events, 16, loop.conns, loop.connection_capacity);
         REQUIRE(count != 0);
         loop.dispatch_batch(events, count);
         if (!conn->h2) break;
+        if (conn->h2->grpc.connect_retry_pending) {
+            grpc_tick(&loop, *conn);
+            if (!conn->h2->grpc.connect_retry_pending) {
+                CHECK_EQ(conn->h2->grpc.connect_attempts, 2u);
+                CHECK_EQ(__builtin_popcount(conn->h2->grpc.connect_tried_mask), 2);
+                CHECK_GT(conn->h2->grpc.connected_at_us, 123u);
+                CHECK(conn->h2->grpc.connecting);
+                CHECK_EQ(conn->h2->grpc.streams[0], &exchange);
+                CHECK(exchange.upstream == conn);
+                REQUIRE(backend_health(0, timed_out_backend) != nullptr);
+                CHECK_EQ(backend_health(0, timed_out_backend)->fails, 1u);
+                failed_attempts = conn->h2->grpc.connect_attempts;
+                timeout_successor_observed = true;
+                if constexpr (std::is_same_v<Loop, IoUringEventLoop>) {
+                    const i32 successor_fd = conn->upstream_fd;
+                    const u32 successor_episode = conn->upstream_episode;
+                    const u32 successor_pending = conn->pending_ops;
+                    const u8 successor_mask = conn->h2->grpc.connect_tried_mask;
+                    loop.dispatch({conn->id,
+                                   -ECANCELED,
+                                   0,
+                                   0,
+                                   IoEventType::UpstreamConnect,
+                                   0,
+                                   0,
+                                   timed_out_episode});
+                    CHECK_EQ(conn->upstream_fd, successor_fd);
+                    CHECK_EQ(conn->upstream_episode, successor_episode);
+                    CHECK_EQ(conn->pending_ops, successor_pending);
+                    CHECK(conn->upstream_connect_armed);
+                    CHECK_EQ(conn->h2->grpc.connect_attempts, 2u);
+                    CHECK_EQ(conn->h2->grpc.connect_tried_mask, successor_mask);
+                    break;
+                }
+            }
+            continue;
+        }
+        if (conn->h2->grpc.connect_attempts == failed_attempts) continue;
         CHECK_EQ(conn->h2->grpc.connect_attempts, failed_attempts + 1);
         CHECK_NE(conn->h2->grpc.connect_tried_mask, previous_mask);
         CHECK_EQ(__builtin_popcount(conn->h2->grpc.connect_tried_mask), failed_attempts + 1);
-        CHECK_EQ(conn->h2->grpc.connected_at_us, 123u);
+        CHECK_GT(conn->h2->grpc.connected_at_us, 123u);
         CHECK(conn->h2->grpc.connecting);
         CHECK_EQ(conn->h2->grpc.streams[0], &exchange);
         CHECK_EQ(conn->h2->grpc.active, 1u);
@@ -2834,11 +2920,33 @@ void grpc_connect_failover_case(rut::test::TestCase* _tc, bool tls) {
         CHECK_FALSE(exchange.response_end);
         failed_attempts++;
     }
+    if constexpr (std::is_same_v<Loop, IoUringEventLoop>) {
+        if (timeout_first && timeout_successor_observed && conn->h2) {
+            CHECK_EQ(conn->h2->grpc.connect_attempts, 2u);
+            CHECK(conn->upstream_connect_armed);
+            CHECK_EQ(conn->pending_ops, 1u);
+            CHECK_EQ(conn->h2->grpc.streams[0], &exchange);
+            loop.close_conn(*conn);
+            loop.shutdown();
+            return;
+        }
+    }
+    if (timeout_first && conn->h2) {
+        CHECK_EQ(conn->pending_ops, 0u);
+        CHECK_EQ(conn->upstream_retirement_target_owned, 0u);
+        CHECK_EQ(conn->upstream_retirement_cancel_owned, 0u);
+        CHECK_EQ(conn->upstream_retirement_cancel_retry, 0u);
+        CHECK_FALSE(conn->upstream_retirement_active);
+        CHECK_FALSE(conn->upstream_connect_armed);
+        CHECK_EQ(conn->h2->grpc.connect_retry_pending, false);
+        CHECK_EQ(conn->h2->grpc.connect_attempts, 3u);
+    }
     CHECK_EQ(failed_attempts, 3u);
     CHECK(conn->h2 == nullptr);
     CHECK(exchange.upstream == nullptr);
     CHECK(exchange.response_end);
     CHECK_EQ(exchange.failure, 14u);
+    if (timeout_first) CHECK_EQ(backend_health(0, timed_out_backend)->fails, 1u);
     loop.shutdown();
 }
 TEST(grpc_proxy, connect_failover_epoll) {
@@ -2852,6 +2960,190 @@ TEST(grpc_proxy, tls_connect_failover_before_handshake_epoll) {
 }
 TEST(grpc_proxy, tls_connect_failover_before_handshake_iouring) {
     grpc_connect_failover_case<IoUringEventLoop>(_tc, true);
+}
+TEST(grpc_proxy, connect_timeout_failover_epoll) {
+    grpc_connect_failover_case<EpollEventLoop>(_tc, false, true);
+}
+TEST(grpc_proxy, connect_timeout_failover_iouring) {
+    grpc_connect_failover_case<IoUringEventLoop>(_tc, false, true);
+}
+
+TEST(grpc_proxy, connect_timeout_retry_waits_for_both_retirement_owners) {
+    for (bool cancel_first : {false, true}) {
+        GrpcBackendHealthReset health_reset{};
+        GrpcConnectRetirementFixture loop;
+        RouteConfig cfg;
+        REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 12345).has_value());
+        REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, 12346));
+        const RouteConfig* cfg_ptr = &cfg;
+        loop.config_ptr = &cfg_ptr;
+
+        Connection conn;
+        conn.reset();
+        Http2Conn h2;
+        h2.init_client();
+        conn.h2 = &h2;
+        conn.request_config = &cfg;
+        conn.upstream_idx = 0;
+        conn.upstream_backend_idx = 0;
+        conn.fd = conn.upstream_fd = UpstreamPool::create_socket();
+        REQUIRE(conn.fd >= 0);
+        conn.pending_ops = 1;
+        conn.upstream_connect_armed = true;
+        GrpcExchange exchange;
+        exchange.init();
+        exchange.upstream = &conn;
+        h2.grpc.upstream = true;
+        h2.grpc.connecting = true;
+        h2.grpc.active = 1;
+        h2.grpc.connected_at_us = monotonic_us() - 2000000;
+        h2.grpc.connect_attempts = 1;
+        h2.grpc.connect_tried_mask = 1;
+        h2.grpc.streams[0] = &exchange;
+
+        grpc_tick(&loop, conn);
+        CHECK(h2.grpc.connect_retry_pending);
+        CHECK_EQ(conn.upstream_retirement_target_owned, kUpstreamOpConnect);
+        CHECK_EQ(conn.upstream_retirement_cancel_owned, kUpstreamOpConnect);
+        CHECK_EQ(loop.connect_submissions, 0u);
+        const u32 old_episode = conn.upstream_retiring_episode;
+        auto retire_target = [&]() {
+            conn.upstream_retirement_target_owned = 0;
+            conn.pending_ops--;
+            conn.upstream_retirement_active = conn.upstream_retirement_cancel_owned != 0 ||
+                                              conn.upstream_retirement_cancel_retry != 0;
+        };
+        auto retire_cancel = [&]() {
+            conn.upstream_retirement_cancel_owned = 0;
+            conn.pending_ops--;
+            conn.upstream_retirement_active = conn.upstream_retirement_target_owned != 0 ||
+                                              conn.upstream_retirement_cancel_retry != 0;
+        };
+        if (cancel_first)
+            retire_cancel();
+        else
+            retire_target();
+        grpc_tick(&loop, conn);
+        CHECK_EQ(loop.connect_submissions, 0u);
+        CHECK(h2.grpc.connect_retry_pending);
+        if (cancel_first)
+            retire_target();
+        else
+            retire_cancel();
+        grpc_tick(&loop, conn);
+        CHECK_FALSE(h2.grpc.connect_retry_pending);
+        CHECK_EQ(loop.connect_submissions, 1u);
+        CHECK_EQ(h2.grpc.connect_attempts, 2u);
+        CHECK_EQ(conn.upstream_episode, old_episode + 1u);
+        CHECK(conn.upstream_connect_armed);
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK_EQ(h2.grpc.streams[0], &exchange);
+        CHECK_EQ(backend_health(0, 0)->fails, 1u);
+
+        loop.close_released_upstream(conn);
+        conn.fd = -1;
+    }
+}
+
+TEST(grpc_proxy, connect_timeout_retry_expires_rpc_before_retirement_finishes) {
+    GrpcBackendHealthReset health_reset{};
+    GrpcConnectRetirementFixture loop;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 12345).has_value());
+    REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, 12346));
+    const RouteConfig* cfg_ptr = &cfg;
+    loop.config_ptr = &cfg_ptr;
+
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init_client();
+    conn.h2 = &h2;
+    conn.request_config = &cfg;
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    conn.fd = conn.upstream_fd = UpstreamPool::create_socket();
+    REQUIRE(conn.fd >= 0);
+    conn.pending_ops = 1;
+    conn.upstream_connect_armed = true;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    GrpcExchange exchange;
+    exchange.init();
+    exchange.upstream = &conn;
+    exchange.downstream = &downstream;
+    exchange.deadline_us = monotonic_us() + 1000000;
+    h2.grpc.upstream = true;
+    h2.grpc.connecting = true;
+    h2.grpc.connected_at_us = monotonic_us() - 2000000;
+    h2.grpc.connect_attempts = 1;
+    h2.grpc.connect_tried_mask = 1;
+    REQUIRE(grpc_attach(h2, &exchange));
+    REQUIRE(grpc_attach(downstream_h2, &exchange));
+
+    grpc_tick(&loop, conn);
+    REQUIRE(h2.grpc.connect_retry_pending);
+    // The downstream RPC deadline elapses while the old connect and cancel
+    // still own the socket slot.
+    exchange.deadline_us = monotonic_us() - 1;
+    grpc_tick(&loop, conn);
+    CHECK(loop.closed);
+    CHECK_EQ(loop.connect_submissions, 0u);
+    CHECK_EQ(exchange.failure, 4u);
+    CHECK_EQ(h2.grpc.active, 0u);
+    CHECK(exchange.upstream == nullptr);
+    loop.close_released_upstream(conn);
+}
+
+TEST(grpc_proxy, connect_timeout_exhaustion_records_backend_once) {
+    GrpcBackendHealthReset health_reset{};
+    GrpcConnectRetirementFixture loop;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 12345).has_value());
+    REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, 12346));
+    REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, 12347));
+    const RouteConfig* cfg_ptr = &cfg;
+    loop.config_ptr = &cfg_ptr;
+
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init_client();
+    conn.h2 = &h2;
+    conn.request_config = &cfg;
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    conn.fd = conn.upstream_fd = UpstreamPool::create_socket();
+    REQUIRE(conn.fd >= 0);
+    conn.pending_ops = 1;
+    conn.upstream_connect_armed = true;
+    GrpcExchange exchange;
+    exchange.init();
+    exchange.upstream = &conn;
+    h2.grpc.upstream = true;
+    h2.grpc.connecting = true;
+    h2.grpc.active = 1;
+    h2.grpc.connected_at_us = monotonic_us() - 2000000;
+    h2.grpc.connect_attempts = 3;
+    h2.grpc.connect_tried_mask = 7;
+    h2.grpc.streams[0] = &exchange;
+
+    grpc_tick(&loop, conn);
+    REQUIRE(h2.grpc.connect_retry_pending);
+    CHECK_EQ(backend_health(0, 0)->fails, 1u);
+    conn.upstream_retirement_target_owned = 0;
+    conn.upstream_retirement_cancel_owned = 0;
+    conn.upstream_retirement_active = false;
+    conn.pending_ops = 0;
+    grpc_tick(&loop, conn);
+    CHECK(loop.closed);
+    CHECK_EQ(loop.connect_submissions, 0u);
+    CHECK_EQ(backend_health(0, 0)->fails, 1u);
+    loop.close_released_upstream(conn);
+    conn.fd = -1;
 }
 
 template <typename Loop>

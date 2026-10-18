@@ -1794,6 +1794,15 @@ public:
         return begin_upstream_retirement_impl(c, selected_targets, false, true);
     }
 
+    // Retire one pending TCP connect before gRPC failover reuses its slot.
+    // The exact connect target and its cancel must both drain before the caller
+    // may detach the socket and submit a successor.
+    [[nodiscard]] bool retire_pending_upstream_connect(Connection& c) {
+        if (!c.upstream_connect_armed || c.pending_ops != 1 || c.fd < 0 || c.upstream_fd != c.fd)
+            return false;
+        return begin_upstream_retirement(c, kUpstreamOpConnect);
+    }
+
     // Use the existing separate receive ring so a large buffered origin
     // cannot consume all buffers needed by downstream TLS requests.
     bool add_response_read_recv(Connection& c, bool direct_buffered_body = false) {
