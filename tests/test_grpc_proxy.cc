@@ -120,6 +120,8 @@ struct EchoServer {
     std::atomic<u32> reply_mode{0};
     std::atomic<u32> stream_response_len{0};
     std::atomic<bool> stream_response_partial_next{false};
+    std::atomic<bool> json_response{false};
+    std::atomic<u32> duplicate_content_type_order{0};
     std::atomic<u32> request_trailers{0};
     std::atomic<u32> grpc_content_type_requests{0};
     std::atomic<u32> te_trailers_requests{0};
@@ -179,6 +181,10 @@ struct EchoServer {
                 self->bad_web_request_headers++;
             const u32 mode = self->reply_mode.exchange(0);
             if (mode == 2) return NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (mode == 6) return 0;
+            if (mode == 7) self->json_response = true;
+            if (mode == 8) self->duplicate_content_type_order = 1;
+            if (mode == 9) self->duplicate_content_type_order = 2;
             if (mode == 5) {
                 const u32 message_len = self->stream_response_len.load();
                 if (message_len < 5 || message_len > sizeof(s->data))
@@ -220,13 +226,20 @@ struct EchoServer {
                 return nghttp2_submit_response(session, s->id, large, 4, nullptr);
             }
             if (mode == 4) nghttp2_submit_goaway(session, 0, s->id, NGHTTP2_NO_ERROR, nullptr, 0);
-            nghttp2_nv headers[] = {nv(":status", "200"),
-                                    nv("content-type", "application/grpc"),
-                                    nv("x-meta-bin", "AAEC/w==")};
+            const u32 duplicate_ct = self->duplicate_content_type_order.load();
+            nghttp2_nv headers[] = {
+                nv(":status", "200"),
+                duplicate_ct == 2 || (!duplicate_ct && self->json_response.load())
+                    ? nv("content-type", "application/grpc+json")
+                    : nv("content-type", "application/grpc"),
+                duplicate_ct == 1 ? nv("content-type", "application/grpc+json")
+                                  : nv("content-type", "application/grpc"),
+                nv("x-meta-bin", "AAEC/w==")};
+            const u32 header_count = duplicate_ct ? 4u : 3u;
             nghttp2_data_provider provider{};
             provider.source.ptr = s;
             provider.read_callback = &read_data;
-            if (nghttp2_submit_response(session, s->id, headers, 3, &provider) != 0)
+            if (nghttp2_submit_response(session, s->id, headers, header_count, &provider) != 0)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
         }
         if (f->hd.type == NGHTTP2_RST_STREAM) self->resets++;

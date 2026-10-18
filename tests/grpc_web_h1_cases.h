@@ -50,13 +50,37 @@ inline std::vector<u8> grpc_web_test_base64(const std::vector<u8>& input) {
     return output;
 }
 
+inline bool grpc_web_test_decode_text_response(const std::vector<u8>& response,
+                                              std::vector<u8>& decoded) {
+    static constexpr char kBoundary[] = "\r\n\r\n";
+    const auto boundary = std::search(response.begin(), response.end(),
+                                      kBoundary, kBoundary + sizeof(kBoundary) - 1);
+    if (boundary == response.end()) return false;
+    const auto body_offset = static_cast<size_t>(boundary - response.begin()) +
+                             sizeof(kBoundary) - 1;
+    if (body_offset > response.size()) return false;
+    const u8* body = response.data() + body_offset;
+    const u32 body_len = static_cast<u32>(response.size() - body_offset);
+    decoded.resize(body_len);
+    GrpcWebBase64Decoder decoder{};
+    decoder.init();
+    u32 consumed = 0, written = 0;
+    if (decoder.feed(body, body_len, consumed, decoded.data(), body_len, written) !=
+            GrpcWebCodecStatus::Ok ||
+        consumed != body_len || decoder.finish() != GrpcWebCodecStatus::Ok)
+        return false;
+    decoded.resize(written);
+    return true;
+}
+
 inline bool grpc_web_test_h1_exchange(u16 port,
                                       bool text,
                                       bool chunked,
                                       const std::vector<u8>& body,
                                       std::vector<u8>& response,
                                       bool tls = false,
-                                      const std::vector<u8>* expected_body = nullptr) {
+                                      const std::vector<u8>* expected_body = nullptr,
+                                      const char* extra_headers = "") {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return false;
     set_socket_timeouts(fd, 5);
@@ -93,9 +117,11 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                  sizeof(header),
                  "POST /test.Echo/Call HTTP/1.1\r\n"
                  "Host: localhost\r\n"
+                 "%s"
                  "Content-Type: %s\r\n"
                  "%s"
                  "Connection: close\r\n\r\n",
+                 extra_headers,
                  content_type,
                  chunked ? "Transfer-Encoding: chunked\r\n" : "Content-Length: 0\r\n");
     if (header_len <= 0 || static_cast<size_t>(header_len) >= sizeof(header)) {
@@ -199,6 +225,7 @@ void grpc_web_h1_streaming_text_message_case(rut::test::TestCase* _tc,
         close(listener);
         SKIP("backend unavailable");
     }
+    REQUIRE(shard->init_access_log());
     RouteConfig config;
     REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
     config.upstreams[0].http2 = true;
@@ -231,6 +258,222 @@ void grpc_web_h1_streaming_text_message_case(rut::test::TestCase* _tc,
     }
     shard->shutdown();
     CHECK_EQ(server->requests.load(), 1u);
+}
+
+void grpc_web_h1_trailers_only_case(rut::test::TestCase* _tc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->reply_mode = 1;
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const std::vector<u8> rpc_body{0, 0, 0, 0, 1, 0};
+    const auto request_body = grpc_web_test_base64(rpc_body);
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(get_port(listener), true, false, request_body, response));
+    std::vector<u8> decoded;
+    CHECK(grpc_web_test_decode_text_response(response, decoded));
+    CHECK_GE(decoded.size(), 5u);
+    if (decoded.size() >= 5) {
+        CHECK_EQ(decoded[0], 0x80u);
+        const u32 payload_len = (static_cast<u32>(decoded[1]) << 24) |
+                                (static_cast<u32>(decoded[2]) << 16) |
+                                (static_cast<u32>(decoded[3]) << 8) | decoded[4];
+        CHECK_EQ(payload_len, decoded.size() - 5);
+        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 7",
+                          "grpc-status: 7" + 14) != decoded.end());
+    }
+    CHECK_EQ(server->requests.load(), 1u);
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+void grpc_web_h1_decoded_request_limit_case(rut::test::TestCase* _tc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    config.upstreams[0].max_request_message_bytes = 1;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const std::vector<u8> native_request{0, 0, 0, 0, 2, 0xaa, 0xbb};
+    const auto request_body = grpc_web_test_base64(native_request);
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(get_port(listener), true, false, request_body, response));
+    std::vector<u8> decoded;
+    CHECK(grpc_web_test_decode_text_response(response, decoded));
+    CHECK_GE(decoded.size(), 5u);
+    if (decoded.size() >= 5) {
+        CHECK_EQ(decoded[0], 0x80u);
+        CHECK_EQ(decoded[4], 16u);
+        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 8",
+                          "grpc-status: 8" + 14) != decoded.end());
+    }
+    CHECK_EQ(server->requests.load(), 0u);
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+void grpc_web_h1_deadline_case(rut::test::TestCase* _tc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->reply_mode = 6;
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const std::vector<u8> native_request{0, 0, 0, 0, 1, 0};
+    const auto request_body = grpc_web_test_base64(native_request);
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(get_port(listener), true, false, request_body, response,
+                                   false, nullptr, "grpc-timeout: 1n\r\n"));
+    std::vector<u8> decoded;
+    CHECK(grpc_web_test_decode_text_response(response, decoded));
+    CHECK_GE(decoded.size(), 5u);
+    if (decoded.size() >= 5) {
+        CHECK_EQ(decoded[0], 0x80u);
+        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 4",
+                          "grpc-status: 4" + 14) != decoded.end());
+    }
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+void grpc_web_h1_decoded_response_limit_case(rut::test::TestCase* _tc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    config.upstreams[0].max_response_message_bytes = 1;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const std::vector<u8> native_request{0, 0, 0, 0, 2, 0xaa, 0xbb};
+    const auto request_body = grpc_web_test_base64(native_request);
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(get_port(listener), true, false, request_body, response));
+    std::vector<u8> decoded;
+    CHECK(grpc_web_test_decode_text_response(response, decoded));
+    CHECK_GE(decoded.size(), 5u);
+    if (decoded.size() >= 5) {
+        CHECK_EQ(decoded[0], 0x80u);
+        CHECK_EQ(decoded[4], 16u);
+        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 8",
+                          "grpc-status: 8" + 14) != decoded.end());
+    }
+    CHECK_EQ(server->requests.load(), 1u);
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+void grpc_web_h1_json_response_rejected_case(rut::test::TestCase* _tc, u32 response_mode) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->reply_mode = response_mode;
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const std::vector<u8> native_request{0, 0, 0, 0, 1, 0};
+    const auto request_body = grpc_web_test_base64(native_request);
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(get_port(listener), true, false, request_body, response));
+    std::vector<u8> decoded;
+    CHECK(grpc_web_test_decode_text_response(response, decoded));
+    CHECK_GE(decoded.size(), 5u);
+    if (decoded.size() >= 5) {
+        CHECK_EQ(decoded[0], 0x80u);
+        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 13",
+                          "grpc-status: 13" + 15) != decoded.end());
+    }
+    CHECK_EQ(server->requests.load(), 1u);
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
 }
 
 template <typename Loop>
@@ -421,6 +664,80 @@ TEST(grpc_proxy, h1_transfer_encoding_chain_fails_closed) {
     grpc_web_test_init_raw_request(conn, storage, sizeof(storage), kRequest, sizeof(kRequest) - 1);
     CHECK_EQ(static_cast<u32>(grpc_web_h1_start<EpollEventLoop>(nullptr, conn, nullptr, 0, true)),
              static_cast<u32>(GrpcWebH1Start::Rejected));
+}
+
+TEST(grpc_proxy, h1_invalid_text_base64_returns_grpc_status) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log());
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const std::vector<u8> invalid{'A', 'B', '=', 'C'};
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(get_port(listener), true, false, invalid, response));
+    std::vector<u8> decoded;
+    CHECK(grpc_web_test_decode_text_response(response, decoded));
+    CHECK_GE(decoded.size(), 5u);
+    if (decoded.size() >= 5) {
+        CHECK_EQ(decoded[0], 0x80u);
+        CHECK_EQ(decoded[4], 17u);
+        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 13",
+                          "grpc-status: 13" + 15) != decoded.end());
+    }
+    CHECK_EQ(server->requests.load(), 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[13], 1u);
+    AccessLogEntry entry{};
+    u32 log_count = 0;
+    while (shard->log_ring->pop(entry)) {
+        log_count++;
+        CHECK_EQ(entry.grpc_status_plus_one, 14u);
+        CHECK_EQ(entry.status, 200u);
+    }
+    CHECK_EQ(log_count, 1u);
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+TEST(grpc_proxy, h1_trailers_only_backend_response) {
+    grpc_web_h1_trailers_only_case(_tc);
+}
+TEST(grpc_proxy, h1_decoded_request_message_limit) {
+    grpc_web_h1_decoded_request_limit_case(_tc);
+}
+TEST(grpc_proxy, h1_deadline_returns_status) {
+    grpc_web_h1_deadline_case(_tc);
+}
+TEST(grpc_proxy, h1_decoded_response_message_limit) {
+    grpc_web_h1_decoded_response_limit_case(_tc);
+}
+TEST(grpc_proxy, h1_json_response_rejected) {
+    grpc_web_h1_json_response_rejected_case(_tc, 7);
+}
+TEST(grpc_proxy, h1_duplicate_json_proto_response_rejected) {
+    grpc_web_h1_json_response_rejected_case(_tc, 8);
+}
+TEST(grpc_proxy, h1_duplicate_proto_json_response_rejected) {
+    grpc_web_h1_json_response_rejected_case(_tc, 9);
 }
 
 TEST(grpc_proxy, h1_path_and_safe_header_overrides_remain_supported) {
