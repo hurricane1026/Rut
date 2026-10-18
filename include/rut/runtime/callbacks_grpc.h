@@ -385,12 +385,6 @@ inline void grpc_record_connect_result(Loop* loop,
     if (current != conn.request_config) return;
     grpc_record_connect_result(conn, success, now_us);
 }
-inline void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us) {
-    if (success) return;
-    if (conn.h2 == nullptr || conn.h2->grpc.session_failure_recorded) return;
-    conn.h2->grpc.session_failure_recorded = true;
-    grpc_record_connect_result(conn, success, now_us);
-}
 template <typename Loop>
 inline void grpc_record_session_failure(Loop* loop, Connection& conn, u64 now_us) {
     if (!conn.h2 || conn.h2->grpc.session_failure_recorded) return;
