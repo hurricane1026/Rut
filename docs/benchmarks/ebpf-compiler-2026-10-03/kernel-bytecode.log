@@ -1,0 +1,1 @@
+{"mode":"required","backend":"sockmap","transfer_ok":true,"verified_bytes":2097169,"relay_userspace_bytes":0,"header_userspace_bytes":54,"tls_only_errno":0,"map_then_tls_errno":0,"tls_then_map_errno":22,"successor_userspace_bytes":17,"half_close_ok":true}

@@ -1,0 +1,13 @@
+Test project /home/hurricane/private/code/Rut/build
+    Start 32: test_ebpf_handoff
+1/2 Test #32: test_ebpf_handoff ................   Passed    0.08 sec
+    Start 33: test_kernel_relay
+2/2 Test #33: test_kernel_relay ................   Passed    0.59 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Label Time Summary:
+network    =   0.67 sec*proc (2 tests)
+unit       =   0.67 sec*proc (2 tests)
+
+Total Test time (real) =   0.67 sec

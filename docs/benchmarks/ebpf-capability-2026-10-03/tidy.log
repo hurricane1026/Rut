@@ -1,0 +1,88 @@
+41 warnings generated.
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:25:14: warning: variable 'fd' of type 'int' can be declared 'const' [misc-const-correctness]
+   25 |         for (int fd : fds)
+      |              ^
+      |                  const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:37:9: warning: variable 'listener' of type 'int' can be declared 'const' [misc-const-correctness]
+   37 |         int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      |         ^
+      |             const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:54:14: warning: variable 'fd' of type 'int' can be declared 'const' [misc-const-correctness]
+   54 |         for (int fd : kSockets) {
+      |              ^
+      |                  const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:55:19: warning: no header providing "timeval" is directly included [misc-include-cleaner]
+    3 |             const timeval kTimeout{5, 0};
+      |                   ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:57:32: warning: no header providing "SOL_SOCKET" is directly included [misc-include-cleaner]
+    3 |             if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &kTimeout, sizeof(kTimeout)) != 0 ||
+      |                                ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:57:44: warning: no header providing "SO_RCVTIMEO" is directly included [misc-include-cleaner]
+   57 |             if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &kTimeout, sizeof(kTimeout)) != 0 ||
+      |                                            ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:58:44: warning: no header providing "SO_SNDTIMEO" is directly included [misc-include-cleaner]
+   58 |                 setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &kTimeout, sizeof(kTimeout)) != 0 ||
+      |                                            ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:99:5: warning: use auto when initializing with a cast to avoid duplicating the type name [modernize-use-auto]
+   99 |     uint32_t value = static_cast<uint32_t>(socket_fd);
+      |     ^~~~~~~~
+      |     auto
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:173:5: warning: variable 'length' of type 'int' can be declared 'const' [misc-const-correctness]
+  173 |     int length = snprintf(path, sizeof(path), "%s.%s.bpf", prefix, suffix);
+      |     ^
+      |         const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:178:5: warning: variable 'fd' of type 'int' can be declared 'const' [misc-const-correctness]
+  178 |     int fd =
+      |     ^
+      |         const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:183:9: warning: no header providing "ssize_t" is directly included [misc-include-cleaner]
+   17 |         ssize_t n = writing ? write(fd, static_cast<char*>(bytes) + done, size - done)
+      |         ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:183:9: warning: variable 'n' of type 'ssize_t' (aka 'long') can be declared 'const' [misc-const-correctness]
+  183 |         ssize_t n = writing ? write(fd, static_cast<char*>(bytes) + done, size - done)
+      |         ^
+      |                 const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:195:5: warning: variable 'result' of type 'int' can be declared 'const' [misc-const-correctness]
+  195 |     int result = close(fd);
+      |     ^
+      |         const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:210:5: warning: variable 'parser_count' of type 'unsigned int' can be declared 'const' [misc-const-correctness]
+  210 |     unsigned parser_count = bounded ? 22 : 2;
+      |     ^
+      |              const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:211:5: warning: variable 'verdict_count' of type 'unsigned int' can be declared 'const' [misc-const-correctness]
+  211 |     unsigned verdict_count = bounded ? 31 : 10;
+      |     ^
+      |              const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:281:22: warning: no header providing "FIONREAD" is directly included [misc-include-cleaner]
+    3 |     if (ioctl(front, FIONREAD, &queued) != 0) return "queue_probe";
+      |                      ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:298:9: warning: variable 'n' of type 'ssize_t' (aka 'long') can be declared 'const' [misc-const-correctness]
+  298 |         ssize_t n = send(fd, bytes, size, MSG_NOSIGNAL);
+      |         ^
+      |                 const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:317:9: warning: variable 'left' of type 'size_t' (aka 'unsigned long') can be declared 'const' [misc-const-correctness]
+  317 |         size_t left = transfer.size - transfer.copied;
+      |         ^
+      |                const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:318:9: warning: variable 'n' of type 'ssize_t' (aka 'long') can be declared 'const' [misc-const-correctness]
+  318 |         ssize_t n = recv(transfer.from, bytes, left < sizeof(bytes) ? left : sizeof(bytes), 0);
+      |         ^
+      |                 const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:331:9: warning: variable 'left' of type 'size_t' (aka 'unsigned long') can be declared 'const' [misc-const-correctness]
+  331 |         size_t left = transfer.size - sent;
+      |         ^
+      |                const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:333:9: warning: variable 'n' of type 'size_t' (aka 'unsigned long') can be declared 'const' [misc-const-correctness]
+  333 |         size_t n = left <= sizeof(bytes) ? left : 4096;
+      |         ^
+      |                const 
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:352:5: warning: no header providing "pthread_t" is directly included [misc-include-cleaner]
+    3 |     pthread_t writer_thread{}, relay_thread{};
+      |     ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:364:9: warning: variable 'n' of type 'ssize_t' (aka 'long') can be declared 'const' [misc-const-correctness]
+  364 |         ssize_t n = recv(receiver, bytes, kLeft < sizeof(bytes) ? kLeft : sizeof(bytes), 0);
+      |         ^
+      |                 const 
+Suppressed 18 warnings (18 in non-user code).
+Use -header-filter=.* or leave it as default to display errors from all non-system headers. Use -system-headers to display errors from system headers as well.

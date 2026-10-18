@@ -1,0 +1,115 @@
+{
+  "files": [
+    {
+      "path": "adversarial.log",
+      "size": 294,
+      "sha256": "81916f8725e94356c30f3662ee94cbaec01c45eb0de1a3f9136c33d048c257fb"
+    },
+    {
+      "path": "adversarial.py",
+      "size": 4726,
+      "sha256": "82b21ec867f9a6dc93c6b4e300a87e09ef8060d71fa9843cbf884987cc7a8e50"
+    },
+    {
+      "path": "candidate.patch",
+      "size": 14687,
+      "sha256": "595883efb0b3f4cefdf072f4ae0cc6db62f5a001c1226308a4bac2c87b8e66f5"
+    },
+    {
+      "path": "lookup-build.log",
+      "size": 4128,
+      "sha256": "586e6c28c10eadbec3528b4c806b4a2cba73a2bff3f42f03a47a396b65f7051d"
+    },
+    {
+      "path": "lookup-link.log",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "lookup-results.log",
+      "size": 1864,
+      "sha256": "173dbbd55324cbae4f8f34b677a273373a55e3e91d9a11841668e5584346c7b6"
+    },
+    {
+      "path": "lookup-summary.json",
+      "size": 474,
+      "sha256": "c17b4b46a3e16856f1bb978cc0458656a2205abae3c23733a6d40ac95e05b3e1"
+    },
+    {
+      "path": "lookup_bench.cc",
+      "size": 1335,
+      "sha256": "ed6170a1b865f47ea780777376524884c65f3aab7c6800225ee8c5ced069fc75"
+    },
+    {
+      "path": "measured_harness.py",
+      "size": 1711,
+      "sha256": "431b04fa00c696d43f97de9ffed1c61ccd385eeb06f7adeb948af0f2debee058"
+    },
+    {
+      "path": "origin-reuse-adversarial-results.json",
+      "size": 111,
+      "sha256": "6adaf574dc9f311ddaf4763116d28f6be7042aa2f0695ee9a54b4937c1d9dfc8"
+    },
+    {
+      "path": "origin-reuse-keepalive-runtime.log",
+      "size": 184,
+      "sha256": "7276116a96dca0575f35425eff522f4f35b10c906d8e24fba5c303da92cdce39"
+    },
+    {
+      "path": "origin-reuse-keepalive.rut",
+      "size": 6804,
+      "sha256": "7b423d9c618ca1d165d71c616a50391d8a044ebc6d153f3788647584fe025c47"
+    },
+    {
+      "path": "provenance.json",
+      "size": 657,
+      "sha256": "d5fc2802313d247aff79da78fc697069c2fc60cedd867245ed4cd8bcf53d2821"
+    },
+    {
+      "path": "proxy.rut",
+      "size": 6806,
+      "sha256": "2749088ac87c8375d1b53d7da0cdebdead77974fad9805d9d3fdb9ed65bb9fcc"
+    },
+    {
+      "path": "run.py",
+      "size": 1402,
+      "sha256": "c8a051d0009f3c386998e95483bfa76a42a8fb3a92a0491a70545d2aa1d44c7b"
+    },
+    {
+      "path": "rut-owner-index-baseline-environment.log",
+      "size": 124,
+      "sha256": "9d91e73da8bd5e9fa65f13d058b60005b4a2f6b7e7b7038d10c6c35cf2354070"
+    },
+    {
+      "path": "rut-owner-index-build.log",
+      "size": 172009,
+      "sha256": "4ff462cfc022838915f26331ff6961608b565ec252f491a09be1b4fda01d8c7c"
+    },
+    {
+      "path": "rut-owner-index-configure.log",
+      "size": 1483,
+      "sha256": "5cd554db7b3cb7f001e1a09a95745f5c9b52a9ce6381cd6105771d3816a62b87"
+    },
+    {
+      "path": "rut-owner-index-focused.log",
+      "size": 224,
+      "sha256": "5a1c44ae2613bc3fa20172b9bf98d685f0b2b2d70606198e70adc4156030d9cd"
+    },
+    {
+      "path": "rut-owner-index-mock-regression.log",
+      "size": 44614,
+      "sha256": "166d4a409f222dae9e58e8c3dee5f6b37ebaafe7744019437a59dbbc43f71297"
+    },
+    {
+      "path": "rut-owner-index-network-full.log",
+      "size": 110431,
+      "sha256": "66756562116a09a9e58c58f2029c0faf055a9cdf26154e159334946028b2964e"
+    },
+    {
+      "path": "rut-owner-index-pure-tests.log",
+      "size": 985,
+      "sha256": "b0b56d8ba7dafa4413fd6c69baef20abcbaa68434c5c2eed002eaf81da4d18c6"
+    }
+  ],
+  "archive_sha256": "dd6568c59a3b43b842c4b69d5355d2631467211bca09dc97b5140c1fce267ce0"
+}

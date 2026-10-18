@@ -1,0 +1,28 @@
+bpf-default-seccomp-label-disabled 1 off 0 copy
+bpf-default-seccomp-label-disabled 1 auto 0 sockmap
+bpf-default-seccomp-label-disabled 1 required 0 sockmap
+bpf-default-seccomp-label-disabled 1 required --header-rewrite 0 sockmap
+bpf-default-seccomp-label-disabled 1 required --header-rewrite --bounded-body 0 sockmap
+bpf-default-seccomp-label-disabled 1 required --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-seccomp-label-disabled 1 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-seccomp-label-disabled 1 auto --fail-after-insert --header-rewrite 0 copy
+bpf-default-seccomp-label-disabled 1 required --fail-after-insert 1 unavailable
+bpf-default-seccomp-label-disabled 2 off 0 copy
+bpf-default-seccomp-label-disabled 2 auto 0 sockmap
+bpf-default-seccomp-label-disabled 2 required 0 sockmap
+bpf-default-seccomp-label-disabled 2 required --header-rewrite 0 sockmap
+bpf-default-seccomp-label-disabled 2 required --header-rewrite --bounded-body 0 sockmap
+bpf-default-seccomp-label-disabled 2 required --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-seccomp-label-disabled 2 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-seccomp-label-disabled 2 auto --fail-after-insert --header-rewrite 0 copy
+bpf-default-seccomp-label-disabled 2 required --fail-after-insert 1 unavailable
+bpf-default-seccomp-label-disabled 3 off 0 copy
+bpf-default-seccomp-label-disabled 3 auto 0 sockmap
+bpf-default-seccomp-label-disabled 3 required 0 sockmap
+bpf-default-seccomp-label-disabled 3 required --header-rewrite 0 sockmap
+bpf-default-seccomp-label-disabled 3 required --header-rewrite --bounded-body 0 sockmap
+bpf-default-seccomp-label-disabled 3 required --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-seccomp-label-disabled 3 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-seccomp-label-disabled 3 auto --fail-after-insert --header-rewrite 0 copy
+bpf-default-seccomp-label-disabled 3 required --fail-after-insert 1 unavailable
+Recorded 27 cases in /home/hurricane/private/code/rut-ebpf-20261003/default-seccomp

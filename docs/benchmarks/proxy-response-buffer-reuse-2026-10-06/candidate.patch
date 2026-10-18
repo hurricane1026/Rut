@@ -1,0 +1,255 @@
+diff --git a/include/rut/runtime/callbacks_impl.h b/include/rut/runtime/callbacks_impl.h
+index d76fe0a5..5fa990d3 100644
+--- a/include/rut/runtime/callbacks_impl.h
++++ b/include/rut/runtime/callbacks_impl.h
+@@ -9535,7 +9535,18 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
+         if (conn.upstream_recv_buf.len() != 0) {
+             (void)consume_upstream_sent(conn);
+         } else {
+-            conn.response_body_tail.consume(inflight, conn.chain_direct_recv_owner.active);
++            constexpr bool kHasDirectBodyRecv = requires(Loop* candidate, Connection& c) {
++                candidate->arm_response_read_direct_body_recv(c);
++            };
++            const bool recycle_bulk =
++                kHasDirectBodyRecv && !conn.tls_active &&
++                conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
++                conn.response_read_deadline_post_commit_declared_body > SlicePool::kBulkSliceSize &&
++                conn.response_read_deadline_post_commit_origin_received <
++                    conn.response_read_deadline_post_commit_declared_body;
++            conn.response_body_tail.consume(
++                inflight, conn.chain_direct_recv_owner.active, recycle_bulk);
++            if (!recycle_bulk) conn.response_body_tail.release_recycled();
+             conn.upstream_send_len = 0;
+         }
+         conn.response_read_deadline_post_commit_phase =
+diff --git a/include/rut/runtime/response_body_chain.h b/include/rut/runtime/response_body_chain.h
+index 9c795aec..b008a24d 100644
+--- a/include/rut/runtime/response_body_chain.h
++++ b/include/rut/runtime/response_body_chain.h
+@@ -16,7 +16,9 @@ struct ResponseBodyChain {
+         Node* next;
+         u32 len;
+         u32 offset;
+-        u8 bytes[SlicePool::kSliceSize - sizeof(Node*) - 2 * sizeof(u32)];
++        // Physical high-water mark survives private reuse within one response.
++        u32 dirty_end;
++        u8 bytes[SlicePool::kSliceSize - sizeof(Node*) - 3 * sizeof(u32)];
+     };
+     static_assert(sizeof(Node) == SlicePool::kSliceSize);
+     static constexpr u32 kPayload = sizeof(Node::bytes);
+@@ -34,6 +36,9 @@ struct ResponseBodyChain {
+ 
+     Node* head = nullptr;
+     Node* tail = nullptr;
++    // One consumed bulk node may remain response-owned for another direct recv.
++    // It is not returned to the zero-filled pool until release_recycled().
++    Node* recycled = nullptr;
+     SlicePool* owner = nullptr;
+     u32 size = 0;
+     // Bytes a direct recv has physically written into the current tail beyond
+@@ -77,7 +82,7 @@ struct ResponseBodyChain {
+                 return false;
+             }
+             node->next = nullptr;
+-            node->len = node->offset = 0;
++            node->len = node->offset = node->dirty_end = 0;
+             if (last)
+                 last->next = node;
+             else
+@@ -102,6 +107,7 @@ struct ResponseBodyChain {
+             const u32 n = len < room ? len : room;
+             __builtin_memcpy(payload(write) + write->len, src, n);
+             write->len += n;
++            if (write->dirty_end < write->len) write->dirty_end = write->len;
+             src += n;
+             len -= n;
+             write = write->next;
+@@ -112,7 +118,7 @@ struct ResponseBodyChain {
+     // Completed sends may consume the committed prefix while a direct recv
+     // still owns the tail's reserved capacity. Retain that node until the
+     // receive target settles; consume(0) then removes any empty retained head.
+-    void consume(u32 len, bool tail_pinned = false) {
++    void consume(u32 len, bool tail_pinned = false, bool recycle_bulk = false) {
+         while (head && (len != 0 || head->offset == head->len)) {
+             const u32 n = len < front_size() ? len : front_size();
+             head->offset += n;
+@@ -122,16 +128,32 @@ struct ResponseBodyChain {
+                 if (head == tail && tail_pinned) break;
+                 Node* old = head;
+                 head = head->next;
+-                release_node(old);
++                if (recycle_bulk && recycled == nullptr &&
++                    owner->is_bulk(reinterpret_cast<const u8*>(old))) {
++                    if (old == tail && old->dirty_end < tail_dirty_end)
++                        old->dirty_end = tail_dirty_end;
++                    old->next = nullptr;
++                    recycled = old;
++                } else {
++                    release_node(old);
++                }
+             }
+         }
+         if (!head) {
+             tail = nullptr;
+-            owner = nullptr;
++            if (!recycled) owner = nullptr;
+             tail_dirty_end = 0;
+         }
+     }
+ 
++    void release_recycled() {
++        if (recycled) {
++            release_node(recycled);
++            recycled = nullptr;
++        }
++        if (!head) owner = nullptr;
++    }
++
+     void release() {
+         while (head) {
+             Node* next = head->next;
+@@ -139,6 +161,7 @@ struct ResponseBodyChain {
+             head = next;
+         }
+         tail = nullptr;
++        release_recycled();
+         owner = nullptr;
+         size = 0;
+         tail_dirty_end = 0;
+@@ -157,10 +180,17 @@ struct ResponseBodyChain {
+     bool reserve_tail(SlicePool& pool, u32 bulk_after = kBulkAfterPlaintext) {
+         if (tail && payload_capacity(pool, tail) > tail->len) return true;
+         if (owner && owner != &pool) return false;
+-        u8* raw = size >= bulk_after ? pool.alloc_bulk() : nullptr;
++        const bool reuse = size >= bulk_after && recycled != nullptr;
++        u8* raw = reuse                ? reinterpret_cast<u8*>(recycled)
++                  : size >= bulk_after ? pool.alloc_bulk()
++                                       : nullptr;
+         if (!raw) raw = pool.alloc();
+         auto* node = reinterpret_cast<Node*>(raw);
+         if (!node) return false;
++        if (reuse)
++            recycled = nullptr;
++        else
++            node->dirty_end = 0;
+         node->next = nullptr;
+         node->len = node->offset = 0;
+         if (tail)
+@@ -187,6 +217,7 @@ struct ResponseBodyChain {
+     // destination (n <= the write_avail() observed when it was armed).
+     void commit(u32 n) {
+         tail->len += n;
++        if (tail->dirty_end < tail->len) tail->dirty_end = tail->len;
+         size += n;
+     }
+ 
+@@ -194,7 +225,7 @@ struct ResponseBodyChain {
+     // logical response. Only the current tail can have a direct recv in flight:
+     // complete-buffered responses do not consume or send body nodes while the
+     // origin recv is active, and close defers chain release until its CQE drains.
+-    bool record_direct_write(const Node* node, const u8* ptr, u32 n, const SlicePool& pool) {
++    bool record_direct_write(Node* node, const u8* ptr, u32 n, const SlicePool& pool) {
+         if (node == nullptr || node != tail || ptr == nullptr) return false;
+         const u64 begin = reinterpret_cast<u64>(payload(node));
+         const u64 address = reinterpret_cast<u64>(ptr);
+@@ -204,6 +235,7 @@ struct ResponseBodyChain {
+             return false;
+         const u32 end = static_cast<u32>(address - begin) + n;
+         if (end > tail_dirty_end) tail_dirty_end = end;
++        if (end > node->dirty_end) node->dirty_end = end;
+         return true;
+     }
+ 
+@@ -211,7 +243,8 @@ private:
+     // Ordinary writes publish [0, len); a direct recv can dirty a longer
+     // prefix before its CQE is accepted, tracked by tail_dirty_end.
+     void release_node(Node* node) {
+-        const u32 dirty = node == tail && tail_dirty_end > node->len ? tail_dirty_end : node->len;
++        u32 dirty = node->dirty_end > node->len ? node->dirty_end : node->len;
++        if (node == tail && tail_dirty_end > dirty) dirty = tail_dirty_end;
+         owner->free_written(reinterpret_cast<u8*>(node), kHeader + dirty);
+         if (node == tail) tail_dirty_end = 0;
+     }
+diff --git a/include/rut/runtime/slice_pool.h b/include/rut/runtime/slice_pool.h
+index 4ae0053b..5b9b589d 100644
+--- a/include/rut/runtime/slice_pool.h
++++ b/include/rut/runtime/slice_pool.h
+@@ -42,7 +42,7 @@ struct SlicePool {
+     // the remaining bounded body in whole SlicePool nodes. Keep this reserve
+     // with the pool sizing contract so every backend accounts for it equally.
+     static constexpr u32 kMaxBufferedResponseBody = 1u << 20;
+-    static constexpr u32 kResponseBodyPayload = kSliceSize - sizeof(void*) - 2 * sizeof(u32);
++    static constexpr u32 kResponseBodyPayload = kSliceSize - sizeof(void*) - 3 * sizeof(u32);
+     static constexpr u32 kMaxBufferedResponseSlices =
+         (kMaxBufferedResponseBody + kResponseBodyPayload - 1) / kResponseBodyPayload;
+     static constexpr u32 kOrdinarySlicesPerConnection = 6;
+diff --git a/tests/test_arena.cc b/tests/test_arena.cc
+index 8d164be1..83376fe1 100644
+--- a/tests/test_arena.cc
++++ b/tests/test_arena.cc
+@@ -870,6 +870,65 @@ TEST(slice_arena, multiple_arenas_same_pool) {
+     pc.destroy();
+ }
+ 
++TEST(response_body_chain, response_owned_bulk_reuse_preserves_dirty_high_water) {
++    SlicePool pool;
++    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, 1).has_value());
++    ResponseBodyChain chain;
++    REQUIRE(chain.reserve_tail(pool, 0));
++    u8* const raw = reinterpret_cast<u8*>(chain.tail);
++    u8* const bytes = chain.write_ptr(pool);
++    constexpr u32 kOld = 200 * 1024;
++    __builtin_memset(bytes, 0x5a, kOld);
++    chain.commit(kOld);
++    chain.consume(kOld, false, true);
++    CHECK_EQ(chain.size, 0u);
++    CHECK_EQ(chain.head, nullptr);
++    CHECK_EQ(reinterpret_cast<u8*>(chain.recycled), raw);
++    CHECK_EQ(pool.bulk_available(), 0u);
++    REQUIRE(chain.reserve_tail(pool, 0));
++    CHECK_EQ(reinterpret_cast<u8*>(chain.tail), raw);
++    CHECK_EQ(chain.front_size(), 0u);
++    CHECK_EQ(chain.recycled, nullptr);
++    __builtin_memset(chain.write_ptr(pool), 0x3c, 4096);
++    REQUIRE(chain.record_direct_write(chain.tail, chain.write_ptr(pool), 4096, pool));
++    chain.commit(128);
++    chain.release();
++    CHECK_EQ(pool.bulk_available(), 1u);
++    u8* reused = pool.alloc_bulk();
++    REQUIRE_EQ(reused, raw);
++    bool zero = true;
++    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) zero &= reused[i] == 0;
++    CHECK(zero);
++    pool.free(reused);
++    pool.destroy();
++}
++
++TEST(response_body_chain, pinned_tail_is_not_recycled_before_recv_settles) {
++    SlicePool pool;
++    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, 1).has_value());
++    ResponseBodyChain chain;
++    REQUIRE(chain.reserve_tail(pool, 0));
++    __builtin_memset(chain.write_ptr(pool), 0x5a, 128);
++    chain.commit(128);
++    auto* const node = chain.tail;
++    chain.consume(128, true, true);
++    CHECK_EQ(chain.head, node);
++    CHECK_EQ(chain.recycled, nullptr);
++    CHECK_EQ(chain.front_size(), 0u);
++    __builtin_memset(chain.write_ptr(pool), 0x3c, 16);
++    REQUIRE(chain.record_direct_write(node, chain.write_ptr(pool), 16, pool));
++    chain.commit(16);
++    chain.consume(16, false, true);
++    CHECK_EQ(chain.recycled, node);
++    CHECK_EQ(chain.head, nullptr);
++    CHECK_EQ(pool.bulk_available(), 0u);
++    chain.release_recycled();
++    CHECK_EQ(pool.bulk_available(), 1u);
++    CHECK_EQ(chain.owner, nullptr);
++    chain.release();
++    pool.destroy();
++}
++
+ int main(int argc, char** argv) {
+     return rut::test::run_all(argc, argv);
+ }

@@ -3,6 +3,7 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_program.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/ebpf_plan.h"
 #include "test.h"
 
 #include <errno.h>
@@ -357,6 +358,53 @@ TEST(native_program, preserves_sigchld_disposition) {
         CHECK_EQ(sigismember(&observed.sa_mask, SIGUSR1), sigismember(&baseline.sa_mask, SIGUSR1));
     }
 }
+#if RUT_ENABLE_EBPF
+TEST(native_program, ebpf_body_plan_survives_compiler_exit_and_is_validated) {
+    Source source;
+    REQUIRE(source.append(
+        "upstream b at \"127.0.0.1:9999\"\n"
+        "route GET \"/plain\" { return forward(b) }\n"
+        "route GET \"/headers\" { return forward(b, request_policy: { version: .http11, "
+        "host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, "
+        ".expect, .upgrade] }) }\n"
+        "route GET \"/static\" { return 200 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    char error[512];
+    REQUIRE(load_native_program(source.path, *owner.p, error, sizeof(error), 2, true));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE(owner.p->has_ebpf_plan);
+    auto& plan = owner.p->ebpf_plan;
+    CHECK_EQ(plan.route_count, 3u);
+    CHECK_EQ(plan.candidate_count, 2u);
+    CHECK_EQ(plan.routes[0].decision, ebpf::Decision::BodyCandidate);
+    CHECK_EQ(plan.routes[1].request_policy_id, 1u);
+    CHECK_EQ(plan.routes[2].reason, ebpf::Reason::NotForward);
+    CHECK(validate_ebpf_plan(plan, owner.p->config));
+    owner.p->config.upstreams[0].http2 = true;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    owner.p->config.upstreams[0].http2 = false;
+    CHECK(validate_ebpf_plan(plan, owner.p->config));
+    // Relocation placeholders must remain zero until an actual kernel load.
+    plan.bytecode.verdict[ebpf::kSocketMapRelocation].immediate = 99;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    plan.bytecode.verdict[ebpf::kSocketMapRelocation].immediate = 0;
+    plan.handoff.verdict[plan.handoff.verdict_ring_map].immediate = 99;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    plan.handoff.verdict[plan.handoff.verdict_ring_map].immediate = 0;
+    plan.routes[0].upstream_id = 99;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    plan.routes[0].upstream_id = 0;
+    plan.routes[0].request_policy_id = 99;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    plan.routes[0].request_policy_id = 0;
+    plan.candidate_count = 0;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    owner.p->destroy();
+    CHECK_FALSE(owner.p->has_ebpf_plan);
+    CHECK_EQ(owner.p->ebpf_plan.route_count, 0u);
+}
+#endif
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);

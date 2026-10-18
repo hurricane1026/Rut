@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/access_log_sink.h"
+#include "rut/common/ebpf_plan.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/listener.h"
 #include "rut/runtime/route_table.h"
@@ -12,6 +13,8 @@ struct NativeProgram {
     bool has_listener = false;
     ListenerSpec listener{};
     AccessLogSinkSpec access_log{};
+    bool has_ebpf_plan = false;
+    ebpf::Plan ebpf_plan{};
     void* library = nullptr;
     i32 artifact_fd = -1;  // sealed, anonymous artifact; retained for unique dlopen identity
     void** regex_handles = nullptr;
@@ -19,7 +22,17 @@ struct NativeProgram {
     MmapArena arena;
     void destroy();
 };
-bool load_native_program(
-    const char* source, NativeProgram& out, char* error, u32 error_size, u8 opt = 2);
+bool load_native_program(const char* source,
+                         NativeProgram& out,
+                         char* error,
+                         u32 error_size,
+                         u8 opt = 2,
+                         bool request_ebpf_plan = false);
+// Diagnostic/export only; these APIs do not attach programs to business sockets.
+bool write_ebpf_plan_json(const NativeProgram& program, int fd);
+bool export_ebpf_bytecode(const NativeProgram& program,
+                          const char* prefix,
+                          char* error,
+                          u32 error_size);
 void activate_native_program(const NativeProgram& program);
 }  // namespace rut

@@ -7,6 +7,10 @@
 // build with -DRUT_ENABLE_WEBSOCKET=0 (e.g. a minimal k8s mesh sidecar that never
 // proxies WebSocket) to compile out the 101 tunnel path entirely — no 101 check
 // on the proxy response path, no tunnel callbacks, no idle-timeout exemption.
+#ifndef RUT_ENABLE_EBPF
+#define RUT_ENABLE_EBPF 0
+#endif
+
 #ifndef RUT_ENABLE_WEBSOCKET
 #define RUT_ENABLE_WEBSOCKET 1
 #endif
