@@ -103,7 +103,7 @@ struct EchoServer {
         u32 len;
         bool end;
         bool trailer;
-        u8 data[65535];
+        u8 data[256 * 1024];
     } streams[64]{};
     int listen_fd = -1;
     int fd = -1;
@@ -3700,3 +3700,5 @@ TEST(grpc_proxy, message_limits_snapshot_epoll) {
 TEST(grpc_proxy, message_limits_snapshot_iouring) {
     message_limit_snapshot_case<IoUringEventLoop>(_tc);
 }
+
+#include "grpc_web_h1_cases.h"
