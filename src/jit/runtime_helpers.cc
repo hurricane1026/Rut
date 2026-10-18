@@ -11,7 +11,6 @@
 #include <hs.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/hmac.h>
 #include <openssl/sha.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -1633,6 +1632,7 @@ bool jwt_decode_claims(
             continue;
         }
         if (!key.eq(lit_str("alg"))) continue;
+        if (has_alg) return false;
         if (document.nodes[node].kind != json::Kind::String) return false;
         json::Writer value_writer{value_bytes, sizeof(value_bytes)};
         if (!document.string(node, value_writer) || !value_writer.ok) return false;

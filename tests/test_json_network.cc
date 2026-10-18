@@ -632,6 +632,7 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     CHECK(ok.first);
     CHECK(ok.second.eq({payload, static_cast<u32>(__builtin_strlen(payload))}));
     CHECK_FALSE(decode("wrong-secret").first);
+    CHECK_FALSE(decode(std::string(32, 'y').c_str()).first);
     CHECK_FALSE(decode("").first);
 
     const char* hs384 =
@@ -649,11 +650,32 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
             .first);
     CHECK(decode(hs384_key.c_str(), hs384).first);
     CHECK(decode(hs512_key.c_str(), hs512).first);
+    CHECK(
+        decode(std::string(65, 'x').c_str(),
+               "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.mtYtHuqIBzRucu6RKwhPy5qdCUlENvY0xsz9zqTioKg")
+            .first);
+    CHECK(decode(std::string(129, 'x').c_str(),
+                 "eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiJvayJ9.JRV-"
+                 "gATamPa5fRjGEIMaLLqBGezuBB5nCsxYJFM1SiEpDUb17YaAUCajN55mCnSA")
+              .first);
+    CHECK(decode(std::string(129, 'x').c_str(),
+                 "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJvayJ9.akk8BrpagvgRV-0SJjwW2ASRv-"
+                 "ZvqJe9wRRTW3cbMjxKsQxDwIxj_UlSjGwoyJmqHyE9UxSq-50dIEKM8loUAA")
+              .first);
     CHECK_FALSE(decode(std::string(31, 'x').c_str()).first);
     CHECK_FALSE(decode(std::string(47, 'x').c_str(), hs384).first);
     CHECK_FALSE(decode(std::string(63, 'x').c_str(), hs512).first);
     CHECK_FALSE(
         decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsInh4eHh4eHh4eHh4eHh4eHh4IjoxfQ.e30.AA")
+            .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), "eyJhbGciOiJYWFhYWFhYWFhYWFhYWFhYWCJ9.eyJzdWIiOiJvayJ9.AA")
+            .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsImFsZyI6IkhTMjU2In0.eyJzdWIiOiJvayJ9.AA")
+            .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsImFsZyI6IkhTNTEyIn0.eyJzdWIiOiJvayJ9.AA")
             .first);
     CHECK_FALSE(decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsImNyaXQiOlsiZXhwIl19.e30.AA").first);
     CHECK_FALSE(decode(hs256_key.c_str(), "eyJjcml0IjpbImV4cCJdLCJhbGciOiJIUzI1NiJ9.e30.AA").first);
