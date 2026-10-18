@@ -413,7 +413,10 @@ needed. gRPC-Web, JSON transcoding, upstream TLS/mTLS and gRPC health probes are
 not implemented by this option; `health_check` with `.http2` is rejected.
 
 Upstream connections are shared per shard/config/upstream/backend and multiplex
-RPCs from different downstream clients. Each session is bounded to 64 active
+RPCs from different downstream clients. Incomplete HTTP/2 input promotes the
+connection's receive slice to 256 KiB when less than 16 KiB of tail space remains;
+allocation failure closes that connection. This receive budget is separate
+from per-message limits. Each session is bounded to 64 active
 streams, header blocks to 16 KiB, and each direction of an RPC to a 65,535-byte
 pending DATA queue. Message/body length is not capped by that queue: flow control
 returns credit as bytes drain. Client cancellation resets only the mapped RPC.

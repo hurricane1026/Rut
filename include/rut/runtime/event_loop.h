@@ -16,6 +16,7 @@
 #include "rut/runtime/mapped_array.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
+#include "rut/runtime/receive_headroom.h"
 #include "rut/runtime/route_table.h"  // RouteConfig::kMaxTimers / timers[] for fire_due_timers
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
@@ -219,6 +220,16 @@ public:
             return;
         }
         if (ev.result > 0) {
+            if constexpr (requires { self().pool.alloc_bulk(); }) {
+                // H2 input can arrive while a downstream send owns the slots.
+                // Reserve the next complete receive without running its parser
+                // or changing the pending send callback/progress.
+                if (conn.protocol == ConnProtocol::Http2 &&
+                    !reserve_request_receive_headroom(self().pool, conn, SlicePool::kSliceSize)) {
+                    self().close_conn(conn);
+                    return;
+                }
+            }
             // A streamed request body is still being forwarded: these bytes (already
             // appended to recv_buf by the backend) are its next chunk, which
             // on_upstream_request_sent / on_request_body_sent pick up. Keep them.

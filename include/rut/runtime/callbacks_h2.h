@@ -20,6 +20,7 @@
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/rate_limit_enforce.h"
+#include "rut/runtime/receive_headroom.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
@@ -2167,11 +2168,12 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.reset_request_receive_buffer();
     if (kRemaining > 0) conn.recv_buf.commit(kRemaining);
 
-    // A partial frame can consume the ordinary request slice. Promote only
-    // after process has released its view of the input and the bytes have been
-    // compacted; rebinding while the engine is still processing is unsafe.
+    // Reserve room for a complete receive after retaining a partial frame.
+    // Nonzero tail space can still be smaller than the next provided-buffer
+    // completion. Promote after process releases its input view and compaction;
+    // an empty ordinary slice keeps its existing allocation.
     if constexpr (requires { loop->pool.alloc_bulk(); }) {
-        if (!r.close && conn.recv_buf.write_avail() == 0 && !grpc_grow_recv(loop, conn)) {
+        if (!r.close && !reserve_request_receive_headroom(loop->pool, conn, kDefaultMaxFrameSize)) {
             loop->close_conn(conn);
             return;
         }
