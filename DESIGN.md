@@ -1539,7 +1539,9 @@ response send is pending. Its private stream index never emits HTTP/2 frames
 downstream or grants HTTP/2 flow-control credit. Content-Length uploads and a
 single final `Transfer-Encoding: chunked` coding are supported; responses are
 connection-delimited and close after the last body bytes, without downstream
-keep-alive or pipelining.
+keep-alive or pipelining. The HTTP/1.1 gRPC-Web bridge rejects forwarding
+routes configured with downstream `throttle` until response pacing is integrated
+with the bridge.
 
 A separate tracker follows native message bytes staged in downstream-owned
 output. Text output commits native bytes only after their entire encoded
