@@ -24,6 +24,7 @@
 // heap-allocating frontend APIs.
 
 #include "rut/common/access_log_sink.h"
+#include "rut/common/ebpf_plan.h"
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/jit/jit_engine.h"
@@ -79,6 +80,8 @@ struct LoadedProgram {
     ListenerSpec listener{};
     // Owned but intentionally inert until the startup sink and reliable publisher increments.
     AccessLogSinkSpec access_log{};
+    bool has_ebpf_plan = false;
+    ebpf::Plan ebpf_plan{};
     RouteConfig config;  // what the shards read (1.28 MB — heap/BSS only)
 
     void destroy();

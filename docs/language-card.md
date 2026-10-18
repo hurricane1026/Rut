@@ -894,3 +894,13 @@ starting at zero after the index. The final block may be partial. Bodies are
 owned by the compiled program; generation performs no per-request allocation.
 Use existing `wait` for application delay. Timed response fragments are not
 provided by this builder.
+
+## Experimental compiler eBPF diagnostics
+
+Linux builds with `-DRUT_ENABLE_EBPF=ON` (and `RUT_ENABLE_JIT=ON`) support
+`rut app.rut --ebpf-plan` and `rut app.rut --emit-ebpf PREFIX`.
+These analyze verified, inlined RIR and optionally export raw body-transfer
+bytecode; they add no language syntax. Fixed terminal forwards can be body
+candidates while routing and headers stay in userspace. A candidate does not
+activate kernel forwarding: live socket handoff remains ⏳. `firewall {}`/XDP and
+kTLS integration also remain unimplemented. See [ebpf.md](ebpf.md).

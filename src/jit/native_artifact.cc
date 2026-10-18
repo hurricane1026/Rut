@@ -68,7 +68,8 @@ bool write_native_program(LoadedProgram& p, const char* output) {
         if (c.routes[i].fn) symbol_count++;
         if (c.routes[i].ws_frame_handler) symbol_count++;
     }
-    u64 size = sizeof(native::Header) + sizeof(RouteEntry) * c.route_count +
+    const u32 kEbpfBytes = p.has_ebpf_plan ? sizeof(ebpf::Plan) : 0;
+    u64 size = kEbpfBytes + sizeof(native::Header) + sizeof(RouteEntry) * c.route_count +
                ((native::metadata_size(c) + 7u) & ~7u) + sizeof(native::Relocation) * view_count +
                sizeof(native::Symbol) * symbol_count + sizeof(native::Regex) * regex_count +
                string_bytes + regex_bytes;
@@ -86,6 +87,7 @@ bool write_native_program(LoadedProgram& p, const char* output) {
           view_count,
           symbol_count,
           regex_count,
+          kEbpfBytes,
           c.dispatch_kind(),
           p.has_listener,
           p.listener,
@@ -103,6 +105,10 @@ bool write_native_program(LoadedProgram& p, const char* output) {
     pos += sizeof(*symbols) * symbol_count;
     auto* regexes = reinterpret_cast<native::Regex*>(bytes + pos);
     pos += sizeof(*regexes) * regex_count;
+    if (kEbpfBytes) {
+        memcpy(bytes + pos, &p.ebpf_plan, kEbpfBytes);
+        pos += kEbpfBytes;
+    }
     auto field = [&](const void* ptr) {
         return static_cast<u32>(reinterpret_cast<uintptr_t>(ptr) - begin);
     };
