@@ -43,8 +43,10 @@ def summarize(root):
         client_hashes.setdefault(key, []).append(wrk_hash(environment))
         try:
             raw_identity = environment['uname']
+            if not isinstance(raw_identity, list):
+                raise ValueError
             identity = tuple(raw_identity)
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, ValueError):
             raise ValueError(f'client environment is missing uname identity: {p}')
         if len(identity) != 5 or any(not isinstance(value, str) or not value for value in identity):
             raise ValueError(f'client environment has malformed uname identity: {p}')

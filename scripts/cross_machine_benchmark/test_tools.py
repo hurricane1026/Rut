@@ -236,6 +236,24 @@ class Tests(unittest.TestCase):
             machine_env.write_text(json.dumps(machine_data))
             with self.assertRaises(ValueError):
                 summarize.summarize(machine_changed)
+            malformed = root / 'malformed-uname'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, malformed / name)
+            malformed_env = malformed / 'rut1' / 'environment.json'
+            malformed_data = json.loads(malformed_env.read_text())
+            malformed_data['uname'] = 'Linux'
+            malformed_env.write_text(json.dumps(malformed_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(malformed)
+            missing_uname = root / 'missing-uname'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, missing_uname / name)
+            missing_env = missing_uname / 'rut1' / 'environment.json'
+            missing_data = json.loads(missing_env.read_text())
+            del missing_data['uname']
+            missing_env.write_text(json.dumps(missing_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(missing_uname)
             origin_changed = root / 'origin-changed'
             for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
                 shutil.copytree(root / name, origin_changed / name)
