@@ -205,6 +205,15 @@ struct Compiler {
         bytes[kSize] = 0;
         return {bytes, static_cast<u32>(kSize)};
     }
+    Str join_scratch(char* bytes, u32 capacity, Str left, char separator, Str right) const {
+        const u64 kSize = static_cast<u64>(left.len) + right.len + 1;
+        if (kSize > capacity - 1) return {};
+        if (left.len) __builtin_memcpy(bytes, left.ptr, left.len);
+        bytes[left.len] = separator;
+        if (right.len) __builtin_memcpy(bytes + left.len + 1, right.ptr, right.len);
+        bytes[kSize] = 0;
+        return {bytes, static_cast<u32>(kSize)};
+    }
     bool imported_path(Str path) const {
         if (!path.len || path.ptr[0] == '/' || path.len > 1024) return false;
         u32 begin = 0;
@@ -276,9 +285,14 @@ struct Compiler {
         for (Reference* item = references; item; item = item->next) {
             Str scope = item->scope;
             Str found{};
+            char candidate_bytes[4096];
+            char first_bytes[4096];
             while (true) {
                 const Str kCandidate =
-                    item->name.ptr[0] == '.' ? item->name : join(scope, '.', item->name);
+                    item->name.ptr[0] == '.'
+                        ? item->name
+                        : join_scratch(
+                              candidate_bytes, sizeof(candidate_bytes), scope, '.', item->name);
                 if (!kCandidate.ptr)
                     return fail(SourceError::Kind::Allocation,
                                 item->file->name,
@@ -294,7 +308,8 @@ struct Compiler {
                 bool shadowed = false;
                 u32 first = 0;
                 while (first < item->name.len && item->name.ptr[first] != '.') ++first;
-                const Str kFirst = join(scope, '.', {item->name.ptr, first});
+                const Str kFirst = join_scratch(
+                    first_bytes, sizeof(first_bytes), scope, '.', {item->name.ptr, first});
                 if (!kFirst.ptr)
                     return fail(SourceError::Kind::Allocation,
                                 item->file->name,

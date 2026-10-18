@@ -297,6 +297,28 @@ TEST(protobuf_source, transitive_symbols_do_not_shadow_visible_outer_type) {
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().kind == SourceError::Kind::Schema);
 }
+TEST(protobuf_source, deep_relative_references_do_not_materialize_probe_names) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; message A {}"));
+    char source[20000];
+    u32 offset = 0;
+    const char* prefix = "syntax='proto3'; import 'types.proto';";
+    memcpy(source + offset, prefix, strlen(prefix));
+    offset += static_cast<u32>(strlen(prefix));
+    for (u32 depth = 0; depth < 20; ++depth) {
+        source[offset++] = ' ';
+        memcpy(source + offset, "message M { A field=1;", 22);
+        offset += 22;
+    }
+    for (u32 depth = 0; depth < 20; ++depth) source[offset++] = '}';
+    source[offset] = 0;
+    REQUIRE(files.write_file("root.proto", source));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE(result.has_value());
+    CHECK(storage.arena.space_allocated() < 1024 * 1024);
+}
 TEST(protobuf_source, qualified_name_limit_is_reported_before_join_allocation) {
     Files files;
     REQUIRE(files.ok);
