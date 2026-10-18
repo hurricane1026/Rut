@@ -856,13 +856,13 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
                 x->failure = 13;
                 break;
         }
-        x->response_end = true;
         if (x->web_mode == GrpcWebContentType::Binary || x->web_mode == GrpcWebContentType::Text) {
-            x->web_response_invalid = !grpc_web_response_boundary(*x);
-            const u32 dropped =
-                x->web_response_invalid ? x->download_len : grpc_web_drop_unstaged_response(*x);
-            h.consume_data(x->upstream_stream, dropped);
+            const u32 outstanding = x->download_len;
+            (void)grpc_web_prepare_failure(*x);
+            x->response_end = true;
+            h.consume_data(x->upstream_stream, outstanding);
         } else {
+            x->response_end = true;
             h.consume_data(x->upstream_stream, x->download_len);
         }
         auto* d = static_cast<GrpcClientDispatch<Loop>*>(ctx);
