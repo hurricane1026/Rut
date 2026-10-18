@@ -567,6 +567,8 @@ void grpc_response_trailers(
         return;
     }
     if (!grpc_has_status(hs, n)) x->failure = 2;
+    if (const u8 framing_status = x->response_message.feed(nullptr, 0, true))
+        x->failure = framing_status;
     if (x->has_response_length && x->expected_response_bytes != x->response_bytes) x->failure = 13;
     x->response_status = grpc_observed_status(hs, n);
     x->response_end = true;
@@ -580,6 +582,14 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     auto* x = grpc_find(h, sid);
     if (!x) {
         h.consume_data(sid, len);
+        return;
+    }
+    const u8 framing_status = x->response_message.feed(data, len, end);
+    if (framing_status) {
+        x->failure = framing_status;
+        x->response_end = true;
+        h.consume_data(sid, len);
+        grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
     if (len > sizeof(x->download) - x->download_len) {
@@ -967,6 +977,8 @@ bool grpc_start_impl(Loop* loop,
     if (!x) return false;
     static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize);
     x->init();
+    x->request_message.init(target.max_request_message_bytes);
+    x->response_message.init(target.max_response_message_bytes);
     if (!grpc_snapshot_response_mutations(down, *x)) {
         loop->pool.free(reinterpret_cast<u8*>(x));
         return false;
@@ -1207,6 +1219,13 @@ void grpc_request_data(
     x.request_bytes += len;
     if (x.failure || !x.upstream) {
         down.h2->consume_data(x.downstream_stream, len);
+        return;
+    }
+    const u8 framing_status = x.request_message.feed(data, len, end);
+    if (framing_status) {
+        down.h2->consume_data(x.downstream_stream, len);
+        x.failure = framing_status;
+        grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
     }
     if (len > sizeof(x.upload) - x.upload_len ||

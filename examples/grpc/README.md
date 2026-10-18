@@ -131,3 +131,12 @@ the same eight-byte payload completes a probe. The existing upstream timeout
 timeout closes the session and fails unfinished RPCs with UNAVAILABLE without
 replay. Idle pooled sessions, handshakes and GOAWAY-draining sessions do not
 start probes. PING does not implement the protobuf gRPC Health service.
+
+To bound individual messages without loading a proto, set
+`max_request_message_bytes: 1048576` and/or
+`max_response_message_bytes: 4194304` on the `.http2` upstream. Values must be
+positive 32-bit integers; omitted directions retain opaque forwarding. Limits
+count payload wire bytes per message (compressed bytes when compressed), not
+whole-stream totals or decompressed size. Oversize fails the RPC with status 8;
+malformed or truncated gRPC envelopes fail with status 13. No protobuf fields
+are decoded and no replay occurs.

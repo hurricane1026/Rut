@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/grpc_message.h"
 #include "rut/runtime/tls.h"
 
 namespace rut {
@@ -32,6 +33,8 @@ struct GrpcExchange {
     bool observed;
     u64 deadline_us;
     u64 request_bytes;
+    GrpcMessageLimit request_message;
+    GrpcMessageLimit response_message;
     u32 expected_request_bytes;
     bool has_request_length;
     bool request_end;
@@ -72,6 +75,8 @@ struct GrpcExchange {
         response_status = 2;
         observed = false;
         deadline_us = request_bytes = 0;
+        request_message.init();
+        response_message.init();
         expected_request_bytes = 0;
         has_request_length = request_end = request_headers_sent = request_end_sent = false;
         response_end = response_headers_sent = response_end_sent = false;
