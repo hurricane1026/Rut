@@ -1,0 +1,2 @@
+READY mode=ebpf batch=65536 capacity=512 tcp_nodelay=1
+COUNTERS {"accepts":72,"reads":35417,"writes":17670,"read_bytes":800738,"written_bytes":800738,"waits":22533,"events":35938,"setup_failures":0,"io_failures":60,"kernel_bytes":18531288810,"retirement_failures":0,"admission_peer_closes":1}

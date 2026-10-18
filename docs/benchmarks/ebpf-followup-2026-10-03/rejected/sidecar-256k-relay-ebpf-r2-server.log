@@ -1,0 +1,3 @@
+READY mode=ebpf batch=65536 capacity=512 tcp_nodelay=1
+enrollment failed: errno=95 slot=0
+COUNTERS {"accepts":72,"reads":131642,"writes":65781,"read_bytes":2965733,"written_bytes":2965733,"waits":66336,"events":69067,"setup_failures":1,"io_failures":24,"kernel_bytes":17255014110,"retirement_failures":0}

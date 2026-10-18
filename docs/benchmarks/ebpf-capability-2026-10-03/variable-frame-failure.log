@@ -1,0 +1,120 @@
+host 1 off 0 copy
+host 1 auto 0 copy
+host 1 required 1 unavailable
+host 1 required --header-rewrite 1 unavailable
+host 1 required --header-rewrite --bounded-body 1 unavailable
+host 1 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+host 1 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+host 1 auto --fail-after-insert --header-rewrite 0 copy
+host 1 required --fail-after-insert 1 unavailable
+host 2 off 0 copy
+host 2 auto 0 copy
+host 2 required 1 unavailable
+host 2 required --header-rewrite 1 unavailable
+host 2 required --header-rewrite --bounded-body 1 unavailable
+host 2 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+host 2 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+host 2 auto --fail-after-insert --header-rewrite 0 copy
+host 2 required --fail-after-insert 1 unavailable
+host 3 off 0 copy
+host 3 auto 0 copy
+host 3 required 1 unavailable
+host 3 required --header-rewrite 1 unavailable
+host 3 required --header-rewrite --bounded-body 1 unavailable
+host 3 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+host 3 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+host 3 auto --fail-after-insert --header-rewrite 0 copy
+host 3 required --fail-after-insert 1 unavailable
+sidecar-default 1 off 0 copy
+sidecar-default 1 auto 0 copy
+sidecar-default 1 required 1 unavailable
+sidecar-default 1 required --header-rewrite 1 unavailable
+sidecar-default 1 required --header-rewrite --bounded-body 1 unavailable
+sidecar-default 1 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+sidecar-default 1 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+sidecar-default 1 auto --fail-after-insert --header-rewrite 0 copy
+sidecar-default 1 required --fail-after-insert 1 unavailable
+sidecar-default 2 off 0 copy
+sidecar-default 2 auto 0 copy
+sidecar-default 2 required 1 unavailable
+sidecar-default 2 required --header-rewrite 1 unavailable
+sidecar-default 2 required --header-rewrite --bounded-body 1 unavailable
+sidecar-default 2 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+sidecar-default 2 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+sidecar-default 2 auto --fail-after-insert --header-rewrite 0 copy
+sidecar-default 2 required --fail-after-insert 1 unavailable
+sidecar-default 3 off 0 copy
+sidecar-default 3 auto 0 copy
+sidecar-default 3 required 1 unavailable
+sidecar-default 3 required --header-rewrite 1 unavailable
+sidecar-default 3 required --header-rewrite --bounded-body 1 unavailable
+sidecar-default 3 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+sidecar-default 3 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+sidecar-default 3 auto --fail-after-insert --header-rewrite 0 copy
+sidecar-default 3 required --fail-after-insert 1 unavailable
+bpf-default-seccomp 1 off 0 copy
+bpf-default-seccomp 1 auto 0 copy
+bpf-default-seccomp 1 required 1 unavailable
+bpf-default-seccomp 1 required --header-rewrite 1 unavailable
+bpf-default-seccomp 1 required --header-rewrite --bounded-body 1 unavailable
+bpf-default-seccomp 1 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+bpf-default-seccomp 1 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-seccomp 1 auto --fail-after-insert --header-rewrite 0 copy
+bpf-default-seccomp 1 required --fail-after-insert 1 unavailable
+bpf-default-seccomp 2 off 0 copy
+bpf-default-seccomp 2 auto 0 copy
+bpf-default-seccomp 2 required 1 unavailable
+bpf-default-seccomp 2 required --header-rewrite 1 unavailable
+bpf-default-seccomp 2 required --header-rewrite --bounded-body 1 unavailable
+bpf-default-seccomp 2 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+bpf-default-seccomp 2 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-seccomp 2 auto --fail-after-insert --header-rewrite 0 copy
+bpf-default-seccomp 2 required --fail-after-insert 1 unavailable
+bpf-default-seccomp 3 off 0 copy
+bpf-default-seccomp 3 auto 0 copy
+bpf-default-seccomp 3 required 1 unavailable
+bpf-default-seccomp 3 required --header-rewrite 1 unavailable
+bpf-default-seccomp 3 required --header-rewrite --bounded-body 1 unavailable
+bpf-default-seccomp 3 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+bpf-default-seccomp 3 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-seccomp 3 auto --fail-after-insert --header-rewrite 0 copy
+bpf-default-seccomp 3 required --fail-after-insert 1 unavailable
+bpf-default-label 1 off 0 copy
+bpf-default-label 1 auto 0 copy
+bpf-default-label 1 required 1 unavailable
+bpf-default-label 1 required --header-rewrite 1 unavailable
+bpf-default-label 1 required --header-rewrite --bounded-body 1 unavailable
+bpf-default-label 1 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+bpf-default-label 1 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-label 1 auto --fail-after-insert --header-rewrite 0 copy
+bpf-default-label 1 required --fail-after-insert 1 unavailable
+bpf-default-label 2 off 0 copy
+bpf-default-label 2 auto 0 copy
+bpf-default-label 2 required 1 unavailable
+bpf-default-label 2 required --header-rewrite 1 unavailable
+bpf-default-label 2 required --header-rewrite --bounded-body 1 unavailable
+bpf-default-label 2 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+bpf-default-label 2 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-label 2 auto --fail-after-insert --header-rewrite 0 copy
+bpf-default-label 2 required --fail-after-insert 1 unavailable
+bpf-default-label 3 off 0 copy
+bpf-default-label 3 auto 0 copy
+bpf-default-label 3 required 1 unavailable
+bpf-default-label 3 required --header-rewrite 1 unavailable
+bpf-default-label 3 required --header-rewrite --bounded-body 1 unavailable
+bpf-default-label 3 required --header-rewrite --bounded-body --prequeued-body 1 unavailable
+bpf-default-label 3 auto --header-rewrite --bounded-body --prequeued-body 0 copy
+bpf-default-label 3 auto --fail-after-insert --header-rewrite 0 copy
+bpf-default-label 3 required --fail-after-insert 1 unavailable
+bpf-relaxed-label 1 off 0 copy
+bpf-relaxed-label 1 auto 0 sockmap
+bpf-relaxed-label 1 required 0 sockmap
+bpf-relaxed-label 1 required --header-rewrite 0 sockmap
+Traceback (most recent call last):
+  File "/home/hurricane/private/code/Rut/scripts/ebpf_capability_probe.py", line 100, in <module>
+    main()
+    ~~~~^^
+  File "/home/hurricane/private/code/Rut/scripts/ebpf_capability_probe.py", line 91, in main
+    assert observation["returncode"] == 1 and records[-1]["backend"] == "unavailable", observation
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'profile': 'bpf-relaxed-label', 'repeat': 1, 'case': ['required', '--header-rewrite', '--bounded-body'], 'command': ['docker', 'run', '--rm', '--pull=never', '--cap-drop', 'ALL', '--cap-add', 'BPF', '--cap-add', 'NET_ADMIN', '--security-opt', 'seccomp=unconfined', '--security-opt', 'label=disable', '--mount', 'type=bind,src=/home/hurricane/private/code/rut-ebpf-20261003,dst=/probe,readonly', '--entrypoint', '/probe/loader', 'nginx:latest', '--library-path', '/probe', '/probe/probe', 'required', '--header-rewrite', '--bounded-body', '--bytecode', '/probe/tunnel'], 'returncode': 1, 'stdout': '{"mode":"required","backend":"sockmap","transfer_ok":false,"verified_bytes":0,"relay_userspace_bytes":0,"header_userspace_bytes":54,"tls_only_errno":0,"map_then_tls_errno":0,"tls_then_map_errno":22,"successor_userspace_bytes":17,"half_close_ok":false}\n', 'stderr': 'payload receive stopped at 1044480/1048576: Resource temporarily unavailable\n', 'records': [{'mode': 'required', 'backend': 'sockmap', 'transfer_ok': False, 'verified_bytes': 0, 'relay_userspace_bytes': 0, 'header_userspace_bytes': 54, 'tls_only_errno': 0, 'map_then_tls_errno': 0, 'tls_then_map_errno': 22, 'successor_userspace_bytes': 17, 'half_close_ok': False}]}

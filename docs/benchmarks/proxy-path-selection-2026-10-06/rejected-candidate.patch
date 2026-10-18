@@ -1,0 +1,198 @@
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index 14b9c6ea..91746c89 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -1702,12 +1702,12 @@ public:
+             c.upstream_recv_terminal_stale || c.upstream_fd < 0 ||
+             !valid_upstream_episode(c.upstream_episode))
+             return false;
+-        const u32 bulk_after =
+-            !c.tls_active &&
+-                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+-                    declared > SlicePool::kBulkSliceSize
+-                ? 0
+-                : c.buffered_response_bulk_after();
++        // A validated large Content-Length also justifies a bulk destination
++        // while buffering the complete response. Keep TLS on its measured
++        // slice threshold and let reserve_tail fall back under pool pressure.
++        const u32 bulk_after = !c.tls_active && declared > SlicePool::kBulkSliceSize
++                                   ? 0
++                                   : c.buffered_response_bulk_after();
+         if (!c.response_body_tail.reserve_tail(pool, bulk_after)) return false;
+         const u32 avail = c.response_body_tail.write_avail(pool);
+         const u32 body_room = ResponseBodyChain::kMaxBody - received + 1u;
+@@ -3807,12 +3807,20 @@ public:
+         if (!arm_response_splice_read(c)) close_conn(c);
+     }
+ 
+-    void flush_deferred_relay_reads() {
++    void flush_deferred_relay_reads(bool try_progress = true) {
+         const u32 count = deferred_relay_read_count;
++        // Progress may park another read or close an owner. Snapshot the tiny
++        // ledger so those mutations cannot overwrite unvisited entries.
++        u32 ids[kDeferredRelayReadLimit];
++        u32 episodes[kDeferredRelayReadLimit];
++        for (u32 i = 0; i < count; ++i) {
++            ids[i] = deferred_relay_read_ids[i];
++            episodes[i] = deferred_relay_read_episodes[i];
++        }
+         deferred_relay_read_count = 0;
+         for (u32 i = 0; i < count; i++) {
+-            const u32 id = deferred_relay_read_ids[i];
+-            const u32 episode = deferred_relay_read_episodes[i];
++            const u32 id = ids[i];
++            const u32 episode = episodes[i];
+             if (id >= slots_initialized) continue;
+             Connection& c = conns[id];
+             RelayOwner& r = c.relay_owner;
+@@ -3838,8 +3846,19 @@ public:
+                 close_conn(c);
+                 continue;
+             }
+-            if (!arm_response_splice_read(c)) close_conn(c);
++            if (try_progress && relay_budget_calls != 0 && relay_budget_bytes != 0) {
++                // Other CQEs have settled. Try the already runnable socket
++                // before paying for a readiness SQE/CQE; EAGAIN still polls.
++                r.read_armed = true;
++                const IoEvent ready{c.id, POLLIN, 0, 0, IoEventType::RelayRead, 0, 0, episode};
++                on_response_splice_event(c, ready);
++            } else if (!arm_response_splice_read(c)) {
++                close_conn(c);
++            }
+         }
++        // Every parked continuation needs a kernel wakeup before wait().
++        // Only one synchronous pass is allowed, preserving turn fairness.
++        if (try_progress && deferred_relay_read_count != 0) flush_deferred_relay_reads(false);
+     }
+ 
+     void clear_deferred_relay_read(u32 id) {
+diff --git a/tests/test_network.cc b/tests/test_network.cc
+index aa6c0042..a72f4a1b 100644
+--- a/tests/test_network.cc
++++ b/tests/test_network.cc
+@@ -38858,6 +38858,76 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
+     if (conn->fd >= 0 || conn->upstream_fd >= 0) loop->close_conn(*conn);
+ }
+ 
++TEST(iouring_relay, batch_tail_progresses_ready_body_without_extra_poll) {
++    ScopedIoUringLoopForRetirement guard;
++    if (!guard.init()) SKIP("io_uring unavailable");
++    auto* loop = guard.loop;
++    i32 upstream[2] = {-1, -1};
++    i32 downstream[2] = {-1, -1};
++    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
++    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
++    int buffer_size = 256 * 1024;
++    REQUIRE_EQ(setsockopt(upstream[1], SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)),
++               0);
++    REQUIRE_EQ(setsockopt(downstream[0], SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)),
++               0);
++    static u8 expected[128 * 1024];
++    static u8 received_body[128 * 1024];
++    for (u32 i = 0; i < sizeof(expected); ++i) expected[i] = static_cast<u8>(i * 13u);
++    u32 sent = 0;
++    while (sent != sizeof(expected)) {
++        const ssize_t n =
++            ::send(upstream[1], expected + sent, sizeof(expected) - sent, MSG_NOSIGNAL);
++        REQUIRE_GT(n, 0);
++        sent += static_cast<u32>(n);
++    }
++    Connection* conn = loop->alloc_conn();
++    REQUIRE(conn != nullptr);
++    conn->fd = downstream[0];
++    downstream[0] = -1;
++    conn->upstream_fd = upstream[0];
++    upstream[0] = -1;
++    REQUIRE_EQ(fcntl(conn->upstream_fd, F_SETFL, fcntl(conn->upstream_fd, F_GETFL) | O_NONBLOCK),
++               0);
++    REQUIRE_EQ(fcntl(conn->fd, F_SETFL, fcntl(conn->fd, F_GETFL) | O_NONBLOCK), 0);
++    CHECK_NE(fcntl(conn->upstream_fd, F_GETFL) & O_NONBLOCK, 0);
++    CHECK_NE(fcntl(conn->fd, F_GETFL) & O_NONBLOCK, 0);
++    conn->protocol = ConnProtocol::Http11;
++    conn->state = ConnState::Proxying;
++    conn->req_method = static_cast<u8>(LogHttpMethod::Get);
++    conn->req_body_mode = BodyMode::None;
++    conn->request_upload_complete = true;
++    conn->resp_body_mode = BodyMode::ContentLength;
++    conn->response_read_deadline_buffering = ForwardResponseBufferingMode::None;
++    conn->resp_body_remaining = sizeof(expected);
++    conn->resp_status = 200;
++    conn->req_start_us = 1;
++    conn->keep_alive = false;
++    conn->upstream_keep_alive = false;
++    Connection* other = loop->alloc_conn();
++    REQUIRE(other != nullptr);
++    REQUIRE(loop->test_start_response_splice(*conn));
++    REQUIRE_GT(loop->deferred_relay_read_count, 0u);
++    const u64 before = loop->relay_written_bytes;
++    REQUIRE_LT(before, sizeof(expected));
++    loop->flush_deferred_relay_reads();
++    CHECK_GT(loop->relay_written_bytes, before);
++    CHECK_EQ(loop->deferred_relay_read_count, 0u);
++    // The remaining response is either complete or owns a wakeup.
++    CHECK(conn->resp_body_remaining == 0 || conn->relay_owner.read_armed ||
++          conn->relay_owner.write_armed);
++    loop->close_conn(*other);
++
++    REQUIRE(pump_relay_downstream(loop, downstream[1], received_body, sizeof(expected)));
++    CHECK_EQ(memcmp(expected, received_body, sizeof(expected)), 0);
++    CHECK_EQ(loop->relay_admissions, 1u);
++    CHECK_EQ(loop->relay_pulled_bytes, sizeof(expected));
++    CHECK_EQ(loop->relay_written_bytes, sizeof(expected));
++    close(upstream[1]);
++    close(downstream[1]);
++    if (conn->fd >= 0 || conn->upstream_fd >= 0) loop->close_conn(*conn);
++}
++
+ TEST(iouring_relay, close_without_relay_cqe_releases_pipe_and_owner) {
+     ScopedIoUringLoopForRetirement guard;
+     if (!guard.init()) SKIP("io_uring unavailable");
+@@ -64731,6 +64801,48 @@ TEST(response_buffering_runtime, bounded_fragmented_prefix_arms_pinned_direct_bo
+     cleanup_prebuilt_d2(loop, fixture);
+ }
+ 
++TEST(response_buffering_runtime, complete_large_prefix_arms_bulk_direct_body_read) {
++    ScopedIoUringLoopForRetirement guard;
++    if (!guard.init()) SKIP("io_uring unavailable");
++    auto* loop = guard.loop;
++    RouteConfig config{};
++    PrebuiltD2Fixture fixture{};
++    REQUIRE(stage_live_precise_get(loop,
++                                   config,
++                                   &fixture,
++                                   false,
++                                   false,
++                                   RequestPolicyId::Http11FixedStrip,
++                                   nullptr,
++                                   nullptr,
++                                   false,
++                                   false,
++                                   ForwardResponseBufferingMode::CompleteContentLength));
++    Connection& conn = *fixture.conn;
++    static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n";
++    REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
++    const IoEvent headers =
++        response_read_copy_event(conn, sizeof(kHeader) - 1u, false, 0, sizeof(kHeader) - 1u);
++    loop->dispatch_batch(&headers, 1);
++    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
++               ResponseReadDeadlinePostCommitPhase::Buffering);
++    u8 body[128]{};
++    const u32 begin = conn.buffered_response_len();
++    REQUIRE_EQ(conn.upstream_recv_buf.write(body, sizeof(body)), sizeof(body));
++    const IoEvent data =
++        response_read_copy_event(conn, sizeof(body), false, begin, conn.buffered_response_len());
++    loop->dispatch_batch(&data, 1);
++    REQUIRE_GE(conn.fd, 0);
++    CHECK(conn.upstream_recv_armed);
++    CHECK(conn.upstream_recv_direct_armed);
++    CHECK(conn.chain_direct_recv_owner.active);
++    CHECK_EQ(conn.chain_direct_recv_owner.node, conn.response_body_tail.tail);
++    CHECK(conn.chain_direct_recv_owner.len > SlicePool::kSliceSize);
++    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
++             ResponseReadDeadlinePostCommitPhase::Buffering);
++    cleanup_prebuilt_d2(loop, fixture);
++}
++
+ TEST(response_buffering_runtime, bounded_chain_send_retains_precise_read_timer_owner) {
+     ScopedIoUringLoopForRetirement guard;
+     if (!guard.init()) SKIP("io_uring unavailable");

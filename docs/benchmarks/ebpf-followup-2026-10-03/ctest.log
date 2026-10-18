@@ -1,0 +1,25 @@
+Test project /home/hurricane/private/code/Rut/build
+    Start  32: test_ebpf_handoff
+1/7 Test  #32: test_ebpf_handoff ................   Passed    0.09 sec
+    Start  33: test_kernel_relay
+2/7 Test  #33: test_kernel_relay ................   Passed    0.41 sec
+    Start 260: test_ebpf_compiler
+3/7 Test #260: test_ebpf_compiler ...............   Passed    0.92 sec
+    Start 261: test_native_program
+4/7 Test #261: test_native_program ..............   Passed    1.05 sec
+    Start 262: test_native_protocol
+5/7 Test #262: test_native_protocol .............   Passed    0.38 sec
+    Start 263: test_serve_loader
+6/7 Test #263: test_serve_loader ................   Passed    5.35 sec
+    Start 267: test_harness
+7/7 Test #267: test_harness .....................   Passed    1.21 sec
+
+100% tests passed, 0 tests failed out of 7
+
+Label Time Summary:
+harness    =   1.21 sec*proc (1 test)
+jit        =   7.70 sec*proc (4 tests)
+network    =   0.49 sec*proc (2 tests)
+unit       =   9.40 sec*proc (7 tests)
+
+Total Test time (real) =   9.41 sec
