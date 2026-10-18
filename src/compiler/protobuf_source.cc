@@ -691,6 +691,10 @@ bool Parser::file() {
             if (!string(path) || !expect(lit_str(";"))) return false;
             if (!compiler.imported_path(path))
                 return fail(SourceError::Kind::Syntax, lit_str("import path"));
+            if (compiler.root_directory.len &&
+                static_cast<u64>(compiler.root_directory.len) + 1 + path.len > 4095)
+                return compiler.fail(
+                    SourceError::Kind::Limit, source.name, token.line, token.column, {});
             const Str kFullPath = compiler.root_directory.len
                                       ? compiler.join(compiler.root_directory, '/', path)
                                       : compiler.copy(path);

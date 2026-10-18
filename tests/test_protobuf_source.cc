@@ -46,6 +46,9 @@ struct Files {
         snprintf(path, sizeof(path), "%s/root.proto", directory);
         return load_proto_source(storage.arena, {path, static_cast<u32>(strlen(path))}, limits);
     }
+    auto load_path(Storage& storage, const char* path, u32 length) {
+        return load_proto_source(storage.arena, {path, length});
+    }
 };
 }  // namespace
 TEST(protobuf_source, native_parser_matches_protoc_schema) {
@@ -181,6 +184,27 @@ TEST(protobuf_source, source_budget_excludes_descriptor_overhead_until_finalizat
     storage.arena.reset();
     result = files.load(storage);
     REQUIRE(result.has_value());
+}
+TEST(protobuf_source, import_path_join_limit_is_reported_before_allocation) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; message T {}"));
+    REQUIRE(files.write_file("root.proto", "syntax='proto3'; import 'types.proto';"));
+    char path[4096];
+    u32 length = static_cast<u32>(strlen(files.directory));
+    memcpy(path, files.directory, length);
+    while (length + 12 < 4095) {
+        path[length++] = '/';
+        path[length++] = '.';
+    }
+    path[length++] = '/';
+    memcpy(path + length, "root.proto", 10);
+    length += 10;
+    path[length] = 0;
+    Storage storage;
+    auto result = files.load_path(storage, path, length);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Limit);
 }
 TEST(protobuf_source, uninitialized_arena_reports_allocation_failure) {
     Arena<MmapBackend> arena;
