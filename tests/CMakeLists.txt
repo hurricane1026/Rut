@@ -3686,7 +3686,8 @@ if(RUT_ENABLE_JIT)
     set_tests_properties(test_json_network PROPERTIES LABELS "unit" RUN_SERIAL TRUE)
 endif()
 
-add_executable(test_grpc_replay_body test_grpc_replay_body.cc)
+add_executable(test_grpc_replay_body
+    test_grpc_replay_body.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_include_directories(test_grpc_replay_body PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
 add_test(NAME test_grpc_replay_body COMMAND test_grpc_replay_body)
