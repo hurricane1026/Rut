@@ -4,6 +4,7 @@
 #include "rut/runtime/arena.h"
 #include "test.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,6 +187,9 @@ TEST(protobuf_source, source_budget_excludes_descriptor_overhead_until_finalizat
     REQUIRE(result.has_value());
 }
 TEST(protobuf_source, import_path_join_limit_is_reported_before_allocation) {
+#if PATH_MAX < 4096
+    SKIP("PATH_MAX is too small for the long path fixture");
+#endif
     Files files;
     REQUIRE(files.ok);
     REQUIRE(files.write_file("types.proto", "syntax='proto3'; message T {}"));
