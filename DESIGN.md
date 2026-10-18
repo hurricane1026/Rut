@@ -39,6 +39,7 @@ This is intentionally coarse-grained. It exists to separate "designed" from
 | RIR data model + builder + printer | **Implemented** | RIR is real and exercised by tests |
 | LLVM ORC JIT integration | **Implemented** | Userspace handler JIT engine and codegen paths exist |
 | `firewall {}` → eBPF / XDP compilation target | **Designed** | Packet-level kernel path is a first-class compilation target in this design |
+| RIR → eBPF body-transfer plans / bytecode export | **Experimental, implemented** | Opt-in `RUT_ENABLE_EBPF`; diagnostic/export only, no live socket offload; see [docs/ebpf.md](docs/ebpf.md) |
 | Offline manifest → RIR → JIT simulate flow | **Implemented** | Current compile-like path is intentionally narrow |
 | Full Rutlang lexer / parser / type checker | **Partial / in progress** | Token surface is declared, but the front-end is not yet complete |
 | Route conflict analysis and full diagnostics | **Designed** | Mentioned throughout this doc, not fully enforced end-to-end today |

@@ -3571,6 +3571,10 @@ if(RUT_ENABLE_JIT)
         target_link_options(test_native_program PRIVATE -Wl,-export_dynamic)
     endif()
     add_dependencies(test_native_program rut-compile)
+    add_test(NAME test_ebpf_compiler
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ebpf_compiler.py
+            --server $<TARGET_FILE:rut> --enabled $<BOOL:${RUT_ENABLE_EBPF}>)
+    set_tests_properties(test_ebpf_compiler PROPERTIES LABELS "unit;jit" TIMEOUT 90)
     add_test(NAME test_native_program COMMAND test_native_program)
     set_tests_properties(test_native_program PROPERTIES LABELS "unit;jit")
 

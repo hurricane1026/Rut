@@ -962,6 +962,8 @@ int main(int argc, char** argv) {
     enum class BackendSelection : u8 { Auto, Epoll, IoUring };
     BackendSelection backend_selection = BackendSelection::Auto;
     bool backend_specified = false;
+    bool ebpf_plan_requested = false;
+    const char* ebpf_output_prefix = nullptr;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [program.rut | --compile PATH]
@@ -1002,6 +1004,23 @@ int main(int argc, char** argv) {
             }
 #endif
             backend_specified = true;
+            continue;
+        }
+        if (str_eq(argv[i], "--ebpf-plan")) {
+            ebpf_plan_requested = true;
+            continue;
+        }
+        if (str_eq(argv[i], "--emit-ebpf")) {
+            if (i + 1 >= argc || !argv[i + 1][0] || starts_with_dash_dash(argv[i + 1])) {
+                write_str("--emit-ebpf requires an output prefix\n");
+                return 1;
+            }
+            if (ebpf_output_prefix) {
+                write_str("--emit-ebpf specified twice\n");
+                return 1;
+            }
+            ebpf_output_prefix = argv[++i];
+            ebpf_plan_requested = true;
             continue;
         }
         if (is_all_digits(argv[i])) {
@@ -1162,6 +1181,24 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (ebpf_plan_requested) {
+#if !RUT_ENABLE_EBPF
+        write_str("eBPF plans require Linux, RUT_ENABLE_JIT=ON and RUT_ENABLE_EBPF=ON\n");
+        return 1;
+#else
+        if (!config_path) {
+            write_str("eBPF plans require a .rut source program\n");
+            return 1;
+        }
+        if (tls_cert_path || tls_key_path || offer_h2) {
+            write_str(
+                "eBPF plan diagnostics use source listener metadata; TLS/h2 CLI options are "
+                "unsupported\n");
+            return 1;
+        }
+#endif
+    }
+
     // Environment variable override: RUE_ACCESS_LOG_COMPRESS=1
     // getenv without stdlib — scan environ directly.
     {
@@ -1228,8 +1265,12 @@ int main(int argc, char** argv) {
     NativeProgram& program = program_storage[0];
     if (config_path) {
         char msg[512];
-        if (!load_native_program(
-                config_path, program, msg, sizeof(msg), static_cast<u8>(opt_level))) {
+        if (!load_native_program(config_path,
+                                 program,
+                                 msg,
+                                 sizeof(msg),
+                                 static_cast<u8>(opt_level),
+                                 ebpf_plan_requested)) {
             write_str("Failed to load ");
             write_str(config_path);
             write_str(": ");
@@ -1238,6 +1279,20 @@ int main(int argc, char** argv) {
             program.destroy();
             destroy_tls_server_context(tls_server);
             return 1;
+        }
+        if (ebpf_plan_requested) {
+            bool ok;
+            if (ebpf_output_prefix) {
+                ok = export_ebpf_bytecode(program, ebpf_output_prefix, msg, sizeof(msg));
+                if (!ok) {
+                    write_str(msg);
+                    write_str("\n");
+                }
+            } else
+                ok = write_ebpf_plan_json(program, STDOUT_FILENO);
+            program.destroy();
+            destroy_tls_server_context(tls_server);
+            return ok ? 0 : 1;
         }
         route_config = &program.config;
         source_listener_present = program.has_listener;
