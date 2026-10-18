@@ -4,7 +4,8 @@
 
 namespace rut {
 struct CacheLocalState;
-}
+inline constexpr u32 kMaxConstantTimeEqualBytes = 16 * 1024;
+}  // namespace rut
 
 // Runtime helper functions callable from JIT'd code.
 // All use extern "C" linkage with rut_helper_ prefix to avoid
@@ -125,6 +126,13 @@ void rut_helper_parse_unprime();
 
 // Check if string s has prefix pfx. Returns 1 (true) or 0 (false).
 rut::u8 rut_helper_str_has_prefix(const char* s, rut::u32 s_len, const char* pfx, rut::u32 pfx_len);
+
+// Equal-length content comparison uses OpenSSL CRYPTO_memcmp. Lengths are public.
+// Empty spans compare equal; invalid or oversized spans fail closed without reads.
+rut::u8 rut_helper_str_constant_time_equal(const char* a,
+                                           rut::u32 a_len,
+                                           const char* b,
+                                           rut::u32 b_len);
 
 // Check if two strings are equal. Returns 1 (true) or 0 (false).
 rut::u8 rut_helper_str_eq(const char* a, rut::u32 a_len, const char* b, rut::u32 b_len);

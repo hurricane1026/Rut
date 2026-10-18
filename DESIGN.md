@@ -3446,6 +3446,17 @@ sha512(data)                  // string (hex)
 fnv32(data)                   // u32 (non-crypto, for load balancing)
 fnv64(data)                   // u64 (non-crypto, for hashing/sharding)
 
+// --- Constant-time equality (implemented) ---
+constantTimeEqual(a, b)       // (str, str) -> bool; direct call or explicit-placeholder pipe
+// Requires unwrapped strings. Uses static OpenSSL CRYPTO_memcmp for equal lengths
+// up to 16 KiB; no content-dependent early exit. Lengths are public: different
+// lengths or either length above 16 KiB return false without reading contents.
+// Two empty strings compare equal. Embedded NULs are compared as bytes.
+// This is byte equality, not Unicode normalization. It allocates no request
+// storage, has no shard/global state, and retains no input view after the call.
+// No constant folding to ordinary Eq; user functions/bindings can shadow the builtin.
+// Authentication policies must separately reject absent/empty credentials.
+
 // --- HMAC ---
 hmacSha256(key, data)         // string (hex)
 hmacSha384(key, data)         // string (hex)

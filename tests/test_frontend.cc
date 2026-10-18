@@ -40046,6 +40046,38 @@ TEST(frontend, json_struct_decode_rejects_invalid_types_and_wrapped_inputs) {
     }
 }
 
+TEST(frontend, constant_time_equal_rejects_arity_types_and_wrapped_values) {
+    const char* cases[] = {
+        "route GET \"/\" { guard constantTimeEqual(\"x\") else { return 401 } return 200 }",
+        "route GET \"/\" { guard constantTimeEqual(1, 1) else { return 401 } return 200 }",
+        "route GET \"/\" { guard constantTimeEqual(\"x\", true) else { return 401 } return 200 }",
+        "route GET \"/\" { guard constantTimeEqual(req.header(\"X-Key\"), \"x\") else { return 401 "
+        "} return 200 }",
+        "route GET \"/\" { guard constantTimeEqual(\"x\", req.header(\"X-Key\")) else { return 401 "
+        "} return 200 }",
+    };
+    for (const char* source : cases) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (hir) fprintf(stderr, "Unexpected constantTimeEqual type-check success: %s\n", source);
+        CHECK(!hir);
+        if (!hir) CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, constant_time_equal_user_function_shadows_builtin) {
+    auto tokens =
+        lex(lit("func constantTimeEqual(_ n: i32) -> bool => n == 7\n"
+                "route GET \"/\" { guard constantTimeEqual(7) else { return 401 } return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
+}
+
 TEST(frontend, jwt_decode_requires_two_unwrapped_strings) {
     const char* cases[] = {
         "route POST \"/\" { let x = jwtDecode(\"t\") return 200 }",

@@ -799,6 +799,30 @@ route GET "/api" {
   wait; branch writes in static-for routes remain unsupported. Per-shard state:
   effective limits ≈ limit × shard count.
 
+## Constant-time equality
+
+`constantTimeEqual(a, b) -> bool` accepts two unwrapped `str` values. Use
+`guard let` or `.or(default)` before passing optional/error-capable values.
+For equal public lengths up to 16 KiB it calls the existing static OpenSSL
+`CRYPTO_memcmp`, with no early exit based on contents. Different lengths or
+lengths above 16 KiB return false; lengths are not secret. Empty strings compare
+equal and embedded NULs are ordinary bytes. No normalization or encoding
+conversion occurs. The call allocates no storage and keeps no references.
+
+```swift
+route GET "/compare" {
+    guard let left = req.header("X-Left") else { return 400 }
+    guard let right = req.header("X-Right") else { return 400 }
+    guard constantTimeEqual(left, right) else { return 403 }
+    return 200
+}
+```
+
+Explicit-placeholder pipes work: `left | constantTimeEqual(_, right)`. A user
+function/binding with the same name shadows the builtin. Equality alone is not
+authentication: credential policies must also reject missing/empty credentials
+and supply a trusted expected value.
+
 ## Built-ins (call them, never reimplement)
 
 ```

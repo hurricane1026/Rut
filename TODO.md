@@ -115,6 +115,12 @@ without presenting lossy or per-shard state as exact shared state.
 
 ## Recently Completed
 
+- [x] Kong/APISIX plan #819, M1 security primitive: `constantTimeEqual(str, str)`
+  exposes bounded OpenSSL content comparison to Rut without a new keyword or
+  dependency. Public lengths, 16 KiB failure limit, empty/binary semantics and
+  user shadowing are documented; this does not complete the remaining random,
+  key-handle, signature or certificate interfaces in M1.
+
 - [x] Handler bodies reject `respond` with a `return` fix-it, while middleware
   functions reject status-`return` with a `respond` fix-it; valid helper
   `respond` propagation and ordinary function value expressions are unchanged.
