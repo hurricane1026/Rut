@@ -386,6 +386,29 @@ TEST(native_program, ebpf_body_plan_survives_compiler_exit_and_is_validated) {
 }
 #endif
 
+TEST(native_program, constant_time_equal_is_available_after_compiler_exit) {
+    const u8 levels[] = {0, 3};
+    for (u8 opt : levels) {
+        Source source;
+        REQUIRE(source.append(
+            "route GET \"/\" { guard let value = req.header(\"X-Key\") else { return 401 } "
+            "guard constantTimeEqual(value, \"native-secret\") else { return 403 } return 200 "
+            "}\n"));
+        Program owner;
+        REQUIRE(owner.p);
+        REQUIRE(load(source, *owner.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        REQUIRE_EQ(owner.p->config.route_count, 1u);
+        const auto& route = owner.p->config.routes[0];
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Key: native-secret\r\n\r\n").status_code, 200);
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Key: Native-secret\r\n\r\n").status_code, 403);
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Key: native-secreT\r\n\r\n").status_code, 403);
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Key: native-secret-long\r\n\r\n").status_code,
+                 403);
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\n\r\n").status_code, 401);
+    }
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -886,6 +886,13 @@ u8 rut_helper_str_has_prefix(const char* s, u32 s_len, const char* pfx, u32 pfx_
     return 1;
 }
 
+u8 rut_helper_str_constant_time_equal(const char* a, u32 a_len, const char* b, u32 b_len) {
+    if (a_len != b_len || a_len > kMaxConstantTimeEqualBytes) return 0;
+    if (a_len == 0) return 1;
+    if (a == nullptr || b == nullptr) return 0;
+    return CRYPTO_memcmp(a, b, a_len) == 0;
+}
+
 u8 rut_helper_str_eq(const char* a, u32 a_len, const char* b, u32 b_len) {
     if (a_len != b_len) return 0;
     for (u32 i = 0; i < a_len; i++) {

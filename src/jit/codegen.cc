@@ -106,6 +106,7 @@ struct Ctx {
     // True while emitting a handler that reads the request (and therefore
     // primed the parse cache). Gates the parse-unprime calls at exits.
     bool cur_fn_needs_parse = false;
+    LLVMValueRef fn_str_constant_time_equal;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
     LLVMValueRef fn_str_cmp;
@@ -487,6 +488,17 @@ struct Ctx {
             fn_req_content_length = LLVMAddFunction(llvm_mod, "rut_helper_req_content_length", ft);
         }
         return fn_req_content_length;
+    }
+
+    // u8 rut_helper_str_constant_time_equal(ptr, i32, ptr, i32)
+    LLVMValueRef get_str_constant_time_equal() {
+        if (!fn_str_constant_time_equal) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 4, 0);
+            fn_str_constant_time_equal =
+                LLVMAddFunction(llvm_mod, "rut_helper_str_constant_time_equal", ft);
+        }
+        return fn_str_constant_time_equal;
     }
 
     // u8 rut_helper_str_has_prefix(ptr, i32, ptr, i32)
@@ -1257,6 +1269,26 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
 
         // ── String operations ──
+        case rir::Opcode::StrConstantTimeEqual: {
+            LLVMValueRef s = c.get_value(inst.operands[0]);
+            LLVMValueRef rhs = c.get_value(inst.operands[1]);
+            LLVMValueRef s_ptr = LLVMBuildExtractValue(c.builder, s, 0, "s.ptr");
+            LLVMValueRef s_len = LLVMBuildExtractValue(c.builder, s, 1, "s.len");
+            LLVMValueRef p_ptr = LLVMBuildExtractValue(c.builder, rhs, 0, "p.ptr");
+            LLVMValueRef p_len = LLVMBuildExtractValue(c.builder, rhs, 1, "p.len");
+            LLVMValueRef args[] = {s_ptr, s_len, p_ptr, p_len};
+            LLVMValueRef r = LLVMBuildCall2(c.builder,
+                                            LLVMGlobalGetValueType(c.get_str_constant_time_equal()),
+                                            c.get_str_constant_time_equal(),
+                                            args,
+                                            4,
+                                            "cte");
+            // Convert u8 result to i1 for branch usage
+            LLVMValueRef b =
+                LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "cte.bool");
+            c.set_value(inst.result, b);
+            break;
+        }
         case rir::Opcode::StrHasPrefix: {
             LLVMValueRef s = c.get_value(inst.operands[0]);
             LLVMValueRef pfx = c.get_value(inst.operands[1]);
@@ -2316,6 +2348,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_time_now_micros = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;
+    c.fn_str_constant_time_equal = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
     c.fn_str_cmp = nullptr;

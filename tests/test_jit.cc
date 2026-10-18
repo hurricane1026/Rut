@@ -22332,3 +22332,97 @@ TEST(jit, gateway_access_module_import_and_policy_order) {
         rir.destroy();
     }
 }
+
+TEST(jit, constant_time_equal_helper_binary_bounds_and_invalid_spans) {
+    CHECK_EQ(rut_helper_str_constant_time_equal(nullptr, 0, nullptr, 0), 1);
+    CHECK_EQ(rut_helper_str_constant_time_equal(nullptr, 1, "a", 1), 0);
+    CHECK_EQ(rut_helper_str_constant_time_equal("a", 1, nullptr, 1), 0);
+    CHECK_EQ(rut_helper_str_constant_time_equal(nullptr, 1, nullptr, 2), 0);
+    // Invalid/over-limit spans must be rejected before dereferencing their pointers.
+    CHECK_EQ(rut_helper_str_constant_time_equal(
+                 nullptr, kMaxConstantTimeEqualBytes + 1, nullptr, kMaxConstantTimeEqualBytes + 1),
+             0);
+    const char a[] = {'a', '\0', static_cast<char>(0xff), 'z'};
+    char b[] = {'a', '\0', static_cast<char>(0xff), 'z'};
+    CHECK_EQ(rut_helper_str_constant_time_equal(a, sizeof(a), b, sizeof(b)), 1);
+    for (u32 i = 0; i < sizeof(a); ++i) {
+        b[i] ^= 1;
+        CHECK_EQ(rut_helper_str_constant_time_equal(a, sizeof(a), b, sizeof(b)), 0);
+        b[i] ^= 1;
+    }
+    char left[kMaxConstantTimeEqualBytes + 1]{};
+    char right[kMaxConstantTimeEqualBytes + 1]{};
+    CHECK_EQ(rut_helper_str_constant_time_equal(
+                 left, kMaxConstantTimeEqualBytes, right, kMaxConstantTimeEqualBytes),
+             1);
+    right[kMaxConstantTimeEqualBytes - 1] = 1;
+    CHECK_EQ(rut_helper_str_constant_time_equal(
+                 left, kMaxConstantTimeEqualBytes, right, kMaxConstantTimeEqualBytes),
+             0);
+    right[kMaxConstantTimeEqualBytes - 1] = 0;
+    CHECK_EQ(rut_helper_str_constant_time_equal(left, sizeof(left), right, sizeof(right)), 0);
+}
+
+TEST(jit, constant_time_equal_frontend_helpers_pipe_and_runtime_values) {
+    const char* source = R"rut(
+func same(_ a: str, _ b: str) -> bool => constantTimeEqual(a, b)
+route GET "/compare" {
+let a = req.header("X-Left").or("")
+let b = req.header("X-Right").or("")
+guard constantTimeEqual("fixed", "fixed") else { return 403 }
+guard same(a, b) else { return 401 }
+guard a | constantTimeEqual(_, b) else { return 402 }
+return 200
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    u32 secure_comparisons = 0;
+    for (u32 fi = 0; fi < rir.module.func_count; ++fi)
+        for (u32 bi = 0; bi < rir.module.functions[fi].block_count; ++bi)
+            for (u32 ii = 0; ii < rir.module.functions[fi].blocks[bi].inst_count; ++ii)
+                secure_comparisons += rir.module.functions[fi].blocks[bi].insts[ii].op ==
+                                      Opcode::StrConstantTimeEqual;
+    CHECK_EQ(secure_comparisons, 3u);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    engine.opt_level = OptLevel::O3;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    struct Case {
+        const char* headers;
+        u16 status;
+    } cases[] = {
+        {"X-Left: secret\r\nX-Right: secret\r\n", 200},
+        {"X-Left: Secret\r\nX-Right: secret\r\n", 401},
+        {"X-Left: secreT\r\nX-Right: secret\r\n", 401},
+        {"X-Left: secret-extra\r\nX-Right: secret\r\n", 401},
+        {"X-Left: secret\r\n", 401},
+        {"", 200},
+    };
+    for (const auto& test : cases) {
+        auto request =
+            std::string("GET /compare HTTP/1.1\r\nHost: test\r\n") + test.headers + "\r\n";
+        auto result = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(request.data()),
+                                                    request.size(),
+                                                    nullptr));
+        CHECK_EQ(result.action, HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, test.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}

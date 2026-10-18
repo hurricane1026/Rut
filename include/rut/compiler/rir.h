@@ -189,10 +189,11 @@ enum class Opcode : u8 {
                             // is available, the write is ignored.
 
     // ── String operations ──
-    StrHasPrefix,    // %r = str.has_prefix %s, %pfx    → bool
-    StrTrimPrefix,   // %r = str.trim_prefix %s, %pfx   → str
-    StrRegexMatch,   // %r = str.regex_match %s, "re"   → bool
-    StrInterpolate,  // %r = str.interpolate [%a, %b..]  → str (variadic)
+    StrConstantTimeEqual,  // bounded byte equality; public lengths, secret contents
+    StrHasPrefix,          // %r = str.has_prefix %s, %pfx    → bool
+    StrTrimPrefix,         // %r = str.trim_prefix %s, %pfx   → str
+    StrRegexMatch,         // %r = str.regex_match %s, "re"   → bool
+    StrInterpolate,        // %r = str.interpolate [%a, %b..]  → str (variadic)
 
     // ── Comparisons ──
     CmpEq,  // %r = cmp.eq %a, %b  → bool

@@ -662,6 +662,17 @@ struct Builder {
 
     // ── String operations ───────────────────────────────────────────
 
+    Result<ValueId> emit_str_constant_time_equal(ValueId str, ValueId rhs, SourceLoc loc = {}) {
+        if (!val_has_type(str, TypeKind::Str) || !val_has_type(rhs, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::StrConstantTimeEqual, ty, loc));
+        inst->operands[0] = str;
+        inst->operands[1] = rhs;
+        inst->operand_count = 2;
+        return vid;
+    }
+
     Result<ValueId> emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
             return err(RirError::InvalidState);

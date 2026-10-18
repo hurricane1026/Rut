@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/shard_limits.h"
+#include "rut/common/types.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/json.h"
@@ -9558,6 +9559,31 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         // Reject here until the i64 error carrier exists.
         if (out.type == HirTypeKind::I64 && out.may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
+        return out;
+    }
+
+    if (expr.name.eq(lit_str("constantTimeEqual")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr Str kDetail = lit_str("constantTimeEqual expects two unwrapped str values");
+        if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        auto lhs = analyze_builtin_arg(*expr.args[0]);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = analyze_builtin_arg(*expr.args[1]);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        if (lhs->type != HirTypeKind::Str || rhs->type != HirTypeKind::Str || lhs->may_nil ||
+            lhs->may_error || rhs->may_nil || rhs->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr out{};
+        out.kind = HirExprKind::ConstantTimeEqual;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        if (!route->exprs.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(rhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
         return out;
     }
 

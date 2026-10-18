@@ -80,6 +80,7 @@ enum class MirValueKind : u8 {
     Mod,
     WidenI64,
     TimeNowMicros,
+    ConstantTimeEqual,
     JsonOp,
     JsonDecode,
     MaxInt,
