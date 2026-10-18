@@ -482,8 +482,14 @@ streams, header blocks to 16 KiB, and each direction of an RPC to a 65,535-byte
 pending DATA queue. Message/body length is not capped by that queue: flow control
 returns credit as bytes drain. Client cancellation resets only the mapped RPC.
 `grpc-timeout` is enforced with the existing precise timer mechanism (millisecond
-granularity); failures use gRPC status trailers. Calls are never automatically
-replayed. See [the complete example](../examples/grpc.rut).
+granularity); failures use gRPC status trailers. Before any upstream HTTP/2
+preface or other wire bytes are sent, socket creation, connect submission, and
+TCP connect failures may advance to another distinct configured endpoint, up
+to three endpoints total (or the address count when smaller). This preserves
+the same session, queued exchanges, deadlines, and per-RPC accounting; no RPC
+is replayed. TLS-configured upstreams can use this TCP-stage failover, but TLS
+setup, handshake, certificate-identity, and ALPN failures after TCP connects
+end the session without trying another endpoint. See [the complete example](../examples/grpc.rut).
 
 Optional per-message wire limits are configured on an HTTP/2 upstream:
 
