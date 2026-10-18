@@ -20,13 +20,18 @@ class Tests(unittest.TestCase):
                 bench.config(bad, 64, None, 8087, 1)
 
     def test_wrk_errors_and_units(self):
-        text = '  99% 2.50ms\nRequests/sec: 1000.25\n'
+        text = ('  99% 2.50ms\nRequests/sec: 1000.25\n'
+                'Timed non-200 responses: 0\n')
         self.assertEqual(bench.parse_wrk(text)['p99_us'], 2500)
         self.assertFalse(bench.parse_wrk(text + 'Socket errors: connect 0, read 1, write 0, timeout 2\n')['valid'])
-        self.assertFalse(bench.parse_wrk(text + 'Timed non-200 responses: 1\n')['valid'])
+        bad_timed = text.replace('Timed non-200 responses: 0',
+                                 'Timed non-200 responses: 1')
+        self.assertFalse(bench.parse_wrk(bad_timed)['valid'])
         self.assertFalse(bench.parse_wrk(text + 'Non-2xx or 3xx responses: 3\n')['valid'])
         with self.assertRaises(ValueError):
             bench.parse_wrk('Requests/sec: 100\n')
+        with self.assertRaises(ValueError):
+            bench.parse_wrk('  99% 2.50ms\nRequests/sec: 1000.25\n')
 
     def test_preflight_real_keepalive_and_corruption(self):
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -67,19 +72,31 @@ class Tests(unittest.TestCase):
     def test_summary_pairs_and_failed_attempt(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for engine, rps in [('rut', 200), ('nginx', 100)]:
+            rps_by_engine = {
+                'nginx': [1, 100, 101],
+                'rut': [2, 101, 202],
+            }
+            for engine, rps_values in rps_by_engine.items():
                 for rep in range(1, 4):
                     p = root / f'{engine}{rep}'
                     p.mkdir()
                     bench.save(p / 'result.json', dict(engine=engine, repetition=rep,
                         host='192.0.2.2', body_size=1024, connections=128, duration=30,
                         warmup=5, port=8087, threads=4, cpus='2-5', valid=True,
-                        results=[dict(phase='measurement', rps=rps, p99_us=100)]))
+                        results=[dict(phase='measurement', rps=rps_values[rep - 1], p99_us=100)]))
             for engine in ('rut', 'nginx'):
                 for rep in range(1, 4):
                     (root / f'{engine}{rep}' / 'environment.json').write_text('{}')
+            self.assertEqual(summarize.summarize(root)[0]['per_repetition_gain_percent'][::2],
+                             [100, 100])
+            self.assertAlmostEqual(summarize.summarize(root)[0]['per_repetition_gain_percent'][1], 1)
             self.assertEqual(summarize.summarize(root)[0]['rut_gain_percent'], 100)
             self.assertEqual(summarize.summarize(root)[0]['cpus'], '2-5')
+            unfinished = root / 'unfinished'
+            unfinished.mkdir()
+            (unfinished / 'environment.json').write_text('{}')
+            with self.assertRaises(ValueError):
+                summarize.summarize(root)
             bench.save(root / 'failure.json', {'valid': False})
             with self.assertRaises(ValueError):
                 summarize.summarize(root)

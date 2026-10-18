@@ -168,10 +168,12 @@ def parse_wrk(text):
     timed_statuses = re.search(r'Timed non-200 responses:\s*(\d+)', text)
     if not rps or not p99:
         raise ValueError('incomplete wrk output; requires --latency')
+    if not timed_statuses:
+        raise ValueError('incomplete wrk output; requires Timed non-200 responses marker')
     counts = dict(zip(('connect', 'read', 'write', 'timeout'),
                       map(int, errors.groups() if errors else ('0',) * 4)))
     counts['status'] = int(statuses[1]) if statuses else 0
-    counts['timed_status'] = int(timed_statuses[1]) if timed_statuses else 0
+    counts['timed_status'] = int(timed_statuses[1])
     return {'rps': float(rps[1]), 'p99_us': float(p99[1]) *
             {'us': 1, 'ms': 1000, 's': 1000000}[p99[2]], 'errors': counts,
             'valid': not any(counts.values())}
