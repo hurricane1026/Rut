@@ -64,6 +64,12 @@ struct GrpcExchange {
     bool web_body_flushed;
     bool web_trailer_flushed;
     bool web_h1;
+    bool web_response_invalid;
+    bool skip_rpc_log;
+    void (*web_h1_kick)(void*, ConnectionBase&);
+    u8 web_pending_output[4];
+    u8 web_pending_output_len;
+    u8 web_pending_output_offset;
     bool has_response_length;
     u32 response_mutation_bytes;
     u8 response_mutation_count;
@@ -102,6 +108,10 @@ struct GrpcExchange {
         response_trailers_offset = upload_raw_credit = 0;
         web_trailer_queued = web_body_flushed = web_trailer_flushed = false;
         web_h1 = false;
+        web_response_invalid = false;
+        skip_rpc_log = false;
+        web_h1_kick = nullptr;
+        web_pending_output_len = web_pending_output_offset = 0;
         has_response_length = false;
         response_mutation_bytes = 0;
         response_mutation_count = 0;
@@ -117,6 +127,7 @@ struct GrpcProxyState {
     bool tls_verified;
     GrpcExchange* streams[64];
     ConnectionBase* pool_next;
+    void (*web_h1_kick)(void*, ConnectionBase&);
     u32 active;
     u32 cursor;
     u32 control_len;
@@ -140,6 +151,7 @@ struct GrpcProxyState {
         tls_verified = false;
         for (auto& stream : streams) stream = nullptr;
         pool_next = nullptr;
+        web_h1_kick = nullptr;
         active = cursor = control_len = pending_cancel_count = 0;
         connected_at_us = idle_since_us = timer_deadline_us = last_ping_us = keepalive_due_us = 0;
         upstream = connecting = busy = preface_sent = session_failure_recorded = false;
