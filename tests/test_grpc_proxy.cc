@@ -3804,7 +3804,8 @@ TEST(grpc_proxy, grpc_web_text_flushes_each_open_stream_message) {
         CHECK_EQ(decoded_len, message_len);
         CHECK_EQ(memcmp(decoded, message, message_len), 0);
         CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
-        CHECK_EQ(x.download_len, append_next_prefix ? 1u : 0u);
+        CHECK_EQ(static_cast<u32>(x.download_len + x.response_base64.pending_len),
+                 append_next_prefix ? 1u : 0u);
         grpc_detach(downstream_h2, &x);
     };
 
