@@ -25,6 +25,7 @@ class Tests(unittest.TestCase):
     def test_server_manifest_coordinates_and_required_fields(self):
         manifest = dict(schema=1, engine='rut', cpus='2', workers=1, body_size=1024,
                         listen_port=8087, config_sha256='a' * 64,
+                        effective_config_sha256='c' * 64,
                         binary_sha256='b' * 64, run_id='rut-run')
         self.assertIs(bench.validate_server_manifest(manifest, 'rut', 8087, 1024), manifest)
         with self.assertRaises(ValueError):
@@ -133,6 +134,21 @@ class Tests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 bench.config(out, 1024, None, 8087, 1)
 
+    def test_port_ownership_preflight_rejects_occupied_port(self):
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('127.0.0.1', 0))
+        child = subprocess.Popen(['sleep', '2'])
+        try:
+            self.assertFalse(bench.port_is_free(sock.getsockname()[1]))
+            sock.listen(1)
+            self.assertTrue(bench.process_owns_port(os.getpid(), sock.getsockname()[1]))
+            self.assertFalse(bench.process_owns_port(child.pid, sock.getsockname()[1]))
+        finally:
+            sock.close()
+            child.terminate()
+            child.wait()
+
     def test_summary_pairs_and_failed_attempt(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -147,19 +163,47 @@ class Tests(unittest.TestCase):
                     bench.save(p / 'result.json', dict(engine=engine, repetition=rep,
                         host='192.0.2.2', body_size=1024, connections=128, duration=30,
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus='2',
-                        server_workers=1, server_config_sha256='config-a', server_binary_sha256='binary-a',
+                        server_workers=1, server_config_sha256='config-a', server_effective_config_sha256='effective-a',
+                        server_binary_sha256='binary-a',
+                        throughput_classification='instrumented-client-rps-full-body-lua',
                         server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
                         server_run_id=f'{engine}-{rep}', valid=True,
                         results=[dict(phase='measurement', rps=rps_values[rep - 1], p99_us=100)]))
             for engine in ('rut', 'nginx'):
                 for rep in range(1, 4):
-                    (root / f'{engine}{rep}' / 'environment.json').write_text('{}')
-            self.assertEqual(summarize.summarize(root)[0]['per_repetition_gain_percent'][::2],
-                             [100, 100])
-            self.assertAlmostEqual(summarize.summarize(root)[0]['per_repetition_gain_percent'][1], 1)
-            self.assertEqual(summarize.summarize(root)[0]['rut_gain_percent'], 100)
+                    order = {('rut', 1): 1, ('nginx', 1): 2, ('nginx', 2): 3,
+                             ('rut', 2): 4, ('rut', 3): 5, ('nginx', 3): 6}
+                    (root / f'{engine}{rep}' / 'environment.json').write_text(
+                        json.dumps({'time': order[(engine, rep)]}))
+            self.assertEqual(summarize.summarize(root)[0]['throughput_classification'],
+                             'inconclusive-lua-body-callback')
+            self.assertEqual(summarize.summarize(root)[0]['rut']['instrumented_rps'], [2, 101, 202])
             self.assertEqual(summarize.summarize(root)[0]['cpus'], '2-5')
             self.assertEqual(summarize.summarize(root)[0]['server_cpus'], '2')
+            duplicate = root / 'duplicate-run'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, duplicate / name)
+            duplicate_result = duplicate / 'rut2' / 'result.json'
+            duplicate_data = json.loads(duplicate_result.read_text())
+            duplicate_data['server_run_id'] = 'rut-1'
+            duplicate_result.write_text(json.dumps(duplicate_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(duplicate)
+            reordered = root / 'reordered'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, reordered / name)
+            (reordered / 'nginx1' / 'environment.json').write_text(json.dumps({'time': 10}))
+            with self.assertRaises(ValueError):
+                summarize.summarize(reordered)
+            binary_changed = root / 'binary-changed'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, binary_changed / name)
+            binary_result = binary_changed / 'rut2' / 'result.json'
+            binary_data = json.loads(binary_result.read_text())
+            binary_data['server_binary_sha256'] = 'binary-b'
+            binary_result.write_text(json.dumps(binary_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(binary_changed)
             mismatch = root / 'mismatch'
             for engine, server_cpus in [('rut', '2'), ('nginx', '3')]:
                 for rep in range(1, 4):
@@ -168,7 +212,9 @@ class Tests(unittest.TestCase):
                     bench.save(p / 'result.json', dict(engine=engine, repetition=rep,
                         host='192.0.2.2', body_size=1024, connections=128, duration=30,
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus=server_cpus,
-                        server_workers=1, server_config_sha256='config-a', server_binary_sha256='binary-a',
+                        server_workers=1, server_config_sha256='config-a', server_effective_config_sha256='effective-a',
+                        server_binary_sha256='binary-a',
+                        throughput_classification='instrumented-client-rps-full-body-lua',
                         server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
                         server_run_id=f'{engine}-{rep}', valid=True,
                         results=[dict(phase='measurement', rps=100, p99_us=100)]))
@@ -182,7 +228,9 @@ class Tests(unittest.TestCase):
                     bench.save(p / 'result.json', dict(engine=engine, repetition=rep,
                         host='192.0.2.2', body_size=1024, connections=128, duration=30,
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus='2',
-                        server_workers=1, server_config_sha256=config_hash, server_binary_sha256='binary-a',
+                        server_workers=1, server_config_sha256=config_hash, server_effective_config_sha256='effective-a',
+                        server_binary_sha256='binary-a',
+                        throughput_classification='instrumented-client-rps-full-body-lua',
                         server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
                         server_run_id=f'{engine}-{rep}', valid=True,
                         results=[dict(phase='measurement', rps=100, p99_us=100)]))

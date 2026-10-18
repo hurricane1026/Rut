@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -127,9 +128,52 @@ def config_identity(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def port_is_free(port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('0.0.0.0', port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def process_owns_port(pid, port):
+    pids = [pid]
+    for current in list(pids):
+        try:
+            children = Path(f'/proc/{current}/task/{current}/children').read_text().split()
+            pids.extend(int(child) for child in children)
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+    try:
+        port_hex = f'{port:04X}'
+        for current in pids:
+            fd_dir = Path(f'/proc/{current}/fd')
+            inodes = set()
+            for fd in fd_dir.iterdir():
+                try:
+                    link = os.readlink(fd)
+                except OSError:
+                    continue
+                if link.startswith('socket:['):
+                    inodes.add(link.split('[', 1)[1][:-1])
+            for table in ('tcp', 'tcp6'):
+                lines = Path(f'/proc/{current}/net/{table}').read_text().splitlines()[1:]
+                for line in lines:
+                    fields = line.split()
+                    if len(fields) > 9 and fields[1].rsplit(':', 1)[-1] == port_hex and fields[3] == '0A':
+                        if fields[9] in inodes:
+                            return True
+    except (FileNotFoundError, OSError, IndexError):
+        return False
+    return False
+
+
 def validate_server_manifest(manifest, engine, port, body_size):
     required = ('schema', 'engine', 'cpus', 'workers', 'body_size', 'listen_port',
-                'config_sha256', 'binary_sha256', 'run_id')
+                'config_sha256', 'effective_config_sha256', 'binary_sha256', 'run_id')
     if any(key not in manifest for key in required):
         raise ValueError('incomplete server manifest')
     if manifest['schema'] != 1 or manifest['engine'] != engine:
@@ -152,6 +196,8 @@ def serve(a):
     binary = str(Path(shutil.which(a.binary) or a.binary).resolve())
     if a.engine == 'rut':
         validate_rut_workers(c['workers'])
+    if not port_is_free(c['port']):
+        raise ValueError(f'listen port is already occupied: {c["port"]}')
     run_id = f'{a.engine}-{time.time_ns()}-{os.getpid()}'
     snapshot(out / f'{run_id}-environment.json', [binary])
     if a.engine == 'rut':
@@ -169,7 +215,8 @@ def serve(a):
     argv = ['taskset', '-c', a.cpus] + argv
     save(out / f'{run_id}-command.json', {'argv': argv,
          'study_environment': {k: v for k, v in env.items() if k.startswith('RUT_STUDY_')}})
-    save(out / 'server-manifest.json', {
+    effective_name = 'proxy.rut' if a.engine == 'rut' else ('origin.conf' if a.engine == 'origin' else 'proxy.conf')
+    manifest = {
         'schema': 1,
         'run_id': run_id,
         'engine': a.engine,
@@ -178,11 +225,29 @@ def serve(a):
         'body_size': c['body_size'],
         'listen_port': c['port'],
         'config_sha256': config_identity(out / 'config.json'),
+        'effective_config_sha256': config_identity(out / effective_name),
         'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
         'command': str(out / f'{run_id}-command.json'),
-    })
-    # Foreground execution: Ctrl-C stops this server, never unrelated processes.
-    os.execvpe(argv[0], argv, env)
+    }
+    child = subprocess.Popen(argv, env=env)
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if child.poll() is not None:
+                raise ValueError('server exited before becoming ready')
+            try:
+                with socket.create_connection(('127.0.0.1', c['port']), timeout=0.2):
+                    if not process_owns_port(child.pid, c['port']):
+                        raise ValueError('readiness socket is not owned by launched server')
+                    save(out / 'server-manifest.json', manifest)
+                    return child.wait()
+            except OSError:
+                time.sleep(0.05)
+        raise ValueError('server did not become ready')
+    except BaseException:
+        child.terminate()
+        child.wait(timeout=5)
+        raise
 
 
 def preflight(host, port, size):
@@ -254,9 +319,12 @@ def client(a):
                   body_size=a.body_size, connections=a.connections,
                   duration=a.duration, warmup=a.warmup, port=a.port, threads=a.threads, results=results,
                   server_cpus=manifest['cpus'], server_workers=manifest['workers'],
-                  server_config_sha256=manifest['config_sha256'], server_binary_sha256=manifest['binary_sha256'],
+                  server_config_sha256=manifest['config_sha256'],
+                  server_effective_config_sha256=manifest['effective_config_sha256'],
+                  server_binary_sha256=manifest['binary_sha256'],
                   server_manifest=str(a.server_manifest.resolve()), server_listen_port=manifest['listen_port'],
                   server_run_id=manifest['run_id'],
+                  throughput_classification='instrumented-client-rps-full-body-lua',
                   valid=all(r['valid'] for r in results))
     save(a.output / 'result.json', result)
     print(json.dumps(result, indent=2))

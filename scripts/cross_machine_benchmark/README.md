@@ -93,6 +93,9 @@ python3 summarize.py results > summary.json
 
 汇总要求相同坐标下两种引擎至少三轮配对，输出 RPS、P99 的中位数、有效载荷 Gb/s
 及 Rut 相对收益。不要把不同构建、网络设置的实验放进同一 results 目录。
+当前脚本的 wrk Lua `response()` 回调会接收完整响应正文；因此结果中的 RPS 是带
+客户端正文回调的端到端测量，汇总脚本将其标为 throughput-inconclusive，不得解释为
+代理容量或 Rut 性能收益。只有另有独立客户端余量证据并更新此契约后，才可作代理吞吐结论。
 RSS/CPU 没有远程自动采集：可在 P 用已有 pidstat/监控工具记录**整个服务进程树**，
 nginx 要包含 master/worker；RSS 不包含内核 socket/pipe 内存。不要把客户端 CPU
 当作代理 CPU。记录 C、P、O 的 CPU 与 NIC 利用率，识别客户端/上游/链路瓶颈。
