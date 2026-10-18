@@ -40044,3 +40044,61 @@ TEST(frontend, json_struct_decode_rejects_invalid_types_and_wrapped_inputs) {
         if (!hir) CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
     }
 }
+
+TEST(frontend, upstream_tls_options_reach_runtime_config) {
+    const char* source =
+        "upstream grpc { host: \"127.0.0.1\", port: 443, protocol: .http2, "
+        "tls: { ca: \"ca.pem\", server_name: \"backend.example\", "
+        "cert: \"client.pem\", key: \"client.key\" } }\n"
+        "route POST \"/test.Echo/Call\" { return forward(grpc) }\n";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    const auto& spec = cfg.upstreams[0].tls;
+    CHECK(spec.enabled);
+    CHECK(strcmp(spec.ca, "ca.pem") == 0);
+    CHECK(strcmp(spec.server_name, "backend.example") == 0);
+    CHECK(strcmp(spec.cert, "client.pem") == 0);
+    CHECK(strcmp(spec.key, "client.key") == 0);
+    rir.destroy();
+}
+
+TEST(frontend, upstream_tls_rejects_incomplete_duplicate_or_unsafe_options) {
+    const char* fields[] = {
+        "ca: \"ca.pem\"",
+        "server_name: \"localhost\"",
+        "ca: \"ca.pem\", server_name: \"localhost\", cert: \"client.pem\"",
+        "ca: \"ca.pem\", server_name: \"localhost\", key: \"client.key\"",
+        "ca: \"ca.pem\", ca: \"other.pem\", server_name: \"localhost\"",
+        "ca: \"ca.pem\", server_name: \"bad/name\"",
+        "ca: \"ca.pem\", server_name: \"localhost\", verify: false",
+        "ca: \"\", server_name: \"localhost\"",
+    };
+    for (const char* field : fields) {
+        char source[1024];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream grpc { host: \"127.0.0.1\", port: 443, protocol: .http2, tls: { %s } }",
+                 field);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK(!parse_file_heap(tokens.value()));
+    }
+    const char* source =
+        "upstream grpc { host: \"127.0.0.1\", port: 443, "
+        "tls: { ca: \"ca.pem\", server_name: \"localhost\" } }";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(!analyze_file_heap(ast.value()));
+}

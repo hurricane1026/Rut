@@ -930,7 +930,10 @@ public:
 
     void release_completed_proxy_receive_buffer(Connection& c) { release_upstream_relay_slice(c); }
 
-    bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
+    bool submit_recv_impl(Connection& c) {
+        if (c.tls_active && c.h2 && c.h2->grpc.upstream) return backend.add_recv_tls(c);
+        return backend.add_recv(c.fd, c.id);
+    }
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {

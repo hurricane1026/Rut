@@ -499,6 +499,34 @@ TEST(prometheus, serializes_aggregated_metrics) {
     CHECK(prom_contains(buf, n, "rut_requests_total 17\n"));
 }
 
+TEST(grpc_metrics, aggregation_and_exposition) {
+    ShardMetrics a, b;
+    a.init();
+    b.init();
+    a.on_grpc_start();
+    a.on_grpc_start();
+    a.on_grpc_complete(0, 125);
+    b.on_grpc_start();
+    b.on_grpc_complete(4, 5000000000ull);  // long stream: no 32-bit wrap
+    ShardMetrics* const shards[] = {&a, &b};
+    const auto total = aggregate_metrics(shards, 2);
+    CHECK_EQ(total.grpc_started, 3u);
+    CHECK_EQ(total.grpc_active, 1u);
+    CHECK_EQ(total.grpc_completed[0], 1u);
+    CHECK_EQ(total.grpc_completed[4], 1u);
+    CHECK_EQ(total.grpc_latency.sum_us, 5000000125ull);
+    CHECK_EQ(total.grpc_latency.buckets[10], 1u);
+    char buf[8192];
+    const u32 kLength = format_prometheus(total, buf, sizeof(buf));
+    REQUIRE(kLength > 0);
+    CHECK(prom_contains(buf, kLength, "rut_grpc_started_total 3\n"));
+    CHECK(prom_contains(buf, kLength, "rut_grpc_active 1\n"));
+    CHECK(prom_contains(buf, kLength, "rut_grpc_completed_total{grpc_status=\"4\"} 1\n"));
+    CHECK(prom_contains(buf, kLength, "rut_grpc_duration_seconds_sum 5000.000125\n"));
+    CHECK(prom_contains(buf, kLength, "rut_grpc_duration_seconds_count 2\n"));
+    CHECK_EQ(format_prometheus(total, buf, 32), 0u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -1356,8 +1356,10 @@ let orders = upstream { "10.0.1.1:8080" }
 `upstream greeter { host: "127.0.0.1", port: 50051, protocol: .http2 }` and
 `route POST "/package.Service/Method" { return forward(greeter) }`.
 `protocol` is an upstream configuration field, not a new keyword. Its closed
-selectors are `.http11` (default) and `.http2` (prior-knowledge cleartext HTTP/2).
-This does not implement the target upstream TLS syntax above.
+selectors are `.http11` (default) and `.http2`. HTTP/2 uses prior-knowledge
+h2c by default; the implemented `tls: { ca: "...", server_name: "..." }`
+configuration enables verified TLS with h2 ALPN. Adding paired `cert` and `key`
+paths enables mTLS. This does not implement the target `.mtls(...)` syntax above.
 
 The host application may pre-bind the endpoint and declare only
 `upstream greeter { protocol: .http2 }`. At publication, the declaration must
@@ -1366,6 +1368,20 @@ metadata are applied to that slot while its existing address remains intact.
 An addressless declaration without a matching pre-bound slot is rejected.
 
 The `.http2` forwarding path accepts native gRPC over downstream h2c or TLS/h2.
+Upstream TLS always verifies the certificate against the explicitly configured
+CA file and the DNS name or IPv4 address in `server_name`. DNS names also set
+SNI; h2 ALPN is mandatory, with no plaintext or HTTP/1 fallback. Client identity
+requires both a certificate chain and a matching private key. CA and identity
+files are loaded on the cold path when a new upstream session is established;
+the resulting OpenSSL context belongs to that session. Pooled sessions retain
+their context and pinned configuration epoch until teardown. Certificate/file/
+handshake/ALPN failures map to UNAVAILABLE without replay. io_uring uses the
+existing owned ciphertext buffers and client-state TlsEngine; readiness backends
+use the existing socket BIO with `SSL_do_handshake`. An epoll re-arm drains any
+plaintext retained inside OpenSSL after an SSL_write-driven client handshake,
+so buffered SETTINGS do not wait for a nonexistent socket readiness event.
+SSL is freed before its session-owned BIO methods; kernel send buffers retain
+the existing cancellation/retirement lifetime.
 It streams all four RPC shapes without decoding protobuf, preserving metadata,
 compressed payloads and trailers. A shard pools upstream HTTP/2 sessions by
 pinned configuration, upstream and backend. Each RPC selects a backend and gets
@@ -1385,9 +1401,34 @@ millisecond resolution. Upstream connection failures map to UNAVAILABLE;
 expired deadlines to DEADLINE_EXCEEDED. Configuration epochs remain pinned by
 active/pooled sessions until teardown.
 
+Native gRPC telemetry is per RPC, independent of the connection-level HTTP
+request counters. `rut_grpc_started_total` counts admitted exchanges,
+`rut_grpc_active` tracks exchanges until retirement, and
+`rut_grpc_completed_total{grpc_status="0"..."16"}` counts final statuses.
+`rut_grpc_duration_seconds` measures admission-to-retirement lifetime, including
+backpressure, with 64-bit microsecond samples for long-lived streams. Invalid,
+duplicate or missing backend status metadata is observed as UNKNOWN; metadata
+is still forwarded unchanged. Locally generated errors override backend status.
+Client resets and disconnects before completion are observed as CANCELLED.
+Completion here means final trailers have entered downstream-owned output,
+not that the remote client has acknowledged delivery.
+
+Each exchange owns its access-log path/upstream snapshot so HPACK reuse and
+multiplexing cannot overwrite another RPC's metadata. The existing access-log
+ring records HTTP status 200 plus a separate `grpc_status` text field, RPC
+lifetime (the separate upstream-latency field remains zero), received request
+DATA bytes and response DATA bytes staged downstream
+(including gRPC framing, excluding HTTP/2 frames). Paths over 128 bytes use the
+existing explicit over-limit marker. Logs share the existing overflow policy;
+RPC completion accounting does not depend on successful log publication.
+Metrics use bounded status labels, with service/method paths available in logs
+rather than unbounded client-controlled Prometheus labels. Pre-admission
+rejections retain the existing HTTP error path and are not counted as admitted
+RPCs. The source live-log writer retains its configured bytes-only output.
+
 Header-only route handlers can forward gRPC. Body-dependent handlers,
-HTTP/1-specific forwarding policies, gRPC-Web, JSON transcoding, upstream
-TLS/mTLS and gRPC health checks remain outside this path. The frontend rejects
+HTTP/1-specific forwarding policies, gRPC-Web, JSON transcoding and gRPC
+health checks remain outside this path. The frontend rejects
 `.http2` combined with the HTTP/1 health-check configuration. See
 [examples/grpc.rut](examples/grpc.rut) and the language card.
 
@@ -3883,10 +3924,10 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 
 | Feature | Requirement |
 |---------|------------|
-| Native gRPC proxy | Implemented over h2c upstream; see §3.4.1 |
+| Native gRPC proxy | Implemented over h2c or TLS/mTLS upstream; see §3.4.1 |
 | gRPC-REST transcoding | HTTP/2 + protobuf definitions |
 | gRPC-Web | HTTP/2 + gRPC-Web protocol |
-| HTTP/2 upstream | Implemented for native gRPC forwarding over h2c |
+| HTTP/2 upstream | Implemented for native gRPC over h2c or TLS/mTLS |
 | mTLS (client certs) | OpenSSL client cert validation |
 | Dynamic SSL / ACME | ACME protocol + cert management |
 

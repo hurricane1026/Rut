@@ -15921,6 +15921,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.upstream.addr_span,
                                   {"HTTP/2 health checks are not supported", 37});
+        up.tls = item.upstream.tls;
+        if (up.tls.enabled && !item.upstream.http2)
+            return frontend_error(FrontendError::UnsupportedSyntax, item.upstream.addr_span);
         up.http2 = item.upstream.http2;
         up.hc_enabled = item.upstream.hc_enabled;
         up.hc_path = item.upstream.hc_path_lit;

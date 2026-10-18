@@ -68,6 +68,26 @@ bool load(Source& source, NativeProgram& p, u8 opt = 2) {
 }
 }  // namespace
 
+TEST(native_program, upstream_tls_configuration_is_owned_after_compiler_exit) {
+    Source source;
+    REQUIRE(
+        source.append("upstream secure { host: \"127.0.0.1\", port: 443, protocol: .http2, "
+                      "tls: { ca: \"ca.pem\", server_name: \"backend.example\", "
+                      "cert: \"client.pem\", key: \"client.key\" } }\n"
+                      "route POST \"/test.Echo/Call\" { return forward(secure) }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& target = owner.p->config.upstreams[0];
+    CHECK(target.http2);
+    CHECK(target.tls.enabled);
+    CHECK_EQ(strcmp(target.tls.ca, "ca.pem"), 0);
+    CHECK_EQ(strcmp(target.tls.server_name, "backend.example"), 0);
+    CHECK_EQ(strcmp(target.tls.cert, "client.pem"), 0);
+    CHECK_EQ(strcmp(target.tls.key, "client.key"), 0);
+}
+
 TEST(native_program, code_and_views_survive_compiler_exit_and_source_removal) {
     Source source;
     REQUIRE(source.append(

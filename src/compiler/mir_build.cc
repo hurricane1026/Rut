@@ -1180,6 +1180,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             up.extra_ips[b] = module.upstreams[i].extra_ips[b];
             up.extra_ports[b] = module.upstreams[i].extra_ports[b];
         }
+        up.tls = module.upstreams[i].tls;
         up.http2 = module.upstreams[i].http2;
         up.hc_enabled = module.upstreams[i].hc_enabled;
         up.hc_path = module.upstreams[i].hc_path;

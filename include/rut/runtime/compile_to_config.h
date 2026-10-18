@@ -561,6 +561,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             }
             // Attach active health-check config (data only; the frontend already
             // validated path/interval). Fails only on an over-long path.
+            if (!valid_upstream_tls(up.tls) || (up.tls.enabled && !up.http2)) return false;
+            cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
             if (up.hc_enabled) {
                 if (!cfg.set_upstream_health_check(i,
@@ -601,6 +603,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
         // empty-upstreams branch above. Fails only on an over-long path.
         for (u32 i = 0; i < mod.upstream_count; i++) {
             const auto& up = mod.upstreams[i];
+            if (!valid_upstream_tls(up.tls) || (up.tls.enabled && !up.http2)) return false;
+            cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
             if (up.hc_enabled) {
                 if (!cfg.set_upstream_health_check(i,
