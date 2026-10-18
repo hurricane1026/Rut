@@ -255,6 +255,15 @@ bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 // upstream timeout from the timer tick, 502 on failure) and tear down the
 // upstream side. Defined in callbacks_impl.h.
 template <typename Loop>
+void grpc_tls_ready(Loop* loop, Connection& conn);
+void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us);
+template <typename Loop>
+inline void grpc_record_handshake_result(Loop* loop, Connection& conn, bool success, u64 now_us) {
+    const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
+    if (current != conn.request_config) return;
+    grpc_record_handshake_result(conn, success, now_us);
+}
+template <typename Loop>
 void grpc_tick(Loop* loop, Connection& conn);
 template <typename Loop>
 void on_h2_data(void* lp, Connection& conn, IoEvent ev);

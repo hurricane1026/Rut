@@ -9,6 +9,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
+#include "rut/common/upstream_tls.h"
 #include "rut/runtime/arena.h"
 
 namespace rut {
@@ -533,6 +534,7 @@ struct Module {
         // Active health-check config carried verbatim from MIR (data only; the
         // compile→config helper feeds it to set_upstream_health_check). hc_path
         // is a Str copied into UpstreamTarget::hc_path there.
+        UpstreamTlsSpec tls{};
         bool http2 = false;
         bool hc_enabled = false;
         Str hc_path;

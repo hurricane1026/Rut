@@ -2854,3 +2854,73 @@ TEST(http2_conn, goaway_refuses_new_stream_without_interrupting_existing_stream)
     CHECK_EQ(cap.data_len, 4u);
     CHECK(has_frame(out, written, Http2FrameType::RstStream, 3, 0));
 }
+
+TEST(h2_serving, partial_frame_promotion_handles_nonzero_sub_frame_tail_capacity) {
+    FakeH2Loop loop;
+    Connection conn;
+    conn.reset();
+    conn.bind_request_receive_buffer(loop.pool.alloc(), SlicePool::kSliceSize);
+    conn.send_slice = loop.pool.alloc();
+    conn.send_buf.bind(conn.send_slice, SlicePool::kSliceSize);
+    REQUIRE(conn.recv_slice && conn.send_slice);
+    conn.recv_buf.write(kClientPreface, kClientPrefaceLen);
+    Http2Settings settings;
+    settings.set_defaults();
+    u8 initial[64];
+    const u32 settings_len = write_settings_frame(initial, settings);
+    conn.recv_buf.write(initial, settings_len);
+    // An unknown extension frame is legal and has the same buffering needs as
+    // a maximum-size DATA frame without requiring a stream callback fixture.
+    Http2FrameHeader frame{};
+    frame.type = 0xff;
+    frame.length = kDefaultMaxFrameSize;
+    write_frame_header(conn.recv_buf.write_ptr(), frame);
+    conn.recv_buf.commit(kFrameHeaderSize);
+    const u32 filled = conn.recv_buf.len();
+    __builtin_memset(conn.recv_buf.write_ptr(), 0x5a, conn.recv_buf.write_avail());
+    conn.recv_buf.commit(conn.recv_buf.write_avail());
+    enter_h2(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0});
+    CHECK(!loop.closed);
+    const u32 partial = SlicePool::kSliceSize - kClientPrefaceLen - settings_len;
+    CHECK_EQ(conn.recv_buf.len(), partial);
+    CHECK(loop.pool.is_bulk(conn.recv_slice));
+    CHECK_GE(conn.recv_buf.write_avail(), kDefaultMaxFrameSize);
+    CHECK_EQ(conn.recv_buf.data()[3], 0xff);
+    for (u32 i = kFrameHeaderSize; i < partial; i++) CHECK_EQ(conn.recv_buf.data()[i], 0x5a);
+    const u32 remaining = kDefaultMaxFrameSize - (SlicePool::kSliceSize - filled);
+    __builtin_memset(conn.recv_buf.write_ptr(), 0x5a, remaining);
+    conn.recv_buf.commit(remaining);
+    on_h2_data<FakeH2Loop>(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0});
+    CHECK(!loop.closed);
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    loop.pool.free(conn.recv_slice);
+    loop.pool.free(conn.send_slice);
+}
+
+TEST(h2_serving, partial_frame_promotion_failure_preserves_owned_slice) {
+    FakeH2Loop loop;
+    Connection conn;
+    conn.reset();
+    conn.bind_request_receive_buffer(loop.pool.alloc(), SlicePool::kSliceSize);
+    REQUIRE(conn.recv_slice);
+    conn.recv_buf.write(kClientPreface, kClientPrefaceLen);
+    u8 partial[kFrameHeaderSize + 1];
+    Http2FrameHeader frame{};
+    frame.type = 0xff;
+    frame.length = kDefaultMaxFrameSize;
+    write_frame_header(partial, frame);
+    partial[kFrameHeaderSize] = 0x5a;
+    conn.recv_buf.write(partial, sizeof(partial));
+    u8* original = conn.recv_slice;
+    const u32 bulk_max = loop.pool.bulk_max_count;
+    loop.pool.bulk_max_count = 0;
+    enter_h2(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0});
+    loop.pool.bulk_max_count = bulk_max;
+    CHECK(loop.closed);
+    CHECK(!loop.send_submitted);
+    CHECK(!loop.recv_submitted);
+    CHECK_EQ(conn.recv_slice, original);
+    CHECK_EQ(conn.recv_buf.len(), sizeof(partial));
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), partial, sizeof(partial)), 0);
+    loop.pool.free(conn.recv_slice);
+}

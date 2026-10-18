@@ -10,6 +10,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
+#include "rut/common/upstream_tls.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -53,6 +54,7 @@ struct HirUpstream {
     // this slice). hc_enabled gates the rest. path/interval required when set;
     // status defaults to 200. hc_path is a Str (like name) copied into a char
     // buffer at populate_route_config via set_upstream_health_check.
+    UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
     Str hc_path{};

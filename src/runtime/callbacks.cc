@@ -21,6 +21,13 @@
 
 namespace rut {
 
+void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us) {
+    if (success) return;
+    if (conn.h2 == nullptr || conn.h2->grpc.session_failure_recorded) return;
+    conn.h2->grpc.session_failure_recorded = true;
+    grpc_record_connect_result(conn, success, now_us);
+}
+
 #ifdef __APPLE__
 using NativeReactorEventLoop = KqueueEventLoop;
 #else
@@ -1266,6 +1273,7 @@ template void resume_jit_handler<IoUringEventLoop>(IoUringEventLoop*, Connection
 template void respond_upstream_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void respond_request_body_overflow<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void h2_proxy_fail<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16);
+template void grpc_tls_ready<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void grpc_tick<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void grpc_deadline_fired<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void throttle_resume<IoUringEventLoop>(IoUringEventLoop*, Connection&);

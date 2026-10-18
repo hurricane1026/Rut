@@ -83,7 +83,8 @@ struct AccessLogEntry {
     char upstream[24];  // upstream name, null-terminated
     u16 target_length;
     AccessLogTargetState target_state;
-    u8 _pad[5];
+    u8 grpc_status_plus_one;  // zero for HTTP; 1..17 encode canonical gRPC status 0..16
+    u8 _pad[4];
 };
 
 static_assert(offsetof(AccessLogEntry, timestamp_us) == 0);
@@ -99,6 +100,7 @@ static_assert(offsetof(AccessLogEntry, path) == 32);
 static_assert(offsetof(AccessLogEntry, upstream) == 160);
 static_assert(offsetof(AccessLogEntry, target_length) == 184);
 static_assert(offsetof(AccessLogEntry, target_state) == 186);
+static_assert(offsetof(AccessLogEntry, grpc_status_plus_one) == 187);
 static_assert(sizeof(AccessLogEntry) == 192, "AccessLogEntry must be 192 bytes");
 static_assert(alignof(AccessLogEntry) == 8, "AccessLogEntry must retain scalar-prefix alignment");
 

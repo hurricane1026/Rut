@@ -1,3 +1,4 @@
+#include "posix.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
@@ -6,6 +7,7 @@
 #include "test_helpers.h"
 
 #include <nghttp2/nghttp2.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #if RUT_GRPC_JIT
 #include "rut/serve_loader.h"
@@ -113,6 +115,11 @@ struct EchoServer {
     std::atomic<u32> reply_mode{0};
     std::atomic<u32> request_trailers{0};
     bool started = false;
+    TlsServerContext* tls_context = nullptr;
+    std::atomic<u32> handshake_failures{0};
+    std::atomic<bool> saw_sni{false};
+    std::atomic<bool> saw_client_cert{false};
+    std::atomic<u32> bad_schemes{0};
     Stream* get(int id) {
         for (auto& s : streams)
             if (s.id == id) return &s;
@@ -199,6 +206,21 @@ struct EchoServer {
         }
         return 0;
     }
+    static int header(nghttp2_session*,
+                      const nghttp2_frame*,
+                      const uint8_t* name,
+                      size_t name_len,
+                      const uint8_t* value,
+                      size_t value_len,
+                      uint8_t,
+                      void* user) {
+        if (name_len != 7 || memcmp(name, ":scheme", 7) != 0) return 0;
+        auto* server = static_cast<EchoServer*>(user);
+        const char* expected = server->tls_context ? "https" : "http";
+        if (value_len != strlen(expected) || memcmp(value, expected, value_len) != 0)
+            server->bad_schemes++;
+        return 0;
+    }
     static int data(nghttp2_session* session,
                     uint8_t,
                     int32_t id,
@@ -222,31 +244,67 @@ struct EchoServer {
             self->accepts++;
             for (auto& stream : self->streams) stream = {};
             set_socket_timeouts(self->fd, 2);
+            SSL* ssl = nullptr;
+            if (self->tls_context) {
+                auto created = create_tls_server_ssl(self->tls_context, self->fd);
+                if (created) ssl = created.value();
+                if (!ssl || SSL_accept(ssl) != 1) {
+                    self->handshake_failures++;
+                    if (ssl) SSL_free(ssl);
+                    close(self->fd);
+                    self->fd = -1;
+                    continue;
+                }
+                const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+                self->saw_sni = name && strcmp(name, "localhost") == 0;
+                X509* peer = SSL_get1_peer_certificate(ssl);
+                self->saw_client_cert = peer != nullptr;
+                if (peer) X509_free(peer);
+            }
             nghttp2_session_callbacks* cb;
             nghttp2_session_callbacks_new(&cb);
             nghttp2_session_callbacks_set_on_frame_recv_callback(cb, &frame);
+            nghttp2_session_callbacks_set_on_header_callback(cb, &header);
             nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, &data);
             nghttp2_session* session;
             nghttp2_session_server_new(&session, cb, self);
             nghttp2_session_callbacks_del(cb);
             nghttp2_submit_settings(session, 0, nullptr, 0);
-            flush_session(session, self->fd);
+            flush_session(session, self->fd, ssl);
             while (!self->stop.load()) {
                 pollfd r{self->fd, POLLIN, 0};
-                if (poll(&r, 1, 20) <= 0) continue;
+                if ((!ssl || !SSL_has_pending(ssl)) && poll(&r, 1, 20) <= 0) continue;
                 u8 bytes[16384];
-                const ssize_t n = recv(self->fd, bytes, sizeof(bytes), 0);
+                const ssize_t n = ssl ? SSL_read(ssl, bytes, sizeof(bytes))
+                                      : recv(self->fd, bytes, sizeof(bytes), 0);
                 if (n <= 0 || nghttp2_session_mem_recv(session, bytes, n) != n ||
-                    !flush_session(session, self->fd))
+                    !flush_session(session, self->fd, ssl))
                     break;
             }
             nghttp2_session_del(session);
+            if (ssl) SSL_free(ssl);
             close(self->fd);
             self->fd = -1;
         }
         return nullptr;
     }
-    bool start() {
+    bool start(bool tls = false, bool mutual = false, bool h2 = true) {
+        if (tls) {
+            auto context = create_tls_server_context(RUT_GRPC_FIXTURES "/localhost_cert.pem",
+                                                     RUT_GRPC_FIXTURES "/localhost_key.pem",
+                                                     h2);
+            if (!context) return false;
+            tls_context = context.value();
+            if (mutual) {
+                if (SSL_CTX_load_verify_locations(tls_context->ssl_ctx,
+                                                  RUT_GRPC_FIXTURES "/localhost_cert.pem",
+                                                  nullptr) != 1)
+                    return false;
+                SSL_CTX_set_verify(tls_context->ssl_ctx,
+                                   SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                                   nullptr);
+            }
+        }
         listen_fd = create_listen_socket(0).value_or(-1);
         if (listen_fd < 0) return false;
         started = pthread_create(&thread, nullptr, &run, this) == 0;
@@ -256,6 +314,7 @@ struct EchoServer {
         stop = true;
         if (started) pthread_join(thread, nullptr);
         if (listen_fd >= 0) close(listen_fd);
+        destroy_tls_server_context(tls_context);
     }
 };
 struct Client {
@@ -433,9 +492,13 @@ struct Client {
 };
 
 template <typename Loop>
-void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
+void streaming_case(rut::test::TestCase* _tc,
+                    bool tls = false,
+                    bool large_first = false,
+                    bool upstream_tls = false,
+                    bool mutual = false) {
     auto server = std::make_unique<EchoServer>();
-    REQUIRE(server->start());
+    REQUIRE(server->start(upstream_tls, mutual));
     auto shard = std::make_unique<Shard<Loop>>();
     const int lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
@@ -443,10 +506,21 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
         close(lfd);
         SKIP("backend unavailable");
     }
+    REQUIRE(shard->init_access_log().has_value());
     RouteConfig cfg;
     REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)).has_value());
     cfg.upstreams[0].http2 = true;
     CHECK_EQ(cfg.upstreams[0].addr_count, 1u);
+    if (upstream_tls) {
+        auto& spec = cfg.upstreams[0].tls;
+        spec.enabled = true;
+        strcpy(spec.ca, RUT_GRPC_FIXTURES "/localhost_cert.pem");
+        strcpy(spec.server_name, "localhost");
+        if (mutual) {
+            strcpy(spec.cert, RUT_GRPC_FIXTURES "/localhost_cert.pem");
+            strcpy(spec.key, RUT_GRPC_FIXTURES "/localhost_key.pem");
+        }
+    }
     REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
     REQUIRE(cfg.add_jit_handler("/jit.Echo/", 'P', &grpc_jit_forward, false));
     REQUIRE(cfg.add_jit_handler("/jitwait.Echo/", 'P', &grpc_jit_timer_forward, false));
@@ -457,19 +531,31 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
         ~Program() { program.destroy(); }
     };
     auto compiled = std::make_unique<Program>();
-    if (tls) {
+    if (tls || upstream_tls) {
         char path[] = "/tmp/rut-grpc-XXXXXX";
         const int file = mkstemp(path);
         REQUIRE(file >= 0);
-        char source[512];
+        char source[2048];
+        char tls_fields[1024]{};
+        if (upstream_tls) {
+            snprintf(tls_fields,
+                     sizeof(tls_fields),
+                     ", tls: { ca: \"%s\", server_name: \"localhost\"%s }",
+                     RUT_GRPC_FIXTURES "/localhost_cert.pem",
+                     mutual ? ", cert: \"" RUT_GRPC_FIXTURES
+                              "/localhost_cert.pem\", key: \"" RUT_GRPC_FIXTURES
+                              "/localhost_key.pem\""
+                            : "");
+        }
         const int len =
             snprintf(source,
                      sizeof(source),
-                     "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
+                     "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2%s }\n"
                      "route POST \"/test.Echo/Call\" { return forward(grpc) }\n"
                      "route POST \"/jit.Echo/Call\" { return forward(grpc) }\n"
                      "route POST \"/jitwait.Echo/Call\" { wait(100) return forward(grpc) }\n",
-                     get_port(server->listen_fd));
+                     get_port(server->listen_fd),
+                     tls_fields);
         const bool written = write(file, source, len) == len;
         close(file);
         LoadError error;
@@ -495,7 +581,7 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
         const bool connected = a.init(get_port(lfd), tls) && b.init(get_port(lfd), tls);
         CHECK(connected);
         if (connected) {
-            CHECK_EQ(a.request(0, 128, false), 1);
+            CHECK_EQ(a.request(0, large_first ? 200000 : 128, false), 1);
             const bool echoed = a.until(0, false);
             CHECK(echoed);  // response DATA arrives before request END_STREAM
             if (echoed) {
@@ -508,12 +594,12 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
                 CHECK_EQ(b.request(0, 64, true), 1);
                 CHECK(b.until(0, true));  // a second downstream shares the same upstream
                 CHECK(b.rpcs[0].ok);
-                a.rpcs[0].size = 100000;
+                a.rpcs[0].size = large_first ? 300000 : 100000;
                 a.rpcs[0].end = true;
                 CHECK_EQ(nghttp2_session_resume_data(a.session, 1), 0);
                 CHECK(a.until(0, true));
                 CHECK(a.rpcs[0].ok && a.rpcs[0].trailer);
-                CHECK_EQ(a.rpcs[0].received, 100000u);
+                CHECK_EQ(a.rpcs[0].received, large_first ? 300000u : 100000u);
                 CHECK_EQ(server->accepts.load(), 1u);
                 CHECK_EQ(server->requests.load(), 3u);
                 CHECK_EQ(a.request(2, 32, false), 5);
@@ -586,6 +672,13 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
                 CHECK_EQ(a.request(12, 0, true), 25);
                 CHECK(a.until(12, true));
                 CHECK(a.rpcs[12].ok);
+                // A client disconnect retires its open RPC as CANCELLED.
+                {
+                    Client disconnected;
+                    CHECK(disconnected.init(get_port(lfd), tls));
+                    CHECK_EQ(disconnected.request(0, 32, false), 1);
+                    CHECK(disconnected.until(0, false));
+                }
                 // Draining sends GOAWAY but lets a bidirectional RPC finish.
                 CHECK_EQ(a.request(13, 4096, true, nullptr, true), 27);
                 CHECK(a.until(13, true));
@@ -621,10 +714,45 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
     }
     shard->stop();
     shard->join();
-    CHECK_EQ(shard->shard_metrics.connections_total, 2u);
+    CHECK_EQ(shard->shard_metrics.connections_total, 3u);
     shard->loop->force_close_all();
     CHECK_EQ(shard->shard_metrics.connections_active, 0u);
-    CHECK_EQ(shard->shard_metrics.connections_closed, 2u);
+    CHECK_EQ(shard->shard_metrics.connections_closed, 3u);
+    const auto& metrics = shard->shard_metrics;
+    CHECK_EQ(metrics.grpc_started, 20u);
+    CHECK_EQ(metrics.grpc_active, 0u);
+    CHECK_EQ(metrics.grpc_completed[0], 14u);
+    CHECK_EQ(metrics.grpc_completed[1], 2u);
+    CHECK_EQ(metrics.grpc_completed[4], 1u);
+    CHECK_EQ(metrics.grpc_completed[7], 2u);
+    CHECK_EQ(metrics.grpc_completed[14], 1u);
+    CHECK_EQ(metrics.grpc_latency.count, 20u);
+    CHECK_EQ(server->bad_schemes.load(), 0u);
+    if (upstream_tls) {
+        CHECK(server->saw_sni.load());
+        CHECK_EQ(server->saw_client_cert.load(), mutual);
+    }
+    AccessLogEntry entry;
+    u32 logs = 0;
+    u32 statuses[17]{};
+    bool large_call = false;
+    while (shard->log_ring->pop(entry)) {
+        logs++;
+        CHECK_EQ(entry.status, 200u);
+        CHECK_EQ(entry.method, static_cast<u8>(LogHttpMethod::Post));
+        CHECK_EQ(entry.target_state, AccessLogTargetState::Complete);
+        const Str path{entry.path, entry.target_length};
+        CHECK(path.eq(lit_str("/test.Echo/Call")) || path.eq(lit_str("/jit.Echo/Call")) ||
+              path.eq(lit_str("/jitwait.Echo/Call")));
+        CHECK(strcmp(entry.upstream, "grpc") == 0);
+        CHECK(entry.grpc_status_plus_one >= 1 && entry.grpc_status_plus_one <= 17);
+        if (entry.grpc_status_plus_one >= 1 && entry.grpc_status_plus_one <= 17)
+            statuses[entry.grpc_status_plus_one - 1]++;
+        if (entry.req_size == 200000 && entry.resp_size == 200000) large_call = true;
+    }
+    CHECK_EQ(logs, 20u);
+    CHECK(large_call);
+    for (u32 code = 0; code < 17; code++) CHECK_EQ(statuses[code], metrics.grpc_completed[code]);
     if (shard->loop->listen_fd >= 0) {
         close(shard->loop->listen_fd);
         shard->loop->listen_fd = -1;
@@ -634,6 +762,9 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
 }
 
 struct GrpcDriveFixture {
+    ShardMetrics* metrics = nullptr;
+    AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
     Connection* grpc_upstreams = nullptr;
     const RouteConfig** config_ptr = nullptr;
     TimerWheel timer;
@@ -1521,6 +1652,55 @@ TEST(grpc_proxy, nonzero_grpc_status_clears_backend_health) {
     CHECK_FALSE(x.slot_held);
 }
 
+TEST(grpc_proxy, trailers_only_status_observes_response_mutations) {
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    Connection downstream;
+    downstream.reset();
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    GrpcExchange x;
+    x.init();
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = x.downstream_stream = 1;
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    upstream_h2.grpc.active = downstream_h2.grpc.active = 1;
+    downstream.resp_header_mutations[0] = {
+        {"grpc-status", 11}, {"7", 1}, Connection::RespHeaderMutationMode::Set};
+    downstream.resp_header_mutation_count = 1;
+    REQUIRE(grpc_snapshot_response_mutations(downstream, x));
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const hpack::Header response[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"grpc-status", 11}, {"0", 1}},
+    };
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, response, 3, true);
+    CHECK_EQ(x.response_status, 7u);
+    CHECK_EQ(x.failure, 0u);
+
+    // Snapshot a second Add mutation through the public mutation path so a
+    // duplicate grpc-status is classified as UNKNOWN after filtering.
+    downstream.resp_header_mutations[0] = {
+        {"grpc-status", 11}, {"0", 1}, Connection::RespHeaderMutationMode::Add};
+    REQUIRE(grpc_snapshot_response_mutations(downstream, x));
+    hpack::Header filtered[8];
+    u32 filtered_n = 1;
+    filtered[0] = response[2];
+    REQUIRE(grpc_apply_response_mutations(x, filtered, &filtered_n, 8));
+    CHECK_EQ(grpc_observed_status(filtered, filtered_n), 2u);
+}
+
 TEST(grpc_proxy, parser_failure_records_active_session_once) {
     GrpcBackendHealthReset health_reset{};
     auto* health = backend_health(0, 0);
@@ -1542,6 +1722,61 @@ TEST(grpc_proxy, parser_failure_records_active_session_once) {
     CHECK(loop.closed);
     CHECK_EQ(health->fails, 1u);
     grpc_record_session_failure(&loop, conn, monotonic_us());
+    CHECK_EQ(health->fails, 1u);
+}
+
+TEST(grpc_proxy, rejected_tls_identity_ejects_backend_once) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    GrpcDriveFixture loop;
+    RouteConfig cfg;
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    Connection conn;
+    conn.reset();
+    conn.request_config = &cfg;
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    Http2Conn h2;
+    h2.init_client();
+    h2.grpc.upstream = true;
+    h2.grpc.client_tls.ssl_ctx = SSL_CTX_new(TLS_client_method());
+    REQUIRE(h2.grpc.client_tls.ssl_ctx != nullptr);
+    conn.h2 = &h2;
+    conn.tls = SSL_new(h2.grpc.client_tls.ssl_ctx);
+    REQUIRE(conn.tls != nullptr);
+    u8 send_bytes[] = {0};
+    conn.send_buf.bind(send_bytes, sizeof(send_bytes));
+    conn.send_buf.commit(1);
+    grpc_on_upstream_sent<GrpcDriveFixture>(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Send, 0});
+    CHECK(loop.closed);
+    CHECK_EQ(health->fails, 1u);
+    grpc_record_handshake_result(&loop, conn, false, monotonic_us());
+    CHECK_EQ(health->fails, 1u);
+    SSL_free(conn.tls);
+    conn.tls = nullptr;
+    SSL_CTX_free(h2.grpc.client_tls.ssl_ctx);
+    h2.grpc.client_tls.ssl_ctx = nullptr;
+
+    health->fails = 0;
+    RouteConfig bad_tls_cfg;
+    REQUIRE(bad_tls_cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    bad_tls_cfg.upstreams[0].http2 = true;
+    bad_tls_cfg.upstreams[0].tls.enabled = true;
+    active = &bad_tls_cfg;
+    Connection setup_failure;
+    setup_failure.reset();
+    setup_failure.request_config = &bad_tls_cfg;
+    setup_failure.upstream_idx = 0;
+    setup_failure.upstream_backend_idx = 0;
+    Http2Conn setup_h2;
+    setup_h2.init_client();
+    setup_h2.grpc.upstream = true;
+    setup_failure.h2 = &setup_h2;
+    grpc_connected<GrpcDriveFixture>(
+        &loop, setup_failure, {setup_failure.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+    CHECK(loop.closed);
     CHECK_EQ(health->fails, 1u);
 }
 
@@ -1622,6 +1857,12 @@ TEST(grpc_proxy, streaming_and_pooling_epoll) {
 }
 TEST(grpc_proxy, streaming_and_pooling_iouring) {
     streaming_case<IoUringEventLoop>(_tc);
+}
+TEST(grpc_proxy, first_large_streaming_rpc_epoll) {
+    streaming_case<EpollEventLoop>(_tc, false, true);
+}
+TEST(grpc_proxy, first_large_streaming_rpc_iouring) {
+    streaming_case<IoUringEventLoop>(_tc, false, true);
 }
 TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
     GrpcBackendHealthReset health_reset{};
@@ -2876,6 +3117,268 @@ TEST(grpc_proxy, tls_downstream_jit_epoll) {
 TEST(grpc_proxy, tls_downstream_jit_iouring) {
     streaming_case<IoUringEventLoop>(_tc, true);
 }
+TEST(grpc_proxy, upstream_tls_epoll) {
+    streaming_case<EpollEventLoop>(_tc, false, false, true);
+}
+TEST(grpc_proxy, upstream_tls_iouring) {
+    streaming_case<IoUringEventLoop>(_tc, false, false, true);
+}
+TEST(grpc_proxy, upstream_mtls_epoll) {
+    streaming_case<EpollEventLoop>(_tc, true, false, true, true);
+}
+TEST(grpc_proxy, upstream_mtls_iouring) {
+    streaming_case<IoUringEventLoop>(_tc, true, false, true, true);
+}
+
+namespace {
+// mode: hostname mismatch, missing client identity, ALPN mismatch, untrusted CA,
+// missing CA file, or a mismatched client key.
+template <typename Loop>
+void tls_rejection_case(rut::test::TestCase* _tc, u32 mode) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start(true, mode == 1, mode != 2));
+    struct TemporaryCa {
+        char path[64] = "/tmp/rut-grpc-untrusted-XXXXXX";
+        bool created = false;
+        ~TemporaryCa() {
+            if (created) unlink(path);
+        }
+    } temporary_ca;
+    if (mode == 3) {
+        EVP_PKEY* key = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "prime256v1");
+        REQUIRE(key);
+        X509* cert = X509_dup(SSL_CTX_get0_certificate(server->tls_context->ssl_ctx));
+        REQUIRE(cert);
+        const bool signed_cert =
+            X509_set_pubkey(cert, key) == 1 && X509_sign(cert, key, EVP_sha256()) > 0;
+        EVP_PKEY_free(key);
+        const i32 file = mkstemp(temporary_ca.path);
+        temporary_ca.created = file >= 0;
+        FILE* output = file >= 0 ? fdopen(file, "w") : nullptr;
+        const bool written = output && PEM_write_X509(output, cert) == 1;
+        if (output)
+            fclose(output);
+        else if (file >= 0)
+            close(file);
+        X509_free(cert);
+        REQUIRE(signed_cert && written);
+    } else if (mode == 5 || mode == 6) {
+        EVP_PKEY* key = nullptr;
+        if (mode == 6) {
+            FILE* input = fopen(RUT_GRPC_FIXTURES "/localhost_key.pem", "r");
+            REQUIRE(input);
+            key = PEM_read_PrivateKey(input, nullptr, nullptr, nullptr);
+            fclose(input);
+        } else {
+            key = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "prime256v1");
+        }
+        REQUIRE(key);
+        const i32 file = mkstemp(temporary_ca.path);
+        temporary_ca.created = file >= 0;
+        FILE* output = file >= 0 ? fdopen(file, "w") : nullptr;
+        const bool written =
+            output && PEM_write_PrivateKey(
+                          output,
+                          key,
+                          mode == 6 ? EVP_aes_256_cbc() : nullptr,
+                          mode == 6 ? reinterpret_cast<const unsigned char*>("secret") : nullptr,
+                          mode == 6 ? 6 : 0,
+                          nullptr,
+                          nullptr) == 1;
+        if (output)
+            fclose(output);
+        else if (file >= 0)
+            close(file);
+        EVP_PKEY_free(key);
+        REQUIRE(written);
+    }
+    auto shard = std::make_unique<Shard<Loop>>();
+    const i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    RouteConfig config;
+    REQUIRE(config.add_upstream("secure", 0x7f000001, get_port(server->listen_fd)));
+    auto& target = config.upstreams[0];
+    target.http2 = true;
+    target.tls.enabled = true;
+    strcpy(target.tls.ca, mode == 3 ? temporary_ca.path : RUT_GRPC_FIXTURES "/localhost_cert.pem");
+    strcpy(target.tls.server_name, mode == 0 ? "wrong.example" : "localhost");
+    if (mode == 4) strcpy(target.tls.ca, "/nonexistent/rut-grpc-ca.pem");
+    if (mode == 5 || mode == 6) {
+        strcpy(target.tls.cert, RUT_GRPC_FIXTURES "/localhost_cert.pem");
+        strcpy(target.tls.key, temporary_ca.path);
+    }
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+    {
+        Client client;
+        CHECK(client.init(get_port(listener)));
+        if (client.session) {
+            CHECK_EQ(client.request(0, 1024, true), 1);
+            CHECK(client.until(0, true));
+            CHECK_EQ(client.rpcs[0].status, 14u);
+        }
+    }
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    CHECK_EQ(server->requests.load(), 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[14], 1u);
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+}  // namespace
+TEST(grpc_proxy, upstream_tls_rejections_epoll) {
+    for (u32 mode = 0; mode < 7; mode++) tls_rejection_case<EpollEventLoop>(_tc, mode);
+}
+TEST(grpc_proxy, upstream_tls_rejections_iouring) {
+    for (u32 mode = 0; mode < 7; mode++) tls_rejection_case<IoUringEventLoop>(_tc, mode);
+}
+
+TEST(grpc_proxy, observed_status_metadata) {
+    const hpack::Header ok[] = {{{"grpc-status", 11}, {"0", 1}}};
+    const hpack::Header denied[] = {{{"grpc-status", 11}, {"7", 1}}};
+    const hpack::Header unauthenticated[] = {{{"grpc-status", 11}, {"16", 2}}};
+    const hpack::Header invalid[] = {{{"grpc-status", 11}, {"17", 2}}};
+    const hpack::Header nonnumeric[] = {{{"grpc-status", 11}, {"x", 1}}};
+    const hpack::Header duplicate[] = {ok[0], denied[0]};
+    const hpack::Header leading_zero[] = {{{"grpc-status", 11}, {"00", 2}}};
+    CHECK_EQ(grpc_observed_status(ok, 1), 0u);
+    CHECK_EQ(grpc_observed_status(leading_zero, 1), 0u);
+    CHECK_EQ(grpc_observed_status(denied, 1), 7u);
+    CHECK_EQ(grpc_observed_status(unauthenticated, 1), 16u);
+    CHECK_EQ(grpc_observed_status(invalid, 1), 2u);
+    CHECK_EQ(grpc_observed_status(nonnumeric, 1), 2u);
+    CHECK_EQ(grpc_observed_status(duplicate, 2), 2u);
+    CHECK_EQ(grpc_observed_status(nullptr, 0), 2u);
+}
+TEST(grpc_proxy, log_target_snapshot_and_bounds) {
+    AccessLogEntry entry{};
+    char path[] = "/service/Method";
+    grpc_log_target(entry, {path, sizeof(path) - 1});
+    path[1] = 'x';
+    CHECK_EQ(entry.target_state, AccessLogTargetState::Complete);
+    CHECK(memcmp(entry.path, "/service/Method", sizeof(path) - 1) == 0);
+    char long_path[kAccessLogCompleteTargetMax + 1];
+    memset(long_path, 'x', sizeof(long_path));
+    long_path[0] = '/';
+    grpc_log_target(entry, {long_path, sizeof(long_path)});
+    CHECK_EQ(entry.target_state, AccessLogTargetState::OverLimit);
+    CHECK_EQ(entry.target_length, sizeof(long_path));
+    grpc_log_target(entry, {"/bad\npath", 9});
+    CHECK_EQ(entry.target_state, AccessLogTargetState::Invalid);
+    grpc_log_target(entry, {});
+    CHECK_EQ(entry.target_state, AccessLogTargetState::Invalid);
+}
+
+TEST(grpc_proxy, log_overflow_does_not_duplicate_or_lose_rpc_accounting) {
+    ShardMetrics metrics;
+    metrics.init();
+    auto ring = std::make_unique<AccessLogRing>();
+    ring->init();
+    AccessLogEntry entry{};
+    for (u32 i = 0; i < AccessLogRing::kCapacity; i++) CHECK(ring->push(entry));
+    struct Loop {
+        ShardMetrics* metrics;
+        AccessLogRing* access_log;
+        SourceLiveAccessLogProducer* live_access_log;
+    } loop{&metrics, ring.get(), nullptr};
+    auto exchange = std::make_unique<GrpcExchange>();
+    exchange->init();
+    exchange->observed = true;
+    exchange->started_us = monotonic_us();
+    exchange->failure = 4;
+    exchange->response_end_sent = true;
+    metrics.on_grpc_start();
+    grpc_observe(&loop, *exchange);
+    grpc_observe(&loop, *exchange);
+    CHECK_EQ(metrics.grpc_active, 0u);
+    CHECK_EQ(metrics.grpc_completed[4], 1u);
+    CHECK_EQ(metrics.grpc_latency.count, 1u);
+    CHECK_EQ(ring->available(), AccessLogRing::kCapacity);
+}
+
+TEST(grpc_proxy, late_failed_upload_data_is_included_in_access_log) {
+    auto transport = std::make_unique<EpollEventLoop>();
+    auto down = std::make_unique<Connection>();
+    down->reset();
+    auto h2 = std::make_unique<Http2Conn>();
+    h2->init();
+    down->h2 = h2.get();
+    auto exchange = std::make_unique<GrpcExchange>();
+    exchange->init();
+    exchange->request_bytes = 100;
+    exchange->failure = 14;
+    grpc_request_data(transport.get(), *down, *exchange, nullptr, 77, false);
+    exchange->failure = 0;  // upstream already detached; late DATA is discarded
+    grpc_request_data(transport.get(), *down, *exchange, nullptr, 23, false);
+    exchange->failure = 14;
+    exchange->observed = true;
+    exchange->response_end_sent = true;
+    exchange->started_us = monotonic_us();
+    auto ring = std::make_unique<AccessLogRing>();
+    ring->init();
+    struct LogLoop {
+        ShardMetrics* metrics;
+        AccessLogRing* access_log;
+        SourceLiveAccessLogProducer* live_access_log;
+    } logs{nullptr, ring.get(), nullptr};
+    grpc_observe(&logs, *exchange);
+    AccessLogEntry entry{};
+    REQUIRE(ring->pop(entry));
+    CHECK_EQ(entry.req_size, 200u);
+    CHECK_EQ(entry.grpc_status_plus_one, 15u);
+    CHECK_EQ(transport->backend.pending_count, 0u);
+}
+
+TEST(grpc_proxy, live_log_keeps_bytes_only_output) {
+    auto ring = std::make_unique<LiveAccessLogRing>();
+    ring->init();
+    i32 fds[2];
+    REQUIRE(rut::test::nonblocking_pipe(fds) == 0);
+    struct Reader {
+        i32 fd;
+        ~Reader() { close(fd); }
+    } reader{fds[0]};
+    LiveAccessLogRing* rings[] = {ring.get()};
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start(SourceAccessLogFd(fds[1]), rings, 1u));
+    SourceLiveAccessLogProducer producer;
+    REQUIRE(producer.init(ring.get(), &session, 0u));
+    ShardMetrics metrics;
+    metrics.init();
+    struct Loop {
+        ShardMetrics* metrics;
+        AccessLogRing* access_log;
+        SourceLiveAccessLogProducer* live_access_log;
+    } loop{&metrics, nullptr, &producer};
+    auto exchange = std::make_unique<GrpcExchange>();
+    exchange->init();
+    exchange->observed = true;
+    exchange->started_us = monotonic_us();
+    exchange->response_end_sent = true;
+    exchange->response_status = 0;
+    exchange->request_bytes = 123;
+    metrics.on_grpc_start();
+    grpc_observe(&loop, *exchange);
+    const auto finished = session.finish();
+    CHECK_EQ(finished.status, SourceLiveAccessLogFinishStatus::Success);
+    char bytes[32];
+    const ssize_t n = read(reader.fd, bytes, sizeof(bytes));
+    CHECK_EQ(n, 4);
+    if (n == 4) CHECK(memcmp(bytes, "123\n", 4) == 0);
+    CHECK_EQ(metrics.grpc_completed[0], 1u);
+    CHECK_EQ(metrics.grpc_active, 0u);
+}
+
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
     return rut::test::run_all(argc, argv);
