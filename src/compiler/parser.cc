@@ -186,7 +186,10 @@ struct Parser {
         u32 value = 0;
         for (u32 i = 0; i < token.text.len; i++) {
             const u32 digit = static_cast<u32>(token.text.ptr[i] - '0');
-            if (value > (maximum - digit) / 10u)
+            // Check the digit before subtracting: when digit > maximum,
+            // unsigned `maximum - digit` wraps and can admit out-of-range
+            // values (for example max_attempts: 4 with maximum == 3).
+            if (digit > maximum || value > (maximum - digit) / 10u)
                 return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
             value = value * 10u + digit;
         }

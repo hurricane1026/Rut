@@ -40250,7 +40250,9 @@ TEST(frontend, upstream_grpc_retry_policy_rejects_invalid_configuration) {
                  field);
         auto tokens = lex(lit(source));
         REQUIRE(tokens);
-        CHECK(!parse_file_heap(tokens.value()));
+        auto parsed = parse_file_heap(tokens.value());
+        if (parsed) fprintf(stderr, "unexpectedly parsed grpc_retry config: %s\n", field);
+        CHECK(!parsed);
     }
 
     const char* non_http2 =
