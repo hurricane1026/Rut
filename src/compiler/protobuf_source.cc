@@ -294,11 +294,8 @@ struct Compiler {
                         : join_scratch(
                               candidate_bytes, sizeof(candidate_bytes), scope, '.', item->name);
                 if (!kCandidate.ptr)
-                    return fail(SourceError::Kind::Allocation,
-                                item->file->name,
-                                item->line,
-                                item->column,
-                                {});
+                    return fail(
+                        SourceError::Kind::Limit, item->file->name, item->line, item->column, {});
                 for (const NamedMessage* type = messages; type; type = type->next)
                     if (type->concrete && type->name.eq(kCandidate) &&
                         visible(item->file, type->file)) {
@@ -311,11 +308,8 @@ struct Compiler {
                 const Str kFirst = join_scratch(
                     first_bytes, sizeof(first_bytes), scope, '.', {item->name.ptr, first});
                 if (!kFirst.ptr)
-                    return fail(SourceError::Kind::Allocation,
-                                item->file->name,
-                                item->line,
-                                item->column,
-                                {});
+                    return fail(
+                        SourceError::Kind::Limit, item->file->name, item->line, item->column, {});
                 for (const NamedMessage* symbol = messages; symbol; symbol = symbol->next) {
                     if (visible(item->file, symbol->file) &&
                         (symbol->name.eq(kFirst) ||
