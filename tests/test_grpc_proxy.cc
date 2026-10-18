@@ -3448,6 +3448,81 @@ TEST(grpc_proxy, grpc_web_incomplete_unstaged_message_becomes_status_trailer) {
     CHECK(has_status);
 }
 
+TEST(grpc_proxy, grpc_web_text_large_message_batches_data_frames) {
+    GrpcDriveFixture loop;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn h;
+    h.init_client();
+    downstream.h2 = &h;
+    auto* stream = h.open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->send_window = 1 << 20;
+    h.conn_send_window = 1 << 20;
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Text;
+    x.downstream = &downstream;
+    x.downstream_stream = 1;
+    x.response_headers_sent = true;
+    REQUIRE(grpc_attach(h, &x));
+    constexpr u32 payload_size = 131072;
+    constexpr u32 message_size = payload_size + 5;
+    auto message = std::make_unique<u8[]>(message_size);
+    auto decoded = std::make_unique<u8[]>(message_size);
+    message[0] = 0;
+    message[1] = static_cast<u8>(payload_size >> 24);
+    message[2] = static_cast<u8>(payload_size >> 16);
+    message[3] = static_cast<u8>(payload_size >> 8);
+    message[4] = static_cast<u8>(payload_size);
+    for (u32 j = 5; j < message_size; j++) message[j] = static_cast<u8>(j);
+    GrpcWebBase64Decoder decoder;
+    decoder.init();
+    u32 supplied = 0, decoded_size = 0, frames = 0;
+    u8 output[kDefaultMaxFrameSize + kFrameHeaderSize];
+    for (u32 turn = 0; turn < 64; turn++) {
+        if (!x.download_len && supplied < message_size) {
+            u32 chunk = message_size - supplied;
+            if (chunk > sizeof(x.download)) chunk = sizeof(x.download);
+            memcpy(x.download, message.get() + supplied, chunk);
+            x.download_len = chunk;
+            supplied += chunk;
+        }
+        const u32 n = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+        if (n) {
+            frames++;
+            Http2FrameHeader frame;
+            REQUIRE(parse_frame_header(output, n, &frame) == ParseStatus::Complete);
+            CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Data));
+            CHECK_EQ(n, kFrameHeaderSize + frame.length);
+            CHECK_LE(frame.length, kDefaultMaxFrameSize);
+            u32 consumed = 0, written = 0;
+            CHECK_EQ(decoder.feed(output + kFrameHeaderSize,
+                                  frame.length,
+                                  consumed,
+                                  decoded.get() + decoded_size,
+                                  message_size - decoded_size,
+                                  written),
+                     GrpcWebCodecStatus::Ok);
+            CHECK_EQ(consumed, frame.length);
+            decoded_size += written;
+        }
+        if (supplied == message_size && !x.download_len && !x.response_base64.pending_len &&
+            !x.web_encode_boundary_pending &&
+            x.web_pending_output_offset == x.web_pending_output_len)
+            break;
+    }
+    CHECK_EQ(supplied, message_size);
+    CHECK_EQ(decoded_size, message_size);
+    CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+    CHECK(memcmp(message.get(), decoded.get(), message_size) == 0);
+    CHECK_LE(frames, 16u);
+    CHECK_GT(frames, 1u);
+    CHECK_EQ(x.staged_response_message.header_bytes, 0u);
+    CHECK_EQ(x.staged_response_message.remaining, 0u);
+    grpc_detach(h, &x);
+}
+
 TEST(grpc_proxy, grpc_web_reset_uses_downstream_staged_message_boundary) {
     auto run = [=](const u8* staged,
                    u32 staged_len,

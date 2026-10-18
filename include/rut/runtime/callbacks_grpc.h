@@ -1532,109 +1532,133 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     }
                     if (final) done = true;
                 } else {
-                    if (x->web_pending_output_offset == x->web_pending_output_len) {
-                        x->web_pending_output_offset = x->web_pending_output_len = 0;
-                        x->web_pending_output_is_trailer = false;
-                        u32 consumed = 0, written = 0;
-                        if (x->web_encode_boundary_pending) {
-                            const u8 native_len = x->response_base64.pending_len;
-                            for (u8 i = 0; i < native_len; i++)
-                                x->web_pending_native[i] = x->response_base64.pending[i];
-                            (void)x->response_base64.flush(
-                                x->web_pending_output, sizeof(x->web_pending_output), written);
-                            if (written == 4) x->web_pending_native_len = native_len;
-                            x->web_encode_boundary_pending = false;
-                        } else if (x->download_len || (!x->web_trailer_encoding &&
-                                                       x->response_base64.pending_len == 3)) {
-                            const u8 previous_len = x->response_base64.pending_len;
-                            u8 native[3]{};
-                            for (u8 i = 0; i < previous_len; i++)
-                                native[i] = x->response_base64.pending[i];
-                            const u32 needed = previous_len < 3 ? 3u - previous_len : 0u;
-                            for (u32 i = 0; i < needed && i < x->download_len; i++)
-                                native[previous_len + i] = x->download[i];
-                            const u32 source_len =
-                                x->web_encoded_message.next_span(x->download_len);
-                            (void)x->response_base64.feed(x->download,
-                                                          source_len,
-                                                          consumed,
-                                                          x->web_pending_output,
-                                                          sizeof(x->web_pending_output),
-                                                          written);
-                            if (consumed) {
-                                (void)x->web_encoded_message.feed(x->download, consumed, false);
-                                if (!x->web_encoded_message.header_bytes &&
-                                    !x->web_encoded_message.remaining)
-                                    x->web_encode_boundary_pending = true;
-                            }
-                            if (written == 4) {
-                                __builtin_memcpy(x->web_pending_native, native, 3);
-                                x->web_pending_native_len = 3;
-                            }
-                            if (consumed) {
-                                grpc_pop(x->download, x->download_len, consumed);
-                                if (x->upstream)
-                                    x->upstream->h2->consume_data(x->upstream_stream, consumed);
-                            }
-                        } else if (x->response_trailers_offset < x->response_trailers_len ||
-                                   (x->web_trailer_encoding &&
-                                    x->response_base64.pending_len == 3)) {
-                            const u32 left = x->response_trailers_len - x->response_trailers_offset;
-                            if (!x->web_trailer_encoding) {
-                                x->web_pending_native_len = x->response_base64.pending_len;
-                                for (u8 i = 0; i < x->web_pending_native_len; i++)
-                                    x->web_pending_native[i] = x->response_base64.pending[i];
-                            }
-                            (void)x->response_base64.feed(
-                                x->response_trailers + x->response_trailers_offset,
-                                left,
-                                consumed,
-                                x->web_pending_output,
-                                sizeof(x->web_pending_output),
-                                written);
-                            x->response_trailers_offset += consumed;
-                            if (consumed || written) x->web_trailer_encoding = true;
-                            if (written) x->web_pending_output_is_trailer = true;
-                        } else if (x->response_end) {
-                            const u8 native_len =
-                                x->web_trailer_encoding ? 0 : x->response_base64.pending_len;
-                            for (u8 i = 0; i < native_len; i++)
-                                x->web_pending_native[i] = x->response_base64.pending[i];
-                            (void)x->response_base64.flush(
-                                x->web_pending_output, sizeof(x->web_pending_output), written);
-                            if (written == 4) x->web_pending_native_len = native_len;
-                            x->web_pending_output_is_trailer = x->web_trailer_encoding;
-                            x->web_body_flushed = true;
-                        }
-                        x->web_pending_output_len = static_cast<u8>(written);
-                    }
-                    if (x->web_pending_output_offset < x->web_pending_output_len) {
-                        amount = x->web_pending_output_len - x->web_pending_output_offset;
-                        if (amount > window) amount = window;
-                        if (amount > cap - total - 9) amount = cap - total - 9;
-                        if (amount > h.peer_settings.max_frame_size)
-                            amount = h.peer_settings.max_frame_size;
-                        payload = x->web_pending_output + x->web_pending_output_offset;
-                        x->web_pending_output_offset += static_cast<u8>(amount);
-                    } else if (x->response_end && x->web_body_flushed) {
-                        final = true;
-                    }
-                    if (!amount && !final) continue;
-                    n = http2_write_data(out + total, x->downstream_stream, payload, amount, final);
-                    if (amount) {
-                        x->staged_response_bytes += amount;
-                        if (x->web_pending_output_is_trailer) x->web_trailer_wire_started = true;
-                        if (x->web_pending_output_offset == x->web_pending_output_len &&
-                            x->web_pending_native_len) {
-                            (void)x->staged_response_message.feed(
-                                x->web_pending_native, x->web_pending_native_len, false);
-                            x->web_pending_native_len = 0;
-                        }
-                        if (x->web_pending_output_offset == x->web_pending_output_len)
+                    // Assemble one DATA payload in owned output. The small pending
+                    // quartet only retains bytes across a flow-control/window tail.
+                    u32 budget = cap - total - kFrameHeaderSize;
+                    if (budget > window) budget = window;
+                    if (budget > h.peer_settings.max_frame_size)
+                        budget = h.peer_settings.max_frame_size;
+                    u32 batched = 0;
+                    while (batched < budget) {
+                        bool progressed = false;
+                        if (x->web_pending_output_offset == x->web_pending_output_len) {
+                            x->web_pending_output_offset = x->web_pending_output_len = 0;
                             x->web_pending_output_is_trailer = false;
-                        stream->send_window -= static_cast<i32>(amount);
-                        h.conn_send_window -= amount;
+                            const bool had_boundary = x->web_encode_boundary_pending;
+                            const bool was_flushed = x->web_body_flushed;
+                            u32 consumed = 0, written = 0;
+                            if (x->web_encode_boundary_pending) {
+                                const u8 native_len = x->response_base64.pending_len;
+                                for (u8 i = 0; i < native_len; i++)
+                                    x->web_pending_native[i] = x->response_base64.pending[i];
+                                (void)x->response_base64.flush(
+                                    x->web_pending_output, sizeof(x->web_pending_output), written);
+                                if (written == 4) x->web_pending_native_len = native_len;
+                                x->web_encode_boundary_pending = false;
+                            } else if (x->download_len || (!x->web_trailer_encoding &&
+                                                           x->response_base64.pending_len == 3)) {
+                                const u8 previous_len = x->response_base64.pending_len;
+                                u8 native[3]{};
+                                for (u8 i = 0; i < previous_len; i++)
+                                    native[i] = x->response_base64.pending[i];
+                                const u32 needed = previous_len < 3 ? 3u - previous_len : 0u;
+                                for (u32 i = 0; i < needed && i < x->download_len; i++)
+                                    native[previous_len + i] = x->download[i];
+                                const u32 source_len =
+                                    x->web_encoded_message.next_span(x->download_len);
+                                (void)x->response_base64.feed(x->download,
+                                                              source_len,
+                                                              consumed,
+                                                              x->web_pending_output,
+                                                              sizeof(x->web_pending_output),
+                                                              written);
+                                if (consumed) {
+                                    (void)x->web_encoded_message.feed(x->download, consumed, false);
+                                    if (!x->web_encoded_message.header_bytes &&
+                                        !x->web_encoded_message.remaining)
+                                        x->web_encode_boundary_pending = true;
+                                }
+                                if (written == 4) {
+                                    __builtin_memcpy(x->web_pending_native, native, 3);
+                                    x->web_pending_native_len = 3;
+                                }
+                                if (consumed) {
+                                    grpc_pop(x->download, x->download_len, consumed);
+                                    if (x->upstream)
+                                        x->upstream->h2->consume_data(x->upstream_stream, consumed);
+                                }
+                            } else if (x->response_trailers_offset < x->response_trailers_len ||
+                                       (x->web_trailer_encoding &&
+                                        x->response_base64.pending_len == 3)) {
+                                const u32 left =
+                                    x->response_trailers_len - x->response_trailers_offset;
+                                if (!x->web_trailer_encoding) {
+                                    x->web_pending_native_len = x->response_base64.pending_len;
+                                    for (u8 i = 0; i < x->web_pending_native_len; i++)
+                                        x->web_pending_native[i] = x->response_base64.pending[i];
+                                }
+                                (void)x->response_base64.feed(
+                                    x->response_trailers + x->response_trailers_offset,
+                                    left,
+                                    consumed,
+                                    x->web_pending_output,
+                                    sizeof(x->web_pending_output),
+                                    written);
+                                x->response_trailers_offset += consumed;
+                                if (consumed || written) x->web_trailer_encoding = true;
+                                if (written) x->web_pending_output_is_trailer = true;
+                            } else if (x->response_end) {
+                                const u8 native_len =
+                                    x->web_trailer_encoding ? 0 : x->response_base64.pending_len;
+                                for (u8 i = 0; i < native_len; i++)
+                                    x->web_pending_native[i] = x->response_base64.pending[i];
+                                (void)x->response_base64.flush(
+                                    x->web_pending_output, sizeof(x->web_pending_output), written);
+                                if (written == 4) x->web_pending_native_len = native_len;
+                                x->web_pending_output_is_trailer = x->web_trailer_encoding;
+                                x->web_body_flushed = true;
+                            }
+                            x->web_pending_output_len = static_cast<u8>(written);
+                            progressed = consumed || written || had_boundary ||
+                                         was_flushed != x->web_body_flushed;
+                        }
+                        if (x->web_pending_output_offset < x->web_pending_output_len) {
+                            u32 chunk = x->web_pending_output_len - x->web_pending_output_offset;
+                            if (chunk > budget - batched) chunk = budget - batched;
+                            __builtin_memcpy(out + total + kFrameHeaderSize + batched,
+                                             x->web_pending_output + x->web_pending_output_offset,
+                                             chunk);
+                            x->web_pending_output_offset += static_cast<u8>(chunk);
+                            batched += chunk;
+                            if (x->web_pending_output_is_trailer)
+                                x->web_trailer_wire_started = true;
+                            if (x->web_pending_output_offset == x->web_pending_output_len &&
+                                x->web_pending_native_len) {
+                                (void)x->staged_response_message.feed(
+                                    x->web_pending_native, x->web_pending_native_len, false);
+                                x->web_pending_native_len = 0;
+                            }
+                            if (x->web_pending_output_offset == x->web_pending_output_len)
+                                x->web_pending_output_is_trailer = false;
+                        } else if (x->response_end && x->web_body_flushed) {
+                            final = true;
+                            break;
+                        } else if (!progressed) {
+                            break;
+                        }
                     }
+                    if (x->response_end && x->web_body_flushed &&
+                        x->web_pending_output_offset == x->web_pending_output_len)
+                        final = true;
+                    if (!batched && !final) continue;
+                    const Http2FrameHeader header{batched,
+                                                  x->downstream_stream,
+                                                  static_cast<u8>(Http2FrameType::Data),
+                                                  final ? http2_flag::kEndStream : u8{0}};
+                    n = write_frame_header(out + total, header) + batched;
+                    x->staged_response_bytes += batched;
+                    stream->send_window -= static_cast<i32>(batched);
+                    h.conn_send_window -= batched;
                     if (final) done = true;
                 }
             } else if (x->response_headers_sent && x->download_len && stream->send_window > 0 &&
