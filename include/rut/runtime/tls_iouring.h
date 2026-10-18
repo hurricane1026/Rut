@@ -433,6 +433,10 @@ void tls_process(Self* loop, Connection& c) {
         const TlsOp kSt = tls_engine_handshake(c.tls_engine);
         c.tls_in_buf.consume(tls_engine_input_consumed(c.tls_engine));
         if (kSt == TlsOp::Error) {
+            if constexpr (requires { loop->grpc_upstreams; }) {
+                if (c.h2 && c.h2->grpc.upstream)
+                    grpc_record_handshake_result(loop, c, false, monotonic_us());
+            }
             loop->close_conn(c);
             return;
         }
@@ -458,6 +462,7 @@ void tls_process(Self* loop, Connection& c) {
         if constexpr (requires { loop->grpc_upstreams; }) {
             if (c.h2 && c.h2->grpc.upstream) {
                 if (!tls_client_peer_valid(c.tls_engine.ssl)) {
+                    grpc_record_handshake_result(loop, c, false, monotonic_us());
                     loop->close_conn(c);
                     return;
                 }

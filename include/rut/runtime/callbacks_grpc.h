@@ -531,7 +531,10 @@ void grpc_response_headers(
         return;
     }
     x->response_end = end;
-    if (end) x->response_status = grpc_observed_status(hs, n);
+    // END_STREAM on the initial headers is a trailers-only response. Response
+    // mutations apply to those headers, so telemetry must observe the same
+    // filtered grpc-status that the downstream receives.
+    if (end) x->response_status = grpc_observed_status(filtered, filtered_n);
     if (end && (!grpc_has_status(hs, n) || !grpc_has_status(filtered, filtered_n))) x->failure = 2;
     if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
         x->failure = 13;
@@ -650,6 +653,7 @@ void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     if (conn.h2->grpc.client_tls.ssl_ctx && !conn.h2->grpc.tls_verified) {
         SSL* ssl = conn.tls_engine.ssl ? conn.tls_engine.ssl : conn.tls;
         if (!tls_client_peer_valid(ssl)) {
+            grpc_record_handshake_result(loop, conn, false, monotonic_us());
             loop->close_conn(conn);
             return;
         }
@@ -778,7 +782,12 @@ template <typename Loop>
 void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result <= 0 || !conn.h2) {
-        if (conn.h2) grpc_record_session_failure(loop, conn, monotonic_us());
+        if (conn.h2) {
+            if (conn.h2->grpc.client_tls.ssl_ctx && !conn.h2->grpc.tls_verified)
+                grpc_record_handshake_result(loop, conn, false, monotonic_us());
+            else
+                grpc_record_session_failure(loop, conn, monotonic_us());
+        }
         loop->close_conn(conn);
         return;
     }
@@ -791,6 +800,7 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
         // An in-progress client handshake has not produced a peer verdict yet.
         if (ssl && !tls_handshake_finished(ssl)) return;
         if (!tls_client_peer_valid(ssl)) {
+            grpc_record_handshake_result(loop, conn, false, monotonic_us());
             loop->close_conn(conn);
             return;
         }
@@ -889,12 +899,14 @@ void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
     if (target.tls.enabled) {
         auto& context = conn.h2->grpc.client_tls;
         if (!init_tls_client_context(context, target.tls)) {
+            grpc_record_handshake_result(loop, conn, false, monotonic_us());
             loop->close_conn(conn);
             return;
         }
         if constexpr (requires { loop->tls_setup(conn, &context, target.tls.server_name); }) {
             if (!loop->tls_setup(conn, &context, target.tls.server_name) ||
                 !loop->grow_h2_tls_input(conn)) {
+                grpc_record_handshake_result(loop, conn, false, monotonic_us());
                 loop->close_conn(conn);
                 return;
             }
@@ -904,6 +916,7 @@ void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
         } else {
             auto ssl = create_tls_client_ssl(context, conn.fd, target.tls.server_name);
             if (!ssl) {
+                grpc_record_handshake_result(loop, conn, false, monotonic_us());
                 loop->close_conn(conn);
                 return;
             }

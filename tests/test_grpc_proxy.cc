@@ -1651,6 +1651,55 @@ TEST(grpc_proxy, nonzero_grpc_status_clears_backend_health) {
     CHECK_FALSE(x.slot_held);
 }
 
+TEST(grpc_proxy, trailers_only_status_observes_response_mutations) {
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    Connection downstream;
+    downstream.reset();
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    GrpcExchange x;
+    x.init();
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = x.downstream_stream = 1;
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    upstream_h2.grpc.active = downstream_h2.grpc.active = 1;
+    downstream.resp_header_mutations[0] = {
+        {"grpc-status", 11}, {"7", 1}, Connection::RespHeaderMutationMode::Set};
+    downstream.resp_header_mutation_count = 1;
+    REQUIRE(grpc_snapshot_response_mutations(downstream, x));
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const hpack::Header response[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"grpc-status", 11}, {"0", 1}},
+    };
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, response, 3, true);
+    CHECK_EQ(x.response_status, 7u);
+    CHECK_EQ(x.failure, 0u);
+
+    // Snapshot a second Add mutation through the public mutation path so a
+    // duplicate grpc-status is classified as UNKNOWN after filtering.
+    downstream.resp_header_mutations[0] = {
+        {"grpc-status", 11}, {"0", 1}, Connection::RespHeaderMutationMode::Add};
+    REQUIRE(grpc_snapshot_response_mutations(downstream, x));
+    hpack::Header filtered[8];
+    u32 filtered_n = 1;
+    filtered[0] = response[2];
+    REQUIRE(grpc_apply_response_mutations(x, filtered, &filtered_n, 8));
+    CHECK_EQ(grpc_observed_status(filtered, filtered_n), 2u);
+}
+
 TEST(grpc_proxy, parser_failure_records_active_session_once) {
     GrpcBackendHealthReset health_reset{};
     auto* health = backend_health(0, 0);
@@ -1672,6 +1721,61 @@ TEST(grpc_proxy, parser_failure_records_active_session_once) {
     CHECK(loop.closed);
     CHECK_EQ(health->fails, 1u);
     grpc_record_session_failure(&loop, conn, monotonic_us());
+    CHECK_EQ(health->fails, 1u);
+}
+
+TEST(grpc_proxy, rejected_tls_identity_ejects_backend_once) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    GrpcDriveFixture loop;
+    RouteConfig cfg;
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    Connection conn;
+    conn.reset();
+    conn.request_config = &cfg;
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    Http2Conn h2;
+    h2.init_client();
+    h2.grpc.upstream = true;
+    h2.grpc.client_tls.ssl_ctx = SSL_CTX_new(TLS_client_method());
+    REQUIRE(h2.grpc.client_tls.ssl_ctx != nullptr);
+    conn.h2 = &h2;
+    conn.tls = SSL_new(h2.grpc.client_tls.ssl_ctx);
+    REQUIRE(conn.tls != nullptr);
+    u8 send_bytes[] = {0};
+    conn.send_buf.bind(send_bytes, sizeof(send_bytes));
+    conn.send_buf.commit(1);
+    grpc_on_upstream_sent<GrpcDriveFixture>(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Send, 0});
+    CHECK(loop.closed);
+    CHECK_EQ(health->fails, 1u);
+    grpc_record_handshake_result(&loop, conn, false, monotonic_us());
+    CHECK_EQ(health->fails, 1u);
+    SSL_free(conn.tls);
+    conn.tls = nullptr;
+    SSL_CTX_free(h2.grpc.client_tls.ssl_ctx);
+    h2.grpc.client_tls.ssl_ctx = nullptr;
+
+    health->fails = 0;
+    RouteConfig bad_tls_cfg;
+    REQUIRE(bad_tls_cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    bad_tls_cfg.upstreams[0].http2 = true;
+    bad_tls_cfg.upstreams[0].tls.enabled = true;
+    active = &bad_tls_cfg;
+    Connection setup_failure;
+    setup_failure.reset();
+    setup_failure.request_config = &bad_tls_cfg;
+    setup_failure.upstream_idx = 0;
+    setup_failure.upstream_backend_idx = 0;
+    Http2Conn setup_h2;
+    setup_h2.init_client();
+    setup_h2.grpc.upstream = true;
+    setup_failure.h2 = &setup_h2;
+    grpc_connected<GrpcDriveFixture>(
+        &loop, setup_failure, {setup_failure.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+    CHECK(loop.closed);
     CHECK_EQ(health->fails, 1u);
 }
 
