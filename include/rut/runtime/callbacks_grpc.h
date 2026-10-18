@@ -1377,12 +1377,24 @@ inline bool grpc_keepalive_tick(Http2Conn& h, u64 now, u64 timeout_us, bool writ
     if (h.ping_pending) return now - g.last_ping_us >= timeout_us;
     constexpr u64 interval_us = 300000000;  // five minutes; avoid server ping strikes
     const u64 since = g.last_ping_us ? g.last_ping_us : g.connected_at_us;
-    if (!g.active || g.connecting || !h.peer_settings_seen || h.peer_goaway || !writable ||
-        now - since < interval_us || sizeof(g.control) - g.control_len < kFrameHeaderSize + 8)
+    if (!g.active || g.connecting || !h.peer_settings_seen || h.peer_goaway) {
+        g.keepalive_due_us = 0;
         return false;
+    }
+    if (!g.keepalive_due_us) {
+        if (now - since < interval_us) return false;
+        // Start the timeout when this tick observes the overdue probe, so a
+        // delayed timer does not close a session before it gets a probe chance.
+        g.keepalive_due_us = now;
+    }
+    // A blocked transport must not keep an active session alive forever by
+    // preventing the probe from entering the control buffer.
+    if (now >= g.keepalive_due_us && now - g.keepalive_due_us >= timeout_us) return true;
+    if (!writable || sizeof(g.control) - g.control_len < kFrameHeaderSize + 8) return false;
     g.control_len +=
         h.write_ping(g.control + g.control_len, sizeof(g.control) - g.control_len, now);
     g.last_ping_us = now;
+    g.keepalive_due_us = 0;
     return false;
 }
 
