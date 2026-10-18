@@ -35,7 +35,7 @@ python3 bench.py serve --engine origin --config /tmp/origin-1m --binary /absolut
 ```
 
 `serve` writes `/tmp/origin-1m/server-manifest.json`; copy this one live origin
-manifest to C and use it for every proxy repetition.
+manifest to P, then from P to C, and use it for every proxy repetition.
 
 保持前台运行。响应是确定性二进制文件，URL 为 `/proxy`，允许上游连接复用。
 仅在受信任测试网络开放 P 的 8087 与 O 的 9087 端口；服务监听所有 IPv4 地址。
@@ -43,7 +43,7 @@ manifest to C and use it for every proxy repetition.
 ## 2. 代理 P
 
 ```bash
-scp O:/tmp/origin-1m/server-manifest.json P:/tmp/origin-1m-server-manifest.json
+scp O:/tmp/origin-1m/server-manifest.json /tmp/origin-1m-server-manifest.json
 python3 bench.py prepare --output /tmp/proxy-1m --origin 192.0.2.30:9087 --port 8087 --workers 1 --body-size 1048576
 python3 bench.py serve --engine rut --config /tmp/proxy-1m --binary /absolute/path/rut --cpus 2 --origin-manifest /tmp/origin-1m-server-manifest.json
 ```
