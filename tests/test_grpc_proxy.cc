@@ -3885,15 +3885,32 @@ TEST(grpc_proxy, keepalive_tick_queues_ping_behind_split_headers_and_before_othe
     CHECK_EQ(parsed.consumed, kClientPrefaceLen + request_wire_len);
     CHECK_EQ(capture.calls, 1u);
     CHECK_EQ(capture.timeout_count, 1u);
-    CHECK_EQ(control_len, kFrameHeaderSize + 8);
+    CHECK_GE(control_len, kFrameHeaderSize + 8);
+    u32 ack_offset = 0;
     Http2FrameHeader ack{};
-    REQUIRE_EQ(parse_frame_header(control, control_len, &ack), ParseStatus::Complete);
+    while (ack_offset + kFrameHeaderSize <= control_len) {
+        if (parse_frame_header(control + ack_offset, control_len - ack_offset, &ack) !=
+            ParseStatus::Complete)
+            break;
+        if (ack.type == static_cast<u8>(Http2FrameType::Ping) && (ack.flags & http2_flag::kAck))
+            break;
+        ack_offset += kFrameHeaderSize + ack.length;
+    }
+    REQUIRE_LT(ack_offset, control_len);
     CHECK_EQ(ack.type, static_cast<u8>(Http2FrameType::Ping));
     CHECK(ack.flags & http2_flag::kAck);
+    CHECK_EQ(ack_offset + kFrameHeaderSize + ack.length, control_len);
+    CHECK_EQ(ack.length, 8u);
+    CHECK_EQ(__builtin_memcmp(control + ack_offset + kFrameHeaderSize,
+                              wire + continuation_offset + continuation_len + kFrameHeaderSize,
+                              8),
+             0);
 
     u8 ignored[32]{};
     u32 ignored_len = 0;
-    const auto acked = h2.process(control, control_len, ignored, sizeof(ignored), &ignored_len);
+    const u32 ack_len = kFrameHeaderSize + ack.length;
+    const auto acked =
+        h2.process(control + ack_offset, ack_len, ignored, sizeof(ignored), &ignored_len);
     CHECK_FALSE(acked.close);
     CHECK_FALSE(h2.ping_pending);
 
