@@ -412,8 +412,9 @@ trailers including `grpc-status` are preserved. Header-only middleware may run
 before forwarding; body-reading handlers and HTTP/1-specific forward policies
 are outside this streaming path. Native gRPC over HTTP/1 is rejected.
 No `.proto`, protobuf dependency, new route keyword or streaming modifier is
-needed. An internal bounded protobuf wire codec exists for runtime development;
-it has no Rut API, descriptor loader or JSON mapping. Native forwarding continues
+needed. Internal bounded protobuf wire primitives and a compiler-side proto3
+`FileDescriptorSet` schema loader exist. They have no Rut API or JSON mapping;
+`rut-compile` does not yet generate message codecs. Native forwarding continues
 to treat protobuf payloads as opaque bytes.
 JSON transcoding and gRPC health probes are not implemented by this
 option; `health_check` with `.http2` is rejected.

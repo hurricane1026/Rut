@@ -621,7 +621,11 @@ canonical spelling for common gateway tasks.
 
 - [ ] 补齐 HTTP/2 上下游及 gRPC metadata、trailers、状态、deadline、取消与流式语义。
 - [x] 内部 protobuf wire 基础：有界 varint/fixed32/fixed64/bytes 读写、ZigZag、畸形输入测试；
-  无 Rut API，描述符、JSON 映射及转码尚未实现。
+  无 Rut API，JSON 映射及转码尚未实现。
+- [x] 编译器内部 proto3 descriptor schema：解析并关联消息/字段/RPC，保留 repeated/packed；
+  有界 Arena 所有权及真实 protoc fixture 验证；尚未接入 `rut-compile` 或生成 codec IR。
+- [ ] 将 protobuf schema 绑定到 Rut 类型，并在编译期生成消息专用 decode/encode；
+  保留运行期 wire/容量检查，补齐 enum、oneof/optional、map 等语义。
 - [ ] 在通用字节/流能力上实现 Rut protobuf 编解码模块、描述符读取与 HTTP/gRPC 转码；
   不强制用户用其他语言生成或维护插件。
 - [ ] Rut 实现 gRPC-Web 文本/二进制 framing 与 trailers，覆盖浏览器跨域与流式限制。

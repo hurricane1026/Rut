@@ -1363,9 +1363,33 @@ budget bounds iteration; lengths are checked against the supplied message and
 closed. Malformed input is terminal and leaves the output field unchanged.
 Writes check the whole field before modifying output; payloads must not overlap
 the destination. This layer does not interpret schemas, validate UTF-8, unpack
-packed scalar fields or recurse into embedded messages. Descriptor loading,
-protobuf JSON mapping and HTTP/gRPC transcoding remain pending; no Rut language
-API or automatic body decoding is added.
+packed scalar fields or recurse into embedded messages. No Rut language API or
+automatic body decoding is added.
+
+**Compile-time protobuf schema foundation (internal C++ API):**
+`compiler/protobuf_schema.h` loads a binary `FileDescriptorSet` into the existing
+compiler Arena, copying the source bytes so names and references survive input
+buffer release. It resolves fully qualified message references across included
+files, nested/recursive messages and RPC request/response types, retaining the
+client/server streaming flags. Fields retain protobuf scalar types, numbers,
+JSON names and repeated/packed semantics (including proto3 default packing).
+This schema is intended as input for later specialized decoder/encoder IR;
+it is not interpreted per request and is not yet wired into `rut-compile`.
+
+The initial subset accepts explicit `proto3` files, scalar and message fields,
+repeated fields and ordinary service signatures. Names and JSON names must be
+ASCII identifiers (qualified type names use dots). Enums, oneof/proto3 optional
+presence, maps, extensions/defaults, reserved declarations, public/weak imports,
+proto2 and editions fail closed rather than losing semantics. Unknown descriptor
+metadata/options are skipped; HTTP annotations are not converted into routes.
+Malformed wire data, duplicate field numbers/names/JSON aliases or type/service
+symbols, invalid packing and unresolved message references are errors.
+Limits can tighten the hard ceilings: 4 MiB input, 128 files, 1,024 messages,
+16,384 fields, 1,024 methods/services, 32 nested declarations and 1,024-byte
+qualified names. A failed load consumes Arena space; discard/reset that compile
+Arena before retrying. This adds no `.proto` text parser, Rut type binding,
+codec IR/native code generation, protobuf JSON mapping or HTTP/gRPC transcoding;
+those remain separate follow-up work.
 
 **Implemented native gRPC gateway path:** the current frontend accepts
 `upstream greeter { host: "127.0.0.1", port: 50051, protocol: .http2 }` and
