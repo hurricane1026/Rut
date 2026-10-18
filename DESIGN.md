@@ -1569,10 +1569,8 @@ Two types of middleware, distinguished by whether the signature contains `Respon
 struct Claims { sub: string, role: string }
 
 func auth(_ req: Request, role: string) -> User {
-    let token = req.authorization.or("")
-    guard token.hasPrefix("Bearer ") else { respond 401 }
-
-    guard let document = jwtDecode(token.trimPrefix("Bearer "), env("JWT_SECRET")) else {
+    let token = req.header("X-JWT").or("")
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
         respond 401
     }
     guard let claims = json.decode(Claims, document) else { respond 401 }
@@ -3711,11 +3709,10 @@ let userCache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
 // ---------- Middleware ----------
 
 func auth(_ req: Request, role: string) {
-    let token = req.authorization.or("")
+    let token = req.header("X-JWT").or("")
     guard !token.isEmpty else { respond 401 }
-    guard token.hasPrefix("Bearer ") else { respond 401 }
 
-    guard let document = jwtDecode(token.trimPrefix("Bearer "), env("JWT_SECRET")) else {
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
         respond 401
     }
     guard let claims = json.decode(Claims, document) else { respond 401 }
