@@ -140,8 +140,8 @@ struct Claims { sub: str role: str }
 
 func auth(_ req: Request, role: str) -> User {
     let token = req.authorization.or("")
-    guard token.hasPrefix("Bearer ") else { respond 401 }
-    guard let document = jwtDecode(token.trimPrefix("Bearer "), env("JWT_SECRET")) else {
+    guard token.has_prefix("Bearer ") else { respond 401 }
+    guard let document = jwtDecode(token.trim_prefix("Bearer "), env("JWT_SECRET")) else {
         respond 401
     }
     guard let claims = json.decode(Claims, document) else { respond 401 }
@@ -157,11 +157,11 @@ func f(_ req: Request, limit: ByteSize) { ... }   // first param unlabeled, rest
 f(req, limit: 1mb)                // ⏳ mixed positional+named call args (parser rejects the label)
 req.f(limit: 1mb)                 // UFCS: t.f(a) == f(t, a) — use when value
                                   // flows into the FIRST parameter
-req.path.trimPrefix("/api").split("/")            // UFCS chaining
+req.path.trim_prefix("/api").split("/")          // UFCS chaining
 
 // Pipeline | — use when the value lands in a NON-first position.
 // RHS must be a call with an explicit _ / _N placeholder (else compile error).
-let parts = req.path | trimPrefix("/api", _) | split(_, "/")
+let parts = req.path | trim_prefix("/api", _) | split(_, "/")
 ```
 
 No closures, no function values (`let g = f` is an error), no recursion, no FFI.
@@ -803,8 +803,8 @@ route GET "/api" {
 ## Built-ins (call them, never reimplement)
 
 ```
-string:  s.len s.isEmpty s.hasPrefix/hasSuffix/contains s.upper()/lower()/trim()
-         s.trimPrefix/trimSuffix/replace/split/slice s.matches(re"") s.match(re"")
+string:  s.len s.is_empty s.has_prefix/has_suffix/contains s.upper()/lower()/trim()
+         s.trim_prefix/trim_suffix/replace/split/slice s.matches(re"") s.match(re"")
 hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
 jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
          decode with json.decode/json.get). ⏳ publicKey/RS/ES and jwtEncode
