@@ -277,6 +277,24 @@ class Tests(unittest.TestCase):
             proxy_result.write_text(json.dumps(proxy_data))
             with self.assertRaises(ValueError):
                 summarize.summarize(proxy_machine_changed)
+            proxy_scalar = root / 'proxy-scalar-identity'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, proxy_scalar / name)
+            scalar_result = proxy_scalar / 'rut1' / 'result.json'
+            scalar_data = json.loads(scalar_result.read_text())
+            scalar_data['server_machine_uname'] = 'Linux'
+            scalar_result.write_text(json.dumps(scalar_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(proxy_scalar)
+            proxy_missing = root / 'proxy-missing-identity'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, proxy_missing / name)
+            missing_result = proxy_missing / 'rut1' / 'result.json'
+            missing_data = json.loads(missing_result.read_text())
+            del missing_data['server_machine_uname']
+            missing_result.write_text(json.dumps(missing_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(proxy_missing)
             versioned = root / 'versioned-wrk'
             for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
                 shutil.copytree(root / name, versioned / name)

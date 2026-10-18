@@ -73,10 +73,14 @@ def summarize(root):
             raise ValueError(f'client wrk binary changed between paired runs: {key}')
         if len(set(client_identities[key])) != 1:
             raise ValueError(f'client machine identity changed between paired runs: {key}')
-        server_identities = {tuple(d.get('server_machine_uname', ()))
-                             for runs in engines.values() for d, _ in runs.values()}
-        if (len(server_identities) != 1 or len(next(iter(server_identities))) != 5
-                or any(not isinstance(value, str) or not value for value in next(iter(server_identities)))):
+        raw_server_identities = [d.get('server_machine_uname')
+                                 for runs in engines.values() for d, _ in runs.values()]
+        if any(not isinstance(identity, list) or len(identity) != 5
+               or any(not isinstance(value, str) or not value for value in identity)
+               for identity in raw_server_identities):
+            raise ValueError(f'proxy machine identity changed or was not recorded: {key}')
+        server_identities = {tuple(identity) for identity in raw_server_identities}
+        if len(server_identities) != 1:
             raise ValueError(f'proxy machine identity changed or was not recorded: {key}')
         for engine, runs in engines.items():
             run_ids = [d['server_run_id'] for d, _ in runs.values()]
