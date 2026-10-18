@@ -582,6 +582,7 @@ void grpc_response_headers(
     bool status = false;
     u32 http_status = 0;
     bool content_type = false;
+    u32 content_type_count = 0;
     bool invalid_content_length = false;
     const bool web_response =
         x->web_mode == GrpcWebContentType::Binary || x->web_mode == GrpcWebContentType::Text;
@@ -594,9 +595,11 @@ void grpc_response_headers(
                     static_cast<u32>((hs[i].value.ptr[0] - '0') * 100 +
                                      (hs[i].value.ptr[1] - '0') * 10 + hs[i].value.ptr[2] - '0');
         }
-        if (hs[i].name.eq({"content-type", 12}))
+        if (hs[i].name.eq({"content-type", 12})) {
+            content_type_count++;
             content_type = web_response ? grpc_web_native_proto_content_type(hs[i].value)
                                         : grpc_content_type(hs[i].value);
+        }
         if (hs[i].name.eq({"content-length", 14})) {
             u32 length = 0;
             if (x->has_response_length || !grpc_parse_content_length(hs[i].value, &length))
@@ -607,6 +610,7 @@ void grpc_response_headers(
             }
         }
     }
+    if (web_response && content_type_count != 1) content_type = false;
     if (!status || !content_type || invalid_content_length) {
         switch (http_status) {
             case 400:
