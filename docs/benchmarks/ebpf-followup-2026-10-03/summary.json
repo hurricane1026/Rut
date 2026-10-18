@@ -1,0 +1,412 @@
+{
+  "sidecar-1m-r2": [
+    {
+      "concurrency": 1,
+      "engine": "copy",
+      "n": 3,
+      "rps": 2559.636611216044,
+      "p99_us": 509.0,
+      "process_cpu_percent": 60.593558022351765,
+      "observed_machine_cpu_seconds_per_gib": 1.205767256559873
+    },
+    {
+      "concurrency": 1,
+      "engine": "ebpf",
+      "n": 3,
+      "rps": 1410.425343341412,
+      "p99_us": 1118.0,
+      "process_cpu_percent": 4.510146162071515,
+      "observed_machine_cpu_seconds_per_gib": 1.7154455720574537
+    },
+    {
+      "concurrency": 32,
+      "engine": "copy",
+      "n": 3,
+      "rps": 2730.018200121334,
+      "p99_us": 17921.0,
+      "process_cpu_percent": 67.64750980692814,
+      "observed_machine_cpu_seconds_per_gib": 1.255453566046596
+    },
+    {
+      "concurrency": 32,
+      "engine": "ebpf",
+      "n": 3,
+      "rps": 1508.0329447812403,
+      "p99_us": 83961.0,
+      "process_cpu_percent": 5.7965105006785915,
+      "observed_machine_cpu_seconds_per_gib": 1.7105161204837245
+    }
+  ],
+  "sidecar-256k-r2": [
+    {
+      "concurrency": 1,
+      "engine": "copy",
+      "n": 3,
+      "rps": 7637.892558912636,
+      "p99_us": 168.0,
+      "process_cpu_percent": 44.31401222792225,
+      "observed_machine_cpu_seconds_per_gib": 1.3531852998124791
+    },
+    {
+      "concurrency": 1,
+      "engine": "ebpf",
+      "n": 3,
+      "rps": 4906.034343809083,
+      "p99_us": 310.0,
+      "process_cpu_percent": 6.274704196718251,
+      "observed_machine_cpu_seconds_per_gib": 1.8098943787212636
+    },
+    {
+      "concurrency": 32,
+      "engine": "copy",
+      "n": 3,
+      "rps": 12393.140270087748,
+      "p99_us": 3311.0,
+      "process_cpu_percent": 69.02399289680366,
+      "observed_machine_cpu_seconds_per_gib": 1.3992284932103867
+    },
+    {
+      "concurrency": 32,
+      "engine": "ebpf",
+      "n": 3,
+      "rps": 5685.46365939842,
+      "p99_us": 7872.0,
+      "process_cpu_percent": 8.598799607574783,
+      "observed_machine_cpu_seconds_per_gib": 1.8754367702938632
+    }
+  ],
+  "actual-rut-256k": [
+    {
+      "concurrency": 1,
+      "engine": "nginx",
+      "n": 3,
+      "rps": 5428.202061748128,
+      "p99_us": 261.0,
+      "process_cpu_percent": 56.86445103157017,
+      "observed_machine_cpu_seconds_per_gib": 1.3346067983988836
+    },
+    {
+      "concurrency": 1,
+      "engine": "rut",
+      "n": 3,
+      "rps": 7962.712043876488,
+      "p99_us": 167.0,
+      "process_cpu_percent": 62.74792784772646,
+      "observed_machine_cpu_seconds_per_gib": 1.0347301618555689
+    },
+    {
+      "concurrency": 32,
+      "engine": "nginx",
+      "n": 3,
+      "rps": 6942.321512784488,
+      "p99_us": 6557.0,
+      "process_cpu_percent": 64.51315607575685,
+      "observed_machine_cpu_seconds_per_gib": 1.2298180996637642
+    },
+    {
+      "concurrency": 32,
+      "engine": "rut",
+      "n": 3,
+      "rps": 13482.2682699599,
+      "p99_us": 2500.0,
+      "process_cpu_percent": 77.79497444465089,
+      "observed_machine_cpu_seconds_per_gib": 0.8215746310923747
+    }
+  ],
+  "actual-rut-1m": [
+    {
+      "concurrency": 1,
+      "engine": "nginx",
+      "n": 3,
+      "rps": 1694.22793797557,
+      "p99_us": 669.0,
+      "process_cpu_percent": 57.260178879230054,
+      "observed_machine_cpu_seconds_per_gib": 1.1448888888789548
+    },
+    {
+      "concurrency": 1,
+      "engine": "rut",
+      "n": 3,
+      "rps": 3188.1973752815584,
+      "p99_us": 380.0,
+      "process_cpu_percent": 69.22102036490261,
+      "observed_machine_cpu_seconds_per_gib": 0.7764180393632023
+    },
+    {
+      "concurrency": 32,
+      "engine": "nginx",
+      "n": 3,
+      "rps": 1679.0107189628604,
+      "p99_us": 36426.0,
+      "process_cpu_percent": 62.1565336810962,
+      "observed_machine_cpu_seconds_per_gib": 1.114525283202938
+    },
+    {
+      "concurrency": 32,
+      "engine": "rut",
+      "n": 3,
+      "rps": 2962.247148047161,
+      "p99_us": 11155.0,
+      "process_cpu_percent": 81.59578965725368,
+      "observed_machine_cpu_seconds_per_gib": 0.8116230083709467
+    }
+  ],
+  "cpu-placement": [
+    {
+      "concurrency": 1,
+      "engine": "copy",
+      "n": 1,
+      "rps": 2802.021283125337,
+      "p99_us": 459.0,
+      "process_cpu_percent": 60.39768739608116,
+      "observed_machine_cpu_seconds_per_gib": 1.1179508713062754
+    },
+    {
+      "concurrency": 1,
+      "engine": "ebpf",
+      "n": 1,
+      "rps": 1404.1438026786775,
+      "p99_us": 1117.0,
+      "process_cpu_percent": 5.490298348694732,
+      "observed_machine_cpu_seconds_per_gib": 1.7316911045756858
+    },
+    {
+      "concurrency": 32,
+      "engine": "copy",
+      "n": 1,
+      "rps": 2875.976656236202,
+      "p99_us": 14973.0,
+      "process_cpu_percent": 68.38993300186213,
+      "observed_machine_cpu_seconds_per_gib": 1.219657905724098
+    },
+    {
+      "concurrency": 32,
+      "engine": "ebpf",
+      "n": 1,
+      "rps": 1497.6554524774792,
+      "p99_us": 81606.0,
+      "process_cpu_percent": 6.397673805804211,
+      "observed_machine_cpu_seconds_per_gib": 1.7456254171698136
+    }
+  ],
+  "cpu-balanced": [
+    {
+      "concurrency": 1,
+      "engine": "copy",
+      "n": 3,
+      "rps": 2567.7643704114325,
+      "p99_us": 513.0,
+      "process_cpu_percent": 60.78709086120993,
+      "observed_machine_cpu_seconds_per_gib": 1.2050278732275044
+    },
+    {
+      "concurrency": 1,
+      "engine": "ebpf",
+      "n": 3,
+      "rps": 1416.867190171577,
+      "p99_us": 1109.0,
+      "process_cpu_percent": 4.510269098342301,
+      "observed_machine_cpu_seconds_per_gib": 1.7090285081728787
+    },
+    {
+      "concurrency": 32,
+      "engine": "copy",
+      "n": 3,
+      "rps": 2660.841318590254,
+      "p99_us": 18516.0,
+      "process_cpu_percent": 67.39091570456303,
+      "observed_machine_cpu_seconds_per_gib": 1.2649858945904613
+    },
+    {
+      "concurrency": 32,
+      "engine": "ebpf",
+      "n": 3,
+      "rps": 1438.6618915168942,
+      "p99_us": 97118.0,
+      "process_cpu_percent": 6.99838477279444,
+      "observed_machine_cpu_seconds_per_gib": 1.7373671300016784
+    }
+  ],
+  "long_flows": [
+    {
+      "body_bytes": 16777216,
+      "chunk_bytes": 4096,
+      "mode": "off",
+      "n": 6,
+      "elapsed_ns": 21912693.0,
+      "cpu_ns": 52887500.0,
+      "relay_cpu_ns": 14619500.0,
+      "writer_cpu_ns": 17893000.0,
+      "reader_cpu_ns": 19341000.0,
+      "control_ns": 0.0,
+      "redirect_wait_ns": 31.5,
+      "barrier_ns": 0.0,
+      "redirected_body_bytes": 0.0
+    },
+    {
+      "body_bytes": 16777216,
+      "chunk_bytes": 4096,
+      "mode": "required",
+      "n": 6,
+      "elapsed_ns": 38680296.5,
+      "cpu_ns": 48129000.0,
+      "relay_cpu_ns": 271500.0,
+      "writer_cpu_ns": 23939000.0,
+      "reader_cpu_ns": 22920000.0,
+      "control_ns": 28735.0,
+      "redirect_wait_ns": 37943008.0,
+      "barrier_ns": 2384.5,
+      "redirected_body_bytes": 16621568.0
+    },
+    {
+      "body_bytes": 16777216,
+      "chunk_bytes": 16384,
+      "mode": "off",
+      "n": 6,
+      "elapsed_ns": 17097952.0,
+      "cpu_ns": 36568000.0,
+      "relay_cpu_ns": 5304000.0,
+      "writer_cpu_ns": 14082000.0,
+      "reader_cpu_ns": 16055000.0,
+      "control_ns": 0.0,
+      "redirect_wait_ns": 32.5,
+      "barrier_ns": 0.0,
+      "redirected_body_bytes": 0.0
+    },
+    {
+      "body_bytes": 16777216,
+      "chunk_bytes": 16384,
+      "mode": "required",
+      "n": 6,
+      "elapsed_ns": 20186310.5,
+      "cpu_ns": 33122500.0,
+      "relay_cpu_ns": 119500.0,
+      "writer_cpu_ns": 16051000.0,
+      "reader_cpu_ns": 16788500.0,
+      "control_ns": 5433.0,
+      "redirect_wait_ns": 19510732.0,
+      "barrier_ns": 2010.0,
+      "redirected_body_bytes": 16760832.0
+    },
+    {
+      "body_bytes": 16777216,
+      "chunk_bytes": 65536,
+      "mode": "off",
+      "n": 6,
+      "elapsed_ns": 17064310.5,
+      "cpu_ns": 33566000.0,
+      "relay_cpu_ns": 3037000.0,
+      "writer_cpu_ns": 13641000.0,
+      "reader_cpu_ns": 15754500.0,
+      "control_ns": 0.0,
+      "redirect_wait_ns": 57.0,
+      "barrier_ns": 0.0,
+      "redirected_body_bytes": 0.0
+    },
+    {
+      "body_bytes": 16777216,
+      "chunk_bytes": 65536,
+      "mode": "required",
+      "n": 6,
+      "elapsed_ns": 18245679.0,
+      "cpu_ns": 30928500.0,
+      "relay_cpu_ns": 113500.0,
+      "writer_cpu_ns": 14295500.0,
+      "reader_cpu_ns": 15594500.0,
+      "control_ns": 5569.0,
+      "redirect_wait_ns": 16096941.0,
+      "barrier_ns": 2365.5,
+      "redirected_body_bytes": 16777163.0
+    },
+    {
+      "body_bytes": 536870912,
+      "chunk_bytes": 4096,
+      "mode": "off",
+      "n": 6,
+      "elapsed_ns": 690181778.5,
+      "cpu_ns": 1662377000.0,
+      "relay_cpu_ns": 456486500.0,
+      "writer_cpu_ns": 578871000.0,
+      "reader_cpu_ns": 630855000.0,
+      "control_ns": 0.0,
+      "redirect_wait_ns": 70.0,
+      "barrier_ns": 0.0,
+      "redirected_body_bytes": 0.0
+    },
+    {
+      "body_bytes": 536870912,
+      "chunk_bytes": 4096,
+      "mode": "required",
+      "n": 6,
+      "elapsed_ns": 1248269689.0,
+      "cpu_ns": 1495797500.0,
+      "relay_cpu_ns": 1489500.0,
+      "writer_cpu_ns": 765657500.0,
+      "reader_cpu_ns": 729722500.0,
+      "control_ns": 190100.0,
+      "redirect_wait_ns": 1246103114.5,
+      "barrier_ns": 4266.0,
+      "redirected_body_bytes": 535533568.0
+    },
+    {
+      "body_bytes": 536870912,
+      "chunk_bytes": 16384,
+      "mode": "off",
+      "n": 6,
+      "elapsed_ns": 525826103.5,
+      "cpu_ns": 1038785000.0,
+      "relay_cpu_ns": 98796500.0,
+      "writer_cpu_ns": 429195000.0,
+      "reader_cpu_ns": 509239000.0,
+      "control_ns": 0.0,
+      "redirect_wait_ns": 36.0,
+      "barrier_ns": 0.0,
+      "redirected_body_bytes": 0.0
+    },
+    {
+      "body_bytes": 536870912,
+      "chunk_bytes": 16384,
+      "mode": "required",
+      "n": 6,
+      "elapsed_ns": 615036006.0,
+      "cpu_ns": 1043550000.0,
+      "relay_cpu_ns": 311500.0,
+      "writer_cpu_ns": 494303000.0,
+      "reader_cpu_ns": 550929000.0,
+      "control_ns": 8267.5,
+      "redirect_wait_ns": 600319881.0,
+      "barrier_ns": 11280126.0,
+      "redirected_body_bytes": 536854528.0
+    },
+    {
+      "body_bytes": 536870912,
+      "chunk_bytes": 65536,
+      "mode": "off",
+      "n": 6,
+      "elapsed_ns": 515456137.5,
+      "cpu_ns": 991652000.0,
+      "relay_cpu_ns": 73815000.0,
+      "writer_cpu_ns": 418198000.0,
+      "reader_cpu_ns": 500365500.0,
+      "control_ns": 0.0,
+      "redirect_wait_ns": 39.5,
+      "barrier_ns": 0.0,
+      "redirected_body_bytes": 0.0
+    },
+    {
+      "body_bytes": 536870912,
+      "chunk_bytes": 65536,
+      "mode": "required",
+      "n": 6,
+      "elapsed_ns": 538848349.0,
+      "cpu_ns": 951010500.0,
+      "relay_cpu_ns": 1091000.0,
+      "writer_cpu_ns": 429972000.0,
+      "reader_cpu_ns": 518482500.0,
+      "control_ns": 6364.5,
+      "redirect_wait_ns": 454638614.5,
+      "barrier_ns": 80450453.0,
+      "redirected_body_bytes": 536870859.0
+    }
+  ]
+}

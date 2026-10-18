@@ -1,0 +1,132 @@
+49 warnings generated.
+/home/hurricane/private/code/Rut/bench/bench_kernel_relay.cc:204:31: warning: no header providing "SOL_SOCKET" is directly included [misc-include-cleaner]
+    6 |     if (setsockopt(kListener, SOL_SOCKET, SO_REUSEADDR, &kOne, sizeof(kOne)) != 0) return 2;
+      |                               ^
+/home/hurricane/private/code/Rut/bench/bench_kernel_relay.cc:204:43: warning: no header providing "SO_REUSEADDR" is directly included [misc-include-cleaner]
+  204 |     if (setsockopt(kListener, SOL_SOCKET, SO_REUSEADDR, &kOne, sizeof(kOne)) != 0) return 2;
+      |                                           ^
+/home/hurricane/private/code/Rut/bench/bench_kernel_relay.cc:258:57: warning: no header providing "SO_ERROR" is directly included [misc-include-cleaner]
+  258 |                 if (getsockopt(pair.fds[1], SOL_SOCKET, SO_ERROR, &error, &length) != 0 ||
+      |                                                         ^
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:80:19: warning: invalid case style for constant 'n' [readability-identifier-naming]
+   80 |         const u32 n =
+      |                   ^
+      |                   kN
+   81 |             connections > kMaxU32 / kBulkPerConnection ? kMaxU32 : connections * kBulkPerConnection;
+   82 |         return n > kMaxBulkSlices ? kMaxBulkSlices : n;
+      |                ~                                     ~
+      |                kN                                    kN
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:199:23: warning: invalid case style for constant 'words' [readability-identifier-naming]
+  199 |             const u32 words = (bulk_max_count + 63u) / 64u;
+      |                       ^~~~~
+      |                       kWords
+  200 |             bulk_in_use_size = static_cast<u64>(words) * sizeof(u64);
+      |                                                 ~~~~~
+      |                                                 kWords
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:226:13: warning: variable 'steps' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  226 |             u32 steps = (prealloc + kGrowStep - 1) / kGrowStep;
+      |             ^
+      |                 const 
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:242:9: warning: variable 'idx' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  242 |         u32 idx = free_stack[--free_top];
+      |         ^
+      |             const 
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:255:19: warning: invalid case style for constant 'idx' [readability-identifier-naming]
+  255 |         const u32 idx = bulk_free[--bulk_free_top];
+      |                   ^~~
+      |                   kIdx
+  256 |         if (bulk_cached_count != 0) --bulk_cached_count;
+  257 |         bulk_in_use[idx >> 6] |= u64{1} << (idx & 63u);
+      |                     ~~~                     ~~~
+      |                     kIdx                    kIdx
+  258 |         return bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+      |                                             ~~~
+      |                                             kIdx
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:286:9: warning: variable 'offset' of type 'u64' (aka 'unsigned long') can be declared 'const' [misc-const-correctness]
+  286 |         u64 offset = static_cast<u64>(ptr - base);
+      |         ^
+      |             const 
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:289:9: warning: variable 'idx' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  289 |         u32 idx = static_cast<u32>(offset / kSliceSize);
+      |         ^
+      |             const 
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:310:19: warning: invalid case style for constant 'boundary' [readability-identifier-naming]
+  310 |         const u32 boundary = free_top - cached_count;
+      |                   ^~~~~~~~
+      |                   kBoundary
+  311 |         if (cached_count != 0) free_stack[free_top] = free_stack[boundary];
+      |                                                                  ~~~~~~~~
+      |                                                                  kBoundary
+  312 |         free_stack[boundary] = idx;
+      |                    ~~~~~~~~
+      |                    kBoundary
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:325:19: warning: invalid case style for constant 'offset' [readability-identifier-naming]
+  325 |         const u64 offset = static_cast<u64>(ptr - base);
+      |                   ^~~~~~
+      |                   kOffset
+  326 |         if (offset % kSliceSize != 0) return false;
+      |             ~~~~~~
+      |             kOffset
+  327 |         return in_use_map[offset / kSliceSize];
+      |                           ~~~~~~
+      |                           kOffset
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:426:19: warning: invalid case style for constant 'offset' [readability-identifier-naming]
+  426 |         const u64 offset = static_cast<u64>(ptr - bulk_base);
+      |                   ^~~~~~
+      |                   kOffset
+  427 |         if (offset % kBulkSliceSize != 0) return;  // not buffer-aligned
+      |             ~~~~~~
+      |             kOffset
+  428 |         const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
+      |                                          ~~~~~~
+      |                                          kOffset
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:428:19: warning: invalid case style for constant 'idx' [readability-identifier-naming]
+  428 |         const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
+      |                   ^~~
+      |                   kIdx
+  429 |         if (idx >= bulk_max_count) return;
+      |             ~~~
+      |             kIdx
+  430 |         u64& word = bulk_in_use[idx >> 6];
+      |                                 ~~~
+      |                                 kIdx
+  431 |         const u64 bit = u64{1} << (idx & 63u);
+      |                                    ~~~
+      |                                    kIdx
+  432 |         if ((word & bit) == 0) return;  // double-free detection
+  433 |         word &= ~bit;
+  434 |         // Like slices, a returned buffer must not expose its owner's bytes.
+  435 |         if (bulk_cached_count < kMaxCachedBulk) {
+  436 |             // Hot: zero in place, since MADV_DONTNEED would make every reuse
+  437 |             // fault its pages back in. Bytes past `dirty` are still zero from
+  438 |             // the previous return (or the fresh mapping).
+  439 |             __builtin_memset(ptr, 0, dirty);
+  440 |             bulk_free[bulk_free_top++] = idx;
+      |                                          ~~~
+      |                                          kIdx
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:431:19: warning: invalid case style for constant 'bit' [readability-identifier-naming]
+  431 |         const u64 bit = u64{1} << (idx & 63u);
+      |                   ^~~
+      |                   kBit
+  432 |         if ((word & bit) == 0) return;  // double-free detection
+      |                     ~~~
+      |                     kBit
+  433 |         word &= ~bit;
+      |                  ~~~
+      |                  kBit
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:452:19: warning: invalid case style for constant 'boundary' [readability-identifier-naming]
+  452 |         const u32 boundary = bulk_free_top - bulk_cached_count;
+      |                   ^~~~~~~~
+      |                   kBoundary
+  453 |         if (bulk_cached_count != 0) bulk_free[bulk_free_top] = bulk_free[boundary];
+      |                                                                          ~~~~~~~~
+      |                                                                          kBoundary
+  454 |         bulk_free[boundary] = idx;
+      |                   ~~~~~~~~
+      |                   kBoundary
+/home/hurricane/private/code/Rut/include/rut/runtime/slice_pool.h:468:9: warning: variable 'chunk_size' of type 'u64' (aka 'unsigned long') can be declared 'const' [misc-const-correctness]
+  468 |         u64 chunk_size = static_cast<u64>(step) * kSliceSize;
+      |         ^
+      |             const 
+Suppressed 32 warnings (32 in non-user code).
+Use -header-filter=.* or leave it as default to display errors from all non-system headers. Use -system-headers to display errors from system headers as well.

@@ -1,0 +1,279 @@
+diff --git a/include/rut/runtime/io_uring_backend.h b/include/rut/runtime/io_uring_backend.h
+index b9cda6ca..4c7c0fa6 100644
+--- a/include/rut/runtime/io_uring_backend.h
++++ b/include/rut/runtime/io_uring_backend.h
+@@ -94,6 +94,13 @@ struct IoUringBackend {
+     // Kernel supports IORING_NOP_INJECT_RESULT (probed at init); required to
+     // complete a send that was written directly in full.
+     bool nop_inject_result = false;
++    // Experimental opt-in. Keep the logical send alive until the kernel
++    // releases its buffer; ordinary completion alone is insufficient for ZC.
++    bool experimental_send_zc = false;
++    u64 send_zc_submitted = 0;
++    u64 send_zc_notifications = 0;
++    u64 send_zc_copied = 0;
++    u64 send_zc_fallbacks = 0;
+ 
+     // Provided buffer ring
+     io_uring_buf_ring* buf_ring = nullptr;
+@@ -132,6 +139,9 @@ struct IoUringBackend {
+         i32 file_fd = -1;
+         u32 file_base = 0;
+         bool shutdown_when_done = false;  // end the stream once every byte is out
++        bool zerocopy = false;
++        bool notification_pending = false;
++        i32 zerocopy_result = 0;
+     };
+     MappedArray<SendState> send_state;
+     MappedArray<SendState> upstream_send_state;
+@@ -297,8 +307,13 @@ struct IoUringBackend {
+     // any partial-send resubmission): the caller submits more of the same
+     // stream from this send's completion.
+     // Returns false if SQ is full (no SQE submitted).
+-    bool add_send(
+-        i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation = 0, bool more_follows = false);
++    bool add_send(i32 fd,
++                  u32 conn_id,
++                  const u8* buf,
++                  u32 len,
++                  u32 generation = 0,
++                  bool more_follows = false,
++                  bool allow_zerocopy = false);
+ 
+     // Send `len` bytes of `file_fd` starting at `file_off` with sendfile(2):
+     // page-cache pages go to the socket without a user-space copy. Writes
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index 14b9c6ea..94f0313c 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -3531,7 +3531,13 @@ public:
+                 return false;
+             }
+         }
+-        if (backend.add_send(c.fd, c.id, buf, len, generation, c.plaintext_send_has_follow_up())) {
++        if (backend.add_send(c.fd,
++                             c.id,
++                             buf,
++                             len,
++                             generation,
++                             c.plaintext_send_has_follow_up(),
++                             !c.tls_active)) {
+             c.pending_ops++;
+             c.send_armed = true;
+             return true;
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index 86caa249..d5f63295 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -10,6 +10,8 @@
+ #include <errno.h>
+ #include <linux/io_uring.h>
+ #include <poll.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>  // memset
+ #include <sys/mman.h>
+ #include <sys/sendfile.h>
+@@ -224,6 +226,9 @@ void IoUringBackend::destroy_send_state_storage() {
+ }
+ 
+ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 capacity) {
++    const char* zc = ::getenv("RUT_EXPERIMENTAL_SEND_ZC");
++    experimental_send_zc = zc != nullptr && zc[0] == '1' && zc[1] == '\0';
++    send_zc_submitted = send_zc_notifications = send_zc_copied = send_zc_fallbacks = 0;
+     last_init_failure_detail = IoUringInitFailureDetail::None;
+     if ((connection_capacity != 0 && connection_capacity != capacity) || ring_fd >= 0 ||
+         timer_fd >= 0) {
+@@ -754,8 +759,13 @@ bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32
+                                upstream_episode);
+ }
+ 
+-bool IoUringBackend::add_send(
+-    i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation, bool more_follows) {
++bool IoUringBackend::add_send(i32 fd,
++                              u32 conn_id,
++                              const u8* buf,
++                              u32 len,
++                              u32 generation,
++                              bool more_follows,
++                              bool allow_zerocopy) {
+     if (conn_id >= connection_capacity || connection_capacity == 0) return false;
+     io_uring_sqe* sqe = get_sqe_flushing();
+     if (!sqe) return false;  // no SQE even after a flush: don't record send_state for it
+@@ -768,7 +778,13 @@ bool IoUringBackend::add_send(
+     }
+ 
+     memset(sqe, 0, sizeof(*sqe));
+-    sqe->opcode = IORING_OP_SEND;
++    const bool use_zc = experimental_send_zc && allow_zerocopy && len >= 32 * 1024;
++    send_state[conn_id].zerocopy = use_zc;
++    sqe->opcode = use_zc ? IORING_OP_SEND_ZC : IORING_OP_SEND;
++    if (use_zc) {
++        sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
++        ++send_zc_submitted;
++    }
+     // MSG_NOSIGNAL explicit; current kernels also force it for io_uring.
+     sqe->msg_flags = MSG_NOSIGNAL | extra_flags;
+     sqe->fd = fd;
+@@ -1405,6 +1421,47 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
+         u32 upstream_episode = 0;
+         decode_user_data(cqe->user_data, conn_id, type, aux, upstream_episode);
+ 
++        io_uring_cqe released{};
++        bool retry_without_zerocopy = false;
++        // Hide the data CQE while F_MORE retains kernel ownership. Delaying
++        // the logical completion also delays body-chain consumption and close
++        // reclamation under the existing pending_ops owner.
++        if (type == IoEventType::Send && conn_id < connection_capacity) {
++            auto& ss = send_state[conn_id];
++            const bool current = aux == ss.generation && (aux & kNonUpstreamSendCancelBit) == 0;
++            if ((cqe->flags & IORING_CQE_F_NOTIF) != 0) {
++                if (!current || !ss.zerocopy || !ss.notification_pending) {
++                    ++head;
++                    continue;
++                }
++                ++send_zc_notifications;
++                if ((static_cast<u32>(cqe->res) & IORING_NOTIF_USAGE_ZC_COPIED) != 0)
++                    ++send_zc_copied;
++                released = *cqe;
++                released.res = ss.zerocopy_result;
++                released.flags = 0;
++                ss.notification_pending = false;
++                cqe = &released;
++            } else if (current && ss.zerocopy) {
++                if ((cqe->flags & IORING_CQE_F_MORE) != 0) {
++                    ss.zerocopy_result = cqe->res;
++                    ss.notification_pending = true;
++                    ++head;
++                    continue;
++                }
++                // Unsupported ZC consumed no bytes and owns no notification.
++                // Reuse the existing partial-send resubmission to try SEND.
++                if (cqe->res == -EINVAL || cqe->res == -EOPNOTSUPP) {
++                    ss.zerocopy = false;
++                    ++send_zc_fallbacks;
++                    retry_without_zerocopy = true;
++                    released = *cqe;
++                    released.res = 0;
++                    cqe = &released;
++                }
++            }
++        }
++
+         // Dispatch an already completed downstream send before copying
+         // or publishing a later receive for that same connection. A sequential
+         // client can receive the response and submit its next request before
+@@ -2082,7 +2139,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
+                 count++;
+                 continue;
+             }
+-            if (cqe->res > 0 && ss.remaining > 0) {
++            if ((cqe->res > 0 || retry_without_zerocopy) && ss.remaining > 0) {
+                 u32 nw = static_cast<u32>(cqe->res);
+                 if (nw > ss.remaining || ss.offset > UINT32_MAX - nw) {
+                     // A completion may never claim bytes outside the submitted
+@@ -2111,7 +2168,11 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
+                     io_uring_sqe* sqe = get_sqe_flushing();
+                     if (sqe) {
+                         memset(sqe, 0, sizeof(*sqe));
+-                        sqe->opcode = IORING_OP_SEND;
++                        sqe->opcode = ss.zerocopy ? IORING_OP_SEND_ZC : IORING_OP_SEND;
++                        if (ss.zerocopy) {
++                            sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
++                            ++send_zc_submitted;
++                        }
+                         sqe->msg_flags = MSG_NOSIGNAL | ss.msg_flags;
+                         sqe->fd = ss.fd;
+                         sqe->addr = reinterpret_cast<u64>(ss.src + ss.offset);
+@@ -2274,6 +2335,13 @@ void IoUringBackend::shutdown() {
+         close(ring_fd);
+         ring_fd = -1;
+     }
++    if (experimental_send_zc && send_zc_submitted != 0)
++        ::fprintf(stderr,
++                  "SEND_ZC submitted=%llu notifications=%llu copied=%llu fallbacks=%llu\n",
++                  static_cast<unsigned long long>(send_zc_submitted),
++                  static_cast<unsigned long long>(send_zc_notifications),
++                  static_cast<unsigned long long>(send_zc_copied),
++                  static_cast<unsigned long long>(send_zc_fallbacks));
+     destroy_send_state_storage();
+ }
+ 
+diff --git a/tests/test_network.cc b/tests/test_network.cc
+index aa6c0042..8b626f81 100644
+--- a/tests/test_network.cc
++++ b/tests/test_network.cc
+@@ -75833,6 +75833,73 @@ struct UserspaceSendWaitFixture {
+     ~UserspaceSendWaitFixture() { backend.destroy_send_state_storage(); }
+ };
+ 
++TEST(iouring_send_zc, holds_completion_until_notification_and_retries_partial) {
++    UserspaceSendWaitFixture f;
++    REQUIRE(f.init());
++    auto& b = f.backend;
++    static const u8 payload[] = "abcdefghi";
++    b.send_state[0] = {payload, 91, 0, 9, IoEventType::Send, 0, 41};
++    b.send_state[0].zerocopy = true;
++    IoEvent event{};
++    REQUIRE(f.push(41, 4, IORING_CQE_F_MORE));
++    CHECK_EQ(b.wait(&event, 1, nullptr, 0), 0u);
++    CHECK(b.send_state[0].notification_pending);
++    CHECK_EQ(b.send_state[0].offset, 0u);
++    CHECK_EQ(b.pending, 0u);
++    // Cancel-token and old-generation notifications cannot release this owner.
++    REQUIRE(f.push(40, 0, IORING_CQE_F_NOTIF));
++    REQUIRE(f.push(41 | kNonUpstreamSendCancelBit, -ENOENT));
++    CHECK_EQ(b.wait(&event, 1, nullptr, 0), 1u);
++    CHECK(b.send_state[0].notification_pending);
++    REQUIRE(f.push(41, IORING_NOTIF_USAGE_ZC_COPIED, IORING_CQE_F_NOTIF));
++    CHECK_EQ(b.wait(&event, 1, nullptr, 0), 0u);
++    CHECK(!b.send_state[0].notification_pending);
++    CHECK_EQ(b.send_state[0].offset, 4u);
++    CHECK_EQ(b.send_state[0].remaining, 5u);
++    CHECK_EQ(b.pending, 1u);
++    CHECK_EQ(f.sq_entries[0].opcode, IORING_OP_SEND_ZC);
++    b.pending = 0;  // queued SQE is simulated, not submitted to a kernel
++    REQUIRE(f.push(41, 5, IORING_CQE_F_MORE));
++    CHECK_EQ(b.wait(&event, 1, nullptr, 0), 0u);
++    CHECK_EQ(b.send_state[0].remaining, 5u);
++    REQUIRE(f.push(41, 0, IORING_CQE_F_NOTIF));
++    CHECK_EQ(b.wait(&event, 1, nullptr, 0), 1u);
++    CHECK_EQ(event.result, 9);
++    CHECK_EQ(event.more, 0u);
++    CHECK_EQ(event.non_upstream_generation, 41u);
++    CHECK_EQ(b.send_zc_notifications, 2u);
++    CHECK_EQ(b.send_zc_copied, 1u);
++}
++
++TEST(iouring_send_zc, unsupported_falls_back_and_error_waits_for_notification) {
++    UserspaceSendWaitFixture f;
++    REQUIRE(f.init());
++    auto& b = f.backend;
++    static const u8 payload[] = "abcdefghi";
++    IoEvent event{};
++    b.send_state[0] = {payload, 91, 0, 9, IoEventType::Send, 0, 42};
++    b.send_state[0].zerocopy = true;
++    REQUIRE(f.push(42, -EOPNOTSUPP));
++    CHECK_EQ(b.wait(&event, 1, nullptr, 0), 0u);
++    CHECK(!b.send_state[0].zerocopy);
++    CHECK_EQ(f.sq_entries[0].opcode, IORING_OP_SEND);
++    CHECK_EQ(b.send_state[0].remaining, 9u);
++    b.pending = 0;  // simulate submission of the fallback
++    REQUIRE(f.push(42, 9));
++    REQUIRE_EQ(b.wait(&event, 1, nullptr, 0), 1u);
++    CHECK_EQ(event.result, 9);
++    b.send_state[0] = {payload, 91, 0, 9, IoEventType::Send, 0, 43};
++    b.send_state[0].zerocopy = true;
++    REQUIRE(f.push(43, -ECANCELED, IORING_CQE_F_MORE));
++    CHECK_EQ(b.wait(&event, 1, nullptr, 0), 0u);
++    CHECK(b.send_state[0].notification_pending);
++    REQUIRE(f.push(43, 0, IORING_CQE_F_NOTIF));
++    REQUIRE_EQ(b.wait(&event, 1, nullptr, 0), 1u);
++    CHECK_EQ(event.result, -ECANCELED);
++    CHECK_EQ(event.non_upstream_generation, 43u);
++    CHECK(!b.send_state[0].notification_pending);
++}
++
+ TEST(iouring_send_generation, backend_wait_bypasses_stale_cancel_and_more_before_proactor) {
+     UserspaceSendWaitFixture fixture;
+     REQUIRE(fixture.init());
