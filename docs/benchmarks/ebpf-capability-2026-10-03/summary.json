@@ -1,0 +1,50 @@
+{
+  "cases": 162,
+  "profiles": {
+    "host": {
+      "cases": 27,
+      "outcomes": {
+        "copy": 12,
+        "unavailable": 15
+      }
+    },
+    "sidecar-default": {
+      "cases": 27,
+      "outcomes": {
+        "copy": 12,
+        "unavailable": 15
+      }
+    },
+    "bpf-default-seccomp": {
+      "cases": 27,
+      "outcomes": {
+        "copy": 12,
+        "unavailable": 15
+      }
+    },
+    "bpf-default-label": {
+      "cases": 27,
+      "outcomes": {
+        "copy": 12,
+        "unavailable": 15
+      }
+    },
+    "bpf-relaxed-label": {
+      "cases": 27,
+      "outcomes": {
+        "copy": 12,
+        "sockmap": 12,
+        "unavailable": 3
+      }
+    },
+    "bpf-default-seccomp-label-disabled": {
+      "cases": 27,
+      "outcomes": {
+        "copy": 12,
+        "sockmap": 12,
+        "unavailable": 3
+      }
+    }
+  },
+  "performance_measured": false
+}

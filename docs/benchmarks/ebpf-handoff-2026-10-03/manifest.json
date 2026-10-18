@@ -1,0 +1,28 @@
+{
+  "binary_path": "/home/hurricane/private/code/rut-ebpf-20261003/handoff-v2",
+  "binary_sha256": "09b89acd8db5a52055ab6eb929446361e1e9809fb36249269f8084fff63b213e",
+  "sources": {
+    "bench/bench_ebpf_handoff.cc": "29b740826fe1509d72efae8e809af6925986ab0e3893c913f9ba5821e1159fc1",
+    "include/rut/common/ebpf_handoff_bytecode.h": "4dfd16e65e823ed11d6f6e39ff32e166bc876170b068950e9d1a06df9594168c",
+    "include/rut/runtime/ebpf_handoff.h": "3e6a6f858957874fea61537c0f8785ada758e6054fbcd160b4818ce90548dc1e",
+    "include/rut/common/ebpf_plan.h": "b8d40b785142b62e7408e7c553af893010b2fc59c89a5a9e6597ca80825ec88f",
+    "include/rut/runtime/ebpf_plan.h": "d488673f673da5eb203fa40fb7ed99e8296f1a0e04c815feb7334ab725e237b4",
+    "src/compiler/ebpf_plan.cc": "9ec770f12d5fdfda1eddae49dd3e2b9972c4c6542c2b694301355281847547e9",
+    "src/ebpf_plan_export.cc": "d35b9854e9af273299406807b839d3a3a563ab8cb6f536c91ee48b56955a91da",
+    "tests/test_ebpf_handoff.py": "8636ddc920be0c6ded15e63c585da452232ccf97f317967ab7503369515b419b",
+    "tests/test_ebpf_compiler.py": "46dde16992eba882e20398c4aa58082066c796a07a97e441ec3a37b1809eab89"
+  },
+  "artifacts": {
+    "three-way.jsonl": "10d0ad5fbef26c27a77032421e29a4569aa4a02a39e2250109f95f2ad161f654",
+    "kernel-suite.jsonl": "5074852dca547e71c5d7771e78a76fe1ed49c31aa465b398902b04c6c615d68d",
+    "ctest.log": "a3e99ad123ef28d40dbcf5429a0d32423df663d1f210a15991b3f1a8605e5ba8",
+    "off-ctest.log": "8ed16e8f2357b7aa3d50ac619ca43ca3cde4d7de6d3c95287c9039f1ffd44b75",
+    "handoff-tidy.log": "707d0defcd38b1c078645e00bb22969e39ea5ab1da0911d6dc5c62ce00db1f89",
+    "planner-tidy.log": "73f472e54c7171298e7e819df0a16a0ca8d1f0c6343ab891f9f2889eb32b01bb",
+    "export-tidy.log": "4f865138306a4b039c2c6ffe316a5813aced2b584481e38f7a1c367a60390aa4",
+    "summary.json": "df0aac73bfbca0159b8265ce5f218bed4424d11de9895b072395c6903eeb6b2b",
+    "compiled-plan.json": "3a33c5085290e0ca2ada4854cabd1c9f6120eeaaba5f99ed07d3704a4812f9fc",
+    "README.md": "ede9324f0d5b54138c20efbeda06cb0f4c98c182a0a710b9dfcd716bd22f6125",
+    "export-input-ctest.log": "429bee3c05840f59c00bf4ab3d4f8bca1b620b4e2ee36a710ea6a19c7f8efdb6"
+  }
+}

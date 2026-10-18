@@ -1,0 +1,82 @@
+[
+  {
+    "connection": "close",
+    "concurrency": 1,
+    "base": {
+      "n": 2,
+      "valid": true,
+      "rps": 2203.1380768601866,
+      "p99_ms": 0.4945,
+      "rss": 36993024.0,
+      "cpu_pct": 67.97394629188018
+    },
+    "candidate": {
+      "n": 2,
+      "valid": true,
+      "rps": 2248.0529496705926,
+      "p99_ms": 0.5085,
+      "rss": 37064704.0,
+      "cpu_pct": 68.02379990488811
+    }
+  },
+  {
+    "connection": "close",
+    "concurrency": 128,
+    "base": {
+      "n": 2,
+      "valid": true,
+      "rps": 2144.0869605513126,
+      "p99_ms": 68.113,
+      "rss": 97140736.0,
+      "cpu_pct": 82.36915660035869
+    },
+    "candidate": {
+      "n": 2,
+      "valid": true,
+      "rps": 2141.1858118306427,
+      "p99_ms": 68.098,
+      "rss": 98725888.0,
+      "cpu_pct": 82.6890644248071
+    }
+  },
+  {
+    "connection": "keepalive",
+    "concurrency": 1,
+    "base": {
+      "n": 2,
+      "valid": true,
+      "rps": 2485.823683657252,
+      "p99_ms": 0.519,
+      "rss": 36589568.0,
+      "cpu_pct": 74.60639911852334
+    },
+    "candidate": {
+      "n": 2,
+      "valid": true,
+      "rps": 2557.890480001838,
+      "p99_ms": 0.487,
+      "rss": 36528128.0,
+      "cpu_pct": 74.95250382266875
+    }
+  },
+  {
+    "connection": "keepalive",
+    "concurrency": 128,
+    "base": {
+      "n": 2,
+      "valid": true,
+      "rps": 2343.974241048146,
+      "p99_ms": 60.012,
+      "rss": 89987072.0,
+      "cpu_pct": 84.47866912179725
+    },
+    "candidate": {
+      "n": 2,
+      "valid": true,
+      "rps": 2367.5169566149266,
+      "p99_ms": 59.248,
+      "rss": 91553792.0,
+      "cpu_pct": 84.7375430360058
+    }
+  }
+]
