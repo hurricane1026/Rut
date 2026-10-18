@@ -496,8 +496,17 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                     (ssl_error == SSL_ERROR_SYSCALL && error_number == 0)) {
                     const auto framing =
                         grpc_web_test_response_framing(response.data(), response.size());
-                    if (framing.headers_complete && framing.valid && framing.web &&
-                        !framing.has_content_length) {
+                    const bool complete_content_length =
+                        framing.headers_complete && framing.valid && framing.has_content_length &&
+                        response.size() >= framing.body_offset &&
+                        response.size() - framing.body_offset == framing.content_length;
+                    const bool complete_connection_delimited_web =
+                        framing.headers_complete && framing.valid && framing.web &&
+                        !framing.has_content_length && response.size() >= framing.body_offset &&
+                        grpc_web_test_complete_envelope(response.data() + framing.body_offset,
+                                                        response.size() - framing.body_offset,
+                                                        framing.text);
+                    if (complete_content_length || complete_connection_delimited_web) {
                         tls_eof = true;
                         break;
                     }
@@ -556,6 +565,7 @@ struct GrpcWebTlsGateServer {
     std::atomic<bool> served{false};
     bool truncate_response = false;
     bool clean_close_truncated_response = false;
+    bool unclean_close_response = false;
     bool started = false;
 
     static void* run(void* ptr) {
@@ -630,7 +640,8 @@ struct GrpcWebTlsGateServer {
                         offset += static_cast<size_t>(n);
                 }
                 self->served.store(ok, std::memory_order_release);
-                if (!self->truncate_response || self->clean_close_truncated_response)
+                if ((!self->truncate_response && !self->unclean_close_response) ||
+                    self->clean_close_truncated_response)
                     SSL_shutdown(ssl);
             }
         }
@@ -1491,6 +1502,15 @@ TEST(grpc_proxy, h1_binary_tls_truncated_content_length_fails) {
     const std::vector<u8> body{0, 0, 0, 0, 1, 0};
     std::vector<u8> response;
     CHECK(!grpc_web_test_h1_exchange(server.port, false, false, body, response, true));
+    CHECK(server.served.load(std::memory_order_acquire));
+}
+TEST(grpc_proxy, h1_binary_tls_complete_content_length_unclean_close_succeeds) {
+    GrpcWebTlsGateServer server;
+    server.unclean_close_response = true;
+    REQUIRE(server.start());
+    const std::vector<u8> body{0, 0, 0, 0, 1, 0};
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(server.port, false, false, body, response, true));
     CHECK(server.served.load(std::memory_order_acquire));
 }
 TEST(grpc_proxy, h1_binary_tls_clean_close_missing_terminal_trailer_fails) {
