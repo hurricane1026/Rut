@@ -928,7 +928,7 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 stream->send_window -= static_cast<i32>(amount);
                 h.conn_send_window -= amount;
                 if (x->web_mode == GrpcWebContentType::Text) {
-                    if (!x->upload_len && x->upload_raw_credit) {
+                    if (!x->web_h1 && !x->upload_len && x->upload_raw_credit) {
                         x->downstream->h2->consume_data(x->downstream_stream, x->upload_raw_credit);
                         x->upload_raw_credit = 0;
                     }
@@ -1178,6 +1178,8 @@ bool grpc_start_impl(Loop* loop,
     if (!x) return false;
     static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize);
     x->init();
+    x->web_h1 = down.h2->grpc.web_h1_kick != nullptr;
+    x->web_h1_kick = down.h2->grpc.web_h1_kick;
     x->web_mode = web_mode;
     constexpr u32 kWebFramingLimit = 0xffffffffu;
     const u32 request_message_limit =
@@ -1271,7 +1273,6 @@ bool grpc_start_impl(Loop* loop,
         return false;
     }
     x->downstream = &down;
-    x->web_h1_kick = down.h2->grpc.web_h1_kick;
     x->upstream = up;
     x->downstream_stream = sid;
     x->upstream_stream = usid;
@@ -1577,7 +1578,12 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
 
 template <typename Loop>
 void grpc_kick_downstream(Loop* loop, Connection& down) {
-    if (!down.h2 || down.h2->grpc.busy || down.on_send || down.h2->async_stream) return;
+    if (!down.h2) return;
+    if (down.h2->grpc.web_h1_kick) {
+        down.h2->grpc.web_h1_kick(loop, static_cast<ConnectionBase&>(down));
+        return;
+    }
+    if (down.h2->grpc.busy || down.on_send || down.h2->async_stream) return;
     on_h2_data<Loop>(static_cast<void*>(loop), down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
 }
 
@@ -1593,7 +1599,7 @@ void grpc_request_data(
     const u8* upload_data = data;
     u32 upload_len = len;
     if (x.web_mode == GrpcWebContentType::Text) {
-        if (len > UINT32_MAX - x.upload_raw_credit) {
+        if (!x.web_h1 && len > UINT32_MAX - x.upload_raw_credit) {
             if (!x.web_h1) {
                 down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
                 down.h2->consume_data(x.downstream_stream, len);
@@ -1604,7 +1610,7 @@ void grpc_request_data(
             grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
             return;
         }
-        x.upload_raw_credit += len;
+        if (!x.web_h1) x.upload_raw_credit += len;
         u32 consumed = 0;
         const auto status = x.request_base64.feed(data,
                                                   len,
