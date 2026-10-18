@@ -734,7 +734,7 @@ TEST(grpc_proxy, h1_transfer_encoding_chain_fails_closed) {
              static_cast<u32>(GrpcWebH1Start::Rejected));
 }
 
-TEST(grpc_proxy, h1_invalid_text_base64_returns_grpc_status) {
+void grpc_web_h1_local_failure_case(rut::test::TestCase* _tc, bool invalid_base64) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
     auto shard = std::make_unique<Shard<EpollEventLoop>>();
@@ -752,7 +752,9 @@ TEST(grpc_proxy, h1_invalid_text_base64_returns_grpc_status) {
     shard->route_config = &config;
     REQUIRE(shard->spawn(-1));
 
-    const std::vector<u8> invalid{'A', 'B', '=', 'C'};
+    const std::vector<u8> invalid = invalid_base64
+                                        ? std::vector<u8>{'A', 'B', '=', 'C'}
+                                        : grpc_web_test_base64(std::vector<u8>{2, 0, 0, 0, 0});
     std::vector<u8> response;
     CHECK(grpc_web_test_h1_exchange(get_port(listener), true, false, invalid, response));
     std::vector<u8> decoded;
@@ -785,6 +787,12 @@ TEST(grpc_proxy, h1_invalid_text_base64_returns_grpc_status) {
         shard->loop->listen_fd = -1;
     }
     shard->shutdown();
+}
+TEST(grpc_proxy, h1_invalid_text_base64_returns_grpc_status) {
+    grpc_web_h1_local_failure_case(_tc, true);
+}
+TEST(grpc_proxy, h1_invalid_native_request_framing_returns_status) {
+    grpc_web_h1_local_failure_case(_tc, false);
 }
 TEST(grpc_proxy, h1_trailers_only_backend_response) {
     grpc_web_h1_trailers_only_case(_tc);
