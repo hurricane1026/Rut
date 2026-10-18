@@ -1179,12 +1179,10 @@ bool grpc_submit_next_connect(Loop* loop, Connection& conn) {
         conn.upstream_backend_idx = static_cast<u8>(backend);
         conn.fd = conn.upstream_fd = UpstreamPool::create_socket();
         if (conn.upstream_fd < 0) {
-            grpc_record_connect_result(loop, conn, false, monotonic_us());
             continue;
         }
         if (loop->submit_connect(conn, &target.addrs[backend], sizeof(target.addrs[backend])))
             return true;
-        grpc_record_connect_result(loop, conn, false, monotonic_us());
         if (!grpc_close_failed_connect_socket(loop, conn)) return false;
     }
     return false;
@@ -1457,7 +1455,6 @@ bool grpc_start_impl(Loop* loop,
         up->fd = up->upstream_fd = UpstreamPool::create_socket();
         up->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);
         if (up->fd < 0) {
-            grpc_record_connect_result(loop, *up, false, monotonic_us());
             if (grpc_submit_next_connect(loop, *up)) {
                 loop->timer.refresh(up, 1);
                 loop->timer.refresh(&down, 1);
@@ -1468,7 +1465,6 @@ bool grpc_start_impl(Loop* loop,
             return true;
         }
         if (!loop->submit_connect(*up, &target.addrs[backend], sizeof(target.addrs[backend]))) {
-            grpc_record_connect_result(loop, *up, false, monotonic_us());
             if (!grpc_submit_next_connect(loop, *up)) {
                 loop->close_conn(*up);
                 return true;

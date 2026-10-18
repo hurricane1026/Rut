@@ -1700,6 +1700,8 @@ TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_
     down->h2->client = true;
     down->protocol = ConnProtocol::Http2;
     down->request_config = &cfg;
+    const RouteConfig* cfg_ptr = &cfg;
+    loop.config_ptr = &cfg_ptr;
     REQUIRE(down->h2->open_stream(1) != nullptr);
     const char* synth = "POST /svc HTTP/1.1\r\nhost: x\r\ncontent-type: application/grpc\r\n\r\n";
     const u32 synth_len = static_cast<u32>(__builtin_strlen(synth));
@@ -1734,7 +1736,11 @@ TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_
     CHECK_EQ(loop.recv_submits, 0u);
     CHECK_EQ(loop.connect_submits, 3u);
     CHECK_EQ(loop.grpc_upstreams, nullptr);
-    CHECK_EQ(health->fails, 0u);
+    for (u32 i = 0; i < cfg.upstreams[0].addr_count; i++) {
+        auto* backend = backend_health(0, i);
+        REQUIRE(backend != nullptr);
+        CHECK_EQ(backend->fails, 0u);
+    }
     REQUIRE(loop.last_connect_conn != nullptr);
     CHECK(loop.last_connect_conn->timer_node.next == &loop.last_connect_conn->timer_node);
     CHECK(loop.last_connect_conn->timer_node.prev == &loop.last_connect_conn->timer_node);
@@ -2674,6 +2680,73 @@ TEST(grpc_proxy, tls_connect_failover_before_handshake_epoll) {
 TEST(grpc_proxy, tls_connect_failover_before_handshake_iouring) {
     grpc_connect_failover_case<IoUringEventLoop>(_tc, true);
 }
+
+template <typename Loop>
+void grpc_connect_failover_success_case(rut::test::TestCase* _tc) {
+    (void)_tc;
+    GrpcBackendHealthReset health_reset{};
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log().has_value());
+
+    // Predict the next round-robin choice so that the first attempted address
+    // is a closed port and the other address is the live echo server.
+    const u32 first = select_backend(0, 2, monotonic_us());
+    const u32 second = select_backend(0, 2, monotonic_us());
+    CHECK_EQ(second, 1u - first);
+    const u32 live = 1u - first;
+    const int refused_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE(refused_fd >= 0);
+    const u16 refused_port = get_port(refused_fd);
+    close(refused_fd);
+
+    RouteConfig cfg;
+    const u16 ports[2] = {first == 0 ? refused_port : get_port(server->listen_fd),
+                          first == 1 ? refused_port : get_port(server->listen_fd)};
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, ports[0]).has_value());
+    REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, ports[1]));
+    cfg.upstreams[0].http2 = true;
+    REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &cfg;
+    REQUIRE(shard->spawn(-1).has_value());
+    {
+        Client client;
+        CHECK(client.init(get_port(lfd), false));
+        if (client.fd >= 0) {
+            CHECK_EQ(client.request(0, 128, true), 1);
+            CHECK(client.until(0, true));
+            CHECK(client.rpcs[0].ok && client.rpcs[0].trailer);
+            CHECK_EQ(client.rpcs[0].received, 128u);
+        }
+    }
+    CHECK_EQ(server->requests.load(), 1u);
+    CHECK_EQ(server->accepts.load(), 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[0], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_latency.count, 1u);
+    REQUIRE(shard->loop->grpc_upstreams != nullptr);
+    auto* upstream = shard->loop->grpc_upstreams;
+    CHECK_EQ(upstream->h2->grpc.connect_attempts, 2u);
+    CHECK_EQ(upstream->h2->grpc.connect_tried_mask, 3u);
+    CHECK_EQ(upstream->upstream_backend_idx, live);
+    shard->shutdown();
+}
+
+TEST(grpc_proxy, connect_failover_success_epoll) {
+    grpc_connect_failover_success_case<EpollEventLoop>(_tc);
+}
+TEST(grpc_proxy, connect_failover_success_iouring) {
+    grpc_connect_failover_success_case<IoUringEventLoop>(_tc);
+}
+
 TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
     GrpcBackendHealthReset health_reset{};
     auto loop = std::make_unique<EventLoop<MockBackend>>();
