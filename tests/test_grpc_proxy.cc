@@ -4030,27 +4030,24 @@ void grpc_connect_failover_success_case(rut::test::TestCase* _tc) {
     }
     REQUIRE(shard->init_access_log().has_value());
 
-    // Predict the next round-robin choice so that the first attempted address
-    // is a closed port and the other address is the live echo server.
-    const u32 first = select_backend(0, 2, monotonic_us());
-    const u32 second = select_backend(0, 2, monotonic_us());
-    CHECK_EQ(second, 1u - first);
-    const u32 live = 1u - first;
+    // The shard thread has its own round-robin cursor, initialized to zero.
+    // Keep backend 0 closed and backend 1 live so its first attempt reliably
+    // fails and the retry reaches the echo server.
     const int refused_fd = create_listen_socket(0).value_or(-1);
     REQUIRE(refused_fd >= 0);
     const u16 refused_port = get_port(refused_fd);
     close(refused_fd);
 
     RouteConfig cfg;
-    const u16 ports[2] = {first == 0 ? refused_port : get_port(server->listen_fd),
-                          first == 1 ? refused_port : get_port(server->listen_fd)};
+    const u16 ports[2] = {refused_port, get_port(server->listen_fd)};
     REQUIRE(cfg.add_upstream("grpc", 0x7f000001, ports[0]).has_value());
     REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, ports[1]));
     cfg.upstreams[0].http2 = true;
     REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
     shard->route_config = &cfg;
-    REQUIRE(shard->spawn(-1).has_value());
-    {
+    const bool spawned = shard->spawn(-1).has_value();
+    CHECK(spawned);
+    if (spawned) {
         Client client;
         CHECK(client.init(get_port(lfd), false));
         if (client.fd >= 0) {
@@ -4060,17 +4057,26 @@ void grpc_connect_failover_success_case(rut::test::TestCase* _tc) {
             CHECK_EQ(client.rpcs[0].received, 128u);
         }
     }
-    CHECK_EQ(server->requests.load(), 1u);
-    CHECK_EQ(server->accepts.load(), 1u);
-    CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
-    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
-    CHECK_EQ(shard->shard_metrics.grpc_completed[0], 1u);
-    CHECK_EQ(shard->shard_metrics.grpc_latency.count, 1u);
-    REQUIRE(shard->loop->grpc_upstreams != nullptr);
-    auto* upstream = shard->loop->grpc_upstreams;
-    CHECK_EQ(upstream->h2->grpc.connect_attempts, 2u);
-    CHECK_EQ(upstream->h2->grpc.connect_tried_mask, 3u);
-    CHECK_EQ(upstream->upstream_backend_idx, live);
+    shard->stop();
+    shard->join();
+    if (spawned) {
+        CHECK_EQ(server->requests.load(), 1u);
+        CHECK_EQ(server->accepts.load(), 1u);
+        CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
+        CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+        CHECK_EQ(shard->shard_metrics.grpc_completed[0], 1u);
+        CHECK_EQ(shard->shard_metrics.grpc_latency.count, 1u);
+        auto* upstream = shard->loop->grpc_upstreams;
+        CHECK(upstream != nullptr);
+        if (upstream != nullptr) {
+            CHECK(upstream->h2 != nullptr);
+        }
+        if (upstream != nullptr && upstream->h2 != nullptr) {
+            CHECK_EQ(upstream->h2->grpc.connect_attempts, 2u);
+            CHECK_EQ(upstream->h2->grpc.connect_tried_mask, 3u);
+            CHECK_EQ(upstream->upstream_backend_idx, 1u);
+        }
+    }
     shard->shutdown();
 }
 
