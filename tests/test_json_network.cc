@@ -703,6 +703,31 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
         decode(hs256_key.c_str(),
                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.IfR5W5USO_w4xSkuH-3bkLY-rSj9vIYL4V9jUdcNv4U!")
             .first);
+    auto b64url = [](const std::string& input) {
+        static constexpr char alphabet[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        std::string out;
+        for (size_t i = 0; i < input.size(); i += 3) {
+            const u32 left = static_cast<unsigned char>(input[i]);
+            const u32 middle = i + 1 < input.size() ? static_cast<unsigned char>(input[i + 1]) : 0;
+            const u32 right = i + 2 < input.size() ? static_cast<unsigned char>(input[i + 2]) : 0;
+            out += alphabet[left >> 2];
+            out += alphabet[((left & 3) << 4) | (middle >> 4)];
+            if (i + 1 < input.size()) out += alphabet[((middle & 15) << 2) | (right >> 6)];
+            if (i + 2 < input.size()) out += alphabet[right & 63];
+        }
+        return out;
+    };
+    std::string flood = R"({"alg":"HS256")";
+    for (u32 i = 0; i < 700; ++i) flood += ",\"x" + std::to_string(i) + "\":0";
+    flood += '}';
+    CHECK(flood.size() > 5000);
+    const std::string flood_token = b64url(flood) + ".e30.AA";
+    CHECK_FALSE(decode(hs256_key.c_str(), flood_token.c_str()).first);
+    std::string oversized = R"({"alg":"HS256","x":")" + std::string(1010, 'x') + "\"}";
+    CHECK(oversized.size() > 1024);
+    const std::string oversized_token = b64url(oversized) + ".e30.AA";
+    CHECK_FALSE(decode(hs256_key.c_str(), oversized_token.c_str()).first);
 
     arena.destroy();
     pool.destroy();

@@ -1615,28 +1615,6 @@ bool jwt_decode_claims(
     if (!b64url_decode({token.ptr, header_b64_len}, header_bytes, sizeof(header_bytes), header_len))
         return false;
     if (header_len > 1024) return false;
-    // Duplicate-key rejection in the general JSON parser is quadratic. JWT
-    // protected headers are deliberately small so hostile member floods fail
-    // before entering that parser.
-    u32 header_members = 0;
-    bool in_string = false;
-    bool escaped = false;
-    for (u32 i = 0; i < header_len; ++i) {
-        const char c = header_bytes[i];
-        if (in_string) {
-            if (escaped)
-                escaped = false;
-            else if (c == '\\')
-                escaped = true;
-            else if (c == '"')
-                in_string = false;
-        } else if (c == '"') {
-            in_string = true;
-        } else if (c == ',') {
-            ++header_members;
-            if (header_members >= 64) return false;
-        }
-    }
     if (!document.parse({header_bytes, header_len})) return false;
     if (document.nodes[0].kind != json::Kind::Object) return false;
     JwtDigest digest_kind = JwtDigest::Sha256;
