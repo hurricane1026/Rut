@@ -416,7 +416,7 @@ Binary and base64-text gRPC-Web can use the same `.http2` upstream through
 HTTP/2 or HTTP/1.1 POST requests. Content types are `application/grpc-web` and
 `application/grpc-web-text`, optionally suffixed with `+proto`; `+json` is not
 supported. The bridge preserves opaque protobuf payloads and converts backend
-trailers into the final gRPC-Web body envelope. Base64 is incremental and
+trailers into the final gRPC-Web body envelope. The incremental base64 request decoder
 accepts independently padded flush blocks. HTTP/1.1 accepts Content-Length or
 chunked uploads and closes after the response; it does not provide keep-alive
 or pipelining for these RPCs. Browser CORS requires explicit OPTIONS routes

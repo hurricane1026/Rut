@@ -1420,8 +1420,9 @@ active/pooled sessions until teardown.
 
 Optional `max_request_message_bytes` and `max_response_message_bytes` upstream
 fields bound the wire payload of each message independently. They are positive
-32-bit values and require `.http2`; omission disables envelope inspection in
-that direction. A per-exchange incremental counter reads only the five-byte
+32-bit values and require `.http2`; omission disables native gRPC envelope
+inspection in that direction. Web always validates message framing, with an
+implicit unsigned 32-bit payload ceiling when no explicit limit is configured. A per-exchange incremental counter reads only the five-byte
 gRPC envelope, skips opaque payloads, and handles split headers, empty and
 multiple messages without buffering whole messages. Compressed payloads are
 bounded in their compressed wire form; no decompression or protobuf decoding
@@ -1466,8 +1467,8 @@ The gRPC-Web bridge accepts HTTP/2 and HTTP/1.1 POST requests with binary
 `application/grpc-web` or base64 `application/grpc-web-text`, with optional
 `+proto`. JSON variants are rejected. It forwards native gRPC upstream and
 encodes terminal metadata as a final 0x80 trailer envelope in the response
-body. Strict incremental base64 accepts arbitrary input boundaries and
-independently padded flush blocks, rejecting invalid alphabet, padding and
+body. The strict incremental request decoder accepts arbitrary input boundaries
+and independently padded base64 flush blocks, rejecting invalid alphabet, padding and
 non-canonical pad bits. Payloads remain opaque, including compressed messages.
 Web message limits inspect the decoded five-byte envelope and wire payload;
 text encoding does not change that limit.
@@ -1477,8 +1478,8 @@ cancellation and configuration ownership. HTTP/2 text upload credit is held
 until decoded bytes leave the upload queue. HTTP/1.1 reads pause when that queue
 fills and resume when upstream capacity returns, including while a response
 send is pending. Its private stream index never emits HTTP/2 frames downstream
-or grants HTTP/2 flow-control credit. Content-Length and exactly chunked
-uploads are supported; responses are connection-delimited and close after the
+or grants HTTP/2 flow-control credit. Content-Length uploads and a single final
+`Transfer-Encoding: chunked` coding are supported; responses are connection-delimited and close after the
 last body bytes, without downstream keep-alive or pipelining.
 
 A separate tracker follows native message bytes staged in downstream-owned
