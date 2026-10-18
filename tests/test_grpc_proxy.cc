@@ -199,8 +199,7 @@ struct EchoServer {
                 s->data[4] = static_cast<u8>(payload_len);
                 for (u32 i = 5; i < message_len; i++) s->data[i] = static_cast<u8>(0xa0 + i);
                 s->len = message_len;
-                if (self->stream_response_partial_next.load())
-                    s->data[s->len++] = 0;
+                if (self->stream_response_partial_next.load()) s->data[s->len++] = 0;
             }
             if (mode == 1) {
                 nghttp2_nv error[] = {nv(":status", "200"),
@@ -234,9 +233,9 @@ struct EchoServer {
             u32 header_count = 0;
             if (duplicate_ct) {
                 headers[1] = duplicate_ct == 2 ? nv("content-type", "application/grpc+json")
-                                              : nv("content-type", "application/grpc");
+                                               : nv("content-type", "application/grpc");
                 headers[2] = duplicate_ct == 1 ? nv("content-type", "application/grpc+json")
-                                              : nv("content-type", "application/grpc");
+                                               : nv("content-type", "application/grpc");
                 headers[3] = nv("x-meta-bin", "AAEC/w==");
                 header_count = 4;
             } else {
