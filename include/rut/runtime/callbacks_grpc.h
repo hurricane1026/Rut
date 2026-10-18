@@ -101,6 +101,19 @@ inline bool grpc_timeout(Str value, u64* micros) {
     *micros = n;
     return true;
 }
+inline bool grpc_request_deadline(
+    const hpack::Header* hs, u32 n, u64 base_us, bool& timeout_present, u64& deadline_us) {
+    timeout_present = false;
+    deadline_us = 0;
+    for (u32 i = 0; i < n; ++i) {
+        if (!hs[i].name.eq({"grpc-timeout", 12})) continue;
+        u64 timeout = 0;
+        if (timeout_present || !grpc_timeout(hs[i].value, &timeout)) return false;
+        timeout_present = true;
+        deadline_us = base_us + timeout;
+    }
+    return true;
+}
 inline u32 grpc_error_headers(u8* out, u32 cap, u32 sid, u8 code, bool started) {
     char status[2] = {static_cast<char>('0' + code / 10), static_cast<char>('0' + code % 10)};
     const Str value = code >= 10 ? Str{status, 2} : Str{status + 1, 1};
@@ -1034,6 +1047,86 @@ void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     grpc_on_upstream_data<Loop>(lp, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0});
 }
 
+inline u32 grpc_retry_timeout_value(char* out, u64 remaining_us) {
+    static constexpr char units[] = {'u', 'm', 'S', 'M', 'H'};
+    static constexpr u64 scales[] = {1, 1000, 1000000, 60000000, 3600000000ull};
+    u64 value = 0;
+    char unit = 'u';
+    for (u32 i = 0; i < 5; ++i) {
+        value = remaining_us / scales[i];
+        if (value && value <= 99999999u) {
+            unit = units[i];
+            break;
+        }
+    }
+    if (!value) return 0;
+    char digits[8];
+    u32 n = 0;
+    while (value) {
+        digits[n++] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    }
+    for (u32 i = 0; i < n; ++i) out[i] = digits[n - i - 1];
+    out[n++] = unit;
+    return n;
+}
+
+enum class GrpcRequestHeaderBuild : u8 { Ready, Expired, NoSpace };
+
+inline GrpcRequestHeaderBuild grpc_build_request_headers_for_send(
+    const GrpcExchange& x, u64 now, u8* out, u32 cap, u32& written) {
+    written = 0;
+    if (x.request_headers_len < kFrameHeaderSize || x.request_headers_len > GrpcExchange::kHeaders)
+        return GrpcRequestHeaderBuild::NoSpace;
+    if (!x.timeout_present) {
+        if (x.request_headers_len > cap) return GrpcRequestHeaderBuild::NoSpace;
+        __builtin_memcpy(out, x.request_headers, x.request_headers_len);
+        written = x.request_headers_len;
+        return GrpcRequestHeaderBuild::Ready;
+    }
+    if (!x.deadline_us || now >= x.deadline_us) return GrpcRequestHeaderBuild::Expired;
+
+    char timeout[9];
+    const u32 timeout_len = grpc_retry_timeout_value(timeout, x.deadline_us - now);
+    if (!timeout_len) return GrpcRequestHeaderBuild::Expired;
+    u8 field[GrpcExchange::kTimeoutFieldMax];
+    const u32 field_len = hpack::encode_header(field, {"grpc-timeout", 12}, {timeout, timeout_len});
+    if (!field_len || field_len > sizeof(field)) return GrpcRequestHeaderBuild::NoSpace;
+
+    Http2FrameHeader headers{};
+    if (parse_frame_header(x.request_headers, x.request_headers_len, &headers) !=
+            ParseStatus::Complete ||
+        headers.type != static_cast<u8>(Http2FrameType::Headers) ||
+        headers.stream_id != x.upstream_stream ||
+        headers.length != x.request_headers_len - kFrameHeaderSize)
+        return GrpcRequestHeaderBuild::NoSpace;
+
+    const bool append_to_headers = headers.length + field_len <= kDefaultMaxFrameSize;
+    const u32 extra = field_len + (append_to_headers ? 0 : kFrameHeaderSize);
+    if (x.request_headers_len > cap || extra > cap - x.request_headers_len)
+        return GrpcRequestHeaderBuild::NoSpace;
+    __builtin_memcpy(out, x.request_headers, x.request_headers_len);
+    if (append_to_headers) {
+        headers.length += field_len;
+        write_frame_header(out, headers);
+        __builtin_memcpy(out + x.request_headers_len, field, field_len);
+        written = x.request_headers_len + field_len;
+        return GrpcRequestHeaderBuild::Ready;
+    }
+
+    headers.flags &= static_cast<u8>(~http2_flag::kEndHeaders);
+    write_frame_header(out, headers);
+    Http2FrameHeader continuation{};
+    continuation.length = field_len;
+    continuation.stream_id = headers.stream_id;
+    continuation.type = static_cast<u8>(Http2FrameType::Continuation);
+    continuation.flags = http2_flag::kEndHeaders;
+    write_frame_header(out + x.request_headers_len, continuation);
+    __builtin_memcpy(out + x.request_headers_len + kFrameHeaderSize, field, field_len);
+    written = x.request_headers_len + kFrameHeaderSize + field_len;
+    return GrpcRequestHeaderBuild::Ready;
+}
+
 template <typename Loop>
 void grpc_drive_upstream(Loop* loop, Connection& conn) {
     auto& h = *conn.h2;
@@ -1063,6 +1156,7 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
     } else {
         u32 opened = 0;
         u32 next_header = 0x7fffffffu;
+        const u64 send_now = monotonic_us();
         for (auto* x : g.streams) {
             if (!x) continue;
             auto* stream = h.find_stream(x->upstream_stream);
@@ -1071,6 +1165,11 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 continue;
             }
             if (x->failure || x->response_end) continue;
+            if (x->timeout_present && (!x->deadline_us || send_now >= x->deadline_us)) {
+                x->failure = 4;
+                x->response_end = true;
+                continue;
+            }
             if (x->replaying_attempt && x->replay_body.remaining &&
                 x->upload_len < sizeof(x->upload)) {
                 const u32 copied = x->replay_body.copy(x->upload + x->upload_len,
@@ -1091,8 +1190,18 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 if (!h.peer_settings_seen || (h.peer_settings.has_max_concurrent_streams &&
                                               opened >= h.peer_settings.max_concurrent_streams))
                     continue;
-                n = x->request_headers_len;
-                __builtin_memcpy(out, x->request_headers, n);
+                const auto build = grpc_build_request_headers_for_send(
+                    *x, send_now, out, conn.send_buf.write_avail(), n);
+                if (build == GrpcRequestHeaderBuild::Expired) {
+                    x->failure = 4;
+                    x->response_end = true;
+                    continue;
+                }
+                if (build != GrpcRequestHeaderBuild::Ready) {
+                    g.busy = false;
+                    loop->close_conn(conn);
+                    return;
+                }
                 x->request_headers_sent = true;
             } else if (x->upload_len && stream->send_window > 0 && h.conn_send_window > 0) {
                 u32 amount = x->upload_len;
@@ -1575,30 +1684,6 @@ inline GrpcWebContentType grpc_web_response_mode(const hpack::Header* headers,
     return first_mode == 2 ? GrpcWebContentType::Text : GrpcWebContentType::Binary;
 }
 
-inline u32 grpc_retry_timeout_value(char* out, u64 remaining_us) {
-    static constexpr char units[] = {'u', 'm', 'S', 'M', 'H'};
-    static constexpr u64 scales[] = {1, 1000, 1000000, 60000000, 3600000000ull};
-    u64 value = 0;
-    char unit = 'u';
-    for (u32 i = 0; i < 5; ++i) {
-        value = remaining_us / scales[i];
-        if (value && value <= 99999999u) {
-            unit = units[i];
-            break;
-        }
-    }
-    if (!value) return 0;
-    char digits[8];
-    u32 n = 0;
-    while (value) {
-        digits[n++] = static_cast<char>('0' + value % 10);
-        value /= 10;
-    }
-    for (u32 i = 0; i < n; ++i) out[i] = digits[n - i - 1];
-    out[n++] = unit;
-    return n;
-}
-
 template <typename Loop>
 bool grpc_bind_retry_attempt(Loop* loop, GrpcExchange& x, u64 now) {
     if constexpr (!(requires(Loop* l, Connection& c) {
@@ -1667,16 +1752,8 @@ bool grpc_bind_retry_attempt(Loop* loop, GrpcExchange& x, u64 now) {
             if (fresh) loop->close_conn(*up);
             return false;
         }
-        char timeout[9];
-        if (x.retry_timeout_present) {
-            if (!x.deadline_us || now >= x.deadline_us) return false;
-            const u32 len = grpc_retry_timeout_value(timeout, x.deadline_us - now);
-            if (!len) return false;
-            for (u32 i = 0; i < nh; ++i)
-                if (hs[i].name.eq({"grpc-timeout", 12})) hs[i].value = {timeout, len};
-        }
         x.request_headers_len =
-            http2_write_headers(x.request_headers, sizeof(x.request_headers), sid, hs, nh, false);
+            http2_write_headers(x.request_headers, GrpcExchange::kHeaders, sid, hs, nh, false);
         hpack::Header trailers[GrpcReplayHeaders::kMaxHeaders];
         u32 nt = 0;
         if (!x.request_headers_len ||
@@ -1780,12 +1857,8 @@ bool grpc_start_impl(Loop* loop,
     else if (auto* stream = down.h2->find_stream(sid); stream && stream->headers_received_us)
         deadline_base = stream->headers_received_us;
     u64 deadline = 0;
-    for (u32 i = 0; i < nh; i++) {
-        if (!hs[i].name.eq({"grpc-timeout", 12})) continue;
-        u64 timeout = 0;
-        if (deadline || !grpc_timeout(hs[i].value, &timeout)) return false;
-        deadline = deadline_base + timeout;
-    }
+    bool timeout_present = false;
+    if (!grpc_request_deadline(hs, nh, deadline_base, timeout_present, deadline)) return false;
     const u32 backend = select_backend(uid, target.addr_count, now);
     Connection* up = nullptr;
     for (auto* c = loop->grpc_upstreams; c; c = c->h2->grpc.pool_next) {
@@ -1866,6 +1939,7 @@ bool grpc_start_impl(Loop* loop,
     hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
     u32 filtered_n = 0;
     for (u32 i = 0; i < nh; i++) {
+        if (hs[i].name.eq({"grpc-timeout", 12})) continue;
         if (!grpc_request_header_allowed(hs[i]) || filtered_n >= Http2Conn::kMaxHeadersPerReq)
             continue;
         if (web_mode == GrpcWebContentType::Text && hs[i].name.eq({"content-length", 14})) continue;
@@ -1894,7 +1968,7 @@ bool grpc_start_impl(Loop* loop,
         filtered[filtered_n++] = {{"te", 2}, {"trailers", 8}};
     }
     x->request_headers_len = http2_write_headers(
-        x->request_headers, sizeof(x->request_headers), usid, filtered, filtered_n, false);
+        x->request_headers, GrpcExchange::kHeaders, usid, filtered, filtered_n, false);
     if (!x->request_headers_len) {
         stream->state = Http2StreamState::Closed;
         loop->pool.free(reinterpret_cast<u8*>(x));
@@ -1912,11 +1986,10 @@ bool grpc_start_impl(Loop* loop,
     x->downstream_stream = sid;
     x->upstream_stream = usid;
     x->deadline_us = deadline;
+    x->timeout_present = timeout_present;
     x->has_request_length = req.has_content_length;
     x->expected_request_bytes = req.content_length;
     x->request_end = end;
-    for (u32 i = 0; i < nh; i++)
-        if (hs[i].name.eq({"grpc-timeout", 12})) x->retry_timeout_present = true;
     x->upstream_id = uid;
     x->retry_tried_mask = static_cast<u8>(1u << backend);
     if (target.max_inflight) {

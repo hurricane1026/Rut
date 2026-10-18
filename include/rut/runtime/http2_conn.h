@@ -66,8 +66,8 @@ struct H2RouteParam {
 
 struct Http2Conn {
     static constexpr u32 kMaxStreams = 64;
-    static constexpr u32 kHeaderBlockCap = 16384;    // assembled HPACK fragments
-    static constexpr u32 kHeaderScratchCap = 16384;  // decoded name/value bytes
+    static constexpr u32 kHeaderBlockCap = 16384 + 32;  // header block plus late gRPC timeout
+    static constexpr u32 kHeaderScratchCap = 16384;     // decoded name/value bytes
     static constexpr u32 kMaxHeadersPerReq = 64;
 
     // Delivered when a stream's header block completes (END_HEADERS). `headers`

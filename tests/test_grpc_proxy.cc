@@ -133,6 +133,9 @@ struct EchoServer {
     std::atomic<u32> duplicate_content_type_order{0};
     std::atomic<u32> request_trailers{0};
     std::atomic<u32> grpc_content_type_requests{0};
+    std::atomic<u32> grpc_encoding_requests{0};
+    std::atomic<u32> grpc_timeout_requests{0};
+    std::atomic<u64> last_grpc_timeout_us{0};
     std::atomic<u32> te_trailers_requests{0};
     std::atomic<u32> bad_web_request_headers{0};
     std::atomic<u32> text_marker_requests{0};
@@ -295,6 +298,17 @@ struct EchoServer {
             memcmp(value, "application/grpc", 16) == 0) {
             stream->saw_grpc_content_type = true;
             server->grpc_content_type_requests++;
+        }
+        if (name_len == 13 && memcmp(name, "grpc-encoding", 13) == 0 && value_len == 4 &&
+            memcmp(value, "gzip", 4) == 0)
+            server->grpc_encoding_requests++;
+        if (name_len == 12 && memcmp(name, "grpc-timeout", 12) == 0) {
+            u64 timeout_us = 0;
+            if (grpc_timeout({reinterpret_cast<const char*>(value), static_cast<u32>(value_len)},
+                             &timeout_us)) {
+                server->grpc_timeout_requests++;
+                server->last_grpc_timeout_us.store(timeout_us);
+            }
         }
         if (stream && name_len == 2 && memcmp(name, "te", 2) == 0 && value_len == 8 &&
             memcmp(value, "trailers", 8) == 0) {
@@ -574,7 +588,11 @@ struct Client {
         provider.read_callback = &data;
         return nghttp2_submit_request(session, nullptr, headers, 7, &provider, nullptr);
     }
-    int request_native_raw(u32 index, const u8* body, u32 body_len, const char* timeout = "1H") {
+    int request_native_raw(u32 index,
+                           const u8* body,
+                           u32 body_len,
+                           const char* timeout = "1H",
+                           const char* encoding = nullptr) {
         auto& rpc = rpcs[index];
         if (body_len > Rpc::kWebBufferCap) return -1;
         if (!rpc.raw) rpc.raw = std::make_unique<u8[]>(Rpc::kWebBufferCap);
@@ -583,17 +601,19 @@ struct Client {
         rpc.raw_request = true;
         rpc.compare_pattern = false;
         rpc.end = true;
-        nghttp2_nv headers[] = {nv(":method", "POST"),
-                                nv(":scheme", "http"),
-                                nv(":authority", "grpc.test"),
-                                nv(":path", "/test.Echo/Call"),
-                                nv("content-type", "application/grpc+proto"),
-                                nv("te", "trailers"),
-                                nv("grpc-timeout", timeout)};
+        nghttp2_nv headers[8] = {nv(":method", "POST"),
+                                 nv(":scheme", "http"),
+                                 nv(":authority", "grpc.test"),
+                                 nv(":path", "/test.Echo/Call"),
+                                 nv("content-type", "application/grpc+proto"),
+                                 nv("te", "trailers"),
+                                 nv("grpc-timeout", timeout)};
+        if (encoding) headers[7] = nv("grpc-encoding", encoding);
         nghttp2_data_provider provider{};
         provider.source.ptr = &rpc;
         provider.read_callback = &data;
-        return nghttp2_submit_request(session, nullptr, headers, 7, &provider, nullptr);
+        return nghttp2_submit_request(
+            session, nullptr, headers, encoding ? 8 : 7, &provider, nullptr);
     }
     int request_web(u32 index,
                     const u8* body,
@@ -1055,6 +1075,38 @@ struct HeldSendGrpcDriveFixture : GrpcDriveFixture {
         closed = true;
     }
 };
+struct GrpcRequestHeaderCapture {
+    u32 calls = 0;
+    u32 timeout_count = 0;
+    u32 timeout_len = 0;
+    u32 encoding_count = 0;
+    u32 padding_len = 0;
+    char timeout[16]{};
+    char encoding[16]{};
+};
+void capture_grpc_request_headers(
+    void* ctx, Http2Conn&, u32, const hpack::Header* hs, u32 n, bool) {
+    auto* capture = static_cast<GrpcRequestHeaderCapture*>(ctx);
+    capture->calls++;
+    for (u32 i = 0; i < n; ++i) {
+        if (hs[i].name.eq({"grpc-timeout", 12})) {
+            capture->timeout_count++;
+            capture->timeout_len = hs[i].value.len;
+            const u32 len = hs[i].value.len < sizeof(capture->timeout) - 1
+                                ? hs[i].value.len
+                                : sizeof(capture->timeout) - 1;
+            __builtin_memcpy(capture->timeout, hs[i].value.ptr, len);
+        } else if (hs[i].name.eq({"grpc-encoding", 13})) {
+            capture->encoding_count++;
+            const u32 len = hs[i].value.len < sizeof(capture->encoding) - 1
+                                ? hs[i].value.len
+                                : sizeof(capture->encoding) - 1;
+            __builtin_memcpy(capture->encoding, hs[i].value.ptr, len);
+        } else if (hs[i].name.eq({"x-padding", 9})) {
+            capture->padding_len = hs[i].value.len;
+        }
+    }
+}
 void pending_send(void*, Connection&, IoEvent) {}
 }  // namespace
 
@@ -3080,6 +3132,302 @@ TEST(grpc_proxy, grpc_retry_web_text_iouring) {
     grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 1, true, true);
 }
 
+TEST(grpc_proxy, request_timeout_is_materialized_at_send_time_and_continues_near_cap) {
+    GrpcExchange exchange;
+    exchange.init();
+    exchange.upstream_stream = 1;
+    const hpack::Header request[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/svc", 4}},
+                                     {{"grpc-encoding", 13}, {"gzip", 4}}};
+    exchange.request_headers_len =
+        http2_write_headers(exchange.request_headers, GrpcExchange::kHeaders, 1, request, 3, false);
+    REQUIRE(exchange.request_headers_len > kFrameHeaderSize);
+    exchange.timeout_present = true;
+    exchange.deadline_us = 10000000;
+
+    u8 output[GrpcExchange::kHeaders + GrpcExchange::kRequestHeadersSlack]{};
+    u32 output_len = 0;
+    CHECK(grpc_build_request_headers_for_send(
+              exchange, 1000000, output, sizeof(output), output_len) ==
+          GrpcRequestHeaderBuild::Ready);
+    CHECK_GT(output_len, exchange.request_headers_len);
+    CHECK_LE(output_len - exchange.request_headers_len, GrpcExchange::kTimeoutFieldMax);
+    u8 input[sizeof(output) + kClientPrefaceLen]{};
+    __builtin_memcpy(input, kClientPreface, kClientPrefaceLen);
+    __builtin_memcpy(input + kClientPrefaceLen, output, output_len);
+    Http2Conn parser;
+    parser.init();
+    GrpcRequestHeaderCapture capture;
+    parser.cb_ctx = &capture;
+    parser.on_headers = capture_grpc_request_headers;
+    u8 control[128]{};
+    u32 control_len = 0;
+    const auto parsed = parser.process(
+        input, kClientPrefaceLen + output_len, control, sizeof(control), &control_len);
+    CHECK_FALSE(parsed.close);
+    CHECK_EQ(parsed.consumed, kClientPrefaceLen + output_len);
+    CHECK_EQ(capture.calls, 1u);
+    CHECK_EQ(capture.timeout_count, 1u);
+    CHECK_EQ(capture.timeout_len, 8u);
+    CHECK_EQ(memcmp(capture.timeout, "9000000u", 8), 0);
+    CHECK_EQ(capture.encoding_count, 1u);
+
+    CHECK(grpc_build_request_headers_for_send(
+              exchange, 8000000, output, sizeof(output), output_len) ==
+          GrpcRequestHeaderBuild::Ready);
+    __builtin_memcpy(input, kClientPreface, kClientPrefaceLen);
+    __builtin_memcpy(input + kClientPrefaceLen, output, output_len);
+    parser.init();
+    capture = {};
+    parser.cb_ctx = &capture;
+    parser.on_headers = capture_grpc_request_headers;
+    control_len = 0;
+    const auto delayed = parser.process(
+        input, kClientPrefaceLen + output_len, control, sizeof(control), &control_len);
+    CHECK_FALSE(delayed.close);
+    CHECK_EQ(delayed.consumed, kClientPrefaceLen + output_len);
+    CHECK_EQ(capture.timeout_count, 1u);
+    CHECK_EQ(capture.timeout_len, 8u);
+    CHECK_EQ(memcmp(capture.timeout, "2000000u", 8), 0);
+
+    GrpcExchange absent;
+    absent.init();
+    absent.upstream_stream = 1;
+    absent.deadline_us = 100;
+    absent.request_headers_len = exchange.request_headers_len;
+    __builtin_memcpy(
+        absent.request_headers, exchange.request_headers, exchange.request_headers_len);
+    CHECK(grpc_build_request_headers_for_send(absent, 200, output, sizeof(output), output_len) ==
+          GrpcRequestHeaderBuild::Ready);
+    CHECK_EQ(output_len, absent.request_headers_len);
+    CHECK_EQ(memcmp(output, absent.request_headers, output_len), 0);
+
+    exchange.deadline_us = 100;
+    CHECK(grpc_build_request_headers_for_send(exchange, 100, output, sizeof(output), output_len) ==
+          GrpcRequestHeaderBuild::Expired);
+    CHECK_EQ(output_len, 0u);
+
+    const hpack::Header duplicate_timeout[] = {{{"grpc-timeout", 12}, {"1S", 2}},
+                                               {{"grpc-timeout", 12}, {"2S", 2}}};
+    bool timeout_present = false;
+    u64 deadline = 0;
+    CHECK_FALSE(grpc_request_deadline(duplicate_timeout, 2, 500, timeout_present, deadline));
+    const hpack::Header malformed_timeout[] = {{{"grpc-timeout", 12}, {"bad", 3}}};
+    CHECK_FALSE(grpc_request_deadline(malformed_timeout, 1, 500, timeout_present, deadline));
+    CHECK(grpc_request_deadline(nullptr, 0, 500, timeout_present, deadline));
+    CHECK_FALSE(timeout_present);
+    CHECK_EQ(deadline, 0u);
+
+    char padding[16350]{};
+    const hpack::Header near_cap[] = {{{":method", 7}, {"POST", 4}},
+                                      {{":path", 5}, {"/svc", 4}},
+                                      {{"x-padding", 9}, {padding, sizeof(padding)}}};
+    exchange.init();
+    exchange.upstream_stream = 3;
+    exchange.timeout_present = true;
+    exchange.deadline_us = 10000000;
+    exchange.request_headers_len = http2_write_headers(
+        exchange.request_headers, GrpcExchange::kHeaders, 3, near_cap, 3, false);
+    REQUIRE(exchange.request_headers_len > GrpcExchange::kHeaders - 64);
+    CHECK(grpc_build_request_headers_for_send(
+              exchange, 1000000, output, sizeof(output), output_len) ==
+          GrpcRequestHeaderBuild::Ready);
+    Http2FrameHeader first{};
+    REQUIRE_EQ(parse_frame_header(output, output_len, &first), ParseStatus::Complete);
+    CHECK_EQ(first.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK_FALSE(first.flags & http2_flag::kEndHeaders);
+    CHECK_LE(first.length, kDefaultMaxFrameSize);
+    const u32 continuation_offset = kFrameHeaderSize + first.length;
+    Http2FrameHeader continuation{};
+    REQUIRE_EQ(parse_frame_header(
+                   output + continuation_offset, output_len - continuation_offset, &continuation),
+               ParseStatus::Complete);
+    CHECK_EQ(continuation.type, static_cast<u8>(Http2FrameType::Continuation));
+    CHECK_EQ(continuation.stream_id, 3u);
+    CHECK_EQ(continuation.flags, http2_flag::kEndHeaders);
+    CHECK_LE(continuation.length, GrpcExchange::kTimeoutFieldMax);
+    __builtin_memcpy(input, kClientPreface, kClientPrefaceLen);
+    __builtin_memcpy(input + kClientPrefaceLen, output, output_len);
+    parser.init();
+    capture = {};
+    parser.cb_ctx = &capture;
+    parser.on_headers = capture_grpc_request_headers;
+    control_len = 0;
+    const auto continued = parser.process(
+        input, kClientPrefaceLen + output_len, control, sizeof(control), &control_len);
+    CHECK_FALSE(continued.close);
+    CHECK_EQ(continued.consumed, kClientPrefaceLen + output_len);
+    CHECK_EQ(capture.calls, 1u);
+    CHECK_EQ(capture.timeout_count, 1u);
+    CHECK_EQ(capture.encoding_count, 0u);
+    CHECK_EQ(capture.padding_len, static_cast<u32>(sizeof(padding)));
+}
+
+TEST(grpc_proxy, request_timeout_waits_for_connect_tls_settings_and_stream_slot) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection upstream;
+    upstream.reset();
+    u8 upstream_send[SlicePool::kSliceSize]{};
+    upstream.send_slice = upstream_send;
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.grpc.preface_sent = true;
+    upstream_h2.grpc.connecting = true;
+    upstream_h2.grpc.client_tls.ssl_ctx = reinterpret_cast<SSL_CTX*>(1);
+    upstream.h2 = &upstream_h2;
+
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream_h2.grpc.busy = true;
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    auto* exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(exchange != nullptr);
+    exchange->init();
+    exchange->downstream = &downstream;
+    exchange->upstream = &upstream;
+    exchange->downstream_stream = exchange->upstream_stream = 1;
+    exchange->timeout_present = true;
+    exchange->deadline_us = monotonic_us() + 10000000;
+    const hpack::Header request[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/svc", 4}},
+                                     {{"grpc-encoding", 13}, {"gzip", 4}}};
+    exchange->request_headers_len = http2_write_headers(
+        exchange->request_headers, GrpcExchange::kHeaders, 1, request, 3, false);
+    REQUIRE(exchange->request_headers_len > 0);
+    REQUIRE(grpc_attach(upstream_h2, exchange));
+    REQUIRE(grpc_attach(downstream_h2, exchange));
+
+    grpc_drive_upstream(&loop, upstream);
+    CHECK_EQ(loop.sends, 0u);
+    CHECK_FALSE(exchange->request_headers_sent);
+
+    upstream_h2.grpc.connecting = false;
+    grpc_drive_upstream(&loop, upstream);
+    CHECK_EQ(loop.sends, 0u);
+    CHECK_FALSE(exchange->request_headers_sent);
+
+    upstream_h2.grpc.tls_verified = true;
+    grpc_drive_upstream(&loop, upstream);
+    CHECK_EQ(loop.sends, 0u);
+    CHECK_FALSE(exchange->request_headers_sent);
+
+    upstream_h2.peer_settings_seen = true;
+    upstream_h2.peer_settings.has_max_concurrent_streams = true;
+    upstream_h2.peer_settings.max_concurrent_streams = 0;
+    grpc_drive_upstream(&loop, upstream);
+    CHECK_EQ(loop.sends, 0u);
+    CHECK_FALSE(exchange->request_headers_sent);
+
+    upstream_h2.peer_settings.max_concurrent_streams = 1;
+    grpc_drive_upstream(&loop, upstream);
+    CHECK_EQ(loop.sends, 1u);
+    CHECK(exchange->request_headers_sent);
+    CHECK_GT(upstream.send_buf.len(), exchange->request_headers_len);
+    u8 input[SlicePool::kSliceSize + kClientPrefaceLen]{};
+    __builtin_memcpy(input, kClientPreface, kClientPrefaceLen);
+    __builtin_memcpy(input + kClientPrefaceLen, upstream.send_buf.data(), upstream.send_buf.len());
+    Http2Conn parser;
+    parser.init();
+    GrpcRequestHeaderCapture capture;
+    parser.cb_ctx = &capture;
+    parser.on_headers = capture_grpc_request_headers;
+    u8 control[128]{};
+    u32 control_len = 0;
+    const auto parsed = parser.process(
+        input, kClientPrefaceLen + upstream.send_buf.len(), control, sizeof(control), &control_len);
+    CHECK_FALSE(parsed.close);
+    CHECK_EQ(capture.calls, 1u);
+    CHECK_EQ(capture.timeout_count, 1u);
+    CHECK_EQ(capture.encoding_count, 1u);
+
+    grpc_detach(upstream_h2, exchange);
+    grpc_detach(downstream_h2, exchange);
+    loop.pool.free(reinterpret_cast<u8*>(exchange));
+}
+
+TEST(grpc_proxy, expired_request_timeout_returns_unavailable_and_releases_once) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection upstream;
+    upstream.reset();
+    u8 upstream_send[SlicePool::kSliceSize]{};
+    upstream.send_slice = upstream_send;
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.grpc.preface_sent = true;
+    upstream_h2.peer_settings_seen = true;
+    upstream.h2 = &upstream_h2;
+
+    Connection downstream;
+    downstream.reset();
+    u8 downstream_send[SlicePool::kSliceSize]{};
+    u8 downstream_recv[SlicePool::kSliceSize]{};
+    downstream.send_slice = downstream_send;
+    downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+    downstream.bind_request_receive_buffer(downstream_recv, sizeof(downstream_recv));
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    auto* exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(exchange != nullptr);
+    exchange->init();
+    exchange->downstream = &downstream;
+    exchange->upstream = &upstream;
+    exchange->downstream_stream = exchange->upstream_stream = 1;
+    exchange->timeout_present = true;
+    exchange->deadline_us = monotonic_us() - 1;
+    exchange->request_end = true;
+    exchange->slot_held = true;
+    exchange->upstream_id = 3;
+    const hpack::Header request[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/svc", 4}}};
+    exchange->request_headers_len = http2_write_headers(
+        exchange->request_headers, GrpcExchange::kHeaders, 1, request, 2, false);
+    REQUIRE(exchange->request_headers_len > 0);
+    REQUIRE(grpc_attach(upstream_h2, exchange));
+    REQUIRE(grpc_attach(downstream_h2, exchange));
+
+    grpc_drive_upstream(&loop, upstream);
+
+    CHECK_EQ(loop.sends, 1u);
+    CHECK_EQ(loop.downstream_sends, 1u);
+    CHECK_EQ(loop.sends - loop.downstream_sends, 0u);
+    CHECK_EQ(loop.released, 1u);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    CHECK_EQ(downstream_h2.grpc.active, 0u);
+    Http2FrameHeader response{};
+    REQUIRE_EQ(parse_frame_header(downstream.send_buf.data(), downstream.send_buf.len(), &response),
+               ParseStatus::Complete);
+    CHECK_EQ(response.type, static_cast<u8>(Http2FrameType::Headers));
+    hpack::DynamicTable dynamic;
+    dynamic.init(0);
+    u8 decoded_storage[128]{};
+    hpack::Header decoded[8];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(dynamic,
+                                       downstream.send_buf.data() + kFrameHeaderSize,
+                                       response.length,
+                                       decoded_storage,
+                                       sizeof(decoded_storage),
+                                       decoded,
+                                       8,
+                                       &decoded_count));
+    bool unavailable = false;
+    for (u32 i = 0; i < decoded_count; ++i)
+        if (decoded[i].name.eq({"grpc-status", 11})) unavailable = decoded[i].value.eq({"4", 1});
+    CHECK(unavailable);
+}
+
 TEST(grpc_proxy, grpc_retry_single_endpoint_refused_then_recovers) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
@@ -3102,12 +3450,27 @@ TEST(grpc_proxy, grpc_retry_single_endpoint_refused_then_recovers) {
         Client client;
         CHECK(client.init(get_port(lfd)));
         if (client.fd >= 0) {
-            static constexpr u8 request[] = {0, 0, 0, 0, 1, 0x5a};
-            CHECK_EQ(client.request_native_raw(0, request, sizeof(request)), 1);
+            // Compression flag and payload stay opaque through the initial
+            // attempt and replay; the encoding metadata is replayed too.
+            static constexpr u8 request[] = {1, 0, 0, 0, 1, 0x5a};
+            CHECK_EQ(client.request_native_raw(0, request, sizeof(request), "1H", "gzip"), 1);
             CHECK(client.until(0, true));
             CHECK(client.rpcs[0].ok);
+            CHECK_EQ(client.rpcs[0].response_len, sizeof(request));
+            CHECK_EQ(memcmp(client.rpcs[0].response.get(), request, sizeof(request)), 0);
             CHECK_EQ(server->requests.load(), 2u);
             CHECK_EQ(server->accepts.load(), 1u);
+            CHECK_EQ(server->grpc_encoding_requests.load(), 2u);
+            CHECK_EQ(server->grpc_timeout_requests.load(), 2u);
+            CHECK_GT(server->last_grpc_timeout_us.load(), 0u);
+            CHECK_LT(server->last_grpc_timeout_us.load(), 3600000000ull);
+            u64 request_hash = 14695981039346656037ull;
+            for (u8 byte : request) {
+                request_hash ^= byte;
+                request_hash *= 1099511628211ull;
+            }
+            CHECK_EQ(server->last_completed_request_size.load(), sizeof(request));
+            CHECK_EQ(server->last_completed_request_hash.load(), request_hash);
         }
     }
     shard->stop();

@@ -476,8 +476,12 @@ from per-message limits. Each session is bounded to 64 active
 streams, header blocks to 16 KiB, and each direction of an RPC to a 65,535-byte
 pending DATA queue. Message/body length is not capped by that queue: flow control
 returns credit as bytes drain. Client cancellation resets only the mapped RPC.
-`grpc-timeout` is enforced with the existing precise timer mechanism (millisecond
-granularity); failures use gRPC status trailers. Before any upstream HTTP/2
+For a valid incoming `grpc-timeout`, the proxy keeps an absolute deadline and
+formats the remaining duration into upstream HEADERS only when they are sent,
+including after connection setup or retry. If the field is absent, it stays
+absent upstream. An expired deadline before send returns DEADLINE_EXCEEDED
+(status 4) without sending request HEADERS. Timers use the existing precise
+mechanism (millisecond granularity); failures use gRPC status trailers. Before any upstream HTTP/2
 preface or other wire bytes are sent, socket creation, connect submission, and
 TCP connect failures may advance to another distinct configured endpoint, up
 to three endpoints total (or the address count when smaller). This preserves
