@@ -189,7 +189,7 @@ TEST(protobuf_schema, unsupported_schema_semantics_are_not_silently_dropped) {
         REQUIRE_FALSE(result.has_value());
         CHECK(result.error() == SchemaError::Unsupported);
     }
-    const u32 kFieldTags[] = {2u, 7u, 9u, 17u};
+    const u32 kFieldTags[] = {2u, 7u, 9u};
     for (const u32 kTag : kFieldTags) {
         Bytes field = member();
         field.number(kTag, 0);
@@ -399,6 +399,37 @@ TEST(protobuf_schema, review_limits_packing_namespaces_and_import_visibility) {
     auto result = load_descriptor_set(storage.arena, input.data, input.size);
     REQUIRE(result.has_value());
     CHECK_FALSE(result->find_message(lit_str(".example.Item"))->fields->packed);
+
+    Bytes explicit_false = member();
+    explicit_false.number(17, 0);
+    input = descriptor(message(explicit_false));
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE(result.has_value());
+
+    Bytes explicit_true = member();
+    explicit_true.number(17, 1);
+    input = descriptor(message(explicit_true));
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == SchemaError::Unsupported);
+
+    Bytes invalid_optional = member();
+    invalid_optional.number(17, 2);
+    input = descriptor(message(invalid_optional));
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == SchemaError::Malformed);
+
+    Bytes malformed_optional = member();
+    malformed_optional.text(17, lit_str("true"));
+    input = descriptor(message(malformed_optional));
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == SchemaError::Malformed);
 
     for (u32 order = 0; order < 2; ++order) {
         Bytes collision;

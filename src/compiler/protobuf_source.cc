@@ -812,9 +812,10 @@ core::Expected<Schema, SourceError> load_proto_source(Arena<MmapBackend>& arena,
         return core::make_unexpected(SourceError{SourceError::Kind::Allocation, {}, 1, 1, {}});
     auto schema = load_descriptor_set(arena, bytes, set.size, limits);
     if (!schema) {
-        const SourceError::Kind kKind = schema.error() == SchemaError::Allocation
-                                            ? SourceError::Kind::Allocation
-                                            : SourceError::Kind::Schema;
+        const SourceError::Kind kKind =
+            schema.error() == SchemaError::Allocation ? SourceError::Kind::Allocation
+            : schema.error() == SchemaError::Limit    ? SourceError::Kind::Limit
+                                                      : SourceError::Kind::Schema;
         return core::make_unexpected(SourceError{kKind,
                                                  compiler.sources ? compiler.sources->name : kName,
                                                  1,

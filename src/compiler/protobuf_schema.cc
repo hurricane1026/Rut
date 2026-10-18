@@ -194,8 +194,11 @@ struct Loader {
                 case 2:
                 case 7:
                 case 9:
-                case 17:
                     return fail(SchemaError::Unsupported);
+                case 17:
+                    if (!wire(part, 0) || part.value > 1) return malformed();
+                    if (part.value) return fail(SchemaError::Unsupported);
+                    break;
                 default:
                     break;
             }
