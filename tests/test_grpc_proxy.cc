@@ -3723,6 +3723,182 @@ TEST(grpc_proxy, request_timeout_slice_boundary_drives_split_and_parses_after_pa
     loop.pool.free(conn.send_slice);
 }
 
+TEST(grpc_proxy, keepalive_tick_queues_ping_behind_split_headers_and_before_other_stream_data) {
+    GrpcDriveFixture loop;
+    Connection conn;
+    conn.reset();
+    conn.send_slice = loop.pool.alloc();
+    REQUIRE(conn.send_slice != nullptr);
+    conn.send_buf.bind(conn.send_slice, SlicePool::kSliceSize);
+    Http2Conn h2;
+    h2.init_client();
+    h2.grpc.upstream = true;
+    h2.grpc.preface_sent = true;
+    h2.grpc.connected_at_us = monotonic_us() - 300'000'001;
+    h2.peer_settings_seen = true;
+    conn.h2 = &h2;
+
+    GrpcExchange exchange;
+    exchange.init();
+    exchange.upstream = &conn;
+    exchange.upstream_stream = 1;
+    exchange.timeout_present = true;
+    exchange.deadline_us = monotonic_us() + 10'000'000;
+    char timeout_value[9]{};
+    const u32 timeout_value_len = grpc_retry_timeout_value(timeout_value, 9'000'000);
+    u8 timeout_field[GrpcExchange::kTimeoutFieldMax]{};
+    const u32 timeout_field_len = hpack::encode_header(
+        timeout_field, {"grpc-timeout", 12}, {timeout_value, timeout_value_len});
+    char padding[16'350]{};
+    hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                               {{":path", 5}, {"/svc", 4}},
+                               {{"x-padding", 9}, {padding, sizeof(padding)}}};
+    bool found_capacity_only_split = false;
+    for (u32 padding_len = 16'300; padding_len < sizeof(padding); ++padding_len) {
+        headers[2].value = {padding, padding_len};
+        exchange.request_headers_len = http2_write_headers(
+            exchange.request_headers, GrpcExchange::kHeaders, 1, headers, 3, false);
+        Http2FrameHeader base{};
+        if (!exchange.request_headers_len ||
+            parse_frame_header(exchange.request_headers, exchange.request_headers_len, &base) !=
+                ParseStatus::Complete)
+            continue;
+        if (base.length + timeout_field_len <= kDefaultMaxFrameSize - 4 &&
+            exchange.request_headers_len + timeout_field_len > SlicePool::kSliceSize) {
+            found_capacity_only_split = true;
+            break;
+        }
+    }
+    REQUIRE(found_capacity_only_split);
+    REQUIRE(h2.open_stream(1) != nullptr);
+    REQUIRE(grpc_attach(h2, &exchange));
+
+    grpc_drive_upstream(&loop, conn);
+    REQUIRE_EQ(loop.sends, 1u);
+    const u32 headers_len = conn.send_buf.len();
+    CHECK_EQ(headers_len, exchange.request_headers_len);
+    u8 wire[SlicePool::kSliceSize + GrpcExchange::kRequestHeadersSlack + 64]{};
+    __builtin_memcpy(wire, conn.send_buf.data(), headers_len);
+
+    GrpcExchange other;
+    other.init();
+    other.upstream = &conn;
+    other.upstream_stream = 3;
+    other.request_headers_sent = true;
+    other.upload_len = 3;
+    other.upload[0] = 0;
+    other.upload[1] = 0;
+    other.upload[2] = 1;
+    REQUIRE(h2.open_stream(3) != nullptr);
+    REQUIRE(grpc_attach(h2, &other));
+
+    u8 borrowed_snapshot[SlicePool::kSliceSize];
+    __builtin_memcpy(borrowed_snapshot, conn.send_buf.data(), headers_len);
+    grpc_tick(&loop, conn);
+    CHECK_EQ(loop.sends, 1u);
+    CHECK_EQ(conn.send_buf.len(), headers_len);
+    CHECK_EQ(__builtin_memcmp(borrowed_snapshot, conn.send_buf.data(), headers_len), 0);
+    CHECK_EQ(h2.grpc.control_len, kFrameHeaderSize + 8);
+    CHECK(h2.ping_pending);
+
+    grpc_on_upstream_sent<GrpcDriveFixture>(
+        &loop, conn, {conn.id, static_cast<i32>(headers_len / 2), 0, 0, IoEventType::Send, 0});
+    REQUIRE_EQ(loop.sends, 2u);
+    const u32 headers_remainder = conn.send_buf.len();
+    __builtin_memcpy(borrowed_snapshot, conn.send_buf.data(), headers_remainder);
+    grpc_tick(&loop, conn);
+    CHECK_EQ(loop.sends, 2u);
+    CHECK_EQ(conn.send_buf.len(), headers_remainder);
+    CHECK_EQ(__builtin_memcmp(borrowed_snapshot, conn.send_buf.data(), headers_remainder), 0);
+    CHECK_EQ(h2.grpc.control_len, kFrameHeaderSize + 8);
+
+    grpc_on_upstream_sent<GrpcDriveFixture>(
+        &loop,
+        conn,
+        {conn.id, static_cast<i32>(headers_len - headers_len / 2), 0, 0, IoEventType::Send, 0});
+    REQUIRE_EQ(loop.sends, 3u);
+    CHECK(h2.grpc.header_continuation_sending);
+    const u32 continuation_len = conn.send_buf.len();
+    const u32 continuation_offset = headers_len;
+    __builtin_memcpy(wire + continuation_offset, conn.send_buf.data(), continuation_len);
+    __builtin_memcpy(borrowed_snapshot, conn.send_buf.data(), continuation_len);
+    grpc_tick(&loop, conn);
+    CHECK_EQ(loop.sends, 3u);
+    CHECK_EQ(conn.send_buf.len(), continuation_len);
+    CHECK_EQ(__builtin_memcmp(borrowed_snapshot, conn.send_buf.data(), continuation_len), 0);
+
+    grpc_on_upstream_sent<GrpcDriveFixture>(
+        &loop, conn, {conn.id, static_cast<i32>(continuation_len / 2), 0, 0, IoEventType::Send, 0});
+    REQUIRE_EQ(loop.sends, 4u);
+    const u32 continuation_remainder = conn.send_buf.len();
+    __builtin_memcpy(borrowed_snapshot, conn.send_buf.data(), continuation_remainder);
+    grpc_tick(&loop, conn);
+    CHECK_EQ(loop.sends, 4u);
+    CHECK_EQ(conn.send_buf.len(), continuation_remainder);
+    CHECK_EQ(__builtin_memcmp(borrowed_snapshot, conn.send_buf.data(), continuation_remainder), 0);
+
+    grpc_on_upstream_sent<GrpcDriveFixture>(
+        &loop,
+        conn,
+        {conn.id,
+         static_cast<i32>(continuation_len - continuation_len / 2),
+         0,
+         0,
+         IoEventType::Send,
+         0});
+    REQUIRE_EQ(loop.sends, 5u);
+    CHECK_FALSE(h2.grpc.header_continuation_sending);
+    const u32 ping_len = conn.send_buf.len();
+    CHECK_EQ(ping_len, kFrameHeaderSize + 8);
+    Http2FrameHeader ping{};
+    REQUIRE_EQ(parse_frame_header(conn.send_buf.data(), ping_len, &ping), ParseStatus::Complete);
+    CHECK_EQ(ping.type, static_cast<u8>(Http2FrameType::Ping));
+    CHECK_EQ(ping.stream_id, 0u);
+    __builtin_memcpy(wire + continuation_offset + continuation_len, conn.send_buf.data(), ping_len);
+
+    grpc_on_upstream_sent<GrpcDriveFixture>(
+        &loop, conn, {conn.id, static_cast<i32>(ping_len), 0, 0, IoEventType::Send, 0});
+    REQUIRE_EQ(loop.sends, 6u);
+    Http2FrameHeader data{};
+    REQUIRE_EQ(parse_frame_header(conn.send_buf.data(), conn.send_buf.len(), &data),
+               ParseStatus::Complete);
+    CHECK_EQ(data.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK_EQ(data.stream_id, 3u);
+
+    u8 input[kClientPrefaceLen + sizeof(wire)]{};
+    __builtin_memcpy(input, kClientPreface, kClientPrefaceLen);
+    const u32 request_wire_len = headers_len + continuation_len + ping_len;
+    __builtin_memcpy(input + kClientPrefaceLen, wire, request_wire_len);
+    Http2Conn parser;
+    parser.init();
+    GrpcRequestHeaderCapture capture;
+    parser.cb_ctx = &capture;
+    parser.on_headers = capture_grpc_request_headers;
+    u8 control[128]{};
+    u32 control_len = 0;
+    const auto parsed = parser.process(
+        input, kClientPrefaceLen + request_wire_len, control, sizeof(control), &control_len);
+    CHECK_FALSE(parsed.close);
+    CHECK_EQ(parsed.consumed, kClientPrefaceLen + request_wire_len);
+    CHECK_EQ(capture.calls, 1u);
+    CHECK_EQ(capture.timeout_count, 1u);
+    CHECK_EQ(control_len, kFrameHeaderSize + 8);
+    Http2FrameHeader ack{};
+    REQUIRE_EQ(parse_frame_header(control, control_len, &ack), ParseStatus::Complete);
+    CHECK_EQ(ack.type, static_cast<u8>(Http2FrameType::Ping));
+    CHECK(ack.flags & http2_flag::kAck);
+
+    u8 ignored[32]{};
+    u32 ignored_len = 0;
+    const auto acked = h2.process(control, control_len, ignored, sizeof(ignored), &ignored_len);
+    CHECK_FALSE(acked.close);
+    CHECK_FALSE(h2.ping_pending);
+
+    grpc_detach(h2, &other);
+    grpc_detach(h2, &exchange);
+    loop.pool.free(conn.send_slice);
+}
+
 TEST(grpc_proxy, timeout_continuation_follows_control_and_precedes_other_streams) {
     GrpcDriveFixture loop;
     Connection conn;
