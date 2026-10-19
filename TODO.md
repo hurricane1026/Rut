@@ -634,6 +634,8 @@ canonical spelling for common gateway tasks.
   count/isEmpty/first、JIT/原生产物；禁止数组路由 wait，不开放索引/循环/修改。
 - [x] repeated 嵌套消息：编译期有界布局、原生 struct 数组、递归预校验和共享预算，
   支持 first 解包后访问子字段及完整数组往返；保留单 Slice 连续槽位上限。
+- [x] 有界 unary gRPC framing：grpc.frame/unframe、单条未压缩消息、请求 arena 所有权；
+  覆盖畸形帧、8 KiB 边界、原生产物与双后端 HTTP/2 分片测试，不含本地 RPC 服务分发。
 - [ ] 扩展 protobuf codec：单遍 tag dispatcher、浮点/uint64、enum、
   oneof/optional、map；proto2 需补齐 presence、显式默认值和 required 校验。
 - [ ] 在通用字节/流能力上实现 Rut protobuf 编解码模块、描述符读取与 HTTP/gRPC 转码；

@@ -23022,3 +23022,77 @@ TEST(jit, protobuf_helper_owns_output_and_preserves_arena_on_allocation_failure)
     CHECK_EQ(pool.in_use(), 0u);
     pool.destroy();
 }
+
+TEST(jit, grpc_unary_helper_owns_payload_and_frames_and_rejects_exhaustion) {
+    SlicePool pool;
+    REQUIRE(pool.init(4, 0, 0));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char input[] = {0, 0, 0, 0, 3, 'a', 0, 'b'};
+    u8 has = 0;
+    const char* data = nullptr;
+    u32 length = 0;
+    i64 number = 0;
+    auto run = [&](u64 op, Str bytes, SliceArena* storage) {
+        rut_helper_protobuf(nullptr,
+                            storage,
+                            op,
+                            bytes.ptr,
+                            bytes.len,
+                            nullptr,
+                            0,
+                            nullptr,
+                            0,
+                            0,
+                            &has,
+                            &data,
+                            &length,
+                            &number);
+    };
+    run(4, {input, sizeof(input)}, &arena);
+    REQUIRE_EQ(has, 1u);
+    REQUIRE_EQ(length, 3u);
+    memset(input, 'z', sizeof(input));
+    CHECK_EQ(memcmp(data, "a\0b", 3), 0);
+    run(5, {data, length}, &arena);
+    REQUIRE_EQ(has, 1u);
+    const char expected[] = {0, 0, 0, 0, 3, 'a', 0, 'b'};
+    CHECK_EQ(length, sizeof(expected));
+    CHECK_EQ(memcmp(data, expected, sizeof(expected)), 0);
+    char maximum[8192];
+    memset(maximum, 'm', sizeof(maximum));
+    run(5, {maximum, sizeof(maximum)}, &arena);
+    REQUIRE_EQ(has, 1u);
+    REQUIRE_EQ(length, 8197u);
+    CHECK_EQ(static_cast<u8>(data[3]), 32u);
+    run(4, {data, length}, &arena);
+    REQUIRE_EQ(has, 1u);
+    CHECK_EQ(length, sizeof(maximum));
+    CHECK_EQ(memcmp(data, maximum, sizeof(maximum)), 0);
+    const u64 used = arena.space_used();
+    run(4, {"bad", 3}, &arena);
+    CHECK_EQ(has, 0u);
+    CHECK(data == nullptr);
+    CHECK_EQ(length, 0u);
+    CHECK_EQ(arena.space_used(), used);
+    run(4, {expected, sizeof(expected)}, nullptr);
+    CHECK_EQ(has, 0u);
+    const char empty[] = {0, 0, 0, 0, 0};
+    run(4, {empty, sizeof(empty)}, nullptr);
+    CHECK_EQ(has, 1u);
+    CHECK_EQ(length, 0u);
+    // Framing an empty payload still needs storage for its five-byte envelope.
+    run(5, {"", 0}, nullptr);
+    CHECK_EQ(has, 0u);
+    arena.destroy();
+    pool.destroy();
+    REQUIRE(pool.init(1, 0, 0));
+    REQUIRE(arena.init(&pool));
+    REQUIRE(arena.alloc(arena.current->remaining()));
+    const u64 full = arena.space_used();
+    run(5, {"x", 1}, &arena);
+    CHECK_EQ(has, 0u);
+    CHECK_EQ(arena.space_used(), full);
+    arena.destroy();
+    pool.destroy();
+}

@@ -86,3 +86,12 @@ are preserved.
 for a roundtrip. Child repeated arrays and singular embedded messages share the
 same request budgets. This extends the payload codec; HTTP/JSON transcoding and
 service dispatch remain separate work.
+
+
+`examples/protobuf-framed.rut` composes `grpc.unframe` and `grpc.frame` with the
+message-array codec. For the example above, prepend `00 00 00 00 09` to the raw
+payload and POST it to `/protobuf/framed`; the same framed message is returned.
+Exactly one uncompressed envelope is accepted, with at most 8 KiB of payload.
+Malformed framing returns HTTP 400; invalid protobuf returns HTTP 422. This is a
+byte-codec demonstration, not a native gRPC endpoint: service dispatch,
+`application/grpc` response headers and `grpc-status` trailers are not generated.

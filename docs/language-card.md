@@ -452,8 +452,15 @@ validated recursively, including elements not accessed by the program. Each
 contiguous array region must also fit one Arena slice (16 KiB minus the block
 header); exceeding the slot-byte limit returns nil. Arrays cannot be grown, mutated, indexed, iterated
 or used in routes with explicit `wait`; general array literals remain rejected.
-These operations handle protobuf payloads; protobuf JSON mapping and gRPC framing
-are separate. Native forwarding continues to treat payloads as opaque bytes.
+These operations handle protobuf payloads. `grpc.unframe(bytes) -> str?` extracts
+one complete, uncompressed native gRPC message payload; `grpc.frame(bytes) -> str?`
+adds its five-byte envelope. Both take a non-optional `str` and return nil on
+invalid input, size/budget or allocation failure. Unframe rejects compression,
+truncation, trailing bytes and multiple messages; an explicit empty message is
+valid. The payload limit is 8 KiB (8 KiB + 5 bytes with its envelope). Results
+own their bytes in the request arena and may contain arbitrary binary data.
+These byte operations do not validate protobuf, dispatch RPC services, generate
+`grpc-status` trailers, or perform protobuf JSON mapping. Native forwarding continues to treat payloads as opaque bytes.
 JSON transcoding and gRPC health probes are not implemented by this
 option; `health_check` with `.http2` is rejected.
 

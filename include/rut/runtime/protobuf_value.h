@@ -5,6 +5,10 @@
 
 namespace rut::protobuf {
 inline constexpr u32 kMaxMessageBytes = 8192;
+// Bounded unary gRPC envelopes reuse the codec helper ABI; these operations
+// handle bytes only and do not validate protobuf or implement service dispatch.
+inline constexpr u64 kGrpcUnframe = 4;
+inline constexpr u64 kGrpcFrame = 5;
 inline constexpr u64 kEncode = u64{1} << 63;
 // No schema reflection: the compiler embeds the field number/type in each op.
 inline bool utf8(Str input) {
@@ -43,6 +47,23 @@ inline bool apply(
     u64 op, Str a, Str b, i64 number, u8* output, u32 capacity, Str& view, i64& scalar) {
     view = {"", 0};
     scalar = 0;
+    if (op == kGrpcUnframe) {
+        if (!a.ptr || a.len < 5 || a.len > kMaxMessageBytes + 5 || a.ptr[0] != 0) return false;
+        u32 length = 0;
+        for (u32 i = 1; i < 5; ++i) length = (length << 8) | static_cast<u8>(a.ptr[i]);
+        if (length != a.len - 5) return false;
+        view = {a.ptr + 5, length};
+        return true;
+    }
+    if (op == kGrpcFrame) {
+        if (!a.ptr || a.len > kMaxMessageBytes || !output || capacity < 5 || a.len > capacity - 5)
+            return false;
+        output[0] = 0;
+        for (u32 i = 0; i < 4; ++i) output[1 + i] = static_cast<u8>(a.len >> (24 - 8 * i));
+        if (a.len) __builtin_memcpy(output + 5, a.ptr, a.len);
+        view = {reinterpret_cast<const char*>(output), a.len + 5};
+        return true;
+    }
     if (a.len > kMaxMessageBytes || (a.len && !a.ptr)) return false;
     if (op == 2) {
         view = a;

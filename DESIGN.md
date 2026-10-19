@@ -8154,3 +8154,19 @@ starting at zero after the index. The final block may be partial. Bodies are
 owned by the compiled program; generation performs no per-request allocation.
 Use existing `wait` for application delay. Timed response fragments are not
 provided by this builder.
+
+
+### Bounded unary gRPC envelope operations
+
+`grpc.unframe(bytes)` and `grpc.frame(bytes)` are optional byte operations lowered
+through the existing ProtoOp/helper ABI (reserved tag-zero operations 4 and 5).
+Unframe requires exactly one complete native gRPC envelope, flag zero and an
+8 KiB maximum payload. Compression, grpc-web trailer flags, concatenated messages,
+truncation and length mismatches fail. Frame accepts arbitrary payload bytes,
+including empty input, and emits the five-byte network-order length header.
+The helper copies successful results into the request SliceArena with the shared
+256 KiB value budget; an empty extracted payload requires no arena allocation.
+Framed output can be 8 KiB plus five bytes without raising protobuf payload limits.
+No new keyword, dependency, service dispatch or streaming container is introduced.
+These operations bridge opaque message bytes to the payload codec; HTTP/JSON
+transcoding and local gRPC status/trailer generation remain separate work.

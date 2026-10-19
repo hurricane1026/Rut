@@ -40578,3 +40578,24 @@ TEST(frontend, protobuf_inferred_types_are_unique_across_imported_modules) {
     REQUIRE(hir);
     CHECK_EQ(hir->imports.len, 2u);
 }
+
+TEST(frontend, grpc_framing_checks_arity_type_and_optional_inputs) {
+    const char* calls[] = {"grpc.frame()",
+                           "grpc.unframe(req.body, req.body)",
+                           "grpc.frame(42)",
+                           "grpc.unframe(true)",
+                           "grpc.frame(grpc.unframe(req.body))",
+                           "grpc.unknown(req.body)"};
+    for (const char* call : calls) {
+        char code[512];
+        snprintf(code, sizeof(code), "route POST \"/frame\" { let result = %s return 200 }", call);
+        auto tokens = lex(lit(code));
+        REQUIRE(tokens);
+        auto ast = parse_file(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file(*ast.value());
+        CHECK_FALSE(hir.has_value());
+        if (hir) delete hir.value();
+        delete ast.value();
+    }
+}
