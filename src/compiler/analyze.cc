@@ -4370,14 +4370,40 @@ static FrontendResult<u32> infer_proto_struct(const protobuf::Message* message,
 }
 // The admitted native carriers have the same C/LLVM layout on supported
 // 64-bit targets. Serialize offsets explicitly; the runtime validates them.
-static bool proto_array_layout(
-    const HirModule& mod, u32 index, std::string& bytes, u32& size, u32& alignment, u32 depth = 0) {
+struct ProtoLayoutBuffer {
+    u8* ptr = nullptr;
+    u32 len = 0;
+
+    bool init(MmapArena& arena) {
+        ptr = static_cast<u8*>(arena.alloc(protobuf::kMaxMessageBytes));
+        return ptr != nullptr;
+    }
+    bool reserve(u32 amount, u32& offset) {
+        offset = len;
+        if (amount > protobuf::kMaxMessageBytes - len) return false;
+        len += amount;
+        return true;
+    }
+    bool write_word(u32 offset, u32 value) {
+        if (offset > len || sizeof(value) > len - offset) return false;
+        ptr[offset] = static_cast<u8>(value);
+        ptr[offset + 1] = static_cast<u8>(value >> 8);
+        ptr[offset + 2] = static_cast<u8>(value >> 16);
+        ptr[offset + 3] = static_cast<u8>(value >> 24);
+        return true;
+    }
+};
+
+static bool proto_array_layout(const HirModule& mod,
+                               u32 index,
+                               ProtoLayoutBuffer& bytes,
+                               u32& size,
+                               u32& alignment,
+                               u32 depth = 0) {
     if (depth > 8 || index >= mod.structs.len) return false;
     const auto& decl = mod.structs[index];
-    auto word = [](std::string& out, u32 value) {
-        for (u32 i = 0; i < 4; ++i) out.push_back(static_cast<char>(value >> (8 * i)));
-    };
-    std::string fields;
+    u32 header = 0;
+    if (!bytes.reserve(12, header)) return false;
     size = 0;
     alignment = 1;
     for (u32 i = 0; i < decl.fields.len; ++i) {
@@ -4386,9 +4412,11 @@ static bool proto_array_layout(
         if (field.protobuf_type != 11 && !protobuf::array_element_size(field.protobuf_type))
             return false;
         u32 child_size = 0, child_align = 1;
-        std::string child;
+        u32 field_header = 0;
+        if (!bytes.reserve(16, field_header)) return false;
+        const u32 child_start = bytes.len;
         if (field.protobuf_type == 11 &&
-            !proto_array_layout(mod, field.struct_index, child, child_size, child_align, depth + 1))
+            !proto_array_layout(mod, field.struct_index, bytes, child_size, child_align, depth + 1))
             return false;
         const u32 width = repeated ? sizeof(Str)
                           : field.protobuf_type == 11
@@ -4401,33 +4429,42 @@ static bool proto_array_layout(
                                                       : 8;
         if (!width && field.protobuf_type != 11) return false;
         size = (size + align - 1) & ~(align - 1);
-        word(fields, field.protobuf_number);
-        word(fields, field.protobuf_type | (repeated ? 256 : 0));
-        word(fields, size);
-        word(fields, static_cast<u32>(child.size()));
-        fields += child;
-        if (fields.size() > protobuf::kMaxMessageBytes - 12) return false;
+        const u32 child_len = field.protobuf_type == 11 ? bytes.len - child_start : 0;
+        if (child_len > protobuf::kMaxMessageBytes - 12 ||
+            !bytes.write_word(field_header, field.protobuf_number))
+            return false;
+        if (!bytes.write_word(field_header + 4, field.protobuf_type | (repeated ? 256 : 0)) ||
+            !bytes.write_word(field_header + 8, size) ||
+            !bytes.write_word(field_header + 12, child_len))
+            return false;
         size += width;
         if (alignment < align) alignment = align;
     }
     size = (size + alignment - 1) & ~(alignment - 1);
-    word(bytes, size);
-    word(bytes, alignment);
-    word(bytes, decl.fields.len);
-    bytes += fields;
-    return true;
+    return bytes.write_word(header, size) && bytes.write_word(header + 4, alignment) &&
+           bytes.write_word(header + 8, decl.fields.len);
 }
 static FrontendResult<HirExpr> proto_array_schema(const HirModule& mod,
                                                   u32 index,
                                                   Span span,
                                                   u32 depth) {
-    std::string bytes;
+    MmapArena arena;
+    if (!arena.init(4096)) return frontend_error(FrontendError::OutOfMemory, span);
+    ProtoLayoutBuffer bytes;
+    if (!bytes.init(arena)) {
+        arena.destroy();
+        return frontend_error(FrontendError::OutOfMemory, span);
+    }
     u32 size = 0, alignment = 1;
-    if (!proto_array_layout(mod, index, bytes, size, alignment, depth))
+    if (!proto_array_layout(mod, index, bytes, size, alignment, depth)) {
+        arena.destroy();
         return frontend_error(FrontendError::UnsupportedSyntax,
                               span,
                               lit_str("protobuf repeated message layout exceeds its budget"));
-    auto stored = intern_owned_response_body({bytes.data(), static_cast<u32>(bytes.size())});
+    }
+    auto stored = intern_owned_response_body(
+        {reinterpret_cast<const char*>(bytes.ptr), static_cast<u32>(bytes.len)});
+    arena.destroy();
     if (!stored) return core::make_unexpected(stored.error());
     HirExpr out{};
     out.kind = HirExprKind::StrLit;

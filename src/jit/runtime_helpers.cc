@@ -1731,8 +1731,12 @@ extern "C" void rut_helper_protobuf(void* conn,
                 if (owned.backend.pool && (owned.current || owned.init(owned.backend.pool)))
                     arena = &owned;
             }
-            if (!protobuf::decode_struct_array(
-                    tag, {schema, schema_len}, {a, a_len}, static_cast<SliceArena*>(arena), view))
+            if (!protobuf::decode_struct_array(tag,
+                                               {schema, schema_len},
+                                               {a, a_len},
+                                               static_cast<SliceArena*>(arena),
+                                               view,
+                                               &preflight))
                 return;
             *has_value = 1;
             *out_ptr = view.ptr;

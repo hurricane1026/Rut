@@ -162,6 +162,32 @@ TEST(protobuf_array, repeated_messages_own_native_structs_and_preserve_empty) {
     arena.destroy();
     pool.destroy();
 }
+TEST(protobuf_array, measured_plan_matches_decode_preflight_and_empty_semantics) {
+    u8 description[44];
+    const Str schema = child_layout(description);
+    const u8 input[] = {10, 5, 10, 1, 'x', 16, 1};
+    protobuf::struct_array_detail::Budget measured{};
+    REQUIRE(protobuf::struct_array_detail::measure_array(
+        1, schema, view(input, sizeof(input)), measured, 0));
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    Str output{};
+    REQUIRE(decode_struct_array(1, schema, view(input, sizeof(input)), &arena, output, &measured));
+    CHECK_EQ(output.len, 1u);
+    CHECK_EQ(arena.collection_items(), measured.items);
+    arena.destroy();
+    pool.destroy();
+
+    const Str empty_input{nullptr, 0};
+    protobuf::struct_array_detail::Budget empty_plan{};
+    REQUIRE(protobuf::struct_array_detail::measure_array(1, schema, empty_input, empty_plan, 0));
+    Str empty_output = lit_str("unchanged");
+    // The measured plan is valid only for this unchanged schema/input pair.
+    REQUIRE(decode_struct_array(1, schema, empty_input, nullptr, empty_output, &empty_plan));
+    CHECK(empty_output.eq(lit_str("")));
+}
 TEST(protobuf_array, repeated_message_preflight_checks_every_element_and_shared_budget) {
     SlicePool pool;
     REQUIRE(pool.init(1, 0, 0));

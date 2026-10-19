@@ -366,10 +366,19 @@ inline bool encode_message(
 }
 }  // namespace struct_array_detail
 
-inline bool decode_struct_array(u32 tag, Str schema, Str input, SliceArena* arena, Str& output) {
+inline bool decode_struct_array(u32 tag,
+                                Str schema,
+                                Str input,
+                                SliceArena* arena,
+                                Str& output,
+                                const struct_array_detail::Budget* measured = nullptr) {
+    // A supplied plan must come from measure_array on this immutable schema/input pair.
     using namespace struct_array_detail;
     Budget budget;
-    if (!measure_array(tag, schema, input, budget, 0)) return false;
+    if (measured != nullptr)
+        budget = *measured;
+    else if (!measure_array(tag, schema, input, budget, 0))
+        return false;
     if (!budget.items) {
         output = {"", 0};
         return true;
