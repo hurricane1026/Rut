@@ -4,7 +4,9 @@
 #include "rut/common/shard_limits.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/protobuf_source.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/protobuf_value.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/ws_terminate.h"  // ws_valid_close_code (shared close-code predicate)
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
@@ -19,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include <stdio.h>
 #include <stdlib.h>
 
 namespace rut {
@@ -33,6 +36,14 @@ namespace {
 // imported file's temporary AstFile and any HirModule copy. The store is
 // shared across copies, so the non-owning Str views stay valid. Analysis is
 // single-threaded per shard.
+static thread_local Str g_proto_source_path{};
+struct ScopedProtoSourcePath {
+    Str previous;
+    explicit ScopedProtoSourcePath(Str path) : previous(g_proto_source_path) {
+        g_proto_source_path = path;
+    }
+    ~ScopedProtoSourcePath() { g_proto_source_path = previous; }
+};
 static thread_local HirGeneratedNames** g_analyze_owned_buffers = nullptr;
 
 struct GeneratedNameSegment {
@@ -4075,7 +4086,7 @@ static FrontendResult<HirExpr> analyze_json_decode(const HirExpr& source,
     }
     const auto& decl = mod.structs[index];
     HirExpr result{};
-    result.kind = HirExprKind::JsonDecode;
+    result.kind = HirExprKind::StructDecode;
     result.type = HirTypeKind::Struct;
     result.struct_index = index;
     result.may_nil = true;
@@ -4146,6 +4157,335 @@ static FrontendResult<HirExpr> analyze_json_decode(const HirExpr& source,
         if (!result.field_inits.push({field.name, &route->exprs[route->exprs.len - 1]}))
             return frontend_error(FrontendError::TooManyItems, span);
     }
+    return result;
+}
+
+static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& mod, Span span);
+
+static FrontendResult<HirExpr> make_proto_op(u64 op,
+                                             HirTypeKind type,
+                                             bool optional,
+                                             const HirExpr* a,
+                                             const HirExpr* b,
+                                             Span span,
+                                             HirRoute* route) {
+    HirExpr out{};
+    out.kind = HirExprKind::ProtoOp;
+    out.type = type;
+    out.may_nil = optional;
+    out.int_value = static_cast<i64>(op);
+    out.span = span;
+    const HirExpr* args[] = {a, b};
+    for (const HirExpr* arg : args) {
+        if (!arg) continue;
+        if (!route->exprs.push(*arg)) return frontend_error(FrontendError::TooManyItems, span);
+        if (!out.args.push(&route->exprs[route->exprs.len - 1]))
+            return frontend_error(FrontendError::TooManyItems, span);
+    }
+    return out;
+}
+static FrontendResult<HirExpr> proto_stable(HirExpr value, HirRoute* route) {
+    if (value.kind == HirExprKind::LocalRef) return value;
+    HirLocal local{};
+    local.span = value.span;
+    local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+    local.type = value.type;
+    local.struct_index = value.struct_index;
+    local.is_runtime_synthetic = true;
+    local.init = value;
+    if (!route->locals.push(local)) return frontend_error(FrontendError::TooManyItems, value.span);
+    HirExpr out{};
+    out.kind = HirExprKind::LocalRef;
+    out.type = value.type;
+    out.span = value.span;
+    out.local_index = local.ref_index;
+    out.struct_index = value.struct_index;
+    return out;
+}
+static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
+                                                     HirRoute* route,
+                                                     const HirModule& mod,
+                                                     const HirLocal* locals,
+                                                     u32 local_count,
+                                                     const MatchPayloadBinding* binding) {
+    const bool decode = expr.name.eq(lit_str("decode"));
+    const bool infer_type = decode && expr.args.len == 3;
+    if ((!decode && !expr.name.eq(lit_str("encode"))) ||
+        (decode ? expr.args.len != 3 && expr.args.len != 4 : expr.args.len != 3))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("protobuf.decode(protoPath, messageName, bytes) / "
+                                      "protobuf.encode(protoPath, messageName, value)"));
+    const u32 path_arg = decode && !infer_type ? 1 : 0;
+    if (expr.args[path_arg]->kind != AstExprKind::StrLit ||
+        expr.args[path_arg + 1]->kind != AstExprKind::StrLit)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("protobuf paths and message names must be literals"));
+    u32 index = 0xffffffffu;
+    HirExpr source{};
+    if (decode && !infer_type) {
+        if (expr.args[0]->kind != AstExprKind::Ident)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        index = find_struct_index(mod, expr.args[0]->name);
+    }
+    auto value =
+        analyze_expr(*expr.args[expr.args.len - 1], route, mod, locals, local_count, binding);
+    if (!value) return value;
+    if (value->may_nil || value->may_error ||
+        (decode ? value->type != HirTypeKind::Str : value->type != HirTypeKind::Struct))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("unwrap protobuf input before encoding/decoding"));
+    if (!decode) index = value->struct_index;
+    if (!infer_type && (index >= mod.structs.len || mod.structs[index].type_params.len))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("protobuf requires a concrete struct"));
+    auto stable = proto_stable(value.value(), route);
+    if (!stable) return stable;
+    source = stable.value();
+    auto decoded_path =
+        decoded_expression_string(expr.args[path_arg]->str_value, mod, expr.args[path_arg]->span);
+    if (!decoded_path) return core::make_unexpected(decoded_path.error());
+    const Str path = decoded_path.value();
+    char full_path[4096];
+    u32 prefix = 0;
+    if (path.len && path.ptr[0] != '/') {
+        prefix = g_proto_source_path.len;
+        while (prefix && g_proto_source_path.ptr[prefix - 1] != '/') --prefix;
+    }
+    if (!path.len || prefix + static_cast<u64>(path.len) >= sizeof(full_path))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, expr.span, lit_str("protobuf path length"));
+    if (prefix) __builtin_memcpy(full_path, g_proto_source_path.ptr, prefix);
+    __builtin_memcpy(full_path + prefix, path.ptr, path.len);
+    full_path[prefix + path.len] = 0;
+    struct SchemaStorage {
+        MmapArena arena;
+        ~SchemaStorage() { arena.destroy(); }
+    } storage;
+    if (!storage.arena.init(4096)) return frontend_error(FrontendError::OutOfMemory, expr.span);
+    auto loaded = protobuf::load_proto_source(storage.arena, {full_path, prefix + path.len});
+    if (!loaded) {
+        const auto& error = loaded.error();
+        if (error.kind == protobuf::SourceError::Kind::Allocation)
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        char detail[1024];
+        const int kWritten = snprintf(detail,
+                                      sizeof(detail),
+                                      "%.*s:%u:%u: %.*s",
+                                      static_cast<int>(error.file.len),
+                                      error.file.ptr ? error.file.ptr : "",
+                                      error.line,
+                                      error.column,
+                                      static_cast<int>(error.detail.len),
+                                      error.detail.ptr ? error.detail.ptr : "");
+        const u32 kSize = kWritten < 0 ? 0
+                          : static_cast<u32>(kWritten) < sizeof(detail)
+                              ? static_cast<u32>(kWritten)
+                              : static_cast<u32>(sizeof(detail) - 1);
+        // A failed analysis destroys both schema and HIR arenas before callers
+        // read the diagnostic. Use the existing stable diagnostic/name store,
+        // as regex failures do, rather than returning a view into either arena.
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              intern_generated_name(str_to_std_string({detail, kSize})));
+    }
+    auto decoded_name = decoded_expression_string(
+        expr.args[path_arg + 1]->str_value, mod, expr.args[path_arg + 1]->span);
+    if (!decoded_name) return core::make_unexpected(decoded_name.error());
+    Str message_name = decoded_name.value();
+    char qualified[1026];
+    if (message_name.len && message_name.ptr[0] != '.') {
+        if (message_name.len > 1024)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        qualified[0] = '.';
+        __builtin_memcpy(qualified + 1, message_name.ptr, message_name.len);
+        message_name = {qualified, message_name.len + 1};
+    }
+    const auto* message = loaded->find_message(message_name);
+    if (!message)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, expr.span, lit_str("protobuf message not found"));
+    if (infer_type) {
+        HirStruct generated{};
+        auto kept_message_name = intern_owned_response_body(message->full_name);
+        if (!kept_message_name) return core::make_unexpected(kept_message_name.error());
+        generated.protobuf_name = kept_message_name.value();
+        const protobuf::SchemaField* ordered[HirStruct::kMaxFields]{};
+        u32 count = 0;
+        for (const auto* proto = message->fields; proto; proto = proto->next) {
+            if (count == HirStruct::kMaxFields)
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            u32 pos = count++;
+            while (pos && ordered[pos - 1]->number > proto->number) {
+                ordered[pos] = ordered[pos - 1];
+                --pos;
+            }
+            ordered[pos] = proto;
+        }
+        // Keep inferred protobuf structs private to the module that loaded the
+        // schema. Local struct indexes collide when two imported Rut modules
+        // each infer their first protobuf type.
+        char name[8192];
+        u32 length = 0;
+        auto append_identity = [&](Str value) {
+            const int prefix = snprintf(name + length, sizeof(name) - length, "%u:", value.len);
+            if (prefix < 0 || static_cast<u32>(prefix) >= sizeof(name) - length ||
+                value.len >= sizeof(name) - length - static_cast<u32>(prefix))
+                return false;
+            length += static_cast<u32>(prefix);
+            if (value.len) __builtin_memcpy(name + length, value.ptr, value.len);
+            length += value.len;
+            name[length++] = '|';
+            return true;
+        };
+        __builtin_memcpy(name, "__rut_pb$", 9);
+        length = 9;
+        if (!append_identity(g_proto_source_path) || !append_identity(mod.package_name) ||
+            !append_identity(message->full_name))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        const int suffix = snprintf(name + length, sizeof(name) - length, "%u", mod.structs.len);
+        if (suffix < 0 || static_cast<u32>(suffix) >= sizeof(name) - length)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        length += static_cast<u32>(suffix);
+        auto kept_name = intern_owned_response_body({name, static_cast<u32>(length)});
+        if (!kept_name) return core::make_unexpected(kept_name.error());
+        generated.name = kept_name.value();
+        generated.span = expr.span;
+        for (u32 i = 0; i < count; ++i) {
+            const auto* proto = ordered[i];
+            HirStruct::FieldDecl field{};
+            field.protobuf_number = proto->number;
+            field.protobuf_type = static_cast<u8>(proto->type);
+            auto kept = intern_owned_response_body(proto->name);
+            if (!kept) return core::make_unexpected(kept.error());
+            field.name = kept.value();
+            using PT = protobuf::Type;
+            if (proto->type == PT::String || proto->type == PT::Bytes)
+                field.type = HirTypeKind::Str;
+            else if (proto->type == PT::Bool)
+                field.type = HirTypeKind::Bool;
+            else if (proto->type == PT::Int32 || proto->type == PT::Sfixed32 ||
+                     proto->type == PT::Sint32)
+                field.type = HirTypeKind::I32;
+            else if (proto->type == PT::Int64 || proto->type == PT::Sfixed64 ||
+                     proto->type == PT::Sint64 || proto->type == PT::Uint32 ||
+                     proto->type == PT::Fixed32)
+                field.type = HirTypeKind::I64;
+            else
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("unsupported protobuf field type"));
+            if (proto->repeated || !generated.fields.push(field))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("protobuf supports at most eight singular scalar fields"));
+        }
+        index = mod.structs.len;
+        for (u32 si = 0; si < mod.structs.len; ++si) {
+            const auto& old = mod.structs[si];
+            if (!old.protobuf_name.eq(generated.protobuf_name) ||
+                old.fields.len != generated.fields.len)
+                continue;
+            bool same = true;
+            for (u32 fi = 0; fi < generated.fields.len; ++fi) {
+                const auto& left = old.fields[fi];
+                const auto& right = generated.fields[fi];
+                same = same && left.name.eq(right.name) &&
+                       left.protobuf_number == right.protobuf_number &&
+                       left.protobuf_type == right.protobuf_type && left.type == right.type;
+            }
+            if (same) {
+                index = si;
+                break;
+            }
+        }
+        if (index == mod.structs.len && !const_cast<HirModule&>(mod).structs.push(generated))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+    }
+    const auto& decl = mod.structs[index];
+    u32 fields = 0;
+    for (const auto* field = message->fields; field; field = field->next) ++fields;
+    if (fields != decl.fields.len)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("protobuf/Rut fields must match exactly"));
+    HirExpr result{};
+    if (decode) {
+        result.kind = HirExprKind::StructDecode;
+        result.type = HirTypeKind::Struct;
+        result.struct_index = index;
+        result.may_nil = true;
+        result.span = expr.span;
+        auto valid = make_proto_op(0, HirTypeKind::Str, true, &source, nullptr, expr.span, route);
+        if (!valid) return valid;
+        if (!route->exprs.push(valid.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        result.lhs = &route->exprs[route->exprs.len - 1];
+    } else {
+        result.kind = HirExprKind::StrLit;
+        result.type = HirTypeKind::Str;
+        result.str_value = lit_str("");
+        result.span = expr.span;
+    }
+    for (u32 fi = 0; fi < decl.fields.len; ++fi) {
+        const auto& field = decl.fields[fi];
+        const protobuf::SchemaField* proto = message->fields;
+        while (proto && !proto->name.eq(field.name)) proto = proto->next;
+        if (!proto || proto->repeated)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("protobuf binding requires matching singular scalar fields"));
+        HirTypeKind expected = HirTypeKind::Unknown;
+        using PT = protobuf::Type;
+        if (proto->type == PT::String || proto->type == PT::Bytes)
+            expected = HirTypeKind::Str;
+        else if (proto->type == PT::Bool)
+            expected = HirTypeKind::Bool;
+        else if (proto->type == PT::Int32 || proto->type == PT::Sfixed32 ||
+                 proto->type == PT::Sint32)
+            expected = HirTypeKind::I32;
+        else if (proto->type == PT::Int64 || proto->type == PT::Sfixed64 ||
+                 proto->type == PT::Sint64 || proto->type == PT::Uint32 ||
+                 proto->type == PT::Fixed32)
+            expected = HirTypeKind::I64;
+        if (expected == HirTypeKind::Unknown || field.type != expected)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("unsupported protobuf/Rut field type mapping"));
+        const u64 op = (static_cast<u64>(proto->number) << 8) | static_cast<u8>(proto->type);
+        if (decode) {
+            auto item = make_proto_op(op, expected, true, &source, nullptr, expr.span, route);
+            if (!item) return item;
+            if (!route->exprs.push(item.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            if (!result.field_inits.push({field.name, &route->exprs[route->exprs.len - 1]}))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        } else {
+            HirExpr selected{};
+            selected.kind = HirExprKind::Field;
+            selected.type = expected;
+            selected.str_value = field.name;
+            if (!route->exprs.push(source))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            selected.lhs = &route->exprs[route->exprs.len - 1];
+            auto appended = make_proto_op(op | protobuf::kEncode,
+                                          HirTypeKind::Str,
+                                          false,
+                                          &result,
+                                          &selected,
+                                          expr.span,
+                                          route);
+            if (!appended) return appended;
+            result = appended.value();
+        }
+    }
+    if (!decode)
+        return make_proto_op(2, HirTypeKind::Str, true, &result, nullptr, expr.span, route);
     return result;
 }
 
@@ -4297,6 +4637,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         return make_json_op(
             json::Op::Parse, HirTypeKind::Json, true, &body, nullptr, nullptr, expr.span, route);
     }
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq(lit_str("protobuf")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("protobuf")))
+        return analyze_protobuf_call(expr, route, mod, locals, local_count, binding);
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         expr.lhs->name.eq(lit_str("json")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, lit_str("json")))
@@ -15557,6 +15901,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     bool internal_strict_local_response_propagation) {
     auto mod_ptr = std::make_unique<HirModule>();
     HirModule& mod = *mod_ptr;
+    ScopedProtoSourcePath proto_source_scope(source_path);
     HirGeneratedNames*& name_store =
         shared_generated_names != nullptr ? *shared_generated_names : mod.generated_names;
     auto* owned_strings =

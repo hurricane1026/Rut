@@ -845,6 +845,24 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_proto(u64 op,
+                               TypeKind result,
+                               bool optional,
+                               const ValueId* args,
+                               u32 count,
+                               SourceLoc loc = {}) {
+        if (count > 2) return err(RirError::InvalidState);
+        for (u32 i = 0; i < count; ++i)
+            if (!valid_val(args[i])) return err(RirError::InvalidState);
+        const Type* ty = TRY(make_type(result));
+        if (optional) ty = TRY(make_type(TypeKind::Optional, ty));
+        auto [inst, vid] = TRY(emit(Opcode::ProtoOp, ty, loc));
+        inst->imm.i64_val = static_cast<i64>(op);
+        inst->operand_count = count;
+        for (u32 i = 0; i < count; ++i) inst->operands[i] = args[i];
+        return vid;
+    }
+
     Result<ValueId> emit_time_now_micros(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::I64));
         return TRY(emit(Opcode::TimeNowMicros, ty, loc)).vid;

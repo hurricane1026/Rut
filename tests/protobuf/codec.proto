@@ -1,0 +1,19 @@
+syntax = "proto3";
+package example;
+message CodecMessage {
+  string text = 1;
+  bool enabled = 2;
+  int32 count = 3;
+  int64 id = 4;
+  sint32 delta = 5;
+  sint64 distance = 6;
+  uint32 size = 7;
+  bytes data = 8;
+}
+message FixedMessage {
+  sfixed32 a = 1;
+  sfixed64 b = 2;
+  fixed32 c = 3;
+}
+
+message HighTag { string text = 536870911; }

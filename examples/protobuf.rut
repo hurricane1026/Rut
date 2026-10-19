@@ -1,0 +1,10 @@
+// Schema paths resolve relative to this .rut file. No protoc is needed.
+route POST "/protobuf" {
+    guard let message = protobuf.decode("protobuf/message.proto", "example.Message", req.body) else {
+        return 400
+    }
+    guard let bytes = protobuf.encode("protobuf/message.proto", "example.Message", message) else {
+        return 500
+    }
+    return response(200, body: bytes)
+}

@@ -412,9 +412,32 @@ trailers including `grpc-status` are preserved. Header-only middleware may run
 before forwarding; body-reading handlers and HTTP/1-specific forward policies
 are outside this streaming path. Native gRPC over HTTP/1 is rejected.
 No `.proto`, protobuf dependency, new route keyword or streaming modifier is
-needed. An internal bounded protobuf wire codec exists for runtime development;
-it has no Rut API, descriptor loader or JSON mapping. Native forwarding continues
-to treat protobuf payloads as opaque bytes.
+needed. Internal bounded protobuf wire primitives and a compiler-side proto3
+`FileDescriptorSet` schema loader back the built-in source compiler:
+
+```swift
+guard let message = protobuf.decode("message.proto", "example.Message", req.body) else {
+    return 400
+}
+guard let bytes = protobuf.encode("message.proto", "example.Message", message) else {
+    return 500
+}
+```
+
+Paths and fully qualified message names must be literals. Paths resolve relative
+to the current `.rut` file. The compiler reads proto3 imports and generates an
+internal message type plus field-specialized RIR/LLVM; no protoc or generated
+bindings are needed. Both operations are optional. Inferred types support at most
+eight singular string/bytes, bool, signed 32/64-bit and unsigned/fixed 32-bit
+fields (the latter infer i64 with range-checked encoding). User i64 annotations
+remain unavailable. Messages cap at 8 KiB; intermediate request bytes at 256 KiB.
+Proto3 defaults, last correctly typed duplicate wins, UTF-8 validation for strings,
+and skipping unknown/wrong-wire fields are implemented (group wire types are
+rejected); unknown fields are lost on encoding. Repeated/embedded values, floating point, unsigned 64-bit values,
+enums, oneof/presence/maps and proto2 are not executable codec shapes yet. See
+[the example and source grammar limits](../examples/protobuf/README.md).
+These operations handle protobuf payloads; protobuf JSON mapping and gRPC framing
+are separate. Native forwarding continues to treat payloads as opaque bytes.
 JSON transcoding and gRPC health probes are not implemented by this
 option; `health_check` with `.http2` is rejected.
 
