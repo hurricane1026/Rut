@@ -1,0 +1,3 @@
+syntax = "proto3";
+// Export the existing executable RPC schema through a compatibility facade.
+import public "reserved.proto";

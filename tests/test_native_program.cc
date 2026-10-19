@@ -762,6 +762,14 @@ TEST(native_program, grpc_enum_and_reserved_codecs_survive_source_and_schema_rem
                      "message Message { State state=1; repeated State history=2; reserved 3 to "
                      "max; reserved 'old_field'; } "
                      "service Codec { rpc Unary(Message) returns (Message); }"));
+    Source facade;
+    char import_code[512];
+    const char* basename = strrchr(proto.path, '/');
+    REQUIRE(basename);
+    const int import_length = snprintf(
+        import_code, sizeof(import_code), "syntax='proto3'; import public '%s';", basename + 1);
+    REQUIRE(import_length > 0 && static_cast<u32>(import_length) < sizeof(import_code));
+    REQUIRE(facade.append(import_code, static_cast<u32>(import_length)));
     Source source;
     char code[2048];
     const int length = snprintf(code,
@@ -772,14 +780,15 @@ TEST(native_program, grpc_enum_and_reserved_codecs_survive_source_and_schema_rem
                                 "guard let framed = grpc.encode(\"%s\", \"/example.Codec/Unary\", "
                                 "value) else { return 500 } "
                                 "return response(200, body: framed) }",
-                                proto.path,
-                                proto.path);
+                                facade.path,
+                                facade.path);
     REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(code));
     REQUIRE(source.append(code, static_cast<u32>(length)));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(proto.path), 0);
+    REQUIRE_EQ(unlink(facade.path), 0);
     REQUIRE_EQ(unlink(source.path), 0);
     SlicePool pool;
     REQUIRE(pool.init(8));

@@ -75,3 +75,9 @@ FileDescriptorSet, while malformed descriptor tests check wire types, missing or
 duplicate endpoints, overlap, duplicate names, invalid UTF-8 and budget limits.
 The gRPC network fixture now compiles `reserved.proto`; its enum oracle payload
 contains a reserved-but-unknown enum number that must survive encoding unchanged.
+
+`public.proto` re-exports `reserved.proto`; `public_root.proto` uses the exported
+message, nested enum and RPC output. `generate_public_oracle.py` builds the matching
+FileDescriptorSet with Google protobuf (optional, no build dependency). Source
+and descriptor metadata are compared in unit tests. The existing reserved-schema
+network roundtrip uses the public facade on both I/O backends.

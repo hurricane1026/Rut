@@ -23243,12 +23243,12 @@ TEST(jit, grpc_enum_codecs_preserve_unknown_negative_and_repeated_values) {
 TEST(jit, grpc_reserved_schema_preserves_deleted_enum_numbers) {
     const char* source =
         "route POST \"/rpc\" { guard let value = grpc.decode(\"" RUT_PROTO_TEST_ROOT
-        "/tests/protobuf/reserved.proto\", \"/example.ReservedCodec/Echo\", req.body) else { "
+        "/tests/protobuf/public.proto\", \"/example.ReservedCodec/Echo\", req.body) else { "
         "return "
         "422 "
         "} "
         "guard let framed = grpc.encode(\"" RUT_PROTO_TEST_ROOT
-        "/tests/protobuf/reserved.proto\", \"/example.ReservedCodec/Echo\", value) else { return "
+        "/tests/protobuf/public.proto\", \"/example.ReservedCodec/Echo\", value) else { return "
         "500 "
         "} "
         "return response(200, body: framed) }";

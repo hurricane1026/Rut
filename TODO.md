@@ -644,6 +644,8 @@ canonical spelling for common gateway tasks.
   repeated packed/unpacked、JIT 与原生产物；不新增 Rut enum 语法。
 - [x] protobuf message/enum reserved：名称、编号、范围/to max、冲突与预算校验，
   源码/descriptor 语义一致；保留 proto3 未知枚举数值的 wire 兼容性。
+- [x] proto3 public import：跨多层 re-export 的 message/enum/RPC 类型解析，
+  源码/descriptor 可见性一致，保留私有边隔离和导入预算。
 - [ ] protobuf enum 的具名 case 与名义类型绑定：复用未来通用 Rut enum 类型机制，
   同时保留 proto3 unknown numeric values；当前 codec 暴露 i32。
 - [ ] 扩展 protobuf codec：单遍 tag dispatcher、浮点/uint64、
