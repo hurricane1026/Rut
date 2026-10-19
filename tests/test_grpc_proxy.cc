@@ -8882,13 +8882,13 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "/../protobuf/codec.proto\", \"/example.UnaryCodec/Echo\", value) else { return 500 } "
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
         "\"grpc-status\": \"0\"}, body: framed) }\n"
-        "route POST \"/example.ReservedCodec/Echo\" { "
+        "route POST \"/example.StringCodec/Echo\" { "
         "guard let value = grpc.decode(\"" RUT_GRPC_FIXTURES
-        "/../protobuf/public.proto\", \"/example.ReservedCodec/Echo\", req.body) else { "
+        "/../protobuf/strings.proto\", \"/example.StringCodec/Echo\", req.body) else { "
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
         "\"grpc-status\": \"13\"}) } "
         "guard let framed = grpc.encode(\"" RUT_GRPC_FIXTURES
-        "/../protobuf/public.proto\", \"/example.ReservedCodec/Echo\", value) else { return 500 "
+        "/../protobuf/strings.proto\", \"/example.StringCodec/Echo\", value) else { return 500 "
         "} "
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
         "\"grpc-status\": \"0\"}, body: framed) }\n"
@@ -9094,7 +9094,7 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                                                              size + 5,
                                                              "1H",
                                                              nullptr,
-                                                             "/example.ReservedCodec/Echo") > 0);
+                                                             "/example.StringCodec/Echo") > 0);
                         enum_client.rpcs[index].max_chunk = 1;
                         const bool complete = enum_client.until(index, true);
                         CHECK(complete);
@@ -9147,7 +9147,7 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                                                        sizeof(empty_frame),
                                                        "1H",
                                                        nullptr,
-                                                       "/example.ReservedCodec/Echo");
+                                                       "/example.StringCodec/Echo");
                     CHECK(cancelled > 0);
                     const u64 enum_deadline = monotonic_us() + 5000000;
                     while (!enum_client.rpcs[5].http_status && monotonic_us() < enum_deadline)

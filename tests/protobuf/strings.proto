@@ -1,0 +1,16 @@
+syntax = 'pro' /* adjacent literals */ "to3";
+package example;
+import "en" '\165m' "\x2eproto";
+message StringBatch {
+  enum State { ZERO = 0; NEGATIVE = -1; reserved 12345; }
+  reserved "a\ab\bc\fd\ne\rf\tg\vh", "\'\"\\\?";
+  reserved "\1\12\1234", "\x1\x12f\X41", "\400";
+  reserved "\u007f\u0080\u07ff\u0800\uffff";
+  reserved "\U00010000\U0010ffff", "\uD83D\uDE00";
+  reserved 'de' /* comment */ "leted";
+  State state = 1 [json_name='sta' "\164e"];
+  repeated EnumChild children = 2;
+}
+service StringCodec {
+  rpc Echo(StringBatch) returns (StringBatch);
+}

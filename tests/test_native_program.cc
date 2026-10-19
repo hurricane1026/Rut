@@ -756,12 +756,12 @@ TEST(native_program, protobuf_repeated_message_codecs_survive_source_and_schema_
 
 TEST(native_program, grpc_enum_and_reserved_codecs_survive_source_and_schema_removal) {
     Source proto;
-    REQUIRE(
-        proto.append("syntax='proto3'; package example; enum State { ZERO=0; NEG=-1; reserved 123; "
-                     "reserved 'OLD_STATE'; } "
-                     "message Message { State state=1; repeated State history=2; reserved 3 to "
-                     "max; reserved 'old_field'; } "
-                     "service Codec { rpc Unary(Message) returns (Message); }"));
+    REQUIRE(proto.append(
+        "syntax='pro' /*x*/ 'to3'; package example; enum State { ZERO=0; NEG=-1; reserved 123; "
+        "reserved 'OLD_STATE'; } "
+        "message Message { State state=1; repeated State history=2; reserved 3 to "
+        "max; reserved 'old_field'; } "
+        "service Codec { rpc Unary(Message) returns (Message); }"));
     Source facade;
     char import_code[512];
     const char* basename = strrchr(proto.path, '/');
