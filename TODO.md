@@ -642,6 +642,8 @@ canonical spelling for common gateway tasks.
   拒绝流式方法，覆盖 JIT、独立原生产物与双后端互通；路由分发仍显式配置。
 - [x] proto3 open enum：顶层/嵌套/导入与别名校验，i32 数值载体，未知/负值保留，
   repeated packed/unpacked、JIT 与原生产物；不新增 Rut enum 语法。
+- [x] protobuf message/enum reserved：名称、编号、范围/to max、冲突与预算校验，
+  源码/descriptor 语义一致；保留 proto3 未知枚举数值的 wire 兼容性。
 - [ ] protobuf enum 的具名 case 与名义类型绑定：复用未来通用 Rut enum 类型机制，
   同时保留 proto3 unknown numeric values；当前 codec 暴露 i32。
 - [ ] 扩展 protobuf codec：单遍 tag dispatcher、浮点/uint64、

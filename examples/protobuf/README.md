@@ -100,6 +100,11 @@ byte-codec demonstration, not a native gRPC endpoint: service dispatch,
 Proto3 enum fields are numeric `i32` values in Rut; repeated enum fields are
 immutable `[i32]`. Unknown numbers and negative values round-trip. The schema
 supports nested/imported enums and `option allow_alias = true`; the first declared
-number must be zero. Rut symbolic enum constants, enum JSON mapping, reserved enum
-declarations and custom enum options are not exposed. See
+number must be zero. Rut symbolic enum constants, enum JSON mapping and custom enum options are not exposed. See
 [`tests/protobuf/enum.proto`](../../tests/protobuf/enum.proto) for a unary RPC schema.
+
+
+Message and enum schemas may use `reserved` names/numbers, ranges and `to max`.
+The compiler rejects reusing a reserved name or number, duplicate names and
+overlapping ranges. Reserved enum numbers can still arrive as unknown numeric
+values in proto3 messages. See [`reserved.proto`](../../tests/protobuf/reserved.proto).

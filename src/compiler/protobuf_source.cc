@@ -159,6 +159,7 @@ struct Parser {
     bool type_reference(Buffer& target, u32 tag, Str scope);
     bool message(Buffer& parent, Str scope, u32 depth);
     bool enumeration(Buffer& parent, Str scope, bool nested);
+    bool reservation(Buffer& parent, bool enumeration);
     bool field(Buffer& parent, Str scope);
     bool service(Buffer& parent, Str scope);
     bool file();
@@ -185,6 +186,7 @@ struct Compiler {
     u32 service_count = 0;
     u32 enum_count = 0;
     u32 enum_value_count = 0;
+    u32 reserved_count = 0;
     bool failed = false;
     bool fail(SourceError::Kind kind, Str file, u32 line, u32 column, Str detail) {
         if (!failed) error = {kind, file, line, column, detail};
@@ -590,6 +592,48 @@ bool Parser::field(Buffer& parent, Str scope) {
     parent.tail = chunk;
     return true;
 }
+bool Parser::reservation(Buffer& parent, bool enumeration) {
+    advance();
+    const bool kNames = token.kind == Token::Kind::String;
+    auto bound = [&](i64& value) -> bool {
+        const bool kNegative = enumeration && take(lit_str("-"));
+        u32 magnitude = 0;
+        if (!number(magnitude)) return false;
+        if (enumeration) {
+            if (magnitude > (kNegative ? 2147483648u : 2147483647u))
+                return fail(SourceError::Kind::Syntax, lit_str("enum reserved bound"));
+        } else if (!magnitude || magnitude > 0x1fffffffu)
+            return fail(SourceError::Kind::Syntax, lit_str("message reserved bound"));
+        value = kNegative ? -static_cast<i64>(magnitude) : static_cast<i64>(magnitude);
+        return true;
+    };
+    do {
+        if (compiler.reserved_count++ >= compiler.limits.reserved)
+            return fail(SourceError::Kind::Limit, lit_str("reserved declaration count"));
+        if (kNames) {
+            Str value{};
+            if (!string(value)) return false;
+            parent.text(enumeration ? 5 : 10, value);
+        } else {
+            i64 first = 0, last = 0;
+            if (!bound(first)) return false;
+            last = first;
+            if (take(lit_str("to"))) {
+                if (take(lit_str("max")))
+                    last = enumeration ? 2147483647 : 0x1fffffff;
+                else if (!bound(last))
+                    return false;
+            }
+            if (last < first)
+                return fail(SourceError::Kind::Syntax, lit_str("reversed reserved range"));
+            Buffer range{compiler.arena};
+            range.number(1, static_cast<u64>(first));
+            range.number(2, static_cast<u64>(enumeration ? last : last + 1));
+            parent.child(enumeration ? 4 : 9, range);
+        }
+    } while (take(lit_str(",")));
+    return expect(lit_str(";"));
+}
 bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
     if (compiler.enum_count++ >= compiler.limits.enums)
         return fail(SourceError::Kind::Limit, lit_str("enum count"));
@@ -623,8 +667,10 @@ bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
             descriptor->child(3, options);
             continue;
         }
-        if (is(lit_str("reserved")))
-            return fail(SourceError::Kind::Unsupported, lit_str("enum reserved"));
+        if (is(lit_str("reserved"))) {
+            if (!reservation(*descriptor, true)) return false;
+            continue;
+        }
         if (compiler.enum_value_count++ >= compiler.limits.enum_values)
             return fail(SourceError::Kind::Limit, lit_str("enum value count"));
         Str value_name{};
@@ -676,8 +722,10 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
             if (!message(*descriptor, kFullName, depth + 1)) return false;
         } else if (is(lit_str("enum"))) {
             if (!enumeration(*descriptor, kFullName, true)) return false;
-        } else if (is(lit_str("oneof")) || is(lit_str("reserved")) || is(lit_str("extensions")) ||
-                   is(lit_str("extend")) || is(lit_str("option")))
+        } else if (is(lit_str("reserved"))) {
+            if (!reservation(*descriptor, false)) return false;
+        } else if (is(lit_str("oneof")) || is(lit_str("extensions")) || is(lit_str("extend")) ||
+                   is(lit_str("option")))
             return fail(SourceError::Kind::Unsupported, lit_str("message declaration"));
         else if (!field(*descriptor, kFullName))
             return false;
@@ -864,7 +912,7 @@ core::Expected<Schema, SourceError> load_proto_source(Arena<MmapBackend>& arena,
         limits.messages > kCeiling.messages || limits.fields > kCeiling.fields ||
         limits.methods > kCeiling.methods || limits.services > kCeiling.services ||
         limits.depth > kCeiling.depth || limits.enums > kCeiling.enums ||
-        limits.enum_values > kCeiling.enum_values)
+        limits.enum_values > kCeiling.enum_values || limits.reserved > kCeiling.reserved)
         return core::make_unexpected(SourceError{SourceError::Kind::Limit, {}, 1, 1, {}});
     if (!path.len || path.len > 4095)
         return core::make_unexpected(SourceError{SourceError::Kind::Io, {}, 1, 1, {}});

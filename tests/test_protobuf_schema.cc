@@ -669,3 +669,60 @@ TEST(protobuf_schema, enum_descriptor_alias_and_malformed_value_rules) {
         }
     }
 }
+
+TEST(protobuf_schema, reserved_descriptor_wire_ranges_duplicates_and_limits) {
+    for (u32 kind = 0; kind < 2; ++kind) {
+        const bool enumeration = kind != 0;
+        for (u32 scenario = 0; scenario < 10; ++scenario) {
+            Bytes range;
+            range.number(1, enumeration ? static_cast<u64>(i64{-2}) : 2u);
+            if (scenario == 2)
+                range.text(2, lit_str("bad"));
+            else if (scenario != 1)
+                range.number(2,
+                             scenario == 3   ? (enumeration ? static_cast<u64>(i64{-3}) : 2u)
+                             : scenario == 4 ? (enumeration ? 2147483648u : 536870913u)
+                             : enumeration   ? static_cast<u64>(i64{-2})
+                                             : 3u);
+            if (scenario == 6) range.number(2, 3);
+            Bytes owner;
+            owner.text(1, lit_str("Owner"));
+            const u32 range_tag = enumeration ? 4u : 9u;
+            const u32 name_tag = enumeration ? 5u : 10u;
+            if (scenario >= 8) {
+                const char invalid[] = {static_cast<char>(255)};
+                owner.text(name_tag, scenario == 8 ? Str{invalid, 1} : lit_str("old"));
+                if (scenario == 9) owner.text(name_tag, lit_str("old"));
+            } else {
+                owner.child(range_tag, range);
+                if (scenario == 5) owner.child(range_tag, range);
+            }
+            if (enumeration) {
+                Bytes zero;
+                zero.text(1, lit_str("ZERO"));
+                zero.number(2, 0);
+                owner.child(2, zero);
+            }
+            Bytes source;
+            source.text(1, lit_str("reserved.proto"));
+            source.text(12, lit_str("proto3"));
+            source.child(enumeration ? 5u : 4u, owner);
+            Bytes input;
+            input.child(1, source);
+            CompileArena arena;
+            SchemaLimits limits{};
+            if (scenario == 7) limits.reserved = 0;
+            auto result = load_descriptor_set(arena.arena, input.data, input.size, limits);
+            if (scenario == 0) {
+                REQUIRE(result);
+                CHECK_EQ(result->reserved_count, 1u);
+            } else {
+                REQUIRE_FALSE(result);
+                CHECK(result.error() == (scenario == 5 || scenario == 6 || scenario == 9
+                                             ? SchemaError::Duplicate
+                                         : scenario == 7 ? SchemaError::Limit
+                                                         : SchemaError::Malformed));
+            }
+        }
+    }
+}

@@ -444,9 +444,16 @@ numeric values, negative values and the zero default. Top-level, nested and impo
 enum declarations resolve at compile time; no Rut enum keyword or named-value API
 is added. The first declared value must be zero, names must be unique in their
 protobuf scope, and duplicate numbers require `option allow_alias = true`.
-Enum declarations are bounded to 1,024 types and 16,384 values per schema; reserved
-declarations, custom options and enum JSON names remain unsupported. Packed and
-unpacked repeated enum inputs may mix; encoding emits unpacked values.
+Enum declarations are bounded to 1,024 types and 16,384 values per schema; custom
+options and enum JSON names remain unsupported. Packed and unpacked repeated enum
+inputs may mix; encoding emits unpacked values.
+Message and enum `reserved` declarations support quoted names, individual numbers,
+inclusive ranges and `to max`. Compilation rejects name/number reuse, reversed or
+overlapping ranges, duplicate names and out-of-range bounds, regardless of declaration
+order. Message range ends in descriptors are exclusive; enum range ends are inclusive.
+At most 16,384 reserved names/ranges are retained across the schema and imports.
+Reserved enum numbers are still accepted as unknown proto3 values on the wire;
+these declarations constrain schema evolution, not runtime numeric membership.
 Repeated scalar and acyclic message arrays support `.count` (i32), `.isEmpty` (bool) and `.first`
 (optional element). `let items: [i32] = message.values` aliases immutable,
 request-owned storage. Empty arrays return nil from `.first`; repeated defaults

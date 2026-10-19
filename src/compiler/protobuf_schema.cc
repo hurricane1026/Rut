@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/protobuf_value.h"
 #include "rut/runtime/protobuf_wire.h"
 
 namespace rut::protobuf {
@@ -255,6 +256,67 @@ struct Loader {
         ++schema.field_count;
         return true;
     }
+    bool reservation(const Field& part,
+                     bool range,
+                     bool enumeration,
+                     ReservedRange*& ranges,
+                     ReservedName*& names) {
+        if (!wire(part, 2)) return false;
+        if (schema.reserved_count >= limits.reserved) return fail(SchemaError::Limit);
+        if (!range) {
+            const Str kName = text(part);
+            if (kName.len > 1024 || !utf8(kName)) return malformed();
+            for (const auto* old = names; old; old = old->next)
+                if (old->name.eq(kName)) return fail(SchemaError::Duplicate);
+            auto* item = arena.alloc_t<ReservedName>();
+            if (!item) return fail(SchemaError::Allocation);
+            item->name = kName;
+            item->next = names;
+            names = item;
+        } else {
+            Reader reader(part.bytes, part.size);
+            Field value;
+            Status status;
+            i64 bounds[2]{};
+            u32 seen = 0;
+            while ((status = reader.next(value)) == Status::Field) {
+                if (value.number != 1 && value.number != 2) continue;
+                if (seen & (1u << value.number)) return fail(SchemaError::Duplicate);
+                seen |= 1u << value.number;
+                if (!wire(value, 0)) return false;
+                if (enumeration) {
+                    const i32 kNumber = static_cast<i32>(value.value);
+                    if (value.value != static_cast<u64>(static_cast<i64>(kNumber)))
+                        return malformed();
+                    bounds[value.number - 1] = kNumber;
+                } else {
+                    if (!value.value || value.value > 0x20000000u) return malformed();
+                    bounds[value.number - 1] = static_cast<i64>(value.value);
+                }
+            }
+            if (status != Status::End || seen != 6) return malformed();
+            if (!enumeration) --bounds[1];
+            if (bounds[0] > bounds[1]) return malformed();
+            for (const auto* old = ranges; old; old = old->next)
+                if (bounds[0] <= old->last && bounds[1] >= old->first)
+                    return fail(SchemaError::Duplicate);
+            auto* item = arena.alloc_t<ReservedRange>();
+            if (!item) return fail(SchemaError::Allocation);
+            item->first = bounds[0];
+            item->last = bounds[1];
+            item->next = ranges;
+            ranges = item;
+        }
+        ++schema.reserved_count;
+        return true;
+    }
+    bool reserved(i64 number, Str name, const ReservedRange* ranges, const ReservedName* names) {
+        for (const auto* r = ranges; r; r = r->next)
+            if (number >= r->first && number <= r->last) return true;
+        for (const auto* n = names; n; n = n->next)
+            if (n->name.eq(name)) return true;
+        return false;
+    }
     bool enumeration(View view, Str scope) {
         if (schema.enum_count >= limits.enums) return fail(SchemaError::Limit);
         auto* item = arena.alloc_t<Enum>();
@@ -285,6 +347,10 @@ struct Loader {
                     if (!read_bool(option, aliases)) return false;
                 }
                 if (os != Status::End) return malformed();
+            } else if (part.number == 4 || part.number == 5) {
+                if (!reservation(
+                        part, part.number == 4, true, item->reserved_ranges, item->reserved_names))
+                    return false;
             } else if (part.number != 2)
                 return fail(SchemaError::Unsupported);
         }
@@ -326,6 +392,8 @@ struct Loader {
                 (first && value->number != 0))
                 return malformed();
             first = false;
+            if (reserved(value->number, value->name, item->reserved_ranges, item->reserved_names))
+                return fail(SchemaError::Duplicate);
             value->full_name = join(scope, '.', value->name);
             if (!value->full_name.ptr) return false;
             if (symbol_used(value->full_name)) return fail(SchemaError::Duplicate);
@@ -381,9 +449,16 @@ struct Loader {
                 case 5:
                 case 6:
                 case 8:
+                    return fail(SchemaError::Unsupported);
                 case 9:
                 case 10:
-                    return fail(SchemaError::Unsupported);
+                    if (!reservation(part,
+                                     part.number == 9,
+                                     false,
+                                     item->reserved_ranges,
+                                     item->reserved_names))
+                        return false;
+                    break;
                 case 7: {
                     bool packed = false;
                     bool explicit_packed = false;
@@ -398,6 +473,8 @@ struct Loader {
         }
         if (status != Status::End) return malformed();
         for (const auto* field = item->fields; field; field = field->next) {
+            if (reserved(field->number, field->name, item->reserved_ranges, item->reserved_names))
+                return fail(SchemaError::Duplicate);
             const Str field_symbol = join(item->full_name, '.', field->name);
             if (!field_symbol.ptr) return false;
             if (symbol_used(field_symbol)) return fail(SchemaError::Duplicate);
@@ -664,7 +741,7 @@ core::Expected<Schema, SchemaError> load_descriptor_set(Arena<MmapBackend>& aren
         limits.messages > kCeiling.messages || limits.fields > kCeiling.fields ||
         limits.methods > kCeiling.methods || limits.services > kCeiling.services ||
         limits.depth > kCeiling.depth || limits.enums > kCeiling.enums ||
-        limits.enum_values > kCeiling.enum_values)
+        limits.enum_values > kCeiling.enum_values || limits.reserved > kCeiling.reserved)
         return core::make_unexpected(SchemaError::Limit);
     if (!size || !data) return core::make_unexpected(SchemaError::Malformed);
     if (size > limits.bytes) return core::make_unexpected(SchemaError::Limit);

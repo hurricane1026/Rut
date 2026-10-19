@@ -29,6 +29,15 @@ enum class Type : u8 {
 struct Message;
 struct Enum;
 struct SchemaFile;
+struct ReservedRange {
+    i64 first = 0;
+    i64 last = 0;  // Inclusive for both message and enum metadata.
+    ReservedRange* next = nullptr;
+};
+struct ReservedName {
+    Str name{};
+    ReservedName* next = nullptr;
+};
 struct SchemaField {
     Str name{};
     Str json_name{};
@@ -50,12 +59,16 @@ struct EnumValue {
 struct Enum {
     Str full_name{};
     EnumValue* values = nullptr;
+    ReservedRange* reserved_ranges = nullptr;
+    ReservedName* reserved_names = nullptr;
     const SchemaFile* file = nullptr;
     Enum* next = nullptr;
 };
 struct Message {
     Str full_name{};  // Leading dot, e.g. .example.Message
     SchemaField* fields = nullptr;
+    ReservedRange* reserved_ranges = nullptr;
+    ReservedName* reserved_names = nullptr;
     Message* next = nullptr;
     const SchemaFile* file = nullptr;
 };
@@ -81,6 +94,7 @@ struct Schema {
     Enum* enums = nullptr;
     u32 enum_count = 0;
     u32 enum_value_count = 0;
+    u32 reserved_count = 0;
     Method* methods = nullptr;
     u32 message_count = 0;
     u32 field_count = 0;
@@ -101,13 +115,14 @@ struct SchemaLimits {
     u32 services = 1024;
     u32 enums = 1024;
     u32 enum_values = 16384;
+    u32 reserved = 16384;
 };
 // Copies input into arena: output never borrows the supplied descriptor buffer.
 // Arena must be initialized and outlive the schema. Failure consumes arena space;
 // callers should discard/reset their compile arena. No filesystem or LLVM access.
 // Initial subset: proto3 scalars, nested/recursive messages and repeated fields,
-// packed scalars, open enums and RPC signatures. Oneof/optional presence, maps, proto2,
-// extensions and editions are rejected. This does not expose a Rut API or emit IR.
+// packed scalars, open enums, reserved names/ranges and RPC signatures. Oneof/optional presence,
+// maps, proto2, extensions and editions are rejected. This does not expose a Rut API or emit IR.
 core::Expected<Schema, SchemaError> load_descriptor_set(Arena<MmapBackend>& arena,
                                                         const u8* data,
                                                         u32 size,
