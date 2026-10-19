@@ -631,3 +631,41 @@ TEST(protobuf_schema, enum_descriptors_validate_open_numeric_types_and_reference
     REQUIRE_FALSE(bad);
     CHECK(bad.error() == SchemaError::Limit);
 }
+
+TEST(protobuf_schema, enum_descriptor_alias_and_malformed_value_rules) {
+    for (u32 scenario = 0; scenario < 7; ++scenario) {
+        Bytes enumeration;
+        enumeration.text(1, lit_str("E"));
+        Bytes first;
+        first.text(1, lit_str("ZERO"));
+        first.number(2, scenario == 0 ? 1u : scenario == 1 ? (u64{1} << 32) : 0u);
+        if (scenario == 2) first.number(2, 0);  // Duplicate descriptor field.
+        if (scenario != 3) enumeration.child(2, first);
+        if (scenario >= 4) {
+            Bytes second;
+            second.text(1, scenario == 6 ? lit_str("ZERO") : lit_str("ALIAS"));
+            second.number(2, 0);
+            enumeration.child(2, second);
+            if (scenario >= 5) {
+                Bytes options;
+                options.number(2, 1);
+                enumeration.child(3, options);
+            }
+        }
+        Bytes source = file(message(member()));
+        source.child(5, enumeration);
+        Bytes input;
+        input.child(1, source);
+        CompileArena arena;
+        auto result = load_descriptor_set(arena.arena, input.data, input.size);
+        if (scenario == 5) {
+            REQUIRE(result);
+            CHECK_EQ(result->enum_value_count, 2u);
+        } else {
+            REQUIRE_FALSE(result);
+            CHECK(result.error() == (scenario == 0 || scenario == 1 || scenario == 3
+                                         ? SchemaError::Malformed
+                                         : SchemaError::Duplicate));
+        }
+    }
+}
