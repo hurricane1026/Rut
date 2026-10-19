@@ -4396,12 +4396,16 @@ struct ProtoLayoutBuffer {
 
 static bool proto_array_layout(const HirModule& mod,
                                u32 index,
+                               const protobuf::Message* message,
                                ProtoLayoutBuffer& bytes,
                                u32& size,
                                u32& alignment,
                                u32 depth = 0) {
     if (depth > 8 || index >= mod.structs.len) return false;
     const auto& decl = mod.structs[index];
+    u32 schema_fields = 0;
+    for (const auto* field = message->fields; field; field = field->next) ++schema_fields;
+    if (decl.fields.len != schema_fields) return false;
     u32 header = 0;
     if (!bytes.reserve(12, header)) return false;
     size = 0;
@@ -4409,29 +4413,33 @@ static bool proto_array_layout(const HirModule& mod,
     for (u32 i = 0; i < decl.fields.len; ++i) {
         const auto& field = decl.fields[i];
         const bool repeated = field.type == HirTypeKind::Array;
-        if (field.protobuf_type != 11 && !protobuf::array_element_size(field.protobuf_type))
+        const protobuf::SchemaField* proto = message->fields;
+        while (proto && !proto->name.eq(field.name)) proto = proto->next;
+        const u8 proto_type = proto ? static_cast<u8>(proto->type) : 0;
+        if (!proto || proto->repeated != repeated || proto_type != field.protobuf_type)
             return false;
+        if (proto_type != 11 && !protobuf::array_element_size(proto_type)) return false;
         u32 child_size = 0, child_align = 1;
         u32 field_header = 0;
         if (!bytes.reserve(16, field_header)) return false;
         const u32 child_start = bytes.len;
-        if (field.protobuf_type == 11 &&
-            !proto_array_layout(mod, field.struct_index, bytes, child_size, child_align, depth + 1))
+        if (proto_type == 11 &&
+            !proto_array_layout(
+                mod, field.struct_index, proto->message, bytes, child_size, child_align, depth + 1))
             return false;
-        const u32 width = repeated ? sizeof(Str)
-                          : field.protobuf_type == 11
-                              ? child_size
-                              : protobuf::array_element_size(field.protobuf_type);
-        const u32 align = repeated                    ? alignof(Str)
-                          : field.protobuf_type == 11 ? child_align
-                          : width == 1                ? 1
-                          : width == 4                ? 4
-                                                      : 8;
-        if (!width && field.protobuf_type != 11) return false;
+        const u32 width = repeated           ? sizeof(Str)
+                          : proto_type == 11 ? child_size
+                                             : protobuf::array_element_size(proto_type);
+        const u32 align = repeated           ? alignof(Str)
+                          : proto_type == 11 ? child_align
+                          : width == 1       ? 1
+                          : width == 4       ? 4
+                                             : 8;
+        if (!width && proto_type != 11) return false;
         size = (size + align - 1) & ~(align - 1);
-        const u32 child_len = field.protobuf_type == 11 ? bytes.len - child_start : 0;
+        const u32 child_len = proto_type == 11 ? bytes.len - child_start : 0;
         if (child_len > protobuf::kMaxMessageBytes - 12 ||
-            !bytes.write_word(field_header, field.protobuf_number))
+            !bytes.write_word(field_header, proto->number))
             return false;
         if (!bytes.write_word(field_header + 4, field.protobuf_type | (repeated ? 256 : 0)) ||
             !bytes.write_word(field_header + 8, size) ||
@@ -4444,10 +4452,8 @@ static bool proto_array_layout(const HirModule& mod,
     return bytes.write_word(header, size) && bytes.write_word(header + 4, alignment) &&
            bytes.write_word(header + 8, decl.fields.len);
 }
-static FrontendResult<HirExpr> proto_array_schema(const HirModule& mod,
-                                                  u32 index,
-                                                  Span span,
-                                                  u32 depth) {
+static FrontendResult<HirExpr> proto_array_schema(
+    const HirModule& mod, u32 index, const protobuf::Message* message, Span span, u32 depth) {
     MmapArena arena;
     if (!arena.init(4096)) return frontend_error(FrontendError::OutOfMemory, span);
     ProtoLayoutBuffer bytes;
@@ -4456,7 +4462,7 @@ static FrontendResult<HirExpr> proto_array_schema(const HirModule& mod,
         return frontend_error(FrontendError::OutOfMemory, span);
     }
     u32 size = 0, alignment = 1;
-    if (!proto_array_layout(mod, index, bytes, size, alignment, depth)) {
+    if (!proto_array_layout(mod, index, message, bytes, size, alignment, depth)) {
         arena.destroy();
         return frontend_error(FrontendError::UnsupportedSyntax,
                               span,
@@ -4476,11 +4482,12 @@ static FrontendResult<HirExpr> proto_array_schema(const HirModule& mod,
 static FrontendResult<HirExpr> add_proto_array_schema(FrontendResult<HirExpr> op,
                                                       const HirModule& mod,
                                                       u32 index,
+                                                      const protobuf::Message* message,
                                                       Span span,
                                                       HirRoute* route,
                                                       u32 depth) {
     if (!op) return op;
-    auto schema = proto_array_schema(mod, index, span, depth);
+    auto schema = proto_array_schema(mod, index, message, span, depth);
     if (!schema) return schema;
     if (!route->exprs.push(schema.value()) || !op->args.push(&route->exprs[route->exprs.len - 1]))
         return frontend_error(FrontendError::TooManyItems, span);
@@ -4598,8 +4605,8 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
                         !item->args.push(&route->exprs[route->exprs.len - 1]))
                         return frontend_error(FrontendError::TooManyItems, span);
                 }
-                item =
-                    add_proto_array_schema(item, mod, field.struct_index, span, route, depth + 1);
+                item = add_proto_array_schema(
+                    item, mod, field.struct_index, proto->message, span, route, depth + 1);
             }
             if (!item) return item;
             if (expected == HirTypeKind::Array) item->shape_index = field.shape_index;
@@ -4636,7 +4643,7 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
                 kOp | protobuf::kEncode, HirTypeKind::Str, false, &result, &selected, span, route);
             if (proto->repeated && proto->type == PT::Message)
                 appended = add_proto_array_schema(
-                    appended, mod, field.struct_index, span, route, depth + 1);
+                    appended, mod, field.struct_index, proto->message, span, route, depth + 1);
             if (!appended) return appended;
             result = appended.value();
         }

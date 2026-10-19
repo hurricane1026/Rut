@@ -52,9 +52,21 @@ message CollectionLeaf {
 }
 message CollectionBranch { repeated CollectionLeaf leaves = 1; }
 message CollectionTree { repeated CollectionBranch branches = 1; }
+message RetaggedNested {
+  string text = 7;
+  int32 id = 8;
+}
+message RetaggedChild { repeated RetaggedNested children = 9; }
+message IncompatibleNested {
+  string text = 7;
+  string extra = 8;
+}
+message IncompatibleChild { repeated IncompatibleNested children = 9; }
 
 service UnaryCodec {
   rpc Echo(RepeatedChild) returns (RepeatedChild);
+  rpc Retag(RepeatedChild) returns (RetaggedChild);
+  rpc BadShape(RepeatedChild) returns (IncompatibleChild);
   rpc Distinct(NestedChild) returns (RepeatedChild);
   rpc ClientStream(stream NestedChild) returns (NestedChild);
   rpc ServerStream(NestedChild) returns (stream NestedChild);

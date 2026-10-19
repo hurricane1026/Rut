@@ -40646,4 +40646,18 @@ TEST(frontend, grpc_method_codecs_reject_streaming_unknown_methods_and_invalid_s
         if (hir) delete hir.value();
         delete ast.value();
     }
+    const char* incompatible =
+        "route POST \"/rpc\" { guard let value = grpc.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/BadShape\", req.body) else { return "
+        "400 } "
+        "let result = grpc.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/BadShape\", value) return 200 }";
+    auto incompatible_tokens = lex(lit(incompatible));
+    REQUIRE(incompatible_tokens);
+    auto incompatible_ast = parse_file(incompatible_tokens.value());
+    REQUIRE(incompatible_ast);
+    auto incompatible_hir = analyze_file(*incompatible_ast.value());
+    CHECK_FALSE(incompatible_hir.has_value());
+    if (incompatible_hir) delete incompatible_hir.value();
+    delete incompatible_ast.value();
 }
