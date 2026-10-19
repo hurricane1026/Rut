@@ -8769,7 +8769,7 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
     char path[] = "/tmp/rut-pb-network-XXXXXX";
     const int file = mkstemp(path);
     REQUIRE(file >= 0);
-    char source[4096];
+    char source[8192];
     const int length = snprintf(
         source,
         sizeof(source),
@@ -8798,6 +8798,15 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "guard let bytes = protobuf.encode(\"" RUT_GRPC_FIXTURES
         "/../protobuf/codec.proto\", \"example.RepeatedChild\", value) else { return 500 } "
         "guard let framed = grpc.frame(bytes) else { return 500 } "
+        "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
+        "\"grpc-status\": \"0\"}, body: framed) }\n"
+        "route POST \"/method.Echo/Call\" { "
+        "guard let value = grpc.decode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", \"/example.UnaryCodec/Echo\", req.body) else { "
+        "return response(200, headers: {\"content-type\": \"application/grpc\", \"grpc-status\": "
+        "\"13\"}) } "
+        "guard let framed = grpc.encode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", \"/example.UnaryCodec/Echo\", value) else { return 500 } "
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
         "\"grpc-status\": \"0\"}, body: framed) }\n"
         "route POST \"/local.Error/Call\" { return response(200, headers: {"
@@ -8951,6 +8960,39 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             CHECK_EQ(client.rpcs[15].response_len, sizeof(maximum));
             if (client.rpcs[15].response_len == sizeof(maximum))
                 CHECK(memcmp(client.rpcs[15].response.get(), maximum, sizeof(maximum)) == 0);
+            Client method_client;
+            const bool method_connected = method_client.init(get_port(lfd));
+            CHECK(method_connected);
+            if (method_connected) {
+                auto invoke_method =
+                    [&](u32 index, const u8* bytes, u32 size, u32 expected_status) {
+                        CHECK(method_client.request_native_raw(
+                                  index, bytes, size, "1H", nullptr, "/method.Echo/Call") > 0);
+                        method_client.rpcs[index].max_chunk = 1;
+                        const bool complete = method_client.until(index, true);
+                        CHECK(complete);
+                        if (complete) {
+                            CHECK_EQ(method_client.rpcs[index].status, expected_status);
+                            CHECK(method_client.rpcs[index].status_in_trailers);
+                            if (!expected_status) {
+                                CHECK_EQ(method_client.rpcs[index].response_len, size);
+                                if (method_client.rpcs[index].response_len == size && size)
+                                    CHECK(memcmp(method_client.rpcs[index].response.get(),
+                                                 bytes,
+                                                 size) == 0);
+                            }
+                        }
+                    };
+                invoke_method(0, framed, sizeof(framed), 0);
+                const u8 empty[] = {0, 0, 0, 0, 0};
+                invoke_method(1, empty, sizeof(empty), 0);
+                invoke_method(2, empty, 0, 13);  // Empty transport is not an empty message.
+                const u8 compressed[] = {1, 0, 0, 0, 0};
+                invoke_method(3, compressed, sizeof(compressed), 13);
+                const u8 invalid[] = {0, 0, 0, 0, 1, 128};
+                invoke_method(4, invalid, sizeof(invalid), 13);
+                invoke_method(5, framed, sizeof(framed), 0);
+            }
         }
     }
     shard->stop();

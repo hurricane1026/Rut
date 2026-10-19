@@ -4493,7 +4493,8 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
                                                  HirRoute* route,
                                                  const HirModule& mod,
                                                  Span span,
-                                                 u32 depth) {
+                                                 u32 depth,
+                                                 bool require_input = false) {
     if (depth > 8)
         return frontend_error(FrontendError::UnsupportedSyntax,
                               span,
@@ -4515,8 +4516,8 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
         result.struct_index = index;
         result.may_nil = true;
         result.span = span;
-        auto valid =
-            make_proto_op(depth ? 3 : 0, HirTypeKind::Str, true, &source, nullptr, span, route);
+        auto valid = make_proto_op(
+            depth || require_input ? 3 : 0, HirTypeKind::Str, true, &source, nullptr, span, route);
         if (!valid) return valid;
         if (!route->exprs.push(valid.value()))
             return frontend_error(FrontendError::TooManyItems, span);
@@ -4648,7 +4649,12 @@ static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
                                                      const HirModule& mod,
                                                      const HirLocal* locals,
                                                      u32 local_count,
-                                                     const MatchPayloadBinding* binding) {
+                                                     const MatchPayloadBinding* binding,
+                                                     bool grpc_method = false) {
+    if (grpc_method && expr.args.len != 3)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("grpc.decode/encode(protoPath, methodPath, value)"));
     const bool decode = expr.name.eq(lit_str("decode"));
     const bool infer_type = decode && expr.args.len == 3;
     if ((!decode && !expr.name.eq(lit_str("encode"))) ||
@@ -4737,15 +4743,28 @@ static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
         expr.args[path_arg + 1]->str_value, mod, expr.args[path_arg + 1]->span);
     if (!decoded_name) return core::make_unexpected(decoded_name.error());
     Str message_name = decoded_name.value();
-    char qualified[1026];
-    if (message_name.len && message_name.ptr[0] != '.') {
-        if (message_name.len > 1024)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        qualified[0] = '.';
-        __builtin_memcpy(qualified + 1, message_name.ptr, message_name.len);
-        message_name = {qualified, message_name.len + 1};
+    const protobuf::Message* message = nullptr;
+    if (grpc_method) {
+        const auto* method = loaded->find_method(message_name);
+        if (!method)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, lit_str("gRPC method not found"));
+        if (method->client_streaming || method->server_streaming)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("gRPC method codecs require a unary method"));
+        message = decode ? method->input : method->output;
+    } else {
+        char qualified[1026];
+        if (message_name.len && message_name.ptr[0] != '.') {
+            if (message_name.len > 1024)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            qualified[0] = '.';
+            __builtin_memcpy(qualified + 1, message_name.ptr, message_name.len);
+            message_name = {qualified, message_name.len + 1};
+        }
+        message = loaded->find_message(message_name);
     }
-    const auto* message = loaded->find_message(message_name);
     if (!message)
         return frontend_error(
             FrontendError::UnsupportedSyntax, expr.span, lit_str("protobuf message not found"));
@@ -4755,7 +4774,20 @@ static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
         if (!inferred) return core::make_unexpected(inferred.error());
         index = inferred.value();
     }
-    return build_proto_codec(decode, message, index, source, route, mod, expr.span, 0);
+    if (grpc_method && decode) {
+        auto payload = make_proto_op(
+            protobuf::kGrpcUnframe, HirTypeKind::Str, false, &source, nullptr, expr.span, route);
+        if (!payload) return payload;
+        source = payload.value();
+    }
+    auto codec = build_proto_codec(
+        decode, message, index, source, route, mod, expr.span, 0, grpc_method && decode);
+    if (!codec || !grpc_method || decode) return codec;
+    // As for nested protobuf encoding, a failed intermediate payload is a null
+    // byte view. Framing rejects that sentinel instead of emitting an empty RPC.
+    codec->may_nil = false;
+    return make_proto_op(
+        protobuf::kGrpcFrame, HirTypeKind::Str, true, &codec.value(), nullptr, expr.span, route);
 }
 
 static FrontendResult<HirExpr> analyze_json_call(const AstExpr& expr,
@@ -4909,6 +4941,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         expr.lhs->name.eq(lit_str("grpc")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, lit_str("grpc"))) {
+        if (expr.name.eq(lit_str("decode")) || expr.name.eq(lit_str("encode")))
+            return analyze_protobuf_call(expr, route, mod, locals, local_count, binding, true);
         const bool frame = expr.name.eq(lit_str("frame"));
         if ((!frame && !expr.name.eq(lit_str("unframe"))) || expr.args.len != 1)
             return frontend_error(FrontendError::UnsupportedSyntax,

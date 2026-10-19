@@ -8186,3 +8186,18 @@ trailers-only HEADERS serializer. No new connection-base allocation, keyword,
 helper ABI or external runtime dependency is introduced. This is local unary
 response transport, not generated service dispatch, deadline scheduling or a
 streaming Rut API.
+
+
+### Compile-time unary method codecs
+
+`grpc.decode(protoPath, methodPath, framed)` resolves a literal canonical RPC path
+and selects its input message; `grpc.encode(protoPath, methodPath, value)` selects
+its output message and validates the existing structural codec shape. Streaming
+methods are rejected. Envelope operations compose with the existing ProtoOp ABI;
+there are no runtime descriptors, schema file access, protoc or new dependencies.
+Decode requires a non-null root payload so an invalid envelope cannot become a
+valid default message; a valid empty envelope remains distinguishable. Encoding
+failure retains the null byte-view sentinel through framing, returning nil rather
+than an empty RPC. Each direction uses its own schema field numbers, including
+when request and response have identical field names. Routes and status headers
+remain explicit; generated dispatch and local deadline scheduling are separate.

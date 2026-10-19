@@ -461,6 +461,17 @@ valid. The payload limit is 8 KiB (8 KiB + 5 bytes with its envelope). Results
 own their bytes in the request arena and may contain arbitrary binary data.
 These byte operations do not validate protobuf, dispatch RPC services, generate
 `grpc-status` trailers, or perform protobuf JSON mapping. Native forwarding continues to treat payloads as opaque bytes.
+`grpc.decode("schema.proto", "/package.Service/Method", framed) -> Request?`
+and `grpc.encode("schema.proto", "/package.Service/Method", value) -> str?`
+bind codecs to a declared unary RPC. Both paths must be literals. Decode selects
+the request message, validates and removes the envelope, then infers its struct;
+encode validates the value's structural shape against the response message and
+adds an envelope. The schema supplies field numbers for each direction. Unknown
+or noncanonical method paths and streaming RPCs are compile-time errors. Invalid
+transport, malformed protobuf, budget exhaustion or oversized encoded output
+return nil; an explicit empty envelope is valid. These operations use the existing
+protobuf subset and do not generate routes or status headers.
+
 JSON transcoding and gRPC health probes are not implemented by this
 option; `health_check` with `.http2` is rejected.
 
@@ -1104,7 +1115,7 @@ kTLS integration also remain unimplemented. See [ebpf.md](ebpf.md).
 
 A local handler can return `response(200, headers: {"content-type":
 "application/grpc+proto", "grpc-status": "0"}, body: framed)` after composing
-`grpc.unframe`, protobuf decode/encode and `grpc.frame`. For these explicitly
+`grpc.decode` and `grpc.encode` (or the low-level envelope and protobuf helpers). For these explicitly
 marked responses, HTTP/2 emits the status as trailing HEADERS after all DATA.
 An empty response with the same headers is a trailers-only response; use a
 nonzero status for a failed RPC. Status values must be canonical decimal 0–16,
@@ -1115,8 +1126,8 @@ fails closed with HTTP 500 before publishing a response body.
 Bodies and the pending numeric status survive flow-control stalls, queued
 response promotion and cancellation. Trailers consume no DATA flow-control
 credit. This local path uses ordinary HTTP request/response accounting, not the
-upstream gRPC proxy exchange counters. It does not automatically bind service
-schemas, enforce grpc-timeout for local work, expose streaming RPC handlers,
+upstream gRPC proxy exchange counters. It does not generate service route dispatch,
+enforce grpc-timeout for local work, expose streaming RPC handlers,
 convert grpc-web, or perform HTTP/JSON transcoding. See
 [the local endpoint](../examples/grpc-local.rut) and
 [client instructions](../examples/grpc/README.md#local-unary-rpc).
