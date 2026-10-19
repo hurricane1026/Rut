@@ -236,6 +236,7 @@ enum class Opcode : u8 {
     StructCreate,  // %r = struct.create Name {...}  → Struct
     BodyParse,     // %r = body.parse TypeName       → T
     ArrayLen,      // %r = array.len %arr            → i32
+    ArrayFirst,    // %r = array.first %arr -> Optional(T), no load for empty arrays
     ArrayGet,      // %r = array.get %arr, %idx      → T
 
     // ── Optional operations ──

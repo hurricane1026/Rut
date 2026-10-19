@@ -92,11 +92,14 @@ struct Arena {
     Block* current = nullptr;
     Backend backend{};
     u64 total_allocated = 0;
+    // Shared request collection budget; reset with the owning arena.
+    u32 collection_items = 0;
 
     // Initialize with backend-specific args (forwarded to Backend::init).
     template <typename... Args>
     core::Expected<void, Error> init(Args&&... args) {
         total_allocated = 0;
+        collection_items = 0;
         current = nullptr;
         auto r = backend.init(static_cast<Args&&>(args)...);
         if (!r) return r;
@@ -155,6 +158,7 @@ struct Arena {
 
     // Free all blocks except first, reset pointer. O(blocks).
     void reset() {
+        collection_items = 0;
         if (!current) return;
         while (current->prev) {
             Block* prev = current->prev;
@@ -175,6 +179,7 @@ struct Arena {
         }
         current = nullptr;
         total_allocated = 0;
+        collection_items = 0;
     }
 
     u64 space_used() const {

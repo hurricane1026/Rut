@@ -286,6 +286,7 @@ static MirTypeKind mir_type_kind(HirTypeKind kind) {
            : kind == HirTypeKind::IP                                 ? MirTypeKind::IP
            : kind == HirTypeKind::Variant                            ? MirTypeKind::Variant
            : kind == HirTypeKind::Tuple                              ? MirTypeKind::Tuple
+           : kind == HirTypeKind::Array                              ? MirTypeKind::Array
            : kind == HirTypeKind::Struct                             ? MirTypeKind::Struct
                                                                      : MirTypeKind::Unknown;
 }
@@ -342,6 +343,12 @@ static bool shape_carrier_ready(const MirModule& mir,
     if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
         shape.type == MirTypeKind::Str || shape.type == MirTypeKind::Method)
         return true;
+    if (shape.type == MirTypeKind::Array) {
+        if (shape.array_elem_shape_index >= mir.type_shapes.len) return false;
+        const auto element = mir.type_shapes[shape.array_elem_shape_index].type;
+        return element == MirTypeKind::Bool || element == MirTypeKind::I32 ||
+               element == MirTypeKind::I64 || element == MirTypeKind::Str;
+    }
     if (shape.type == MirTypeKind::Struct)
         return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
     if (shape.type == MirTypeKind::Variant)
@@ -366,6 +373,12 @@ static bool shape_slot_carrier_ready(const MirModule& mir,
     if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
         shape.type == MirTypeKind::Str)
         return true;
+    if (shape.type == MirTypeKind::Array) {
+        if (shape.array_elem_shape_index >= mir.type_shapes.len) return false;
+        const auto element = mir.type_shapes[shape.array_elem_shape_index].type;
+        return element == MirTypeKind::Bool || element == MirTypeKind::I32 ||
+               element == MirTypeKind::I64 || element == MirTypeKind::Str;
+    }
     if (shape.type == MirTypeKind::Struct)
         return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
     if (shape.type == MirTypeKind::Variant)
@@ -735,6 +748,17 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     if (expr.kind == HirExprKind::ReqContentLength) {
         v.kind = MirValueKind::ReqContentLength;
         v.type = MirTypeKind::ByteSize;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ArrayLen || expr.kind == HirExprKind::ArrayFirst) {
+        v.kind =
+            expr.kind == HirExprKind::ArrayLen ? MirValueKind::ArrayLen : MirValueKind::ArrayFirst;
+        v.type = mir_type_kind(expr.type);
+        auto child = mir_value(*expr.lhs, module, fn, ctx);
+        if (!child) return core::make_unexpected(child.error());
+        if (!fn->values.push(child.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.lhs = &fn->values[fn->values.len - 1];
         return v;
     }
     if (expr.kind == HirExprKind::JsonOp || expr.kind == HirExprKind::ProtoOp) {
@@ -1155,6 +1179,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         shape.variant_index = module.type_shapes[i].variant_index;
         shape.struct_index = module.type_shapes[i].struct_index;
         shape.tuple_len = module.type_shapes[i].tuple_len;
+        shape.array_elem_shape_index = module.type_shapes[i].array_elem_shape_index;
         for (u32 ti = 0; ti < shape.tuple_len; ti++) {
             shape.tuple_elem_shape_indices[ti] = module.type_shapes[i].tuple_elem_shape_indices[ti];
         }
@@ -1352,7 +1377,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             // Array locals are compile-time constants for for-loop unroll
             // only. They have no runtime MirValue carrier yet, so do not
             // emit a MIR local for them.
-            if (module.routes[i].locals[li].type == HirTypeKind::Array ||
+            if ((module.routes[i].locals[li].type == HirTypeKind::Array &&
+                 module.routes[i].locals[li].init.kind == HirExprKind::ArrayLit) ||
                 module.routes[i].locals[li].type == HirTypeKind::Response)
                 continue;
             // Skip synthetic name-cleared locals. Analyze keeps for-loop

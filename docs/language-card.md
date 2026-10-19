@@ -102,10 +102,7 @@ match status {                            // general dispatch — no `case` keyw
     _        => "other"                   // exhaustive: all cases or _
 }
 
-for item in order.items {                 // ⏳ finite collections only, no while
-    if item.qty == 0 { continue }         // ⏳ break / continue allowed
-    guard item.qty > 0 else { return 400 }
-}
+// `for` loops are rejected by the current Core parser.
 
 defer conn.close()                        // ⏳ runs on every exit path, LIFO (no defer in parser yet)
 ```
@@ -428,9 +425,10 @@ Paths and fully qualified message names must be literals. Paths resolve relative
 to the current `.rut` file. The compiler reads proto3 imports and generates an
 internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most
-eight singular fields per message: string/bytes, bool, signed 32/64-bit,
+eight fields per message: string/bytes, bool, signed 32/64-bit,
 unsigned/fixed 32-bit and acyclic embedded message fields. Unsigned/fixed 32-bit
-fields infer i64 with range-checked encoding; user i64 annotations remain
+fields infer i64 with range-checked encoding; repeated scalar fields infer `[T]`.
+User i64 annotations remain
 unavailable. Messages cap at 8 KiB; intermediate request bytes at 256 KiB.
 Proto3 defaults, last correctly typed duplicate wins, UTF-8 validation for strings,
 and skipping unknown/wrong-wire fields are implemented (group wire types are
@@ -438,11 +436,17 @@ rejected); unknown fields are lost on encoding. Embedded messages infer nested
 structs (up to eight nesting edges); duplicate
 submessages merge, and absent messages expose recursively default-valued structs.
 Presence is not exposed: encoding such a default struct emits an empty embedded
-message. Repeated values, floating point, unsigned 64-bit values,
+message. Repeated embedded messages, floating point, unsigned 64-bit values,
 enums, oneof/presence/maps and proto2 are not executable codec shapes yet. See
 [the example and source grammar limits](../examples/protobuf/README.md).
-An internal bounded C++ message codec also handles repeated wire trees; repeated
-values are not yet bound to Rut types or the helper ABI.
+Repeated scalar arrays support `.count` (i32), `.isEmpty` (bool) and `.first`
+(optional element). `let items: [i32] = message.values` aliases immutable,
+request-owned storage. Empty arrays return nil from `.first`; repeated defaults
+are retained. Packed/unpacked inputs may mix, and encoding emits unpacked values.
+Limits: 512 elements per array, 4,096 across the request Arena, and the shared
+256 KiB value budget. Decode returns nil on limit/allocation failure. Strings
+and bytes own their payloads. Arrays cannot be grown, mutated, indexed, iterated
+or used in routes with explicit `wait`; general array literals remain rejected.
 These operations handle protobuf payloads; protobuf JSON mapping and gRPC framing
 are separate. Native forwarding continues to treat payloads as opaque bytes.
 JSON transcoding and gRPC health probes are not implemented by this

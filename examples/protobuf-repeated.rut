@@ -1,0 +1,14 @@
+// Runtime length, immutable storage owned by the request Arena.
+route POST "/protobuf/repeated" {
+    guard let batch = protobuf.decode("protobuf/message.proto", "example.Batch", req.body) else {
+        return 400
+    }
+    let values: [i32] = batch.values
+    guard values.count == 3 else { return 422 }
+    guard let first = batch.names.first else { return 422 }
+    guard first == "x" else { return 422 }
+    guard let bytes = protobuf.encode("protobuf/message.proto", "example.Batch", batch) else {
+        return 500
+    }
+    return response(200, body: bytes)
+}

@@ -516,3 +516,59 @@ TEST(native_program, protobuf_nested_codecs_survive_source_and_schema_removal) {
     connections.destroy();
     pool.destroy();
 }
+
+TEST(native_program, protobuf_repeated_codecs_survive_source_and_schema_removal) {
+    Source proto;
+    REQUIRE(
+        proto.append("syntax='proto3'; package example; message Message { repeated int32 values=1; "
+                     "repeated string names=2; }"));
+    Source source;
+    char code[2048];
+    const int length = snprintf(
+        code,
+        sizeof(code),
+        "route POST \"/codec\" { guard let value = protobuf.decode(\"%s\", \"example.Message\", "
+        "req.body) else { return 400 } "
+        "guard value.values.count == 3 else { return 411 } "
+        "guard let first = value.names.first else { return 412 } "
+        "guard first == \"x\" else { return 413 } "
+        "guard let bytes = protobuf.encode(\"%s\", \"example.Message\", value) else { return 500 } "
+        "return response(200, body: bytes) }",
+        proto.path,
+        proto.path);
+    REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(code));
+    REQUIRE(source.append(code, static_cast<u32>(length)));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(proto.path), 0);
+    REQUIRE_EQ(unlink(source.path), 0);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    MappedArray<Connection> connections;
+    REQUIRE(connections.init(1));
+    auto& conn = connections[0];
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    const u8 kPayload[] = {8, 1, 8, 2, 8, 0, 18, 1, 'x', 18, 0};
+    char request[128];
+    const int header = snprintf(request,
+                                sizeof(request),
+                                "POST /codec HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                static_cast<u32>(sizeof(kPayload)));
+    memcpy(request + header, kPayload, sizeof(kPayload));
+    jit::HandlerCtx ctx{};
+    const auto result = jit::HandlerResult::unpack(
+        owner.p->config.routes[0].fn(&conn,
+                                     &ctx,
+                                     reinterpret_cast<const u8*>(request),
+                                     static_cast<u32>(header) + sizeof(kPayload),
+                                     nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK(conn.jit_response_body_valid);
+    REQUIRE_EQ(conn.jit_response_body.len, sizeof(kPayload));
+    CHECK_EQ(memcmp(conn.jit_response_body.ptr, kPayload, sizeof(kPayload)), 0);
+    conn.reset();
+    connections.destroy();
+    pool.destroy();
+}

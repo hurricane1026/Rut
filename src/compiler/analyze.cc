@@ -8,6 +8,7 @@
 #include "rut/compiler/protobuf_schema.h"
 #include "rut/compiler/protobuf_source.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/protobuf_array.h"
 #include "rut/runtime/protobuf_value.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/ws_terminate.h"  // ws_valid_close_code (shared close-code predicate)
@@ -4192,16 +4193,22 @@ static FrontendResult<HirExpr> proto_stable(HirExpr value, HirRoute* route) {
     local.span = value.span;
     local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
     local.type = value.type;
+    local.may_nil = value.may_nil;
+    local.may_error = value.may_error;
     local.struct_index = value.struct_index;
+    local.shape_index = value.shape_index;
     local.is_runtime_synthetic = true;
     local.init = value;
     if (!route->locals.push(local)) return frontend_error(FrontendError::TooManyItems, value.span);
     HirExpr out{};
     out.kind = HirExprKind::LocalRef;
     out.type = value.type;
+    out.may_nil = value.may_nil;
+    out.may_error = value.may_error;
     out.span = value.span;
     out.local_index = local.ref_index;
     out.struct_index = value.struct_index;
+    out.shape_index = value.shape_index;
     return out;
 }
 struct ProtoInference {
@@ -4303,7 +4310,38 @@ static FrontendResult<u32> infer_proto_struct(const protobuf::Message* message,
         } else
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span, lit_str("unsupported protobuf field type"));
-        if (proto->repeated || !generated.fields.push(field))
+        if (proto->repeated) {
+            if (field.type == HirTypeKind::Struct)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span,
+                                      lit_str("repeated embedded messages are not supported"));
+            auto element = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                                 field.type,
+                                                 0xffffffffu,
+                                                 0xffffffffu,
+                                                 0xffffffffu,
+                                                 0,
+                                                 nullptr,
+                                                 nullptr,
+                                                 nullptr,
+                                                 span);
+            if (!element) return core::make_unexpected(element.error());
+            auto array = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                               HirTypeKind::Array,
+                                               0xffffffffu,
+                                               0xffffffffu,
+                                               0xffffffffu,
+                                               0,
+                                               nullptr,
+                                               nullptr,
+                                               nullptr,
+                                               span,
+                                               element.value());
+            if (!array) return core::make_unexpected(array.error());
+            field.type = HirTypeKind::Array;
+            field.shape_index = array.value();
+        }
+        if (!generated.fields.push(field))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   span,
                                   lit_str("protobuf supports at most eight singular fields"));
@@ -4378,7 +4416,7 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
         const auto& field = decl.fields[fi];
         const protobuf::SchemaField* proto = message->fields;
         while (proto && !proto->name.eq(field.name)) proto = proto->next;
-        if (!proto || proto->repeated)
+        if (!proto)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   span,
                                   lit_str("protobuf binding requires matching singular fields"));
@@ -4397,12 +4435,23 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
             expected = HirTypeKind::I64;
         else if (proto->type == PT::Message && proto->message)
             expected = HirTypeKind::Struct;
+        if (proto->repeated) {
+            if (expected == HirTypeKind::Struct || field.shape_index >= mod.type_shapes.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            const auto& array = mod.type_shapes[field.shape_index];
+            if (array.type != HirTypeKind::Array ||
+                array.array_elem_shape_index >= mod.type_shapes.len ||
+                mod.type_shapes[array.array_elem_shape_index].type != expected)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            expected = HirTypeKind::Array;
+        }
         if (expected == HirTypeKind::Unknown || field.type != expected ||
             (expected == HirTypeKind::Struct && field.struct_index >= mod.structs.len))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   span,
                                   lit_str("unsupported protobuf/Rut field type mapping"));
-        const u64 kOp = (static_cast<u64>(proto->number) << 8) | static_cast<u8>(proto->type);
+        const u64 kOp = (static_cast<u64>(proto->number) << 8) | static_cast<u8>(proto->type) |
+                        (proto->repeated ? protobuf::kRepeated : 0);
         if (decode) {
             auto item = make_proto_op(kOp,
                                       expected == HirTypeKind::Struct ? HirTypeKind::Str : expected,
@@ -4421,6 +4470,7 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
                                          span,
                                          depth + 1);
             if (!item) return item;
+            if (expected == HirTypeKind::Array) item->shape_index = field.shape_index;
             if (!route->exprs.push(item.value()))
                 return frontend_error(FrontendError::TooManyItems, span);
             if (!result.field_inits.push({field.name, &route->exprs[route->exprs.len - 1]}))
@@ -4431,6 +4481,7 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
             selected.type = expected;
             selected.str_value = field.name;
             selected.struct_index = field.struct_index;
+            selected.shape_index = field.shape_index;
             if (!route->exprs.push(source))
                 return frontend_error(FrontendError::TooManyItems, span);
             selected.lhs = &route->exprs[route->exprs.len - 1];
@@ -4456,7 +4507,7 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
         }
     }
     if (!decode) return make_proto_op(2, HirTypeKind::Str, true, &result, nullptr, span, route);
-    return result;
+    return depth == 0 ? proto_stable(result, route) : FrontendResult<HirExpr>(result);
 }
 static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
                                                      HirRoute* route,
@@ -8091,6 +8142,47 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         auto base = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!base) return core::make_unexpected(base.error());
+        if (base->type == HirTypeKind::Array) {
+            if (base->may_nil || base->may_error || base->shape_index >= mod.type_shapes.len)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("unwrap the array before reading its properties"));
+            const auto& shape = mod.type_shapes[base->shape_index];
+            if (shape.array_elem_shape_index >= mod.type_shapes.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (!expr.name.eq(lit_str("count")) && !expr.name.eq(lit_str("isEmpty")) &&
+                !expr.name.eq(lit_str("first")))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("immutable arrays support count, isEmpty and first"));
+            out.kind =
+                expr.name.eq(lit_str("first")) ? HirExprKind::ArrayFirst : HirExprKind::ArrayLen;
+            out.type = out.kind == HirExprKind::ArrayFirst
+                           ? mod.type_shapes[shape.array_elem_shape_index].type
+                           : HirTypeKind::I32;
+            out.may_nil = out.kind == HirExprKind::ArrayFirst;
+            out.span = expr.span;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            if (expr.name.eq(lit_str("isEmpty"))) {
+                HirExpr zero{};
+                zero.kind = HirExprKind::IntLit;
+                zero.type = HirTypeKind::I32;
+                if (!route->exprs.push(out))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                auto* length = &route->exprs[route->exprs.len - 1];
+                if (!route->exprs.push(zero))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                out = {};
+                out.kind = HirExprKind::Eq;
+                out.type = HirTypeKind::Bool;
+                out.span = expr.span;
+                out.lhs = length;
+                out.rhs = &route->exprs[route->exprs.len - 1];
+            }
+            return out;
+        }
         if (base->is_wait_result) {
             if (base->kind != HirExprKind::LocalRef)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -9159,6 +9251,19 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
         adopt_int_literal_type(&lhs.value(), &rhs.value());
+        auto contains_array = [&](auto&& self, HirTypeKind type, u32 index, u32 depth) -> bool {
+            if (type == HirTypeKind::Array) return true;
+            if (type != HirTypeKind::Struct || index >= mod.structs.len || depth > 8) return false;
+            const auto& fields = mod.structs[index].fields;
+            for (u32 i = 0; i < fields.len; ++i)
+                if (self(self, fields[i].type, fields[i].struct_index, depth + 1)) return true;
+            return false;
+        };
+        if (contains_array(contains_array, lhs->type, lhs->struct_index, 0) ||
+            contains_array(contains_array, rhs->type, rhs->struct_index, 0))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("runtime array comparison is not supported"));
         const bool lhs_maybe_missing = lhs->may_nil || lhs->may_error;
         const bool rhs_maybe_missing = rhs->may_nil || rhs->may_error;
         if (expr.kind != AstExprKind::Eq && (lhs_maybe_missing || rhs_maybe_missing))
@@ -9394,7 +9499,8 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 tuple.span = expr.span;
                 return tuple;
             }
-            if (locals[i].type == HirTypeKind::Array && !allow_array_lit)
+            if (locals[i].type == HirTypeKind::Array && !allow_array_lit &&
+                locals[i].init.kind == HirExprKind::ArrayLit)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     expr.span,
@@ -20174,7 +20280,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                nullptr)));
                 route.allow_respond_effects = saved_allow_respond_effects;
                 if (!init) return core::make_unexpected(init.error());
-                if (init.value().type == HirTypeKind::Array) {
+                if (init.value().type == HirTypeKind::Array &&
+                    init->kind == HirExprKind::ArrayLit) {
                     if (!used_for_iter || !is_static_for_iter_expr(
                                               init.value(), route.locals.data, route.locals.len, 0))
                         return frontend_error(
@@ -21357,6 +21464,28 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // decorators are parser-unreachable today (official whitelist), so
         // this is defensive — but a future decorator carrying a CacheGet
         // into a wait route must not resurrect the re-materialization bug.
+        if (route.waits.len > 0) {
+            auto has_array = [&](auto&& self, HirTypeKind type, u32 index, u32 depth) -> bool {
+                if (type == HirTypeKind::Array) return true;
+                if (type != HirTypeKind::Struct || index >= mod.structs.len || depth > 8)
+                    return false;
+                for (const auto& field : mod.structs[index].fields)
+                    if (self(self, field.type, field.struct_index, depth + 1)) return true;
+                return false;
+            };
+            for (const auto& expr : route.exprs)
+                if (has_array(has_array, expr.type, expr.struct_index, 0))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        expr.span,
+                        lit_str("runtime arrays cannot be used in routes with wait"));
+            for (const auto& local : route.locals)
+                if (has_array(has_array, local.type, local.struct_index, 0))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        local.span,
+                        lit_str("runtime arrays cannot be used in routes with wait"));
+        }
         if (route.waits.len > 0) {
             auto is_cache_op = [](const HirExpr& e) {
                 return e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet;
