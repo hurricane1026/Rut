@@ -40436,10 +40436,10 @@ TEST(frontend, protobuf_nested_inference_reuse_and_unsupported_collections) {
     }
 }
 
-TEST(frontend, protobuf_arrays_reject_growth_repeated_messages_and_wait) {
+TEST(frontend, protobuf_arrays_reject_growth_comparison_and_wait) {
     const char* tails[] = {"let changed = value.values.append(1) return 200",
                            "wait(1) return 200",
-                           "return 200",
+                           "wait(1) return 200",
                            "guard value.values == value.values else { return 400 } return 200",
                            "guard value == value else { return 400 } return 200"};
     for (u32 i = 0; i < 5; ++i) {
@@ -40496,6 +40496,47 @@ TEST(frontend, protobuf_nested_depth_boundary) {
             CHECK(hir.has_value());
         else
             CHECK_FALSE(hir.has_value());
+        if (hir) delete hir.value();
+        delete ast.value();
+    }
+    unlink(path);
+}
+
+TEST(frontend, protobuf_repeated_message_depth_with_shared_shallow_type) {
+    char path[] = "/tmp/rut-protobuf-array-depth-XXXXXX";
+    const int fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    const char* prefix = "syntax='proto3'; package depth; ";
+    REQUIRE(write(fd, prefix, strlen(prefix)) == static_cast<ssize_t>(strlen(prefix)));
+    for (u32 i = 1; i < 10; ++i) {
+        char field[128];
+        const int length =
+            i == 9 ? snprintf(field, sizeof(field), "message M9 { string text=1; }")
+                   : snprintf(field, sizeof(field), "message M%u { M%u child=1; }", i, i + 1);
+        REQUIRE(write(fd, field, length) == length);
+    }
+    const char* roots =
+        "message Boundary { M6 shallow=1; repeated M2 deep=2; } message TooDeep { M6 shallow=1; "
+        "repeated M1 deep=2; }";
+    REQUIRE(write(fd, roots, strlen(roots)) == static_cast<ssize_t>(strlen(roots)));
+    close(fd);
+    for (u32 i = 0; i < 2; ++i) {
+        char code[2048];
+        snprintf(code,
+                 sizeof(code),
+                 "route POST \"/depth\" { guard let value = protobuf.decode(\"%s\", \"depth.%s\", "
+                 "req.body) else { return 400 } return 200 }",
+                 path,
+                 i ? "TooDeep" : "Boundary");
+        auto tokens = lex(lit(code));
+        REQUIRE(tokens);
+        auto ast = parse_file(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file(*ast.value());
+        if (i)
+            CHECK_FALSE(hir.has_value());
+        else
+            CHECK(hir.has_value());
         if (hir) delete hir.value();
         delete ast.value();
     }

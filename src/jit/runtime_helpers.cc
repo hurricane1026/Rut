@@ -8,6 +8,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/protobuf_array.h"
+#include "rut/runtime/protobuf_struct_array.h"
 #include "rut/runtime/protobuf_value.h"
 
 #include <hs.h>
@@ -1697,8 +1698,8 @@ extern "C" void rut_helper_protobuf(void* conn,
                                     u32 a_len,
                                     const char* b,
                                     u32 b_len,
-                                    const char*,
-                                    u32,
+                                    const char* schema,
+                                    u32 schema_len,
                                     i64 number,
                                     u8* has_value,
                                     const char** out_ptr,
@@ -1711,7 +1712,41 @@ extern "C" void rut_helper_protobuf(void* conn,
     u8 scratch[protobuf::kMaxMessageBytes];
     Str view{};
     i64 scalar = 0;
-    if (op & protobuf::kRepeated) {
+    if (op & protobuf::kStructArray) {
+        const u32 tag = static_cast<u32>(
+            (op & ~(protobuf::kStructArray | protobuf::kRepeated | protobuf::kEncode)) >> 8);
+        if (!(op & protobuf::kRepeated) || static_cast<u8>(op) != 11) return;
+        if (!(op & protobuf::kEncode)) {
+            protobuf::struct_array_detail::Budget preflight;
+            if (!protobuf::struct_array_detail::measure_array(
+                    tag, {schema, schema_len}, {a, a_len}, preflight, 0))
+                return;
+            if (!preflight.items) {
+                *has_value = 1;
+                *out_ptr = "";
+                return;
+            }
+            if (!arena && conn) {
+                auto& owned = static_cast<ConnectionBase*>(conn)->json_arena;
+                if (owned.backend.pool && (owned.current || owned.init(owned.backend.pool)))
+                    arena = &owned;
+            }
+            if (!protobuf::decode_struct_array(tag,
+                                               {schema, schema_len},
+                                               {a, a_len},
+                                               static_cast<SliceArena*>(arena),
+                                               view,
+                                               &preflight))
+                return;
+            *has_value = 1;
+            *out_ptr = view.ptr;
+            *out_len = view.len;
+            return;
+        }
+        if (!protobuf::encode_struct_array(
+                tag, {schema, schema_len}, {a, a_len}, {b, b_len}, scratch, sizeof(scratch), view))
+            return;
+    } else if (op & protobuf::kRepeated) {
         if (!(op & protobuf::kEncode)) {
             protobuf::ArrayPlan plan{};
             if (!protobuf::plan_array(op, {a, a_len}, plan)) return;

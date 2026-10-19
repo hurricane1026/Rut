@@ -864,7 +864,7 @@ struct Builder {
                                u32 count,
                                SourceLoc loc = {},
                                const Type* array_element = nullptr) {
-        if (count > 2) return err(RirError::InvalidState);
+        if (count > 3) return err(RirError::InvalidState);
         for (u32 i = 0; i < count; ++i)
             if (!valid_val(args[i])) return err(RirError::InvalidState);
         if (result == TypeKind::Array && !array_element) return err(RirError::InvalidState);

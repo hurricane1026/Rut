@@ -1,0 +1,12 @@
+// A fixed array of native structs, owned by the request Arena.
+route POST "/protobuf/messages" {
+    guard let batch = protobuf.decode("protobuf/message.proto", "example.MessageBatch", req.body) else {
+        return 400
+    }
+    guard let entry = batch.entries.first else { return 422 }
+    guard entry.text == "Rut" else { return 422 }
+    guard let bytes = protobuf.encode("protobuf/message.proto", "example.MessageBatch", batch) else {
+        return 500
+    }
+    return response(200, body: bytes)
+}
