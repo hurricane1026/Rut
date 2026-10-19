@@ -8219,3 +8219,19 @@ Unknown proto3 enum numbers are retained rather than rejected or coerced to zero
 Repeated and nested message layouts use the same carrier validation and output
 schema types as other scalar fields. No runtime reflection, new keyword or library
 is introduced; symbolic Rut enum values and protobuf JSON mapping remain absent.
+
+### Protobuf reserved declarations
+
+Source and descriptor loaders retain Arena-owned reserved ranges/names for messages
+and enums and reject declaration reuse, overlapping/reversed ranges and duplicate
+names. Validation happens after the containing declaration is parsed, so a reserved
+statement before or after the field/value has the same effect. Message descriptor
+range ends are exclusive; enum ends are inclusive. Metadata normalizes both to
+inclusive i64 endpoints so maximum field numbers and signed enum bounds do not
+overflow. Source `to max` follows the corresponding protobuf bound.
+
+The shared schema/import budget admits 16,384 reserved names/ranges and can be
+tightened using SchemaLimits::reserved. No new runtime checks or IR operations are
+introduced: deleted/reserved enum numbers remain valid unknown proto3 wire values.
+Independent Google protobuf descriptor fixtures verify source/descriptor parity;
+JIT, native schema-removal and both network backends exercise reserved schemas.

@@ -1,0 +1,19 @@
+syntax = "proto3";
+package example;
+import "enum.proto";
+
+message ReservedBatch {
+  reserved 3 to 5, 100 to max;
+  reserved "deleted_state", "deleted_children";
+  enum Local {
+    reserved -10 to -2, 12345;
+    reserved "DELETED_STATE";
+    LOCAL_ZERO = 0;
+    LOCAL_NEGATIVE = -1;
+  }
+  Local state = 1;
+  repeated EnumChild children = 2;
+}
+service ReservedCodec {
+  rpc Echo(ReservedBatch) returns (ReservedBatch);
+}

@@ -13,6 +13,7 @@
 using namespace rut;
 using namespace rut::protobuf;
 #include "protobuf/enum_oracle.inc"
+#include "protobuf/reserved_oracle.inc"
 #include "protobuf/schema_descriptor.inc"
 
 namespace {
@@ -503,4 +504,113 @@ TEST(protobuf_source, enum_import_visibility_shadowing_and_exact_limits) {
     REQUIRE(m);
     REQUIRE(m->fields);
     CHECK(m->fields->type_name.eq(lit_str(".M.E")));
+}
+
+TEST(protobuf_source, reserved_ranges_names_boundaries_and_open_enum_values) {
+    Storage storage;
+    auto schema =
+        load_proto_source(storage.arena, lit_str(RUT_SOURCE_DIR "/tests/protobuf/reserved.proto"));
+    REQUIRE(schema);
+    const auto* message = schema->find_message(lit_str(".example.ReservedBatch"));
+    REQUIRE(message);
+    REQUIRE(message->reserved_ranges);
+    CHECK_EQ(message->reserved_ranges->first, 100);
+    CHECK_EQ(message->reserved_ranges->last, 536870911);
+    REQUIRE(message->reserved_ranges->next);
+    CHECK_EQ(message->reserved_ranges->next->last, 5);
+    const auto* enumeration = schema->find_enum(lit_str(".example.ReservedBatch.Local"));
+    REQUIRE(enumeration);
+    REQUIRE(enumeration->reserved_ranges);
+    CHECK_EQ(enumeration->reserved_ranges->first, 12345);
+    CHECK_EQ(enumeration->reserved_ranges->last, 12345);
+    REQUIRE(enumeration->reserved_ranges->next);
+    CHECK_EQ(enumeration->reserved_ranges->next->first, -10);
+    CHECK_EQ(enumeration->reserved_ranges->next->last, -2);
+    CHECK_EQ(schema->reserved_count, 7u);
+    Files files;
+    REQUIRE(files.ok);
+    const char* invalid[] = {"message M { reserved 1; int32 value=1; }",
+                             "message M { int32 value=1; reserved 1; }",
+                             "message M { reserved 'value'; int32 value=1; }",
+                             "message M { reserved 1 to 3,3 to 4; }",
+                             "message M { reserved 'old','old'; }",
+                             "message M { reserved 0; }",
+                             "message M { reserved 536870912; }",
+                             "message M { reserved 2 to 1; }",
+                             "message M { reserved 1,'old'; }",
+                             "message M { reserved 'old',1; }",
+                             "message M { reserved 1 to; }",
+                             "enum E { ZERO=0; reserved 0; }",
+                             "enum E { reserved 'ZERO'; ZERO=0; }",
+                             "enum E { ZERO=0; reserved -2 to -1; NEG=-1; }",
+                             "enum E { ZERO=0; reserved 1 to max; MAX=2147483647; }",
+                             "enum E { ZERO=0; reserved -2147483649; }",
+                             "enum E { ZERO=0; reserved 2147483648; }",
+                             "enum E { ZERO=0; reserved -3 to -2,-2; }"};
+    for (const char* body : invalid) {
+        char text[512];
+        snprintf(text, sizeof(text), "syntax='proto3'; %s", body);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage bad;
+        CHECK_FALSE(files.load(bad));
+    }
+    REQUIRE(files.write_file("root.proto",
+                             "syntax='proto3'; message M { reserved 2 to 3; reserved 'old'; int32 "
+                             "new_name=1 [json_name='old']; int32 edge=4; } enum E { ZERO=0; "
+                             "reserved -2147483648 to -1,1 to max; }"));
+    SchemaLimits cap{};
+    cap.reserved = 4;
+    Storage exact;
+    REQUIRE(files.load(exact, cap));
+    cap.reserved = 3;
+    Storage short_budget;
+    CHECK_FALSE(files.load(short_budget, cap));
+}
+
+TEST(protobuf_source, reserved_source_matches_independent_descriptor_metadata) {
+    Storage source, descriptor;
+    auto actual =
+        load_proto_source(source.arena, lit_str(RUT_SOURCE_DIR "/tests/protobuf/reserved.proto"));
+    auto expected =
+        load_descriptor_set(descriptor.arena, kReservedDescriptor, sizeof(kReservedDescriptor));
+    REQUIRE(actual);
+    REQUIRE(expected);
+    CHECK_EQ(actual->reserved_count, expected->reserved_count);
+    auto compare = [&](const ReservedRange* left,
+                       const ReservedRange* right,
+                       const ReservedName* names_left,
+                       const ReservedName* names_right) {
+        u32 actual_count = 0, expected_count = 0;
+        for (const auto* r = left; r; r = r->next) ++actual_count;
+        for (const auto* r = right; r; r = r->next) {
+            ++expected_count;
+            const auto* found = left;
+            while (found && (found->first != r->first || found->last != r->last))
+                found = found->next;
+            CHECK(found);
+        }
+        CHECK_EQ(actual_count, expected_count);
+        actual_count = 0;
+        expected_count = 0;
+        for (const auto* n = names_left; n; n = n->next) ++actual_count;
+        for (const auto* n = names_right; n; n = n->next) {
+            ++expected_count;
+            const auto* found = names_left;
+            while (found && !found->name.eq(n->name)) found = found->next;
+            CHECK(found);
+        }
+        CHECK_EQ(actual_count, expected_count);
+    };
+    for (const auto* m = expected->messages; m; m = m->next) {
+        const auto* found = actual->find_message(m->full_name);
+        REQUIRE(found);
+        compare(
+            found->reserved_ranges, m->reserved_ranges, found->reserved_names, m->reserved_names);
+    }
+    for (const auto* e = expected->enums; e; e = e->next) {
+        const auto* found = actual->find_enum(e->full_name);
+        REQUIRE(found);
+        compare(
+            found->reserved_ranges, e->reserved_ranges, found->reserved_names, e->reserved_names);
+    }
 }
