@@ -22620,10 +22620,10 @@ TEST(jit, protobuf_repeated_immutable_arrays_roundtrip_and_properties) {
     REQUIRE(conn.jit_response_body_valid);
     memset(request, 'z', sizeof(request));
     CHECK(conn.jit_response_body.eq({reinterpret_cast<const char*>(expected), sizeof(expected)}));
-    CHECK_EQ(conn.json_arena.collection_items, 9u);
+    CHECK_EQ(conn.json_arena.collection_items(), 9u);
     conn.reset();
     conn.json_arena.backend.pool = &pool;
-    CHECK_EQ(conn.json_arena.collection_items, 0u);
+    CHECK_EQ(conn.json_arena.collection_items(), 0u);
     const char* empty_request = "POST /empty HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
     result = HandlerResult::unpack(empty(&conn,
                                          nullptr,
@@ -22671,7 +22671,7 @@ TEST(jit, protobuf_array_helper_shared_budget_and_failure) {
         REQUIRE_EQ(has, 1u);
         CHECK_EQ(count, 512u);
     }
-    CHECK_EQ(arena.collection_items, 4096u);
+    CHECK_EQ(arena.collection_items(), 4096u);
     const auto used = arena.space_used();
     rut_helper_protobuf(nullptr,
                         &arena,
@@ -22692,7 +22692,7 @@ TEST(jit, protobuf_array_helper_shared_budget_and_failure) {
     CHECK_EQ(count, 0u);
     CHECK_EQ(arena.space_used(), used);
     arena.reset();
-    CHECK_EQ(arena.collection_items, 0u);
+    CHECK_EQ(arena.collection_items(), 0u);
     const char malformed[] = {10, 1, static_cast<char>(128)};
     const auto reset_used = arena.space_used();
     rut_helper_protobuf(nullptr,
@@ -22711,7 +22711,7 @@ TEST(jit, protobuf_array_helper_shared_budget_and_failure) {
                         &number);
     CHECK_EQ(has, 0u);
     CHECK_EQ(arena.space_used(), reset_used);
-    CHECK_EQ(arena.collection_items, 0u);
+    CHECK_EQ(arena.collection_items(), 0u);
     arena.destroy();
     pool.destroy();
     REQUIRE(pool.init(1, 0, 0));
@@ -22735,7 +22735,7 @@ TEST(jit, protobuf_array_helper_shared_budget_and_failure) {
     CHECK_EQ(has, 0u);
     CHECK(data == nullptr);
     CHECK_EQ(count, 0u);
-    CHECK_EQ(arena.collection_items, 0u);
+    CHECK_EQ(arena.collection_items(), 0u);
     CHECK_EQ(arena.space_used(), full_used);
     arena.destroy();
     CHECK_EQ(pool.in_use(), 0u);

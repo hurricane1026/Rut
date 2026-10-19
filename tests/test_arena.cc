@@ -213,6 +213,38 @@ TEST(arena, overflow_mmap_failure_keeps_existing_block_usable) {
     a.destroy();
 }
 
+TEST(arena, collection_budget_follows_blocks_and_resets) {
+    MmapArena a;
+    REQUIRE(a.init(256).has_value());
+    const u64 cap = a.current->capacity();
+    a.set_collection_items(17);
+    REQUIRE(a.alloc(cap) != nullptr);
+    REQUIRE(a.alloc(64) != nullptr);
+    CHECK_EQ(a.collection_items(), 17u);
+    CHECK_EQ(a.current->prev->collection_items, 17u);
+
+    a.reset();
+    CHECK_EQ(a.collection_items(), 0u);
+    CHECK_EQ(a.current->collection_items, 0u);
+    a.destroy();
+}
+
+TEST(arena, collection_budget_survives_failed_block_allocation) {
+    MmapArena a;
+    REQUIRE(a.init(256).has_value());
+    const u64 cap = a.current->capacity();
+    a.set_collection_items(23);
+    REQUIRE(a.alloc(cap) != nullptr);
+
+    {
+        ScopedMemoryFault fault(1);
+        CHECK(a.alloc(64) == nullptr);
+    }
+
+    CHECK_EQ(a.collection_items(), 23u);
+    a.destroy();
+}
+
 TEST(arena, large_alloc_gets_own_block) {
     MmapArena a;
     REQUIRE(a.init(256).has_value());

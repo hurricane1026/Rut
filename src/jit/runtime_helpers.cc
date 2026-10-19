@@ -1730,7 +1730,7 @@ extern "C" void rut_helper_protobuf(void* conn,
             auto& owned = *static_cast<SliceArena*>(arena);
             const u32 slot_bytes = plan.count * protobuf::array_element_size(static_cast<u8>(op));
             const u32 needed = ((slot_bytes + 7) & ~7u) + ((plan.bytes + 7) & ~7u);
-            if (owned.collection_items > protobuf::kMaxRequestArrayElements - plan.count ||
+            if (owned.collection_items() > protobuf::kMaxRequestArrayElements - plan.count ||
                 owned.space_used() > protobuf::kMaxRequestValueBytes - needed)
                 return;
             auto* slots = slot_bytes ? static_cast<u8*>(owned.alloc(slot_bytes)) : nullptr;
@@ -1738,7 +1738,7 @@ extern "C" void rut_helper_protobuf(void* conn,
             auto* payload = plan.bytes ? static_cast<u8*>(owned.alloc(plan.bytes)) : nullptr;
             if (plan.bytes && !payload) return;
             if (!protobuf::fill_array(op, {a, a_len}, slots, payload, plan)) return;
-            owned.collection_items += plan.count;
+            owned.set_collection_items(owned.collection_items() + plan.count);
             *has_value = 1;
             *out_ptr = slots ? reinterpret_cast<const char*>(slots) : "";
             *out_len = plan.count;

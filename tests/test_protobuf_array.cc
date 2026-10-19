@@ -82,12 +82,12 @@ TEST(protobuf_array, malformed_wire_limits_and_budget_reset) {
     CHECK_EQ(plan.count, kMaxArrayElements);
     MmapArena arena;
     REQUIRE(arena.init(4096));
-    arena.collection_items = 9;
+    arena.set_collection_items(9);
     arena.reset();
-    CHECK_EQ(arena.collection_items, 0u);
-    arena.collection_items = 4;
+    CHECK_EQ(arena.collection_items(), 0u);
+    arena.set_collection_items(4);
     arena.destroy();
-    CHECK_EQ(arena.collection_items, 0u);
+    CHECK_EQ(arena.collection_items(), 0u);
 }
 TEST(protobuf_array, scalar_boundaries_empty_packing_and_fixed_width) {
     const u8 packed_fixed[] = {10, 8, 0, 0, 0, 0, 255, 255, 255, 255};
