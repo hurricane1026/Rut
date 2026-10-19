@@ -22430,6 +22430,105 @@ TEST(jit, protobuf_source_specializes_decode_encode_roundtrip) {
     rir.destroy();
 }
 
+TEST(jit, protobuf_nested_messages_merge_access_and_reencode) {
+    const char* src =
+        "route POST \"/nested\" {\n"
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.NestedMessage\", req.body) else { return 422 }\n"
+        "guard let bytes = protobuf.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.NestedMessage\", value) else { return 500 }\n"
+        "return response(200, body: bytes)\n}\n"
+        "route POST \"/field\" {\n"
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.NestedMessage\", req.body) else { return 422 }\n"
+        "let text = value.child.text\nreturn response(200, body: text)\n}\n";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    if (!ast)
+        fprintf(stderr,
+                "nested parse: %u at %u:%u %.*s\n",
+                static_cast<u32>(ast.error().code),
+                ast.error().span.line,
+                ast.error().span.col,
+                ast.error().detail.len,
+                ast.error().detail.ptr);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir)
+        fprintf(stderr, "nested analyze: %.*s\n", hir.error().detail.len, hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    if (!lowered)
+        fprintf(
+            stderr, "nested lower: %.*s\n", lowered.error().detail.len, lowered.error().detail.ptr);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    auto field = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(field);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    MappedArray<Connection> connections;
+    REQUIRE(connections.init(1));
+    auto& conn = connections[0];
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    const u8 input[] = {10, 3, 10, 1, 'x', 10, 2, 16, 7, 18, 1, 'a'};
+    const u8 merged[] = {10, 5, 10, 1, 'x', 16, 7, 18, 1, 'a'};
+    const u8 invalid[] = {10, 1, 8, 10, 1, 1};  // two malformed fragments cannot repair one another
+    const u8 invalid_utf8[] = {10, 3, 10, 1, 255};
+    const Str inputs[] = {{reinterpret_cast<const char*>(input), sizeof(input)},
+                          {},
+                          {reinterpret_cast<const char*>(invalid), sizeof(invalid)},
+                          {reinterpret_cast<const char*>(invalid_utf8), sizeof(invalid_utf8)}};
+    for (u32 pass = 0; pass < 4; ++pass) {
+        for (u32 route = 0; route < 2; ++route) {
+            char request[128];
+            const auto body = inputs[pass];
+            const int header = snprintf(request,
+                                        sizeof(request),
+                                        "POST /%s HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                        route ? "field" : "nested",
+                                        body.len);
+            if (body.len) memcpy(request + header, body.ptr, body.len);
+            const auto result = HandlerResult::unpack(
+                (route ? field : handler)(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request),
+                                          static_cast<u32>(header) + body.len,
+                                          nullptr));
+            CHECK_EQ(result.status_code, pass >= 2 ? 422u : 200u);
+            if (pass < 2) {
+                REQUIRE(conn.jit_response_body_valid);
+                if (route)
+                    CHECK(conn.jit_response_body.eq(pass == 0 ? lit_str("x") : lit_str("")));
+                else if (pass == 0)
+                    CHECK(conn.jit_response_body.eq(
+                        {reinterpret_cast<const char*>(merged), sizeof(merged)}));
+                else {
+                    const char empty[] = {10, 0};
+                    CHECK(conn.jit_response_body.eq({empty, 2}));
+                }
+            }
+            conn.reset();
+            conn.json_arena.backend.pool = &pool;
+        }
+    }
+    connections.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, protobuf_helper_owns_output_and_preserves_arena_on_allocation_failure) {
     SlicePool pool;
     REQUIRE(pool.init(1, 0, 0));

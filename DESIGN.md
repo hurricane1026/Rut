@@ -1428,7 +1428,28 @@ values; inferred types emit fields by increasing tag. Unknown fields are not
 retained. These are protobuf payload codecs, not gRPC framing or protobuf JSON
 mapping.
 
-Repeated/embedded shapes remain schema-only; executable codecs for those shapes,
+An internal C++ wire-tree codec (`runtime/protobuf_message.h`) now provides a
+single Reader traversal per message with bounded layout lookup, repeated packed
+and unpacked scalar values, and embedded-message merge semantics. It uses
+caller-owned value slots and borrows string/bytes input; callers must preserve
+input lifetime or copy before asynchronous buffer reuse. Slots bound total
+occurrences, including overwritten singular values. Messages cap at 8 KiB,
+layouts at 64 fields and nesting at 16 levels. Encoding preserves repeated
+defaults and empty embedded-message presence, and emits repeated scalars unpacked.
+Numeric slots retain raw wire bits, including float/double and uint64; these are
+not new Rut numeric types. Enum and presence-aware schema features are excluded.
+The wire-tree API remains internal; the Rut integration below reuses the existing
+field helper ABI.
+
+Singular acyclic embedded messages now infer nested Rut structs and lower through
+recursive StructDecode/field projections into the existing ProtoOp helper ABI.
+Duplicate payload fragments merge after independent wire validation, and helper
+failures propagate through null byte views to the outer optional result. Up to
+eight nesting edges and eight fields per message are supported. Absent messages
+materialize recursively default-valued structs; presence is not exposed, so
+encoding defaults emits an empty embedded message. Recursive types are rejected.
+
+Repeated shapes remain schema-only in Rut; executable codecs for those shapes,
 floating point, uint64/fixed64, enums, oneof/optional presence, maps, proto2 and
 editions remain pending. Proto2 must implement explicit presence, defaults and
 required-field validation before being enabled. The source parser rejects custom

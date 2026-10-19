@@ -39,17 +39,27 @@ Views returned to the program own their bytes through the request Arena.
 
 The first executable subset supports at most eight singular fields per message:
 `string`/`bytes`, `bool`, `int32`/`sint32`/`sfixed32`,
-`int64`/`sint64`/`sfixed64`, and `uint32`/`fixed32`. The latter two infer signed
+`int64`/`sint64`/`sfixed64`, and `uint32`/`fixed32`, plus acyclic singular embedded messages. The latter scalar types two infer signed
 Rut `i64` fields while enforcing the unsigned 32-bit range on encoding. Message
 payloads are limited to 8 KiB and intermediate owned bytes to 256 KiB. Imports
 resolve under the root proto file's directory; imports cannot be absolute or
 contain empty, `.` or `..` path components. Package declarations must precede
 message/service declarations. File/source/declaration budgets are bounded.
 
-Repeated/embedded message shapes can be parsed but cannot yet be bound to the
-executable codec. Floating point, uint64/fixed64, enums, oneof/optional presence,
+Embedded fields infer nested structs; access them with ordinary member access
+(e.g. `let text = message.child.text`). Each message has at most eight fields and
+at most eight nested edges are supported. Recursive schemas are rejected.
+Duplicate submessages merge, but each wire occurrence must be independently
+well-formed. Absent messages expose recursively default-valued structs; message
+presence is not exposed, and re-encoding defaults emits empty embedded messages.
+Repeated fields can be parsed but cannot yet be bound to the executable codec. Floating point, uint64/fixed64, enums, oneof/optional presence,
 maps, extensions/defaults, reserved declarations, custom options, public/weak
 imports, proto2 and editions are rejected. Source string escapes currently cover
 quotes and backslashes only. Proto2 needs separate presence/default/required
 semantics before it can be enabled. No implicit protobuf JSON mapping is provided
 by the general-purpose `json` operations.
+
+`examples/protobuf-nested.rut` shows `example.Envelope` with a nested `Message`.
+POST `0a 07 0a 03 52 75 74 10 7b` to `/protobuf/nested` for a roundtrip of
+`child.text = "Rut"` and `child.id = 123`; ordinary member access reads the
+nested values. Inputs are raw protobuf payloads, without gRPC envelopes.

@@ -137,6 +137,44 @@ TEST(protobuf_value, fixed_width_signed_and_unsigned_scalars) {
         CHECK_EQ(number, kValues[i]);
     }
 }
+TEST(protobuf_value, nested_fragment_validation_and_failure_propagation) {
+    const u8 kInput[] = {10, 2, 8, 1, 10, 2, 16, 2};
+    const u8 kBroken[] = {10, 1, 8, 10, 1, 1};
+    const u8 kMerged[] = {8, 1, 16, 2};
+    u8 output[32];
+    Str view{};
+    i64 scalar = 0;
+    REQUIRE(apply((1u << 8) | 11,
+                  {reinterpret_cast<const char*>(kInput), sizeof(kInput)},
+                  {},
+                  0,
+                  output,
+                  sizeof(output),
+                  view,
+                  scalar));
+    CHECK(view.eq({reinterpret_cast<const char*>(kMerged), sizeof(kMerged)}));
+    CHECK_FALSE(apply((1u << 8) | 11,
+                      {reinterpret_cast<const char*>(kBroken), sizeof(kBroken)},
+                      {},
+                      0,
+                      output,
+                      sizeof(output),
+                      view,
+                      scalar));
+    CHECK_FALSE(apply(3, {}, {}, 0, output, sizeof(output), view, scalar));
+    CHECK_FALSE(
+        apply(kEncode | (1u << 8) | 11, lit_str(""), {}, 0, output, sizeof(output), view, scalar));
+    REQUIRE(apply(kEncode | (1u << 8) | 11,
+                  lit_str(""),
+                  lit_str(""),
+                  0,
+                  output,
+                  sizeof(output),
+                  view,
+                  scalar));
+    CHECK_EQ(view.len, 2u);
+    CHECK_EQ(static_cast<u8>(view.ptr[0]), 10u);
+}
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -40400,6 +40400,78 @@ TEST(frontend, protobuf_inferred_type_reuse_and_schema_errors) {
     }
 }
 
+TEST(frontend, protobuf_nested_inference_reuse_and_unsupported_collections) {
+    const char* names[] = {"NestedMessage", "RecursiveMessage", "RepeatedMessage", "SharedMessage"};
+    for (u32 i = 0; i < 4; ++i) {
+        char code[2048];
+        snprintf(code,
+                 sizeof(code),
+                 "route POST \"/nested\" { guard let first = "
+                 "protobuf.decode(\"%s/tests/protobuf/codec.proto\", \"example.%s\", req.body) "
+                 "else { return 400 } "
+                 "guard let second = protobuf.decode(\"%s/tests/protobuf/codec.proto\", "
+                 "\"example.%s\", req.body) else { return 400 } return 200 }",
+                 RUT_PROTO_TEST_ROOT,
+                 names[i],
+                 RUT_PROTO_TEST_ROOT,
+                 names[i]);
+        auto tokens = lex(lit(code));
+        REQUIRE(tokens);
+        auto ast = parse_file(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file(*ast.value());
+        if (i == 0 || i == 3) {
+            REQUIRE(hir);
+            CHECK_EQ(hir.value()->structs.len, 2u);
+            CHECK(hir.value()->structs[1].fields[0].type == HirTypeKind::Struct);
+            CHECK_EQ(hir.value()->structs[1].fields[0].struct_index, 0u);
+            if (i == 3) CHECK_EQ(hir.value()->structs[1].fields[1].struct_index, 0u);
+        } else
+            CHECK_FALSE(hir.has_value());
+        if (hir) delete hir.value();
+        delete ast.value();
+    }
+}
+
+TEST(frontend, protobuf_nested_depth_boundary) {
+    char path[] = "/tmp/rut-protobuf-nested-depth-XXXXXX";
+    const int fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    const char* prefix = "syntax='proto3'; package depth; ";
+    REQUIRE(write(fd, prefix, strlen(prefix)) == static_cast<ssize_t>(strlen(prefix)));
+    for (u32 i = 0; i < 10; ++i) {
+        char declaration[128];
+        const int length =
+            i == 9
+                ? snprintf(declaration, sizeof(declaration), "message M9 { string text=1; }")
+                : snprintf(
+                      declaration, sizeof(declaration), "message M%u { M%u child=1; }", i, i + 1);
+        REQUIRE(write(fd, declaration, static_cast<u32>(length)) == length);
+    }
+    close(fd);
+    for (u32 i = 0; i < 2; ++i) {
+        char code[1024];
+        snprintf(code,
+                 sizeof(code),
+                 "route POST \"/depth\" { guard let value = protobuf.decode(\"%s\", \"depth.M%u\", "
+                 "req.body) else { return 400 } return 200 }",
+                 path,
+                 i);
+        auto tokens = lex(lit(code));
+        REQUIRE(tokens);
+        auto ast = parse_file(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file(*ast.value());
+        if (i)
+            CHECK(hir.has_value());
+        else
+            CHECK_FALSE(hir.has_value());
+        if (hir) delete hir.value();
+        delete ast.value();
+    }
+    unlink(path);
+}
+
 TEST(frontend, protobuf_missing_source_diagnostic_survives_failed_analysis) {
     auto tokens =
         lex(lit("route POST \"/x\" { guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT

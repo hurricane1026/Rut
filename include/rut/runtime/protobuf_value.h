@@ -51,7 +51,8 @@ inline bool apply(
     const bool kEncoding = (op & kEncode) != 0;
     const u32 kTag = static_cast<u32>((op & ~kEncode) >> 8);
     const u32 kType = static_cast<u32>(op & 255);
-    if (!op) {
+    if (!op || op == 3) {
+        if (op == 3 && !a.ptr) return false;
         Reader reader(reinterpret_cast<const u8*>(a.ptr), a.len);
         Field field;
         Status status;
@@ -60,19 +61,35 @@ inline bool apply(
         return status == Status::End;
     }
     if (!kTag || kTag > 0x1fffffff || kType > 18 || !kType || kType == 1 || kType == 2 ||
-        kType == 4 || kType == 6 || kType == 10 || kType == 11 || kType == 14)
+        kType == 4 || kType == 6 || kType == 10 || kType == 14)
         return false;
-    const u8 kWire = kType == 9 || kType == 12   ? 2
-                     : kType == 7 || kType == 15 ? 5
-                     : kType == 16               ? 1
-                                                 : 0;
+    const u8 kWire = kType == 9 || kType == 11 || kType == 12 ? 2
+                     : kType == 7 || kType == 15              ? 5
+                     : kType == 16                            ? 1
+                                                              : 0;
     if (!kEncoding) {
+        if (kType == 11 && !a.ptr) return false;
+        u32 merged = 0;
         Reader reader(reinterpret_cast<const u8*>(a.ptr), a.len);
         Field field;
         Status status;
         while ((status = reader.next(field)) == Status::Field) {
             if (field.number != kTag || field.wire != kWire) continue;
-            if (kWire == 2) {
+            if (kType == 11) {
+                // Each duplicate is a complete submessage; concatenation must
+                // not repair a truncated fragment using the next occurrence.
+                Reader nested(field.bytes, field.size);
+                Field child;
+                Status nested_status;
+                while ((nested_status = nested.next(child)) == Status::Field) {
+                }
+                if (nested_status != Status::End) return false;
+                if (field.size > capacity - merged || field.size > kMaxMessageBytes - merged)
+                    return false;
+                if (field.size) __builtin_memcpy(output + merged, field.bytes, field.size);
+                merged += field.size;
+                view = {reinterpret_cast<const char*>(output), merged};
+            } else if (kWire == 2) {
                 view = {reinterpret_cast<const char*>(field.bytes), field.size};
                 if (kType == 9 && !utf8(view)) return false;
             } else if (kType == 17)
@@ -91,10 +108,11 @@ inline bool apply(
         return status == Status::End;
     }
     if (!a.ptr || b.len > kMaxMessageBytes || (b.len && !b.ptr)) return false;
+    if (kType == 11 && !b.ptr) return false;
     if (kType == 9 && !utf8(b)) return false;
     if (kType == 7 || kType == 13)
         if (number < 0 || static_cast<u64>(number) > 0xffffffffu) return false;
-    if ((kWire == 2 && !b.len) || (kWire != 2 && !number)) {
+    if ((kWire == 2 && kType != 11 && !b.len) || (kWire != 2 && !number)) {
         view = a;
         return true;
     }
