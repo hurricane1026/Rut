@@ -63,7 +63,7 @@ unwraps the optional before ordinary field access. All elements and descendants
 are validated before decode returns. Each contiguous slot allocation must also fit
 one 16 KiB Arena slice minus its block header; oversized slot regions fail decode.
 Array-bearing routes with `wait`
-are rejected until collection suspension ownership is implemented. Floating point, uint64/fixed64, enums, oneof/optional presence,
+are rejected until collection suspension ownership is implemented. Floating point, uint64/fixed64, oneof/optional presence,
 maps, extensions/defaults, reserved declarations, custom options, public/weak
 imports, proto2 and editions are rejected. Source string escapes currently cover
 quotes and backslashes only. Proto2 needs separate presence/default/required
@@ -95,3 +95,11 @@ Exactly one uncompressed envelope is accepted, with at most 8 KiB of payload.
 Malformed framing returns HTTP 400; invalid protobuf returns HTTP 422. This is a
 byte-codec demonstration, not a native gRPC endpoint: service dispatch,
 `application/grpc` response headers and `grpc-status` trailers are not generated.
+
+
+Proto3 enum fields are numeric `i32` values in Rut; repeated enum fields are
+immutable `[i32]`. Unknown numbers and negative values round-trip. The schema
+supports nested/imported enums and `option allow_alias = true`; the first declared
+number must be zero. Rut symbolic enum constants, enum JSON mapping, reserved enum
+declarations and custom enum options are not exposed. See
+[`tests/protobuf/enum.proto`](../../tests/protobuf/enum.proto) for a unary RPC schema.

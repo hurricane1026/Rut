@@ -53,6 +53,7 @@ inline u8 wire(u8 type) {
         case 5:
         case 8:
         case 13:
+        case 14:
         case 17:
         case 18:
             return 0;

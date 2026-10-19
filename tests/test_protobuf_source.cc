@@ -128,7 +128,6 @@ TEST(protobuf_source, import_deduplication_cycle_and_missing_file) {
 }
 TEST(protobuf_source, syntax_and_unsupported_semantics_are_explicit) {
     const char* cases[] = {"syntax='proto2'; message A {}",
-                           "syntax='proto3'; enum E { A=0; }",
                            "syntax='proto3'; message A { optional string a=1; }",
                            "syntax='proto3'; message A { map<string,string> a=1; }",
                            "syntax='proto3'; message A { oneof a { string s=1; } }",
@@ -385,4 +384,52 @@ TEST(protobuf_source, transitive_import_does_not_grant_type_visibility) {
 }
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(protobuf_source, open_enums_resolve_nested_imports_and_validate_declarations) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("types.proto",
+                             "syntax='proto3'; package common; enum State { ZERO=0; NEG=-1; }"));
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax='proto3'; package example; import 'types.proto'; "
+        "message Box { enum Mode { option allow_alias=true; OFF=0; ALSO_OFF=0; ON=1; } "
+        "Mode mode=1; repeated common.State states=2; } "
+        "service S { rpc Call(Box) returns(Box); }"));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE(result);
+    CHECK_EQ(result->enum_count, 2u);
+    CHECK_EQ(result->enum_value_count, 5u);
+    REQUIRE(result->find_enum(lit_str(".example.Box.Mode")));
+    const auto* box = result->find_message(lit_str(".example.Box"));
+    REQUIRE(box);
+    for (const auto* f = box->fields; f; f = f->next) CHECK(f->type == Type::Enum);
+    const char* invalid[] = {"enum E {}",
+                             "enum E { A=1; }",
+                             "enum E { A=0; A=1; }",
+                             "enum E { A=0; B=0; }",
+                             "enum E { A=0; B=2147483648; }",
+                             "enum E { A=0; B=-2147483649; }",
+                             "enum E { A=0; } enum F { A=0; }",
+                             "enum E { A=0; } message A {}",
+                             "message M { int32 A=1; enum E { A=0; } }",
+                             "enum E { A=0; } service S { rpc Call(E) returns(E); }",
+                             "enum E { A=0; } message M { Missing e=1; }"};
+    for (const char* body : invalid) {
+        char text[512];
+        snprintf(text, sizeof(text), "syntax='proto3'; %s", body);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage bad;
+        CHECK_FALSE(files.load(bad));
+    }
+    REQUIRE(files.write_file(
+        "root.proto", "syntax='proto3'; enum E { ZERO=0; MIN=-2147483648; MAX=2147483647; }"));
+    Storage limits;
+    SchemaLimits cap{};
+    cap.enum_values = 2;
+    CHECK_FALSE(files.load(limits, cap));
+    Storage boundaries;
+    CHECK(files.load(boundaries));
 }

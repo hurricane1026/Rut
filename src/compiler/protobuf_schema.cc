@@ -11,6 +11,11 @@ const Message* Schema::find_message(Str name) const {
         if (item->full_name.eq(name)) return item;
     return nullptr;
 }
+const Enum* Schema::find_enum(Str name) const {
+    for (const Enum* item = enums; item; item = item->next)
+        if (item->full_name.eq(name)) return item;
+    return nullptr;
+}
 const Method* Schema::find_method(Str path) const {
     for (const Method* item = methods; item; item = item->next)
         if (item->path.eq(path)) return item;
@@ -67,7 +72,10 @@ struct Loader {
     };
     PackageName* packages = nullptr;
     bool declared_symbol(Str name) const {
-        if (schema.find_message(name)) return true;
+        if (schema.find_message(name) || schema.find_enum(name)) return true;
+        for (const auto* e = schema.enums; e; e = e->next)
+            for (const auto* v = e->values; v; v = v->next)
+                if (v->full_name.eq(name)) return true;
         for (const ServiceName* item = services; item; item = item->next)
             if (item->name.eq(name)) return true;
         return false;
@@ -93,7 +101,10 @@ struct Loader {
         return true;
     }
     bool symbol_used(Str name) const {
-        if (schema.find_message(name)) return true;
+        if (schema.find_message(name) || schema.find_enum(name)) return true;
+        for (const auto* e = schema.enums; e; e = e->next)
+            for (const auto* v = e->values; v; v = v->next)
+                if (v->full_name.eq(name)) return true;
         for (const ServiceName* item = services; item; item = item->next)
             if (item->name.eq(name)) return true;
         if (package_used(name)) return true;
@@ -206,9 +217,8 @@ struct Loader {
         if (status != Status::End || !(seen & (1u << 5)) || !identifier(item->name) ||
             !item->number || (label != 1 && label != 3))
             return malformed();
-        if (item->type == Type::Group || item->type == Type::Enum)
-            return fail(SchemaError::Unsupported);
-        if (item->type == Type::Message) {
+        if (item->type == Type::Group) return fail(SchemaError::Unsupported);
+        if (item->type == Type::Message || item->type == Type::Enum) {
             if (!reference(item->type_name)) return malformed();
         } else if (item->type_name.len)
             return malformed();
@@ -244,6 +254,88 @@ struct Loader {
         owner.fields = item;
         ++schema.field_count;
         return true;
+    }
+    bool enumeration(View view, Str scope) {
+        if (schema.enum_count >= limits.enums) return fail(SchemaError::Limit);
+        auto* item = arena.alloc_t<Enum>();
+        if (!item) return fail(SchemaError::Allocation);
+        Reader reader(view.data, view.size);
+        Field part;
+        Status status;
+        Str name{};
+        bool seen_name = false, seen_options = false, aliases = false;
+        while ((status = reader.next(part)) == Status::Field) {
+            if (part.number == 1) {
+                if (seen_name) return fail(SchemaError::Duplicate);
+                seen_name = true;
+                if (!wire(part, 2)) return false;
+                name = text(part);
+            } else if (part.number == 3) {
+                if (seen_options) return fail(SchemaError::Duplicate);
+                seen_options = true;
+                if (!wire(part, 2)) return false;
+                Reader options(part.bytes, part.size);
+                Field option;
+                Status os;
+                bool seen_aliases = false;
+                while ((os = options.next(option)) == Status::Field) {
+                    if (option.number != 2) return fail(SchemaError::Unsupported);
+                    if (seen_aliases) return fail(SchemaError::Duplicate);
+                    seen_aliases = true;
+                    if (!read_bool(option, aliases)) return false;
+                }
+                if (os != Status::End) return malformed();
+            } else if (part.number != 2)
+                return fail(SchemaError::Unsupported);
+        }
+        if (status != Status::End || !identifier(name)) return malformed();
+        item->full_name = join(scope, '.', name);
+        if (!item->full_name.ptr) return false;
+        if (symbol_used(item->full_name)) return fail(SchemaError::Duplicate);
+        item->file = current_file;
+        item->next = schema.enums;
+        schema.enums = item;
+        ++schema.enum_count;
+        reader = Reader(view.data, view.size);
+        bool first = true;
+        while ((status = reader.next(part)) == Status::Field) {
+            if (part.number != 2) continue;
+            if (!wire(part, 2)) return false;
+            if (schema.enum_value_count >= limits.enum_values) return fail(SchemaError::Limit);
+            auto* value = arena.alloc_t<EnumValue>();
+            if (!value) return fail(SchemaError::Allocation);
+            Reader values(part.bytes, part.size);
+            Field v;
+            Status vs;
+            u32 seen = 0;
+            while ((vs = values.next(v)) == Status::Field) {
+                if (v.number != 1 && v.number != 2) return fail(SchemaError::Unsupported);
+                if (seen & (1u << v.number)) return fail(SchemaError::Duplicate);
+                seen |= 1u << v.number;
+                if (v.number == 1) {
+                    if (!wire(v, 2)) return false;
+                    value->name = text(v);
+                } else {
+                    if (!wire(v, 0)) return false;
+                    const i32 kNumber = static_cast<i32>(v.value);
+                    if (v.value != static_cast<u64>(static_cast<i64>(kNumber))) return malformed();
+                    value->number = kNumber;
+                }
+            }
+            if (vs != Status::End || seen != 6 || !identifier(value->name) ||
+                (first && value->number != 0))
+                return malformed();
+            first = false;
+            value->full_name = join(scope, '.', value->name);
+            if (!value->full_name.ptr) return false;
+            if (symbol_used(value->full_name)) return fail(SchemaError::Duplicate);
+            for (const auto* old = item->values; old; old = old->next)
+                if (!aliases && old->number == value->number) return fail(SchemaError::Duplicate);
+            value->next = item->values;
+            item->values = value;
+            ++schema.enum_value_count;
+        }
+        return (status == Status::End && !first) || malformed();
     }
     bool message(View view, Str scope, u32 depth) {
         if (depth > limits.depth || schema.message_count >= limits.messages)
@@ -283,6 +375,9 @@ struct Loader {
                         return false;
                     break;
                 case 4:
+                    if (!wire(part, 2) || !enumeration({part.bytes, part.size}, kFullName))
+                        return false;
+                    break;
                 case 5:
                 case 6:
                 case 8:
@@ -305,7 +400,7 @@ struct Loader {
         for (const auto* field = item->fields; field; field = field->next) {
             const Str field_symbol = join(item->full_name, '.', field->name);
             if (!field_symbol.ptr) return false;
-            if (schema.find_message(field_symbol)) return fail(SchemaError::Duplicate);
+            if (symbol_used(field_symbol)) return fail(SchemaError::Duplicate);
         }
         return true;
     }
@@ -467,6 +562,9 @@ struct Loader {
                     if (!wire(part, 2) || !service({part.bytes, part.size}, package)) return false;
                     break;
                 case 5:
+                    if (!wire(part, 2) || !enumeration({part.bytes, part.size}, kScope))
+                        return false;
+                    break;
                 case 7:
                 case 11:
                 case 14:
@@ -533,6 +631,12 @@ struct Loader {
         };
         for (auto* item = schema.messages; item; item = item->next)
             for (auto* member = item->fields; member; member = member->next) {
+                if (member->type == Type::Enum) {
+                    const auto* e = schema.find_enum(member->type_name);
+                    if (!e || !visible(member->file, e->file, 0))
+                        return fail(SchemaError::Unresolved);
+                    continue;
+                }
                 if (member->type != Type::Message) continue;
                 member->message = schema.find_message(member->type_name);
                 if (!member->message) return fail(SchemaError::Unresolved);
@@ -559,7 +663,8 @@ core::Expected<Schema, SchemaError> load_descriptor_set(Arena<MmapBackend>& aren
     if (limits.bytes > kCeiling.bytes || limits.files > kCeiling.files ||
         limits.messages > kCeiling.messages || limits.fields > kCeiling.fields ||
         limits.methods > kCeiling.methods || limits.services > kCeiling.services ||
-        limits.depth > kCeiling.depth)
+        limits.depth > kCeiling.depth || limits.enums > kCeiling.enums ||
+        limits.enum_values > kCeiling.enum_values)
         return core::make_unexpected(SchemaError::Limit);
     if (!size || !data) return core::make_unexpected(SchemaError::Malformed);
     if (size > limits.bytes) return core::make_unexpected(SchemaError::Limit);

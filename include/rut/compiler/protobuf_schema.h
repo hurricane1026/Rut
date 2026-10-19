@@ -27,6 +27,7 @@ enum class Type : u8 {
     Sint64
 };
 struct Message;
+struct Enum;
 struct SchemaFile;
 struct SchemaField {
     Str name{};
@@ -39,6 +40,18 @@ struct SchemaField {
     const Message* message = nullptr;
     const SchemaFile* file = nullptr;
     SchemaField* next = nullptr;
+};
+struct EnumValue {
+    Str name{};
+    Str full_name{};
+    i32 number = 0;
+    EnumValue* next = nullptr;
+};
+struct Enum {
+    Str full_name{};
+    EnumValue* values = nullptr;
+    const SchemaFile* file = nullptr;
+    Enum* next = nullptr;
 };
 struct Message {
     Str full_name{};  // Leading dot, e.g. .example.Message
@@ -65,11 +78,15 @@ struct SchemaFile {
 };
 struct Schema {
     Message* messages = nullptr;
+    Enum* enums = nullptr;
+    u32 enum_count = 0;
+    u32 enum_value_count = 0;
     Method* methods = nullptr;
     u32 message_count = 0;
     u32 field_count = 0;
     u32 method_count = 0;
     const Message* find_message(Str full_name) const;
+    const Enum* find_enum(Str full_name) const;
     const Method* find_method(Str path) const;
 };
 enum class SchemaError : u8 { Malformed, Unsupported, Duplicate, Unresolved, Limit, Allocation };
@@ -82,12 +99,14 @@ struct SchemaLimits {
     u32 methods = 1024;
     u32 depth = 32;
     u32 services = 1024;
+    u32 enums = 1024;
+    u32 enum_values = 16384;
 };
 // Copies input into arena: output never borrows the supplied descriptor buffer.
 // Arena must be initialized and outlive the schema. Failure consumes arena space;
 // callers should discard/reset their compile arena. No filesystem or LLVM access.
 // Initial subset: proto3 scalars, nested/recursive messages and repeated fields,
-// packed scalars and RPC signatures. Enums, oneof/optional presence, maps, proto2,
+// packed scalars, open enums and RPC signatures. Oneof/optional presence, maps, proto2,
 // extensions and editions are rejected. This does not expose a Rut API or emit IR.
 core::Expected<Schema, SchemaError> load_descriptor_set(Arena<MmapBackend>& arena,
                                                         const u8* data,

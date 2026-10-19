@@ -101,6 +101,7 @@ struct NamedMessage {
     NamedMessage* next = nullptr;
     bool concrete = true;
     const Source* file = nullptr;
+    bool is_enum = false;
 };
 struct Reference {
     Str name{};
@@ -157,6 +158,7 @@ struct Parser {
     bool number(u32& out);
     bool type_reference(Buffer& target, u32 tag, Str scope);
     bool message(Buffer& parent, Str scope, u32 depth);
+    bool enumeration(Buffer& parent, Str scope, bool nested);
     bool field(Buffer& parent, Str scope);
     bool service(Buffer& parent, Str scope);
     bool file();
@@ -181,6 +183,8 @@ struct Compiler {
     u32 field_count = 0;
     u32 method_count = 0;
     u32 service_count = 0;
+    u32 enum_count = 0;
+    u32 enum_value_count = 0;
     bool failed = false;
     bool fail(SourceError::Kind kind, Str file, u32 line, u32 column, Str detail) {
         if (!failed) error = {kind, file, line, column, detail};
@@ -285,6 +289,7 @@ struct Compiler {
         for (Reference* item = references; item; item = item->next) {
             Str scope = item->scope;
             Str found{};
+            bool is_enum = false;
             char candidate_bytes[4096];
             char first_bytes[4096];
             while (true) {
@@ -299,6 +304,13 @@ struct Compiler {
                 for (const NamedMessage* type = messages; type; type = type->next)
                     if (type->concrete && type->name.eq(kCandidate) &&
                         visible(item->file, type->file)) {
+                        if (type->is_enum && item->tag != 6)
+                            return fail(SourceError::Kind::Schema,
+                                        item->file->name,
+                                        item->line,
+                                        item->column,
+                                        lit_str("RPC requires a message"));
+                        is_enum = type->is_enum;
                         found = type->name;
                         break;
                     }
@@ -339,6 +351,7 @@ struct Compiler {
                             item->column,
                             lit_str("unresolved message type"));
             item->target->text(item->tag, found);
+            if (item->tag == 6) item->target->number(5, is_enum ? 14 : 11);
         }
         return true;
     }
@@ -535,7 +548,7 @@ bool Parser::field(Buffer& parent, Str scope) {
     descriptor->text(1, field_name);
     descriptor->number(3, tag);
     descriptor->number(4, kRepeated ? 3 : 1);
-    descriptor->number(5, type);
+    if (type != 11) descriptor->number(5, type);
     if (take(lit_str("["))) {
         Buffer options{compiler.arena};
         bool packed_seen = false, json_seen = false;
@@ -577,6 +590,68 @@ bool Parser::field(Buffer& parent, Str scope) {
     parent.tail = chunk;
     return true;
 }
+bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
+    if (compiler.enum_count++ >= compiler.limits.enums)
+        return fail(SourceError::Kind::Limit, lit_str("enum count"));
+    advance();
+    Str enum_name{};
+    if (!name(enum_name)) return false;
+    if (enum_name.len > 1023 || scope.len > 1023 - enum_name.len)
+        return fail(SourceError::Kind::Limit, lit_str("name length"));
+    const Str kFullName = compiler.join(scope, '.', enum_name);
+    auto* named = compiler.arena.alloc_t<NamedMessage>();
+    auto* descriptor = compiler.arena.alloc_t<Buffer>(compiler.arena);
+    if (!named || !descriptor || !kFullName.ptr) return fail(SourceError::Kind::Allocation, {});
+    *named = {kFullName, compiler.messages, true, &source, true};
+    compiler.messages = named;
+    descriptor->text(1, enum_name);
+    if (!expect(lit_str("{"))) return false;
+    bool options_seen = false;
+    while (!take(lit_str("}"))) {
+        if (take(lit_str(";"))) continue;
+        if (take(lit_str("option"))) {
+            if (options_seen)
+                return fail(SourceError::Kind::Syntax, lit_str("duplicate enum option"));
+            options_seen = true;
+            if (!expect(lit_str("allow_alias")) || !expect(lit_str("="))) return false;
+            const bool kAliases = is(lit_str("true"));
+            if (!take(lit_str("true")) && !take(lit_str("false")))
+                return fail(SourceError::Kind::Syntax, lit_str("boolean"));
+            if (!expect(lit_str(";"))) return false;
+            Buffer options{compiler.arena};
+            options.number(2, kAliases);
+            descriptor->child(3, options);
+            continue;
+        }
+        if (is(lit_str("reserved")))
+            return fail(SourceError::Kind::Unsupported, lit_str("enum reserved"));
+        if (compiler.enum_value_count++ >= compiler.limits.enum_values)
+            return fail(SourceError::Kind::Limit, lit_str("enum value count"));
+        Str value_name{};
+        u32 magnitude = 0;
+        if (!name(value_name) || !expect(lit_str("="))) return false;
+        const bool kNegative = take(lit_str("-"));
+        if (!number(magnitude)) return false;
+        if (magnitude > (kNegative ? 2147483648u : 2147483647u))
+            return fail(SourceError::Kind::Syntax, lit_str("enum int32 value"));
+        const i64 kValue = kNegative ? -static_cast<i64>(magnitude) : static_cast<i64>(magnitude);
+        if (!expect(lit_str(";"))) return false;
+        Buffer entry{compiler.arena};
+        entry.text(1, value_name);
+        entry.number(2, static_cast<u64>(kValue));
+        descriptor->child(2, entry);
+    }
+    auto* chunk = compiler.arena.alloc_t<Chunk>();
+    if (!chunk) return fail(SourceError::Kind::Allocation, {});
+    chunk->child = descriptor;
+    chunk->tag = nested ? 4u : 5u;
+    if (parent.tail)
+        parent.tail->next = chunk;
+    else
+        parent.head = chunk;
+    parent.tail = chunk;
+    return true;
+}
 bool Parser::message(Buffer& parent, Str scope, u32 depth) {
     if (depth > compiler.limits.depth || compiler.message_count++ >= compiler.limits.messages)
         return fail(SourceError::Kind::Limit, lit_str("message depth/count"));
@@ -599,8 +674,10 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
         if (take(lit_str(";"))) continue;
         if (is(lit_str("message"))) {
             if (!message(*descriptor, kFullName, depth + 1)) return false;
-        } else if (is(lit_str("enum")) || is(lit_str("oneof")) || is(lit_str("reserved")) ||
-                   is(lit_str("extensions")) || is(lit_str("extend")) || is(lit_str("option")))
+        } else if (is(lit_str("enum"))) {
+            if (!enumeration(*descriptor, kFullName, true)) return false;
+        } else if (is(lit_str("oneof")) || is(lit_str("reserved")) || is(lit_str("extensions")) ||
+                   is(lit_str("extend")) || is(lit_str("option")))
             return fail(SourceError::Kind::Unsupported, lit_str("message declaration"));
         else if (!field(*descriptor, kFullName))
             return false;
@@ -731,6 +808,8 @@ bool Parser::file() {
             if (source.package.len && !kScope.ptr) return fail(SourceError::Kind::Allocation, {});
             if (is(lit_str("message"))) {
                 if (!message(*source.descriptor, kScope, 1)) return false;
+            } else if (is(lit_str("enum"))) {
+                if (!enumeration(*source.descriptor, kScope, false)) return false;
             } else if (is(lit_str("service"))) {
                 if (!service(*source.descriptor, kScope)) return false;
             } else
@@ -784,7 +863,8 @@ core::Expected<Schema, SourceError> load_proto_source(Arena<MmapBackend>& arena,
     if (limits.bytes > kCeiling.bytes || limits.files > kCeiling.files ||
         limits.messages > kCeiling.messages || limits.fields > kCeiling.fields ||
         limits.methods > kCeiling.methods || limits.services > kCeiling.services ||
-        limits.depth > kCeiling.depth)
+        limits.depth > kCeiling.depth || limits.enums > kCeiling.enums ||
+        limits.enum_values > kCeiling.enum_values)
         return core::make_unexpected(SourceError{SourceError::Kind::Limit, {}, 1, 1, {}});
     if (!path.len || path.len > 4095)
         return core::make_unexpected(SourceError{SourceError::Kind::Io, {}, 1, 1, {}});

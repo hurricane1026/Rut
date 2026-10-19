@@ -1,0 +1,6 @@
+syntax = "proto3";
+package example;
+enum State { STATE_ZERO = 0; STATE_NEGATIVE = -1; STATE_READY = 1; }
+message EnumChild { State state = 1; repeated State history = 2; }
+message EnumBatch { State state = 1; repeated EnumChild children = 2; }
+service EnumCodec { rpc Echo(EnumBatch) returns (EnumBatch); }

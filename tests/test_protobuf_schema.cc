@@ -182,7 +182,7 @@ TEST(protobuf_schema, field_number_type_label_and_identifier_validation) {
 
 TEST(protobuf_schema, unsupported_schema_semantics_are_not_silently_dropped) {
     CompileArena storage;
-    const u32 kTypes[] = {10u, 14u};
+    const u32 kTypes[] = {10u};
     for (const u32 kType : kTypes) {
         Bytes input = descriptor(message(member(lit_str("a"), 1, kType)));
         auto result = load_descriptor_set(storage.arena, input.data, input.size);
@@ -202,7 +202,7 @@ TEST(protobuf_schema, unsupported_schema_semantics_are_not_silently_dropped) {
     auto result = load_descriptor_set(storage.arena, input.data, input.size);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == SchemaError::Unsupported);
-    const u32 kMessageTags[] = {4u, 5u, 6u, 8u};
+    const u32 kMessageTags[] = {5u, 6u, 8u};
     for (const u32 kTag : kMessageTags) {
         Bytes msg = message(member());
         const Bytes kEmpty;
@@ -589,4 +589,45 @@ TEST(protobuf_schema, review_limits_packing_namespaces_and_import_visibility) {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(protobuf_schema, enum_descriptors_validate_open_numeric_types_and_references) {
+    Bytes zero, negative, enumeration;
+    zero.text(1, lit_str("ZERO"));
+    zero.number(2, 0);
+    negative.text(1, lit_str("NEG"));
+    negative.number(2, static_cast<u64>(i64{-1}));
+    enumeration.text(1, lit_str("State"));
+    enumeration.child(2, zero);
+    enumeration.child(2, negative);
+    Bytes field = member(lit_str("state"), 1, 14, 3);
+    field.text(6, lit_str(".example.State"));
+    Bytes source = file(message(field));
+    source.child(5, enumeration);
+    Bytes input;
+    input.child(1, source);
+    CompileArena arena;
+    auto result = load_descriptor_set(arena.arena, input.data, input.size);
+    REQUIRE(result);
+    const auto* e = result->find_enum(lit_str(".example.State"));
+    REQUIRE(e);
+    REQUIRE(e->values);
+    CHECK_EQ(e->values->number, -1);
+    const auto* msg = result->find_message(lit_str(".example.Item"));
+    REQUIRE(msg);
+    REQUIRE(msg->fields);
+    CHECK(msg->fields->type == Type::Enum);
+    CHECK(msg->fields->packed);
+    Bytes missing;
+    missing.child(1, file(message(field)));
+    CompileArena unresolved;
+    auto bad = load_descriptor_set(unresolved.arena, missing.data, missing.size);
+    REQUIRE_FALSE(bad);
+    CHECK(bad.error() == SchemaError::Unresolved);
+    SchemaLimits limits{};
+    limits.enums = 0;
+    CompileArena bounded;
+    bad = load_descriptor_set(bounded.arena, input.data, input.size, limits);
+    REQUIRE_FALSE(bad);
+    CHECK(bad.error() == SchemaError::Limit);
 }

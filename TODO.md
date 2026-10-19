@@ -640,7 +640,11 @@ canonical spelling for common gateway tasks.
   流控/取消/复用；不含服务 schema 自动绑定、本地 deadline 或流式 handler。
 - [x] unary RPC 方法编解码绑定：编译期选择请求/响应类型与字段编号，自动 framing，
   拒绝流式方法，覆盖 JIT、独立原生产物与双后端互通；路由分发仍显式配置。
-- [ ] 扩展 protobuf codec：单遍 tag dispatcher、浮点/uint64、enum、
+- [x] proto3 open enum：顶层/嵌套/导入与别名校验，i32 数值载体，未知/负值保留，
+  repeated packed/unpacked、JIT 与原生产物；不新增 Rut enum 语法。
+- [ ] protobuf enum 的具名 case 与名义类型绑定：复用未来通用 Rut enum 类型机制，
+  同时保留 proto3 unknown numeric values；当前 codec 暴露 i32。
+- [ ] 扩展 protobuf codec：单遍 tag dispatcher、浮点/uint64、
   oneof/optional、map；proto2 需补齐 presence、显式默认值和 required 校验。
 - [ ] 在通用字节/流能力上实现 Rut protobuf 编解码模块、描述符读取与 HTTP/gRPC 转码；
   不强制用户用其他语言生成或维护插件。

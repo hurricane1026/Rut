@@ -4297,7 +4297,7 @@ static FrontendResult<u32> infer_proto_struct(const protobuf::Message* message,
         else if (proto->type == PT::Bool)
             field.type = HirTypeKind::Bool;
         else if (proto->type == PT::Int32 || proto->type == PT::Sfixed32 ||
-                 proto->type == PT::Sint32)
+                 proto->type == PT::Sint32 || proto->type == PT::Enum)
             field.type = HirTypeKind::I32;
         else if (proto->type == PT::Int64 || proto->type == PT::Sfixed64 ||
                  proto->type == PT::Sint64 || proto->type == PT::Uint32 ||
@@ -4403,6 +4403,7 @@ static HirTypeKind proto_carrier_type(u8 type) {
         case PT::Bool:
             return HirTypeKind::Bool;
         case PT::Int32:
+        case PT::Enum:
         case PT::Sfixed32:
         case PT::Sint32:
             return HirTypeKind::I32;
@@ -4588,7 +4589,7 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
         else if (proto->type == PT::Bool)
             expected = HirTypeKind::Bool;
         else if (proto->type == PT::Int32 || proto->type == PT::Sfixed32 ||
-                 proto->type == PT::Sint32)
+                 proto->type == PT::Sint32 || proto->type == PT::Enum)
             expected = HirTypeKind::I32;
         else if (proto->type == PT::Int64 || proto->type == PT::Sfixed64 ||
                  proto->type == PT::Sint64 || proto->type == PT::Uint32 ||
