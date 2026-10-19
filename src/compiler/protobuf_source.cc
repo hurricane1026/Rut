@@ -340,20 +340,21 @@ struct Compiler {
                     return fail(
                         SourceError::Kind::Limit, item->file->name, item->line, item->column, {});
                 for (const NamedMessage* symbol = messages; symbol; symbol = symbol->next) {
-                    if (visible(item->file, symbol->file) &&
-                        (symbol->name.eq(kFirst) ||
-                         (symbol->name.len > kFirst.len && symbol->name.ptr[kFirst.len] == '.' &&
-                          Str{symbol->name.ptr, kFirst.len}.eq(kFirst))))
-                        shadowed = true;
+                    const bool kNameMatches =
+                        symbol->name.eq(kFirst) ||
+                        (symbol->name.len > kFirst.len && symbol->name.ptr[kFirst.len] == '.' &&
+                         Str{symbol->name.ptr, kFirst.len}.eq(kFirst));
+                    if (kNameMatches && visible(item->file, symbol->file)) shadowed = true;
                 }
                 for (const Source* package = sources; package; package = package->next) {
-                    if (visible(item->file, package) && kFirst.len > 1) {
+                    if (kFirst.len > 1) {
                         const Str kPackagePrefix{kFirst.ptr + 1, kFirst.len - 1};
-                        if (package->package.eq(kPackagePrefix) ||
+                        const bool kPackageMatches =
+                            package->package.eq(kPackagePrefix) ||
                             (package->package.len > kPackagePrefix.len &&
                              package->package.ptr[kPackagePrefix.len] == '.' &&
-                             Str{package->package.ptr, kPackagePrefix.len}.eq(kPackagePrefix)))
-                            shadowed = true;
+                             Str{package->package.ptr, kPackagePrefix.len}.eq(kPackagePrefix));
+                        if (kPackageMatches && visible(item->file, package)) shadowed = true;
                     }
                 }
                 if (found.ptr || shadowed || item->name.ptr[0] == '.' || !scope.len) break;

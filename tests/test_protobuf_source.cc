@@ -299,6 +299,24 @@ TEST(protobuf_source, transitive_symbols_do_not_shadow_visible_outer_type) {
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().kind == SourceError::Kind::Schema);
 }
+TEST(protobuf_source, public_package_prefix_shadows_outer_fallback_only_when_visible) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; package p.x; message A {}"));
+    REQUIRE(files.write_file("extra.proto", "syntax='proto3'; package p.q.x; message B {}"));
+    REQUIRE(files.write_file("mid.proto", "syntax='proto3'; import 'extra.proto';"));
+    REQUIRE(files.write_file("root.proto",
+                             "syntax='proto3'; package p.q; import 'types.proto'; import "
+                             "'mid.proto'; message M { x.A value=1; }"));
+    Storage private_storage;
+    REQUIRE(files.load(private_storage).has_value());
+
+    REQUIRE(files.write_file("mid.proto", "syntax='proto3'; import public 'extra.proto';"));
+    Storage public_storage;
+    auto rejected = files.load(public_storage);
+    REQUIRE_FALSE(rejected.has_value());
+    CHECK(rejected.error().kind == SourceError::Kind::Schema);
+}
 TEST(protobuf_source, deep_relative_references_do_not_materialize_probe_names) {
     Files files;
     REQUIRE(files.ok);
