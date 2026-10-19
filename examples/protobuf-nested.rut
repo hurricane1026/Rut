@@ -1,0 +1,11 @@
+// Acyclic singular messages infer nested structs. Input/output are raw payloads.
+route POST "/protobuf/nested" {
+    guard let envelope = protobuf.decode("protobuf/message.proto", "example.Envelope", req.body) else {
+        return 400
+    }
+    let text = envelope.child.text
+    guard let bytes = protobuf.encode("protobuf/message.proto", "example.Envelope", envelope) else {
+        return 500
+    }
+    return response(200, body: bytes)
+}

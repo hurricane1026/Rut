@@ -3716,6 +3716,12 @@ target_include_directories(test_protobuf_source PRIVATE
 target_compile_definitions(test_protobuf_source PRIVATE RUT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 add_test(NAME test_protobuf_source COMMAND test_protobuf_source)
 set_tests_properties(test_protobuf_source PROPERTIES LABELS "unit;compiler" TIMEOUT 30)
+add_executable(test_protobuf_message test_protobuf_message.cc)
+target_include_directories(test_protobuf_message PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_protobuf_message COMMAND test_protobuf_message)
+set_tests_properties(test_protobuf_message PROPERTIES LABELS "unit" TIMEOUT 30)
+
 add_executable(test_protobuf_value test_protobuf_value.cc)
 target_include_directories(test_protobuf_value PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
@@ -3759,6 +3765,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_http2_conn>
         COMMAND $<TARGET_FILE:test_grpc_replay_body>
         COMMAND $<TARGET_FILE:test_protobuf_source>
+        COMMAND $<TARGET_FILE:test_protobuf_message>
         COMMAND $<TARGET_FILE:test_protobuf_value>
         COMMAND $<TARGET_FILE:test_protobuf_schema>
         COMMAND $<TARGET_FILE:test_protobuf_wire>
@@ -3795,7 +3802,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_grpc_replay_body test_protobuf_source test_protobuf_value test_protobuf_schema test_protobuf_wire test_grpc_web ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_grpc_replay_body test_protobuf_source test_protobuf_message test_protobuf_value test_protobuf_schema test_protobuf_wire test_grpc_web ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
         COMMENT "Running all tests..."
     )
 else()
@@ -3819,6 +3826,7 @@ else()
         COMMAND $<TARGET_FILE:test_http2_conn>
         COMMAND $<TARGET_FILE:test_grpc_replay_body>
         COMMAND $<TARGET_FILE:test_protobuf_source>
+        COMMAND $<TARGET_FILE:test_protobuf_message>
         COMMAND $<TARGET_FILE:test_protobuf_value>
         COMMAND $<TARGET_FILE:test_protobuf_schema>
         COMMAND $<TARGET_FILE:test_protobuf_wire>
@@ -3851,7 +3859,7 @@ else()
         COMMAND $<TARGET_FILE:test_iouring_idle_trim>
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_grpc_replay_body test_protobuf_source test_protobuf_value test_protobuf_schema test_protobuf_wire test_grpc_web ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_grpc_replay_body test_protobuf_source test_protobuf_message test_protobuf_value test_protobuf_schema test_protobuf_wire test_grpc_web ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
         COMMENT "Running non-JIT tests..."
     )
 endif()

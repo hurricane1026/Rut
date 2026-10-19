@@ -1,5 +1,6 @@
-These proto3 inputs exercise the internal compiler descriptor loader. They do
-not enable JSON/gRPC transcoding or expose protobuf functions to Rut programs.
+`schema.proto` and `types.proto` exercise the internal compiler descriptor loader.
+Those fixtures do not enable JSON/gRPC transcoding; the executable codec fixtures
+are described below.
 
 `schema_descriptor.inc` contains the `FileDescriptorSet` produced by
 `grpc_tools.protoc --include_imports`. Tests compile the checked-in byte array;
@@ -26,3 +27,11 @@ including signed minima, uint32 maximum and embedded NUL/non-UTF-8 bytes. The
 maximum-tag message also exercises field-operation immediates above 32 bits.
 Neither fixture requires reference tools to run. The native-program regression
 creates its own temporary proto source and deletes it after compilation.
+
+`test_protobuf_message` checks the internal C++ wire-tree codec using independent
+hand-encoded fixtures: packed/unpacked repeated scalars, singular embedded-message
+merging, repeated empty messages, float/double/uint64 bit preservation, malformed
+nested payloads, UTF-8, fixed-width packing, slot/depth/output limits and bounded
+arbitrary inputs. Repeated values remain internal; nested Rut integration is covered by frontend,
+JIT and native-program regressions. Neither path adds gRPC framing. Encoding uses unpacked repeated scalars, so semantic roundtrip rather
+than byte identity is expected for packed input.

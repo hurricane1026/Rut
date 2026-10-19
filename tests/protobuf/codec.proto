@@ -17,3 +17,21 @@ message FixedMessage {
 }
 
 message HighTag { string text = 536870911; }
+message NestedChild {
+  string text = 1;
+  int32 id = 2;
+}
+message NestedMessage {
+  NestedChild child = 1;
+  string label = 2;
+}
+message RecursiveMessage {
+  RecursiveMessage child = 1;
+}
+message RepeatedMessage {
+  repeated int32 values = 1;
+}
+message SharedMessage {
+  NestedChild first = 1;
+  NestedChild second = 2;
+}

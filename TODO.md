@@ -626,7 +626,11 @@ canonical spelling for common gateway tasks.
   有界 Arena 所有权及真实 protoc fixture 验证。
 - [x] 内置 proto3 文本/import 解析、推导消息类型与单值标量 decode/encode 的 RIR/LLVM
   生成；JIT 与 `rut-compile` 原生产物可用，不依赖 protoc 或外部 protobuf 运行库。
-- [ ] 扩展 protobuf codec：单遍 tag dispatcher、repeated/嵌套消息、浮点/uint64、enum、
+- [x] 内部有界消息 wire-tree codec：单遍 Reader、packed/unpacked repeated、嵌套合并；
+  调用方固定槽位与借用字节视图，尚未接入 Rut 类型/RIR。
+- [x] Rut 单值嵌套 protobuf：推导 struct、字段访问、重复子消息合并与原有 helper ABI；
+  最多八层嵌套边，不暴露 presence，递归类型仍拒绝。
+- [ ] 扩展 protobuf codec：单遍 tag dispatcher、repeated、浮点/uint64、enum、
   oneof/optional、map；proto2 需补齐 presence、显式默认值和 required 校验。
 - [ ] 在通用字节/流能力上实现 Rut protobuf 编解码模块、描述符读取与 HTTP/gRPC 转码；
   不强制用户用其他语言生成或维护插件。
