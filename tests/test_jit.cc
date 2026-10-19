@@ -23096,3 +23096,75 @@ TEST(jit, grpc_unary_helper_owns_payload_and_frames_and_rejects_exhaustion) {
     arena.destroy();
     pool.destroy();
 }
+
+TEST(jit, grpc_method_codec_roundtrip_and_invalid_envelope_propagation) {
+    const char* source =
+        "route POST \"/rpc\" { guard let value = grpc.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Convert\", req.body) else { return "
+        "422 "
+        "} "
+        "guard let framed = grpc.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Convert\", value) else { return 500 "
+        "} "
+        "return response(200, body: framed) }";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    MappedArray<Connection> connections;
+    REQUIRE(connections.init(1));
+    auto& conn = connections[0];
+    const u8 valid[] = {0, 0, 0, 0, 9, 10, 5, 10, 1, 'x', 16, 1, 10, 0};
+    const u8 empty[] = {0, 0, 0, 0, 0};
+    const u8 compressed[] = {1, 0, 0, 0, 0};
+    const u8 malformed[] = {0, 0, 0, 0, 1, 128};
+    const Str bodies[] = {{reinterpret_cast<const char*>(valid), sizeof(valid)},
+                          {reinterpret_cast<const char*>(empty), sizeof(empty)},
+                          {"", 0},
+                          {reinterpret_cast<const char*>(compressed), sizeof(compressed)},
+                          {reinterpret_cast<const char*>(malformed), sizeof(malformed)},
+                          {reinterpret_cast<const char*>(valid), sizeof(valid) - 1}};
+    for (u32 i = 0; i < 6; ++i) {
+        conn.reset();
+        conn.json_arena.backend.pool = &pool;
+        char request[256];
+        const int header = snprintf(request,
+                                    sizeof(request),
+                                    "POST /rpc HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                    bodies[i].len);
+        memcpy(request + header, bodies[i].ptr, bodies[i].len);
+        const auto result = HandlerResult::unpack(handler(
+            &conn, nullptr, reinterpret_cast<const u8*>(request), header + bodies[i].len, nullptr));
+        CHECK_EQ(result.status_code, i < 2 ? 200u : 422u);
+        if (i < 2) {
+            CHECK(conn.jit_response_body_valid);
+            memset(request, 'z', sizeof(request));
+            const u8 expected[] = {0, 0, 0, 0, 9, 0x4a, 5, 0x3a, 1, 'x', 0x40, 2, 0x4a, 0};
+            const Str expected_body =
+                i == 0 ? Str{reinterpret_cast<const char*>(expected), sizeof(expected)} : bodies[i];
+            CHECK(conn.jit_response_body.eq(expected_body));
+        } else {
+            CHECK_FALSE(conn.jit_response_body_valid);
+        }
+    }
+    conn.reset();
+    connections.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}

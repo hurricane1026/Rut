@@ -13,3 +13,5 @@ message Batch {
   repeated string names = 2;
 }
 message MessageBatch { repeated Message entries = 1; }
+
+service BatchEcho { rpc Unary(MessageBatch) returns (MessageBatch); }

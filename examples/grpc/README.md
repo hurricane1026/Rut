@@ -175,8 +175,10 @@ The HTTP/1.1 bridge closes its downstream connection after each response.
 ## Local unary RPC
 
 The endpoint in `examples/grpc-local.rut` handles a native unary RPC locally:
-it unframes, decodes and re-encodes `example.MessageBatch`, then returns a framed
-response with grpc-status trailers. No backend or generated stubs are needed.
+it uses `grpc.decode` and `grpc.encode` bound to the proto declaration
+`/example.BatchEcho/Unary` to decode the request and encode the response, then
+returns grpc-status trailers. The route remains explicit. No backend or generated
+stubs are needed.
 Using the existing pinned Python development requirements, run:
 
 ```sh

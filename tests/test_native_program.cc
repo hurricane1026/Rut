@@ -518,6 +518,77 @@ TEST(native_program, grpc_unary_framing_and_codecs_survive_source_removal) {
     pool.destroy();
 }
 
+TEST(native_program, grpc_method_codecs_bind_distinct_input_output_after_schema_removal) {
+    Source proto;
+    REQUIRE(proto.append(
+        "syntax='proto3'; package example; message Message { string text=1; int64 id=2; } "
+        "message Reply { string text=536870911; int64 id=4; } "
+        "service Codec { rpc Unary(Message) returns (Reply); }"));
+    Source source;
+    char code[2048];
+    const int length = snprintf(code,
+                                sizeof(code),
+                                "route POST \"/codec\" { "
+                                "guard let value = grpc.decode(\"%s\", \"/example.Codec/Unary\", "
+                                "req.body) else { return 400 } "
+                                "guard let framed = grpc.encode(\"%s\", \"/example.Codec/Unary\", "
+                                "value) else { return 500 } "
+                                "return response(200, body: framed) }",
+                                proto.path,
+                                proto.path);
+    REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(code));
+    REQUIRE(source.append(code, static_cast<u32>(length)));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(proto.path), 0);
+    REQUIRE_EQ(unlink(source.path), 0);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    MappedArray<Connection> connections;
+    REQUIRE(connections.init(1));
+    auto& conn = connections[0];
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    const u8 kPayload[] = {0, 0, 0, 0, 7, 0x0a, 3, 'R', 'u', 't', 0x10, 123};
+    const u8 expected[] = {0, 0, 0, 0, 11, 250, 255, 255, 255, 15, 3, 'R', 'u', 't', 32, 123};
+    char request[8400];
+    const int header = snprintf(request,
+                                sizeof(request),
+                                "POST /codec HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                static_cast<u32>(sizeof(kPayload)));
+    memcpy(request + header, kPayload, sizeof(kPayload));
+    jit::HandlerCtx ctx{};
+    const auto result = jit::HandlerResult::unpack(
+        owner.p->config.routes[0].fn(&conn,
+                                     &ctx,
+                                     reinterpret_cast<const u8*>(request),
+                                     static_cast<u32>(header) + sizeof(kPayload),
+                                     nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK(conn.jit_response_body_valid);
+    REQUIRE_EQ(conn.jit_response_body.len, sizeof(expected));
+    CHECK_EQ(memcmp(conn.jit_response_body.ptr, expected, sizeof(expected)), 0);
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    // The request fits 8 KiB, but the response's wider tag makes encoding
+    // exceed that limit. Failure must remain nil, never an empty framed RPC.
+    u8 large[8197] = {0, 0, 0, 32, 0, 10, 253, 63};
+    memset(large + 8, 'x', sizeof(large) - 8);
+    const int large_header = snprintf(request,
+                                      sizeof(request),
+                                      "POST /codec HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                      static_cast<u32>(sizeof(large)));
+    memcpy(request + large_header, large, sizeof(large));
+    const auto rejected = jit::HandlerResult::unpack(owner.p->config.routes[0].fn(
+        &conn, &ctx, reinterpret_cast<const u8*>(request), large_header + sizeof(large), nullptr));
+    CHECK_EQ(rejected.status_code, 500u);
+    CHECK_FALSE(conn.jit_response_body_valid);
+    conn.reset();
+    connections.destroy();
+    pool.destroy();
+}
+
 TEST(native_program, protobuf_nested_codecs_survive_source_and_schema_removal) {
     Source proto;
     REQUIRE(

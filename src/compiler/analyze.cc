@@ -4394,14 +4394,55 @@ struct ProtoLayoutBuffer {
     }
 };
 
+static HirTypeKind proto_carrier_type(u8 type) {
+    using PT = protobuf::Type;
+    switch (static_cast<PT>(type)) {
+        case PT::String:
+        case PT::Bytes:
+            return HirTypeKind::Str;
+        case PT::Bool:
+            return HirTypeKind::Bool;
+        case PT::Int32:
+        case PT::Sfixed32:
+        case PT::Sint32:
+            return HirTypeKind::I32;
+        case PT::Int64:
+        case PT::Sfixed64:
+        case PT::Sint64:
+        case PT::Uint32:
+        case PT::Fixed32:
+            return HirTypeKind::I64;
+        case PT::Message:
+            return HirTypeKind::Struct;
+        default:
+            return HirTypeKind::Unknown;
+    }
+}
+
+static bool proto_layout_field_compatible(const HirModule& mod,
+                                          const HirStruct::FieldDecl& field,
+                                          u8 proto_type) {
+    const HirTypeKind carrier = proto_carrier_type(proto_type);
+    if (carrier == HirTypeKind::Unknown) return false;
+    if (field.type != HirTypeKind::Array) return field.type == carrier;
+    if (field.shape_index >= mod.type_shapes.len) return false;
+    const auto& array = mod.type_shapes[field.shape_index];
+    return array.type == HirTypeKind::Array && array.array_elem_shape_index < mod.type_shapes.len &&
+           mod.type_shapes[array.array_elem_shape_index].type == carrier;
+}
+
 static bool proto_array_layout(const HirModule& mod,
                                u32 index,
+                               const protobuf::Message* message,
                                ProtoLayoutBuffer& bytes,
                                u32& size,
                                u32& alignment,
                                u32 depth = 0) {
     if (depth > 8 || index >= mod.structs.len) return false;
     const auto& decl = mod.structs[index];
+    u32 schema_fields = 0;
+    for (const auto* field = message->fields; field; field = field->next) ++schema_fields;
+    if (decl.fields.len != schema_fields) return false;
     u32 header = 0;
     if (!bytes.reserve(12, header)) return false;
     size = 0;
@@ -4409,31 +4450,36 @@ static bool proto_array_layout(const HirModule& mod,
     for (u32 i = 0; i < decl.fields.len; ++i) {
         const auto& field = decl.fields[i];
         const bool repeated = field.type == HirTypeKind::Array;
-        if (field.protobuf_type != 11 && !protobuf::array_element_size(field.protobuf_type))
+        const protobuf::SchemaField* proto = message->fields;
+        while (proto && !proto->name.eq(field.name)) proto = proto->next;
+        const u8 proto_type = proto ? static_cast<u8>(proto->type) : 0;
+        if (!proto || proto->repeated != repeated ||
+            !proto_layout_field_compatible(mod, field, proto_type))
             return false;
+        if (proto_type != 11 && !protobuf::array_element_size(proto_type)) return false;
         u32 child_size = 0, child_align = 1;
         u32 field_header = 0;
         if (!bytes.reserve(16, field_header)) return false;
         const u32 child_start = bytes.len;
-        if (field.protobuf_type == 11 &&
-            !proto_array_layout(mod, field.struct_index, bytes, child_size, child_align, depth + 1))
+        if (proto_type == 11 &&
+            !proto_array_layout(
+                mod, field.struct_index, proto->message, bytes, child_size, child_align, depth + 1))
             return false;
-        const u32 width = repeated ? sizeof(Str)
-                          : field.protobuf_type == 11
-                              ? child_size
-                              : protobuf::array_element_size(field.protobuf_type);
-        const u32 align = repeated                    ? alignof(Str)
-                          : field.protobuf_type == 11 ? child_align
-                          : width == 1                ? 1
-                          : width == 4                ? 4
-                                                      : 8;
-        if (!width && field.protobuf_type != 11) return false;
+        const u32 width = repeated           ? sizeof(Str)
+                          : proto_type == 11 ? child_size
+                                             : protobuf::array_element_size(proto_type);
+        const u32 align = repeated           ? alignof(Str)
+                          : proto_type == 11 ? child_align
+                          : width == 1       ? 1
+                          : width == 4       ? 4
+                                             : 8;
+        if (!width && proto_type != 11) return false;
         size = (size + align - 1) & ~(align - 1);
-        const u32 child_len = field.protobuf_type == 11 ? bytes.len - child_start : 0;
+        const u32 child_len = proto_type == 11 ? bytes.len - child_start : 0;
         if (child_len > protobuf::kMaxMessageBytes - 12 ||
-            !bytes.write_word(field_header, field.protobuf_number))
+            !bytes.write_word(field_header, proto->number))
             return false;
-        if (!bytes.write_word(field_header + 4, field.protobuf_type | (repeated ? 256 : 0)) ||
+        if (!bytes.write_word(field_header + 4, proto_type | (repeated ? 256 : 0)) ||
             !bytes.write_word(field_header + 8, size) ||
             !bytes.write_word(field_header + 12, child_len))
             return false;
@@ -4444,10 +4490,8 @@ static bool proto_array_layout(const HirModule& mod,
     return bytes.write_word(header, size) && bytes.write_word(header + 4, alignment) &&
            bytes.write_word(header + 8, decl.fields.len);
 }
-static FrontendResult<HirExpr> proto_array_schema(const HirModule& mod,
-                                                  u32 index,
-                                                  Span span,
-                                                  u32 depth) {
+static FrontendResult<HirExpr> proto_array_schema(
+    const HirModule& mod, u32 index, const protobuf::Message* message, Span span, u32 depth) {
     MmapArena arena;
     if (!arena.init(4096)) return frontend_error(FrontendError::OutOfMemory, span);
     ProtoLayoutBuffer bytes;
@@ -4456,7 +4500,7 @@ static FrontendResult<HirExpr> proto_array_schema(const HirModule& mod,
         return frontend_error(FrontendError::OutOfMemory, span);
     }
     u32 size = 0, alignment = 1;
-    if (!proto_array_layout(mod, index, bytes, size, alignment, depth)) {
+    if (!proto_array_layout(mod, index, message, bytes, size, alignment, depth)) {
         arena.destroy();
         return frontend_error(FrontendError::UnsupportedSyntax,
                               span,
@@ -4476,11 +4520,12 @@ static FrontendResult<HirExpr> proto_array_schema(const HirModule& mod,
 static FrontendResult<HirExpr> add_proto_array_schema(FrontendResult<HirExpr> op,
                                                       const HirModule& mod,
                                                       u32 index,
+                                                      const protobuf::Message* message,
                                                       Span span,
                                                       HirRoute* route,
                                                       u32 depth) {
     if (!op) return op;
-    auto schema = proto_array_schema(mod, index, span, depth);
+    auto schema = proto_array_schema(mod, index, message, span, depth);
     if (!schema) return schema;
     if (!route->exprs.push(schema.value()) || !op->args.push(&route->exprs[route->exprs.len - 1]))
         return frontend_error(FrontendError::TooManyItems, span);
@@ -4493,7 +4538,8 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
                                                  HirRoute* route,
                                                  const HirModule& mod,
                                                  Span span,
-                                                 u32 depth) {
+                                                 u32 depth,
+                                                 bool require_input = false) {
     if (depth > 8)
         return frontend_error(FrontendError::UnsupportedSyntax,
                               span,
@@ -4515,8 +4561,8 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
         result.struct_index = index;
         result.may_nil = true;
         result.span = span;
-        auto valid =
-            make_proto_op(depth ? 3 : 0, HirTypeKind::Str, true, &source, nullptr, span, route);
+        auto valid = make_proto_op(
+            depth || require_input ? 3 : 0, HirTypeKind::Str, true, &source, nullptr, span, route);
         if (!valid) return valid;
         if (!route->exprs.push(valid.value()))
             return frontend_error(FrontendError::TooManyItems, span);
@@ -4597,8 +4643,8 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
                         !item->args.push(&route->exprs[route->exprs.len - 1]))
                         return frontend_error(FrontendError::TooManyItems, span);
                 }
-                item =
-                    add_proto_array_schema(item, mod, field.struct_index, span, route, depth + 1);
+                item = add_proto_array_schema(
+                    item, mod, field.struct_index, proto->message, span, route, depth + 1);
             }
             if (!item) return item;
             if (expected == HirTypeKind::Array) item->shape_index = field.shape_index;
@@ -4635,7 +4681,7 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
                 kOp | protobuf::kEncode, HirTypeKind::Str, false, &result, &selected, span, route);
             if (proto->repeated && proto->type == PT::Message)
                 appended = add_proto_array_schema(
-                    appended, mod, field.struct_index, span, route, depth + 1);
+                    appended, mod, field.struct_index, proto->message, span, route, depth + 1);
             if (!appended) return appended;
             result = appended.value();
         }
@@ -4648,7 +4694,12 @@ static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
                                                      const HirModule& mod,
                                                      const HirLocal* locals,
                                                      u32 local_count,
-                                                     const MatchPayloadBinding* binding) {
+                                                     const MatchPayloadBinding* binding,
+                                                     bool grpc_method = false) {
+    if (grpc_method && expr.args.len != 3)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("grpc.decode/encode(protoPath, methodPath, value)"));
     const bool decode = expr.name.eq(lit_str("decode"));
     const bool infer_type = decode && expr.args.len == 3;
     if ((!decode && !expr.name.eq(lit_str("encode"))) ||
@@ -4737,15 +4788,28 @@ static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
         expr.args[path_arg + 1]->str_value, mod, expr.args[path_arg + 1]->span);
     if (!decoded_name) return core::make_unexpected(decoded_name.error());
     Str message_name = decoded_name.value();
-    char qualified[1026];
-    if (message_name.len && message_name.ptr[0] != '.') {
-        if (message_name.len > 1024)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        qualified[0] = '.';
-        __builtin_memcpy(qualified + 1, message_name.ptr, message_name.len);
-        message_name = {qualified, message_name.len + 1};
+    const protobuf::Message* message = nullptr;
+    if (grpc_method) {
+        const auto* method = loaded->find_method(message_name);
+        if (!method)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, lit_str("gRPC method not found"));
+        if (method->client_streaming || method->server_streaming)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("gRPC method codecs require a unary method"));
+        message = decode ? method->input : method->output;
+    } else {
+        char qualified[1026];
+        if (message_name.len && message_name.ptr[0] != '.') {
+            if (message_name.len > 1024)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            qualified[0] = '.';
+            __builtin_memcpy(qualified + 1, message_name.ptr, message_name.len);
+            message_name = {qualified, message_name.len + 1};
+        }
+        message = loaded->find_message(message_name);
     }
-    const auto* message = loaded->find_message(message_name);
     if (!message)
         return frontend_error(
             FrontendError::UnsupportedSyntax, expr.span, lit_str("protobuf message not found"));
@@ -4755,7 +4819,20 @@ static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
         if (!inferred) return core::make_unexpected(inferred.error());
         index = inferred.value();
     }
-    return build_proto_codec(decode, message, index, source, route, mod, expr.span, 0);
+    if (grpc_method && decode) {
+        auto payload = make_proto_op(
+            protobuf::kGrpcUnframe, HirTypeKind::Str, false, &source, nullptr, expr.span, route);
+        if (!payload) return payload;
+        source = payload.value();
+    }
+    auto codec = build_proto_codec(
+        decode, message, index, source, route, mod, expr.span, 0, grpc_method && decode);
+    if (!codec || !grpc_method || decode) return codec;
+    // As for nested protobuf encoding, a failed intermediate payload is a null
+    // byte view. Framing rejects that sentinel instead of emitting an empty RPC.
+    codec->may_nil = false;
+    return make_proto_op(
+        protobuf::kGrpcFrame, HirTypeKind::Str, true, &codec.value(), nullptr, expr.span, route);
 }
 
 static FrontendResult<HirExpr> analyze_json_call(const AstExpr& expr,
@@ -4909,6 +4986,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         expr.lhs->name.eq(lit_str("grpc")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, lit_str("grpc"))) {
+        if (expr.name.eq(lit_str("decode")) || expr.name.eq(lit_str("encode")))
+            return analyze_protobuf_call(expr, route, mod, locals, local_count, binding, true);
         const bool frame = expr.name.eq(lit_str("frame"));
         if ((!frame && !expr.name.eq(lit_str("unframe"))) || expr.args.len != 1)
             return frontend_error(FrontendError::UnsupportedSyntax,

@@ -40599,3 +40599,65 @@ TEST(frontend, grpc_framing_checks_arity_type_and_optional_inputs) {
         delete ast.value();
     }
 }
+
+TEST(frontend, grpc_method_codecs_reject_streaming_unknown_methods_and_invalid_shapes) {
+    const char* methods[] = {"/example.UnaryCodec/ClientStream",
+                             "/example.UnaryCodec/ServerStream",
+                             "/example.UnaryCodec/Bidi",
+                             "/example.UnaryCodec/Missing",
+                             "example.UnaryCodec/Echo"};
+    for (const char* method : methods) {
+        char source[1024];
+        snprintf(source,
+                 sizeof(source),
+                 "route POST \"/rpc\" { let value = grpc.decode(\"%s/tests/protobuf/codec.proto\", "
+                 "\"%s\", req.body) return 200 }",
+                 RUT_PROTO_TEST_ROOT,
+                 method);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file(*ast.value());
+        CHECK_FALSE(hir.has_value());
+        if (hir) delete hir.value();
+        delete ast.value();
+    }
+    const char* tails[] = {
+        "let result = grpc.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Echo\", 42) return 200",
+        "guard let value = grpc.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Distinct\", req.body) else { return "
+        "400 } "
+        "let result = grpc.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Echo\", value) return 200",
+        "let value = grpc.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Echo\", grpc.frame(req.body)) return "
+        "200"};
+    for (const char* tail : tails) {
+        char source[2048];
+        snprintf(source, sizeof(source), "route POST \"/rpc\" { %s }", tail);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file(*ast.value());
+        CHECK_FALSE(hir.has_value());
+        if (hir) delete hir.value();
+        delete ast.value();
+    }
+    const char* incompatible =
+        "route POST \"/rpc\" { guard let value = grpc.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/BadShape\", req.body) else { return "
+        "400 } "
+        "let result = grpc.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/BadShape\", value) return 200 }";
+    auto incompatible_tokens = lex(lit(incompatible));
+    REQUIRE(incompatible_tokens);
+    auto incompatible_ast = parse_file(incompatible_tokens.value());
+    REQUIRE(incompatible_ast);
+    auto incompatible_hir = analyze_file(*incompatible_ast.value());
+    CHECK_FALSE(incompatible_hir.has_value());
+    if (incompatible_hir) delete incompatible_hir.value();
+    delete incompatible_ast.value();
+}

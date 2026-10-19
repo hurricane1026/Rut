@@ -638,6 +638,8 @@ canonical spelling for common gateway tasks.
   覆盖畸形帧、8 KiB 边界、原生产物与双后端 HTTP/2 分片测试，不含本地 RPC 服务分发。
 - [x] HTTP/2 本地 unary 响应：显式 gRPC content-type/status、DATA 后 trailers、
   流控/取消/复用；不含服务 schema 自动绑定、本地 deadline 或流式 handler。
+- [x] unary RPC 方法编解码绑定：编译期选择请求/响应类型与字段编号，自动 framing，
+  拒绝流式方法，覆盖 JIT、独立原生产物与双后端互通；路由分发仍显式配置。
 - [ ] 扩展 protobuf codec：单遍 tag dispatcher、浮点/uint64、enum、
   oneof/optional、map；proto2 需补齐 presence、显式默认值和 required 校验。
 - [ ] 在通用字节/流能力上实现 Rut protobuf 编解码模块、描述符读取与 HTTP/gRPC 转码；

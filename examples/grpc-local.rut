@@ -1,15 +1,9 @@
-// Native unary RPC endpoint for examples/grpc/local_client.py.
+// Native unary RPC endpoint with an RPC method bound at compile time.
 route POST "/example.BatchEcho/Unary" {
-    guard let payload = grpc.unframe(req.body) else {
+    guard let batch = grpc.decode("protobuf/message.proto", "/example.BatchEcho/Unary", req.body) else {
         return response(200, headers: {"content-type": "application/grpc+proto", "grpc-status": "13"})
     }
-    guard let batch = protobuf.decode("protobuf/message.proto", "example.MessageBatch", payload) else {
-        return response(200, headers: {"content-type": "application/grpc+proto", "grpc-status": "13"})
-    }
-    guard let bytes = protobuf.encode("protobuf/message.proto", "example.MessageBatch", batch) else {
-        return response(200, headers: {"content-type": "application/grpc+proto", "grpc-status": "13"})
-    }
-    guard let framed = grpc.frame(bytes) else {
+    guard let framed = grpc.encode("protobuf/message.proto", "/example.BatchEcho/Unary", batch) else {
         return response(200, headers: {"content-type": "application/grpc+proto", "grpc-status": "13"})
     }
     return response(200, headers: {"content-type": "application/grpc+proto", "grpc-status": "0"}, body: framed)
