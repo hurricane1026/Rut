@@ -445,6 +445,7 @@ struct Client {
         static constexpr u32 kWebBufferCap = 262144;
         u32 sent = 0, received = 0, size = 0;
         u32 status = 99, http_status = 0;
+        bool status_in_trailers = false;
         u32 raw_len = 0, max_chunk = 0, response_len = 0;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
              meta = false, trailer = false, raw_request = false, compare_pattern = true,
@@ -516,6 +517,7 @@ struct Client {
         }
         if (n == 11 && memcmp(name, "grpc-status", n) == 0) {
             rpc.ok = v == 1 && *value == '0';
+            rpc.status_in_trailers = (f->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
             rpc.status = 0;
             for (size_t i = 0; i < v; i++) rpc.status = rpc.status * 10 + value[i] - '0';
         }
@@ -7416,6 +7418,78 @@ TEST(grpc_proxy, grpc_web_terminal_data_can_end_with_zero_flow_control_credit) {
     CHECK_EQ(x.download_len, 1u);
 }
 
+TEST(grpc_proxy, native_trailer_emits_pending_hpack_resize_after_data_stall) {
+    Http2Conn h;
+    h.init_client();
+    auto* stream = h.open_stream(1);
+    REQUIRE(stream != nullptr);
+
+    // Put the encoder and a peer decoder into a non-empty, synchronized state.
+    u8 first[256];
+    const hpack::Header first_headers[] = {{{"x-seed", 6}, {"value", 5}}};
+    const u32 first_len = http2_write_response(
+        first, sizeof(first), h.hpack_enc, 1, 200, first_headers, 1, nullptr, 0);
+    REQUIRE_GT(first_len, 0u);
+    hpack::DynamicTable decoder;
+    decoder.init(kDefaultHeaderTableSize);
+    hpack::Header decoded[8];
+    u8 decoded_storage[256];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(decoder,
+                                       first + kFrameHeaderSize,
+                                       first_len - kFrameHeaderSize,
+                                       decoded_storage,
+                                       sizeof(decoded_storage),
+                                       decoded,
+                                       8,
+                                       &decoded_count));
+
+    static const u8 body[] = {0xaa, 0xbb};
+    h.outbound_stream = 1;
+    h.outbound_body = body;
+    h.outbound_body_len = sizeof(body);
+    h.outbound_body_offset = 0;
+    h.outbound_grpc_status = 0;
+    h.conn_send_window = 0;
+    stream->send_window = 0;
+    h.hpack_enc.set_table_size(0);
+    CHECK_GE(h.hpack_enc.pending_size_update, 0);
+
+    u8 output[128];
+    H2PumpStatus status = H2PumpStatus::Blocked;
+    CHECK_EQ(h2_pump_outbound(h, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Blocked);
+    CHECK_GE(h.hpack_enc.pending_size_update, 0);
+
+    h.conn_send_window = 16;
+    stream->send_window = 16;
+    REQUIRE_EQ(h2_pump_outbound(h, output, sizeof(output), status), 11u);
+    CHECK_EQ(status, H2PumpStatus::Produced);
+    CHECK_EQ(h.outbound_body_offset, sizeof(body));
+
+    // A failed output attempt must leave the resize armed for the retry.
+    CHECK_EQ(h2_pump_outbound(h, output, kFrameHeaderSize, status), 0u);
+    CHECK_GE(h.hpack_enc.pending_size_update, 0);
+    const u32 trailer_len = h2_pump_outbound(h, output, sizeof(output), status);
+    REQUIRE_GT(trailer_len, static_cast<u32>(kFrameHeaderSize));
+    CHECK_EQ(status, H2PumpStatus::Produced);
+    Http2FrameHeader trailer_frame;
+    REQUIRE(parse_frame_header(output, trailer_len, &trailer_frame) == ParseStatus::Complete);
+    CHECK_EQ(trailer_frame.type, static_cast<u8>(Http2FrameType::Headers));
+    REQUIRE(hpack::decode_header_block(decoder,
+                                       output + kFrameHeaderSize,
+                                       trailer_frame.length,
+                                       decoded_storage,
+                                       sizeof(decoded_storage),
+                                       decoded,
+                                       8,
+                                       &decoded_count));
+    REQUIRE_EQ(decoded_count, 1u);
+    CHECK(decoded[0].name.eq({"grpc-status", 11}));
+    CHECK(decoded[0].value.eq({"0", 1}));
+    CHECK_EQ(h.hpack_enc.pending_size_update, -1);
+}
+
 TEST(grpc_proxy, grpc_web_text_large_message_batches_data_frames) {
     GrpcDriveFixture loop;
     Connection downstream;
@@ -8788,7 +8862,18 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "guard let bytes = protobuf.encode(\"" RUT_GRPC_FIXTURES
         "/../protobuf/codec.proto\", \"example.RepeatedChild\", value) else { return 500 } "
         "guard let framed = grpc.frame(bytes) else { return 500 } "
-        "return response(200, body: framed) }\n",
+        "return response(200, body: framed) }\n"
+        "route POST \"/local.Echo/Call\" { "
+        "guard let payload = grpc.unframe(req.body) else { return 422 } "
+        "guard let value = protobuf.decode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", \"example.RepeatedChild\", payload) else { return 400 } "
+        "guard let bytes = protobuf.encode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", \"example.RepeatedChild\", value) else { return 500 } "
+        "guard let framed = grpc.frame(bytes) else { return 500 } "
+        "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
+        "\"grpc-status\": \"0\"}, body: framed) }\n"
+        "route POST \"/local.Error/Call\" { return response(200, headers: {"
+        "\"content-type\": \"application/grpc\", \"grpc-status\": \"7\"}) }\n",
         get_port(server->listen_fd));
     const bool written = length > 0 && length < static_cast<int>(sizeof(source)) &&
                          write(file, source, length) == length;
@@ -8884,6 +8969,60 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             framed[0] = 0;
             codec(8, framed, sizeof(framed) - 1, 422, nullptr, 0, "/framed");
             codec(9, framed, sizeof(framed), 200, framed, sizeof(framed), "/framed");
+            auto local_rpc = [&](u32 index) {
+                CHECK(client.request_native_raw(
+                          index, framed, sizeof(framed), "1H", nullptr, "/local.Echo/Call") > 0);
+                client.rpcs[index].max_chunk = 1;
+                const bool completed = client.until(index, true);
+                CHECK(completed);
+                if (completed) {
+                    CHECK(client.rpcs[index].ok);
+                    CHECK(client.rpcs[index].status_in_trailers);
+                    CHECK_EQ(client.rpcs[index].http_status, 200u);
+                    CHECK_EQ(client.rpcs[index].response_len, sizeof(framed));
+                    if (client.rpcs[index].response_len == sizeof(framed))
+                        CHECK(memcmp(client.rpcs[index].response.get(), framed, sizeof(framed)) ==
+                              0);
+                }
+            };
+            local_rpc(10);
+            local_rpc(11);
+            // Hold response DATA at zero window, cancel, then reuse the connection.
+            nghttp2_settings_entry zero_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 0};
+            CHECK_EQ(nghttp2_submit_settings(client.session, NGHTTP2_FLAG_NONE, &zero_window, 1),
+                     0);
+            const int stalled = client.request_native_raw(
+                12, framed, sizeof(framed), "1H", nullptr, "/local.Echo/Call");
+            CHECK(stalled > 0);
+            const u64 deadline = monotonic_us() + 5000000;
+            while (!client.rpcs[12].http_status && monotonic_us() < deadline)
+                if (!client.step()) break;
+            CHECK_EQ(client.rpcs[12].http_status, 200u);
+            CHECK_EQ(client.rpcs[12].response_len, 0u);
+            CHECK_EQ(nghttp2_submit_rst_stream(
+                         client.session, NGHTTP2_FLAG_NONE, stalled, NGHTTP2_CANCEL),
+                     0);
+            nghttp2_settings_entry window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535};
+            CHECK_EQ(nghttp2_submit_settings(client.session, NGHTTP2_FLAG_NONE, &window, 1), 0);
+            local_rpc(13);
+            CHECK(client.request_native_raw(
+                      14, framed, sizeof(framed), "1H", nullptr, "/local.Error/Call") > 0);
+            CHECK(client.until(14, true));
+            CHECK_EQ(client.rpcs[14].status, 7u);
+            CHECK(client.rpcs[14].status_in_trailers);
+            CHECK_EQ(client.rpcs[14].response_len, 0u);
+            // Maximum codec payload plus envelope exceeds the inline JIT body.
+            // It must survive arena release in a separately owned pool slice.
+            u8 maximum[8197] = {0, 0, 0, 32, 0, 10, 253, 63, 10, 250, 63};
+            memset(maximum + 11, 'x', sizeof(maximum) - 11);
+            CHECK(client.request_native_raw(
+                      15, maximum, sizeof(maximum), "1H", nullptr, "/local.Echo/Call") > 0);
+            client.rpcs[15].max_chunk = 17;
+            CHECK(client.until(15, true));
+            CHECK(client.rpcs[15].ok && client.rpcs[15].status_in_trailers);
+            CHECK_EQ(client.rpcs[15].response_len, sizeof(maximum));
+            if (client.rpcs[15].response_len == sizeof(maximum))
+                CHECK(memcmp(client.rpcs[15].response.get(), maximum, sizeof(maximum)) == 0);
         }
     }
     shard->stop();

@@ -230,6 +230,7 @@ struct Http2Conn {
     u32 outbound_body_offset;
     bool outbound_final_staged;
     H2OutboundBodySource outbound_source;
+    u8 outbound_grpc_status;  // 0..16: trailers follow DATA; 255: ordinary HTTP.
     u32 queued_stream;
     const RouteConfig* queued_config;
     const u8* queued_body;
@@ -237,6 +238,7 @@ struct Http2Conn {
     u32 queued_body_offset;
     bool queued_final_staged;
     H2OutboundBodySource queued_source;
+    u8 queued_grpc_status;
     // Small JIT bodies fit inline; larger (up to one SlicePool slice) bodies
     // borrow a pool slice until their final DATA frame or cancellation.
     u8 jit_outbound_body[8192];
@@ -277,6 +279,16 @@ struct Http2Conn {
 // encoded block would exceed out_cap.
 u32 http2_write_headers(
     u8* out, u32 out_cap, u32 stream_id, const hpack::Header* hs, u32 n, bool end_stream);
+
+// Stateful variant for response blocks emitted after a peer SETTINGS update.
+// The encoder is committed only when the complete frame fits in out.
+u32 http2_write_headers(u8* out,
+                        u32 out_cap,
+                        u32 stream_id,
+                        const hpack::Header* hs,
+                        u32 n,
+                        bool end_stream,
+                        hpack::Encoder& enc);
 
 // Write a DATA frame for data[0..len) on stream_id into out (must hold
 // kFrameHeaderSize + len). Returns octets written.
