@@ -216,7 +216,13 @@ bool load_native_program(const char* source,
         close(channel[0]);
         return fail("cannot start rut-compile");
     }
-    if (setpgid(child, child) != 0 && errno != EACCES && errno != ESRCH) {
+    // Darwin may report EPERM when the child has already established its
+    // process group and exec'd. Accept that race only after verifying the
+    // requested isolation; other failures still terminate the child.
+    const int group_result = setpgid(child, child);
+    const int group_error = errno;
+    if (group_result != 0 && group_error != EACCES && group_error != ESRCH &&
+        !(group_error == EPERM && getpgid(child) == child)) {
         kill(child, SIGKILL);
         while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
         }
