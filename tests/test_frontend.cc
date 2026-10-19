@@ -40420,7 +40420,10 @@ TEST(frontend, protobuf_nested_inference_reuse_and_unsupported_collections) {
         auto ast = parse_file(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file(*ast.value());
-        if (i == 0 || i == 3) {
+        if (i == 2) {
+            REQUIRE(hir);
+            CHECK(hir.value()->structs[0].fields[0].type == HirTypeKind::Array);
+        } else if (i == 0 || i == 3) {
             REQUIRE(hir);
             CHECK_EQ(hir.value()->structs.len, 2u);
             CHECK(hir.value()->structs[1].fields[0].type == HirTypeKind::Struct);
@@ -40428,6 +40431,33 @@ TEST(frontend, protobuf_nested_inference_reuse_and_unsupported_collections) {
             if (i == 3) CHECK_EQ(hir.value()->structs[1].fields[1].struct_index, 0u);
         } else
             CHECK_FALSE(hir.has_value());
+        if (hir) delete hir.value();
+        delete ast.value();
+    }
+}
+
+TEST(frontend, protobuf_arrays_reject_growth_repeated_messages_and_wait) {
+    const char* tails[] = {"let changed = value.values.append(1) return 200",
+                           "wait(1) return 200",
+                           "return 200",
+                           "guard value.values == value.values else { return 400 } return 200",
+                           "guard value == value else { return 400 } return 200"};
+    for (u32 i = 0; i < 5; ++i) {
+        char code[2048];
+        snprintf(code,
+                 sizeof(code),
+                 "route POST \"/array\" { guard let value = "
+                 "protobuf.decode(\"%s/tests/protobuf/codec.proto\", \"example.%s\", req.body) "
+                 "else { return 400 } %s }",
+                 RUT_PROTO_TEST_ROOT,
+                 i == 2 ? "RepeatedChild" : "RepeatedScalars",
+                 tails[i]);
+        auto tokens = lex(lit(code));
+        REQUIRE(tokens);
+        auto ast = parse_file(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file(*ast.value());
+        CHECK_FALSE(hir.has_value());
         if (hir) delete hir.value();
         delete ast.value();
     }

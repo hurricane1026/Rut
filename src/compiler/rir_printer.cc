@@ -342,6 +342,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::OptWrap:
             buf.put_cstr("opt.wrap");
             break;
+        case Opcode::ArrayFirst:
+            buf.put_cstr("array.first");
+            break;
         case Opcode::ArrayLen:
             buf.put_cstr("array.len");
             break;

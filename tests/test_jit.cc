@@ -22529,6 +22529,219 @@ TEST(jit, protobuf_nested_messages_merge_access_and_reencode) {
     rir.destroy();
 }
 
+TEST(jit, protobuf_repeated_immutable_arrays_roundtrip_and_properties) {
+    const char* src =
+        "route POST \"/arrays\" { "
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.RepeatedScalars\", req.body) else { return 422 } "
+        "let items: [i32] = value.values guard items.count == 3 && items.isEmpty == false && "
+        "value.numbers.first == -1 else { return 410 } "
+        "guard let first = items.first else { return 412 } "
+        "guard let name = value.names.first else { return 414 } "
+        "guard let flag = value.flags.first else { return 416 } "
+        "guard first == 1 && name == \"x\" && flag == false else { return 417 } "
+        "guard let bytes = protobuf.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.RepeatedScalars\", value) else { return 500 } "
+        "return response(200, body: bytes) }\n"
+        "route POST \"/empty\" { "
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.RepeatedScalars\", req.body) else { return 422 } "
+        "guard value.values.isEmpty else { return 410 } guard value.names.count == 0 else { return "
+        "411 } "
+        "guard value.values.first == nil else { return 412 } "
+        "guard value.names.first == nil else { return 413 } return 204 }\n";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    if (!ast)
+        fprintf(stderr,
+                "arrays parse %u:%u %.*s\n",
+                ast.error().span.line,
+                ast.error().span.col,
+                ast.error().detail.len,
+                ast.error().detail.ptr);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir)
+        fprintf(stderr,
+                "arrays analyze %u:%u %.*s\n",
+                hir.error().span.line,
+                hir.error().span.col,
+                hir.error().detail.len,
+                hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    if (!mir)
+        fprintf(stderr,
+                "arrays mir code=%u %u:%u %.*s\n",
+                static_cast<u32>(mir.error().code),
+                mir.error().span.line,
+                mir.error().span.col,
+                mir.error().detail.len,
+                mir.error().detail.ptr);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    if (!lowered)
+        fprintf(stderr,
+                "arrays lower %u:%u %.*s\n",
+                lowered.error().span.line,
+                lowered.error().span.col,
+                lowered.error().detail.len,
+                lowered.error().detail.ptr);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    auto empty = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(empty);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    MappedArray<Connection> connections;
+    REQUIRE(connections.init(1));
+    auto& conn = connections[0];
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    const u8 input[] = {8, 1, 10, 2, 2, 0, 18, 1, 'x', 18, 0, 24, 0, 26, 1, 1, 34, 2, 1, 0};
+    const u8 expected[] = {8, 1, 8, 2, 8, 0, 18, 1, 'x', 18, 0, 24, 0, 24, 1, 32, 1, 32, 0};
+    char request[128];
+    const int header = snprintf(request,
+                                sizeof(request),
+                                "POST /arrays HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                static_cast<u32>(sizeof(input)));
+    memcpy(request + header, input, sizeof(input));
+    auto result = HandlerResult::unpack(handler(
+        &conn, nullptr, reinterpret_cast<const u8*>(request), header + sizeof(input), nullptr));
+    REQUIRE_EQ(result.status_code, 200u);
+    REQUIRE(conn.jit_response_body_valid);
+    memset(request, 'z', sizeof(request));
+    CHECK(conn.jit_response_body.eq({reinterpret_cast<const char*>(expected), sizeof(expected)}));
+    CHECK_EQ(conn.json_arena.collection_items(), 9u);
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    CHECK_EQ(conn.json_arena.collection_items(), 0u);
+    const char* empty_request = "POST /empty HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    result = HandlerResult::unpack(empty(&conn,
+                                         nullptr,
+                                         reinterpret_cast<const u8*>(empty_request),
+                                         strlen(empty_request),
+                                         nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    conn.reset();
+    connections.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, protobuf_array_helper_shared_budget_and_failure) {
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 input[1024];
+    for (u32 i = 0; i < 512; ++i) {
+        input[2 * i] = 8;
+        input[2 * i + 1] = 0;
+    }
+    u8 has = 0;
+    const char* data = nullptr;
+    u32 count = 0;
+    i64 number = 0;
+    const u64 op = (u64{1} << 62) | (1u << 8) | 5u;
+    for (u32 i = 0; i < 8; ++i) {
+        rut_helper_protobuf(nullptr,
+                            &arena,
+                            op,
+                            reinterpret_cast<const char*>(input),
+                            sizeof(input),
+                            nullptr,
+                            0,
+                            nullptr,
+                            0,
+                            0,
+                            &has,
+                            &data,
+                            &count,
+                            &number);
+        REQUIRE_EQ(has, 1u);
+        CHECK_EQ(count, 512u);
+    }
+    CHECK_EQ(arena.collection_items(), 4096u);
+    const auto used = arena.space_used();
+    rut_helper_protobuf(nullptr,
+                        &arena,
+                        op,
+                        reinterpret_cast<const char*>(input),
+                        sizeof(input),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &data,
+                        &count,
+                        &number);
+    CHECK_EQ(has, 0u);
+    CHECK(data == nullptr);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(arena.space_used(), used);
+    arena.reset();
+    CHECK_EQ(arena.collection_items(), 0u);
+    const char malformed[] = {10, 1, static_cast<char>(128)};
+    const auto reset_used = arena.space_used();
+    rut_helper_protobuf(nullptr,
+                        &arena,
+                        op,
+                        malformed,
+                        sizeof(malformed),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &data,
+                        &count,
+                        &number);
+    CHECK_EQ(has, 0u);
+    CHECK_EQ(arena.space_used(), reset_used);
+    CHECK_EQ(arena.collection_items(), 0u);
+    arena.destroy();
+    pool.destroy();
+    REQUIRE(pool.init(1, 0, 0));
+    REQUIRE(arena.init(&pool));
+    REQUIRE(arena.alloc(arena.current->remaining()));
+    const auto full_used = arena.space_used();
+    rut_helper_protobuf(nullptr,
+                        &arena,
+                        op,
+                        reinterpret_cast<const char*>(input),
+                        sizeof(input),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &data,
+                        &count,
+                        &number);
+    CHECK_EQ(has, 0u);
+    CHECK(data == nullptr);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(arena.collection_items(), 0u);
+    CHECK_EQ(arena.space_used(), full_used);
+    arena.destroy();
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
 TEST(jit, protobuf_helper_owns_output_and_preserves_arena_on_allocation_failure) {
     SlicePool pool;
     REQUIRE(pool.init(1, 0, 0));

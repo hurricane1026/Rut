@@ -328,11 +328,44 @@ construct.
 
 Likewise, `if const` is the lightweight compile-time boolean branch.
 
-The current implementation covers the route-local static array subset and lowers
-supported shapes by compile-time unrolling. For that implemented subset, see
+The Core parser currently rejects `for`. Static-loop lowering code is historical
+and does not establish a supported language surface; see
 [docs/for-loops.md](docs/for-loops.md).
 
 ### 3.3 Type System
+
+Runtime immutable arrays use the existing `[T]` type syntax. Their length is known
+at creation time, rather than compilation time, and remains fixed. The initial
+producer is protobuf repeated scalar decoding; general array literals, indexing,
+mutation, growth, append and iteration are not executable Core features.
+
+Each array is a `{data, count}` value with contiguous native element storage.
+Supported element carriers are bool, i32, i64 and string/bytes (both represented
+as `str`). Aliases share immutable request-owned storage; assignment does not
+copy the payload or add reference counting. `.count` returns i32, `.isEmpty`
+returns bool, and `.first` returns an optional element, including nil for empty
+arrays. Empty `.first` selects a valid fallback slot before loading; it never
+loads through the empty-array sentinel. No implicit indexing or trapping API is
+introduced. Arrays and array-bearing structs in routes with explicit `wait` are
+rejected, including nested and inlined producers. This conservative restriction
+precedes future work on suspension-safe collection ownership.
+
+Decoding first validates/counts elements, then allocates exactly one contiguous
+slot region and fills it without growth. String/bytes elements copy their bytes
+into one separately sized Arena region for the array; no element borrows the
+receive buffer. Both allocations use the existing request SliceArena/SlicePool.
+Limits are 512 elements per array, 4,096 array elements across the entire request
+Arena, the existing shared 256 KiB value-memory budget, 8 KiB wire payloads and
+eight nested message edges. Arena init/reset/destroy reset the element budget.
+Exhaustion fails the outer optional decode without publishing a partial result;
+space already allocated remains charged until request reset. Budget checks happen
+before allocation and count only successfully constructed arrays.
+
+Repeated scalar decoding accepts mixed packed/unpacked occurrences and preserves
+wire element order, zero values, false and empty strings. Encoding emits legal
+unpacked occurrences, retaining every element. The existing supported scalar
+mappings/range checks apply. Repeated embedded messages, float/uint64/enum values,
+map/oneof/presence and array construction/transformation APIs remain absent.
 
 #### 3.3.1 Built-in Domain Types
 
@@ -1449,8 +1482,8 @@ eight nesting edges and eight fields per message are supported. Absent messages
 materialize recursively default-valued structs; presence is not exposed, so
 encoding defaults emits an empty embedded message. Recursive types are rejected.
 
-Repeated shapes remain schema-only in Rut; executable codecs for those shapes,
-floating point, uint64/fixed64, enums, oneof/optional presence, maps, proto2 and
+Repeated scalar fields now use the runtime immutable array carriers above.
+Repeated embedded messages, floating point, uint64/fixed64, enums, oneof/optional presence, maps, proto2 and
 editions remain pending. Proto2 must implement explicit presence, defaults and
 required-field validation before being enabled. The source parser rejects custom
 options, public/weak imports, reserved/default/extension declarations and string

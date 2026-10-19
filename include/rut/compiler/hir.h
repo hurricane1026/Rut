@@ -211,6 +211,8 @@ enum class HirExprKind : u8 {
     JsonOp,
     StructDecode,
     ProtoOp,
+    ArrayLen,
+    ArrayFirst,
     // `max(a, b)` / `min(a, b)` builtins — same-width {I32,I64} binary,
     // signed; single evaluation (real opcodes, not an IfElse desugar).
     MaxInt,

@@ -698,6 +698,7 @@ struct Ctx {
             case rir::TypeKind::F64:
                 return LLVMDoubleTypeInContext(llvm_ctx);
             case rir::TypeKind::Str:
+            case rir::TypeKind::Array:
                 return str_ty;
             case rir::TypeKind::ByteSize:
             case rir::TypeKind::Duration:
@@ -1435,6 +1436,39 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildCall2(c.builder, ft, fn, args, 5, "");
             break;
         }
+        case rir::Opcode::ArrayLen: {
+            auto array = c.get_value(inst.operands[0]);
+            c.set_value(inst.result, LLVMBuildExtractValue(c.builder, array, 1, "array.count"));
+            break;
+        }
+        case rir::Opcode::ArrayFirst: {
+            auto array = c.get_value(inst.operands[0]);
+            auto* element = c.cur_fn->values[inst.operands[0].id].type->inner;
+            auto element_type = c.map_type(element);
+            auto count = LLVMBuildExtractValue(c.builder, array, 1, "array.count");
+            auto has = LLVMBuildICmp(
+                c.builder, LLVMIntNE, count, LLVMConstInt(c.i32_ty, 0, 0), "array.has_first");
+            // Select a valid zero slot before loading. LLVM select on loaded
+            // values would still dereference the empty array's sentinel.
+            auto empty = LLVMBuildAlloca(c.builder, element_type, "array.empty_slot");
+            LLVMBuildStore(c.builder, LLVMConstNull(element_type), empty);
+            auto data = LLVMBuildExtractValue(c.builder, array, 0, "array.data");
+            auto safe = LLVMBuildSelect(c.builder, has, data, empty, "array.safe_first");
+            auto value = LLVMBuildLoad2(c.builder, element_type, safe, "array.first");
+            const auto* result_type = c.cur_fn->values[inst.result.id].type;
+            auto result = LLVMGetUndef(c.map_type(result_type));
+            result = LLVMBuildInsertValue(
+                c.builder, result, LLVMBuildZExt(c.builder, has, c.i8_ty, "array.present"), 0, "");
+            if (element->kind == rir::TypeKind::Str) {
+                result = LLVMBuildInsertValue(
+                    c.builder, result, LLVMBuildExtractValue(c.builder, value, 0, ""), 1, "");
+                result = LLVMBuildInsertValue(
+                    c.builder, result, LLVMBuildExtractValue(c.builder, value, 1, ""), 2, "");
+            } else
+                result = LLVMBuildInsertValue(c.builder, result, value, 1, "");
+            c.set_value(inst.result, result);
+            break;
+        }
         case rir::Opcode::JsonOp:
         case rir::Opcode::ProtoOp: {
             const bool kProto = inst.op == rir::Opcode::ProtoOp;
@@ -1480,7 +1514,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             for (u32 i = 0; i < inst.operand_count; ++i) {
                 auto val = c.get_value(inst.operands[i]);
                 const auto* ty = c.cur_fn->values[inst.operands[i].id].type;
-                if (ty->kind == rir::TypeKind::Str) {
+                if (ty->kind == rir::TypeKind::Str || ty->kind == rir::TypeKind::Array) {
                     args[3 + i * 2] = LLVMBuildExtractValue(c.builder, val, 0, "json.arg.ptr");
                     args[4 + i * 2] = LLVMBuildExtractValue(c.builder, val, 1, "json.arg.len");
                 } else if (ty->kind == rir::TypeKind::I64)
@@ -1495,7 +1529,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             const bool optional = result_type->kind == rir::TypeKind::Optional;
             const auto* inner = optional ? result_type->inner : result_type;
             LLVMValueRef result;
-            if (inner->kind == rir::TypeKind::Str) {
+            if (inner->kind == rir::TypeKind::Str || inner->kind == rir::TypeKind::Array) {
                 result = LLVMGetUndef(c.str_ty);
                 result = LLVMBuildInsertValue(
                     c.builder,
@@ -1761,7 +1795,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             if (out_ty == c.i32_ty) {
                 LLVMValueRef v = LLVMBuildExtractValue(c.builder, opt, 1, "uw.i32");
                 c.set_value(inst.result, v);
-            } else if (out_ty == c.str_ty) {
+            } else if (c.cur_fn->values[inst.result.id].type->kind == rir::TypeKind::Str) {
                 LLVMValueRef p = LLVMBuildExtractValue(c.builder, opt, 1, "uw.ptr");
                 LLVMValueRef l = LLVMBuildExtractValue(c.builder, opt, 2, "uw.len");
                 LLVMValueRef strval = LLVMGetUndef(c.str_ty);

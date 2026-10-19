@@ -7,6 +7,7 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/protobuf_array.h"
 #include "rut/runtime/protobuf_value.h"
 
 #include <hs.h>
@@ -1710,8 +1711,49 @@ extern "C" void rut_helper_protobuf(void* conn,
     u8 scratch[protobuf::kMaxMessageBytes];
     Str view{};
     i64 scalar = 0;
-    if (!protobuf::apply(
-            op, {a, a_len}, {b, b_len}, number, scratch, sizeof(scratch), view, scalar))
+    if (op & protobuf::kRepeated) {
+        if (!(op & protobuf::kEncode)) {
+            protobuf::ArrayPlan plan{};
+            if (!protobuf::plan_array(op, {a, a_len}, plan)) return;
+            if (!plan.count) {
+                *has_value = 1;
+                *out_ptr = "";
+                return;
+            }
+            if (!arena && conn) {
+                auto& owned = static_cast<ConnectionBase*>(conn)->json_arena;
+                if (!owned.backend.pool) return;
+                if (!owned.current && !owned.init(owned.backend.pool)) return;
+                arena = &owned;
+            }
+            if (!arena) return;
+            auto& owned = *static_cast<SliceArena*>(arena);
+            const u32 slot_bytes = plan.count * protobuf::array_element_size(static_cast<u8>(op));
+            const u32 needed = ((slot_bytes + 7) & ~7u) + ((plan.bytes + 7) & ~7u);
+            if (owned.collection_items() > protobuf::kMaxRequestArrayElements - plan.count ||
+                owned.space_used() > protobuf::kMaxRequestValueBytes - needed)
+                return;
+            auto* slots = slot_bytes ? static_cast<u8*>(owned.alloc(slot_bytes)) : nullptr;
+            if (slot_bytes && !slots) return;
+            auto* payload = plan.bytes ? static_cast<u8*>(owned.alloc(plan.bytes)) : nullptr;
+            if (plan.bytes && !payload) return;
+            if (!protobuf::fill_array(op, {a, a_len}, slots, payload, plan)) return;
+            owned.set_collection_items(owned.collection_items() + plan.count);
+            *has_value = 1;
+            *out_ptr = slots ? reinterpret_cast<const char*>(slots) : "";
+            *out_len = plan.count;
+            return;
+        }
+        if (!protobuf::encode_array(op,
+                                    {a, a_len},
+                                    reinterpret_cast<const u8*>(b),
+                                    b_len,
+                                    scratch,
+                                    sizeof(scratch),
+                                    view))
+            return;
+    } else if (!protobuf::apply(
+                   op, {a, a_len}, {b, b_len}, number, scratch, sizeof(scratch), view, scalar))
         return;
     if (view.len) {
         if (!arena && conn) {

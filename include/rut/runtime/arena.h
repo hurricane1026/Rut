@@ -82,6 +82,9 @@ struct Arena {
         Block* prev;
         u64 size;  // total block size (including this header)
         u64 used;  // bytes allocated after header
+        // Shared request collection budget. This occupies existing padding:
+        // kHeaderSize is rounded to 32 bytes while the fields above occupy 24.
+        u32 collection_items;
 
         static constexpr u64 kHeaderSize = (sizeof(Block) + 15) & ~u64(15);
         u8* data() { return reinterpret_cast<u8*>(this) + kHeaderSize; }
@@ -92,6 +95,11 @@ struct Arena {
     Block* current = nullptr;
     Backend backend{};
     u64 total_allocated = 0;
+
+    u32 collection_items() const { return current ? current->collection_items : 0; }
+    void set_collection_items(u32 count) {
+        if (current) current->collection_items = count;
+    }
 
     // Initialize with backend-specific args (forwarded to Backend::init).
     template <typename... Args>
@@ -164,6 +172,7 @@ struct Arena {
             current = prev;
         }
         current->used = 0;
+        current->collection_items = 0;
     }
 
     // Free everything.
@@ -194,6 +203,7 @@ private:
         b->prev = prev;
         b->size = actual_size;
         b->used = 0;
+        b->collection_items = prev ? prev->collection_items : 0;
         total_allocated += actual_size;
         return b;
     }

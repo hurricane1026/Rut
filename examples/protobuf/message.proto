@@ -8,3 +8,7 @@ message Envelope {
   Message child = 1;
   string label = 2;
 }
+message Batch {
+  repeated int32 values = 1;
+  repeated string names = 2;
+}

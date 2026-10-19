@@ -845,16 +845,30 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_array(ValueId array, bool first, SourceLoc loc = {}) {
+        if (!val_has_type(array, TypeKind::Array)) return err(RirError::InvalidState);
+        const Type* element = cur_func->values[array.id].type->inner;
+        if (!element) return err(RirError::InvalidState);
+        const Type* ty =
+            first ? TRY(make_type(TypeKind::Optional, element)) : TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(first ? Opcode::ArrayFirst : Opcode::ArrayLen, ty, loc));
+        inst->operands[0] = array;
+        inst->operand_count = 1;
+        return vid;
+    }
+
     Result<ValueId> emit_proto(u64 op,
                                TypeKind result,
                                bool optional,
                                const ValueId* args,
                                u32 count,
-                               SourceLoc loc = {}) {
+                               SourceLoc loc = {},
+                               const Type* array_element = nullptr) {
         if (count > 2) return err(RirError::InvalidState);
         for (u32 i = 0; i < count; ++i)
             if (!valid_val(args[i])) return err(RirError::InvalidState);
-        const Type* ty = TRY(make_type(result));
+        if (result == TypeKind::Array && !array_element) return err(RirError::InvalidState);
+        const Type* ty = TRY(make_type(result, array_element));
         if (optional) ty = TRY(make_type(TypeKind::Optional, ty));
         auto [inst, vid] = TRY(emit(Opcode::ProtoOp, ty, loc));
         inst->imm.i64_val = static_cast<i64>(op);

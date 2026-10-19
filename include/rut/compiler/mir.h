@@ -85,6 +85,8 @@ enum class MirValueKind : u8 {
     JsonOp,
     StructDecode,
     ProtoOp,
+    ArrayLen,
+    ArrayFirst,
     MaxInt,
     MinInt,
     Or,
@@ -112,12 +114,14 @@ enum class MirTypeKind : u8 {
     Method,
     ByteSize,
     IP,
+    Array,
 };
 
 struct MirTypeShape {
     MirTypeKind type = MirTypeKind::Unknown;
     bool is_concrete = false;
     bool carrier_ready = false;
+    u32 array_elem_shape_index = 0xffffffffu;
     u32 generic_index = 0xffffffffu;
     u32 variant_index = 0xffffffffu;
     u32 struct_index = 0xffffffffu;
