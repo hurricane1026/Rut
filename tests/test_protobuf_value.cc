@@ -242,3 +242,23 @@ TEST(protobuf_value, grpc_unary_envelopes_boundaries_and_malformed_inputs) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(protobuf_value, open_enum_unknown_negative_and_default_values) {
+    const i32 values[] = {0, 12345, -1, -2147483647 - 1, 2147483647};
+    for (i32 value : values) {
+        u8 output[32], scratch[32];
+        Str encoded{}, view{};
+        i64 scalar = 0;
+        REQUIRE(apply(kEncode | (1u << 8) | 14,
+                      lit_str(""),
+                      {},
+                      value,
+                      output,
+                      sizeof(output),
+                      encoded,
+                      scalar));
+        REQUIRE(apply((1u << 8) | 14, encoded, {}, 0, scratch, sizeof(scratch), view, scalar));
+        CHECK_EQ(scalar, static_cast<i64>(value));
+        CHECK_EQ(encoded.len, value == 0 ? 0u : value < 0 ? 11u : value == 12345 ? 3u : 6u);
+    }
+}

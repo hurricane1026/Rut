@@ -8819,6 +8819,7 @@ TEST(grpc_proxy, message_limits_snapshot_iouring) {
 #include "grpc_web_h1_cases.h"
 
 #if RUT_GRPC_JIT
+#include "protobuf/enum_oracle.inc"
 #include "protobuf/repeated_oracle.inc"
 
 template <typename Loop>
@@ -8879,6 +8880,15 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "\"13\"}) } "
         "guard let framed = grpc.encode(\"" RUT_GRPC_FIXTURES
         "/../protobuf/codec.proto\", \"/example.UnaryCodec/Echo\", value) else { return 500 } "
+        "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
+        "\"grpc-status\": \"0\"}, body: framed) }\n"
+        "route POST \"/example.EnumCodec/Echo\" { "
+        "guard let value = grpc.decode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/enum.proto\", \"/example.EnumCodec/Echo\", req.body) else { "
+        "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
+        "\"grpc-status\": \"13\"}) } "
+        "guard let framed = grpc.encode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/enum.proto\", \"/example.EnumCodec/Echo\", value) else { return 500 } "
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
         "\"grpc-status\": \"0\"}, body: framed) }\n"
         "route POST \"/local.Error/Call\" { return response(200, headers: {"
@@ -9064,6 +9074,100 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                 const u8 invalid[] = {0, 0, 0, 0, 1, 128};
                 invoke_method(4, invalid, sizeof(invalid), 13);
                 invoke_method(5, framed, sizeof(framed), 0);
+                Client enum_client;
+                const bool enum_connected = enum_client.init(get_port(lfd));
+                CHECK(enum_connected);
+                if (enum_connected) {
+                    auto invoke_enum = [&](u32 index,
+                                           const u8* payload,
+                                           u32 size,
+                                           const u8* expected,
+                                           u32 expected_size,
+                                           u32 status) {
+                        u8 envelope[1024]{};
+                        for (u32 n = 0; n < 4; ++n)
+                            envelope[n + 1] = static_cast<u8>(size >> (24 - 8 * n));
+                        memcpy(envelope + 5, payload, size);
+                        CHECK(enum_client.request_native_raw(index,
+                                                             envelope,
+                                                             size + 5,
+                                                             "1H",
+                                                             nullptr,
+                                                             "/example.EnumCodec/Echo") > 0);
+                        enum_client.rpcs[index].max_chunk = 1;
+                        const bool complete = enum_client.until(index, true);
+                        CHECK(complete);
+                        if (!complete) return;
+                        CHECK_EQ(enum_client.rpcs[index].status, status);
+                        CHECK(enum_client.rpcs[index].status_in_trailers);
+                        CHECK_EQ(enum_client.rpcs[index].response_len,
+                                 status ? 0u : expected_size + 5);
+                        if (!status && enum_client.rpcs[index].response_len == expected_size + 5) {
+                            const auto* response = enum_client.rpcs[index].response.get();
+                            CHECK_EQ(response[0], 0u);
+                            for (u32 n = 0; n < 4; ++n)
+                                CHECK_EQ(response[n + 1],
+                                         static_cast<u8>(expected_size >> (24 - 8 * n)));
+                            CHECK(memcmp(response + 5, expected, expected_size) == 0);
+                        }
+                    };
+                    invoke_enum(0,
+                                kEnumPacked,
+                                sizeof(kEnumPacked),
+                                kEnumCanonical,
+                                sizeof(kEnumCanonical),
+                                0);
+                    invoke_enum(1,
+                                kEnumCanonical,
+                                sizeof(kEnumCanonical),
+                                kEnumCanonical,
+                                sizeof(kEnumCanonical),
+                                0);
+                    const u8 malformed[] = {18, 3, 18, 1, 128};
+                    invoke_enum(2, malformed, sizeof(malformed), nullptr, 0, 13);
+                    invoke_enum(
+                        3, kEnumOverElementLimit, sizeof(kEnumOverElementLimit), nullptr, 0, 13);
+                    invoke_enum(4,
+                                kEnumPacked,
+                                sizeof(kEnumPacked),
+                                kEnumCanonical,
+                                sizeof(kEnumCanonical),
+                                0);
+                    // Stall response DATA so cancellation exercises an owned enum response,
+                    // rather than cancelling a request that has not reached its handler.
+                    nghttp2_settings_entry paused_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 0};
+                    CHECK_EQ(nghttp2_submit_settings(
+                                 enum_client.session, NGHTTP2_FLAG_NONE, &paused_window, 1),
+                             0);
+                    const u8 empty_frame[] = {0, 0, 0, 0, 0};
+                    const int32_t cancelled =
+                        enum_client.request_native_raw(5,
+                                                       empty_frame,
+                                                       sizeof(empty_frame),
+                                                       "1H",
+                                                       nullptr,
+                                                       "/example.EnumCodec/Echo");
+                    CHECK(cancelled > 0);
+                    const u64 enum_deadline = monotonic_us() + 5000000;
+                    while (!enum_client.rpcs[5].http_status && monotonic_us() < enum_deadline)
+                        if (!enum_client.step()) break;
+                    CHECK_EQ(enum_client.rpcs[5].http_status, 200u);
+                    CHECK_EQ(enum_client.rpcs[5].response_len, 0u);
+                    CHECK_EQ(nghttp2_submit_rst_stream(
+                                 enum_client.session, NGHTTP2_FLAG_NONE, cancelled, NGHTTP2_CANCEL),
+                             0);
+                    nghttp2_settings_entry resumed_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+                                                          65535};
+                    CHECK_EQ(nghttp2_submit_settings(
+                                 enum_client.session, NGHTTP2_FLAG_NONE, &resumed_window, 1),
+                             0);
+                    invoke_enum(6,
+                                kEnumPacked,
+                                sizeof(kEnumPacked),
+                                kEnumCanonical,
+                                sizeof(kEnumCanonical),
+                                0);
+                }
             }
         }
     }

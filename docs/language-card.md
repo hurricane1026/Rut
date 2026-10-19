@@ -425,7 +425,7 @@ Paths and fully qualified message names must be literals. Paths resolve relative
 to the current `.rut` file. The compiler reads proto3 imports and generates an
 internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most
-eight fields per message: string/bytes, bool, signed 32/64-bit,
+eight fields per message: string/bytes, bool, open enum numbers (i32), signed 32/64-bit,
 unsigned/fixed 32-bit and acyclic embedded message fields. Unsigned/fixed 32-bit
 fields infer i64 with range-checked encoding; repeated scalar/message fields infer `[T]`.
 User i64 annotations remain
@@ -437,8 +437,16 @@ structs (up to eight nesting edges); duplicate
 submessages merge, and absent messages expose recursively default-valued structs.
 Presence is not exposed: encoding such a default struct emits an empty embedded
 message. Floating point, unsigned 64-bit values,
-enums, oneof/presence/maps and proto2 are not executable codec shapes yet. See
+oneof/presence/maps and proto2 are not executable codec shapes yet. See
 [the example and source grammar limits](../examples/protobuf/README.md).
+Proto3 enum fields use `i32` (and `[i32]` for repeated fields), preserving unknown
+numeric values, negative values and the zero default. Top-level, nested and imported
+enum declarations resolve at compile time; no Rut enum keyword or named-value API
+is added. The first declared value must be zero, names must be unique in their
+protobuf scope, and duplicate numbers require `option allow_alias = true`.
+Enum declarations are bounded to 1,024 types and 16,384 values per schema; reserved
+declarations, custom options and enum JSON names remain unsupported. Packed and
+unpacked repeated enum inputs may mix; encoding emits unpacked values.
 Repeated scalar and acyclic message arrays support `.count` (i32), `.isEmpty` (bool) and `.first`
 (optional element). `let items: [i32] = message.values` aliases immutable,
 request-owned storage. Empty arrays return nil from `.first`; repeated defaults

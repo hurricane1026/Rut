@@ -476,3 +476,71 @@ TEST(protobuf_array, invalid_native_layout_is_rejected_before_allocation) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(protobuf_array, packed_open_enum_preserves_unknown_negative_and_defaults) {
+    const u8 input[] = {10, 12, 0, 123, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1};
+    ArrayPlan plan{};
+    const u64 op = kRepeated | (1u << 8) | 14;
+    REQUIRE(plan_array(op, view(input, sizeof(input)), plan));
+    REQUIRE_EQ(plan.count, 3u);
+    i32 slots[3]{};
+    REQUIRE(
+        fill_array(op, view(input, sizeof(input)), reinterpret_cast<u8*>(slots), nullptr, plan));
+    CHECK_EQ(slots[0], 0);
+    CHECK_EQ(slots[1], 123);
+    CHECK_EQ(slots[2], -1);
+    u8 output[32];
+    Str encoded{};
+    REQUIRE(encode_array(op | kEncode,
+                         lit_str(""),
+                         reinterpret_cast<const u8*>(slots),
+                         3,
+                         output,
+                         sizeof(output),
+                         encoded));
+    ArrayPlan again{};
+    REQUIRE(plan_array(op, encoded, again));
+    CHECK_EQ(again.count, 3u);
+}
+
+TEST(protobuf_array, enum_truncated_varints_limits_and_output_capacity) {
+    const u64 op = kRepeated | (1u << 8) | 14;
+    for (u32 length = 1; length <= 10; ++length) {
+        u8 input[12] = {10, static_cast<u8>(length)};
+        for (u32 i = 0; i < length; ++i) input[i + 2] = 255;
+        if (length == 10) input[11] = 2;  // Ten-byte varints may carry only one final bit.
+        ArrayPlan plan{7, 9};
+        CHECK_FALSE(plan_array(op, view(input, length + 2), plan));
+        CHECK_EQ(plan.count, 7u);
+        CHECK_EQ(plan.bytes, 9u);
+    }
+    // A 512-element packed enum field has a two-byte length prefix.
+    u8 input[3 + kMaxArrayElements] = {10, 128, 4};
+    ArrayPlan plan{};
+    REQUIRE(plan_array(op, view(input, sizeof(input)), plan));
+    CHECK_EQ(plan.count, kMaxArrayElements);
+    const i32 values[] = {-1, 0, 12345};
+    u8 output[32];
+    Str encoded{};
+    REQUIRE(encode_array(op | kEncode,
+                         lit_str(""),
+                         reinterpret_cast<const u8*>(values),
+                         3,
+                         output,
+                         sizeof(output),
+                         encoded));
+    const u32 required = encoded.len;
+    for (u32 capacity = 0; capacity < required; ++capacity) {
+        Str failed{};
+        CHECK_FALSE(encode_array(op | kEncode,
+                                 lit_str(""),
+                                 reinterpret_cast<const u8*>(values),
+                                 3,
+                                 output,
+                                 capacity,
+                                 failed));
+    }
+    CHECK_EQ(values[0], -1);
+    CHECK_EQ(values[1], 0);
+    CHECK_EQ(values[2], 12345);
+}

@@ -8201,3 +8201,21 @@ failure retains the null byte-view sentinel through framing, returning nil rathe
 than an empty RPC. Each direction uses its own schema field numbers, including
 when request and response have identical field names. Routes and status headers
 remain explicit; generated dispatch and local deadline scheduling are separate.
+
+
+### Proto3 open enum codecs
+
+Source and descriptor loaders retain bounded enum declarations and validate their
+names, int32 values, zero first value, aliases, namespace collisions and import
+visibility. Enum references remain distinct from message references, including RPC
+signatures which require messages. The source parser resolves forward references
+before writing descriptor field types. Limits are 1,024 enum types and 16,384 enum
+values across a schema, independently tighten-able through SchemaLimits.
+
+Executable enum fields use the existing i32 carrier, with repeated fields using
+immutable i32 arrays. The existing field operation ABI carries protobuf type 14;
+wire handling follows signed int32 varints, including ten-byte negative values.
+Unknown proto3 enum numbers are retained rather than rejected or coerced to zero.
+Repeated and nested message layouts use the same carrier validation and output
+schema types as other scalar fields. No runtime reflection, new keyword or library
+is introduced; symbolic Rut enum values and protobuf JSON mapping remain absent.

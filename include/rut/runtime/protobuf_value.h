@@ -82,7 +82,7 @@ inline bool apply(
         return status == Status::End;
     }
     if (!kTag || kTag > 0x1fffffff || kType > 18 || !kType || kType == 1 || kType == 2 ||
-        kType == 4 || kType == 6 || kType == 10 || kType == 14)
+        kType == 4 || kType == 6 || kType == 10)
         return false;
     const u8 kWire = kType == 9 || kType == 11 || kType == 12 ? 2
                      : kType == 7 || kType == 15              ? 5
@@ -119,7 +119,7 @@ inline bool apply(
                 scalar = zigzag_decode(field.value);
             else if (kType == 8)
                 scalar = field.value != 0;
-            else if (kType == 5 || kType == 15)
+            else if (kType == 5 || kType == 14 || kType == 15)
                 scalar = static_cast<i32>(field.value);
             else if (kType == 7 || kType == 13)
                 scalar = static_cast<u32>(field.value);

@@ -13,7 +13,7 @@ struct ArrayPlan {
 inline u32 array_element_size(u8 type) {
     if (type == 9 || type == 12) return sizeof(Str);
     if (type == 8) return sizeof(u8);
-    if (type == 5 || type == 15 || type == 17) return sizeof(i32);
+    if (type == 5 || type == 14 || type == 15 || type == 17) return sizeof(i32);
     if (type == 3 || type == 16 || type == 18 || type == 7 || type == 13) return sizeof(i64);
     return 0;
 }
@@ -60,7 +60,7 @@ inline bool walk_array(u64 op, Str input, Visit visit) {
                 value = zigzag_decode(static_cast<u32>(raw));
             else if (type == 18)
                 value = zigzag_decode(raw);
-            else if (type == 5 || type == 15)
+            else if (type == 5 || type == 14 || type == 15)
                 value = static_cast<i32>(raw);
             else if (type == 7 || type == 13)
                 value = static_cast<u32>(raw);
