@@ -816,3 +816,145 @@ route POST "/jwt" {
     loop->free_conn(*conn);
     pool.destroy();
 }
+
+TEST(json_network, grpc_local_trailers_follow_data_without_flow_control_credit) {
+    auto h2 = std::make_unique<Http2Conn>();
+    h2->init();
+    h2->nstreams = 1;
+    h2->streams[0].id = 1;
+    auto* stream = &h2->streams[0];
+    stream->state = Http2StreamState::HalfClosedRemote;
+    const u8 body[] = {0, 0, 0, 0, 0};
+    h2->outbound_stream = 1;
+    h2->outbound_body = body;
+    h2->outbound_body_len = sizeof(body);
+    h2->outbound_grpc_status = 16;
+    stream->send_window = 2;
+    h2->conn_send_window = 5;
+    u8 bytes[128];
+    H2PumpStatus status{};
+    CHECK_EQ(h2_pump_outbound(*h2, bytes, sizeof(bytes), status), 11u);
+    CHECK_EQ(bytes[3], 0u);
+    CHECK_EQ(bytes[4] & 1u, 0u);
+    CHECK_EQ(h2_pump_outbound(*h2, bytes, sizeof(bytes), status), 0u);
+    stream->send_window = 3;
+    CHECK_EQ(h2_pump_outbound(*h2, bytes, sizeof(bytes), status), 12u);
+    CHECK_EQ(bytes[4] & 1u, 0u);
+    CHECK(!h2->outbound_final_staged);
+    CHECK_EQ(h2->conn_send_window, 0);
+    CHECK_EQ(stream->send_window, 0);
+    // Too-small output cannot retire the stream or lose the pending status.
+    CHECK_EQ(h2_pump_outbound(*h2, bytes, 9, status), 0u);
+    CHECK(!h2->outbound_final_staged);
+    CHECK(h2_pump_outbound(*h2, bytes, sizeof(bytes), status) > 9u);
+    CHECK_EQ(bytes[3], 1u);  // HEADERS
+    CHECK_EQ(bytes[4] & 1u, 1u);
+    CHECK(h2->outbound_final_staged);
+    CHECK_EQ(h2_pump_outbound(*h2, bytes, sizeof(bytes), status), 0u);
+    h2_clear_outbound(*h2);
+    CHECK_EQ(h2->outbound_grpc_status, 255u);
+    CHECK_EQ(h2->queued_grpc_status, 255u);
+    h2->queued_stream = 3;
+    h2->queued_body = body;
+    h2->queued_body_len = sizeof(body);
+    h2->queued_source = H2OutboundBodySource::RouteConfig;
+    h2->queued_grpc_status = 7;
+    h2_promote_queued(*h2);
+    CHECK_EQ(h2->outbound_stream, 3u);
+    CHECK_EQ(h2->outbound_grpc_status, 7u);
+    CHECK_EQ(h2->queued_grpc_status, 255u);
+    h2_clear_outbound(*h2);
+    h2->outbound_stream = 1;
+    h2->outbound_body = body;
+    h2->outbound_body_len = sizeof(body);
+    h2->conn_send_window = 5;
+    stream->send_window = 5;
+    CHECK_EQ(h2_pump_outbound(*h2, bytes, sizeof(bytes), status), 14u);
+    CHECK_EQ(bytes[4] & 1u, 1u);  // Ordinary HTTP still ends on its final DATA.
+}
+
+TEST(json_network, grpc_local_response_rejects_invalid_status_or_frame_before_staging) {
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    auto h2 = std::make_unique<Http2Conn>();
+    conn->h2 = h2.get();
+    const char good[] = {0, 0, 0, 0, 0};
+    const char compressed[] = {1, 0, 0, 0, 0};
+    const char truncated[] = {0, 0, 0, 0, 1};
+    const Str bodies[] = {{good, 5},
+                          {good, 5},
+                          {good, 5},
+                          {good, 5},
+                          {"bad", 3},
+                          {compressed, 5},
+                          {truncated, 5},
+                          {good, 5},
+                          {good, 5},
+                          {good, 5},
+                          {good, 5}};
+    const Str statuses[] = {{"17", 2},
+                            {"00", 2},
+                            {"-1", 2},
+                            {"", 0},
+                            {"0", 1},
+                            {"0", 1},
+                            {"0", 1},
+                            {"0", 1},
+                            {"0", 1},
+                            {"0", 1},
+                            {"0", 1}};
+    for (u32 i = 0; i < 11; ++i) {
+        h2->init();
+        h2->nstreams = 1;
+        h2->streams[0].id = 1;
+        h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+        conn->epoch_held = true;
+        conn->jit_response_body_valid = true;
+        conn->jit_response_body = bodies[i];
+        conn->resp_header_mutation_count = 2;
+        conn->resp_header_mutations[0] = {{"content-type", 12},
+                                          {"application/grpc", 16},
+                                          Connection::RespHeaderMutationMode::Set};
+        conn->resp_header_mutations[1] = {
+            {"grpc-status", 11}, statuses[i], Connection::RespHeaderMutationMode::Set};
+        if (i == 9 || i == 10) {
+            conn->resp_header_mutation_count = 3;
+            conn->resp_header_mutations[2] =
+                i == 9 ? conn->resp_header_mutations[1] : conn->resp_header_mutations[0];
+            conn->resp_header_mutations[2].mode = Connection::RespHeaderMutationMode::Add;
+        }
+        JitDispatchOutcome outcome{};
+        outcome.status_code = i == 7 ? 201 : 200;
+        outcome.response_body_idx = 0xffffu;
+        u8 response[1024];
+        H2Dispatch<SmallLoop> dispatch{loop.get(), conn, response, sizeof(response), 0, false};
+        h2_emit_outcome(dispatch, 1, outcome, nullptr, i == 8);
+        CHECK_EQ(h2->outbound_stream, 0u);
+        CHECK_EQ(h2->queued_stream, 0u);
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &frame), ParseStatus::Complete);
+        CHECK_EQ(frame.flags & http2_flag::kEndStream, http2_flag::kEndStream);
+        hpack::DynamicTable decoder;
+        decoder.init(kDefaultHeaderTableSize);
+        hpack::Header headers[8];
+        u8 scratch[256];
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(decoder,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           8,
+                                           &count));
+        bool failed_closed = false;
+        for (u32 j = 0; j < count; ++j)
+            failed_closed |=
+                headers[j].name.eq(lit_str(":status")) && headers[j].value.eq(lit_str("500"));
+        CHECK(failed_closed);
+    }
+    conn->h2 = nullptr;
+    loop->free_conn(*conn);
+}

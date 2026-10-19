@@ -202,6 +202,7 @@ inline void h2_promote_queued(Http2Conn& h2) {
     h2.outbound_body_offset = h2.queued_body_offset;
     h2.outbound_final_staged = h2.queued_final_staged;
     h2.outbound_source = h2.queued_source;
+    h2.outbound_grpc_status = h2.queued_grpc_status;
     if (h2.outbound_source == H2OutboundBodySource::JitDynamic) {
         if (h2.jit_queued_slice != nullptr) {
             h2.jit_outbound_slice = h2.jit_queued_slice;
@@ -221,6 +222,7 @@ inline void h2_promote_queued(Http2Conn& h2) {
     h2.queued_body_offset = 0;
     h2.queued_final_staged = false;
     h2.queued_source = H2OutboundBodySource::None;
+    h2.queued_grpc_status = 255;
 }
 
 inline void h2_clear_primary_outbound(Http2Conn& h2) {
@@ -235,6 +237,7 @@ inline void h2_clear_primary_outbound(Http2Conn& h2) {
     h2.outbound_body_offset = 0;
     h2.outbound_final_staged = false;
     h2.outbound_source = H2OutboundBodySource::None;
+    h2.outbound_grpc_status = 255;
 }
 
 inline void h2_clear_queued_outbound(Http2Conn& h2) {
@@ -249,6 +252,7 @@ inline void h2_clear_queued_outbound(Http2Conn& h2) {
     h2.queued_body_offset = 0;
     h2.queued_final_staged = false;
     h2.queued_source = H2OutboundBodySource::None;
+    h2.queued_grpc_status = 255;
 }
 
 enum class H2PumpStatus : u8 { Blocked, Produced, Invalid };
@@ -260,7 +264,7 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
     status = H2PumpStatus::Blocked;
     if (h2.outbound_stream == 0 || h2.outbound_final_staged) return 0;
     if (h2.outbound_body == nullptr || h2.outbound_body_len == 0 ||
-        h2.outbound_body_offset >= h2.outbound_body_len) {
+        h2.outbound_body_offset > h2.outbound_body_len) {
         status = H2PumpStatus::Invalid;
         return 0;
     }
@@ -272,6 +276,24 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
                               stream->state != Http2StreamState::HalfClosedRemote)) {
         status = H2PumpStatus::Invalid;
         return 0;
+    }
+    // Trailers do not consume DATA flow-control credit. Publish them only
+    // after all payload octets, and retain ownership until their send completes.
+    if (h2.outbound_body_offset == h2.outbound_body_len) {
+        if (h2.outbound_grpc_status > 16) {
+            status = H2PumpStatus::Invalid;
+            return 0;
+        }
+        char value[2];
+        const u32 length = h2.outbound_grpc_status < 10 ? 1u : 2u;
+        value[0] = static_cast<char>('0' + h2.outbound_grpc_status / (length == 1 ? 1 : 10));
+        value[1] = static_cast<char>('0' + h2.outbound_grpc_status % 10);
+        const hpack::Header trailers[] = {{{"grpc-status", 11}, {value, length}}};
+        const u32 n = http2_write_headers(out, cap, h2.outbound_stream, trailers, 1, true);
+        if (!n) return 0;
+        h2.outbound_final_staged = true;
+        status = H2PumpStatus::Produced;
+        return n;
     }
     if (h2.conn_send_window <= 0 || stream->send_window <= 0) return 0;
     if (cap < kFrameHeaderSize + 1) return 0;
@@ -285,14 +307,15 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
     Http2FrameHeader frame{};
     frame.length = n;
     frame.type = static_cast<u8>(Http2FrameType::Data);
-    frame.flags = (n == kRemaining) ? http2_flag::kEndStream : 0;
+    const bool final_data = n == kRemaining && h2.outbound_grpc_status > 16;
+    frame.flags = final_data ? http2_flag::kEndStream : 0;
     frame.stream_id = h2.outbound_stream;
     write_frame_header(out, frame);
     __builtin_memcpy(out + kFrameHeaderSize, h2.outbound_body + h2.outbound_body_offset, n);
     h2.outbound_body_offset += n;
     h2.conn_send_window -= n;
     stream->send_window -= static_cast<i32>(n);
-    h2.outbound_final_staged = n == kRemaining;
+    h2.outbound_final_staged = final_data;
     status = H2PumpStatus::Produced;
     return kFrameHeaderSize + n;
 }
@@ -320,7 +343,8 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
                              const u8* body,
                              u32 body_len,
                              H2OutboundBodySource source,
-                             const RouteConfig* cfg) {
+                             const RouteConfig* cfg,
+                             u8 grpc_status = 255) {
     Http2Conn& h2 = *d.conn->h2;
     if (body_len == 0 || !d.conn->epoch_held || h2.find_stream(stream_id) == nullptr) return false;
     const bool queued = h2.outbound_stream != 0;
@@ -389,6 +413,7 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         h2.queued_body_offset = 0;
         h2.queued_final_staged = false;
         h2.queued_source = source;
+        h2.queued_grpc_status = grpc_status;
         h2.jit_queued_slice = body_slice;
         h2.jit_queued_pool = body_pool;
     } else {
@@ -400,6 +425,7 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         h2.outbound_body_offset = 0;
         h2.outbound_final_staged = false;
         h2.outbound_source = source;
+        h2.outbound_grpc_status = grpc_status;
         h2.jit_outbound_slice = body_slice;
         h2.jit_outbound_pool = body_pool;
     }
@@ -961,6 +987,46 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
+    u8 grpc_status = 255;
+    u32 grpc_status_index = nhdrs, content_types = 0, statuses = 0;
+    bool native_grpc = false;
+    for (u32 i = 0; i < nhdrs; ++i) {
+        if (grpc_header_name(hdrs[i].name, {"content-type", 12})) {
+            ++content_types;
+            native_grpc |= grpc_content_type(hdrs[i].value);
+        }
+        if (grpc_header_name(hdrs[i].name, {"grpc-status", 11})) {
+            ++statuses;
+            grpc_status_index = i;
+        }
+    }
+    if (native_grpc && statuses) {
+        const Str value = hdrs[grpc_status_index].value;
+        const bool single = value.len == 1 && value.ptr[0] >= '0' && value.ptr[0] <= '9';
+        const bool two =
+            value.len == 2 && value.ptr[0] == '1' && value.ptr[1] >= '0' && value.ptr[1] <= '6';
+        if (content_types != 1 || statuses != 1 || (!single && !two) || o.status_code != 200 ||
+            is_head) {
+            h2_emit_status(d, stream_id, 500);
+            return;
+        }
+        grpc_status = static_cast<u8>(single ? value.ptr[0] - '0' : 10 + value.ptr[1] - '0');
+        if (body_len) {
+            // A local unary response contains exactly one uncompressed frame.
+            if (!body || body_len < 5 || body_len > 8197 || body[0] != 0) {
+                h2_emit_status(d, stream_id, 500);
+                return;
+            }
+            u32 payload = 0;
+            for (u32 j = 1; j < 5; ++j) payload = (payload << 8) | body[j];
+            if (payload != body_len - 5) {
+                h2_emit_status(d, stream_id, 500);
+                return;
+            }
+            for (u32 j = grpc_status_index + 1; j < nhdrs; ++j) hdrs[j - 1] = hdrs[j];
+            --nhdrs;
+        }
+    }
     // Statuses that cannot carry a representation body are serialized without
     // one over HTTP/2 too, matching the ordinary HTTP/1 formatter.
     const bool bodyless_status =
@@ -999,7 +1065,8 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                                      o.response_body_idx == 0xffffu
                                          ? H2OutboundBodySource::JitDynamic
                                          : H2OutboundBodySource::RouteConfig,
-                                     cfg)) {
+                                     cfg,
+                                     grpc_status)) {
             if (!d.overflow) h2_emit_status(d, stream_id, 500);
         }
     } else {

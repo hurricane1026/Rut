@@ -445,6 +445,7 @@ struct Client {
         static constexpr u32 kWebBufferCap = 262144;
         u32 sent = 0, received = 0, size = 0;
         u32 status = 99, http_status = 0;
+        bool status_in_trailers = false;
         u32 raw_len = 0, max_chunk = 0, response_len = 0;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
              meta = false, trailer = false, raw_request = false, compare_pattern = true,
@@ -516,6 +517,7 @@ struct Client {
         }
         if (n == 11 && memcmp(name, "grpc-status", n) == 0) {
             rpc.ok = v == 1 && *value == '0';
+            rpc.status_in_trailers = (f->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
             rpc.status = 0;
             for (size_t i = 0; i < v; i++) rpc.status = rpc.status * 10 + value[i] - '0';
         }
@@ -8788,7 +8790,18 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "guard let bytes = protobuf.encode(\"" RUT_GRPC_FIXTURES
         "/../protobuf/codec.proto\", \"example.RepeatedChild\", value) else { return 500 } "
         "guard let framed = grpc.frame(bytes) else { return 500 } "
-        "return response(200, body: framed) }\n",
+        "return response(200, body: framed) }\n"
+        "route POST \"/local.Echo/Call\" { "
+        "guard let payload = grpc.unframe(req.body) else { return 422 } "
+        "guard let value = protobuf.decode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", \"example.RepeatedChild\", payload) else { return 400 } "
+        "guard let bytes = protobuf.encode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", \"example.RepeatedChild\", value) else { return 500 } "
+        "guard let framed = grpc.frame(bytes) else { return 500 } "
+        "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
+        "\"grpc-status\": \"0\"}, body: framed) }\n"
+        "route POST \"/local.Error/Call\" { return response(200, headers: {"
+        "\"content-type\": \"application/grpc\", \"grpc-status\": \"7\"}) }\n",
         get_port(server->listen_fd));
     const bool written = length > 0 && length < static_cast<int>(sizeof(source)) &&
                          write(file, source, length) == length;
@@ -8884,6 +8897,60 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             framed[0] = 0;
             codec(8, framed, sizeof(framed) - 1, 422, nullptr, 0, "/framed");
             codec(9, framed, sizeof(framed), 200, framed, sizeof(framed), "/framed");
+            auto local_rpc = [&](u32 index) {
+                CHECK(client.request_native_raw(
+                          index, framed, sizeof(framed), "1H", nullptr, "/local.Echo/Call") > 0);
+                client.rpcs[index].max_chunk = 1;
+                const bool completed = client.until(index, true);
+                CHECK(completed);
+                if (completed) {
+                    CHECK(client.rpcs[index].ok);
+                    CHECK(client.rpcs[index].status_in_trailers);
+                    CHECK_EQ(client.rpcs[index].http_status, 200u);
+                    CHECK_EQ(client.rpcs[index].response_len, sizeof(framed));
+                    if (client.rpcs[index].response_len == sizeof(framed))
+                        CHECK(memcmp(client.rpcs[index].response.get(), framed, sizeof(framed)) ==
+                              0);
+                }
+            };
+            local_rpc(10);
+            local_rpc(11);
+            // Hold response DATA at zero window, cancel, then reuse the connection.
+            nghttp2_settings_entry zero_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 0};
+            CHECK_EQ(nghttp2_submit_settings(client.session, NGHTTP2_FLAG_NONE, &zero_window, 1),
+                     0);
+            const int stalled = client.request_native_raw(
+                12, framed, sizeof(framed), "1H", nullptr, "/local.Echo/Call");
+            CHECK(stalled > 0);
+            const u64 deadline = monotonic_us() + 5000000;
+            while (!client.rpcs[12].http_status && monotonic_us() < deadline)
+                if (!client.step()) break;
+            CHECK_EQ(client.rpcs[12].http_status, 200u);
+            CHECK_EQ(client.rpcs[12].response_len, 0u);
+            CHECK_EQ(nghttp2_submit_rst_stream(
+                         client.session, NGHTTP2_FLAG_NONE, stalled, NGHTTP2_CANCEL),
+                     0);
+            nghttp2_settings_entry window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535};
+            CHECK_EQ(nghttp2_submit_settings(client.session, NGHTTP2_FLAG_NONE, &window, 1), 0);
+            local_rpc(13);
+            CHECK(client.request_native_raw(
+                      14, framed, sizeof(framed), "1H", nullptr, "/local.Error/Call") > 0);
+            CHECK(client.until(14, true));
+            CHECK_EQ(client.rpcs[14].status, 7u);
+            CHECK(client.rpcs[14].status_in_trailers);
+            CHECK_EQ(client.rpcs[14].response_len, 0u);
+            // Maximum codec payload plus envelope exceeds the inline JIT body.
+            // It must survive arena release in a separately owned pool slice.
+            u8 maximum[8197] = {0, 0, 0, 32, 0, 10, 253, 63, 10, 250, 63};
+            memset(maximum + 11, 'x', sizeof(maximum) - 11);
+            CHECK(client.request_native_raw(
+                      15, maximum, sizeof(maximum), "1H", nullptr, "/local.Echo/Call") > 0);
+            client.rpcs[15].max_chunk = 17;
+            CHECK(client.until(15, true));
+            CHECK(client.rpcs[15].ok && client.rpcs[15].status_in_trailers);
+            CHECK_EQ(client.rpcs[15].response_len, sizeof(maximum));
+            if (client.rpcs[15].response_len == sizeof(maximum))
+                CHECK(memcmp(client.rpcs[15].response.get(), maximum, sizeof(maximum)) == 0);
         }
     }
     shard->stop();

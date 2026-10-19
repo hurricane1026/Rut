@@ -8170,3 +8170,19 @@ Framed output can be 8 KiB plus five bytes without raising protobuf payload limi
 No new keyword, dependency, service dispatch or streaming container is introduced.
 These operations bridge opaque message bytes to the payload codec; HTTP/JSON
 transcoding and local gRPC status/trailer generation remain separate work.
+
+
+### Local unary response completion
+
+Explicit local HTTP/2 responses with native gRPC content type and grpc-status
+validate the canonical status and a single uncompressed bounded message before
+staging DATA. The two existing owned-output slots carry an additional numeric
+status (255 means ordinary HTTP). The final DATA fragment leaves END_STREAM
+clear; a subsequent pump writes stateless HPACK grpc-status trailing HEADERS
+with END_STREAM, independent of exhausted DATA windows. Ownership remains pinned
+until that trailing write completes. Promotion, reset and clear paths copy or
+reset status together with the body owner. Empty local responses use the existing
+trailers-only HEADERS serializer. No new connection-base allocation, keyword,
+helper ABI or external runtime dependency is introduced. This is local unary
+response transport, not generated service dispatch, deadline scheduling or a
+streaming Rut API.

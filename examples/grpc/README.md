@@ -170,3 +170,22 @@ Change both the preflight route and response headers for your application's
 origin and request headers. CORS is configured through ordinary routes and
 response middleware; the gateway does not automatically reflect origins.
 The HTTP/1.1 bridge closes its downstream connection after each response.
+
+
+## Local unary RPC
+
+The endpoint in `examples/grpc-local.rut` handles a native unary RPC locally:
+it unframes, decodes and re-encodes `example.MessageBatch`, then returns a framed
+response with grpc-status trailers. No backend or generated stubs are needed.
+Using the existing pinned Python development requirements, run:
+
+```sh
+build/src/rut 50052 examples/grpc-local.rut --backend epoll --shards 1 --no-pin
+python examples/grpc/local_client.py 127.0.0.1:50052
+```
+
+The generic grpcio client sends raw protobuf; grpcio handles the wire envelopes.
+It checks a successful echo, INTERNAL for malformed protobuf, and a subsequent
+successful call on the same channel. For io_uring use `--backend io_uring` on a
+supported Linux host. This example supports one uncompressed message up to 8 KiB;
+it does not implement local deadline scheduling or streaming message handlers.

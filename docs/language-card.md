@@ -1098,3 +1098,25 @@ bytecode; they add no language syntax. Fixed terminal forwards can be body
 candidates while routing and headers stay in userspace. A candidate does not
 activate kernel forwarding: live socket handoff remains ⏳. `firewall {}`/XDP and
 kTLS integration also remain unimplemented. See [ebpf.md](ebpf.md).
+
+
+### Local unary gRPC responses over HTTP/2
+
+A local handler can return `response(200, headers: {"content-type":
+"application/grpc+proto", "grpc-status": "0"}, body: framed)` after composing
+`grpc.unframe`, protobuf decode/encode and `grpc.frame`. For these explicitly
+marked responses, HTTP/2 emits the status as trailing HEADERS after all DATA.
+An empty response with the same headers is a trailers-only response; use a
+nonzero status for a failed RPC. Status values must be canonical decimal 0–16,
+with exactly one content type and one grpc-status. Nonempty bodies must contain
+one complete uncompressed envelope with at most 8 KiB of payload. Invalid output
+fails closed with HTTP 500 before publishing a response body.
+
+Bodies and the pending numeric status survive flow-control stalls, queued
+response promotion and cancellation. Trailers consume no DATA flow-control
+credit. This local path uses ordinary HTTP request/response accounting, not the
+upstream gRPC proxy exchange counters. It does not automatically bind service
+schemas, enforce grpc-timeout for local work, expose streaming RPC handlers,
+convert grpc-web, or perform HTTP/JSON transcoding. See
+[the local endpoint](../examples/grpc-local.rut) and
+[client instructions](../examples/grpc/README.md#local-unary-rpc).
