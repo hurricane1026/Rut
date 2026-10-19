@@ -444,7 +444,7 @@ struct Client {
     struct Rpc {
         static constexpr u32 kWebBufferCap = 262144;
         u32 sent = 0, received = 0, size = 0;
-        u32 status = 99;
+        u32 status = 99, http_status = 0;
         u32 raw_len = 0, max_chunk = 0, response_len = 0;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
              meta = false, trailer = false, raw_request = false, compare_pattern = true,
@@ -510,6 +510,10 @@ struct Client {
                       uint8_t,
                       void* ctx) {
         auto& rpc = static_cast<Client*>(ctx)->rpcs[(f->hd.stream_id - 1) / 2];
+        if (n == 7 && memcmp(name, ":status", n) == 0) {
+            rpc.http_status = 0;
+            for (size_t i = 0; i < v; ++i) rpc.http_status = rpc.http_status * 10 + value[i] - '0';
+        }
         if (n == 11 && memcmp(name, "grpc-status", n) == 0) {
             rpc.ok = v == 1 && *value == '0';
             rpc.status = 0;
@@ -595,7 +599,9 @@ struct Client {
                            const u8* body,
                            u32 body_len,
                            const char* timeout = "1H",
-                           const char* encoding = nullptr) {
+                           const char* encoding = nullptr,
+                           const char* path = "/test.Echo/Call",
+                           const char* content_type = "application/grpc+proto") {
         auto& rpc = rpcs[index];
         if (body_len > Rpc::kWebBufferCap) return -1;
         if (!rpc.raw) rpc.raw = std::make_unique<u8[]>(Rpc::kWebBufferCap);
@@ -607,8 +613,8 @@ struct Client {
         nghttp2_nv headers[8] = {nv(":method", "POST"),
                                  nv(":scheme", "http"),
                                  nv(":authority", "grpc.test"),
-                                 nv(":path", "/test.Echo/Call"),
-                                 nv("content-type", "application/grpc+proto"),
+                                 nv(":path", path),
+                                 nv("content-type", content_type),
                                  nv("te", "trailers"),
                                  nv("grpc-timeout", timeout)};
         if (encoding) headers[7] = nv("grpc-encoding", encoding);
@@ -8737,3 +8743,148 @@ TEST(grpc_proxy, message_limits_snapshot_iouring) {
 }
 
 #include "grpc_web_h1_cases.h"
+
+#if RUT_GRPC_JIT
+#include "protobuf/repeated_oracle.inc"
+
+template <typename Loop>
+void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log().has_value());
+    struct Program {
+        LoadedProgram value;
+        ~Program() { value.destroy(); }
+    };
+    auto program = std::make_unique<Program>();
+    char path[] = "/tmp/rut-pb-network-XXXXXX";
+    const int file = mkstemp(path);
+    REQUIRE(file >= 0);
+    char source[4096];
+    const int length =
+        snprintf(source,
+                 sizeof(source),
+                 "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
+                 "route POST \"/test.Echo/Call\" { return forward(grpc) }\n"
+                 "route POST \"/codec\" { "
+                 "guard let value = protobuf.decode(\"" RUT_GRPC_FIXTURES
+                 "/../protobuf/codec.proto\", "
+                 "\"example.RepeatedChild\", req.body) else { return 422 } "
+                 "guard let bytes = protobuf.encode(\"" RUT_GRPC_FIXTURES
+                 "/../protobuf/codec.proto\", "
+                 "\"example.RepeatedChild\", value) else { return 500 } "
+                 "return response(200, body: bytes) }\n",
+                 get_port(server->listen_fd));
+    const bool written = length > 0 && length < static_cast<int>(sizeof(source)) &&
+                         write(file, source, length) == length;
+    close(file);
+    LoadError error;
+    const bool loaded = written && load_rut_program(path, program->value, error);
+    unlink(path);
+    REQUIRE(loaded);
+    shard->route_config = &program->value.config;
+    REQUIRE(shard->spawn(-1).has_value());
+    // Every branch below reaches stop/join before the loaded program is destroyed.
+    {
+        Client client;
+        const bool connected = client.init(get_port(lfd));
+        CHECK(connected);
+        if (connected) {
+            // Raw protobuf codec over real HTTP/2, with one-byte DATA fragments.
+            auto codec = [&](u32 index,
+                             const u8* input,
+                             u32 size,
+                             u32 status,
+                             const u8* expected,
+                             u32 expected_size) {
+                CHECK(client.request_native_raw(
+                          index, input, size, "1H", nullptr, "/codec", "application/protobuf") > 0);
+                client.rpcs[index].max_chunk = 1;
+                const bool complete = client.until(index, true);
+                CHECK(complete);
+                if (complete) {
+                    CHECK_EQ(client.rpcs[index].http_status, status);
+                    CHECK_EQ(client.rpcs[index].response_len, expected_size);
+                    if (expected_size && client.rpcs[index].response_len == expected_size)
+                        CHECK(memcmp(client.rpcs[index].response.get(), expected, expected_size) ==
+                              0);
+                }
+            };
+            codec(0,
+                  kRepeatedOracle,
+                  sizeof(kRepeatedOracle),
+                  200,
+                  kRepeatedOracle,
+                  sizeof(kRepeatedOracle));
+            const u8 malformed[] = {10, 0, 10, 3, 10, 1, 255};
+            // Rejected later children must not poison the next request's arena.
+            codec(1, malformed, sizeof(malformed), 422, nullptr, 0);
+            codec(2,
+                  kRepeatedNoncanonical,
+                  sizeof(kRepeatedNoncanonical),
+                  200,
+                  kRepeatedNormalized,
+                  sizeof(kRepeatedNormalized));
+            // Native gRPC forwarding handles envelopes opaquely; the codec route
+            // above intentionally uses raw protobuf rather than a gRPC envelope.
+            u8 framed[5 + sizeof(kRepeatedOracle)] = {};
+            framed[4] = sizeof(kRepeatedOracle);
+            memcpy(framed + 5, kRepeatedOracle, sizeof(kRepeatedOracle));
+            CHECK(client.request_native_raw(3, framed, sizeof(framed)) > 0);
+            client.rpcs[3].max_chunk = 1;
+            const bool echoed = client.until(3, true);
+            CHECK(echoed);
+            if (echoed) {
+                CHECK(client.rpcs[3].ok);
+                CHECK_EQ(client.rpcs[3].response_len, sizeof(framed));
+                if (client.rpcs[3].response_len == sizeof(framed))
+                    CHECK(memcmp(client.rpcs[3].response.get(), framed, sizeof(framed)) == 0);
+            }
+            // Cancel an incomplete codec body, then reuse the same connection.
+            const int stream = client.request_native_raw(4,
+                                                         kRepeatedOracle,
+                                                         sizeof(kRepeatedOracle),
+                                                         "1H",
+                                                         nullptr,
+                                                         "/codec",
+                                                         "application/protobuf");
+            CHECK(stream > 0);
+            client.rpcs[4].end = false;
+            client.rpcs[4].max_chunk = 1;
+            CHECK(client.step());
+            CHECK_EQ(nghttp2_submit_rst_stream(
+                         client.session, NGHTTP2_FLAG_NONE, stream, NGHTTP2_CANCEL),
+                     0);
+            codec(5,
+                  kRepeatedOracle,
+                  sizeof(kRepeatedOracle),
+                  200,
+                  kRepeatedOracle,
+                  sizeof(kRepeatedOracle));
+        }
+    }
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    CHECK_EQ(shard->shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+TEST(grpc_proxy, repeated_protobuf_network_epoll) {
+    repeated_protobuf_network_case<EpollEventLoop>(_tc);
+}
+TEST(grpc_proxy, repeated_protobuf_network_iouring) {
+    repeated_protobuf_network_case<IoUringEventLoop>(_tc);
+}
+#endif

@@ -75,8 +75,8 @@ TEST(protobuf_array, malformed_wire_limits_and_budget_reset) {
     CHECK_FALSE(plan_array(kRepeated | (1u << 8) | 9, view(utf8, sizeof(utf8)), plan));
     u8 many[(kMaxArrayElements + 1) * 2];
     for (u32 i = 0; i < kMaxArrayElements + 1; ++i) {
-        many[2 * i] = 8;
-        many[2 * i + 1] = 0;
+        many[2ULL * i] = 8;
+        many[2ULL * i + 1] = 0;
     }
     CHECK_FALSE(plan_array(kRepeated | (1u << 8) | 5, view(many, sizeof(many)), plan));
     REQUIRE(plan_array(kRepeated | (1u << 8) | 5, view(many, sizeof(many) - 2), plan));
@@ -215,8 +215,8 @@ TEST(protobuf_array, repeated_message_contiguous_slot_limit) {
     }
     u8 input[256];
     for (u32 i = 0; i < 128; ++i) {
-        input[2 * i] = 10;
-        input[2 * i + 1] = 0;
+        input[2ULL * i] = 10;
+        input[2ULL * i + 1] = 0;
     }
     SlicePool pool;
     REQUIRE(pool.init(2));
@@ -231,6 +231,218 @@ TEST(protobuf_array, repeated_message_contiguous_slot_limit) {
         1, view(description, cursor), view(input, sizeof(input) - 2), &arena, result));
     CHECK_EQ(result.len, 127u);
     CHECK_EQ(arena.collection_items(), 127u);
+    arena.destroy();
+    pool.destroy();
+}
+
+#include "protobuf/repeated_oracle.inc"
+
+TEST(protobuf_array, repeated_message_google_protobuf_interoperability) {
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 description[44];
+    const Str schema = child_layout(description);
+    Str array{};
+    REQUIRE(decode_struct_array(
+        1, schema, view(kRepeatedOracle, sizeof(kRepeatedOracle)), &arena, array));
+    REQUIRE(array.len == 3);
+    NativeChild children[3];
+    __builtin_memcpy(children, array.ptr, sizeof(children));
+    CHECK(children[0].text.eq(Str{"\xe9\x9b\xaa\0", 4}));
+    CHECK_EQ(children[0].id, (-2147483647 - 1));
+    CHECK_EQ(children[1].text.len, 0u);
+    CHECK_EQ(children[1].id, 0);
+    CHECK(children[2].text.eq(lit_str("last")));
+    CHECK_EQ(children[2].id, 2147483647);
+    u8 output[128];
+    Str encoded{};
+    REQUIRE(encode_struct_array(1, schema, lit_str(""), array, output, sizeof(output), encoded));
+    CHECK(encoded.eq(view(kRepeatedOracle, sizeof(kRepeatedOracle))));
+    arena.reset();
+    REQUIRE(decode_struct_array(
+        1, schema, view(kRepeatedNoncanonical, sizeof(kRepeatedNoncanonical)), &arena, array));
+    REQUIRE(encode_struct_array(1, schema, lit_str(""), array, output, sizeof(output), encoded));
+    CHECK(encoded.eq(view(kRepeatedNormalized, sizeof(kRepeatedNormalized))));
+    CHECK_EQ(arena.collection_items(), 2u);
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(protobuf_array, repeated_message_truncation_and_invalid_later_element_are_atomic) {
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 description[44];
+    const Str schema = child_layout(description);
+    // Every prefix inside a length-delimited child must fail; complete child
+    // boundaries are independently valid protobuf messages.
+    const u32 boundaries[] = {0, 19, 21, sizeof(kRepeatedOracle)};
+    for (u32 length = 0; length <= sizeof(kRepeatedOracle); ++length) {
+        bool complete = false;
+        for (u32 boundary : boundaries) complete |= length == boundary;
+        Str result = lit_str("unchanged");
+        const bool accepted =
+            decode_struct_array(1, schema, view(kRepeatedOracle, length), &arena, result);
+        CHECK_EQ(accepted, complete);
+        if (!accepted) {
+            CHECK(result.eq(lit_str("unchanged")));
+            CHECK_EQ(arena.space_used(), 0u);
+            CHECK_EQ(arena.collection_items(), 0u);
+        }
+        arena.reset();
+    }
+    const u8 invalid[][8] = {
+        {10, 0, 10, 2, 16, 128, 0, 0},  // truncated varint in second child
+        {10, 0, 10, 2, 10, 1, 0, 0},    // string exceeds second child
+        {10, 0, 10, 2, 0, 0, 0, 0},     // forbidden zero field tag
+        {10, 0, 10, 2, 15, 0, 0, 0},    // forbidden wire type
+    };
+    for (const auto& bytes : invalid) {
+        Str result = lit_str("unchanged");
+        CHECK_FALSE(decode_struct_array(1, schema, view(bytes, 6), &arena, result));
+        CHECK(result.eq(lit_str("unchanged")));
+        CHECK_EQ(arena.space_used(), 0u);
+        CHECK_EQ(arena.collection_items(), 0u);
+    }
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(protobuf_array, repeated_message_encode_capacity_prefix_and_invalid_native_values) {
+    u8 description[44];
+    const Str schema = child_layout(description);
+    NativeChild child{lit_str("x"), 1};
+    const Str array{reinterpret_cast<const char*>(&child), 1};
+    const u8 expected[] = {24, 7, 10, 5, 10, 1, 'x', 16, 1};
+    const Str prefix = view(expected, 2);
+    u8 output[32];
+    for (u32 capacity = 0; capacity <= sizeof(expected); ++capacity) {
+        __builtin_memset(output, 0xa5, sizeof(output));
+        Str result = lit_str("unchanged");
+        const bool ok = encode_struct_array(1, schema, prefix, array, output, capacity, result);
+        CHECK_EQ(ok, capacity == sizeof(expected));
+        if (ok)
+            CHECK(result.eq(view(expected, sizeof(expected))));
+        else
+            CHECK(result.eq(lit_str("unchanged")));
+        for (u32 i = capacity; i < sizeof(output); ++i) CHECK_EQ(output[i], 0xa5u);
+    }
+    Str result = lit_str("unchanged");
+    child.text = Str{"\xff", 1};
+    CHECK_FALSE(encode_struct_array(1, schema, lit_str(""), array, output, sizeof(output), result));
+    child.text = {nullptr, 1};
+    CHECK_FALSE(encode_struct_array(1, schema, lit_str(""), array, output, sizeof(output), result));
+    CHECK_FALSE(
+        encode_struct_array(1, schema, lit_str(""), {nullptr, 1}, output, sizeof(output), result));
+    CHECK_FALSE(encode_struct_array(0, schema, lit_str(""), array, output, sizeof(output), result));
+    CHECK(result.eq(lit_str("unchanged")));
+}
+
+TEST(protobuf_array, repeated_message_request_budget_boundary_and_reuse) {
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 description[44];
+    const Str schema = child_layout(description);
+    const u8 empty[] = {10, 0};
+    Str result{};
+    arena.set_collection_items(kMaxRequestArrayElements - 1);
+    REQUIRE(decode_struct_array(1, schema, view(empty, sizeof(empty)), &arena, result));
+    CHECK_EQ(arena.collection_items(), kMaxRequestArrayElements);
+    const u64 used = arena.space_used();
+    result = lit_str("unchanged");
+    CHECK_FALSE(decode_struct_array(1, schema, view(empty, sizeof(empty)), &arena, result));
+    CHECK(result.eq(lit_str("unchanged")));
+    CHECK_EQ(arena.space_used(), used);
+    // Repeated request resets must reclaim both allocation and collection limits.
+    for (u32 request = 0; request < 64; ++request) {
+        arena.reset();
+        CHECK_EQ(arena.collection_items(), 0u);
+        CHECK_EQ(arena.space_used(), 0u);
+        REQUIRE(decode_struct_array(
+            1, schema, view(kRepeatedOracle, sizeof(kRepeatedOracle)), &arena, result));
+        CHECK_EQ(result.len, 3u);
+        CHECK_EQ(arena.collection_items(), 3u);
+    }
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(protobuf_array, nested_repeated_messages_share_budget_and_own_descendants) {
+    u8 description[72];
+    const u32 words[] = {16, 8, 1, 1, 11 | 256, 0, 44};
+    u32 cursor = 0;
+    for (u32 word : words)
+        for (u32 i = 0; i < 4; ++i) description[cursor++] = static_cast<u8>(word >> (8 * i));
+    child_layout(description + cursor);
+    const Str schema = view(description, sizeof(description));
+    u8 input[] = {10, 9, 10, 5, 10, 1, 'x', 16, 1, 10, 0};
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    Str result = lit_str("unchanged");
+    // One outer message plus its two children must all count against the
+    // request budget, including the child with no populated fields.
+    arena.set_collection_items(kMaxRequestArrayElements - 2);
+    CHECK_FALSE(decode_struct_array(1, schema, view(input, sizeof(input)), &arena, result));
+    CHECK(result.eq(lit_str("unchanged")));
+    CHECK_EQ(arena.space_used(), 0u);
+    arena.set_collection_items(kMaxRequestArrayElements - 3);
+    REQUIRE(decode_struct_array(1, schema, view(input, sizeof(input)), &arena, result));
+    CHECK_EQ(arena.collection_items(), kMaxRequestArrayElements);
+    CHECK_EQ(result.len, 1u);
+    Str children;
+    __builtin_memcpy(&children, result.ptr, sizeof(children));
+    REQUIRE(children.len == 2);
+    NativeChild first;
+    __builtin_memcpy(&first, children.ptr, sizeof(first));
+    __builtin_memset(input, 0xff, sizeof(input));
+    CHECK(first.text.eq(lit_str("x")));
+    CHECK_EQ(first.id, 1);
+    u8 output[32];
+    Str encoded;
+    REQUIRE(encode_struct_array(1, schema, lit_str(""), result, output, sizeof(output), encoded));
+    const u8 expected[] = {10, 9, 10, 5, 10, 1, 'x', 16, 1, 10, 0};
+    CHECK(encoded.eq(view(expected, sizeof(expected))));
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(protobuf_array, invalid_native_layout_is_rejected_before_allocation) {
+    SlicePool pool;
+    REQUIRE(pool.init(2));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 description[44];
+    const u8 input[] = {10, 0};
+    // Truncated metadata and corrupt sizes, alignment, tags, types and offsets
+    // must never escape into a native memory read/write.
+    for (u32 length = 0; length < sizeof(description); ++length) {
+        child_layout(description);
+        Str result = lit_str("unchanged");
+        CHECK_FALSE(decode_struct_array(
+            1, view(description, length), view(input, sizeof(input)), &arena, result));
+        CHECK(result.eq(lit_str("unchanged")));
+        CHECK_EQ(arena.space_used(), 0u);
+    }
+    const u32 positions[] = {0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40};
+    for (u32 position : positions) {
+        child_layout(description);
+        description[position] = 255;
+        Str result = lit_str("unchanged");
+        // 255 is a legal tag; make the second tag duplicate instead.
+        if (position == 12 || position == 28) description[position] = position == 12 ? 2 : 1;
+        CHECK_FALSE(decode_struct_array(
+            1, view(description, sizeof(description)), view(input, sizeof(input)), &arena, result));
+        CHECK(result.eq(lit_str("unchanged")));
+        CHECK_EQ(arena.space_used(), 0u);
+        CHECK_EQ(arena.collection_items(), 0u);
+    }
     arena.destroy();
     pool.destroy();
 }
