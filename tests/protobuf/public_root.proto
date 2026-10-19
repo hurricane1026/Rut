@@ -1,0 +1,9 @@
+syntax = "proto3";
+import "public.proto";
+message PublicRequest {
+  example.ReservedBatch batch = 1;
+  example.ReservedBatch.Local state = 2;
+}
+service PublicCodec {
+  rpc Echo(PublicRequest) returns (example.ReservedBatch);
+}

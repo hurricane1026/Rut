@@ -422,7 +422,10 @@ guard let bytes = protobuf.encode("message.proto", "example.Message", message) e
 ```
 
 Paths and fully qualified message names must be literals. Paths resolve relative
-to the current `.rut` file. The compiler reads proto3 imports and generates an
+to the current `.rut` file. Proto3 `import public` re-exports message/enum types
+through public chains; private transitive imports remain invisible and weak
+imports remain unsupported. Import cycles are rejected within existing budgets.
+The compiler reads proto3 imports and generates an
 internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most
 eight fields per message: string/bytes, bool, open enum numbers (i32), signed 32/64-bit,

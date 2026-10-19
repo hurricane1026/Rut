@@ -13,6 +13,7 @@
 using namespace rut;
 using namespace rut::protobuf;
 #include "protobuf/enum_oracle.inc"
+#include "protobuf/public_oracle.inc"
 #include "protobuf/reserved_oracle.inc"
 #include "protobuf/schema_descriptor.inc"
 
@@ -141,7 +142,7 @@ TEST(protobuf_source, syntax_and_unsupported_semantics_are_explicit) {
                            "syntax='proto3'; message A { Missing a=1; }",
                            "syntax='proto3'; message A { string a=09; }",
                            "syntax='proto3'; message A { string a=429496729600; }",
-                           "syntax='proto3'; import public 'x.proto';",
+                           "syntax='proto3'; import weak 'x.proto';",
                            "\"syntax\"='proto3';"};
     for (const char* text : cases) {
         Files files;
@@ -613,4 +614,105 @@ TEST(protobuf_source, reserved_source_matches_independent_descriptor_metadata) {
         compare(
             found->reserved_ranges, e->reserved_ranges, found->reserved_names, e->reserved_names);
     }
+}
+
+TEST(protobuf_source, public_imports_export_messages_enums_and_rpc_types) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("extra.proto",
+                             "syntax='proto3'; package shared; message Item { string text=1; } "
+                             "enum State { ZERO=0; READY=1; }"));
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; import public 'extra.proto';"));
+    REQUIRE(files.write_file("mid.proto", "syntax='proto3'; import public 'types.proto';"));
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax='proto3'; import 'mid.proto'; message Request { shared.Item item=1; "
+        "shared.State state=2; } service Echo { rpc Call(shared.Item) returns (Request); }"));
+    Storage storage;
+    auto schema = files.load(storage);
+    REQUIRE(schema.has_value());
+    const auto* request = schema->find_message(lit_str(".Request"));
+    REQUIRE(request);
+    CHECK_EQ(schema->message_count, 2u);
+    CHECK_EQ(schema->enum_count, 1u);
+    const auto* method = schema->find_method(lit_str("/Echo/Call"));
+    REQUIRE(method);
+    CHECK(method->input == schema->find_message(lit_str(".shared.Item")));
+    CHECK(method->output == request);
+    // A private edge breaks re-export, even when all files have been loaded.
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; import 'extra.proto';"));
+    Storage hidden;
+    auto rejected = files.load(hidden);
+    REQUIRE_FALSE(rejected.has_value());
+    CHECK(rejected.error().kind == SourceError::Kind::Schema);
+    // The importing file's own public flag cannot expose its dependency's private imports.
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax='proto3'; import public 'mid.proto'; message Request { shared.Item item=1; }"));
+    Storage private_edge;
+    CHECK_FALSE(files.load(private_edge).has_value());
+}
+
+TEST(protobuf_source, public_import_diamond_deduplication_cycles_and_limits) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("extra.proto", "syntax='proto3'; message Item {}"));
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; import public 'extra.proto';"));
+    REQUIRE(files.write_file("mid.proto", "syntax='proto3'; import public 'extra.proto';"));
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax='proto3'; import 'types.proto'; import public 'types.proto'; "
+        "import public 'types.proto'; import 'mid.proto'; message Root { Item item=1; }"));
+    Storage storage;
+    SchemaLimits limits;
+    limits.files = 4;
+    auto schema = files.load(storage, limits);
+    REQUIRE(schema.has_value());
+    CHECK_EQ(schema->message_count, 2u);
+    const auto* root = schema->find_message(lit_str(".Root"));
+    REQUIRE(root);
+    CHECK_EQ(root->file->dependency_count, 2u);
+    CHECK_EQ(root->file->public_dependencies[0], 1u);
+    CHECK_EQ(root->file->public_dependencies[1], 0u);
+    limits.files = 3;
+    Storage bounded;
+    auto limited = files.load(bounded, limits);
+    REQUIRE_FALSE(limited.has_value());
+    CHECK(limited.error().kind == SourceError::Kind::Limit);
+    REQUIRE(files.write_file("extra.proto", "syntax='proto3'; import public 'root.proto';"));
+    Storage cyclic;
+    CHECK_FALSE(files.load(cyclic).has_value());
+}
+
+TEST(protobuf_source, public_imports_match_google_descriptor_visibility) {
+    Storage source, descriptor;
+    auto parsed = load_proto_source(source.arena,
+                                    lit_str(RUT_SOURCE_DIR "/tests/protobuf/public_root.proto"));
+    auto golden =
+        load_descriptor_set(descriptor.arena, kPublicDescriptor, sizeof(kPublicDescriptor));
+    REQUIRE(parsed.has_value());
+    REQUIRE(golden.has_value());
+    CHECK_EQ(parsed->message_count, golden->message_count);
+    CHECK_EQ(parsed->enum_count, golden->enum_count);
+    CHECK_EQ(parsed->field_count, golden->field_count);
+    CHECK_EQ(parsed->method_count, golden->method_count);
+    for (const auto* message = golden->messages; message; message = message->next) {
+        const auto* actual = parsed->find_message(message->full_name);
+        REQUIRE(actual);
+        CHECK_EQ(actual->file->dependency_count, message->file->dependency_count);
+        for (u32 i = 0; i < actual->file->dependency_count; ++i) {
+            CHECK(actual->file->dependencies[i].eq(message->file->dependencies[i]));
+            CHECK_EQ(actual->file->public_dependencies[i], message->file->public_dependencies[i]);
+        }
+        for (const auto* field = message->fields; field; field = field->next) {
+            const auto* match = actual->fields;
+            while (match && !match->name.eq(field->name)) match = match->next;
+            REQUIRE(match);
+            CHECK(match->type == field->type);
+            CHECK(match->type_name.eq(field->type_name));
+        }
+    }
+    const auto* method = parsed->find_method(lit_str("/PublicCodec/Echo"));
+    REQUIRE(method);
+    CHECK(method->output == parsed->find_message(lit_str(".example.ReservedBatch")));
 }

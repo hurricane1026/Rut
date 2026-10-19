@@ -64,8 +64,7 @@ are validated before decode returns. Each contiguous slot allocation must also f
 one 16 KiB Arena slice minus its block header; oversized slot regions fail decode.
 Array-bearing routes with `wait`
 are rejected until collection suspension ownership is implemented. Floating point, uint64/fixed64, oneof/optional presence,
-maps, extensions/defaults, reserved declarations, custom options, public/weak
-imports, proto2 and editions are rejected. Source string escapes currently cover
+maps, extensions/defaults, custom options, weak imports, proto2 and editions are rejected. Source string escapes currently cover
 quotes and backslashes only. Proto2 needs separate presence/default/required
 semantics before it can be enabled. No implicit protobuf JSON mapping is provided
 by the general-purpose `json` operations.
@@ -108,3 +107,9 @@ Message and enum schemas may use `reserved` names/numbers, ranges and `to max`.
 The compiler rejects reusing a reserved name or number, duplicate names and
 overlapping ranges. Reserved enum numbers can still arrive as unknown numeric
 values in proto3 messages. See [`reserved.proto`](../../tests/protobuf/reserved.proto).
+
+`import public` re-exports message and enum types through import chains, including
+RPC request/response references. Ordinary imports expose only the imported file
+and its public exports; private transitive imports remain invisible. Duplicate
+imports share a dependency entry; a public occurrence marks that entry public.
+Import cycles and existing file/depth/byte budgets still apply.

@@ -8884,11 +8884,11 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "\"grpc-status\": \"0\"}, body: framed) }\n"
         "route POST \"/example.ReservedCodec/Echo\" { "
         "guard let value = grpc.decode(\"" RUT_GRPC_FIXTURES
-        "/../protobuf/reserved.proto\", \"/example.ReservedCodec/Echo\", req.body) else { "
+        "/../protobuf/public.proto\", \"/example.ReservedCodec/Echo\", req.body) else { "
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
         "\"grpc-status\": \"13\"}) } "
         "guard let framed = grpc.encode(\"" RUT_GRPC_FIXTURES
-        "/../protobuf/reserved.proto\", \"/example.ReservedCodec/Echo\", value) else { return 500 "
+        "/../protobuf/public.proto\", \"/example.ReservedCodec/Echo\", value) else { return 500 "
         "} "
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
         "\"grpc-status\": \"0\"}, body: framed) }\n"

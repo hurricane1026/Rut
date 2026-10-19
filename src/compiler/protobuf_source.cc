@@ -91,10 +91,13 @@ struct Source {
     Source* next = nullptr;
     Buffer* descriptor = nullptr;
     Import* imports = nullptr;
+    u32 import_count = 0;
 };
 struct Import {
     const Source* source = nullptr;
     Import* next = nullptr;
+    u32 index = 0;
+    bool is_public = false;
 };
 struct NamedMessage {
     Str name{};
@@ -170,8 +173,20 @@ struct Compiler {
     SourceError error{};
     bool visible(const Source* file, const Source* owner) const {
         if (file == owner) return true;
+        const Source* visited[128]{};
+        u32 count = 0;
+        auto exported = [&](const Source* from, auto&& self) -> bool {
+            if (from == owner) return true;
+            for (u32 i = 0; i < count; ++i)
+                if (visited[i] == from) return false;
+            if (count >= limits.files) return false;
+            visited[count++] = from;
+            for (const Import* edge = from->imports; edge; edge = edge->next)
+                if (edge->is_public && self(edge->source, self)) return true;
+            return false;
+        };
         for (const Import* imported = file->imports; imported; imported = imported->next)
-            if (imported->source == owner) return true;
+            if (exported(imported->source, exported)) return true;
         return false;
     }
     Str root_directory{};
@@ -819,8 +834,9 @@ bool Parser::file() {
             if (!expect(lit_str(";"))) return false;
             source.descriptor->text(2, source.package);
         } else if (take(lit_str("import"))) {
-            if (is(lit_str("public")) || is(lit_str("weak")))
-                return fail(SourceError::Kind::Unsupported, lit_str("public/weak imports"));
+            const bool kPublic = take(lit_str("public"));
+            if (is(lit_str("weak")))
+                return fail(SourceError::Kind::Unsupported, lit_str("weak imports"));
             Str path{};
             if (!string(path) || !expect(lit_str(";"))) return false;
             if (!compiler.imported_path(path))
@@ -840,15 +856,18 @@ bool Parser::file() {
             const Source* imported = compiler.sources;
             while (imported && !imported->name.eq(path)) imported = imported->next;
             if (!imported) return fail(SourceError::Kind::Syntax, lit_str("unresolved import"));
-            bool seen = false;
-            for (const Import* old = source.imports; old; old = old->next)
-                seen = seen || old->source == imported;
-            if (!seen) {
-                auto* entry = compiler.arena.alloc_t<Import>();
+            Import* entry = source.imports;
+            while (entry && entry->source != imported) entry = entry->next;
+            if (!entry) {
+                entry = compiler.arena.alloc_t<Import>();
                 if (!entry) return fail(SourceError::Kind::Allocation, {});
-                *entry = {imported, source.imports};
+                *entry = {imported, source.imports, source.import_count++, false};
                 source.imports = entry;
                 source.descriptor->text(3, path);
+            }
+            if (kPublic && !entry->is_public) {
+                entry->is_public = true;
+                source.descriptor->number(10, entry->index);
             }
         } else {
             declarations = true;

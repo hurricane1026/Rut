@@ -1498,10 +1498,10 @@ materialize recursively default-valued structs; presence is not exposed, so
 encoding defaults emits an empty embedded message. Recursive types are rejected.
 
 Repeated scalar and message fields now use the runtime immutable array carriers above.
-Floating point, uint64/fixed64, enums, oneof/optional presence, maps, proto2 and
+Floating point, uint64/fixed64, oneof/optional presence, maps, proto2 and
 editions remain pending. Proto2 must implement explicit presence, defaults and
 required-field validation before being enabled. The source parser rejects custom
-options, public/weak imports, reserved/default/extension declarations and string
+options, weak imports, default/extension declarations and string
 escapes beyond quotes/backslashes; packages must precede declarations. Schema
 sources are read during compilation/reload, not watched or opened per request.
 See [the runnable codec example](examples/protobuf/README.md).
@@ -8235,3 +8235,13 @@ tightened using SchemaLimits::reserved. No new runtime checks or IR operations a
 introduced: deleted/reserved enum numbers remain valid unknown proto3 wire values.
 Independent Google protobuf descriptor fixtures verify source/descriptor parity;
 JIT, native schema-removal and both network backends exercise reserved schemas.
+
+### Protobuf public imports
+
+The source loader emits FileDescriptorProto.public_dependency indexes and resolves
+message, enum and RPC references through the public export closure of each direct
+import. Private transitive imports do not grant visibility. Traversal visits each
+source at most once per visibility query and uses the existing 128-file ceiling;
+source import cycles remain rejected. Repeated imports reuse one dependency index
+and any public occurrence marks it as exported. The descriptor loader applies the
+same visibility rules. No runtime ABI or wire codec changes are required.
