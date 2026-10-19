@@ -23100,10 +23100,12 @@ TEST(jit, grpc_unary_helper_owns_payload_and_frames_and_rejects_exhaustion) {
 TEST(jit, grpc_method_codec_roundtrip_and_invalid_envelope_propagation) {
     const char* source =
         "route POST \"/rpc\" { guard let value = grpc.decode(\"" RUT_PROTO_TEST_ROOT
-        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Retag\", req.body) else { return 422 "
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Convert\", req.body) else { return "
+        "422 "
         "} "
         "guard let framed = grpc.encode(\"" RUT_PROTO_TEST_ROOT
-        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Retag\", value) else { return 500 } "
+        "/tests/protobuf/codec.proto\", \"/example.UnaryCodec/Convert\", value) else { return 500 "
+        "} "
         "return response(200, body: framed) }";
     auto tokens = lex(lit(source));
     REQUIRE(tokens);
@@ -23152,7 +23154,7 @@ TEST(jit, grpc_method_codec_roundtrip_and_invalid_envelope_propagation) {
         if (i < 2) {
             CHECK(conn.jit_response_body_valid);
             memset(request, 'z', sizeof(request));
-            const u8 expected[] = {0, 0, 0, 0, 9, 0x4a, 5, 0x3a, 1, 'x', 0x40, 1, 0x4a, 0};
+            const u8 expected[] = {0, 0, 0, 0, 9, 0x4a, 5, 0x3a, 1, 'x', 0x40, 2, 0x4a, 0};
             const Str expected_body =
                 i == 0 ? Str{reinterpret_cast<const char*>(expected), sizeof(expected)} : bodies[i];
             CHECK(conn.jit_response_body.eq(expected_body));

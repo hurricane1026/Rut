@@ -4394,6 +4394,43 @@ struct ProtoLayoutBuffer {
     }
 };
 
+static HirTypeKind proto_carrier_type(u8 type) {
+    using PT = protobuf::Type;
+    switch (static_cast<PT>(type)) {
+        case PT::String:
+        case PT::Bytes:
+            return HirTypeKind::Str;
+        case PT::Bool:
+            return HirTypeKind::Bool;
+        case PT::Int32:
+        case PT::Sfixed32:
+        case PT::Sint32:
+            return HirTypeKind::I32;
+        case PT::Int64:
+        case PT::Sfixed64:
+        case PT::Sint64:
+        case PT::Uint32:
+        case PT::Fixed32:
+            return HirTypeKind::I64;
+        case PT::Message:
+            return HirTypeKind::Struct;
+        default:
+            return HirTypeKind::Unknown;
+    }
+}
+
+static bool proto_layout_field_compatible(const HirModule& mod,
+                                          const HirStruct::FieldDecl& field,
+                                          u8 proto_type) {
+    const HirTypeKind carrier = proto_carrier_type(proto_type);
+    if (carrier == HirTypeKind::Unknown) return false;
+    if (field.type != HirTypeKind::Array) return field.type == carrier;
+    if (field.shape_index >= mod.type_shapes.len) return false;
+    const auto& array = mod.type_shapes[field.shape_index];
+    return array.type == HirTypeKind::Array && array.array_elem_shape_index < mod.type_shapes.len &&
+           mod.type_shapes[array.array_elem_shape_index].type == carrier;
+}
+
 static bool proto_array_layout(const HirModule& mod,
                                u32 index,
                                const protobuf::Message* message,
@@ -4416,7 +4453,8 @@ static bool proto_array_layout(const HirModule& mod,
         const protobuf::SchemaField* proto = message->fields;
         while (proto && !proto->name.eq(field.name)) proto = proto->next;
         const u8 proto_type = proto ? static_cast<u8>(proto->type) : 0;
-        if (!proto || proto->repeated != repeated || proto_type != field.protobuf_type)
+        if (!proto || proto->repeated != repeated ||
+            !proto_layout_field_compatible(mod, field, proto_type))
             return false;
         if (proto_type != 11 && !protobuf::array_element_size(proto_type)) return false;
         u32 child_size = 0, child_align = 1;
@@ -4441,7 +4479,7 @@ static bool proto_array_layout(const HirModule& mod,
         if (child_len > protobuf::kMaxMessageBytes - 12 ||
             !bytes.write_word(field_header, proto->number))
             return false;
-        if (!bytes.write_word(field_header + 4, field.protobuf_type | (repeated ? 256 : 0)) ||
+        if (!bytes.write_word(field_header + 4, proto_type | (repeated ? 256 : 0)) ||
             !bytes.write_word(field_header + 8, size) ||
             !bytes.write_word(field_header + 12, child_len))
             return false;
