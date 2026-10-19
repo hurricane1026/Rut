@@ -116,6 +116,10 @@ jobs:
           submodules: recursive
       - name: Install tools
         run: |
+          # Runner-provided Microsoft packages are not build dependencies; a
+          # transient 403 from that feed must not block Ubuntu/LLVM installation.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+            /etc/apt/sources.list.d/microsoft-prod.sources
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
           echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | \
             sudo tee /etc/apt/sources.list.d/llvm.list
