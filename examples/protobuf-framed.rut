@@ -1,0 +1,9 @@
+// Envelope/payload codec demonstration, not a native gRPC service endpoint.
+// Send one uncompressed gRPC envelope containing example.MessageBatch bytes.
+route POST "/protobuf/framed" {
+    guard let payload = grpc.unframe(req.body) else { return 400 }
+    guard let value = protobuf.decode("protobuf/message.proto", "example.MessageBatch", payload) else { return 422 }
+    guard let bytes = protobuf.encode("protobuf/message.proto", "example.MessageBatch", value) else { return 500 }
+    guard let framed = grpc.frame(bytes) else { return 500 }
+    return response(200, body: framed)
+}

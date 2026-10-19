@@ -8768,20 +8768,28 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
     const int file = mkstemp(path);
     REQUIRE(file >= 0);
     char source[4096];
-    const int length =
-        snprintf(source,
-                 sizeof(source),
-                 "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
-                 "route POST \"/test.Echo/Call\" { return forward(grpc) }\n"
-                 "route POST \"/codec\" { "
-                 "guard let value = protobuf.decode(\"" RUT_GRPC_FIXTURES
-                 "/../protobuf/codec.proto\", "
-                 "\"example.RepeatedChild\", req.body) else { return 422 } "
-                 "guard let bytes = protobuf.encode(\"" RUT_GRPC_FIXTURES
-                 "/../protobuf/codec.proto\", "
-                 "\"example.RepeatedChild\", value) else { return 500 } "
-                 "return response(200, body: bytes) }\n",
-                 get_port(server->listen_fd));
+    const int length = snprintf(
+        source,
+        sizeof(source),
+        "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
+        "route POST \"/test.Echo/Call\" { return forward(grpc) }\n"
+        "route POST \"/codec\" { "
+        "guard let value = protobuf.decode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", "
+        "\"example.RepeatedChild\", req.body) else { return 422 } "
+        "guard let bytes = protobuf.encode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", "
+        "\"example.RepeatedChild\", value) else { return 500 } "
+        "return response(200, body: bytes) }\n"
+        "route POST \"/framed\" { "
+        "guard let payload = grpc.unframe(req.body) else { return 422 } "
+        "guard let value = protobuf.decode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", \"example.RepeatedChild\", payload) else { return 400 } "
+        "guard let bytes = protobuf.encode(\"" RUT_GRPC_FIXTURES
+        "/../protobuf/codec.proto\", \"example.RepeatedChild\", value) else { return 500 } "
+        "guard let framed = grpc.frame(bytes) else { return 500 } "
+        "return response(200, body: framed) }\n",
+        get_port(server->listen_fd));
     const bool written = length > 0 && length < static_cast<int>(sizeof(source)) &&
                          write(file, source, length) == length;
     close(file);
@@ -8803,9 +8811,11 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                              u32 size,
                              u32 status,
                              const u8* expected,
-                             u32 expected_size) {
+                             u32 expected_size,
+                             const char* route_path = "/codec") {
                 CHECK(client.request_native_raw(
-                          index, input, size, "1H", nullptr, "/codec", "application/protobuf") > 0);
+                          index, input, size, "1H", nullptr, route_path, "application/protobuf") >
+                      0);
                 client.rpcs[index].max_chunk = 1;
                 const bool complete = client.until(index, true);
                 CHECK(complete);
@@ -8868,6 +8878,12 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                   200,
                   kRepeatedOracle,
                   sizeof(kRepeatedOracle));
+            codec(6, framed, sizeof(framed), 200, framed, sizeof(framed), "/framed");
+            framed[0] = 1;
+            codec(7, framed, sizeof(framed), 422, nullptr, 0, "/framed");
+            framed[0] = 0;
+            codec(8, framed, sizeof(framed) - 1, 422, nullptr, 0, "/framed");
+            codec(9, framed, sizeof(framed), 200, framed, sizeof(framed), "/framed");
         }
     }
     shard->stop();

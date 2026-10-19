@@ -4907,6 +4907,28 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             json::Op::Parse, HirTypeKind::Json, true, &body, nullptr, nullptr, expr.span, route);
     }
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq(lit_str("grpc")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("grpc"))) {
+        const bool frame = expr.name.eq(lit_str("frame"));
+        if ((!frame && !expr.name.eq(lit_str("unframe"))) || expr.args.len != 1)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("grpc.frame(bytes) / grpc.unframe(bytes)"));
+        auto input = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!input) return input;
+        if (input->type != HirTypeKind::Str || input->may_nil || input->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("unwrap gRPC framing input first"));
+        return make_proto_op(frame ? protobuf::kGrpcFrame : protobuf::kGrpcUnframe,
+                             HirTypeKind::Str,
+                             true,
+                             &input.value(),
+                             nullptr,
+                             expr.span,
+                             route);
+    }
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         expr.lhs->name.eq(lit_str("protobuf")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, lit_str("protobuf")))
         return analyze_protobuf_call(expr, route, mod, locals, local_count, binding);

@@ -805,8 +805,19 @@ target_include_directories(test_frontend PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 target_compile_definitions(test_frontend PRIVATE RUT_PROTO_TEST_ROOT="${PROJECT_SOURCE_DIR}")
-add_test(NAME test_frontend COMMAND test_frontend)
-set_tests_properties(test_frontend PROPERTIES LABELS "unit;compiler")
+# Keep every frontend case under the per-test CI timeout without raising it.
+# The framework hashes suite/name so each case runs in exactly one shard.
+set(RUT_FRONTEND_TEST_SHARDS 8)
+foreach(shard RANGE 0 7)
+    if(shard EQUAL 0)
+        set(frontend_test_name test_frontend)
+    else()
+        set(frontend_test_name test_frontend_shard_${shard})
+    endif()
+    add_test(NAME ${frontend_test_name} COMMAND test_frontend
+        --shard-index=${shard} --shard-count=${RUT_FRONTEND_TEST_SHARDS})
+    set_tests_properties(${frontend_test_name} PROPERTIES LABELS "unit;compiler")
+endforeach()
 
 add_executable(test_hir_generated_names_lifetime test_hir_generated_names_lifetime.cc)
 target_include_directories(test_hir_generated_names_lifetime PRIVATE

@@ -175,6 +175,70 @@ TEST(protobuf_value, nested_fragment_validation_and_failure_propagation) {
     CHECK_EQ(view.len, 2u);
     CHECK_EQ(static_cast<u8>(view.ptr[0]), 10u);
 }
+TEST(protobuf_value, grpc_unary_envelopes_boundaries_and_malformed_inputs) {
+    u8 output[kMaxMessageBytes + 6];
+    u8 input[kMaxMessageBytes + 1];
+    for (u32 i = 0; i < sizeof(input); ++i) input[i] = static_cast<u8>(i);
+    Str framed{}, payload{};
+    i64 number = 0;
+    const u32 sizes[] = {0, 1, 255, 256, kMaxMessageBytes};
+    for (u32 size : sizes) {
+        memset(output, 0xa5, sizeof(output));
+        REQUIRE(apply(kGrpcFrame,
+                      {reinterpret_cast<const char*>(input), size},
+                      {},
+                      0,
+                      output,
+                      size + 5,
+                      framed,
+                      number));
+        CHECK_EQ(framed.len, size + 5);
+        CHECK_EQ(output[size + 5], 0xa5u);
+        REQUIRE(apply(kGrpcUnframe, framed, {}, 0, nullptr, 0, payload, number));
+        CHECK_EQ(payload.len, size);
+        CHECK_EQ(memcmp(payload.ptr, input, size), 0);
+        CHECK_FALSE(apply(kGrpcFrame,
+                          {reinterpret_cast<const char*>(input), size},
+                          {},
+                          0,
+                          output,
+                          size + 4,
+                          framed,
+                          number));
+    }
+    CHECK_FALSE(apply(kGrpcFrame,
+                      {reinterpret_cast<const char*>(input), sizeof(input)},
+                      {},
+                      0,
+                      output,
+                      sizeof(output),
+                      framed,
+                      number));
+    const u8 valid[] = {0, 0, 0, 0, 2, 0xff, 0};
+    const Str bytes{reinterpret_cast<const char*>(valid), sizeof(valid)};
+    for (u32 length = 0; length < sizeof(valid); ++length)
+        CHECK_FALSE(apply(
+            kGrpcUnframe, {bytes.ptr, length}, {}, 0, output, sizeof(output), payload, number));
+    const u8 invalid[][10] = {
+        {1, 0, 0, 0, 0},                 // compressed message (no decompressor)
+        {2, 0, 0, 0, 0},                 // invalid flag
+        {128, 0, 0, 0, 0},               // grpc-web trailers are not a native message
+        {0, 255, 255, 255, 255},         // huge length
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0},  // two empty messages
+    };
+    for (u32 i = 0; i < 5; ++i)
+        CHECK_FALSE(apply(kGrpcUnframe,
+                          {reinterpret_cast<const char*>(invalid[i]), i == 4 ? 10u : 5u},
+                          {},
+                          0,
+                          output,
+                          sizeof(output),
+                          payload,
+                          number));
+    CHECK_FALSE(apply(kGrpcUnframe, {nullptr, 5}, {}, 0, output, sizeof(output), payload, number));
+    CHECK_FALSE(apply(kGrpcFrame, {nullptr, 1}, {}, 0, output, sizeof(output), payload, number));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
