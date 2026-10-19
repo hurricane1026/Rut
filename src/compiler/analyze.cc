@@ -9,6 +9,7 @@
 #include "rut/compiler/protobuf_source.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/protobuf_array.h"
+#include "rut/runtime/protobuf_struct_array.h"
 #include "rut/runtime/protobuf_value.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/ws_terminate.h"  // ws_valid_close_code (shared close-code predicate)
@@ -4311,15 +4312,11 @@ static FrontendResult<u32> infer_proto_struct(const protobuf::Message* message,
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span, lit_str("unsupported protobuf field type"));
         if (proto->repeated) {
-            if (field.type == HirTypeKind::Struct)
-                return frontend_error(FrontendError::UnsupportedSyntax,
-                                      span,
-                                      lit_str("repeated embedded messages are not supported"));
             auto element = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                                  field.type,
                                                  0xffffffffu,
                                                  0xffffffffu,
-                                                 0xffffffffu,
+                                                 field.struct_index,
                                                  0,
                                                  nullptr,
                                                  nullptr,
@@ -4370,6 +4367,87 @@ static FrontendResult<u32> infer_proto_struct(const protobuf::Message* message,
         return frontend_error(FrontendError::TooManyItems, span);
     cache.indices[kCacheIndex] = index;
     return index;
+}
+// The admitted native carriers have the same C/LLVM layout on supported
+// 64-bit targets. Serialize offsets explicitly; the runtime validates them.
+static bool proto_array_layout(
+    const HirModule& mod, u32 index, std::string& bytes, u32& size, u32& alignment, u32 depth = 0) {
+    if (depth > 8 || index >= mod.structs.len) return false;
+    const auto& decl = mod.structs[index];
+    auto word = [](std::string& out, u32 value) {
+        for (u32 i = 0; i < 4; ++i) out.push_back(static_cast<char>(value >> (8 * i)));
+    };
+    std::string fields;
+    size = 0;
+    alignment = 1;
+    for (u32 i = 0; i < decl.fields.len; ++i) {
+        const auto& field = decl.fields[i];
+        const bool repeated = field.type == HirTypeKind::Array;
+        if (field.protobuf_type != 11 && !protobuf::array_element_size(field.protobuf_type))
+            return false;
+        u32 child_size = 0, child_align = 1;
+        std::string child;
+        if (field.protobuf_type == 11 &&
+            !proto_array_layout(mod, field.struct_index, child, child_size, child_align, depth + 1))
+            return false;
+        const u32 width = repeated ? sizeof(Str)
+                          : field.protobuf_type == 11
+                              ? child_size
+                              : protobuf::array_element_size(field.protobuf_type);
+        const u32 align = repeated                    ? alignof(Str)
+                          : field.protobuf_type == 11 ? child_align
+                          : width == 1                ? 1
+                          : width == 4                ? 4
+                                                      : 8;
+        if (!width && field.protobuf_type != 11) return false;
+        size = (size + align - 1) & ~(align - 1);
+        word(fields, field.protobuf_number);
+        word(fields, field.protobuf_type | (repeated ? 256 : 0));
+        word(fields, size);
+        word(fields, static_cast<u32>(child.size()));
+        fields += child;
+        if (fields.size() > protobuf::kMaxMessageBytes - 12) return false;
+        size += width;
+        if (alignment < align) alignment = align;
+    }
+    size = (size + alignment - 1) & ~(alignment - 1);
+    word(bytes, size);
+    word(bytes, alignment);
+    word(bytes, decl.fields.len);
+    bytes += fields;
+    return true;
+}
+static FrontendResult<HirExpr> proto_array_schema(const HirModule& mod,
+                                                  u32 index,
+                                                  Span span,
+                                                  u32 depth) {
+    std::string bytes;
+    u32 size = 0, alignment = 1;
+    if (!proto_array_layout(mod, index, bytes, size, alignment, depth))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              span,
+                              lit_str("protobuf repeated message layout exceeds its budget"));
+    auto stored = intern_owned_response_body({bytes.data(), static_cast<u32>(bytes.size())});
+    if (!stored) return core::make_unexpected(stored.error());
+    HirExpr out{};
+    out.kind = HirExprKind::StrLit;
+    out.type = HirTypeKind::Str;
+    out.str_value = stored.value();
+    out.span = span;
+    return out;
+}
+static FrontendResult<HirExpr> add_proto_array_schema(FrontendResult<HirExpr> op,
+                                                      const HirModule& mod,
+                                                      u32 index,
+                                                      Span span,
+                                                      HirRoute* route,
+                                                      u32 depth) {
+    if (!op) return op;
+    auto schema = proto_array_schema(mod, index, span, depth);
+    if (!schema) return schema;
+    if (!route->exprs.push(schema.value()) || !op->args.push(&route->exprs[route->exprs.len - 1]))
+        return frontend_error(FrontendError::TooManyItems, span);
+    return op;
 }
 static FrontendResult<HirExpr> build_proto_codec(bool decode,
                                                  const protobuf::Message* message,
@@ -4436,7 +4514,7 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
         else if (proto->type == PT::Message && proto->message)
             expected = HirTypeKind::Struct;
         if (proto->repeated) {
-            if (expected == HirTypeKind::Struct || field.shape_index >= mod.type_shapes.len)
+            if (field.shape_index >= mod.type_shapes.len)
                 return frontend_error(FrontendError::UnsupportedSyntax, span);
             const auto& array = mod.type_shapes[field.shape_index];
             if (array.type != HirTypeKind::Array ||
@@ -4450,8 +4528,10 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   span,
                                   lit_str("unsupported protobuf/Rut field type mapping"));
-        const u64 kOp = (static_cast<u64>(proto->number) << 8) | static_cast<u8>(proto->type) |
-                        (proto->repeated ? protobuf::kRepeated : 0);
+        const u64 kOp =
+            (static_cast<u64>(proto->number) << 8) | static_cast<u8>(proto->type) |
+            (proto->repeated ? protobuf::kRepeated : 0) |
+            (proto->repeated && proto->type == PT::Message ? protobuf::kStructArray : 0);
         if (decode) {
             auto item = make_proto_op(kOp,
                                       expected == HirTypeKind::Struct ? HirTypeKind::Str : expected,
@@ -4469,6 +4549,20 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
                                          mod,
                                          span,
                                          depth + 1);
+            if (proto->repeated && proto->type == PT::Message) {
+                // Preserve the existing argument ABI: input, unused value, layout.
+                if (item) {
+                    HirExpr empty{};
+                    empty.kind = HirExprKind::StrLit;
+                    empty.type = HirTypeKind::Str;
+                    empty.str_value = lit_str("");
+                    if (!route->exprs.push(empty) ||
+                        !item->args.push(&route->exprs[route->exprs.len - 1]))
+                        return frontend_error(FrontendError::TooManyItems, span);
+                }
+                item =
+                    add_proto_array_schema(item, mod, field.struct_index, span, route, depth + 1);
+            }
             if (!item) return item;
             if (expected == HirTypeKind::Array) item->shape_index = field.shape_index;
             if (!route->exprs.push(item.value()))
@@ -4502,6 +4596,9 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
             }
             auto appended = make_proto_op(
                 kOp | protobuf::kEncode, HirTypeKind::Str, false, &result, &selected, span, route);
+            if (proto->repeated && proto->type == PT::Message)
+                appended = add_proto_array_schema(
+                    appended, mod, field.struct_index, span, route, depth + 1);
             if (!appended) return appended;
             result = appended.value();
         }
@@ -8160,6 +8257,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.type = out.kind == HirExprKind::ArrayFirst
                            ? mod.type_shapes[shape.array_elem_shape_index].type
                            : HirTypeKind::I32;
+            if (out.kind == HirExprKind::ArrayFirst) {
+                out.shape_index = shape.array_elem_shape_index;
+                out.struct_index = mod.type_shapes[shape.array_elem_shape_index].struct_index;
+            }
             out.may_nil = out.kind == HirExprKind::ArrayFirst;
             out.span = expr.span;
             if (!route->exprs.push(base.value()))

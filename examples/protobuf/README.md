@@ -52,13 +52,17 @@ at most eight nested edges are supported. Recursive schemas are rejected.
 Duplicate submessages merge, but each wire occurrence must be independently
 well-formed. Absent messages expose recursively default-valued structs; message
 presence is not exposed, and re-encoding defaults emits empty embedded messages.
-Repeated supported scalar fields infer immutable `[T]` arrays. Read `.count`,
+Repeated supported scalar and acyclic message fields infer immutable `[T]` arrays. Read `.count`,
 `.isEmpty` or optional `.first`; typed `let` aliases preserve the element type.
 Arrays do not grow or expose mutation/indexing/iteration. Each array is limited
 to 512 elements and the request Arena to 4,096 array elements plus the existing
-256 KiB value-memory budget. Repeated values may be packed/unpacked on input;
+256 KiB value-memory budget. Repeated numeric scalar values may be packed/unpacked on input;
 encoding emits unpacked occurrences and preserves defaults/empty elements.
-Repeated embedded messages remain unsupported. Array-bearing routes with `wait`
+Repeated message elements are native structs; `guard let entry = batch.entries.first`
+unwraps the optional before ordinary field access. All elements and descendants
+are validated before decode returns. Each contiguous slot allocation must also fit
+one 16 KiB Arena slice minus its block header; oversized slot regions fail decode.
+Array-bearing routes with `wait`
 are rejected until collection suspension ownership is implemented. Floating point, uint64/fixed64, enums, oneof/optional presence,
 maps, extensions/defaults, reserved declarations, custom options, public/weak
 imports, proto2 and editions are rejected. Source string escapes currently cover
@@ -76,3 +80,9 @@ arrays. POST `0a 03 01 02 00 12 01 78 12 00` to `/protobuf/repeated`;
 the response is `08 01 08 02 08 00 12 01 78 12 00`. The packed values
 `[1, 2, 0]` become unpacked occurrences; both string elements (`"x"`, `""`)
 are preserved.
+
+`examples/protobuf-messages.rut` shows `example.MessageBatch` with repeated
+`Message` structs. POST `0a 07 0a 03 52 75 74 10 7b` to `/protobuf/messages`
+for a roundtrip. Child repeated arrays and singular embedded messages share the
+same request budgets. This extends the payload codec; HTTP/JSON transcoding and
+service dispatch remain separate work.

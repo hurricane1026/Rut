@@ -44,3 +44,11 @@ message RepeatedScalars {
 message RepeatedChild {
   repeated NestedChild children = 1;
 }
+message CollectionLeaf {
+  repeated sint32 values = 1;
+  NestedChild child = 2;
+  bool enabled = 3;
+  sint64 distance = 4;
+}
+message CollectionBranch { repeated CollectionLeaf leaves = 1; }
+message CollectionTree { repeated CollectionBranch branches = 1; }

@@ -1,6 +1,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/protobuf_array.h"
+#include "rut/runtime/protobuf_struct_array.h"
 #include "test.h"
 using namespace rut;
 using namespace rut::protobuf;
@@ -117,6 +118,123 @@ TEST(protobuf_array, scalar_boundaries_empty_packing_and_fixed_width) {
                              sizeof(output),
                              encoded));
 }
+namespace {
+Str child_layout(u8* bytes) {
+    const u32 words[] = {24, 8, 2, 1, 9, 0, 0, 2, 5, 16, 0};
+    u32 cursor = 0;
+    for (u32 word : words)
+        for (u32 i = 0; i < 4; ++i) bytes[cursor++] = static_cast<u8>(word >> (8 * i));
+    return view(bytes, cursor);
+}
+struct NativeChild {
+    Str text;
+    i32 id;
+};
+static_assert(sizeof(NativeChild) == 24);
+}  // namespace
+TEST(protobuf_array, repeated_messages_own_native_structs_and_preserve_empty) {
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 description[44];
+    const Str schema = child_layout(description);
+    u8 input[] = {10, 5, 10, 1, 'x', 16, 1, 10, 0};
+    Str array{};
+    REQUIRE(decode_struct_array(1, schema, view(input, sizeof(input)), &arena, array));
+    CHECK_EQ(array.len, 2u);
+    CHECK_EQ(arena.collection_items(), 2u);
+    NativeChild first{}, second{};
+    __builtin_memcpy(&first, array.ptr, sizeof(first));
+    __builtin_memcpy(&second, array.ptr + sizeof(first), sizeof(second));
+    __builtin_memset(input, 0, sizeof(input));
+    CHECK(first.text.eq(lit_str("x")));
+    CHECK_EQ(first.id, 1);
+    CHECK(second.text.eq(lit_str("")));
+    CHECK_EQ(second.id, 0);
+    u8 output[64];
+    Str encoded{};
+    REQUIRE(encode_struct_array(1, schema, lit_str(""), array, output, sizeof(output), encoded));
+    const u8 expected[] = {10, 5, 10, 1, 'x', 16, 1, 10, 0};
+    CHECK(encoded.eq(view(expected, sizeof(expected))));
+    arena.reset();
+    CHECK_EQ(arena.collection_items(), 0u);
+    arena.destroy();
+    pool.destroy();
+}
+TEST(protobuf_array, repeated_message_preflight_checks_every_element_and_shared_budget) {
+    SlicePool pool;
+    REQUIRE(pool.init(1, 0, 0));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 description[44];
+    const Str schema = child_layout(description);
+    const u8 malformed[] = {10, 3, 10, 1, 'x', 10, 3, 10, 1, 255};
+    Str result = lit_str("unchanged");
+    const u64 before = arena.space_used();
+    CHECK_FALSE(decode_struct_array(1, schema, view(malformed, sizeof(malformed)), &arena, result));
+    CHECK(result.eq(lit_str("unchanged")));
+    CHECK_EQ(arena.space_used(), before);
+    CHECK_EQ(arena.collection_items(), 0u);
+    const u8 empty[] = {10, 0, 10, 0};
+    arena.set_collection_items(kMaxRequestArrayElements - 1);
+    CHECK_FALSE(decode_struct_array(1, schema, view(empty, sizeof(empty)), &arena, result));
+    CHECK_EQ(arena.collection_items(), kMaxRequestArrayElements - 1);
+    CHECK_EQ(arena.space_used(), before);
+    arena.reset();
+    REQUIRE(arena.alloc(arena.current->remaining()));
+    CHECK_FALSE(decode_struct_array(1, schema, view(empty, sizeof(empty)), &arena, result));
+    CHECK_EQ(arena.collection_items(), 0u);
+    CHECK(result.eq(lit_str("unchanged")));
+    arena.reset();
+    REQUIRE(arena.alloc(arena.current->remaining() - 8));
+    const u64 before_partial = arena.space_used();
+    const u8 one[] = {10, 3, 10, 1, 'x'};
+    CHECK_FALSE(decode_struct_array(1, schema, view(one, sizeof(one)), &arena, result));
+    CHECK_EQ(arena.collection_items(), 0u);
+    CHECK_EQ(arena.space_used(), before_partial + 8);
+    CHECK(result.eq(lit_str("unchanged")));
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(protobuf_array, repeated_message_contiguous_slot_limit) {
+    u8 description[140];
+    u32 cursor = 0;
+    auto word = [&](u32 value) {
+        for (u32 i = 0; i < 4; ++i) description[cursor++] = static_cast<u8>(value >> (8 * i));
+    };
+    word(128);
+    word(8);
+    word(8);
+    for (u32 i = 0; i < 8; ++i) {
+        word(i + 1);
+        word(9);
+        word(i * 16);
+        word(0);
+    }
+    u8 input[256];
+    for (u32 i = 0; i < 128; ++i) {
+        input[2 * i] = 10;
+        input[2 * i + 1] = 0;
+    }
+    SlicePool pool;
+    REQUIRE(pool.init(2));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    Str result = lit_str("unchanged");
+    CHECK_FALSE(decode_struct_array(
+        1, view(description, cursor), view(input, sizeof(input)), &arena, result));
+    CHECK(result.eq(lit_str("unchanged")));
+    CHECK_EQ(arena.space_used(), 0u);
+    REQUIRE(decode_struct_array(
+        1, view(description, cursor), view(input, sizeof(input) - 2), &arena, result));
+    CHECK_EQ(result.len, 127u);
+    CHECK_EQ(arena.collection_items(), 127u);
+    arena.destroy();
+    pool.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -427,7 +427,7 @@ internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most
 eight fields per message: string/bytes, bool, signed 32/64-bit,
 unsigned/fixed 32-bit and acyclic embedded message fields. Unsigned/fixed 32-bit
-fields infer i64 with range-checked encoding; repeated scalar fields infer `[T]`.
+fields infer i64 with range-checked encoding; repeated scalar/message fields infer `[T]`.
 User i64 annotations remain
 unavailable. Messages cap at 8 KiB; intermediate request bytes at 256 KiB.
 Proto3 defaults, last correctly typed duplicate wins, UTF-8 validation for strings,
@@ -436,16 +436,21 @@ rejected); unknown fields are lost on encoding. Embedded messages infer nested
 structs (up to eight nesting edges); duplicate
 submessages merge, and absent messages expose recursively default-valued structs.
 Presence is not exposed: encoding such a default struct emits an empty embedded
-message. Repeated embedded messages, floating point, unsigned 64-bit values,
+message. Floating point, unsigned 64-bit values,
 enums, oneof/presence/maps and proto2 are not executable codec shapes yet. See
 [the example and source grammar limits](../examples/protobuf/README.md).
-Repeated scalar arrays support `.count` (i32), `.isEmpty` (bool) and `.first`
+Repeated scalar and acyclic message arrays support `.count` (i32), `.isEmpty` (bool) and `.first`
 (optional element). `let items: [i32] = message.values` aliases immutable,
 request-owned storage. Empty arrays return nil from `.first`; repeated defaults
-are retained. Packed/unpacked inputs may mix, and encoding emits unpacked values.
+are retained. Numeric scalar packed/unpacked inputs may mix; encoding emits
+unpacked scalars and length-delimited message entries.
 Limits: 512 elements per array, 4,096 across the request Arena, and the shared
 256 KiB value budget. Decode returns nil on limit/allocation failure. Strings
-and bytes own their payloads. Arrays cannot be grown, mutated, indexed, iterated
+and bytes own their payloads. Message arrays contain native structs; unwrap
+`.first` before accessing its fields. Child arrays and singular messages are
+validated recursively, including elements not accessed by the program. Each
+contiguous array region must also fit one Arena slice (16 KiB minus the block
+header); exceeding the slot-byte limit returns nil. Arrays cannot be grown, mutated, indexed, iterated
 or used in routes with explicit `wait`; general array literals remain rejected.
 These operations handle protobuf payloads; protobuf JSON mapping and gRPC framing
 are separate. Native forwarding continues to treat payloads as opaque bytes.

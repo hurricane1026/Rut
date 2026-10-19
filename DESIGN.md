@@ -336,12 +336,12 @@ and does not establish a supported language surface; see
 
 Runtime immutable arrays use the existing `[T]` type syntax. Their length is known
 at creation time, rather than compilation time, and remains fixed. The initial
-producer is protobuf repeated scalar decoding; general array literals, indexing,
+producer is protobuf repeated scalar/message decoding; general array literals, indexing,
 mutation, growth, append and iteration are not executable Core features.
 
 Each array is a `{data, count}` value with contiguous native element storage.
-Supported element carriers are bool, i32, i64 and string/bytes (both represented
-as `str`). Aliases share immutable request-owned storage; assignment does not
+Supported element carriers are bool, i32, i64, string/bytes (both represented
+as `str`) and acyclic inferred protobuf structs. Aliases share immutable request-owned storage; assignment does not
 copy the payload or add reference counting. `.count` returns i32, `.isEmpty`
 returns bool, and `.first` returns an optional element, including nil for empty
 arrays. Empty `.first` selects a valid fallback slot before loading; it never
@@ -364,8 +364,22 @@ before allocation and count only successfully constructed arrays.
 Repeated scalar decoding accepts mixed packed/unpacked occurrences and preserves
 wire element order, zero values, false and empty strings. Encoding emits legal
 unpacked occurrences, retaining every element. The existing supported scalar
-mappings/range checks apply. Repeated embedded messages, float/uint64/enum values,
+mappings/range checks apply. Float/uint64/enum values,
 map/oneof/presence and array construction/transformation APIs remain absent.
+
+Repeated message arrays use a compiler-emitted, bounded native-layout constant
+(size/alignment, field tags/types/offsets and nested layout constants). The runtime
+validates the constant and every message element before allocating output. No
+source schema, heap descriptor graph or filesystem lookup is needed at runtime.
+The admitted C/LLVM bool, i32, i64, string/array and struct carriers use natural
+native alignment. Each array's contiguous slots must fit one SliceArena block
+(16 KiB minus its header); the element count and shared request budgets still
+apply. Slot-byte exhaustion returns nil rather than growing or chaining an array.
+Payload bytes for the entire repeated-message subtree are counted and copied into
+one exact-sized Arena region. Child arrays allocate their own fixed slot regions.
+All descendants share the 4,096-element and 256 KiB limits, including empty
+message elements. Empty repeated messages are preserved on re-encoding; absent
+singular children retain the existing recursively default-valued semantics.
 
 #### 3.3.1 Built-in Domain Types
 
@@ -1443,13 +1457,14 @@ The analyzer creates/caches nominal internal message types from fully qualified
 names and exact field identities. This permits inferred i64 message fields
 without enabling user i64 annotations. It emits field-specific RIR operations
 with constant field tags/types, and LLVM compiles those operations into handlers
-for both ORC JIT and native artifacts. Shared wire/scalar helpers have no schema
-pointer, descriptors or filesystem access on the request path. The initial decoder
+for both ORC JIT and native artifacts. Shared wire/scalar helpers have no source schema or filesystem access on the
+request path; repeated message operations also carry the compiled layout constant
+described above. The initial decoder
 uses bounded per-field wire scans (at most eight fields); it is not yet a single
 pass generated tag dispatcher. JSON and protobuf share optional struct assembly
 and the helper ABI lowering, while retaining distinct operations/semantics.
 
-The executable subset supports up to eight singular `string`/`bytes`, `bool`,
+The executable subset supports up to eight fields per message: `string`/`bytes`, `bool`,
 `int32`/`sint32`/`sfixed32`, `int64`/`sint64`/`sfixed64` and
 `uint32`/`fixed32` fields; unsigned 32-bit values infer i64 and encode with a
 range check. Inputs/outputs cap at 8 KiB and request-owned intermediate bytes at
@@ -1482,8 +1497,8 @@ eight nesting edges and eight fields per message are supported. Absent messages
 materialize recursively default-valued structs; presence is not exposed, so
 encoding defaults emits an empty embedded message. Recursive types are rejected.
 
-Repeated scalar fields now use the runtime immutable array carriers above.
-Repeated embedded messages, floating point, uint64/fixed64, enums, oneof/optional presence, maps, proto2 and
+Repeated scalar and message fields now use the runtime immutable array carriers above.
+Floating point, uint64/fixed64, enums, oneof/optional presence, maps, proto2 and
 editions remain pending. Proto2 must implement explicit presence, defaults and
 required-field validation before being enabled. The source parser rejects custom
 options, public/weak imports, reserved/default/extension declarations and string

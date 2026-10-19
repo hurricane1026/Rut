@@ -115,6 +115,7 @@ struct TupleLoweringInfo {
 
 struct FlatMirShape {
     MirTypeKind array_element = MirTypeKind::Unknown;
+    u32 array_element_struct_index = 0xffffffffu;
     MirTypeKind type = MirTypeKind::Unknown;
     u32 variant_index = 0xffffffffu;
     u32 struct_index = 0xffffffffu;
@@ -498,8 +499,11 @@ static bool expand_flat_shape(const MirModule& mir, u32 shape_index, FlatMirShap
     out->variant_index = shape.variant_index;
     out->struct_index = shape.struct_index;
     out->tuple_len = shape.tuple_len;
-    if (shape.type == MirTypeKind::Array && shape.array_elem_shape_index < mir.type_shapes.len)
+    if (shape.type == MirTypeKind::Array && shape.array_elem_shape_index < mir.type_shapes.len) {
         out->array_element = mir.type_shapes[shape.array_elem_shape_index].type;
+        out->array_element_struct_index =
+            mir.type_shapes[shape.array_elem_shape_index].struct_index;
+    }
     if (shape.type != MirTypeKind::Tuple) return true;
     for (u32 i = 0; i < shape.tuple_len; i++) {
         const u32 elem_index = shape.tuple_elem_shape_indices[i];
@@ -701,6 +705,18 @@ static FrontendResult<const rir::Type*> rir_type_for_flat_shape(
     rir::Builder& b,
     Span span) {
     if (shape.type == MirTypeKind::Array) {
+        if (shape.array_element == MirTypeKind::Struct) {
+            const u32 index = shape.array_element_struct_index;
+            if (index >= MirModule::kMaxStructs || !user_struct_defs[index])
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            auto element = b.make_type(rir::TypeKind::Struct,
+                                       nullptr,
+                                       const_cast<rir::StructDef*>(user_struct_defs[index]));
+            if (!element) return frontend_error(FrontendError::OutOfMemory, span);
+            auto array = b.make_type(rir::TypeKind::Array, element.value());
+            if (!array) return frontend_error(FrontendError::OutOfMemory, span);
+            return array.value();
+        }
         const auto kind = shape.array_element == MirTypeKind::Bool  ? rir::TypeKind::Bool
                           : shape.array_element == MirTypeKind::I32 ? rir::TypeKind::I32
                           : shape.array_element == MirTypeKind::I64 ? rir::TypeKind::I64

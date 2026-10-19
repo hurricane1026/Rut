@@ -345,7 +345,11 @@ static bool shape_carrier_ready(const MirModule& mir,
         return true;
     if (shape.type == MirTypeKind::Array) {
         if (shape.array_elem_shape_index >= mir.type_shapes.len) return false;
-        const auto element = mir.type_shapes[shape.array_elem_shape_index].type;
+        const auto& element_shape = mir.type_shapes[shape.array_elem_shape_index];
+        const auto element = element_shape.type;
+        if (element == MirTypeKind::Struct)
+            return element_shape.struct_index < mir.structs.len &&
+                   struct_ready[element_shape.struct_index];
         return element == MirTypeKind::Bool || element == MirTypeKind::I32 ||
                element == MirTypeKind::I64 || element == MirTypeKind::Str;
     }
@@ -373,12 +377,8 @@ static bool shape_slot_carrier_ready(const MirModule& mir,
     if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
         shape.type == MirTypeKind::Str)
         return true;
-    if (shape.type == MirTypeKind::Array) {
-        if (shape.array_elem_shape_index >= mir.type_shapes.len) return false;
-        const auto element = mir.type_shapes[shape.array_elem_shape_index].type;
-        return element == MirTypeKind::Bool || element == MirTypeKind::I32 ||
-               element == MirTypeKind::I64 || element == MirTypeKind::Str;
-    }
+    if (shape.type == MirTypeKind::Array)
+        return shape_carrier_ready(mir, shape_index, struct_ready, variant_ready);
     if (shape.type == MirTypeKind::Struct)
         return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
     if (shape.type == MirTypeKind::Variant)
@@ -423,6 +423,9 @@ static bool field_carrier_ready(const MirModule& mir,
                                 const bool* struct_ready,
                                 const bool* variant_ready) {
     if (field.is_error_type) return true;
+    // Ordinary struct fields have native i64 slots. This does not widen the
+    // distinct variant/error scalar carriers, whose payloads remain i32.
+    if (field.type == MirTypeKind::I64) return true;
     if (field.shape_index != 0xffffffffu)
         return shape_slot_carrier_ready(mir, field.shape_index, struct_ready, variant_ready);
     // Note: Method is intentionally omitted here (and in the variant

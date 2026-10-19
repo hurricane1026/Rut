@@ -12,3 +12,4 @@ message Batch {
   repeated int32 values = 1;
   repeated string names = 2;
 }
+message MessageBatch { repeated Message entries = 1; }

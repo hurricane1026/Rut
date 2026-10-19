@@ -3716,7 +3716,8 @@ target_include_directories(test_protobuf_source PRIVATE
 target_compile_definitions(test_protobuf_source PRIVATE RUT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 add_test(NAME test_protobuf_source COMMAND test_protobuf_source)
 set_tests_properties(test_protobuf_source PROPERTIES LABELS "unit;compiler" TIMEOUT 30)
-add_executable(test_protobuf_array test_protobuf_array.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+add_executable(test_protobuf_array test_protobuf_array.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc
+    ${PROJECT_SOURCE_DIR}/src/runtime/arena.cc)
 target_include_directories(test_protobuf_array PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
 add_test(NAME test_protobuf_array COMMAND test_protobuf_array)

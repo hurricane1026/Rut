@@ -632,7 +632,9 @@ canonical spelling for common gateway tasks.
   最多八层嵌套边，不暴露 presence，递归类型仍拒绝。
 - [x] 不可增长运行时数组与 repeated 标量：计数后一次分配元素槽位、请求共享预算、
   count/isEmpty/first、JIT/原生产物；禁止数组路由 wait，不开放索引/循环/修改。
-- [ ] 扩展 protobuf codec：单遍 tag dispatcher、repeated 嵌套消息、浮点/uint64、enum、
+- [x] repeated 嵌套消息：编译期有界布局、原生 struct 数组、递归预校验和共享预算，
+  支持 first 解包后访问子字段及完整数组往返；保留单 Slice 连续槽位上限。
+- [ ] 扩展 protobuf codec：单遍 tag dispatcher、浮点/uint64、enum、
   oneof/optional、map；proto2 需补齐 presence、显式默认值和 required 校验。
 - [ ] 在通用字节/流能力上实现 Rut protobuf 编解码模块、描述符读取与 HTTP/gRPC 转码；
   不强制用户用其他语言生成或维护插件。

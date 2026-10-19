@@ -22638,6 +22638,246 @@ TEST(jit, protobuf_repeated_immutable_arrays_roundtrip_and_properties) {
     rir.destroy();
 }
 
+TEST(jit, protobuf_repeated_messages_native_structs_roundtrip) {
+    const char* src =
+        "route POST \"/arrays\" { "
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.RepeatedChild\", req.body) else { return 422 } "
+        "guard value.children.count == 2 else { return 410 } "
+        "guard let first = value.children.first else { return 412 } "
+        "guard first.text == \"x\" && first.id == 1 else { return 413 } "
+        "guard let bytes = protobuf.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.RepeatedChild\", value) else { return 500 } "
+        "return response(200, body: bytes) }\n"
+        "route POST \"/empty\" { "
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.RepeatedChild\", req.body) else { return 422 } "
+        "guard value.children.isEmpty else { return 410 } "
+        "guard value.children.first == nil else { return 413 } return 204 }\n";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    if (!ast)
+        fprintf(stderr,
+                "arrays parse %u:%u %.*s\n",
+                ast.error().span.line,
+                ast.error().span.col,
+                ast.error().detail.len,
+                ast.error().detail.ptr);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir)
+        fprintf(stderr,
+                "arrays analyze %u:%u %.*s\n",
+                hir.error().span.line,
+                hir.error().span.col,
+                hir.error().detail.len,
+                hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    if (!mir)
+        fprintf(stderr,
+                "arrays mir code=%u %u:%u %.*s\n",
+                static_cast<u32>(mir.error().code),
+                mir.error().span.line,
+                mir.error().span.col,
+                mir.error().detail.len,
+                mir.error().detail.ptr);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    if (!lowered)
+        fprintf(stderr,
+                "arrays lower %u:%u %.*s\n",
+                lowered.error().span.line,
+                lowered.error().span.col,
+                lowered.error().detail.len,
+                lowered.error().detail.ptr);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    auto empty = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(empty);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    MappedArray<Connection> connections;
+    REQUIRE(connections.init(1));
+    auto& conn = connections[0];
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    const u8 input[] = {10, 5, 10, 1, 'x', 16, 1, 10, 0};
+    const u8 expected[] = {10, 5, 10, 1, 'x', 16, 1, 10, 0};
+    char request[128];
+    const int header = snprintf(request,
+                                sizeof(request),
+                                "POST /arrays HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                static_cast<u32>(sizeof(input)));
+    memcpy(request + header, input, sizeof(input));
+    auto result = HandlerResult::unpack(handler(
+        &conn, nullptr, reinterpret_cast<const u8*>(request), header + sizeof(input), nullptr));
+    REQUIRE_EQ(result.status_code, 200u);
+    REQUIRE(conn.jit_response_body_valid);
+    memset(request, 'z', sizeof(request));
+    CHECK(conn.jit_response_body.eq({reinterpret_cast<const char*>(expected), sizeof(expected)}));
+    CHECK_EQ(conn.json_arena.collection_items(), 2u);
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    CHECK_EQ(conn.json_arena.collection_items(), 0u);
+    const char* empty_request = "POST /empty HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    result = HandlerResult::unpack(empty(&conn,
+                                         nullptr,
+                                         reinterpret_cast<const u8*>(empty_request),
+                                         strlen(empty_request),
+                                         nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    auto reject = [&](const u8* payload, u32 length) {
+        conn.reset();
+        conn.json_arena.backend.pool = &pool;
+        char malformed_request[2048];
+        const int prefix = snprintf(malformed_request,
+                                    sizeof(malformed_request),
+                                    "POST /arrays HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                    length);
+        memcpy(malformed_request + prefix, payload, length);
+        const auto rejected =
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(malformed_request),
+                                          prefix + length,
+                                          nullptr));
+        CHECK_EQ(rejected.status_code, 422u);
+        CHECK_EQ(conn.json_arena.collection_items(), 0u);
+        CHECK_EQ(conn.json_arena.space_used(), 0u);
+    };
+    const u8 bad_utf8[] = {10, 3, 10, 1, 'x', 10, 3, 10, 1, 255};
+    reject(bad_utf8, sizeof(bad_utf8));
+    const u8 bad_fragment[] = {10, 1, 128};
+    reject(bad_fragment, sizeof(bad_fragment));
+    u8 too_many[1026];
+    for (u32 i = 0; i < 513; ++i) {
+        too_many[2 * i] = 10;
+        too_many[2 * i + 1] = 0;
+    }
+    reject(too_many, sizeof(too_many));
+    conn.reset();
+    connections.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, protobuf_repeated_message_tree_with_scalar_arrays) {
+    const char* src =
+        "route POST \"/arrays\" { "
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.CollectionTree\", req.body) else { return 422 } "
+        "guard let branch = value.branches.first else { return 410 } "
+        "guard let leaf = branch.leaves.first else { return 411 } "
+        "guard leaf.child.id == 7 && leaf.enabled && leaf.distance == -1 && leaf.values.count == 3 "
+        "&& leaf.values.first == -1 else { return 412 } "
+        "guard let bytes = protobuf.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.CollectionTree\", value) else { return 500 } "
+        "return response(200, body: bytes) }\n"
+        "route POST \"/empty\" { "
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.CollectionTree\", req.body) else { return 422 } "
+        "guard value.branches.isEmpty else { return 410 } "
+        "guard value.branches.first == nil else { return 413 } return 204 }\n";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    if (!ast)
+        fprintf(stderr,
+                "arrays parse %u:%u %.*s\n",
+                ast.error().span.line,
+                ast.error().span.col,
+                ast.error().detail.len,
+                ast.error().detail.ptr);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir)
+        fprintf(stderr,
+                "arrays analyze %u:%u %.*s\n",
+                hir.error().span.line,
+                hir.error().span.col,
+                hir.error().detail.len,
+                hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    if (!mir)
+        fprintf(stderr,
+                "arrays mir code=%u %u:%u %.*s\n",
+                static_cast<u32>(mir.error().code),
+                mir.error().span.line,
+                mir.error().span.col,
+                mir.error().detail.len,
+                mir.error().detail.ptr);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    if (!lowered)
+        fprintf(stderr,
+                "arrays lower %u:%u %.*s\n",
+                lowered.error().span.line,
+                lowered.error().span.col,
+                lowered.error().detail.len,
+                lowered.error().detail.ptr);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    auto empty = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(empty);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    MappedArray<Connection> connections;
+    REQUIRE(connections.init(1));
+    auto& conn = connections[0];
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    const u8 input[] = {10, 20, 10,  16, 10, 3,  1, 4,  0, 18, 5,
+                        10, 1,  'x', 16, 7,  24, 1, 32, 1, 10, 0};
+    const u8 expected[] = {10, 23,  10, 17, 8,  1, 8,  4, 8,  0, 18, 5, 10,
+                           1,  'x', 16, 7,  24, 1, 32, 1, 10, 2, 18, 0};
+    char request[128];
+    const int header = snprintf(request,
+                                sizeof(request),
+                                "POST /arrays HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                static_cast<u32>(sizeof(input)));
+    memcpy(request + header, input, sizeof(input));
+    auto result = HandlerResult::unpack(handler(
+        &conn, nullptr, reinterpret_cast<const u8*>(request), header + sizeof(input), nullptr));
+    REQUIRE_EQ(result.status_code, 200u);
+    REQUIRE(conn.jit_response_body_valid);
+    memset(request, 'z', sizeof(request));
+    CHECK(conn.jit_response_body.eq({reinterpret_cast<const char*>(expected), sizeof(expected)}));
+    CHECK_EQ(conn.json_arena.collection_items(), 6u);
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    CHECK_EQ(conn.json_arena.collection_items(), 0u);
+    const char* empty_request = "POST /empty HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    result = HandlerResult::unpack(empty(&conn,
+                                         nullptr,
+                                         reinterpret_cast<const u8*>(empty_request),
+                                         strlen(empty_request),
+                                         nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    conn.reset();
+    connections.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, protobuf_array_helper_shared_budget_and_failure) {
     SlicePool pool;
     REQUIRE(pool.init(16));
