@@ -7418,6 +7418,78 @@ TEST(grpc_proxy, grpc_web_terminal_data_can_end_with_zero_flow_control_credit) {
     CHECK_EQ(x.download_len, 1u);
 }
 
+TEST(grpc_proxy, native_trailer_emits_pending_hpack_resize_after_data_stall) {
+    Http2Conn h;
+    h.init_client();
+    auto* stream = h.open_stream(1);
+    REQUIRE(stream != nullptr);
+
+    // Put the encoder and a peer decoder into a non-empty, synchronized state.
+    u8 first[256];
+    const hpack::Header first_headers[] = {{{"x-seed", 6}, {"value", 5}}};
+    const u32 first_len = http2_write_response(
+        first, sizeof(first), h.hpack_enc, 1, 200, first_headers, 1, nullptr, 0);
+    REQUIRE_GT(first_len, 0u);
+    hpack::DynamicTable decoder;
+    decoder.init(kDefaultHeaderTableSize);
+    hpack::Header decoded[8];
+    u8 decoded_storage[256];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(decoder,
+                                       first + kFrameHeaderSize,
+                                       first_len - kFrameHeaderSize,
+                                       decoded_storage,
+                                       sizeof(decoded_storage),
+                                       decoded,
+                                       8,
+                                       &decoded_count));
+
+    static const u8 body[] = {0xaa, 0xbb};
+    h.outbound_stream = 1;
+    h.outbound_body = body;
+    h.outbound_body_len = sizeof(body);
+    h.outbound_body_offset = 0;
+    h.outbound_grpc_status = 0;
+    h.conn_send_window = 0;
+    stream->send_window = 0;
+    h.hpack_enc.set_table_size(0);
+    CHECK_GE(h.hpack_enc.pending_size_update, 0);
+
+    u8 output[128];
+    H2PumpStatus status = H2PumpStatus::Blocked;
+    CHECK_EQ(h2_pump_outbound(h, output, sizeof(output), status), 0u);
+    CHECK_EQ(status, H2PumpStatus::Blocked);
+    CHECK_GE(h.hpack_enc.pending_size_update, 0);
+
+    h.conn_send_window = 16;
+    stream->send_window = 16;
+    REQUIRE_EQ(h2_pump_outbound(h, output, sizeof(output), status), 11u);
+    CHECK_EQ(status, H2PumpStatus::Produced);
+    CHECK_EQ(h.outbound_body_offset, sizeof(body));
+
+    // A failed output attempt must leave the resize armed for the retry.
+    CHECK_EQ(h2_pump_outbound(h, output, kFrameHeaderSize, status), 0u);
+    CHECK_GE(h.hpack_enc.pending_size_update, 0);
+    const u32 trailer_len = h2_pump_outbound(h, output, sizeof(output), status);
+    REQUIRE_GT(trailer_len, static_cast<u32>(kFrameHeaderSize));
+    CHECK_EQ(status, H2PumpStatus::Produced);
+    Http2FrameHeader trailer_frame;
+    REQUIRE(parse_frame_header(output, trailer_len, &trailer_frame) == ParseStatus::Complete);
+    CHECK_EQ(trailer_frame.type, static_cast<u8>(Http2FrameType::Headers));
+    REQUIRE(hpack::decode_header_block(decoder,
+                                       output + kFrameHeaderSize,
+                                       trailer_frame.length,
+                                       decoded_storage,
+                                       sizeof(decoded_storage),
+                                       decoded,
+                                       8,
+                                       &decoded_count));
+    REQUIRE_EQ(decoded_count, 1u);
+    CHECK(decoded[0].name.eq({"grpc-status", 11}));
+    CHECK(decoded[0].value.eq({"0", 1}));
+    CHECK_EQ(h.hpack_enc.pending_size_update, -1);
+}
+
 TEST(grpc_proxy, grpc_web_text_large_message_batches_data_frames) {
     GrpcDriveFixture loop;
     Connection downstream;

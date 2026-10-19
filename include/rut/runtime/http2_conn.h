@@ -280,6 +280,16 @@ struct Http2Conn {
 u32 http2_write_headers(
     u8* out, u32 out_cap, u32 stream_id, const hpack::Header* hs, u32 n, bool end_stream);
 
+// Stateful variant for response blocks emitted after a peer SETTINGS update.
+// The encoder is committed only when the complete frame fits in out.
+u32 http2_write_headers(u8* out,
+                        u32 out_cap,
+                        u32 stream_id,
+                        const hpack::Header* hs,
+                        u32 n,
+                        bool end_stream,
+                        hpack::Encoder& enc);
+
 // Write a DATA frame for data[0..len) on stream_id into out (must hold
 // kFrameHeaderSize + len). Returns octets written.
 u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream);

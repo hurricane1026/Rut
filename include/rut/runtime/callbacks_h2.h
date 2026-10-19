@@ -289,7 +289,12 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
         value[0] = static_cast<char>('0' + h2.outbound_grpc_status / (length == 1 ? 1 : 10));
         value[1] = static_cast<char>('0' + h2.outbound_grpc_status % 10);
         const hpack::Header trailers[] = {{{"grpc-status", 11}, {value, length}}};
-        const u32 n = http2_write_headers(out, cap, h2.outbound_stream, trailers, 1, true);
+        // A peer SETTINGS_HEADER_TABLE_SIZE may have armed a dynamic-table
+        // resize while DATA was flow-control stalled. Stage the trailer with a
+        // copy of the connection encoder and commit it only when the complete
+        // HEADERS frame fits, so a retry cannot consume the pending update.
+        const u32 n =
+            http2_write_headers(out, cap, h2.outbound_stream, trailers, 1, true, h2.hpack_enc);
         if (!n) return 0;
         h2.outbound_final_staged = true;
         status = H2PumpStatus::Produced;

@@ -215,14 +215,33 @@ bool Http2Conn::consume_data(u32 stream_id, u32 len) {
 
 // --- Response serialization ---
 
-u32 http2_write_headers(
-    u8* out, u32 out_cap, u32 stream_id, const hpack::Header* hs, u32 n, bool end_stream) {
+static u32 http2_write_headers_impl(u8* out,
+                                    u32 out_cap,
+                                    u32 stream_id,
+                                    const hpack::Header* hs,
+                                    u32 n,
+                                    bool end_stream,
+                                    hpack::Encoder* encoder) {
     if (out_cap < kFrameHeaderSize) return 0;
     u32 o = kFrameHeaderSize;
+    hpack::Encoder next;
+    if (encoder != nullptr) next = *encoder;
+    if (encoder != nullptr) {
+        u8 pending[12];
+        const u32 pending_len = next.emit_pending_size_update(pending);
+        if (pending_len > out_cap - o) return 0;
+        __builtin_memcpy(out + o, pending, pending_len);
+        o += pending_len;
+    }
     for (u32 i = 0; i < n; i++) {
         // Worst-case per header: name+value+small prefixes. Bail if it won't fit.
-        if (o + hs[i].name.len + hs[i].value.len + 8 > out_cap) return 0;
-        o += hpack::encode_header(out + o, hs[i].name, hs[i].value);
+        const u32 overhead = encoder != nullptr ? 11u : 8u;
+        if (o > out_cap || hs[i].name.len > out_cap - o ||
+            hs[i].value.len > out_cap - o - hs[i].name.len ||
+            overhead > out_cap - o - hs[i].name.len - hs[i].value.len)
+            return 0;
+        o += encoder != nullptr ? next.encode(out + o, hs[i].name, hs[i].value)
+                                : hpack::encode_header(out + o, hs[i].name, hs[i].value);
     }
     const u32 kPayload = o - kFrameHeaderSize;
     u8 flags = http2_flag::kEndHeaders;
@@ -233,7 +252,23 @@ u32 http2_write_headers(
     h.flags = flags;
     h.stream_id = stream_id;
     write_frame_header(out, h);
+    if (encoder != nullptr) *encoder = next;
     return o;
+}
+
+u32 http2_write_headers(
+    u8* out, u32 out_cap, u32 stream_id, const hpack::Header* hs, u32 n, bool end_stream) {
+    return http2_write_headers_impl(out, out_cap, stream_id, hs, n, end_stream, nullptr);
+}
+
+u32 http2_write_headers(u8* out,
+                        u32 out_cap,
+                        u32 stream_id,
+                        const hpack::Header* hs,
+                        u32 n,
+                        bool end_stream,
+                        hpack::Encoder& enc) {
+    return http2_write_headers_impl(out, out_cap, stream_id, hs, n, end_stream, &enc);
 }
 
 u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream) {
