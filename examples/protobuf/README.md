@@ -116,3 +116,14 @@ RPC request/response references. Ordinary imports expose only the imported file
 and its public exports; private transitive imports remain invisible. Duplicate
 imports share a dependency entry; a public occurrence marks that entry public.
 Import cycles and existing file/depth/byte budgets still apply.
+
+Standard file-level generator metadata is accepted (not executed):
+`java_package`, `java_outer_classname`, `java_multiple_files`,
+`java_generate_equals_and_hash`, `java_string_check_utf8`, `go_package`,
+`cc_generic_services`, `java_generic_services`, `py_generic_services`, `deprecated`,
+`cc_enable_arenas`, `objc_class_prefix`, `csharp_namespace`, `swift_prefix`,
+`php_class_prefix`, `php_namespace`, `php_metadata_namespace`, `ruby_package`,
+and `optimize_for` (`SPEED`, `CODE_SIZE`, `LITE_RUNTIME`). Names are unique per
+file, strings support the escapes/concatenation above, and values must have the
+correct string/bool/enum type. Unknown/custom and editions `features` options
+remain rejected. These options do not enable new codecs or language generators.

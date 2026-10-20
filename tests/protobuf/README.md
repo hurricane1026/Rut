@@ -89,3 +89,10 @@ pairs). `generate_strings_oracle.py` optionally invokes official protoc from
 Neither package is required by builds/tests. Protoc warns about non-identifier
 reserved names but retains their bytes, allowing direct metadata comparison.
 The schema also drives JIT and epoll/io_uring RPC roundtrip regressions.
+
+`file_options.proto` exercises all supported standard file generator options and
+publicly imports the string/enum RPC fixture. The optional
+`generate_file_options_oracle.py` uses official libprotoc 31.1 (grpcio-tools 1.78.0)
+to generate the committed descriptor. Source tests compare executable schema/RPCs
+and reject unknown, custom, wrongly typed and duplicate options. JIT, native
+schema-removal and both network backends exercise option-bearing schema inputs.

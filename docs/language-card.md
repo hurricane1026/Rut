@@ -429,6 +429,10 @@ Proto source strings support adjacent literals, character/octal/hex escapes and
 Unicode scalar escapes, including paired UTF-16 surrogates within one literal.
 Decoded import paths still reject parent traversal, absolute paths and NUL.
 Unpaired surrogates, invalid scalars, unknown escapes and raw newlines are rejected.
+Standard file generation options are accepted with checked scalar types: Java,
+Go, C++/Python generic services, arena generation, deprecated, optimize_for, and
+Objective-C/C#/Swift/PHP/Ruby naming options. They do not alter Rut wire/RPC
+semantics; duplicates, wrong types and unknown/custom/editions options are rejected.
 The compiler reads proto3 imports and generates an
 internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most

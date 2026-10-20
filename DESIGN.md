@@ -8263,3 +8263,20 @@ apply. Import paths are validated after decoding/concatenation so escaped absolu
 paths, parent traversal and NUL bytes cannot bypass path guards. Unknown escapes,
 raw newlines and unterminated literals are syntax errors. The runtime ABI is
 unchanged. A committed official protoc fixture checks byte-exact decoded metadata.
+
+### Standard protobuf file generation options
+
+The proto3 source loader accepts the standard string/bool file options for Java,
+Go, C++, Python, Objective-C, C#, Swift, PHP and Ruby generation, plus deprecated
+and optimize_for (SPEED, CODE_SIZE, LITE_RUNTIME). Values are parsed with their
+FileOptions scalar types and encoded using the descriptor field numbers. Options
+are unique per file, may appear around imports/declarations, and share existing
+source/descriptor byte budgets. String values must be valid UTF-8.
+
+These are generator metadata: Rut validates source spelling/types but does not
+run language generators or change wire decoding, UTF-8 checks, RPC routing or
+Arena ownership. The schema loader ignores file generation metadata equally for
+source-emitted and external descriptors. Unknown/custom/aggregate/editions options
+remain rejected by the source loader; message, field, enum and method option
+support is unchanged. An official protoc fixture verifies that option-bearing
+schemas and public imported RPCs retain the same executable schema.
