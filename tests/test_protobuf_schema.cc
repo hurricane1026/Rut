@@ -765,6 +765,45 @@ TEST(protobuf_schema, optional_metadata_matches_official_descriptor) {
             .has_value());
 }
 
+TEST(protobuf_schema, repeated_message_preserves_nested_optional_metadata) {
+    // This is the descriptor shape that reaches the compiler's repeated
+    // message layout path.  The source parser intentionally rejects the
+    // `optional` keyword, so keep the regression at the descriptor boundary
+    // where proto3 presence is represented by proto3_optional + a synthetic
+    // oneof.
+    Bytes optional_field = member(lit_str("value"), 1, 5);
+    optional_field.number(17, 1);
+    optional_field.number(9, 0);
+    Bytes synthetic_oneof;
+    synthetic_oneof.text(1, lit_str("_value"));
+    Bytes child;
+    child.text(1, lit_str("Child"));
+    child.child(2, optional_field);
+    child.child(8, synthetic_oneof);
+
+    Bytes repeated_child = member(lit_str("children"), 1, 11, 3);
+    repeated_child.text(6, lit_str(".example.Child"));
+    Bytes root;
+    root.text(1, lit_str("Root"));
+    root.child(2, repeated_child);
+    Bytes source = file(child);
+    source.child(4, root);
+    Bytes input;
+    input.child(1, source);
+
+    CompileArena storage;
+    auto result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE(result);
+    const auto* root_message = result->find_message(lit_str(".example.Root"));
+    const auto* child_message = result->find_message(lit_str(".example.Child"));
+    REQUIRE(root_message && child_message);
+    REQUIRE(root_message->fields && root_message->fields->message == child_message);
+    CHECK(root_message->fields->repeated);
+    REQUIRE(child_message->fields);
+    CHECK(child_message->fields->proto3_optional);
+    CHECK_EQ(child_message->fields->oneof_index, 0u);
+}
+
 TEST(protobuf_schema, synthetic_oneof_validation) {
     // Descriptor declaration order must not affect index validation.
     for (u32 order = 0; order < 2; ++order) {

@@ -3,6 +3,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
+#include "rut/compiler/analyze_internal.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/compiler/protobuf_schema.h"
@@ -4461,6 +4462,10 @@ static bool proto_array_layout(const HirModule& mod,
         if (!proto || proto->repeated != repeated ||
             !proto_layout_field_compatible(mod, field, proto_type))
             return false;
+        // Repeated-message layouts recurse through this helper instead of
+        // build_proto_codec, so preserve the fail-closed proto3-optional
+        // policy at every level of the layout traversal.
+        if (proto->proto3_optional) return false;
         if (proto_type != 11 && !protobuf::array_element_size(proto_type)) return false;
         u32 child_size = 0, child_align = 1;
         u32 field_header = 0;
@@ -4495,6 +4500,7 @@ static bool proto_array_layout(const HirModule& mod,
     return bytes.write_word(header, size) && bytes.write_word(header + 4, alignment) &&
            bytes.write_word(header + 8, decl.fields.len);
 }
+
 static FrontendResult<HirExpr> proto_array_schema(
     const HirModule& mod, u32 index, const protobuf::Message* message, Span span, u32 depth) {
     MmapArena arena;
@@ -13338,6 +13344,23 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
 }
 
 }  // namespace
+
+// Narrow test seam for descriptor-only proto metadata. The source parser
+// intentionally rejects `optional`, so tests that exercise this fail-closed
+// layout path must supply a loaded descriptor directly.
+bool proto_array_layout_for_test(const HirModule& mod,
+                                 u32 index,
+                                 const protobuf::Message* message) {
+    MmapArena arena;
+    if (!arena.init(4096)) return false;
+    ProtoLayoutBuffer bytes;
+    const bool initialized = bytes.init(arena);
+    u32 size = 0, alignment = 1;
+    const bool valid =
+        initialized && proto_array_layout(mod, index, message, bytes, size, alignment);
+    arena.destroy();
+    return valid;
+}
 
 static FrontendResult<HirModule*> analyze_file_internal(
     const AstFile& file,
