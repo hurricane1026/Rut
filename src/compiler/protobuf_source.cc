@@ -968,7 +968,7 @@ bool Parser::service(Buffer& parent, Str scope) {
                 options.number(deprecated ? 33 : 34, value);
                 if (!expect(lit_str(";"))) return false;
             }
-            if (options.size) method->child(4, options);
+            if (options.size || options.error != Buffer::Error::None) method->child(4, options);
         }
         auto* chunk = compiler.arena.alloc_t<Chunk>();
         if (!chunk) return fail(SourceError::Kind::Allocation, {});
