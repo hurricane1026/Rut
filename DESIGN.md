@@ -8300,3 +8300,14 @@ The source loader serializes the original FieldOptions tags into its internal
 descriptor. The existing schema loader discards these generator hints, as it
 does for official protoc descriptors. Packing and JSON names keep their existing
 validation and semantics; this adds no Rut syntax or runtime dependency.
+
+### Proto3 optional descriptor metadata
+
+The internal descriptor loader retains proto3 optional field presence and its
+synthetic oneof index/name. It validates singular labels, index bounds, unique
+names and exactly one optional member per synthetic oneof, independent of
+serialization order. Synthetic declarations share the schema field-count
+ceiling. Real oneofs and oneof options remain unsupported. This is compiler
+schema metadata only: `.proto` source `optional` and executable presence-aware
+codecs remain unsupported, so absent and explicitly default-valued fields are
+never silently collapsed by accepting this syntax.

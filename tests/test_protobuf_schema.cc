@@ -10,6 +10,7 @@
 using namespace rut;
 using namespace rut::protobuf;
 
+#include "protobuf/optional_schema_oracle.inc"
 #include "protobuf/schema_descriptor.inc"
 
 namespace {
@@ -210,7 +211,7 @@ TEST(protobuf_schema, unsupported_schema_semantics_are_not_silently_dropped) {
         input = descriptor(msg);
         result = load_descriptor_set(storage.arena, input.data, input.size);
         REQUIRE_FALSE(result.has_value());
-        CHECK(result.error() == SchemaError::Unsupported);
+        CHECK(result.error() == (kTag == 8 ? SchemaError::Malformed : SchemaError::Unsupported));
     }
     Bytes options;
     options.number(7, 1);
@@ -413,7 +414,7 @@ TEST(protobuf_schema, review_limits_packing_namespaces_and_import_visibility) {
     storage.arena.reset();
     result = load_descriptor_set(storage.arena, input.data, input.size);
     REQUIRE_FALSE(result.has_value());
-    CHECK(result.error() == SchemaError::Unsupported);
+    CHECK(result.error() == SchemaError::Malformed);
 
     Bytes invalid_optional = member();
     invalid_optional.number(17, 2);
@@ -725,4 +726,106 @@ TEST(protobuf_schema, reserved_descriptor_wire_ranges_duplicates_and_limits) {
             }
         }
     }
+}
+
+TEST(protobuf_schema, optional_metadata_matches_official_descriptor) {
+    CompileArena storage;
+    auto result = load_descriptor_set(
+        storage.arena, kOptionalSchemaDescriptor, sizeof(kOptionalSchemaDescriptor));
+    REQUIRE(result.has_value());
+    CHECK_EQ(result->synthetic_oneof_count, 5u);
+    const auto* message = result->find_message(lit_str(".presence.Message"));
+    REQUIRE(message != nullptr);
+    u32 optional = 0, implicit = 0;
+    for (const auto* field = message->fields; field; field = field->next) {
+        if (field->proto3_optional) {
+            ++optional;
+            CHECK_EQ(field->oneof_index, field->number < 4 ? field->number - 1 : field->number - 2);
+            const SyntheticOneof* declaration = message->synthetic_oneofs;
+            while (declaration && declaration->index != field->oneof_index)
+                declaration = declaration->next;
+            REQUIRE(declaration != nullptr);
+            CHECK_EQ(declaration->name.len, field->name.len + 1);
+            CHECK_EQ(declaration->name.ptr[0], '_');
+            CHECK((Str{declaration->name.ptr + 1, declaration->name.len - 1}).eq(field->name));
+            CHECK_FALSE(field->repeated);
+        } else {
+            ++implicit;
+            CHECK_EQ(field->oneof_index, 0xffffffffu);
+        }
+    }
+    CHECK_EQ(optional, 5u);
+    CHECK_EQ(implicit, 1u);
+    SchemaLimits limits;
+    limits.fields = 4;
+    CompileArena bounded;
+    CHECK_FALSE(
+        load_descriptor_set(
+            bounded.arena, kOptionalSchemaDescriptor, sizeof(kOptionalSchemaDescriptor), limits)
+            .has_value());
+}
+
+TEST(protobuf_schema, synthetic_oneof_validation) {
+    // Descriptor declaration order must not affect index validation.
+    for (u32 order = 0; order < 2; ++order) {
+        Bytes field = member();
+        field.number(17, 1);
+        field.number(9, 0);
+        Bytes oneof;
+        oneof.text(1, lit_str("_value"));
+        Bytes msg;
+        msg.text(1, lit_str("Item"));
+        msg.child(order ? 8 : 2, order ? oneof : field);
+        msg.child(order ? 2 : 8, order ? field : oneof);
+        Bytes input = descriptor(msg);
+        CompileArena storage;
+        auto result = load_descriptor_set(storage.arena, input.data, input.size);
+        REQUIRE(result.has_value());
+        const auto* item = result->find_message(lit_str(".example.Item"));
+        REQUIRE(item != nullptr);
+        CHECK(item->fields->proto3_optional);
+        CHECK(item->synthetic_oneofs->name.eq(lit_str("_value")));
+    }
+    for (u32 scenario = 0; scenario < 14; ++scenario) {
+        Bytes field = member(lit_str("value"), 1, 9, scenario == 0 ? 3 : 1);
+        if (scenario != 1) field.number(17, 1);
+        field.number(9, scenario == 2 ? 1 : 0);
+        if (scenario == 3) field.number(9, 0);
+        Bytes oneof;
+        if (scenario != 10)
+            oneof.text(1,
+                       scenario == 4    ? lit_str("value")
+                       : scenario == 11 ? lit_str("bad.name")
+                                        : lit_str("_value"));
+        if (scenario == 12) oneof.number(1, 1);
+        if (scenario == 13) field.number(9, 0xffffffffffffffffULL);
+        if (scenario == 5) oneof.text(1, lit_str("again"));
+        if (scenario == 6) oneof.child(2, Bytes{});
+        Bytes msg = message(field);
+        if (scenario != 7) msg.child(8, oneof);
+        if (scenario == 8) msg.child(8, oneof);
+        if (scenario == 9) {
+            Bytes second = member(lit_str("other"), 2);
+            second.number(17, 1);
+            second.number(9, 0);
+            msg.child(2, second);
+        }
+        Bytes input = descriptor(msg);
+        CompileArena storage;
+        CHECK_FALSE(load_descriptor_set(storage.arena, input.data, input.size).has_value());
+    }
+    Bytes empty;
+    empty.text(1, lit_str("Item"));
+    Bytes oneof;
+    oneof.text(1, lit_str("_empty"));
+    empty.child(8, oneof);
+    Bytes input = descriptor(empty);
+    CompileArena storage;
+    CHECK_FALSE(load_descriptor_set(storage.arena, input.data, input.size).has_value());
+    SchemaLimits limits;
+    limits.fields = 0;
+    CompileArena bounded;
+    auto limited = load_descriptor_set(bounded.arena, input.data, input.size, limits);
+    REQUIRE_FALSE(limited.has_value());
+    CHECK(limited.error() == SchemaError::Limit);
 }

@@ -107,3 +107,20 @@ deprecated and debug_redact, mixed with packing. Regenerate with
 grpcio-tools environment. Unit tests also reject wrong scalar types, enum
 values, duplicate options, custom options and malformed lists. No protobuf
 package is needed to build or run these tests.
+
+### Proto3 optional descriptor metadata
+
+The internal descriptor loader retains proto3 optional field presence and its
+synthetic oneof index/name. It validates singular labels, index bounds, unique
+names and exactly one optional member per synthetic oneof, independent of
+serialization order. Synthetic declarations share the schema field-count
+ceiling. Real oneofs and oneof options remain unsupported. This is compiler
+schema metadata only: `.proto` source `optional` and executable presence-aware
+codecs remain unsupported, so absent and explicitly default-valued fields are
+never silently collapsed by accepting this syntax.
+
+`optional_schema_oracle.inc` comes from official libprotoc 31.1; regenerate
+with `python tests/protobuf/generate_optional_schema_oracle.py` in the optional
+grpcio-tools environment. It covers optional scalar/string/bytes/bool/message
+fields alongside an implicit-presence scalar. Malformed synthetic oneofs are
+tested with hand-built descriptors. No new test/build dependency is required.

@@ -458,7 +458,9 @@ structs (up to eight nesting edges); duplicate
 submessages merge, and absent messages expose recursively default-valued structs.
 Presence is not exposed: encoding such a default struct emits an empty embedded
 message. Floating point, unsigned 64-bit values,
-oneof/presence/maps and proto2 are not executable codec shapes yet. See
+oneof/presence/maps and proto2 are not executable codec shapes yet. The internal
+descriptor loader retains and validates proto3 optional synthetic-oneof metadata;
+the source loader still rejects `optional`. See
 [the example and source grammar limits](../examples/protobuf/README.md).
 Proto3 enum fields use `i32` (and `[i32]` for repeated fields), preserving unknown
 numeric values, negative values and the zero default. Top-level, nested and imported

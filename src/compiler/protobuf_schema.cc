@@ -205,11 +205,14 @@ struct Loader {
                     break;
                 case 2:
                 case 7:
-                case 9:
                     return fail(SchemaError::Unsupported);
+                case 9:
+                    if (!wire(part, 0) || part.value > 0x7fffffffu) return malformed();
+                    item->oneof_index = static_cast<u32>(part.value);
+                    break;
                 case 17:
                     if (!wire(part, 0) || part.value > 1) return malformed();
-                    if (part.value) return fail(SchemaError::Unsupported);
+                    item->proto3_optional = part.value != 0;
                     break;
                 default:
                     break;
@@ -223,6 +226,10 @@ struct Loader {
             if (!reference(item->type_name)) return malformed();
         } else if (item->type_name.len)
             return malformed();
+        if (item->proto3_optional && (label != 1 || item->oneof_index == 0xffffffffu))
+            return malformed();
+        if (!item->proto3_optional && item->oneof_index != 0xffffffffu)
+            return fail(SchemaError::Unsupported);
         item->repeated = label == 3;
         if (explicit_packed && item->packed && (!item->repeated || !packable(item->type)))
             return malformed();
@@ -433,6 +440,7 @@ struct Loader {
         schema.messages = item;
         ++schema.message_count;
         Reader reader(view.data, view.size);
+        u32 oneof_count = 0;
         while ((status = reader.next(part)) == Status::Field) {
             switch (part.number) {
                 case 2:
@@ -448,8 +456,35 @@ struct Loader {
                     break;
                 case 5:
                 case 6:
-                case 8:
                     return fail(SchemaError::Unsupported);
+                case 8: {
+                    if (!wire(part, 2)) return false;
+                    if (schema.synthetic_oneof_count >= limits.fields)
+                        return fail(SchemaError::Limit);
+                    Reader declaration(part.bytes, part.size);
+                    Field value;
+                    Status state;
+                    Str oneof_name{};
+                    bool seen = false;
+                    while ((state = declaration.next(value)) == Status::Field) {
+                        if (value.number == 1) {
+                            if (seen) return fail(SchemaError::Duplicate);
+                            seen = true;
+                            if (!wire(value, 2)) return false;
+                            oneof_name = text(value);
+                        } else if (value.number == 2)
+                            return fail(SchemaError::Unsupported);
+                    }
+                    if (state != Status::End || !identifier(oneof_name)) return malformed();
+                    for (const auto* old = item->synthetic_oneofs; old; old = old->next)
+                        if (old->name.eq(oneof_name)) return fail(SchemaError::Duplicate);
+                    auto* oneof = arena.alloc_t<SyntheticOneof>();
+                    if (!oneof) return fail(SchemaError::Allocation);
+                    *oneof = {oneof_name, oneof_count++, item->synthetic_oneofs};
+                    item->synthetic_oneofs = oneof;
+                    ++schema.synthetic_oneof_count;
+                    break;
+                }
                 case 9:
                 case 10:
                     if (!reservation(part,
@@ -472,7 +507,19 @@ struct Loader {
             }
         }
         if (status != Status::End) return malformed();
+        for (const auto* oneof = item->synthetic_oneofs; oneof; oneof = oneof->next) {
+            u32 members = 0;
+            for (const auto* field = item->fields; field; field = field->next) {
+                if (field->oneof_index == oneof->index) ++members;
+                if (field->name.eq(oneof->name)) return fail(SchemaError::Duplicate);
+            }
+            if (members != 1) return malformed();
+            const Str symbol = join(item->full_name, '.', oneof->name);
+            if (!symbol.ptr) return false;
+            if (symbol_used(symbol)) return fail(SchemaError::Duplicate);
+        }
         for (const auto* field = item->fields; field; field = field->next) {
+            if (field->proto3_optional && field->oneof_index >= oneof_count) return malformed();
             if (reserved(field->number, field->name, item->reserved_ranges, item->reserved_names))
                 return fail(SchemaError::Duplicate);
             const Str field_symbol = join(item->full_name, '.', field->name);

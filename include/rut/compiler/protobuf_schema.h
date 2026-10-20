@@ -44,6 +44,8 @@ struct SchemaField {
     Str type_name{};
     u32 number = 0;
     Type type = Type::Int32;
+    bool proto3_optional = false;
+    u32 oneof_index = 0xffffffffu;
     bool repeated = false;
     bool packed = false;
     const Message* message = nullptr;
@@ -64,9 +66,15 @@ struct Enum {
     const SchemaFile* file = nullptr;
     Enum* next = nullptr;
 };
+struct SyntheticOneof {
+    Str name{};
+    u32 index = 0;
+    SyntheticOneof* next = nullptr;
+};
 struct Message {
     Str full_name{};  // Leading dot, e.g. .example.Message
     SchemaField* fields = nullptr;
+    SyntheticOneof* synthetic_oneofs = nullptr;
     ReservedRange* reserved_ranges = nullptr;
     ReservedName* reserved_names = nullptr;
     Message* next = nullptr;
@@ -98,6 +106,7 @@ struct Schema {
     Method* methods = nullptr;
     u32 message_count = 0;
     u32 field_count = 0;
+    u32 synthetic_oneof_count = 0;
     u32 method_count = 0;
     const Message* find_message(Str full_name) const;
     const Enum* find_enum(Str full_name) const;
@@ -121,8 +130,9 @@ struct SchemaLimits {
 // Arena must be initialized and outlive the schema. Failure consumes arena space;
 // callers should discard/reset their compile arena. No filesystem or LLVM access.
 // Initial subset: proto3 scalars, nested/recursive messages and repeated fields,
-// packed scalars, open enums, reserved names/ranges and RPC signatures. Oneof/optional presence,
-// maps, proto2, extensions and editions are rejected. This does not expose a Rut API or emit IR.
+// packed scalars, open enums, reserved names/ranges and RPC signatures. Proto3 optional presence is
+// retained as schema metadata. Real oneofs, maps, proto2, extensions and editions are rejected.
+// Optional fields are not executable codecs. This does not expose a Rut API or emit IR.
 core::Expected<Schema, SchemaError> load_descriptor_set(Arena<MmapBackend>& arena,
                                                         const u8* data,
                                                         u32 size,

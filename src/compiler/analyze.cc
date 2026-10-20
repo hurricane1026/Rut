@@ -4285,6 +4285,10 @@ static FrontendResult<u32> infer_proto_struct(const protobuf::Message* message,
     generated.span = span;
     for (u32 i = 0; i < count; ++i) {
         const auto* proto = ordered[i];
+        if (proto->proto3_optional)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span,
+                                  lit_str("protobuf optional presence is not executable yet"));
         HirStruct::FieldDecl field{};
         field.protobuf_number = proto->number;
         field.protobuf_type = static_cast<u8>(proto->type);
@@ -4582,6 +4586,10 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   span,
                                   lit_str("protobuf binding requires matching singular fields"));
+        if (proto->proto3_optional)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span,
+                                  lit_str("protobuf optional presence is not executable yet"));
         HirTypeKind expected = HirTypeKind::Unknown;
         using PT = protobuf::Type;
         if (proto->type == PT::String || proto->type == PT::Bytes)
