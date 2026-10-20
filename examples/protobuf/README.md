@@ -170,3 +170,8 @@ The internal source schema loader accepts proto3 `optional`, for example
 the descriptor loader. This is schema support: executable DSL encode/decode
 still reject optional-presence fields until their value representation is wired
 through the compiler. Real oneofs and maps remain unsupported.
+
+Message and enum bodies accept `option deprecated = true;`. Enum values accept
+`ZERO = 0 [deprecated = true, debug_redact = false];`. These boolean generator
+hints are checked and discarded; `debug_redact` does not enable Rut log
+redaction. Duplicate, mistyped, custom and other declaration options are rejected.

@@ -1,0 +1,21 @@
+syntax = "proto3";
+package declaration_options;
+message Request {
+  option deprecated = true;
+  enum Kind {
+    option deprecated = true;
+    option allow_alias = true;
+    ZERO = 0 [deprecated = true, debug_redact = false];
+    ALSO_ZERO = 0 [debug_redact = true, deprecated = false];
+    ONE = 1;
+  }
+  Kind kind = 1;
+  message Child { option deprecated = false; int32 count = 1; }
+  Child child = 2;
+}
+enum State {
+  option deprecated = false;
+  UNKNOWN = 0 [deprecated = false];
+  ACTIVE = 1 [debug_redact = true];
+}
+service Service { rpc Call(Request) returns (Request); }

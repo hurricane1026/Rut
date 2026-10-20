@@ -45,6 +45,7 @@ Bytes member(Str name = lit_str("value"), u32 number = 1, u32 type = 9, u32 labe
     out.number(5, type);
     return out;
 }
+
 Bytes message(const Bytes& field) {
     Bytes out;
     out.text(1, lit_str("Item"));
@@ -70,6 +71,30 @@ const SchemaField* find_field(const Message& owner, Str name) {
     return nullptr;
 }
 }  // namespace
+
+TEST(protobuf_schema, message_options_reject_duplicate_containers) {
+    CompileArena storage;
+
+    Bytes valid_options;
+    valid_options.number(3, 1);
+    valid_options.number(7, 0);
+    Bytes valid_message = message(member());
+    valid_message.child(7, valid_options);
+    Bytes valid_input = descriptor(valid_message);
+    auto valid = load_descriptor_set(storage.arena, valid_input.data, valid_input.size);
+    REQUIRE(valid.has_value());
+
+    Bytes deprecated;
+    deprecated.number(3, 1);
+    Bytes duplicate = message(member());
+    duplicate.child(7, deprecated);
+    duplicate.child(7, deprecated);
+    Bytes duplicate_input = descriptor(duplicate);
+    auto duplicate_result =
+        load_descriptor_set(storage.arena, duplicate_input.data, duplicate_input.size);
+    REQUIRE_FALSE(duplicate_result.has_value());
+    CHECK(duplicate_result.error() == SchemaError::Duplicate);
+}
 
 TEST(protobuf_schema, protoc_descriptor_resolves_imports_nested_recursion_and_all_rpc_shapes) {
     CompileArena storage;
@@ -989,6 +1014,46 @@ TEST(protobuf_schema, service_option_wire_validation) {
             REQUIRE_FALSE(result);
             CHECK(result.error() == (scenario == 2 || scenario == 6 ? SchemaError::Duplicate
                                                                     : SchemaError::Malformed));
+        }
+    }
+}
+TEST(protobuf_schema, declaration_option_boolean_validation) {
+    // Message deprecated, enum deprecated, enum-value deprecated/debug_redact.
+    for (u32 scope = 0; scope < 4; ++scope) {
+        for (u32 scenario = 0; scenario < 5; ++scenario) {
+            Bytes options;
+            const u32 kTag = scope == 2 ? 1 : 3;
+            if (scenario == 0) options.number(kTag, 0);
+            if (scenario == 1) options.number(kTag, 1);
+            if (scenario == 2) options.number(kTag, 2);
+            if (scenario == 3) options.text(kTag, lit_str("true"));
+            if (scenario == 4) {
+                options.number(kTag, 0);
+                options.number(kTag, 1);
+            }
+            Bytes msg = message(member());
+            Bytes enumeration;
+            enumeration.text(1, lit_str("E"));
+            Bytes value;
+            value.text(1, lit_str("ZERO"));
+            value.number(2, 0);
+            if (scope >= 2) value.child(3, options);
+            enumeration.child(2, value);
+            if (scope == 1) enumeration.child(3, options);
+            if (scope == 0) msg.child(7, options);
+            Bytes source = file(msg);
+            source.child(5, enumeration);
+            Bytes input;
+            input.child(1, source);
+            CompileArena storage;
+            auto result = load_descriptor_set(storage.arena, input.data, input.size);
+            if (scenario < 2)
+                REQUIRE(result);
+            else {
+                REQUIRE_FALSE(result);
+                CHECK(result.error() ==
+                      (scenario == 4 ? SchemaError::Duplicate : SchemaError::Malformed));
+            }
         }
     }
 }
