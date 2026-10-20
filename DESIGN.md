@@ -8308,9 +8308,12 @@ synthetic oneof index/name. It validates singular labels, index bounds, unique
 names and exactly one optional member per synthetic oneof, independent of
 serialization order. Synthetic declarations share the schema field-count
 ceiling. Real oneofs and oneof options remain unsupported. This is compiler
-schema metadata only: `.proto` source `optional` and executable presence-aware
-codecs remain unsupported, so absent and explicitly default-valued fields are
-never silently collapsed by accepting this syntax.
+schema metadata only: the `.proto` source loader accepts `optional`, assigns
+synthetic indexes in field order, and avoids field, nested-type and enum-value
+name collisions using protoc naming rules. Synthetic declarations share the
+source field budget. Executable presence-aware DSL codecs remain unsupported
+and reject these schemas, so absent and explicitly default-valued fields are
+never silently collapsed.
 
 ### Explicit presence in the internal wire tree
 

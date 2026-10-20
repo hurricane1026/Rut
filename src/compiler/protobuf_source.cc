@@ -22,12 +22,19 @@ struct Chunk {
     Buffer* child = nullptr;
     u32 tag = 0;
 };
+struct Symbol {
+    Str name{};
+    Symbol* next = nullptr;
+};
 struct Buffer {
     enum class Error : u8 { None, Limit, Allocation };
     Arena<MmapBackend>& arena;
     Chunk* head = nullptr;
     Chunk* tail = nullptr;
     u32 size = 0;
+    Str declared_name{};
+    bool optional = false;
+    Symbol* symbols = nullptr;
     Error error = Error::None;
     void add(Field field) {
         const u64 kCapacity = static_cast<u64>(field.size) + 20;
@@ -55,6 +62,20 @@ struct Buffer {
             head = chunk;
         tail = chunk;
         size += chunk->size;
+    }
+    void symbol(Str name) {
+        auto* item = arena.alloc_t<Symbol>();
+        if (!item) {
+            error = Error::Allocation;
+            return;
+        }
+        *item = {name, symbols};
+        symbols = item;
+    }
+    bool contains(Str name) const {
+        for (const auto* item = symbols; item; item = item->next)
+            if (item->name.eq(name)) return true;
+        return false;
     }
     void number(u32 tag, u64 value) { add({tag, 0, value}); }
     void text(u32 tag, Str value) {
@@ -644,8 +665,9 @@ bool Parser::field(Buffer& parent, Str scope) {
         return fail(SourceError::Kind::Limit, lit_str("field count"));
     auto* descriptor = compiler.arena.alloc_t<Buffer>(compiler.arena);
     if (!descriptor) return fail(SourceError::Kind::Allocation, {});
-    const bool kRepeated = take(lit_str("repeated"));
-    if (is(lit_str("optional")) || is(lit_str("required")) || is(lit_str("map")))
+    const bool kOptional = take(lit_str("optional"));
+    const bool kRepeated = !kOptional && take(lit_str("repeated"));
+    if (is(lit_str("required")) || is(lit_str("map")))
         return fail(SourceError::Kind::Unsupported, lit_str("presence/map fields"));
     const Str kScalars[] = {lit_str("double"),
                             lit_str("float"),
@@ -678,6 +700,9 @@ bool Parser::field(Buffer& parent, Str scope) {
     Str field_name{};
     u32 tag = 0;
     if (!name(field_name) || !expect(lit_str("=")) || !number(tag)) return false;
+    parent.symbol(field_name);
+    descriptor->declared_name = field_name;
+    descriptor->optional = kOptional;
     descriptor->text(1, field_name);
     descriptor->number(3, tag);
     descriptor->number(4, kRepeated ? 3 : 1);
@@ -814,6 +839,7 @@ bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
     if (!named || !descriptor || !kFullName.ptr) return fail(SourceError::Kind::Allocation, {});
     *named = {kFullName, compiler.messages, true, &source, true};
     compiler.messages = named;
+    parent.symbol(enum_name);
     descriptor->text(1, enum_name);
     if (!expect(lit_str("{"))) return false;
     bool options_seen = false;
@@ -849,6 +875,7 @@ bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
         const i64 kValue = kNegative ? -static_cast<i64>(magnitude) : static_cast<i64>(magnitude);
         if (!expect(lit_str(";"))) return false;
         Buffer entry{compiler.arena};
+        parent.symbol(value_name);
         entry.text(1, value_name);
         entry.number(2, static_cast<u64>(kValue));
         descriptor->child(2, entry);
@@ -878,6 +905,7 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
     if (!named || !descriptor || !kFullName.ptr) return fail(SourceError::Kind::Allocation, {});
     *named = {kFullName, compiler.messages, true, &source};
     compiler.messages = named;
+    parent.symbol(message_name);
     descriptor->text(1, message_name);
     if (!expect(lit_str("{"))) return false;
     while (!take(lit_str("}"))) {
@@ -895,6 +923,29 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
             return fail(SourceError::Kind::Unsupported, lit_str("message declaration"));
         else if (!field(*descriptor, kFullName))
             return false;
+    }
+    // Match protoc: synthetic declarations follow all ordinary declarations.
+    // Their names must avoid every symbol in the containing message, including
+    // nested types and enum values declared after the optional field.
+    u32 optional_index = 0;
+    for (auto* item = descriptor->head; item; item = item->next) {
+        if (item->tag != 2 || !item->child || !item->child->optional) continue;
+        if (compiler.field_count++ >= compiler.limits.fields)
+            return fail(SourceError::Kind::Limit, lit_str("field/oneof count"));
+        auto& field = *item->child;
+        Str name = field.declared_name;
+        if (!name.len || name.ptr[0] != '_') name = compiler.join({}, '_', name);
+        while (descriptor->contains(name)) {
+            name = compiler.join({}, 'X', name);
+            if (!name.ptr) return fail(SourceError::Kind::Allocation, {});
+        }
+        if (!name.ptr) return fail(SourceError::Kind::Allocation, {});
+        descriptor->symbol(name);
+        Buffer oneof{compiler.arena};
+        oneof.text(1, name);
+        descriptor->child(8, oneof);
+        field.number(9, optional_index++);
+        field.number(17, 1);
     }
     auto* chunk = compiler.arena.alloc_t<Chunk>();
     if (!chunk) return fail(SourceError::Kind::Allocation, {});

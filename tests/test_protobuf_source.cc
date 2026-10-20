@@ -15,6 +15,7 @@ using namespace rut::protobuf;
 #include "protobuf/enum_oracle.inc"
 #include "protobuf/field_options_oracle.inc"
 #include "protobuf/file_options_oracle.inc"
+#include "protobuf/optional_schema_oracle.inc"
 #include "protobuf/public_oracle.inc"
 #include "protobuf/reserved_oracle.inc"
 #include "protobuf/rpc_options_oracle.inc"
@@ -135,7 +136,6 @@ TEST(protobuf_source, import_deduplication_cycle_and_missing_file) {
 }
 TEST(protobuf_source, syntax_and_unsupported_semantics_are_explicit) {
     const char* cases[] = {"syntax='proto2'; message A {}",
-                           "syntax='proto3'; message A { optional string a=1; }",
                            "syntax='proto3'; message A { map<string,string> a=1; }",
                            "syntax='proto3'; message A { oneof a { string s=1; } }",
                            "syntax='proto3'; message A { string a=1 [default='x']; }",
@@ -1089,4 +1089,99 @@ TEST(protobuf_source, imported_rpc_options_and_method_budget) {
     auto limited = files.load(bounded, limits);
     REQUIRE_FALSE(limited);
     CHECK(limited.error().kind == SourceError::Kind::Limit);
+}
+
+TEST(protobuf_source, optional_metadata_matches_protoc) {
+    Storage source, oracle;
+    auto parsed = load_proto_source(
+        source.arena, lit_str(RUT_SOURCE_DIR "/tests/protobuf/optional_schema.proto"));
+    auto expected = load_descriptor_set(
+        oracle.arena, kOptionalSchemaDescriptor, sizeof(kOptionalSchemaDescriptor));
+    REQUIRE(parsed);
+    REQUIRE(expected);
+    CHECK_EQ(parsed->synthetic_oneof_count, expected->synthetic_oneof_count);
+    for (const auto* message = expected->messages; message; message = message->next) {
+        const auto* actual = parsed->find_message(message->full_name);
+        REQUIRE(actual);
+        for (const auto* field = message->fields; field; field = field->next) {
+            const auto* match = actual->fields;
+            while (match && !match->name.eq(field->name)) match = match->next;
+            REQUIRE(match);
+            CHECK_EQ(match->proto3_optional, field->proto3_optional);
+            CHECK_EQ(match->oneof_index, field->oneof_index);
+            CHECK(match->type == field->type);
+        }
+        auto* a = actual->synthetic_oneofs;
+        auto* b = message->synthetic_oneofs;
+        while (a && b) {
+            CHECK(a->name.eq(b->name));
+            CHECK_EQ(a->index, b->index);
+            a = a->next;
+            b = b->next;
+        }
+        CHECK(a == nullptr && b == nullptr);
+    }
+}
+TEST(protobuf_source, optional_names_avoid_later_message_symbols) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("root.proto",
+                             "syntax='proto3'; message A { "
+                             "optional int32 value=1; int32 _value=2; "
+                             "message X_value {} enum E { XX_value=0; } "
+                             "optional bool _flag=3; }"));
+    Storage storage;
+    auto parsed = files.load(storage);
+    REQUIRE(parsed);
+    const auto* message = parsed->find_message(lit_str(".A"));
+    REQUIRE(message);
+    const auto* oneof = message->synthetic_oneofs;
+    bool value_seen = false, flag_seen = false;
+    for (; oneof; oneof = oneof->next) {
+        value_seen |= oneof->name.eq(lit_str("XXX_value"));
+        flag_seen |= oneof->name.eq(lit_str("X_flag"));
+    }
+    CHECK(value_seen);
+    CHECK(flag_seen);
+    SchemaLimits limits;
+    limits.fields = 4;  // Three fields plus two synthetic declarations exceed this.
+    Storage bounded;
+    auto rejected = files.load(bounded, limits);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().kind == SourceError::Kind::Limit);
+}
+
+TEST(protobuf_source, optional_imports_nested_types_and_invalid_labels) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("types.proto",
+                             "syntax='proto3'; package types; "
+                             "enum Kind { ZERO=0; } message Child { optional string text=1; }"));
+    REQUIRE(
+        files.write_file("root.proto",
+                         "syntax='proto3'; import 'types.proto'; "
+                         "message A { optional types.Kind kind=1; optional types.Child child=2; "
+                         "message Nested { optional bytes raw=1; } }"));
+    Storage storage;
+    auto parsed = files.load(storage);
+    REQUIRE(parsed);
+    CHECK_EQ(parsed->synthetic_oneof_count, 4u);
+    const auto* message = parsed->find_message(lit_str(".A"));
+    REQUIRE(message);
+    for (auto* field = message->fields; field; field = field->next) {
+        CHECK(field->proto3_optional);
+        CHECK_FALSE(field->repeated);
+    }
+    const char* invalid[] = {"optional repeated int32 a=1;",
+                             "repeated optional int32 a=1;",
+                             "required int32 a=1;",
+                             "optional map<string,string> a=1;",
+                             "optional int32 a=1 [packed=true];"};
+    for (const char* field : invalid) {
+        char text[256];
+        snprintf(text, sizeof(text), "syntax='proto3'; message A { %s }", field);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage bad;
+        CHECK_FALSE(files.load(bad));
+    }
 }
