@@ -7,6 +7,7 @@ message StringBatch {
   reserved "\1\12\1234", "\x1\x12f\X41", "\400";
   reserved "\u007f\u0080\u07ff\u0800\uffff";
   reserved "\U00010000\U0010ffff", "\uD83D\uDE00";
+  reserved "eight_\U0000D83D\uDE00";
   reserved 'de' /* comment */ "leted";
   State state = 1 [json_name='sta' "\164e"];
   repeated EnumChild children = 2;

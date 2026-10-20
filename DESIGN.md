@@ -8251,7 +8251,8 @@ same visibility rules. No runtime ABI or wire codec changes are required.
 Source string values accept adjacent single/double quoted literals, with whitespace
 and comments between segments, and decode standard character escapes, one-to-three
 octal digits, one-to-two hexadecimal digits, and Unicode escapes (four/eight hex
-digits). UTF-16 surrogate pairs within one literal combine into a Unicode scalar;
+digits). A high surrogate spelled with either Unicode escape width followed by a four-digit
+`\u` low surrogate within one literal combines into a Unicode scalar;
 unpaired surrogates and out-of-range scalars fail closed. Octal byte escapes retain
 the low eight bits, matching protoc. Existing descriptor UTF-8 and identifier
 validation remains authoritative for the decoded value.

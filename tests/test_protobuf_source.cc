@@ -757,7 +757,7 @@ TEST(protobuf_source, string_literals_match_protoc_escapes_and_concatenation) {
         CHECK(found);
         ++count;
     }
-    CHECK_EQ(count, 9u);
+    CHECK_EQ(count, 10u);
     CHECK_EQ(parsed->reserved_count, golden->reserved_count);
     for (const auto* field = actual->fields; field; field = field->next) {
         const auto* match = expected->fields;
@@ -785,6 +785,10 @@ TEST(protobuf_source, malformed_string_escapes_and_decoded_path_guards) {
         R"(syntax='proto3'; message M { reserved '\uD800\uZZZZ'; })",
         R"(syntax='proto3'; message M { reserved '\xff'; })",
         R"(syntax='proto3'; message M { reserved '\uD800' '\uDC00'; })",
+        R"(syntax='proto3'; message M { reserved '\U0000D800'; })",
+        R"(syntax='proto3'; message M { reserved '\U0000D800\u0041'; })",
+        R"(syntax='proto3'; message M { reserved '\uD800\U0000DC00'; })",
+        R"(syntax='proto3'; message M { reserved '\U0000D800\U0000DC00'; })",
         R"(syntax='proto3'; import '\056\056/x.proto';)",
         R"(syntax='proto3'; import 'types\0.proto';)",
         R"(syntax='proto3'; import '\x2ftypes.proto';)",

@@ -552,9 +552,8 @@ bool Parser::string(Str& out) {
                             value = value * 16 + kDigit;
                         }
                         // protoc combines adjacent UTF-16 escapes within one literal.
-                        if (c == 'u' && value >= 0xd800 && value <= 0xdbff &&
-                            token.text.len - i - 1 >= 6 && token.text.ptr[i + 1] == '\\' &&
-                            token.text.ptr[i + 2] == 'u') {
+                        if (value >= 0xd800 && value <= 0xdbff && token.text.len - i - 1 >= 6 &&
+                            token.text.ptr[i + 1] == '\\' && token.text.ptr[i + 2] == 'u') {
                             u32 low = 0;
                             for (u32 n = 3; n <= 6; ++n) {
                                 const u32 kDigit = hex(token.text.ptr[i + n]);
