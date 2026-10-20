@@ -8268,10 +8268,14 @@ unchanged. A committed official protoc fixture checks byte-exact decoded metadat
 
 The proto3 source loader accepts the standard string/bool file options for Java,
 Go, C++, Python, Objective-C, C#, Swift, PHP and Ruby generation, plus deprecated
-and optimize_for (SPEED, CODE_SIZE, LITE_RUNTIME). Values are parsed with their
-FileOptions scalar types and encoded using the descriptor field numbers. Options
-are unique per file, may appear around imports/declarations, and share existing
-source/descriptor byte budgets. String values must be valid UTF-8.
+and optimize_for (SPEED, CODE_SIZE, LITE_RUNTIME). It also accepts the legacy
+`php_generic_services` bool at FileOptions field 42 for proto files written for
+older protoc releases. Protobuf v21.12 declares that field; newer descriptor
+schemas reserve field 42 after removing it, so it is covered by source-parser
+compatibility tests rather than the current official descriptor fixture. Values
+are parsed with their FileOptions scalar types and encoded using the descriptor
+field numbers. Options are unique per file, may appear around imports/declarations,
+and share existing source/descriptor byte budgets. String values must be valid UTF-8.
 
 These are generator metadata: Rut validates source spelling/types but does not
 run language generators or change wire decoding, UTF-8 checks, RPC routing or

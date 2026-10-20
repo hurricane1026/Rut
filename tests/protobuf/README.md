@@ -96,6 +96,6 @@ publicly imports the string/enum RPC fixture. The optional
 to generate the committed descriptor. Source tests compare executable schema/RPCs
 and reject unknown, custom, wrongly typed and duplicate options. The source parser
 also accepts the historical `php_generic_services` boolean (FileOptions field 42),
-which was removed from newer protoc descriptors and is therefore covered by an
-independent source fixture. JIT, native schema-removal and both network backends
+which was removed from newer protoc descriptors and is therefore covered by
+inline source-parser cases. JIT, native schema-removal and both network backends
 exercise option-bearing schema inputs.

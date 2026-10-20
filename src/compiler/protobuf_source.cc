@@ -951,8 +951,8 @@ bool Parser::file_option(Buffer& options, u32& seen) {
         {lit_str("swift_prefix"), 39, 9},
         {lit_str("php_class_prefix"), 40, 9},
         {lit_str("php_namespace"), 41, 9},
-        // Retained for proto files produced by protoc versions that still
-        // declared FileOptions.php_generic_services (field 42).
+        // Retained for schemas targeting protoc versions that declared
+        // FileOptions.php_generic_services (field 42).
         {lit_str("php_generic_services"), 42, 8},
         {lit_str("php_metadata_namespace"), 44, 9},
         {lit_str("ruby_package"), 45, 9},
