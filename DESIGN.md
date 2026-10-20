@@ -8311,3 +8311,12 @@ ceiling. Real oneofs and oneof options remain unsupported. This is compiler
 schema metadata only: `.proto` source `optional` and executable presence-aware
 codecs remain unsupported, so absent and explicitly default-valued fields are
 never silently collapsed by accepting this syntax.
+
+### Explicit presence in the internal wire tree
+
+The internal C++ wire-tree codec supports explicit presence on singular fields.
+Absent fields have no value node; present zero/false/empty values retain their
+node and wire output when the layout marks explicit presence. Duplicate scalars
+use the last correctly typed value, including zero; merged submessages preserve
+presence. Repeated fields cannot carry this flag. Existing slot/depth/output
+budgets still apply. This is not exposed by the source compiler or DSL yet.
