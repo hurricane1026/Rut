@@ -955,6 +955,10 @@ TEST(protobuf_source, field_generation_option_validation) {
                              "ctype=CORD, ctype=STRING",
                              "jstype=CORD",
                              "jstype=JS_STRING, jstype=JS_NUMBER",
+                             "jstype=JS_STRING",
+                             "jstype=JS_NUMBER",
+                             "lazy=true",
+                             "unverified_lazy=true",
                              "unknown=true",
                              "(custom.name)=true",
                              "features.field_presence=EXPLICIT",
@@ -977,16 +981,61 @@ TEST(protobuf_source, field_generation_option_validation) {
                            "jstype=JS_STRING",
                            "jstype=JS_NUMBER",
                            "lazy=false",
-                           "unverified_lazy=true",
+                           "unverified_lazy=false",
                            "debug_redact=false",
                            "deprecated=false"};
     for (const char* option : valid) {
         Files files;
         REQUIRE(files.ok);
         char code[512];
-        snprintf(code, sizeof(code), "syntax='proto3'; message M { string value=1 [%s]; }", option);
+        const bool k64 =
+            strcmp(option, "jstype=JS_STRING") == 0 || strcmp(option, "jstype=JS_NUMBER") == 0;
+        snprintf(code,
+                 sizeof(code),
+                 "syntax='proto3'; message M { %s value=1 [%s]; }",
+                 k64 ? "int64" : "string",
+                 option);
         REQUIRE(files.write_file("root.proto", code));
         Storage storage;
         CHECK(files.load(storage).has_value());
+    }
+
+    {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file(
+            "root.proto",
+            "syntax='proto3'; message M { Child value=1 [lazy=true, unverified_lazy=true]; } "
+            "message Child {}"));
+        Storage storage;
+        CHECK(files.load(storage).has_value());
+    }
+    {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file("types.proto", "syntax='proto3'; message Child {}"));
+        REQUIRE(files.write_file("root.proto",
+                                 "syntax='proto3'; import 'types.proto'; message M { "
+                                 "Child value=1 [lazy=true, unverified_lazy=true]; }"));
+        Storage storage;
+        CHECK(files.load(storage).has_value());
+    }
+    {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file(
+            "root.proto",
+            "syntax='proto3'; enum E { ZERO=0; } message M { E value=1 [lazy=true]; }"));
+        Storage storage;
+        CHECK_FALSE(files.load(storage).has_value());
+    }
+    {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file("root.proto",
+                                 "syntax='proto3'; enum E { ZERO=0; } message M { E value=1 "
+                                 "[unverified_lazy=true]; }"));
+        Storage storage;
+        CHECK_FALSE(files.load(storage).has_value());
     }
 }
