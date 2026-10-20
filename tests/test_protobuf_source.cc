@@ -17,6 +17,7 @@ using namespace rut::protobuf;
 #include "protobuf/file_options_oracle.inc"
 #include "protobuf/public_oracle.inc"
 #include "protobuf/reserved_oracle.inc"
+#include "protobuf/rpc_options_oracle.inc"
 #include "protobuf/schema_descriptor.inc"
 #include "protobuf/strings_oracle.inc"
 
@@ -989,4 +990,103 @@ TEST(protobuf_source, field_generation_option_validation) {
         Storage storage;
         CHECK(files.load(storage).has_value());
     }
+}
+
+TEST(protobuf_source, rpc_options_match_official_protoc) {
+    Storage source, descriptor;
+    auto parsed = load_proto_source(source.arena,
+                                    lit_str(RUT_SOURCE_DIR "/tests/protobuf/rpc_options.proto"));
+    auto golden =
+        load_descriptor_set(descriptor.arena, kRpcOptionsDescriptor, sizeof(kRpcOptionsDescriptor));
+    REQUIRE(parsed);
+    REQUIRE(golden);
+    CHECK_EQ(parsed->method_count, 5u);
+    for (auto* method = parsed->methods; method; method = method->next) {
+        const auto* reference = golden->find_method(method->path);
+        REQUIRE(reference != nullptr);
+        CHECK(method->input_name.eq(reference->input_name));
+        CHECK(method->output_name.eq(reference->output_name));
+        CHECK_EQ(method->deprecated, reference->deprecated);
+        CHECK(method->idempotency == reference->idempotency);
+        CHECK_EQ(method->client_streaming, reference->client_streaming);
+        CHECK_EQ(method->server_streaming, reference->server_streaming);
+    }
+    const auto* client = parsed->find_method(lit_str("/rpc_options.Counter/Client"));
+    REQUIRE(client != nullptr);
+    CHECK(client->deprecated);
+    CHECK(client->idempotency == IdempotencyLevel::NoSideEffects);
+    CHECK(parsed->find_method(lit_str("/rpc_options.Counter/Server"))->idempotency ==
+          IdempotencyLevel::Idempotent);
+    CHECK(parsed->find_method(lit_str("/rpc_options.Counter/Bare"))->idempotency ==
+          IdempotencyLevel::Unknown);
+}
+
+TEST(protobuf_source, rpc_option_types_duplicates_and_scopes) {
+    const char* invalid[] = {
+        "option deprecated=1;",
+        "option deprecated='true';",
+        "option deprecated=true; option deprecated=false;",
+        "option idempotency_level=2;",
+        "option idempotency_level='IDEMPOTENT';",
+        "option idempotency_level=BAD;",
+        "option idempotency_level=true;",
+        "option idempotency_level=IDEMPOTENT; option idempotency_level=IDEMPOTENT;",
+        "option unknown=true;",
+        "option (custom.name)=true;",
+        "option features.field_presence=EXPLICIT;",
+        "option deprecated=true",
+        "option deprecated true;",
+        "option deprecated=;",
+        "option deprecated=true; rpc Nested(M) returns(M);"};
+    for (const char* option : invalid) {
+        Files files;
+        REQUIRE(files.ok);
+        char code[512];
+        snprintf(code,
+                 sizeof(code),
+                 "syntax='proto3'; message M {} service S { rpc Call(M) returns(M) { %s } }",
+                 option);
+        REQUIRE(files.write_file("root.proto", code));
+        Storage storage;
+        CHECK_FALSE(files.load(storage).has_value());
+    }
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax='proto3'; message M {} service S { rpc A(M) returns(M) { ; option deprecated=true; "
+        "; } rpc B(M) returns(M) { option deprecated=true; } rpc C(M) returns(M) {} }"));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE(result);
+    CHECK_EQ(result->method_count, 3u);
+}
+
+TEST(protobuf_source, imported_rpc_options_and_method_budget) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file(
+        "types.proto",
+        "syntax='proto3'; package child; message M {} service Imported { rpc Get(M) returns(M) { "
+        "option deprecated=true; option idempotency_level=IDEMPOTENT; } }"));
+    REQUIRE(files.write_file("root.proto",
+                             "syntax='proto3'; import 'types.proto'; message M {} service Local { "
+                             "rpc Get(M) returns(M) {} }"));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE(result);
+    const auto* imported = result->find_method(lit_str("/child.Imported/Get"));
+    const auto* local = result->find_method(lit_str("/Local/Get"));
+    REQUIRE(imported != nullptr);
+    REQUIRE(local != nullptr);
+    CHECK(imported->deprecated);
+    CHECK(imported->idempotency == IdempotencyLevel::Idempotent);
+    CHECK_FALSE(local->deprecated);
+    CHECK(local->idempotency == IdempotencyLevel::Unknown);
+    SchemaLimits limits;
+    limits.methods = 1;
+    Storage bounded;
+    auto limited = files.load(bounded, limits);
+    REQUIRE_FALSE(limited);
+    CHECK(limited.error().kind == SourceError::Kind::Limit);
 }

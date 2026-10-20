@@ -898,3 +898,49 @@ TEST(protobuf_schema, synthetic_oneof_validation) {
     REQUIRE_FALSE(limited.has_value());
     CHECK(limited.error() == SchemaError::Limit);
 }
+
+TEST(protobuf_schema, rpc_option_wire_values_and_duplicates) {
+    for (u32 scenario = 0; scenario < 8; ++scenario) {
+        Bytes options;
+        if (scenario == 0) options.number(33, 2);
+        if (scenario == 1) options.text(33, lit_str("true"));
+        if (scenario == 2) options.number(34, 3);
+        if (scenario == 3) options.text(34, lit_str("IDEMPOTENT"));
+        if (scenario == 4) {
+            options.number(33, 1);
+            options.number(33, 0);
+        }
+        if (scenario == 5) {
+            options.number(34, 1);
+            options.number(34, 2);
+        }
+        if (scenario == 6) options.number(34, 0xffffffffffffffffULL);
+        if (scenario == 7) {
+            options.number(33, 1);
+            options.number(34, 2);
+        }
+        Bytes method;
+        method.text(1, lit_str("Call"));
+        method.text(2, lit_str(".example.Item"));
+        method.text(3, lit_str(".example.Item"));
+        method.child(4, options);
+        Bytes service;
+        service.text(1, lit_str("S"));
+        service.child(2, method);
+        Bytes source = file(message(member()));
+        source.child(6, service);
+        Bytes input;
+        input.child(1, source);
+        CompileArena storage;
+        auto result = load_descriptor_set(storage.arena, input.data, input.size);
+        if (scenario == 7) {
+            REQUIRE(result);
+            CHECK(result->methods->deprecated);
+            CHECK(result->methods->idempotency == IdempotencyLevel::Idempotent);
+        } else {
+            REQUIRE_FALSE(result);
+            CHECK(result.error() == (scenario == 4 || scenario == 5 ? SchemaError::Duplicate
+                                                                    : SchemaError::Malformed));
+        }
+    }
+}

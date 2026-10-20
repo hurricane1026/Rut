@@ -443,6 +443,11 @@ lists alongside `packed` and `json_name`. Values are type-checked and each
 option may appear once per field. These hints do not change Rut's eager wire
 codec, field carriers, or logging behavior. Unknown/custom, weak-field and
 editions options remain unsupported.
+RPC method bodies accept standard `deprecated` booleans and `idempotency_level`
+values (`IDEMPOTENCY_UNKNOWN`, `NO_SIDE_EFFECTS`, `IDEMPOTENT`), preserving this
+metadata in the compiler schema. Duplicate, mistyped and unknown/custom method
+options are rejected. These declarations do not enable retries or change the
+configured gRPC retry policy.
 The compiler reads proto3 imports and generates an
 internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most

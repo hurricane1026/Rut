@@ -80,12 +80,16 @@ struct Message {
     Message* next = nullptr;
     const SchemaFile* file = nullptr;
 };
+// Passive protobuf MethodOptions metadata; this does not configure runtime retries.
+enum class IdempotencyLevel : u8 { Unknown = 0, NoSideEffects = 1, Idempotent = 2 };
 struct Method {
     Str path{};  // /package.Service/Method
     Str input_name{};
     Str output_name{};
     const Message* input = nullptr;
     const Message* output = nullptr;
+    bool deprecated = false;
+    IdempotencyLevel idempotency = IdempotencyLevel::Unknown;
     bool client_streaming = false;
     bool server_streaming = false;
     Method* next = nullptr;

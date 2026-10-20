@@ -937,7 +937,38 @@ bool Parser::service(Buffer& parent, Str scope) {
         method->number(6, take(lit_str("stream")));
         if (!type_reference(*method, 3, scope) || !expect(lit_str(")"))) return false;
         if (!take(lit_str(";"))) {
-            if (!expect(lit_str("{")) || !expect(lit_str("}"))) return false;
+            if (!expect(lit_str("{"))) return false;
+            Buffer options{compiler.arena};
+            u32 seen = 0;
+            while (!take(lit_str("}"))) {
+                if (take(lit_str(";"))) continue;
+                if (!expect(lit_str("option"))) return false;
+                const bool deprecated = is(lit_str("deprecated"));
+                if (!deprecated && !is(lit_str("idempotency_level")))
+                    return fail(SourceError::Kind::Unsupported, lit_str("RPC option"));
+                const u32 bit = deprecated ? 1u : 2u;
+                if (seen & bit)
+                    return fail(SourceError::Kind::Syntax, lit_str("duplicate RPC option"));
+                seen |= bit;
+                advance();
+                if (!expect(lit_str("="))) return false;
+                u32 value = 0;
+                if (deprecated) {
+                    value = is(lit_str("true"));
+                    if (!take(lit_str("true")) && !take(lit_str("false")))
+                        return fail(SourceError::Kind::Syntax, lit_str("RPC option boolean"));
+                } else if (take(lit_str("IDEMPOTENCY_UNKNOWN")))
+                    value = 0;
+                else if (take(lit_str("NO_SIDE_EFFECTS")))
+                    value = 1;
+                else if (take(lit_str("IDEMPOTENT")))
+                    value = 2;
+                else
+                    return fail(SourceError::Kind::Syntax, lit_str("RPC idempotency_level"));
+                options.number(deprecated ? 33 : 34, value);
+                if (!expect(lit_str(";"))) return false;
+            }
+            if (options.size) method->child(4, options);
         }
         auto* chunk = compiler.arena.alloc_t<Chunk>();
         if (!chunk) return fail(SourceError::Kind::Allocation, {});
