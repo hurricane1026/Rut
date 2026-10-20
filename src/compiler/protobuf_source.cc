@@ -469,23 +469,136 @@ bool Parser::name(Str& out, bool qualified) {
 bool Parser::string(Str& out) {
     if (token.kind != Token::Kind::String)
         return fail(SourceError::Kind::Syntax, lit_str("string"));
-    auto* bytes = static_cast<char*>(compiler.arena.alloc(token.text.len + 1));
+    // Count adjacent literals before allocating once; comments and whitespace
+    // are skipped by advance(). Decoding never expands beyond the raw spelling.
+    Parser probe = *this;
+    u64 capacity = 0;
+    do {
+        capacity += probe.token.text.len;
+        probe.advance();
+    } while (probe.token.kind == Token::Kind::String);
+    if (capacity > compiler.limits.bytes)
+        return fail(SourceError::Kind::Limit, lit_str("string length"));
+    auto* bytes = static_cast<char*>(compiler.arena.alloc(static_cast<u32>(capacity) + 1));
     if (!bytes) return fail(SourceError::Kind::Allocation, {});
+    auto hex = [](char c) -> u32 {
+        if (c >= '0' && c <= '9') return static_cast<u32>(c - '0');
+        if (c >= 'a' && c <= 'f') return static_cast<u32>(c - 'a') + 10;
+        if (c >= 'A' && c <= 'F') return static_cast<u32>(c - 'A') + 10;
+        return 16;
+    };
     u32 length = 0;
-    for (u32 i = 0; i < token.text.len; ++i) {
-        char c = token.text.ptr[i];
-        if (c == '\\') {
+    do {
+        for (u32 i = 0; i < token.text.len; ++i) {
+            char c = token.text.ptr[i];
+            if (c != '\\') {
+                bytes[length++] = c;
+                continue;
+            }
             if (++i == token.text.len)
                 return fail(SourceError::Kind::Syntax, lit_str("string escape"));
             c = token.text.ptr[i];
-            if (c != '\\' && c != '\'' && c != '"')
-                return fail(SourceError::Kind::Unsupported, lit_str("string escape"));
+            switch (c) {
+                case 'a':
+                    c = '\a';
+                    break;
+                case 'b':
+                    c = '\b';
+                    break;
+                case 'f':
+                    c = '\f';
+                    break;
+                case 'n':
+                    c = '\n';
+                    break;
+                case 'r':
+                    c = '\r';
+                    break;
+                case 't':
+                    c = '\t';
+                    break;
+                case 'v':
+                    c = '\v';
+                    break;
+                case '\\':
+                case '\'':
+                case '"':
+                case '?':
+                    break;
+                default: {
+                    u32 value = 0;
+                    if (c >= '0' && c <= '7') {
+                        value = static_cast<u32>(c - '0');
+                        for (u32 n = 1; n < 3 && i + 1 < token.text.len; ++n) {
+                            const char kNext = token.text.ptr[i + 1];
+                            if (kNext < '0' || kNext > '7') break;
+                            value = value * 8 + static_cast<u32>(kNext - '0');
+                            ++i;
+                        }
+                    } else if (c == 'x' || c == 'X') {
+                        if (i + 1 == token.text.len || hex(token.text.ptr[i + 1]) == 16)
+                            return fail(SourceError::Kind::Syntax, lit_str("hex escape"));
+                        value = hex(token.text.ptr[++i]);
+                        if (i + 1 < token.text.len && hex(token.text.ptr[i + 1]) != 16)
+                            value = value * 16 + hex(token.text.ptr[++i]);
+                    } else if (c == 'u' || c == 'U') {
+                        const u32 kDigits = c == 'u' ? 4 : 8;
+                        if (token.text.len - i - 1 < kDigits)
+                            return fail(SourceError::Kind::Syntax, lit_str("unicode escape"));
+                        for (u32 n = 0; n < kDigits; ++n) {
+                            const u32 kDigit = hex(token.text.ptr[++i]);
+                            if (kDigit == 16)
+                                return fail(SourceError::Kind::Syntax, lit_str("unicode escape"));
+                            value = value * 16 + kDigit;
+                        }
+                        // protoc combines adjacent UTF-16 escapes within one literal.
+                        if (value >= 0xd800 && value <= 0xdbff && token.text.len - i - 1 >= 6 &&
+                            token.text.ptr[i + 1] == '\\' && token.text.ptr[i + 2] == 'u') {
+                            u32 low = 0;
+                            for (u32 n = 3; n <= 6; ++n) {
+                                const u32 kDigit = hex(token.text.ptr[i + n]);
+                                if (kDigit == 16)
+                                    return fail(SourceError::Kind::Syntax,
+                                                lit_str("unicode escape"));
+                                low = low * 16 + kDigit;
+                            }
+                            if (low < 0xdc00 || low > 0xdfff)
+                                return fail(SourceError::Kind::Syntax,
+                                            lit_str("unicode surrogate"));
+                            value = 0x10000 + ((value - 0xd800) << 10) + low - 0xdc00;
+                            i += 6;
+                        }
+                        if (value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff))
+                            return fail(SourceError::Kind::Syntax, lit_str("unicode scalar"));
+                        if (value < 0x80) {
+                            bytes[length++] = static_cast<char>(value);
+                        } else if (value < 0x800) {
+                            bytes[length++] = static_cast<char>(0xc0 | (value >> 6));
+                            bytes[length++] = static_cast<char>(0x80 | (value & 0x3f));
+                        } else {
+                            if (value >= 0x10000) {
+                                bytes[length++] = static_cast<char>(0xf0 | (value >> 18));
+                                bytes[length++] = static_cast<char>(0x80 | ((value >> 12) & 0x3f));
+                            } else {
+                                bytes[length++] = static_cast<char>(0xe0 | (value >> 12));
+                            }
+                            bytes[length++] = static_cast<char>(0x80 | ((value >> 6) & 0x3f));
+                            bytes[length++] = static_cast<char>(0x80 | (value & 0x3f));
+                        }
+                        continue;
+                    } else {
+                        return fail(SourceError::Kind::Syntax, lit_str("string escape"));
+                    }
+                    c = static_cast<char>(value & 0xff);
+                    break;
+                }
+            }
+            bytes[length++] = c;
         }
-        bytes[length++] = c;
-    }
+        advance();
+    } while (token.kind == Token::Kind::String);
     bytes[length] = 0;
     out = {bytes, length};
-    advance();
     return true;
 }
 bool Parser::number(u32& out) {

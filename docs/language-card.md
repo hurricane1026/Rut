@@ -425,6 +425,10 @@ Paths and fully qualified message names must be literals. Paths resolve relative
 to the current `.rut` file. Proto3 `import public` re-exports message/enum types
 through public chains; private transitive imports remain invisible and weak
 imports remain unsupported. Import cycles are rejected within existing budgets.
+Proto source strings support adjacent literals, character/octal/hex escapes and
+Unicode scalar escapes, including paired UTF-16 surrogates within one literal.
+Decoded import paths still reject parent traversal, absolute paths and NUL.
+Unpaired surrogates, invalid scalars, unknown escapes and raw newlines are rejected.
 The compiler reads proto3 imports and generates an
 internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most

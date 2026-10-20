@@ -81,3 +81,11 @@ message, nested enum and RPC output. `generate_public_oracle.py` builds the matc
 FileDescriptorSet with Google protobuf (optional, no build dependency). Source
 and descriptor metadata are compared in unit tests. The existing reserved-schema
 network roundtrip uses the public facade on both I/O backends.
+
+`strings.proto` exercises escaped imports, adjacent literals with comments, escaped
+JSON names and reserved metadata (control bytes, Unicode boundaries and surrogate
+pairs). `generate_strings_oracle.py` optionally invokes official protoc from
+`grpcio-tools==1.78.0` with `protobuf==6.33.5` to produce `strings_oracle.inc`.
+Neither package is required by builds/tests. Protoc warns about non-identifier
+reserved names but retains their bytes, allowing direct metadata comparison.
+The schema also drives JIT and epoll/io_uring RPC roundtrip regressions.

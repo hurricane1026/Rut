@@ -1501,9 +1501,9 @@ Repeated scalar and message fields now use the runtime immutable array carriers 
 Floating point, uint64/fixed64, oneof/optional presence, maps, proto2 and
 editions remain pending. Proto2 must implement explicit presence, defaults and
 required-field validation before being enabled. The source parser rejects custom
-options, weak imports, default/extension declarations and string
-escapes beyond quotes/backslashes; packages must precede declarations. Schema
-sources are read during compilation/reload, not watched or opened per request.
+options, weak imports and default/extension declarations; packages must precede
+declarations. Schema sources are read during compilation/reload, not watched or
+opened per request.
 See [the runnable codec example](examples/protobuf/README.md).
 
 **Implemented native gRPC gateway path:** the current frontend accepts
@@ -8245,3 +8245,21 @@ source at most once per visibility query and uses the existing 128-file ceiling;
 source import cycles remain rejected. Repeated imports reuse one dependency index
 and any public occurrence marks it as exported. The descriptor loader applies the
 same visibility rules. No runtime ABI or wire codec changes are required.
+
+### Protobuf source string literals
+
+Source string values accept adjacent single/double quoted literals, with whitespace
+and comments between segments, and decode standard character escapes, one-to-three
+octal digits, one-to-two hexadecimal digits, and Unicode escapes (four/eight hex
+digits). A high surrogate spelled with either Unicode escape width followed by a four-digit
+`\u` low surrogate within one literal combines into a Unicode scalar;
+unpaired surrogates and out-of-range scalars fail closed. Octal byte escapes retain
+the low eight bits, matching protoc. Existing descriptor UTF-8 and identifier
+validation remains authoritative for the decoded value.
+
+A token lookahead counts raw bytes across adjacent segments before one Arena
+allocation; decoding cannot expand beyond that bound. Existing source-byte budgets
+apply. Import paths are validated after decoding/concatenation so escaped absolute
+paths, parent traversal and NUL bytes cannot bypass path guards. Unknown escapes,
+raw newlines and unterminated literals are syntax errors. The runtime ABI is
+unchanged. A committed official protoc fixture checks byte-exact decoded metadata.

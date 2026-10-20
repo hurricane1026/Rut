@@ -64,9 +64,12 @@ are validated before decode returns. Each contiguous slot allocation must also f
 one 16 KiB Arena slice minus its block header; oversized slot regions fail decode.
 Array-bearing routes with `wait`
 are rejected until collection suspension ownership is implemented. Floating point, uint64/fixed64, oneof/optional presence,
-maps, extensions/defaults, custom options, weak imports, proto2 and editions are rejected. Source string escapes currently cover
-quotes and backslashes only. Proto2 needs separate presence/default/required
-semantics before it can be enabled. No implicit protobuf JSON mapping is provided
+maps, extensions/defaults, custom options, weak imports, proto2 and editions are
+rejected. Source strings accept adjacent single/double quoted literals, standard character,
+octal/hex byte and Unicode escapes. Paired UTF-16 surrogates within a literal
+are combined; unpaired surrogates, invalid scalars and unknown escapes are rejected.
+Import path guards apply to the decoded concatenated value. Proto2 needs separate
+presence/default/required semantics before it can be enabled. No implicit protobuf JSON mapping is provided
 by the general-purpose `json` operations.
 
 `examples/protobuf-nested.rut` shows `example.Envelope` with a nested `Message`.

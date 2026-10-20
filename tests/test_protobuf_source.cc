@@ -16,6 +16,7 @@ using namespace rut::protobuf;
 #include "protobuf/public_oracle.inc"
 #include "protobuf/reserved_oracle.inc"
 #include "protobuf/schema_descriptor.inc"
+#include "protobuf/strings_oracle.inc"
 
 namespace {
 struct Storage {
@@ -733,4 +734,82 @@ TEST(protobuf_source, public_imports_match_google_descriptor_visibility) {
     const auto* method = parsed->find_method(lit_str("/PublicCodec/Echo"));
     REQUIRE(method);
     CHECK(method->output == parsed->find_message(lit_str(".example.ReservedBatch")));
+}
+
+TEST(protobuf_source, string_literals_match_protoc_escapes_and_concatenation) {
+    Storage source, descriptor;
+    auto parsed =
+        load_proto_source(source.arena, lit_str(RUT_SOURCE_DIR "/tests/protobuf/strings.proto"));
+    auto golden =
+        load_descriptor_set(descriptor.arena, kStringsDescriptor, sizeof(kStringsDescriptor));
+    REQUIRE(parsed.has_value());
+    REQUIRE(golden.has_value());
+    CHECK_EQ(parsed->message_count, golden->message_count);
+    CHECK_EQ(parsed->method_count, golden->method_count);
+    const auto* actual = parsed->find_message(lit_str(".example.StringBatch"));
+    const auto* expected = golden->find_message(lit_str(".example.StringBatch"));
+    REQUIRE(actual && expected);
+    u32 count = 0;
+    for (const auto* name = expected->reserved_names; name; name = name->next) {
+        bool found = false;
+        for (const auto* match = actual->reserved_names; match; match = match->next)
+            found = found || name->name.eq(match->name);
+        CHECK(found);
+        ++count;
+    }
+    CHECK_EQ(count, 10u);
+    CHECK_EQ(parsed->reserved_count, golden->reserved_count);
+    for (const auto* field = actual->fields; field; field = field->next) {
+        const auto* match = expected->fields;
+        while (match && !match->name.eq(field->name)) match = match->next;
+        REQUIRE(match);
+        CHECK(field->json_name.eq(match->json_name));
+        CHECK(field->type_name.eq(match->type_name));
+    }
+}
+
+TEST(protobuf_source, malformed_string_escapes_and_decoded_path_guards) {
+    const char* cases[] = {
+        R"(syntax='proto3'; message M { reserved '\q'; })",
+        R"(syntax='proto3'; message M { reserved '\8'; })",
+        R"(syntax='proto3'; message M { reserved '\x'; })",
+        R"(syntax='proto3'; message M { reserved '\xg0'; })",
+        R"(syntax='proto3'; message M { reserved '\u123'; })",
+        R"(syntax='proto3'; message M { reserved '\u12gg'; })",
+        R"(syntax='proto3'; message M { reserved '\U0000000'; })",
+        R"(syntax='proto3'; message M { reserved '\U00110000'; })",
+        R"(syntax='proto3'; message M { reserved '\UFFFFFFFF'; })",
+        R"(syntax='proto3'; message M { reserved '\uD800'; })",
+        R"(syntax='proto3'; message M { reserved '\uDC00'; })",
+        R"(syntax='proto3'; message M { reserved '\uD800\u0041'; })",
+        R"(syntax='proto3'; message M { reserved '\uD800\uZZZZ'; })",
+        R"(syntax='proto3'; message M { reserved '\xff'; })",
+        R"(syntax='proto3'; message M { reserved '\uD800' '\uDC00'; })",
+        R"(syntax='proto3'; message M { reserved '\U0000D800'; })",
+        R"(syntax='proto3'; message M { reserved '\U0000D800\u0041'; })",
+        R"(syntax='proto3'; message M { reserved '\uD800\U0000DC00'; })",
+        R"(syntax='proto3'; message M { reserved '\U0000D800\U0000DC00'; })",
+        R"(syntax='proto3'; import '\056\056/x.proto';)",
+        R"(syntax='proto3'; import 'types\0.proto';)",
+        R"(syntax='proto3'; import '\x2ftypes.proto';)",
+        R"(syntax='proto3'; import '.' /*x*/ './types.proto';)",
+        "syntax='proto3'; message M { reserved 'line\nbreak'; }",
+        "syntax='proto3'; message M { reserved 'line\\\nbreak'; }",
+        "syntax='proto3'; message M { reserved 'trailing\\",
+    };
+    for (const char* text : cases) {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage storage;
+        CHECK_FALSE(files.load(storage).has_value());
+    }
+    // Name conflicts must be checked after decoding and concatenating literals.
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file(
+        "root.proto",
+        R"(syntax='proto3'; message M { reserved 'de' "\154eted"; string deleted=1; })"));
+    Storage storage;
+    CHECK_FALSE(files.load(storage).has_value());
 }
