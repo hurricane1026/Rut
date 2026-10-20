@@ -50,7 +50,7 @@ struct ProtoDescriptorBytes {
     u32 size = 0;
     void add(u32 tag, u64 value, const u8* payload = nullptr, u32 length = 0) {
         protobuf::Writer writer(data + size, sizeof(data) - size);
-        writer.write({tag, payload ? 2u : 0u, value, payload, length});
+        writer.write({tag, static_cast<u8>(payload ? 2u : 0u), value, payload, length});
         size += writer.size();
     }
     void text(u32 tag, Str value) {
@@ -40435,11 +40435,20 @@ TEST(frontend, protobuf_repeated_layout_rejects_nested_optional_descriptor) {
     static HirModule module;
     HirStruct child_decl;
     child_decl.name = lit("Child");
-    child_decl.fields.push({lit("value"), 1, 5, {}, HirTypeKind::I32});
+    HirStruct::FieldDecl value_field{};
+    value_field.name = lit("value");
+    value_field.protobuf_number = 1;
+    value_field.protobuf_type = 5;
+    value_field.type = HirTypeKind::I32;
+    REQUIRE(child_decl.fields.push(value_field));
     REQUIRE(module.structs.push(child_decl));
     HirStruct root_decl;
     root_decl.name = lit("Root");
-    HirStruct::FieldDecl children{lit("children"), 1, 11, {}, HirTypeKind::Array};
+    HirStruct::FieldDecl children{};
+    children.name = lit("children");
+    children.protobuf_number = 1;
+    children.protobuf_type = 11;
+    children.type = HirTypeKind::Array;
     children.struct_index = 0;
     children.shape_index = 1;
     REQUIRE(root_decl.fields.push(children));
