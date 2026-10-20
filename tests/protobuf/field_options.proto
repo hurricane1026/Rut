@@ -1,0 +1,10 @@
+syntax = "proto3";
+package field_options;
+message Child { string text = 1; }
+message Message {
+  string text = 1 [ctype = CORD, deprecated = true, debug_redact = true];
+  int64 number = 2 [jstype = JS_STRING, deprecated = false];
+  Child child = 3 [lazy = true, unverified_lazy = false];
+  repeated int32 values = 4 [packed = true, deprecated = true];
+  bytes raw = 5 [ctype = STRING_PIECE];
+}

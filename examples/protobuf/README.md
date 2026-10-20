@@ -130,3 +130,12 @@ descriptor schemas reserve that field. Names are unique per file, strings
 support the escapes/concatenation above, and values must have the correct
 string/bool/enum type. Unknown/custom and editions `features` options remain
 rejected. These options do not enable new codecs or language generators.
+
+
+Field generator hints `ctype` (`STRING`, `CORD`, `STRING_PIECE`), `jstype`
+(`JS_NORMAL`, `JS_STRING`, `JS_NUMBER`), and the boolean `lazy`,
+`unverified_lazy`, `deprecated`, `debug_redact` are accepted in field option
+lists alongside `packed` and `json_name`. Values are type-checked and each
+option may appear once per field. These hints do not change Rut's eager wire
+codec, field carriers, or logging behavior. Unknown/custom, weak-field and
+editions options remain unsupported.

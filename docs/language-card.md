@@ -435,6 +435,16 @@ Objective-C/C#/Swift/PHP/Ruby naming options, plus the legacy PHP generic-servic
 boolean (field 42) retained for proto files from older protoc releases. They do
 not alter Rut wire/RPC semantics; duplicates, wrong types and unknown/custom/editions
 options are rejected.
+
+Field generator hints `ctype` (`STRING`, `CORD`, `STRING_PIECE`), `jstype`
+(`JS_NORMAL`, `JS_STRING`, `JS_NUMBER`), and the boolean `lazy`,
+`unverified_lazy`, `deprecated`, `debug_redact` are accepted in field option
+lists alongside `packed` and `json_name`. Values are type-checked and each
+option may appear once per field. Non-default `jstype` values require a 64-bit
+integer field, and enabled `lazy` or `unverified_lazy` requires a message field,
+matching protoc validation. These hints do not change Rut's eager wire codec,
+field carriers, or logging behavior. Unknown/custom, weak-field and editions
+options remain unsupported.
 The compiler reads proto3 imports and generates an
 internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most

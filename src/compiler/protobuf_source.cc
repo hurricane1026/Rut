@@ -115,7 +115,19 @@ struct Reference {
     Source* file = nullptr;
     u32 line = 0;
     u32 column = 0;
+    bool is_enum = false;
     Reference* next = nullptr;
+};
+struct FieldCheck {
+    u32 type = 11;
+    u32 jstype = 0;
+    bool lazy = false;
+    bool unverified_lazy = false;
+    Reference* reference = nullptr;
+    Source* file = nullptr;
+    u32 line = 0;
+    u32 column = 0;
+    FieldCheck* next = nullptr;
 };
 struct Token {
     enum class Kind : u8 { End, Ident, Number, String, Symbol, Bad };
@@ -160,7 +172,7 @@ struct Parser {
     bool name(Str& out, bool qualified = false);
     bool string(Str& out);
     bool number(u32& out);
-    bool type_reference(Buffer& target, u32 tag, Str scope);
+    bool type_reference(Buffer& target, u32 tag, Str scope, Reference** out = nullptr);
     bool message(Buffer& parent, Str scope, u32 depth);
     bool enumeration(Buffer& parent, Str scope, bool nested);
     bool reservation(Buffer& parent, bool enumeration);
@@ -195,6 +207,7 @@ struct Compiler {
     Source* sources = nullptr;
     NamedMessage* messages = nullptr;
     Reference* references = nullptr;
+    FieldCheck* field_checks = nullptr;
     u32 source_bytes = 0;
     u32 file_count = 0;
     u32 message_count = 0;
@@ -371,7 +384,27 @@ struct Compiler {
                             item->column,
                             lit_str("unresolved message type"));
             item->target->text(item->tag, found);
-            if (item->tag == 6) item->target->number(5, is_enum ? 14 : 11);
+            if (item->tag == 6) {
+                item->is_enum = is_enum;
+                item->target->number(5, is_enum ? 14 : 11);
+            }
+        }
+        for (const FieldCheck* check = field_checks; check; check = check->next) {
+            const bool k64Bit = check->type == 3 || check->type == 4 || check->type == 6 ||
+                                check->type == 16 || check->type == 18;
+            if (check->jstype && (!k64Bit || check->reference))
+                return fail(SourceError::Kind::Schema,
+                            check->file->name,
+                            check->line,
+                            check->column,
+                            lit_str("jstype requires a 64-bit integer field"));
+            if ((check->lazy || check->unverified_lazy) &&
+                (!check->reference || check->reference->is_enum))
+                return fail(SourceError::Kind::Schema,
+                            check->file->name,
+                            check->line,
+                            check->column,
+                            lit_str("lazy requires a message field"));
         }
         return true;
     }
@@ -629,14 +662,15 @@ bool Parser::number(u32& out) {
     advance();
     return true;
 }
-bool Parser::type_reference(Buffer& target, u32 tag, Str scope) {
+bool Parser::type_reference(Buffer& target, u32 tag, Str scope, Reference** out) {
     const u32 kLine = token.line, kColumn = token.column;
     Str type{};
     if (!name(type, true)) return false;
     auto* ref = compiler.arena.alloc_t<Reference>();
     if (!ref) return fail(SourceError::Kind::Allocation, {});
-    *ref = {type, scope, &target, tag, &source, kLine, kColumn, compiler.references};
+    *ref = {type, scope, &target, tag, &source, kLine, kColumn, false, compiler.references};
     compiler.references = ref;
+    if (out) *out = ref;
     return true;
 }
 bool Parser::field(Buffer& parent, Str scope) {
@@ -666,13 +700,14 @@ bool Parser::field(Buffer& parent, Str scope) {
                             lit_str("sint32"),
                             lit_str("sint64")};
     u32 type = 11;
+    Reference* type_ref = nullptr;
     for (u32 i = 0; i < 18; ++i)
         if (kScalars[i].len && is(kScalars[i])) {
             type = i + 1;
             break;
         }
     if (type == 11) {
-        if (!type_reference(*descriptor, 6, scope)) return false;
+        if (!type_reference(*descriptor, 6, scope, &type_ref)) return false;
     } else
         advance();
     Str field_name{};
@@ -685,6 +720,9 @@ bool Parser::field(Buffer& parent, Str scope) {
     if (take(lit_str("["))) {
         Buffer options{compiler.arena};
         bool packed_seen = false, json_seen = false;
+        u32 generation_seen = 0;
+        u32 jstype = 0;
+        bool lazy = false, unverified_lazy = false;
         do {
             if (take(lit_str("packed"))) {
                 if (packed_seen)
@@ -702,11 +740,62 @@ bool Parser::field(Buffer& parent, Str scope) {
                 Str value{};
                 if (!expect(lit_str("=")) || !string(value)) return false;
                 descriptor->text(10, value);
-            } else
-                return fail(SourceError::Kind::Unsupported, lit_str("field option"));
+            } else {
+                // Generator hints have no effect on Rut's eager wire codec.
+                const Str kNames[] = {lit_str("ctype"),
+                                      lit_str("jstype"),
+                                      lit_str("lazy"),
+                                      lit_str("unverified_lazy"),
+                                      lit_str("deprecated"),
+                                      lit_str("debug_redact")};
+                const u32 kTags[] = {1, 6, 5, 15, 3, 16};
+                u32 index = 0;
+                while (index < 6 && !is(kNames[index])) ++index;
+                if (index == 6)
+                    return fail(SourceError::Kind::Unsupported, lit_str("field option"));
+                if (generation_seen & (1u << index))
+                    return fail(SourceError::Kind::Syntax, lit_str("duplicate field option"));
+                generation_seen |= 1u << index;
+                advance();
+                if (!expect(lit_str("="))) return false;
+                u32 value = 0;
+                if (index < 2) {
+                    const Str kCtype[] = {
+                        lit_str("STRING"), lit_str("CORD"), lit_str("STRING_PIECE")};
+                    const Str kJstype[] = {
+                        lit_str("JS_NORMAL"), lit_str("JS_STRING"), lit_str("JS_NUMBER")};
+                    const Str* names = index == 0 ? kCtype : kJstype;
+                    while (value < 3 && !is(names[value])) ++value;
+                    if (value == 3)
+                        return fail(SourceError::Kind::Syntax, lit_str("field option enum"));
+                    advance();
+                    if (index == 1) jstype = value;
+                } else {
+                    value = is(lit_str("true"));
+                    if (!take(lit_str("true")) && !take(lit_str("false")))
+                        return fail(SourceError::Kind::Syntax, lit_str("field option boolean"));
+                    if (index == 2) lazy = value != 0;
+                    if (index == 3) unverified_lazy = value != 0;
+                }
+                options.number(kTags[index], value);
+            }
         } while (take(lit_str(",")));
         if (!expect(lit_str("]"))) return false;
         if (options.size) descriptor->child(8, options);
+        if (jstype || lazy || unverified_lazy) {
+            auto* check = compiler.arena.alloc_t<FieldCheck>();
+            if (!check) return fail(SourceError::Kind::Allocation, {});
+            *check = {type,
+                      jstype,
+                      lazy,
+                      unverified_lazy,
+                      type_ref,
+                      &source,
+                      token.line,
+                      token.column,
+                      compiler.field_checks};
+            compiler.field_checks = check;
+        }
     }
     if (!expect(lit_str(";"))) return false;
     // Flattening must wait until every type reference has been resolved.
