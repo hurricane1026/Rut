@@ -156,7 +156,12 @@ The compiler schema retains the deprecation flag and idempotency level for unary
 and streaming methods, including methods in imported files. Values must have the
 correct bool/enum spelling and each option may occur once per method. Empty RPC
 bodies and semicolon-only declarations remain valid. Unknown/custom/editions
-method options and service-level options are still rejected by the source parser.
+method options are still rejected by the source parser. Service bodies accept
+`option deprecated = true/false;` once per service. The schema copies this flag
+to each method as `service_deprecated`, independently of method deprecation;
+options may appear before or after RPC declarations, including in empty services.
+Other service options remain unsupported in source. Descriptor input validates
+the boolean wire type/value and rejects duplicate service options.
 The metadata does not enable retries, change the configured retry policy, alter
 RPC routing, generate bindings or change payload encoding.
 

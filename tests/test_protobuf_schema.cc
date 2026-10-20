@@ -944,3 +944,51 @@ TEST(protobuf_schema, rpc_option_wire_values_and_duplicates) {
         }
     }
 }
+
+TEST(protobuf_schema, service_option_wire_validation) {
+    for (u32 scenario = 0; scenario < 8; ++scenario) {
+        Bytes options;
+        if (scenario == 0) options.number(33, 2);
+        if (scenario == 1) options.text(33, lit_str("true"));
+        if (scenario == 2) {
+            options.number(33, 1);
+            options.number(33, 0);
+        }
+        if (scenario >= 4) options.number(33, scenario == 4 ? 0 : 1);
+        Bytes method;
+        method.text(1, lit_str("Call"));
+        method.text(2, lit_str(".example.Item"));
+        method.text(3, lit_str(".example.Item"));
+        Bytes service;
+        service.text(1, lit_str("S"));
+        service.child(2, method);
+        if (scenario == 3)
+            service.number(3, 1);
+        else
+            service.child(3, options);
+        if (scenario == 6) service.child(3, options);
+        if (scenario == 7) {
+            // Even a service without methods must validate its options.
+            service = Bytes{};
+            service.text(1, lit_str("S"));
+            options = Bytes{};
+            options.number(33, 3);
+            service.child(3, options);
+        }
+        Bytes source = file(message(member()));
+        source.child(6, service);
+        Bytes input;
+        input.child(1, source);
+        CompileArena storage;
+        auto result = load_descriptor_set(storage.arena, input.data, input.size);
+        if (scenario == 4 || scenario == 5) {
+            REQUIRE(result);
+            CHECK_EQ(result->methods->service_deprecated, scenario == 5);
+            CHECK_FALSE(result->methods->deprecated);
+        } else {
+            REQUIRE_FALSE(result);
+            CHECK(result.error() == (scenario == 2 || scenario == 6 ? SchemaError::Duplicate
+                                                                    : SchemaError::Malformed));
+        }
+    }
+}

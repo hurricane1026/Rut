@@ -448,6 +448,9 @@ values (`IDEMPOTENCY_UNKNOWN`, `NO_SIDE_EFFECTS`, `IDEMPOTENT`), preserving this
 metadata in the compiler schema. Duplicate, mistyped and unknown/custom method
 options are rejected. These declarations do not enable retries or change the
 configured gRPC retry policy.
+Service bodies also accept `option deprecated = true/false;` once per service;
+the compiler retains it separately from each method's own deprecation flag.
+Other service options remain unsupported in source.
 The compiler reads proto3 imports and generates an
 internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most

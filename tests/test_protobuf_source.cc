@@ -20,6 +20,7 @@ using namespace rut::protobuf;
 #include "protobuf/reserved_oracle.inc"
 #include "protobuf/rpc_options_oracle.inc"
 #include "protobuf/schema_descriptor.inc"
+#include "protobuf/service_options_oracle.inc"
 #include "protobuf/strings_oracle.inc"
 
 namespace {
@@ -1216,4 +1217,57 @@ TEST(protobuf_source, optional_imports_nested_types_and_invalid_labels) {
         Storage bad;
         CHECK_FALSE(files.load(bad));
     }
+}
+
+TEST(protobuf_source, service_options_match_official_descriptor) {
+    Storage source, oracle;
+    auto parsed = load_proto_source(
+        source.arena, lit_str(RUT_SOURCE_DIR "/tests/protobuf/service_options.proto"));
+    auto expected = load_descriptor_set(
+        oracle.arena, kServiceOptionsDescriptor, sizeof(kServiceOptionsDescriptor));
+    REQUIRE(parsed);
+    REQUIRE(expected);
+    CHECK_EQ(parsed->method_count, 4u);
+    for (const auto* method = expected->methods; method; method = method->next) {
+        const auto* actual = parsed->find_method(method->path);
+        REQUIRE(actual);
+        CHECK_EQ(actual->service_deprecated, method->service_deprecated);
+        CHECK_EQ(actual->deprecated, method->deprecated);
+        CHECK_EQ(actual->client_streaming, method->client_streaming);
+        CHECK_EQ(actual->server_streaming, method->server_streaming);
+        CHECK_EQ(actual->service_deprecated,
+                 method->path.eq(lit_str("/service_options.Old/Unary")) ||
+                     method->path.eq(lit_str("/service_options.Old/Bidi")));
+    }
+    const auto* current = parsed->find_method(lit_str("/service_options.Current/Get"));
+    REQUIRE(current);
+    CHECK(current->deprecated);
+    CHECK_FALSE(current->service_deprecated);
+}
+TEST(protobuf_source, service_options_invalid_and_imported) {
+    Files files;
+    REQUIRE(files.ok);
+    const char* cases[] = {"option deprecated = 1;",
+                           "option deprecated = 'true';",
+                           "option deprecated = true; option deprecated = false;",
+                           "option idempotency_level = IDEMPOTENT;",
+                           "option (custom) = true;"};
+    for (const char* option : cases) {
+        char source[512];
+        snprintf(source, sizeof(source), "syntax='proto3'; service S { %s }", option);
+        REQUIRE(files.write_file("root.proto", source));
+        Storage storage;
+        CHECK_FALSE(files.load(storage));
+    }
+    REQUIRE(files.write_file("root.proto", "syntax='proto3'; import 'types.proto';"));
+    REQUIRE(files.write_file("types.proto",
+                             "syntax='proto3'; message M {} service S { "
+                             "rpc Call(M) returns(M); option deprecated=true; }"));
+    Storage imported;
+    auto result = files.load(imported);
+    REQUIRE(result);
+    const auto* method = result->find_method(lit_str("/S/Call"));
+    REQUIRE(method);
+    CHECK(method->service_deprecated);
+    CHECK_FALSE(method->deprecated);
 }

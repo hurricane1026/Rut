@@ -968,8 +968,24 @@ bool Parser::service(Buffer& parent, Str scope) {
     compiler.messages = symbol;
     Buffer descriptor{compiler.arena};
     descriptor.text(1, service_name);
+    Buffer service_options{compiler.arena};
+    bool deprecated_seen = false;
     while (!take(lit_str("}"))) {
         if (take(lit_str(";"))) continue;
+        if (take(lit_str("option"))) {
+            if (!take(lit_str("deprecated")))
+                return fail(SourceError::Kind::Unsupported, lit_str("service option"));
+            if (deprecated_seen)
+                return fail(SourceError::Kind::Syntax, lit_str("duplicate service option"));
+            deprecated_seen = true;
+            if (!expect(lit_str("="))) return false;
+            const bool kValue = is(lit_str("true"));
+            if (!take(lit_str("true")) && !take(lit_str("false")))
+                return fail(SourceError::Kind::Syntax, lit_str("service option boolean"));
+            service_options.number(33, kValue);
+            if (!expect(lit_str(";"))) return false;
+            continue;
+        }
         if (!expect(lit_str("rpc"))) return false;
         if (compiler.method_count++ >= compiler.limits.methods)
             return fail(SourceError::Kind::Limit, lit_str("method count"));
@@ -1028,6 +1044,8 @@ bool Parser::service(Buffer& parent, Str scope) {
             descriptor.head = chunk;
         descriptor.tail = chunk;
     }
+    if (service_options.size || service_options.error != Buffer::Error::None)
+        descriptor.child(3, service_options);
     // descriptor lives on stack: move the trivially owning list into arena.
     auto* kept = compiler.arena.alloc_t<Buffer>(descriptor);
     auto* chunk = compiler.arena.alloc_t<Chunk>();

@@ -1,0 +1,14 @@
+syntax = "proto3";
+package service_options;
+message Request { int32 count = 1; }
+service Old {
+  rpc Unary(Request) returns (Request) { option deprecated = false; }
+  option deprecated = true;
+  rpc Bidi(stream Request) returns (stream Request) { option deprecated = true; }
+}
+service Current {
+  option deprecated = false;
+  rpc Get(Request) returns (Request) { option deprecated = true; }
+}
+service Default { rpc Get(Request) returns (Request); }
+service Empty { option deprecated = true; }
