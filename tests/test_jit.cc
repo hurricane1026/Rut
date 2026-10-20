@@ -17,6 +17,8 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/protobuf_array.h"
+#include "rut/runtime/protobuf_value.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
 #endif
