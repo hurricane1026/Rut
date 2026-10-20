@@ -4,6 +4,7 @@
 #include "rut/common/types.h"
 #include "rut/compiler/protobuf_schema.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/protobuf_value.h"
 #include "rut/runtime/protobuf_wire.h"
 
 #include <errno.h>
@@ -165,6 +166,7 @@ struct Parser {
     bool reservation(Buffer& parent, bool enumeration);
     bool field(Buffer& parent, Str scope);
     bool service(Buffer& parent, Str scope);
+    bool file_option(Buffer& options, u32& seen);
     bool file();
 };
 struct Compiler {
@@ -925,6 +927,70 @@ bool Parser::service(Buffer& parent, Str scope) {
     parent.tail = chunk;
     return true;
 }
+bool Parser::file_option(Buffer& options, u32& seen) {
+    struct Definition {
+        Str name;
+        u32 tag;
+        u8 type;  // FileOptions descriptor scalar type.
+    };
+    const Definition kOptions[] = {
+        {lit_str("java_package"), 1, 9},
+        {lit_str("java_outer_classname"), 8, 9},
+        {lit_str("java_multiple_files"), 10, 8},
+        {lit_str("java_generate_equals_and_hash"), 20, 8},
+        {lit_str("java_string_check_utf8"), 27, 8},
+        {lit_str("optimize_for"), 9, 14},
+        {lit_str("go_package"), 11, 9},
+        {lit_str("cc_generic_services"), 16, 8},
+        {lit_str("java_generic_services"), 17, 8},
+        {lit_str("py_generic_services"), 18, 8},
+        {lit_str("deprecated"), 23, 8},
+        {lit_str("cc_enable_arenas"), 31, 8},
+        {lit_str("objc_class_prefix"), 36, 9},
+        {lit_str("csharp_namespace"), 37, 9},
+        {lit_str("swift_prefix"), 39, 9},
+        {lit_str("php_class_prefix"), 40, 9},
+        {lit_str("php_namespace"), 41, 9},
+        // Retained for schemas targeting protoc versions that declared
+        // FileOptions.php_generic_services (field 42).
+        {lit_str("php_generic_services"), 42, 8},
+        {lit_str("php_metadata_namespace"), 44, 9},
+        {lit_str("ruby_package"), 45, 9},
+    };
+    advance();  // option
+    for (u32 i = 0; i < sizeof(kOptions) / sizeof(kOptions[0]); ++i) {
+        if (!is(kOptions[i].name)) continue;
+        if (seen & (1u << i))
+            return fail(SourceError::Kind::Syntax, lit_str("duplicate file option"));
+        seen |= 1u << i;
+        advance();
+        if (!expect(lit_str("="))) return false;
+        if (kOptions[i].type == 9) {
+            Str value{};
+            if (!string(value)) return false;
+            if (!utf8(value)) return fail(SourceError::Kind::Syntax, lit_str("file option UTF-8"));
+            options.text(kOptions[i].tag, value);
+        } else if (kOptions[i].type == 8) {
+            const bool kTrue = is(lit_str("true"));
+            if (!take(lit_str("true")) && !take(lit_str("false")))
+                return fail(SourceError::Kind::Syntax, lit_str("file option boolean"));
+            options.number(kOptions[i].tag, kTrue);
+        } else {
+            u32 value = 0;
+            if (take(lit_str("SPEED")))
+                value = 1;
+            else if (take(lit_str("CODE_SIZE")))
+                value = 2;
+            else if (take(lit_str("LITE_RUNTIME")))
+                value = 3;
+            else
+                return fail(SourceError::Kind::Syntax, lit_str("file optimize_for"));
+            options.number(kOptions[i].tag, value);
+        }
+        return expect(lit_str(";"));
+    }
+    return fail(SourceError::Kind::Unsupported, lit_str("file option"));
+}
 bool Parser::file() {
     if (!expect(lit_str("syntax")) || !expect(lit_str("="))) return false;
     Str syntax{};
@@ -934,6 +1000,8 @@ bool Parser::file() {
     source.descriptor->text(1, source.name);
     source.descriptor->text(12, syntax);
     bool package_seen = false, declarations = false;
+    Buffer options{compiler.arena};
+    u32 options_seen = 0;
     while (token.kind != Token::Kind::End) {
         if (take(lit_str(";"))) continue;
         if (take(lit_str("package"))) {
@@ -947,6 +1015,8 @@ bool Parser::file() {
                 return fail(SourceError::Kind::Limit, lit_str("name length"));
             if (!expect(lit_str(";"))) return false;
             source.descriptor->text(2, source.package);
+        } else if (is(lit_str("option"))) {
+            if (!file_option(options, options_seen)) return false;
         } else if (take(lit_str("import"))) {
             const bool kPublic = take(lit_str("public"));
             if (is(lit_str("weak")))
@@ -997,6 +1067,7 @@ bool Parser::file() {
                 return fail(SourceError::Kind::Unsupported, lit_str("proto declaration"));
         }
     }
+    if (options.size || options.error != Buffer::Error::None) source.descriptor->child(8, options);
     return true;
 }
 // Resolve deferred nested buffers bottom-up. Structural depth is bounded by the

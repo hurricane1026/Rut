@@ -648,6 +648,8 @@ canonical spelling for common gateway tasks.
   源码/descriptor 可见性一致，保留私有边隔离和导入预算。
 - [x] proto3 字符串字面量：字符/八进制/十六进制/Unicode 转义与相邻拼接，
   protoc fixture 对照、非法转义和解码后 import 路径检查。
+- [x] proto3 标准文件生成选项：语言 package/name/bool 与 optimize_for，
+  逐文件重复/类型/UTF-8 检查；不改变 wire/RPC 语义，未知选项仍拒绝。
 - [ ] protobuf enum 的具名 case 与名义类型绑定：复用未来通用 Rut enum 类型机制，
   同时保留 proto3 unknown numeric values；当前 codec 暴露 i32。
 - [ ] 扩展 protobuf codec：单遍 tag dispatcher、浮点/uint64、

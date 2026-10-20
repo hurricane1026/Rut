@@ -23316,12 +23316,12 @@ TEST(jit, grpc_reserved_schema_preserves_deleted_enum_numbers) {
 TEST(jit, grpc_schema_string_literals_roundtrip) {
     const char* source =
         "route POST \"/rpc\" { guard let value = grpc.decode(\"" RUT_PROTO_TEST_ROOT
-        "/tests/protobuf/strings.proto\", \"/example.StringCodec/Echo\", req.body) else { "
+        "/tests/protobuf/file_options.proto\", \"/example.StringCodec/Echo\", req.body) else { "
         "return "
         "422 "
         "} "
         "guard let framed = grpc.encode(\"" RUT_PROTO_TEST_ROOT
-        "/tests/protobuf/strings.proto\", \"/example.StringCodec/Echo\", value) else { return "
+        "/tests/protobuf/file_options.proto\", \"/example.StringCodec/Echo\", value) else { return "
         "500 "
         "} "
         "return response(200, body: framed) }";

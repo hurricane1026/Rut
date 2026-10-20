@@ -13,6 +13,7 @@
 using namespace rut;
 using namespace rut::protobuf;
 #include "protobuf/enum_oracle.inc"
+#include "protobuf/file_options_oracle.inc"
 #include "protobuf/public_oracle.inc"
 #include "protobuf/reserved_oracle.inc"
 #include "protobuf/schema_descriptor.inc"
@@ -812,4 +813,104 @@ TEST(protobuf_source, malformed_string_escapes_and_decoded_path_guards) {
         R"(syntax='proto3'; message M { reserved 'de' "\154eted"; string deleted=1; })"));
     Storage storage;
     CHECK_FALSE(files.load(storage).has_value());
+}
+
+TEST(protobuf_source, standard_file_options_match_official_protoc_schema) {
+    Storage source, descriptor;
+    auto parsed = load_proto_source(source.arena,
+                                    lit_str(RUT_SOURCE_DIR "/tests/protobuf/file_options.proto"));
+    auto golden = load_descriptor_set(
+        descriptor.arena, kFileOptionsDescriptor, sizeof(kFileOptionsDescriptor));
+    REQUIRE(parsed.has_value());
+    REQUIRE(golden.has_value());
+    CHECK_EQ(parsed->message_count, golden->message_count);
+    CHECK_EQ(parsed->enum_count, golden->enum_count);
+    CHECK_EQ(parsed->field_count, golden->field_count);
+    CHECK_EQ(parsed->method_count, golden->method_count);
+    for (const auto* method = golden->methods; method; method = method->next) {
+        const auto* match = parsed->find_method(method->path);
+        REQUIRE(match);
+        CHECK(match->input_name.eq(method->input_name));
+        CHECK(match->output_name.eq(method->output_name));
+    }
+}
+
+TEST(protobuf_source, legacy_php_generic_services_file_option) {
+    const char* accepted[] = {
+        "syntax='proto3'; option php_generic_services=true; message M {}",
+        "syntax='proto3'; option php_generic_services=false; message M {}",
+    };
+    for (const char* text : accepted) {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage storage;
+        REQUIRE(files.load(storage).has_value());
+    }
+    const char* rejected[] = {
+        "syntax='proto3'; option php_generic_services=1; message M {}",
+        "syntax='proto3'; option php_generic_services='true'; message M {}",
+        "syntax='proto3'; option php_generic_services=true; "
+        "option php_generic_services=false; message M {}",
+    };
+    for (const char* text : rejected) {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage storage;
+        CHECK_FALSE(files.load(storage).has_value());
+    }
+}
+
+TEST(protobuf_source, file_options_types_duplicates_scopes_and_limits) {
+    const char* invalid[] = {
+        "option unknown = true;",
+        "option (custom.name) = 'value';",
+        "option features.field_presence = EXPLICIT;",
+        "option optimize_for = BAD;",
+        "option optimize_for = 1;",
+        "option optimize_for = 'SPEED';",
+        "option deprecated = 1;",
+        "option deprecated = 'true';",
+        "option go_package = false;",
+        "option java_package = 1;",
+        "option go_package = 'x'",
+        "option cc_enable_arenas true;",
+        "option go_package = 'x'; option go_package = 'x';",
+        "option deprecated = false; option deprecated = true;",
+        "option optimize_for = SPEED; option optimize_for = CODE_SIZE;",
+        R"(option go_package = '\xff';)",
+        "message M { option java_package = 'x'; }",
+    };
+    for (const char* declaration : invalid) {
+        Files files;
+        REQUIRE(files.ok);
+        char code[512];
+        snprintf(code, sizeof(code), "syntax='proto3'; %s", declaration);
+        REQUIRE(files.write_file("root.proto", code));
+        Storage storage;
+        CHECK_FALSE(files.load(storage).has_value());
+    }
+    const char* modes[] = {"SPEED", "CODE_SIZE", "LITE_RUNTIME"};
+    for (const char* mode : modes) {
+        Files files;
+        REQUIRE(files.ok);
+        char code[512];
+        snprintf(code,
+                 sizeof(code),
+                 "syntax='proto3'; option optimize_for=%s; import 'types.proto'; "
+                 "message M { Child value=1; } option go_package='root';",
+                 mode);
+        REQUIRE(files.write_file("root.proto", code));
+        REQUIRE(files.write_file("types.proto",
+                                 "syntax='proto3'; option go_package='child'; message Child {}"));
+        Storage storage;
+        auto schema = files.load(storage);
+        REQUIRE(schema.has_value());
+        CHECK_EQ(schema->message_count, 2u);
+        SchemaLimits limits;
+        limits.bytes = static_cast<u32>(strlen(code)) - 1;
+        Storage bounded;
+        CHECK_FALSE(files.load(bounded, limits).has_value());
+    }
 }
