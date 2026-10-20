@@ -476,6 +476,7 @@ struct Loader {
         ++schema.message_count;
         Reader reader(view.data, view.size);
         u32 oneof_count = 0;
+        bool seen_options = false;
         while ((status = reader.next(part)) == Status::Field) {
             switch (part.number) {
                 case 2:
@@ -529,6 +530,8 @@ struct Loader {
                         return false;
                     break;
                 case 7: {
+                    if (seen_options) return fail(SchemaError::Duplicate);
+                    seen_options = true;
                     bool packed = false;
                     bool explicit_packed = false;
                     if (!wire(part, 2) ||

@@ -45,6 +45,7 @@ Bytes member(Str name = lit_str("value"), u32 number = 1, u32 type = 9, u32 labe
     out.number(5, type);
     return out;
 }
+
 Bytes message(const Bytes& field) {
     Bytes out;
     out.text(1, lit_str("Item"));
@@ -70,6 +71,30 @@ const SchemaField* find_field(const Message& owner, Str name) {
     return nullptr;
 }
 }  // namespace
+
+TEST(protobuf_schema, message_options_reject_duplicate_containers) {
+    CompileArena storage;
+
+    Bytes valid_options;
+    valid_options.number(3, 1);
+    valid_options.number(7, 0);
+    Bytes valid_message = message(member());
+    valid_message.child(7, valid_options);
+    Bytes valid_input = descriptor(valid_message);
+    auto valid = load_descriptor_set(storage.arena, valid_input.data, valid_input.size);
+    REQUIRE(valid.has_value());
+
+    Bytes deprecated;
+    deprecated.number(3, 1);
+    Bytes duplicate = message(member());
+    duplicate.child(7, deprecated);
+    duplicate.child(7, deprecated);
+    Bytes duplicate_input = descriptor(duplicate);
+    auto duplicate_result =
+        load_descriptor_set(storage.arena, duplicate_input.data, duplicate_input.size);
+    REQUIRE_FALSE(duplicate_result.has_value());
+    CHECK(duplicate_result.error() == SchemaError::Duplicate);
+}
 
 TEST(protobuf_schema, protoc_descriptor_resolves_imports_nested_recursion_and_all_rpc_shapes) {
     CompileArena storage;
