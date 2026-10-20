@@ -159,3 +159,9 @@ bodies and semicolon-only declarations remain valid. Unknown/custom/editions
 method options and service-level options are still rejected by the source parser.
 The metadata does not enable retries, change the configured retry policy, alter
 RPC routing, generate bindings or change payload encoding.
+
+The internal source schema loader accepts proto3 `optional`, for example
+`optional int32 count = 1;`, and retains its synthetic-oneof metadata just like
+the descriptor loader. This is schema support: executable DSL encode/decode
+still reject optional-presence fields until their value representation is wired
+through the compiler. Real oneofs and maps remain unsupported.

@@ -465,7 +465,8 @@ Presence is not exposed: encoding such a default struct emits an empty embedded
 message. Floating point, unsigned 64-bit values,
 oneof/presence/maps and proto2 are not executable codec shapes yet. The internal
 descriptor loader retains and validates proto3 optional synthetic-oneof metadata;
-the source loader still rejects `optional`. The internal wire-tree codec can retain
+the source loader accepts `optional` and creates matching synthetic declarations.
+Executable DSL codecs still reject these presence-aware fields. The internal wire-tree codec can retain
 explicit scalar presence, but this is not yet exposed to DSL codecs. See
 [the example and source grammar limits](../examples/protobuf/README.md).
 Proto3 enum fields use `i32` (and `[i32]` for repeated fields), preserving unknown
