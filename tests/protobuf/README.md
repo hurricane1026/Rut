@@ -140,3 +140,11 @@ explicitly present defaults, including float/double, enum and uint64 bit carrier
 in the internal wire tree. Reference tools are optional development tools, not
 build dependencies. Runtime tests also cover absent values, implicit omission,
 output limits, duplicate-zero overwrite, submessage merge and wrong-wire input.
+
+`rpc_options.proto` and `rpc_options_oracle.inc` compare all four RPC streaming
+shapes and standard method options against official libprotoc 31.1. Regenerate
+with `python tests/protobuf/generate_rpc_options_oracle.py` in the optional
+grpcio-tools environment. Tests cover defaults, all three idempotency enum
+values, deprecation true/false, duplicate and mistyped source options, malformed
+descriptor wire types/enum ranges and per-method option scopes. No protobuf
+package is needed at build/test time.

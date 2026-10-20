@@ -139,3 +139,23 @@ lists alongside `packed` and `json_name`. Values are type-checked and each
 option may appear once per field. These hints do not change Rut's eager wire
 codec, field carriers, or logging behavior. Unknown/custom, weak-field and
 editions options remain unsupported.
+
+
+RPC method bodies accept `option deprecated = true/false;` and
+`option idempotency_level = IDEMPOTENCY_UNKNOWN/NO_SIDE_EFFECTS/IDEMPOTENT;`.
+For example:
+
+```proto
+rpc Get(Request) returns (Response) {
+  option idempotency_level = NO_SIDE_EFFECTS;
+}
+```
+
+These standard declarations no longer prevent loading the containing `.proto`.
+The compiler schema retains the deprecation flag and idempotency level for unary
+and streaming methods, including methods in imported files. Values must have the
+correct bool/enum spelling and each option may occur once per method. Empty RPC
+bodies and semicolon-only declarations remain valid. Unknown/custom/editions
+method options and service-level options are still rejected by the source parser.
+The metadata does not enable retries, change the configured retry policy, alter
+RPC routing, generate bindings or change payload encoding.

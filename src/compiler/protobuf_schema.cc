@@ -557,6 +557,25 @@ struct Loader {
                     item->input_name = text(part);
                 else
                     item->output_name = text(part);
+            } else if (part.number == 4) {
+                if (!wire(part, 2)) return false;
+                Reader options(part.bytes, part.size);
+                Field option;
+                Status option_status;
+                u32 option_seen = 0;
+                while ((option_status = options.next(option)) == Status::Field) {
+                    if (option.number != 33 && option.number != 34) continue;
+                    const u32 bit = option.number == 33 ? 1u : 2u;
+                    if (option_seen & bit) return fail(SchemaError::Duplicate);
+                    option_seen |= bit;
+                    if (option.number == 33) {
+                        if (!read_bool(option, item->deprecated)) return false;
+                    } else {
+                        if (!wire(option, 0) || option.value > 2) return malformed();
+                        item->idempotency = static_cast<IdempotencyLevel>(option.value);
+                    }
+                }
+                if (option_status != Status::End) return malformed();
             } else if (part.number == 5) {
                 if (!read_bool(part, item->client_streaming)) return false;
             } else if (part.number == 6) {

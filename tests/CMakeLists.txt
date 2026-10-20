@@ -3928,6 +3928,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_libraries(test_grpc_proxy rut_loader)
         target_compile_definitions(test_grpc_proxy PRIVATE RUT_GRPC_JIT=1)
     endif()
-    add_test(NAME test_grpc_proxy COMMAND test_grpc_proxy)
-    set_tests_properties(test_grpc_proxy PROPERTIES LABELS "network" TIMEOUT 60)
+    # The full suite includes TLS, retry/deadline waits and JIT codec network
+    # cases. Keep the per-process timeout bounded without putting all of that
+    # work under one shared 60-second deadline on slower Debug runners.
+    add_test(NAME test_grpc_proxy
+        COMMAND test_grpc_proxy --shard-index=0 --shard-count=2)
+    add_test(NAME test_grpc_proxy_shard_1
+        COMMAND test_grpc_proxy --shard-index=1 --shard-count=2)
+    set_tests_properties(test_grpc_proxy test_grpc_proxy_shard_1
+        PROPERTIES LABELS "network" TIMEOUT 60)
 endif()

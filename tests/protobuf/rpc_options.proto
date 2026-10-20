@@ -1,0 +1,13 @@
+syntax = "proto3";
+package rpc_options;
+message Request { int32 count = 1; }
+service Counter {
+  rpc Unary(Request) returns (Request) { option deprecated = false; }
+  rpc Client(stream Request) returns (Request) {
+    option deprecated = true;
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  rpc Server(Request) returns (stream Request) { option idempotency_level = IDEMPOTENT; }
+  rpc Bidi(stream Request) returns (stream Request) { option idempotency_level = IDEMPOTENCY_UNKNOWN; }
+  rpc Bare(Request) returns (Request);
+}
