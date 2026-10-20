@@ -12,6 +12,7 @@ struct MessageField {
     u8 type;
     bool repeated = false;
     const MessageLayout* message = nullptr;
+    bool explicit_presence = false;
 };
 struct MessageLayout {
     const MessageField* fields;
@@ -66,7 +67,7 @@ inline bool valid(const MessageLayout& layout) {
     for (u32 i = 0; i < layout.count; ++i) {
         const auto& f = layout.fields[i];
         if (!f.number || f.number > 0x1fffffff || wire(f.type) == 255 ||
-            (f.type == 11 && !f.message))
+            (f.type == 11 && !f.message) || (f.repeated && f.explicit_presence))
             return false;
         for (u32 j = 0; j < i; ++j)
             if (layout.fields[j].number == f.number) return false;
@@ -198,9 +199,9 @@ inline MessageStatus encode(const MessageLayout& layout,
             if (kBytes.len && !kBytes.ptr) return MessageStatus::Invalid;
             if (field.type == 9 && !utf8(kBytes)) return MessageStatus::Invalid;
         }
-        // Repeated defaults and embedded-message presence must be retained.
-        const bool kOmit =
-            !field.repeated && field.type != 11 && (kExpected == 2 ? !length : !value.scalar);
+        // Repeated defaults, explicit scalar presence and embedded messages must be retained.
+        const bool kOmit = !field.repeated && !field.explicit_presence && field.type != 11 &&
+                           (kExpected == 2 ? !length : !value.scalar);
         if (!kOmit) {
             const u64 kTag = (static_cast<u64>(field.number) << 3) | kExpected;
             const u32 kPayload = kExpected == 2   ? varint_size(length) + length

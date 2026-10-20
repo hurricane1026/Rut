@@ -5,6 +5,7 @@
 
 using namespace rut;
 using namespace rut::protobuf;
+#include "protobuf/presence_oracle.inc"
 namespace {
 constexpr MessageField kChildFields[] = {{1, 9}, {2, 5}};
 constexpr MessageLayout kChild{kChildFields, 2};
@@ -173,4 +174,87 @@ TEST(protobuf_message, bounded_arbitrary_inputs_roundtrip_and_preserve_budget) {
 }
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(protobuf_message, explicit_presence_preserves_defaults_for_all_wire_carriers) {
+    const u8 types[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18};
+    for (u8 type : types) {
+        MessageField field{1, type, false, nullptr, true};
+        MessageLayout layout{&field, 1};
+        u8 input[16]{};
+        Writer writer(input, sizeof(input));
+        const u8 wire = message_detail::wire(type);
+        const u8 empty = 0;
+        REQUIRE(writer.write({1, wire, 0, &empty, 0}));
+        MessageValue values[4]{};
+        MessageStorage storage{values, 4};
+        u32 head = 0, size = 0;
+        u8 output[32]{};
+        REQUIRE(decode_message(layout, bytes(input, writer.size()), storage, head) ==
+                MessageStatus::Ok);
+        CHECK(head != 0);
+        REQUIRE(encode_message(layout, storage, head, output, sizeof(output), size) ==
+                MessageStatus::Ok);
+        CHECK_EQ(size, writer.size());
+        for (u32 i = 0; i < size; ++i) CHECK_EQ(input[i], output[i]);
+        CHECK(encode_message(layout, storage, head, output, writer.size() - 1, size) ==
+              MessageStatus::Limit);
+        CHECK_EQ(size, 0u);
+        // Implicit presence continues omitting the same default-valued node.
+        field.explicit_presence = false;
+        REQUIRE(encode_message(layout, storage, head, output, sizeof(output), size) ==
+                MessageStatus::Ok);
+        CHECK_EQ(size, 0u);
+        field.explicit_presence = true;
+        storage.used = 0;
+        REQUIRE(decode_message(layout, {}, storage, head) == MessageStatus::Ok);
+        CHECK_EQ(head, 0u);
+        REQUIRE(encode_message(layout, storage, head, output, sizeof(output), size) ==
+                MessageStatus::Ok);
+        CHECK_EQ(size, 0u);
+    }
+}
+
+TEST(protobuf_message, explicit_presence_duplicate_merge_and_wrong_wire) {
+    const MessageField child_fields[] = {{1, 5, false, nullptr, true}};
+    const MessageLayout child{child_fields, 1};
+    const MessageField root_fields[] = {{1, 11, false, &child}};
+    const MessageLayout root{root_fields, 1};
+    // A later explicit zero overwrites 7; merging an empty child preserves it.
+    const u8 input[] = {10, 2, 8, 7, 10, 2, 8, 0, 10, 0};
+    const u8 expected[] = {10, 2, 8, 0};
+    MessageValue values[16]{};
+    MessageStorage storage{values, 16};
+    u32 head = 0, size = 0;
+    u8 output[32]{};
+    REQUIRE(decode_message(root, bytes(input, sizeof(input)), storage, head) == MessageStatus::Ok);
+    REQUIRE(encode_message(root, storage, head, output, sizeof(output), size) == MessageStatus::Ok);
+    CHECK_EQ(size, sizeof(expected));
+    for (u32 i = 0; i < size; ++i) CHECK_EQ(output[i], expected[i]);
+    const u8 wrong_wire[] = {10, 0};
+    storage.used = 0;
+    REQUIRE(decode_message(child, bytes(wrong_wire, sizeof(wrong_wire)), storage, head) ==
+            MessageStatus::Ok);
+    CHECK_EQ(head, 0u);
+    MessageField invalid{1, 5, true, nullptr, true};
+    REQUIRE(decode_message({&invalid, 1}, {}, storage, head) == MessageStatus::Invalid);
+}
+
+TEST(protobuf_message, explicit_presence_matches_official_protobuf_default_wire) {
+    const u8 types[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18};
+    MessageField fields[16]{};
+    for (u32 i = 0; i < 16; ++i) fields[i] = {i + 1, types[i], false, nullptr, true};
+    const MessageLayout layout{fields, 16};
+    MessageValue values[32]{};
+    MessageStorage storage{values, 32};
+    u32 head = 0, size = 0;
+    u8 output[128]{};
+    REQUIRE(decode_message(
+                layout, bytes(kPresenceDefaults, sizeof(kPresenceDefaults)), storage, head) ==
+            MessageStatus::Ok);
+    CHECK_EQ(storage.used, 16u);
+    REQUIRE(encode_message(layout, storage, head, output, sizeof(output), size) ==
+            MessageStatus::Ok);
+    CHECK_EQ(size, sizeof(kPresenceDefaults));
+    for (u32 i = 0; i < size; ++i) CHECK_EQ(output[i], kPresenceDefaults[i]);
 }
