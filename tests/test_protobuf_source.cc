@@ -835,6 +835,33 @@ TEST(protobuf_source, standard_file_options_match_official_protoc_schema) {
     }
 }
 
+TEST(protobuf_source, legacy_php_generic_services_file_option) {
+    const char* accepted[] = {
+        "syntax='proto3'; option php_generic_services=true; message M {}",
+        "syntax='proto3'; option php_generic_services=false; message M {}",
+    };
+    for (const char* text : accepted) {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage storage;
+        REQUIRE(files.load(storage).has_value());
+    }
+    const char* rejected[] = {
+        "syntax='proto3'; option php_generic_services=1; message M {}",
+        "syntax='proto3'; option php_generic_services='true'; message M {}",
+        "syntax='proto3'; option php_generic_services=true; "
+        "option php_generic_services=false; message M {}",
+    };
+    for (const char* text : rejected) {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage storage;
+        CHECK_FALSE(files.load(storage).has_value());
+    }
+}
+
 TEST(protobuf_source, file_options_types_duplicates_scopes_and_limits) {
     const char* invalid[] = {
         "option unknown = true;",
