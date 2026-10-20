@@ -8376,8 +8376,11 @@ occurrence. Encoding with the flag emits default values explicitly instead of
 omitting them. Callers represent absence by skipping the encoding operation.
 
 The existing scalar carrier set and message/output budgets remain unchanged.
-The flag is rejected for embedded-message and repeated operations; nested
-message merge and collection semantics keep their existing paths. The runtime
+The flag also supports singular embedded messages: absence fails lookup, while
+an explicit empty message succeeds. Duplicate occurrences merge after each
+submessage is validated independently; an empty occurrence retains presence.
+Encoding a present empty message emits its tag and zero length. Repeated
+operations still reject the flag; collection semantics remain unchanged. The runtime
 helper preserves nil/error output initialization and copies encoded bytes into
 its request arena. Ordinary implicit-presence operations keep their default
 omission behavior. This is internal helper support, not executable DSL optional

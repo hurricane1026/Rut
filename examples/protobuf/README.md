@@ -178,5 +178,8 @@ redaction. Duplicate, mistyped, custom and other declaration options are rejecte
 
 The internal scalar helper can now distinguish an absent optional scalar from
 an explicitly present default (for example, `count = 0`) and preserve explicit
-defaults during encoding. This is a runtime building block; DSL codecs still
+defaults during encoding. Singular embedded-message helpers also distinguish
+absence from an explicit empty message and retain presence across duplicate
+message merges. Each duplicate must be valid independently. These are runtime
+building blocks; DSL codecs still
 reject optional-presence fields until compiler wiring is complete.

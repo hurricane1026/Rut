@@ -367,3 +367,81 @@ TEST(protobuf_value, explicit_defaults_match_google_reference_wire) {
     CHECK_EQ(prefix.len, sizeof(kValuePresenceDefaults));
     CHECK(memcmp(prefix.ptr, kValuePresenceDefaults, sizeof(kValuePresenceDefaults)) == 0);
 }
+
+TEST(protobuf_value, explicit_message_presence_absent_empty_and_wrong_wire) {
+    const u64 kOp = (u64{1} << 8) | 11 | kExplicitPresence;
+    u8 output[64]{};
+    Str view{};
+    i64 scalar = 0;
+    CHECK_FALSE(apply(kOp, lit_str(""), {}, 0, output, sizeof(output), view, scalar));
+    const u8 kWrong[] = {8, 0};
+    CHECK_FALSE(apply(kOp,
+                      {reinterpret_cast<const char*>(kWrong), sizeof(kWrong)},
+                      {},
+                      0,
+                      output,
+                      sizeof(output),
+                      view,
+                      scalar));
+    const u8 kEmpty[] = {10, 0};
+    REQUIRE(apply(kOp,
+                  {reinterpret_cast<const char*>(kEmpty), sizeof(kEmpty)},
+                  {},
+                  0,
+                  output,
+                  sizeof(output),
+                  view,
+                  scalar));
+    CHECK_EQ(view.len, 0u);
+    REQUIRE(
+        apply(kOp | kEncode, lit_str(""), lit_str(""), 0, output, sizeof(output), view, scalar));
+    CHECK_EQ(view.len, sizeof(kEmpty));
+    CHECK(memcmp(view.ptr, kEmpty, sizeof(kEmpty)) == 0);
+    CHECK_FALSE(apply(kOp | kEncode, lit_str(""), {}, 0, output, sizeof(output), view, scalar));
+    CHECK_FALSE(apply(kOp | kEncode, lit_str(""), lit_str(""), 0, output, 1, view, scalar));
+}
+
+TEST(protobuf_value, explicit_message_presence_merges_and_validates_every_occurrence) {
+    const u64 kOp = (u64{1} << 8) | 11 | kExplicitPresence;
+    // Empty duplicates preserve presence; wrong-wire occurrences do not clear it.
+    const u8 kWire[] = {10, 2, 8, 7, 10, 0, 8, 0, 10, 2, 16, 9};
+    const u8 kMerged[] = {8, 7, 16, 9};
+    u8 output[64]{};
+    Str view{};
+    i64 scalar = 0;
+    const Str kInput{reinterpret_cast<const char*>(kWire), sizeof(kWire)};
+    REQUIRE(apply(kOp, kInput, {}, 0, output, sizeof(output), view, scalar));
+    CHECK_EQ(view.len, sizeof(kMerged));
+    CHECK(memcmp(view.ptr, kMerged, sizeof(kMerged)) == 0);
+    CHECK_FALSE(apply(kOp, kInput, {}, 0, output, 3, view, scalar));
+    CHECK_FALSE(apply(kOp, kInput, {}, 0, nullptr, sizeof(output), view, scalar));
+    // The next occurrence cannot complete a truncated submessage.
+    const u8 kSplit[] = {10, 1, 8, 10, 1, 1};
+    CHECK_FALSE(apply(kOp,
+                      {reinterpret_cast<const char*>(kSplit), sizeof(kSplit)},
+                      {},
+                      0,
+                      output,
+                      sizeof(output),
+                      view,
+                      scalar));
+    const u8 kBadTail[] = {10, 0, 128};
+    CHECK_FALSE(apply(kOp,
+                      {reinterpret_cast<const char*>(kBadTail), sizeof(kBadTail)},
+                      {},
+                      0,
+                      output,
+                      sizeof(output),
+                      view,
+                      scalar));
+    const u8 kEmpty[] = {10, 0};
+    REQUIRE(apply(kOp,
+                  {reinterpret_cast<const char*>(kEmpty), sizeof(kEmpty)},
+                  {},
+                  0,
+                  nullptr,
+                  0,
+                  view,
+                  scalar));
+    CHECK_EQ(view.len, 0u);
+}

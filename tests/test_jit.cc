@@ -23456,3 +23456,76 @@ TEST(jit, protobuf_scalar_helper_preserves_explicit_default_presence) {
     arena.destroy();
     pool.destroy();
 }
+
+TEST(jit, protobuf_message_helper_preserves_presence_and_owns_merged_payload) {
+    const u64 kOp = (u64{1} << 8) | 11 | protobuf::kExplicitPresence;
+    u8 has = 1;
+    const char* data = nullptr;
+    u32 length = 0;
+    i64 number = 0;
+    rut_helper_protobuf(
+        nullptr, nullptr, kOp, "", 0, nullptr, 0, nullptr, 0, 0, &has, &data, &length, &number);
+    CHECK_EQ(has, 0u);
+    CHECK(data == nullptr);
+    const char kEmpty[] = {10, 0};
+    rut_helper_protobuf(nullptr,
+                        nullptr,
+                        kOp,
+                        kEmpty,
+                        sizeof(kEmpty),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &data,
+                        &length,
+                        &number);
+    REQUIRE_EQ(has, 1u);
+    CHECK_EQ(length, 0u);
+    CHECK(data != nullptr);
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char wire[] = {10, 2, 8, 7, 10, 0, 10, 2, 16, 9};
+    const char kMerged[] = {8, 7, 16, 9};
+    rut_helper_protobuf(nullptr,
+                        &arena,
+                        kOp,
+                        wire,
+                        sizeof(wire),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &data,
+                        &length,
+                        &number);
+    REQUIRE_EQ(has, 1u);
+    memset(wire, 0, sizeof(wire));
+    CHECK_EQ(length, sizeof(kMerged));
+    CHECK(data && memcmp(data, kMerged, sizeof(kMerged)) == 0);
+    rut_helper_protobuf(nullptr,
+                        &arena,
+                        kOp | protobuf::kEncode,
+                        "",
+                        0,
+                        "",
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &data,
+                        &length,
+                        &number);
+    REQUIRE_EQ(has, 1u);
+    CHECK_EQ(length, sizeof(kEmpty));
+    CHECK(data && memcmp(data, kEmpty, sizeof(kEmpty)) == 0);
+    arena.destroy();
+    pool.destroy();
+}
