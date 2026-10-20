@@ -6,6 +6,7 @@
 using namespace rut;
 using namespace rut::protobuf;
 #include "protobuf/codec_message.inc"
+#include "protobuf/value_presence_oracle.inc"
 TEST(protobuf_value, reference_message_decodes_all_bound_scalar_fields) {
     const Str kInput{reinterpret_cast<const char*>(kCodecMessage), sizeof(kCodecMessage)};
     const u32 kTypes[] = {9, 8, 5, 3, 17, 18, 13, 12};
@@ -261,4 +262,108 @@ TEST(protobuf_value, open_enum_unknown_negative_and_default_values) {
         CHECK_EQ(scalar, static_cast<i64>(value));
         CHECK_EQ(encoded.len, value == 0 ? 0u : value < 0 ? 11u : value == 12345 ? 3u : 6u);
     }
+}
+
+TEST(protobuf_value, explicit_scalar_presence_defaults_and_absence) {
+    // All scalar carriers supported by the generated-code helper.
+    const u8 kTypes[] = {3, 5, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18};
+    u8 output[64]{};
+    Str view{};
+    i64 scalar = 0;
+    for (const u8 kType : kTypes) {
+        const u64 kOp = (u64{1} << 8) | kType;
+        CHECK(apply(kOp, lit_str(""), {}, 0, output, sizeof(output), view, scalar));
+        CHECK_FALSE(apply(
+            kOp | kExplicitPresence, lit_str(""), {}, 0, output, sizeof(output), view, scalar));
+        REQUIRE(apply(
+            kOp | kEncode, lit_str(""), lit_str(""), 0, output, sizeof(output), view, scalar));
+        CHECK_EQ(view.len, 0u);
+        REQUIRE(apply(kOp | kEncode | kExplicitPresence,
+                      lit_str(""),
+                      lit_str(""),
+                      0,
+                      output,
+                      sizeof(output),
+                      view,
+                      scalar));
+        CHECK(view.len > 0);
+        u8 encoded[64]{};
+        const u32 kSize = view.len;
+        memcpy(encoded, view.ptr, kSize);
+        REQUIRE(apply(kOp | kExplicitPresence,
+                      {reinterpret_cast<const char*>(encoded), kSize},
+                      {},
+                      0,
+                      output,
+                      sizeof(output),
+                      view,
+                      scalar));
+        CHECK_EQ(scalar, 0);
+        if (kType == 9 || kType == 12) CHECK_EQ(view.len, 0u);
+    }
+}
+TEST(protobuf_value, explicit_presence_validates_duplicates_and_tail) {
+    u8 output[64]{};
+    Str view{};
+    i64 scalar = 0;
+    const u64 kOp = (u64{1} << 8) | 5 | kExplicitPresence;
+    const u8 kWrongWire[] = {10, 0};
+    CHECK_FALSE(apply(kOp,
+                      {reinterpret_cast<const char*>(kWrongWire), sizeof(kWrongWire)},
+                      {},
+                      0,
+                      output,
+                      sizeof(output),
+                      view,
+                      scalar));
+    const u8 kDuplicate[] = {8, 7, 10, 0, 8, 0};
+    REQUIRE(apply(kOp,
+                  {reinterpret_cast<const char*>(kDuplicate), sizeof(kDuplicate)},
+                  {},
+                  0,
+                  output,
+                  sizeof(output),
+                  view,
+                  scalar));
+    CHECK_EQ(scalar, 0);
+    const u8 kBadTail[] = {8, 0, 128};
+    CHECK_FALSE(apply(kOp,
+                      {reinterpret_cast<const char*>(kBadTail), sizeof(kBadTail)},
+                      {},
+                      0,
+                      output,
+                      sizeof(output),
+                      view,
+                      scalar));
+    CHECK_FALSE(
+        apply(kExplicitPresence | 2, lit_str(""), {}, 0, output, sizeof(output), view, scalar));
+    CHECK_FALSE(apply(kExplicitPresence | (u64{1} << 8) | 11,
+                      lit_str(""),
+                      {},
+                      0,
+                      output,
+                      sizeof(output),
+                      view,
+                      scalar));
+    CHECK_FALSE(apply(kOp | kEncode, lit_str(""), {}, 0, output, 1, view, scalar));
+}
+
+TEST(protobuf_value, explicit_defaults_match_google_reference_wire) {
+    const u8 kTypes[] = {3, 5, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18};
+    u8 output[128]{}, accumulated[128]{};
+    Str prefix = lit_str("");
+    Str view{};
+    i64 scalar = 0;
+    const Str kInput{reinterpret_cast<const char*>(kValuePresenceDefaults),
+                     sizeof(kValuePresenceDefaults)};
+    for (u32 i = 0; i < 12; ++i) {
+        const u64 kOp = (static_cast<u64>(i + 1) << 8) | kTypes[i] | kExplicitPresence;
+        REQUIRE(apply(kOp, kInput, {}, 0, output, sizeof(output), view, scalar));
+        CHECK_EQ(scalar, 0);
+        REQUIRE(apply(kOp | kEncode, prefix, lit_str(""), 0, output, sizeof(output), view, scalar));
+        memcpy(accumulated, view.ptr, view.len);
+        prefix = {reinterpret_cast<const char*>(accumulated), view.len};
+    }
+    CHECK_EQ(prefix.len, sizeof(kValuePresenceDefaults));
+    CHECK(memcmp(prefix.ptr, kValuePresenceDefaults, sizeof(kValuePresenceDefaults)) == 0);
 }

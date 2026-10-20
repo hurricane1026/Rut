@@ -8365,3 +8365,21 @@ duplicates; it discards these generator hints, as it does field generator
 options. They do not change enum alias validation, open enum values, payload
 encoding, type carriers, runtime access policy or logging/redaction. The official
 protoc fixture checks message/enum/RPC shape equivalence across both loaders.
+
+### Explicit scalar presence in generated-code helper operations
+
+The internal protobuf scalar helper accepts `kExplicitPresence` on singular
+scalar operations. Decode succeeds only when a correctly typed occurrence is
+present; a present zero, false or empty value succeeds with that default value.
+It still validates the complete input and uses the last correctly typed
+occurrence. Encoding with the flag emits default values explicitly instead of
+omitting them. Callers represent absence by skipping the encoding operation.
+
+The existing scalar carrier set and message/output budgets remain unchanged.
+The flag is rejected for embedded-message and repeated operations; nested
+message merge and collection semantics keep their existing paths. The runtime
+helper preserves nil/error output initialization and copies encoded bytes into
+its request arena. Ordinary implicit-presence operations keep their default
+omission behavior. This is internal helper support, not executable DSL optional
+fields: the compiler still rejects presence-aware schemas until optional value
+shapes and lowering are wired through all paths.
