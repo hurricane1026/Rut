@@ -534,10 +534,11 @@ struct Loader {
         }
         return true;
     }
-    bool method(View view, Str service) {
+    bool method(View view, Str service, bool service_deprecated) {
         if (schema.method_count >= limits.methods) return fail(SchemaError::Limit);
         auto* item = arena.alloc_t<Method>();
         if (!item) return fail(SchemaError::Allocation);
+        item->service_deprecated = service_deprecated;
         Str name{};
         u32 seen = 0;
         Reader reader(view.data, view.size);
@@ -600,12 +601,28 @@ struct Loader {
         Field part;
         Status status;
         bool seen_name = false;
+        bool seen_options = false, deprecated = false;
         while ((status = names.next(part)) == Status::Field) {
             if (part.number == 1) {
                 if (seen_name) return fail(SchemaError::Duplicate);
                 seen_name = true;
                 if (!wire(part, 2)) return false;
                 name = text(part);
+            } else if (part.number == 3) {
+                if (seen_options) return fail(SchemaError::Duplicate);
+                seen_options = true;
+                if (!wire(part, 2)) return false;
+                Reader options(part.bytes, part.size);
+                Field option;
+                Status option_status;
+                bool deprecated_seen = false;
+                while ((option_status = options.next(option)) == Status::Field) {
+                    if (option.number != 33) continue;
+                    if (deprecated_seen) return fail(SchemaError::Duplicate);
+                    deprecated_seen = true;
+                    if (!read_bool(option, deprecated)) return false;
+                }
+                if (option_status != Status::End) return malformed();
             }
         }
         if (status != Status::End || !identifier(name)) return malformed();
@@ -625,7 +642,8 @@ struct Loader {
         if (!kPath.ptr) return false;
         Reader reader(view.data, view.size);
         while ((status = reader.next(part)) == Status::Field) {
-            if (part.number == 2 && (!wire(part, 2) || !method({part.bytes, part.size}, kPath)))
+            if (part.number == 2 &&
+                (!wire(part, 2) || !method({part.bytes, part.size}, kPath, deprecated)))
                 return false;
         }
         return status == Status::End || malformed();

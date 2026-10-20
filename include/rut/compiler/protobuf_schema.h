@@ -89,6 +89,7 @@ struct Method {
     const Message* input = nullptr;
     const Message* output = nullptr;
     bool deprecated = false;
+    bool service_deprecated = false;  // Passive ServiceOptions metadata, independent of method.
     IdempotencyLevel idempotency = IdempotencyLevel::Unknown;
     bool client_streaming = false;
     bool server_streaming = false;
