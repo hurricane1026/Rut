@@ -1122,13 +1122,12 @@ TEST(protobuf_source, optional_metadata_matches_protoc) {
         CHECK(a == nullptr && b == nullptr);
     }
 }
-TEST(protobuf_source, optional_names_avoid_later_message_symbols) {
+TEST(protobuf_source, optional_names_avoid_field_symbols) {
     Files files;
     REQUIRE(files.ok);
     REQUIRE(files.write_file("root.proto",
                              "syntax='proto3'; message A { "
                              "optional int32 value=1; int32 _value=2; "
-                             "message X_value {} enum E { XX_value=0; } "
                              "optional bool _flag=3; }"));
     Storage storage;
     auto parsed = files.load(storage);
@@ -1138,11 +1137,44 @@ TEST(protobuf_source, optional_names_avoid_later_message_symbols) {
     const auto* oneof = message->synthetic_oneofs;
     bool value_seen = false, flag_seen = false;
     for (; oneof; oneof = oneof->next) {
-        value_seen |= oneof->name.eq(lit_str("XXX_value"));
+        value_seen |= oneof->name.eq(lit_str("X_value"));
         flag_seen |= oneof->name.eq(lit_str("X_flag"));
     }
     CHECK(value_seen);
     CHECK(flag_seen);
+}
+TEST(protobuf_source, optional_names_reject_nested_and_enum_symbols) {
+    Files files;
+    REQUIRE(files.ok);
+    const char* cases[] = {
+        "syntax='proto3'; message A { optional int32 value=1; int32 _value=2; "
+        "message X_value {} }",
+        "syntax='proto3'; message A { optional int32 value=1; int32 _value=2; "
+        "enum E { X_value=0; } }"};
+    for (const char* source : cases) {
+        REQUIRE(files.write_file("root.proto", source));
+        Storage storage;
+        auto rejected = files.load(storage);
+        REQUIRE_FALSE(rejected);
+        CHECK(rejected.error().kind == SourceError::Kind::Schema);
+    }
+    REQUIRE(files.write_file("root.proto",
+                             "syntax='proto3'; message A { optional int32 value=1; int32 _value=2; "
+                             "message X_value {} enum E { XX_value=0; } optional bool _flag=3; }"));
+    Storage storage;
+    auto rejected = files.load(storage);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().kind == SourceError::Kind::Schema);
+}
+
+TEST(protobuf_source, optional_names_still_honor_field_budget) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("root.proto",
+                             "syntax='proto3'; message A { "
+                             "optional int32 value=1; int32 _value=2; "
+                             "optional bool _flag=3; }"));
+    Storage storage;
     SchemaLimits limits;
     limits.fields = 4;  // Three fields plus two synthetic declarations exceed this.
     Storage bounded;

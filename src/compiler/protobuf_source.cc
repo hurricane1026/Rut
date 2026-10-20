@@ -839,7 +839,6 @@ bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
     if (!named || !descriptor || !kFullName.ptr) return fail(SourceError::Kind::Allocation, {});
     *named = {kFullName, compiler.messages, true, &source, true};
     compiler.messages = named;
-    parent.symbol(enum_name);
     descriptor->text(1, enum_name);
     if (!expect(lit_str("{"))) return false;
     bool options_seen = false;
@@ -875,7 +874,6 @@ bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
         const i64 kValue = kNegative ? -static_cast<i64>(magnitude) : static_cast<i64>(magnitude);
         if (!expect(lit_str(";"))) return false;
         Buffer entry{compiler.arena};
-        parent.symbol(value_name);
         entry.text(1, value_name);
         entry.number(2, static_cast<u64>(kValue));
         descriptor->child(2, entry);
@@ -905,7 +903,6 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
     if (!named || !descriptor || !kFullName.ptr) return fail(SourceError::Kind::Allocation, {});
     *named = {kFullName, compiler.messages, true, &source};
     compiler.messages = named;
-    parent.symbol(message_name);
     descriptor->text(1, message_name);
     if (!expect(lit_str("{"))) return false;
     while (!take(lit_str("}"))) {
@@ -925,8 +922,8 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
             return false;
     }
     // Match protoc: synthetic declarations follow all ordinary declarations.
-    // Their names must avoid every symbol in the containing message, including
-    // nested types and enum values declared after the optional field.
+    // Their names avoid field and synthetic oneof names; descriptor validation
+    // rejects collisions with nested types and enum values.
     u32 optional_index = 0;
     for (auto* item = descriptor->head; item; item = item->next) {
         if (item->tag != 2 || !item->child || !item->child->optional) continue;
