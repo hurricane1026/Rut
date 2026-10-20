@@ -138,12 +138,34 @@ struct Loader {
         value = field.value != 0;
         return true;
     }
+    bool boolean_hints(View view, u32 first, u32 second = 0) {
+        Reader reader(view.data, view.size);
+        Field field;
+        Status status;
+        u32 seen = 0;
+        while ((status = reader.next(field)) == Status::Field) {
+            if (field.number != first && (!second || field.number != second))
+                return fail(SchemaError::Unsupported);
+            const u32 kBit = field.number == first ? 1u : 2u;
+            if (seen & kBit) return fail(SchemaError::Duplicate);
+            seen |= kBit;
+            bool ignored = false;
+            if (!read_bool(field, ignored)) return false;
+        }
+        return status == Status::End || malformed();
+    }
     bool options(View view, bool message_options, bool& packed, bool& explicit_packed) {
         Reader reader(view.data, view.size);
         Field field;
         Status status;
+        bool seen_deprecated = false;
         while ((status = reader.next(field)) == Status::Field) {
-            if (message_options && field.number == 7) {
+            if (message_options && field.number == 3) {
+                if (seen_deprecated) return fail(SchemaError::Duplicate);
+                seen_deprecated = true;
+                bool ignored = false;
+                if (!read_bool(field, ignored)) return false;
+            } else if (message_options && field.number == 7) {
                 bool map = false;
                 if (!read_bool(field, map)) return false;
                 if (map) return fail(SchemaError::Unsupported);
@@ -353,12 +375,15 @@ struct Loader {
                 Reader options(part.bytes, part.size);
                 Field option;
                 Status os;
-                bool seen_aliases = false;
+                u32 option_seen = 0;
                 while ((os = options.next(option)) == Status::Field) {
-                    if (option.number != 2) return fail(SchemaError::Unsupported);
-                    if (seen_aliases) return fail(SchemaError::Duplicate);
-                    seen_aliases = true;
-                    if (!read_bool(option, aliases)) return false;
+                    if (option.number != 2 && option.number != 3)
+                        return fail(SchemaError::Unsupported);
+                    const u32 kBit = 1u << option.number;
+                    if (option_seen & kBit) return fail(SchemaError::Duplicate);
+                    option_seen |= kBit;
+                    bool ignored = false;
+                    if (!read_bool(option, option.number == 2 ? aliases : ignored)) return false;
                 }
                 if (os != Status::End) return malformed();
             } else if (part.number == 4 || part.number == 5) {
@@ -389,12 +414,15 @@ struct Loader {
             Status vs;
             u32 seen = 0;
             while ((vs = values.next(v)) == Status::Field) {
-                if (v.number != 1 && v.number != 2) return fail(SchemaError::Unsupported);
+                if (v.number != 1 && v.number != 2 && v.number != 3)
+                    return fail(SchemaError::Unsupported);
                 if (seen & (1u << v.number)) return fail(SchemaError::Duplicate);
                 seen |= 1u << v.number;
                 if (v.number == 1) {
                     if (!wire(v, 2)) return false;
                     value->name = text(v);
+                } else if (v.number == 3) {
+                    if (!wire(v, 2) || !boolean_hints({v.bytes, v.size}, 1, 3)) return false;
                 } else {
                     if (!wire(v, 0)) return false;
                     const i32 kNumber = static_cast<i32>(v.value);
@@ -402,7 +430,7 @@ struct Loader {
                     value->number = kNumber;
                 }
             }
-            if (vs != Status::End || seen != 6 || !identifier(value->name) ||
+            if (vs != Status::End || (seen & 6) != 6 || !identifier(value->name) ||
                 (first && value->number != 0))
                 return malformed();
             first = false;

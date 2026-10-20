@@ -8350,3 +8350,18 @@ Other service options remain unsupported in source. Descriptor input validates
 the boolean wire type/value and rejects duplicate service options.
 The metadata does not enable retries, change the configured retry policy, alter
 RPC routing, generate bindings or change payload encoding.
+
+### Standard protobuf declaration generator hints
+
+The source loader accepts boolean `deprecated` in message and enum bodies and
+boolean `deprecated`/`debug_redact` in enum-value brackets. Existing enum
+`allow_alias` may coexist with enum deprecation; all options are unique within
+their declaration. For example, `ZERO = 0 [deprecated = true];` no longer blocks
+schema loading. Message `map_entry`, custom options and editions declarations
+remain unsupported in source.
+
+The descriptor loader validates recognized hint wire types, boolean ranges and
+duplicates; it discards these generator hints, as it does field generator
+options. They do not change enum alias validation, open enum values, payload
+encoding, type carriers, runtime access policy or logging/redaction. The official
+protoc fixture checks message/enum/RPC shape equivalence across both loaders.

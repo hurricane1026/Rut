@@ -451,6 +451,11 @@ configured gRPC retry policy.
 Service bodies also accept `option deprecated = true/false;` once per service;
 the compiler retains it separately from each method's own deprecation flag.
 Other service options remain unsupported in source.
+Message and enum bodies accept `option deprecated = true/false;`. Enum values
+accept `[deprecated = true/false, debug_redact = true/false]`. These generator
+hints are validated then discarded, matching the descriptor path; they do not
+change field carriers, wire encoding or live logging. Duplicate options, bad
+types, custom options and other declaration options remain rejected.
 The compiler reads proto3 imports and generates an
 internal message type plus field-specialized RIR/LLVM; no protoc or generated
 bindings are needed. Both operations are optional. Inferred types support at most

@@ -992,3 +992,43 @@ TEST(protobuf_schema, service_option_wire_validation) {
         }
     }
 }
+TEST(protobuf_schema, declaration_option_boolean_validation) {
+    // Message deprecated, enum deprecated, enum-value deprecated/debug_redact.
+    for (u32 scope = 0; scope < 4; ++scope) {
+        for (u32 scenario = 0; scenario < 5; ++scenario) {
+            Bytes options;
+            const u32 kTag = scope == 2 ? 1 : 3;
+            if (scenario == 0) options.number(kTag, 0);
+            if (scenario == 1) options.number(kTag, 1);
+            if (scenario == 2) options.number(kTag, 2);
+            if (scenario == 3) options.text(kTag, lit_str("true"));
+            if (scenario == 4) {
+                options.number(kTag, 0);
+                options.number(kTag, 1);
+            }
+            Bytes msg = message(member());
+            Bytes enumeration;
+            enumeration.text(1, lit_str("E"));
+            Bytes value;
+            value.text(1, lit_str("ZERO"));
+            value.number(2, 0);
+            if (scope >= 2) value.child(3, options);
+            enumeration.child(2, value);
+            if (scope == 1) enumeration.child(3, options);
+            if (scope == 0) msg.child(7, options);
+            Bytes source = file(msg);
+            source.child(5, enumeration);
+            Bytes input;
+            input.child(1, source);
+            CompileArena storage;
+            auto result = load_descriptor_set(storage.arena, input.data, input.size);
+            if (scenario < 2)
+                REQUIRE(result);
+            else {
+                REQUIRE_FALSE(result);
+                CHECK(result.error() ==
+                      (scenario == 4 ? SchemaError::Duplicate : SchemaError::Malformed));
+            }
+        }
+    }
+}

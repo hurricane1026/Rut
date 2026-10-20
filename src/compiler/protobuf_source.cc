@@ -186,6 +186,7 @@ struct Parser {
     bool enumeration(Buffer& parent, Str scope, bool nested);
     bool reservation(Buffer& parent, bool enumeration);
     bool field(Buffer& parent, Str scope);
+    bool boolean_option(Buffer& options, u32 tag);
     bool service(Buffer& parent, Str scope);
     bool file_option(Buffer& options, u32& seen);
     bool file();
@@ -825,6 +826,14 @@ bool Parser::reservation(Buffer& parent, bool enumeration) {
     } while (take(lit_str(",")));
     return expect(lit_str(";"));
 }
+bool Parser::boolean_option(Buffer& options, u32 tag) {
+    if (!expect(lit_str("="))) return false;
+    const bool kValue = is(lit_str("true"));
+    if (!take(lit_str("true")) && !take(lit_str("false")))
+        return fail(SourceError::Kind::Syntax, lit_str("option boolean"));
+    options.number(tag, kValue);
+    return true;
+}
 bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
     if (compiler.enum_count++ >= compiler.limits.enums)
         return fail(SourceError::Kind::Limit, lit_str("enum count"));
@@ -841,21 +850,22 @@ bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
     compiler.messages = named;
     descriptor->text(1, enum_name);
     if (!expect(lit_str("{"))) return false;
-    bool options_seen = false;
+    u32 options_seen = 0;
+    Buffer enum_options{compiler.arena};
     while (!take(lit_str("}"))) {
         if (take(lit_str(";"))) continue;
         if (take(lit_str("option"))) {
-            if (options_seen)
+            u32 tag = 0;
+            if (take(lit_str("allow_alias")))
+                tag = 2;
+            else if (take(lit_str("deprecated")))
+                tag = 3;
+            else
+                return fail(SourceError::Kind::Unsupported, lit_str("enum option"));
+            if (options_seen & (1u << tag))
                 return fail(SourceError::Kind::Syntax, lit_str("duplicate enum option"));
-            options_seen = true;
-            if (!expect(lit_str("allow_alias")) || !expect(lit_str("="))) return false;
-            const bool kAliases = is(lit_str("true"));
-            if (!take(lit_str("true")) && !take(lit_str("false")))
-                return fail(SourceError::Kind::Syntax, lit_str("boolean"));
-            if (!expect(lit_str(";"))) return false;
-            Buffer options{compiler.arena};
-            options.number(2, kAliases);
-            descriptor->child(3, options);
+            options_seen |= 1u << tag;
+            if (!boolean_option(enum_options, tag) || !expect(lit_str(";"))) return false;
             continue;
         }
         if (is(lit_str("reserved"))) {
@@ -872,12 +882,33 @@ bool Parser::enumeration(Buffer& parent, Str scope, bool nested) {
         if (magnitude > (kNegative ? 2147483648u : 2147483647u))
             return fail(SourceError::Kind::Syntax, lit_str("enum int32 value"));
         const i64 kValue = kNegative ? -static_cast<i64>(magnitude) : static_cast<i64>(magnitude);
-        if (!expect(lit_str(";"))) return false;
         Buffer entry{compiler.arena};
         entry.text(1, value_name);
         entry.number(2, static_cast<u64>(kValue));
+        if (take(lit_str("["))) {
+            Buffer options{compiler.arena};
+            u32 seen = 0;
+            do {
+                u32 tag = 0;
+                if (take(lit_str("deprecated")))
+                    tag = 1;
+                else if (take(lit_str("debug_redact")))
+                    tag = 3;
+                else
+                    return fail(SourceError::Kind::Unsupported, lit_str("enum value option"));
+                if (seen & (1u << tag))
+                    return fail(SourceError::Kind::Syntax, lit_str("duplicate enum value option"));
+                seen |= 1u << tag;
+                if (!boolean_option(options, tag)) return false;
+            } while (take(lit_str(",")));
+            if (!expect(lit_str("]"))) return false;
+            if (options.size || options.error != Buffer::Error::None) entry.child(3, options);
+        }
+        if (!expect(lit_str(";"))) return false;
         descriptor->child(2, entry);
     }
+    if (enum_options.size || enum_options.error != Buffer::Error::None)
+        descriptor->child(3, enum_options);
     auto* chunk = compiler.arena.alloc_t<Chunk>();
     if (!chunk) return fail(SourceError::Kind::Allocation, {});
     chunk->child = descriptor;
@@ -905,10 +936,21 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
     compiler.messages = named;
     descriptor->text(1, message_name);
     if (!expect(lit_str("{"))) return false;
+    Buffer message_options{compiler.arena};
+    bool deprecated_seen = false;
     while (!take(lit_str("}"))) {
         if (token.kind == Token::Kind::End || token.kind == Token::Kind::Bad)
             return fail(SourceError::Kind::Syntax, lit_str("message body"));
         if (take(lit_str(";"))) continue;
+        if (take(lit_str("option"))) {
+            if (!take(lit_str("deprecated")))
+                return fail(SourceError::Kind::Unsupported, lit_str("message option"));
+            if (deprecated_seen)
+                return fail(SourceError::Kind::Syntax, lit_str("duplicate message option"));
+            deprecated_seen = true;
+            if (!boolean_option(message_options, 3) || !expect(lit_str(";"))) return false;
+            continue;
+        }
         if (is(lit_str("message"))) {
             if (!message(*descriptor, kFullName, depth + 1)) return false;
         } else if (is(lit_str("enum"))) {
@@ -921,6 +963,8 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
         else if (!field(*descriptor, kFullName))
             return false;
     }
+    if (message_options.size || message_options.error != Buffer::Error::None)
+        descriptor->child(7, message_options);
     // Match protoc: synthetic declarations follow all ordinary declarations.
     // Their names avoid field and synthetic oneof names; descriptor validation
     // rejects collisions with nested types and enum values.

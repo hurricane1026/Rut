@@ -12,6 +12,7 @@
 
 using namespace rut;
 using namespace rut::protobuf;
+#include "protobuf/declaration_options_oracle.inc"
 #include "protobuf/enum_oracle.inc"
 #include "protobuf/field_options_oracle.inc"
 #include "protobuf/file_options_oracle.inc"
@@ -1270,4 +1271,63 @@ TEST(protobuf_source, service_options_invalid_and_imported) {
     REQUIRE(method);
     CHECK(method->service_deprecated);
     CHECK_FALSE(method->deprecated);
+}
+
+TEST(protobuf_source, declaration_options_match_protoc) {
+    Storage source, oracle;
+    auto parsed = load_proto_source(
+        source.arena, lit_str(RUT_SOURCE_DIR "/tests/protobuf/declaration_options.proto"));
+    auto expected = load_descriptor_set(
+        oracle.arena, kDeclarationOptionsDescriptor, sizeof(kDeclarationOptionsDescriptor));
+    REQUIRE(parsed);
+    REQUIRE(expected);
+    CHECK_EQ(parsed->message_count, expected->message_count);
+    CHECK_EQ(parsed->enum_count, expected->enum_count);
+    CHECK_EQ(parsed->enum_value_count, expected->enum_value_count);
+    CHECK_EQ(parsed->field_count, expected->field_count);
+    for (const auto* enumeration = expected->enums; enumeration; enumeration = enumeration->next) {
+        const auto* actual = parsed->find_enum(enumeration->full_name);
+        REQUIRE(actual);
+        for (const auto* value = enumeration->values; value; value = value->next) {
+            const auto* match = actual->values;
+            while (match && !match->name.eq(value->name)) match = match->next;
+            REQUIRE(match);
+            CHECK_EQ(match->number, value->number);
+        }
+    }
+    CHECK(parsed->find_method(lit_str("/declaration_options.Service/Call")) != nullptr);
+}
+TEST(protobuf_source, declaration_options_reject_bad_types_duplicates_and_scopes) {
+    Files files;
+    REQUIRE(files.ok);
+    const char* declarations[] = {
+        "message M { option deprecated=1; }",
+        "message M { option deprecated='true'; }",
+        "message M { option deprecated=true; option deprecated=false; }",
+        "message M { option map_entry=true; }",
+        "message M { option debug_redact=true; }",
+        "message M { option (custom)=true; }",
+        "enum E { option deprecated=true; option deprecated=false; ZERO=0; }",
+        "enum E { option deprecated=1; ZERO=0; }",
+        "enum E { ZERO=0 [deprecated=true, deprecated=false]; }",
+        "enum E { ZERO=0 [debug_redact=true, debug_redact=false]; }",
+        "enum E { ZERO=0 [deprecated=1]; }",
+        "enum E { ZERO=0 [debug_redact='true']; }",
+        "enum E { ZERO=0 [allow_alias=true]; }",
+        "enum E { ZERO=0 [(custom)=true]; }",
+        "enum E { ZERO=0 [deprecated=true,]; }",
+        "enum E { option deprecated=true; ZERO=0; ALIAS=0; }"};
+    for (const char* declaration : declarations) {
+        char text[512];
+        snprintf(text, sizeof(text), "syntax='proto3'; %s", declaration);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage storage;
+        CHECK_FALSE(files.load(storage));
+    }
+    REQUIRE(files.write_file("root.proto", "syntax='proto3'; import 'types.proto';"));
+    REQUIRE(files.write_file("types.proto",
+                             "syntax='proto3'; message M { option deprecated=true; "
+                             "} enum E { ZERO=0 [deprecated=true]; option deprecated=true; }"));
+    Storage imported;
+    CHECK(files.load(imported).has_value());
 }
