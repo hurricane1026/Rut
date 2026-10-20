@@ -765,6 +765,36 @@ TEST(protobuf_schema, optional_metadata_matches_official_descriptor) {
             .has_value());
 }
 
+TEST(protobuf_schema, fields_and_synthetic_oneofs_share_budget_in_wire_order) {
+    for (u32 order = 0; order < 2; ++order) {
+        Bytes field = member(lit_str("value"), 1, 5);
+        field.number(17, 1);
+        field.number(9, 0);
+        Bytes oneof;
+        oneof.text(1, lit_str("_value"));
+        Bytes item;
+        item.text(1, lit_str("Item"));
+        item.child(order ? 8 : 2, order ? oneof : field);
+        item.child(order ? 2 : 8, order ? field : oneof);
+        Bytes input = descriptor(item);
+
+        SchemaLimits tight;
+        tight.fields = 1;
+        CompileArena bounded;
+        auto rejected = load_descriptor_set(bounded.arena, input.data, input.size, tight);
+        REQUIRE_FALSE(rejected.has_value());
+        CHECK(rejected.error() == SchemaError::Limit);
+
+        SchemaLimits exact;
+        exact.fields = 2;
+        CompileArena allowed;
+        auto result = load_descriptor_set(allowed.arena, input.data, input.size, exact);
+        REQUIRE(result);
+        CHECK_EQ(result->field_count, 1u);
+        CHECK_EQ(result->synthetic_oneof_count, 1u);
+    }
+}
+
 TEST(protobuf_schema, repeated_message_preserves_nested_optional_metadata) {
     // This is the descriptor shape that reaches the compiler's repeated
     // message layout path.  The source parser intentionally rejects the

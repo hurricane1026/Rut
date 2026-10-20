@@ -155,8 +155,15 @@ struct Loader {
         }
         return status == Status::End || malformed();
     }
+    bool shared_field_budget_available() const {
+        // Fields and synthetic oneofs share the descriptor allocation budget.
+        // Check the subtraction only after bounding field_count to keep the
+        // arithmetic overflow-safe for caller-supplied limits.
+        return schema.field_count < limits.fields &&
+               schema.synthetic_oneof_count < limits.fields - schema.field_count;
+    }
     bool field(View view, Message& owner) {
-        if (schema.field_count >= limits.fields) return fail(SchemaError::Limit);
+        if (!shared_field_budget_available()) return fail(SchemaError::Limit);
         auto* item = arena.alloc_t<SchemaField>();
         if (!item) return fail(SchemaError::Allocation);
         Reader reader(view.data, view.size);
@@ -459,8 +466,7 @@ struct Loader {
                     return fail(SchemaError::Unsupported);
                 case 8: {
                     if (!wire(part, 2)) return false;
-                    if (schema.synthetic_oneof_count >= limits.fields)
-                        return fail(SchemaError::Limit);
+                    if (!shared_field_budget_available()) return fail(SchemaError::Limit);
                     Reader declaration(part.bytes, part.size);
                     Field value;
                     Status state;
