@@ -1,14 +1,17 @@
 #include "deferred_preflight_fixture.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
+#include "rut/compiler/analyze_internal.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/protobuf_schema.h"
 #include "rut/compiler/rir_printer.h"
 #include "rut/compiler/verifier.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/listener.h"
+#include "rut/runtime/protobuf_wire.h"
 #include "rut/runtime/route_method.h"
 #include "test.h"
 #include <cstdio>
@@ -40,6 +43,32 @@ static Str lit(const char* s) {
     u32 n = 0;
     while (s[n]) n++;
     return {s, n};
+}
+
+struct ProtoDescriptorBytes {
+    u8 data[4096]{};
+    u32 size = 0;
+    void add(u32 tag, u64 value, const u8* payload = nullptr, u32 length = 0) {
+        protobuf::Writer writer(data + size, sizeof(data) - size);
+        writer.write({tag, static_cast<u8>(payload ? 2u : 0u), value, payload, length});
+        size += writer.size();
+    }
+    void text(u32 tag, Str value) {
+        add(tag, 0, reinterpret_cast<const u8*>(value.ptr), value.len);
+    }
+    void number(u32 tag, u64 value) { add(tag, value); }
+    void child(u32 tag, const ProtoDescriptorBytes& value) { add(tag, 0, value.data, value.size); }
+};
+
+static ProtoDescriptorBytes test_proto_field(
+    Str name, u32 number, u32 type, u32 label = 1, Str type_name = {}) {
+    ProtoDescriptorBytes field;
+    field.text(1, name);
+    field.number(3, number);
+    field.number(4, label);
+    field.number(5, type);
+    if (type_name.ptr) field.text(6, type_name);
+    return field;
 }
 static bool block_has_op(const rir::Block& block, rir::Opcode op) {
     for (u32 i = 0; i < block.inst_count; i++) {
@@ -40365,6 +40394,80 @@ TEST(frontend, env_decodes_literal_name_before_lookup) {
     REQUIRE(hir);
     CHECK(hir->routes[0].locals[0].init.str_value.eq(lit_str("decoded")));
     unsetenv("RUT_TEST_ENV_SECRET");
+}
+
+TEST(frontend, protobuf_repeated_layout_rejects_nested_optional_descriptor) {
+    ProtoDescriptorBytes optional = test_proto_field(lit("value"), 1, 5);
+    optional.number(17, 1);  // proto3_optional
+    optional.number(9, 0);   // synthetic oneof index
+    ProtoDescriptorBytes oneof;
+    oneof.text(1, lit("_value"));
+    ProtoDescriptorBytes child;
+    child.text(1, lit("Child"));
+    child.child(2, optional);
+    child.child(8, oneof);
+    ProtoDescriptorBytes repeated =
+        test_proto_field(lit("children"), 1, 11, 3, lit(".example.Child"));
+    ProtoDescriptorBytes root;
+    root.text(1, lit("Root"));
+    root.child(2, repeated);
+    ProtoDescriptorBytes file;
+    file.text(1, lit("layout.proto"));
+    file.text(2, lit("example"));
+    file.text(12, lit("proto3"));
+    file.child(4, child);
+    file.child(4, root);
+    ProtoDescriptorBytes set;
+    set.child(1, file);
+
+    MmapArena arena;
+    REQUIRE(arena.init(4096));
+    auto loaded = protobuf::load_descriptor_set(arena, set.data, set.size);
+    REQUIRE(loaded);
+    const auto* root_message = loaded->find_message(lit(".example.Root"));
+    const auto* child_message = loaded->find_message(lit(".example.Child"));
+    REQUIRE(root_message && child_message && root_message->fields);
+    REQUIRE(root_message->fields->message == child_message);
+    REQUIRE(child_message->fields && child_message->fields->proto3_optional);
+
+    // HirModule intentionally has a large fixed-capacity footprint; keep the
+    // hand-built fixture out of the test stack.
+    static HirModule module;
+    HirStruct child_decl;
+    child_decl.name = lit("Child");
+    HirStruct::FieldDecl value_field{};
+    value_field.name = lit("value");
+    value_field.protobuf_number = 1;
+    value_field.protobuf_type = 5;
+    value_field.type = HirTypeKind::I32;
+    REQUIRE(child_decl.fields.push(value_field));
+    REQUIRE(module.structs.push(child_decl));
+    HirStruct root_decl;
+    root_decl.name = lit("Root");
+    HirStruct::FieldDecl children{};
+    children.name = lit("children");
+    children.protobuf_number = 1;
+    children.protobuf_type = 11;
+    children.type = HirTypeKind::Array;
+    children.struct_index = 0;
+    children.shape_index = 1;
+    REQUIRE(root_decl.fields.push(children));
+    REQUIRE(module.structs.push(root_decl));
+    HirTypeShape element;
+    element.type = HirTypeKind::Struct;
+    element.struct_index = 0;
+    REQUIRE(module.type_shapes.push(element));
+    HirTypeShape array;
+    array.type = HirTypeKind::Array;
+    array.array_elem_shape_index = 0;
+    REQUIRE(module.type_shapes.push(array));
+    auto* mutable_child_field = const_cast<protobuf::SchemaField*>(child_message->fields);
+    CHECK_FALSE(proto_array_layout_for_test(module, 1, root_message));
+    mutable_child_field->proto3_optional = false;
+    CHECK(proto_array_layout_for_test(module, 1, root_message));
+    mutable_child_field->proto3_optional = true;
+    CHECK_FALSE(proto_array_layout_for_test(module, 1, root_message));
+    arena.destroy();
 }
 
 TEST(frontend, protobuf_inferred_type_reuse_and_schema_errors) {

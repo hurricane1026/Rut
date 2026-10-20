@@ -1,0 +1,11 @@
+syntax = "proto3";
+package presence;
+message Child { string text = 1; }
+message Message {
+  optional int32 number = 1;
+  optional string text = 2;
+  optional Child child = 3;
+  int32 implicit = 4;
+  optional bytes raw = 5;
+  optional bool enabled = 6;
+}
