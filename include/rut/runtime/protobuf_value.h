@@ -10,6 +10,10 @@ inline constexpr u32 kMaxMessageBytes = 8192;
 inline constexpr u64 kGrpcUnframe = 4;
 inline constexpr u64 kGrpcFrame = 5;
 inline constexpr u64 kEncode = u64{1} << 63;
+// Singular scalar operations only: decode fails if no correctly typed field is
+// present; encode retains explicit zero/false/empty values. Callers omit the
+// encode operation entirely for an absent field. This flag adds no DSL syntax.
+inline constexpr u64 kExplicitPresence = u64{1} << 60;
 // No schema reflection: the compiler embeds the field number/type in each op.
 inline bool utf8(Str input) {
     u32 remaining = 0, code = 0, minimum = 0;
@@ -70,7 +74,10 @@ inline bool apply(
         return a.ptr != nullptr;
     }
     const bool kEncoding = (op & kEncode) != 0;
-    const u32 kTag = static_cast<u32>((op & ~kEncode) >> 8);
+    const bool kPresence = (op & kExplicitPresence) != 0;
+    const u64 kPayloadMask = (u64{0x1fffffff} << 8) | 255;
+    if (op & ~(kEncode | kExplicitPresence | kPayloadMask)) return false;
+    const u32 kTag = static_cast<u32>((op & kPayloadMask) >> 8);
     const u32 kType = static_cast<u32>(op & 255);
     if (!op || op == 3) {
         if (op == 3 && !a.ptr) return false;
@@ -84,18 +91,21 @@ inline bool apply(
     if (!kTag || kTag > 0x1fffffff || kType > 18 || !kType || kType == 1 || kType == 2 ||
         kType == 4 || kType == 6 || kType == 10)
         return false;
+    if (kPresence && kType == 11) return false;
     const u8 kWire = kType == 9 || kType == 11 || kType == 12 ? 2
                      : kType == 7 || kType == 15              ? 5
                      : kType == 16                            ? 1
                                                               : 0;
     if (!kEncoding) {
         if (kType == 11 && !a.ptr) return false;
+        bool found = false;
         u32 merged = 0;
         Reader reader(reinterpret_cast<const u8*>(a.ptr), a.len);
         Field field;
         Status status;
         while ((status = reader.next(field)) == Status::Field) {
             if (field.number != kTag || field.wire != kWire) continue;
+            found = true;
             if (kType == 11) {
                 // Each duplicate is a complete submessage; concatenation must
                 // not repair a truncated fragment using the next occurrence.
@@ -126,14 +136,14 @@ inline bool apply(
             else
                 scalar = static_cast<i64>(field.value);
         }
-        return status == Status::End;
+        return status == Status::End && (!kPresence || found);
     }
     if (!a.ptr || b.len > kMaxMessageBytes || (b.len && !b.ptr)) return false;
     if (kType == 11 && !b.ptr) return false;
     if (kType == 9 && !utf8(b)) return false;
     if (kType == 7 || kType == 13)
         if (number < 0 || static_cast<u64>(number) > 0xffffffffu) return false;
-    if ((kWire == 2 && kType != 11 && !b.len) || (kWire != 2 && !number)) {
+    if (!kPresence && ((kWire == 2 && kType != 11 && !b.len) || (kWire != 2 && !number))) {
         view = a;
         return true;
     }

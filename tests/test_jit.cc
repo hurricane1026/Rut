@@ -17,6 +17,8 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/protobuf_array.h"
+#include "rut/runtime/protobuf_value.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
 #endif
@@ -23384,4 +23386,73 @@ TEST(jit, grpc_schema_string_literals_roundtrip) {
     pool.destroy();
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit, protobuf_scalar_helper_preserves_explicit_default_presence) {
+    const u64 kOp = (u64{1} << 8) | 5 | protobuf::kExplicitPresence;
+    const char kPresent[] = {8, 0};
+    u8 has = 0;
+    const char* data = nullptr;
+    u32 length = 0;
+    i64 number = -1;
+    rut_helper_protobuf(nullptr,
+                        nullptr,
+                        kOp,
+                        kPresent,
+                        sizeof(kPresent),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &data,
+                        &length,
+                        &number);
+    CHECK_EQ(has, 1u);
+    CHECK_EQ(number, 0);
+    rut_helper_protobuf(
+        nullptr, nullptr, kOp, "", 0, nullptr, 0, nullptr, 0, 0, &has, &data, &length, &number);
+    CHECK_EQ(has, 0u);
+    CHECK(data == nullptr);
+    // An invalid repeated/presence combination must not silently become a list.
+    rut_helper_protobuf(nullptr,
+                        nullptr,
+                        kOp | protobuf::kRepeated,
+                        kPresent,
+                        sizeof(kPresent),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &data,
+                        &length,
+                        &number);
+    CHECK_EQ(has, 0u);
+    CHECK(data == nullptr);
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    rut_helper_protobuf(nullptr,
+                        &arena,
+                        kOp | protobuf::kEncode,
+                        "",
+                        0,
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &data,
+                        &length,
+                        &number);
+    REQUIRE_EQ(has, 1u);
+    CHECK_EQ(length, sizeof(kPresent));
+    CHECK(data && memcmp(data, kPresent, sizeof(kPresent)) == 0);
+    arena.destroy();
+    pool.destroy();
 }

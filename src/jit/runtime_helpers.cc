@@ -1709,6 +1709,8 @@ extern "C" void rut_helper_protobuf(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
+    if ((op & protobuf::kExplicitPresence) && (op & (protobuf::kRepeated | protobuf::kStructArray)))
+        return;
     u8 scratch[protobuf::kMaxMessageBytes + 5];
     Str view{};
     i64 scalar = 0;

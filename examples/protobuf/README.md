@@ -175,3 +175,8 @@ Message and enum bodies accept `option deprecated = true;`. Enum values accept
 `ZERO = 0 [deprecated = true, debug_redact = false];`. These boolean generator
 hints are checked and discarded; `debug_redact` does not enable Rut log
 redaction. Duplicate, mistyped, custom and other declaration options are rejected.
+
+The internal scalar helper can now distinguish an absent optional scalar from
+an explicitly present default (for example, `count = 0`) and preserve explicit
+defaults during encoding. This is a runtime building block; DSL codecs still
+reject optional-presence fields until compiler wiring is complete.
