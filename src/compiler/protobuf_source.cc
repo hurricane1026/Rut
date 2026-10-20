@@ -685,6 +685,7 @@ bool Parser::field(Buffer& parent, Str scope) {
     if (take(lit_str("["))) {
         Buffer options{compiler.arena};
         bool packed_seen = false, json_seen = false;
+        u32 generation_seen = 0;
         do {
             if (take(lit_str("packed"))) {
                 if (packed_seen)
@@ -702,8 +703,42 @@ bool Parser::field(Buffer& parent, Str scope) {
                 Str value{};
                 if (!expect(lit_str("=")) || !string(value)) return false;
                 descriptor->text(10, value);
-            } else
-                return fail(SourceError::Kind::Unsupported, lit_str("field option"));
+            } else {
+                // Generator hints have no effect on Rut's eager wire codec.
+                const Str kNames[] = {lit_str("ctype"),
+                                      lit_str("jstype"),
+                                      lit_str("lazy"),
+                                      lit_str("unverified_lazy"),
+                                      lit_str("deprecated"),
+                                      lit_str("debug_redact")};
+                const u32 kTags[] = {1, 6, 5, 15, 3, 16};
+                u32 index = 0;
+                while (index < 6 && !is(kNames[index])) ++index;
+                if (index == 6)
+                    return fail(SourceError::Kind::Unsupported, lit_str("field option"));
+                if (generation_seen & (1u << index))
+                    return fail(SourceError::Kind::Syntax, lit_str("duplicate field option"));
+                generation_seen |= 1u << index;
+                advance();
+                if (!expect(lit_str("="))) return false;
+                u32 value = 0;
+                if (index < 2) {
+                    const Str kCtype[] = {
+                        lit_str("STRING"), lit_str("CORD"), lit_str("STRING_PIECE")};
+                    const Str kJstype[] = {
+                        lit_str("JS_NORMAL"), lit_str("JS_STRING"), lit_str("JS_NUMBER")};
+                    const Str* names = index == 0 ? kCtype : kJstype;
+                    while (value < 3 && !is(names[value])) ++value;
+                    if (value == 3)
+                        return fail(SourceError::Kind::Syntax, lit_str("field option enum"));
+                    advance();
+                } else {
+                    value = is(lit_str("true"));
+                    if (!take(lit_str("true")) && !take(lit_str("false")))
+                        return fail(SourceError::Kind::Syntax, lit_str("field option boolean"));
+                }
+                options.number(kTags[index], value);
+            }
         } while (take(lit_str(",")));
         if (!expect(lit_str("]"))) return false;
         if (options.size) descriptor->child(8, options);

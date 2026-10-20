@@ -99,3 +99,11 @@ also accepts the historical `php_generic_services` boolean (FileOptions field 42
 which was removed from newer protoc descriptors and is therefore covered by
 inline source-parser cases. JIT, native schema-removal and both network backends
 exercise option-bearing schema inputs.
+
+`field_options.proto` and `field_options_oracle.inc` compare source-loaded fields
+with official libprotoc 31.1 descriptors for ctype, jstype, lazy, unverified_lazy,
+deprecated and debug_redact, mixed with packing. Regenerate with
+`python tests/protobuf/generate_field_options_oracle.py` in the optional
+grpcio-tools environment. Unit tests also reject wrong scalar types, enum
+values, duplicate options, custom options and malformed lists. No protobuf
+package is needed to build or run these tests.

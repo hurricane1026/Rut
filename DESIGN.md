@@ -8284,3 +8284,19 @@ source-emitted and external descriptors. Unknown/custom/aggregate/editions optio
 remain rejected by the source loader; message, field, enum and method option
 support is unchanged. An official protoc fixture verifies that option-bearing
 schemas and public imported RPCs retain the same executable schema.
+
+### Standard protobuf field generation options
+
+
+Field generator hints `ctype` (`STRING`, `CORD`, `STRING_PIECE`), `jstype`
+(`JS_NORMAL`, `JS_STRING`, `JS_NUMBER`), and the boolean `lazy`,
+`unverified_lazy`, `deprecated`, `debug_redact` are accepted in field option
+lists alongside `packed` and `json_name`. Values are type-checked and each
+option may appear once per field. These hints do not change Rut's eager wire
+codec, field carriers, or logging behavior. Unknown/custom, weak-field and
+editions options remain unsupported.
+
+The source loader serializes the original FieldOptions tags into its internal
+descriptor. The existing schema loader discards these generator hints, as it
+does for official protoc descriptors. Packing and JSON names keep their existing
+validation and semantics; this adds no Rut syntax or runtime dependency.

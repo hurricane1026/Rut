@@ -13,6 +13,7 @@
 using namespace rut;
 using namespace rut::protobuf;
 #include "protobuf/enum_oracle.inc"
+#include "protobuf/field_options_oracle.inc"
 #include "protobuf/file_options_oracle.inc"
 #include "protobuf/public_oracle.inc"
 #include "protobuf/reserved_oracle.inc"
@@ -912,5 +913,80 @@ TEST(protobuf_source, file_options_types_duplicates_scopes_and_limits) {
         limits.bytes = static_cast<u32>(strlen(code)) - 1;
         Storage bounded;
         CHECK_FALSE(files.load(bounded, limits).has_value());
+    }
+}
+
+TEST(protobuf_source, field_generation_options_match_protoc) {
+    Storage source, descriptor;
+    auto parsed = load_proto_source(source.arena,
+                                    lit_str(RUT_SOURCE_DIR "/tests/protobuf/field_options.proto"));
+    auto golden = load_descriptor_set(
+        descriptor.arena, kFieldOptionsDescriptor, sizeof(kFieldOptionsDescriptor));
+    REQUIRE(parsed.has_value());
+    REQUIRE(golden.has_value());
+    CHECK_EQ(parsed->field_count, golden->field_count);
+    const auto* message = parsed->find_message(lit_str(".field_options.Message"));
+    const auto* expected = golden->find_message(lit_str(".field_options.Message"));
+    REQUIRE(message != nullptr);
+    REQUIRE(expected != nullptr);
+    auto* field = message->fields;
+    auto* reference = expected->fields;
+    for (; field && reference; field = field->next, reference = reference->next) {
+        CHECK(field->name.eq(reference->name));
+        CHECK_EQ(field->number, reference->number);
+        CHECK(field->type == reference->type);
+        CHECK_EQ(field->repeated, reference->repeated);
+        CHECK_EQ(field->packed, reference->packed);
+    }
+    CHECK(field == nullptr);
+    CHECK(reference == nullptr);
+}
+
+TEST(protobuf_source, field_generation_option_validation) {
+    const char* invalid[] = {"deprecated=1",
+                             "deprecated='true'",
+                             "deprecated=true, deprecated=false",
+                             "debug_redact=0",
+                             "lazy=TRUE",
+                             "unverified_lazy='false'",
+                             "ctype=0",
+                             "ctype='CORD'",
+                             "ctype=JS_STRING",
+                             "ctype=CORD, ctype=STRING",
+                             "jstype=CORD",
+                             "jstype=JS_STRING, jstype=JS_NUMBER",
+                             "unknown=true",
+                             "(custom.name)=true",
+                             "features.field_presence=EXPLICIT",
+                             "weak=true",
+                             "deprecated=true,",
+                             "deprecated true"};
+    for (const char* option : invalid) {
+        Files files;
+        REQUIRE(files.ok);
+        char code[512];
+        snprintf(code, sizeof(code), "syntax='proto3'; message M { string value=1 [%s]; }", option);
+        REQUIRE(files.write_file("root.proto", code));
+        Storage storage;
+        CHECK_FALSE(files.load(storage).has_value());
+    }
+    const char* valid[] = {"ctype=STRING",
+                           "ctype=CORD",
+                           "ctype=STRING_PIECE",
+                           "jstype=JS_NORMAL",
+                           "jstype=JS_STRING",
+                           "jstype=JS_NUMBER",
+                           "lazy=false",
+                           "unverified_lazy=true",
+                           "debug_redact=false",
+                           "deprecated=false"};
+    for (const char* option : valid) {
+        Files files;
+        REQUIRE(files.ok);
+        char code[512];
+        snprintf(code, sizeof(code), "syntax='proto3'; message M { string value=1 [%s]; }", option);
+        REQUIRE(files.write_file("root.proto", code));
+        Storage storage;
+        CHECK(files.load(storage).has_value());
     }
 }
