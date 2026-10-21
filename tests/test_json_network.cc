@@ -1187,6 +1187,24 @@ route GET "/custom" {
     pool.destroy();
 }
 
+TEST(json_network, chunked_grpc_web_event_yield_is_rejected_before_upstream_io) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn);
+    conn->grpc_web_local_chunk_done = true;
+    conn->upstream_fd = -1;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Post);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.yield_kind = jit::YieldKind::UpstreamConnect;
+    handle_jit_outcome(&loop, *conn, outcome, nullptr, false, nullptr);
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK(conn->send_buf.len() != 0);
+    loop.free_conn(*conn);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
@@ -2141,3 +2159,5 @@ TEST(json_network, h2_grpc_web_reset_releases_parked_normalization_arena) {
     loop.free_conn(*conn);
     pool.destroy();
 }
+
+
