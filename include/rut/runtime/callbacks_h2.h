@@ -60,6 +60,7 @@ inline void h2_release_completed_jit_json(Connection& conn) {
     conn.json_arena.destroy();
     conn.jit_response_body = {};
     conn.jit_response_body_valid = false;
+    if (conn.handler_ctx != nullptr) conn.reset_jit_ctx();
 }
 
 inline bool h2_prepare_forward_request(
@@ -2264,6 +2265,8 @@ void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error 
                   }) {
         if (auto* x = grpc_find(c, stream_id)) grpc_release(d->loop, x, true);
     }
+    if (c.async_stream != 0 && c.async_stream == stream_id)
+        h2_release_completed_jit_json(*d->conn);
     const bool kOutboundOwner = c.outbound_stream == stream_id;
     if (d->close_after_process) return;
     if (kOutboundOwner && d->owned_hpack_pending && d->owned_stream == stream_id) {

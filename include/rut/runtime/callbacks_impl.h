@@ -2485,8 +2485,9 @@ inline bool collect_local_grpc_web_chunked_body(Connection& conn) {
         for (u32 i = 0; i < suffix; i++)
             recv_data[conn.req_header_end + i] = recv_data[conn.req_header_end + pos + i];
         conn.recv_buf.set_len(conn.req_header_end + suffix);
-        conn.downstream_req_size += pos;
-        conn.req_size += pos;
+        // The receive path accounts bytes in req_initial_send_len before the
+        // collector runs; compaction only moves them and must not count them
+        // again in the access-log totals.
     }
     if (conn.grpc_web_local_chunk_parser.state == ChunkedParser::State::Complete) {
         if (conn.grpc_web_local_chunk_mode == static_cast<u8>(GrpcWebContentType::Text)) {
@@ -4020,7 +4021,9 @@ void handle_jit_outcome(Loop* loop,
     // shape until a separate request rewriter exists; fail before any
     // preflight, upstream connect, or send rather than exposing a header /
     // successor mixup.
-    if (outcome.kind == JitDispatchOutcome::Kind::Forward && conn.grpc_web_local_chunk_done) {
+    if ((outcome.kind == JitDispatchOutcome::Kind::Forward ||
+         outcome.kind == JitDispatchOutcome::Kind::EventYield) &&
+        conn.grpc_web_local_chunk_done) {
         conn.pending_handler_fn = nullptr;
         conn.resp_status = 400;
         conn.keep_alive = false;
