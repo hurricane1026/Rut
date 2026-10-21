@@ -22609,7 +22609,7 @@ TEST(jit, protobuf_repeated_immutable_arrays_roundtrip_and_properties) {
     conn.reset();
     conn.json_arena.backend.pool = &pool;
     const u8 input[] = {8, 1, 10, 2, 2, 0, 18, 1, 'x', 18, 0, 24, 0, 26, 1, 1, 34, 2, 1, 0};
-    const u8 expected[] = {8, 1, 8, 2, 8, 0, 18, 1, 'x', 18, 0, 24, 0, 24, 1, 32, 1, 32, 0};
+    const u8 expected[] = {8, 1, 8, 2, 8, 0, 18, 1, 'x', 18, 0, 26, 2, 0, 1, 34, 2, 1, 0};
     char request[128];
     const int header = snprintf(request,
                                 sizeof(request),
@@ -22848,8 +22848,8 @@ TEST(jit, protobuf_repeated_message_tree_with_scalar_arrays) {
     conn.json_arena.backend.pool = &pool;
     const u8 input[] = {10, 20, 10,  16, 10, 3,  1, 4,  0, 18, 5,
                         10, 1,  'x', 16, 7,  24, 1, 32, 1, 10, 0};
-    const u8 expected[] = {10, 23,  10, 17, 8,  1, 8,  4, 8,  0, 18, 5, 10,
-                           1,  'x', 16, 7,  24, 1, 32, 1, 10, 2, 18, 0};
+    const u8 expected[] = {10, 22,  10, 16, 10, 3, 1,  4, 0,  18, 5,  10,
+                           1,  'x', 16, 7,  24, 1, 32, 1, 10, 2,  18, 0};
     char request[128];
     const int header = snprintf(request,
                                 sizeof(request),
@@ -23205,7 +23205,9 @@ TEST(jit, grpc_enum_codecs_preserve_unknown_negative_and_repeated_values) {
     auto& conn = connections[0];
     const u8 valid[] = {0,   0,   0,   0,   19,  8,   123, 18, 15, 8, 255, 255,
                         255, 255, 255, 255, 255, 255, 255, 1,  16, 0, 16,  123};
-    const Str expected_body{reinterpret_cast<const char*>(valid), sizeof(valid)};
+    const u8 canonical[] = {0,   0,   0,   0,   19,  8,   123, 18, 15, 8, 255, 255,
+                            255, 255, 255, 255, 255, 255, 255, 1,  18, 2, 0,   123};
+    const Str expected_body{reinterpret_cast<const char*>(canonical), sizeof(canonical)};
     const u8 empty[] = {0, 0, 0, 0, 0};
     const u8 compressed[] = {1, 0, 0, 0, 0};
     const u8 malformed[] = {0, 0, 0, 0, 1, 128};
@@ -23278,7 +23280,9 @@ TEST(jit, grpc_reserved_schema_preserves_deleted_enum_numbers) {
     auto& conn = connections[0];
     const u8 valid[] = {0,   0,   0,   0,   20,  8,   185, 96, 18, 15, 8,  255, 255,
                         255, 255, 255, 255, 255, 255, 255, 1,  16, 0,  16, 123};
-    const Str expected_body{reinterpret_cast<const char*>(valid), sizeof(valid)};
+    const u8 canonical[] = {0,   0,   0,   0,   20,  8,   185, 96, 18, 15, 8, 255, 255,
+                            255, 255, 255, 255, 255, 255, 255, 1,  18, 2,  0, 123};
+    const Str expected_body{reinterpret_cast<const char*>(canonical), sizeof(canonical)};
     const u8 empty[] = {0, 0, 0, 0, 0};
     const u8 compressed[] = {1, 0, 0, 0, 0};
     const u8 malformed[] = {0, 0, 0, 0, 1, 128};
@@ -23351,7 +23355,9 @@ TEST(jit, grpc_schema_string_literals_roundtrip) {
     auto& conn = connections[0];
     const u8 valid[] = {0,   0,   0,   0,   20,  8,   185, 96, 18, 15, 8,  255, 255,
                         255, 255, 255, 255, 255, 255, 255, 1,  16, 0,  16, 123};
-    const Str expected_body{reinterpret_cast<const char*>(valid), sizeof(valid)};
+    const u8 canonical[] = {0,   0,   0,   0,   20,  8,   185, 96, 18, 15, 8, 255, 255,
+                            255, 255, 255, 255, 255, 255, 255, 1,  18, 2,  0, 123};
+    const Str expected_body{reinterpret_cast<const char*>(canonical), sizeof(canonical)};
     const u8 empty[] = {0, 0, 0, 0, 0};
     const u8 compressed[] = {1, 0, 0, 0, 0};
     const u8 malformed[] = {0, 0, 0, 0, 1, 128};

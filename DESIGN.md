@@ -363,7 +363,8 @@ before allocation and count only successfully constructed arrays.
 
 Repeated scalar decoding accepts mixed packed/unpacked occurrences and preserves
 wire element order, zero values, false and empty strings. Encoding emits legal
-unpacked occurrences, retaining every element. The existing supported scalar
+schema-selected packed or unpacked occurrences, retaining every element.
+The existing supported scalar
 mappings/range checks apply. Float/uint64/enum values,
 map/oneof/presence and array construction/transformation APIs remain absent.
 
@@ -8386,3 +8387,14 @@ its request arena. Ordinary implicit-presence operations keep their default
 omission behavior. This is internal helper support, not executable DSL optional
 fields: the compiler still rejects presence-aware schemas until optional value
 shapes and lowering are wired through all paths.
+
+### Schema-selected repeated numeric encoding
+
+Executable protobuf and unary gRPC codecs preserve the schema's `packed` setting
+through scalar helper operations and nested native message-array layouts. Proto3
+numeric and enum fields default to packed encoding; explicit `packed = false`
+retains unpacked output. Both forms remain accepted on input, including mixed
+occurrences. Empty arrays emit no field, and defaults remain array elements.
+String, bytes, and message fields cannot carry a packed hint. Existing array,
+message-size, allocation, and nesting budgets still apply. The independent
+internal wire-tree codec retains its existing unpacked encoding contract.

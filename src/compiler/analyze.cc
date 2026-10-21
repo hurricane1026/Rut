@@ -4489,7 +4489,8 @@ static bool proto_array_layout(const HirModule& mod,
         if (child_len > protobuf::kMaxMessageBytes - 12 ||
             !bytes.write_word(field_header, proto->number))
             return false;
-        if (!bytes.write_word(field_header + 4, proto_type | (repeated ? 256 : 0)) ||
+        if (!bytes.write_word(field_header + 4,
+                              proto_type | (repeated ? 256 : 0) | (proto->packed ? 512 : 0)) ||
             !bytes.write_word(field_header + 8, size) ||
             !bytes.write_word(field_header + 12, child_len))
             return false;
@@ -4628,7 +4629,7 @@ static FrontendResult<HirExpr> build_proto_codec(bool decode,
                                   lit_str("unsupported protobuf/Rut field type mapping"));
         const u64 kOp =
             (static_cast<u64>(proto->number) << 8) | static_cast<u8>(proto->type) |
-            (proto->repeated ? protobuf::kRepeated : 0) |
+            (proto->repeated ? protobuf::kRepeated : 0) | (proto->packed ? protobuf::kPacked : 0) |
             (proto->repeated && proto->type == PT::Message ? protobuf::kStructArray : 0);
         if (decode) {
             auto item = make_proto_op(kOp,

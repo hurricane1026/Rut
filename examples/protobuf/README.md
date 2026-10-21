@@ -57,7 +57,7 @@ Repeated supported scalar and acyclic message fields infer immutable `[T]` array
 Arrays do not grow or expose mutation/indexing/iteration. Each array is limited
 to 512 elements and the request Arena to 4,096 array elements plus the existing
 256 KiB value-memory budget. Repeated numeric scalar values may be packed/unpacked on input;
-encoding emits unpacked occurrences and preserves defaults/empty elements.
+encoding follows the schema packed setting and preserves defaults/empty elements.
 Repeated message elements are native structs; `guard let entry = batch.entries.first`
 unwraps the optional before ordinary field access. All elements and descendants
 are validated before decode returns. Each contiguous slot allocation must also fit
@@ -80,7 +80,7 @@ nested values. Inputs are raw protobuf payloads, without gRPC envelopes.
 `examples/protobuf-repeated.rut` shows `example.Batch` with immutable scalar
 arrays. POST `0a 03 01 02 00 12 01 78 12 00` to `/protobuf/repeated`;
 the response is `08 01 08 02 08 00 12 01 78 12 00`. The packed values
-`[1, 2, 0]` become unpacked occurrences; both string elements (`"x"`, `""`)
+`[1, 2, 0]` become one packed numeric field by default; both string elements (`"x"`, `""`)
 are preserved.
 
 `examples/protobuf-messages.rut` shows `example.MessageBatch` with repeated

@@ -9114,8 +9114,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                         }
                     };
                     invoke_enum(0,
-                                kEnumPacked,
-                                sizeof(kEnumPacked),
+                                kEnumUnpacked,
+                                sizeof(kEnumUnpacked),
                                 kEnumCanonical,
                                 sizeof(kEnumCanonical),
                                 0);

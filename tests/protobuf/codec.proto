@@ -36,10 +36,10 @@ message SharedMessage {
   NestedChild second = 2;
 }
 message RepeatedScalars {
-  repeated int32 values = 1;
+  repeated int32 values = 1 [packed = false];
   repeated string names = 2;
   repeated bool flags = 3;
-  repeated sint64 numbers = 4;
+  repeated sint64 numbers = 4 [packed = true];
 }
 message RepeatedChild {
   repeated NestedChild children = 1;
