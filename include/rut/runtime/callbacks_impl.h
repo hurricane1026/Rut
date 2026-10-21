@@ -4013,6 +4013,20 @@ void handle_jit_outcome(Loop* loop,
                         jit::HandlerFn fn,
                         bool keep_alive,
                         const RouteEntry* selected_route) {
+    // The bounded H1 chunk collector stages the Web payload for local body
+    // readers. Forward replay is deliberately unsupported for this framing
+    // shape until a separate request rewriter exists; fail before any
+    // preflight, upstream connect, or send rather than exposing a header /
+    // successor mixup.
+    if (outcome.kind == JitDispatchOutcome::Kind::Forward && conn.grpc_web_local_chunk_done) {
+        conn.pending_handler_fn = nullptr;
+        conn.resp_status = 400;
+        conn.keep_alive = false;
+        format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
     if (selected_route != nullptr &&
         selected_route->forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection) {
         const RouteConfig* config = conn.request_config;
@@ -4064,19 +4078,6 @@ void handle_jit_outcome(Loop* loop,
     if (conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
         outcome.kind != JitDispatchOutcome::Kind::Forward) {
         loop->close_conn(conn);
-        return;
-    }
-    // The bounded H1 chunk collector stages the Web payload for local body
-    // readers. Forward replay is deliberately unsupported for this framing
-    // shape until a separate request rewriter exists; fail before any upstream
-    // connect or send rather than exposing a header/successor mixup.
-    if (outcome.kind == JitDispatchOutcome::Kind::Forward && conn.grpc_web_local_chunk_done) {
-        conn.pending_handler_fn = nullptr;
-        conn.resp_status = 400;
-        conn.keep_alive = false;
-        format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
-        conn.transition_to_sending(&on_response_sent<Loop>);
-        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
     switch (outcome.kind) {
