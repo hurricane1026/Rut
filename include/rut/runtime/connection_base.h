@@ -12,6 +12,7 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/buffered_send_vector.h"
 #include "rut/runtime/chunked_parser.h"
+#include "rut/runtime/grpc_web.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/listener_context.h"
@@ -1596,6 +1597,18 @@ struct ConnectionBase {
     BodyMode req_body_mode;
     u32 req_body_remaining;          // bytes left for request body (Content-Length)
     ChunkedParser req_chunk_parser;  // for chunked request body end detection
+    // Bounded local gRPC-Web chunked collector. Body bytes are staged in the
+    // request arena while recv_buf is compacted back to the header boundary.
+    u8 grpc_web_local_chunk_mode;
+    bool grpc_web_local_chunk_active;
+    bool grpc_web_local_chunk_done;
+    u8* grpc_web_local_chunk_payload;
+    u32 grpc_web_local_chunk_payload_len;
+    u32 grpc_web_local_chunk_framing_len;
+    ChunkedParser grpc_web_local_chunk_parser;
+    GrpcWebBase64Decoder grpc_web_local_chunk_decoder;
+    u8* grpc_web_local_chunk_native;
+    u32 grpc_web_local_chunk_native_len;
     // True once any request-body byte has started streaming upstream (recv_buf is
     // reset + refilled with body chunks, so the original headers+body are gone).
     // Once set, the request can no longer be replayed from recv_buf, so the
@@ -2112,6 +2125,16 @@ struct ConnectionBase {
         req_body_mode = BodyMode::None;
         req_body_remaining = 0;
         req_chunk_parser.reset();
+        grpc_web_local_chunk_mode = 0;
+        grpc_web_local_chunk_active = false;
+        grpc_web_local_chunk_done = false;
+        grpc_web_local_chunk_payload = nullptr;
+        grpc_web_local_chunk_payload_len = 0;
+        grpc_web_local_chunk_framing_len = 0;
+        grpc_web_local_chunk_parser.reset();
+        grpc_web_local_chunk_decoder.init();
+        grpc_web_local_chunk_native = nullptr;
+        grpc_web_local_chunk_native_len = 0;
         req_body_streamed = false;
         clear_response_accounting();
         recv_armed = false;

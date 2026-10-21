@@ -4,7 +4,10 @@
 
 namespace rut {
 struct CacheLocalState;
+namespace jit {
+struct HandlerCtx;
 }
+}  // namespace rut
 
 // Runtime helper functions callable from JIT'd code.
 // All use extern "C" linkage with rut_helper_ prefix to avoid
@@ -40,6 +43,11 @@ void rut_helper_req_body(const rut::u8* req_data,
                          rut::u32 req_len,
                          const char** out_ptr,
                          rut::u32* out_len);
+void rut_helper_req_body_ctx(const rut::u8* req_data,
+                             rut::u32 req_len,
+                             rut::jit::HandlerCtx* ctx,
+                             const char** out_ptr,
+                             rut::u32* out_len);
 
 // Extract the HTTP version token from the request line as "HTTP/1.0",
 // "HTTP/1.1", or an empty string when parsing fails.

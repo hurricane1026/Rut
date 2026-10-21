@@ -242,6 +242,41 @@ struct GrpcWebBase64Encoder {
     }
 };
 
+inline bool grpc_web_validate_native_unary_request(const u8* input, u32 length) {
+    if (!input || length < 5 || input[0] != 0) return false;
+    const u32 payload = (static_cast<u32>(input[1]) << 24) | (static_cast<u32>(input[2]) << 16) |
+                        (static_cast<u32>(input[3]) << 8) | input[4];
+    return payload <= 8192 && payload == length - 5;
+}
+
+inline bool grpc_web_normalize_unary_request(GrpcWebContentType mode,
+                                             const u8* input,
+                                             u32 input_len,
+                                             u8* output,
+                                             u32 output_cap,
+                                             u32* output_len) {
+    if (!output_len || !output || output_cap < 5 || (input_len != 0 && input == nullptr) ||
+        (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text))
+        return false;
+    u32 length = 0;
+    if (mode == GrpcWebContentType::Binary) {
+        if (input_len > output_cap) return false;
+        if (input_len != 0) __builtin_memcpy(output, input, input_len);
+        length = input_len;
+    } else {
+        GrpcWebBase64Decoder decoder;
+        decoder.init();
+        u32 consumed = 0;
+        if (decoder.feed(input, input_len, consumed, output, output_cap, length) !=
+                GrpcWebCodecStatus::Ok ||
+            consumed != input_len || decoder.finish() != GrpcWebCodecStatus::Ok)
+            return false;
+    }
+    if (!grpc_web_validate_native_unary_request(output, length)) return false;
+    *output_len = length;
+    return true;
+}
+
 struct GrpcWebTrailer {
     Str name;
     Str value;

@@ -36,6 +36,15 @@
 namespace rut {
 inline void release_completed_jit_json(Connection& conn) {
     conn.json_arena.destroy();
+    conn.grpc_web_local_chunk_mode = 0;
+    conn.grpc_web_local_chunk_active = false;
+    conn.grpc_web_local_chunk_done = false;
+    conn.grpc_web_local_chunk_payload = nullptr;
+    conn.grpc_web_local_chunk_payload_len = 0;
+    conn.grpc_web_local_chunk_framing_len = 0;
+    conn.grpc_web_local_chunk_parser.reset();
+    conn.grpc_web_local_chunk_native = nullptr;
+    conn.grpc_web_local_chunk_native_len = 0;
     conn.jit_response_body = {};
     conn.jit_response_body_valid = false;
 }
@@ -2423,6 +2432,119 @@ inline bool http1_raw_header_has_transfer_encoding(const u8* data, u32 header_en
     return false;
 }
 
+inline bool prepare_local_grpc_web_request_body(Connection& conn,
+                                                const u8* request,
+                                                u32 request_len,
+                                                jit::HandlerCtx* ctx);
+
+inline bool collect_local_grpc_web_chunked_body(Connection& conn) {
+    if (!conn.grpc_web_local_chunk_active || conn.recv_buf.len() < conn.req_header_end)
+        return false;
+    const u32 available = conn.recv_buf.len() - conn.req_header_end;
+    u32 pos = 0;
+    while (pos < available &&
+           conn.grpc_web_local_chunk_parser.state != ChunkedParser::State::Complete) {
+        u32 consumed = 0, out_start = 0, out_len = 0;
+        const ChunkStatus status =
+            conn.grpc_web_local_chunk_parser.feed(conn.recv_buf.data() + conn.req_header_end + pos,
+                                                  available - pos,
+                                                  &consumed,
+                                                  &out_start,
+                                                  &out_len);
+        if (status == ChunkStatus::Error || consumed == 0) return false;
+        if (out_len > 0) {
+            const u8* chunk = conn.recv_buf.data() + conn.req_header_end + pos + out_start;
+            if (conn.grpc_web_local_chunk_mode == static_cast<u8>(GrpcWebContentType::Text)) {
+                u32 consumed_b64 = 0, written_native = 0;
+                if (conn.grpc_web_local_chunk_decoder.feed(
+                        chunk,
+                        out_len,
+                        consumed_b64,
+                        conn.grpc_web_local_chunk_native + conn.grpc_web_local_chunk_native_len,
+                        8197u - conn.grpc_web_local_chunk_native_len,
+                        written_native) != GrpcWebCodecStatus::Ok ||
+                    consumed_b64 != out_len)
+                    return false;
+                conn.grpc_web_local_chunk_native_len += written_native;
+            } else {
+                if (out_len > 8197u - conn.grpc_web_local_chunk_payload_len) return false;
+                for (u32 i = 0; i < out_len; i++)
+                    conn.grpc_web_local_chunk_payload[conn.grpc_web_local_chunk_payload_len + i] =
+                        chunk[i];
+                conn.grpc_web_local_chunk_payload_len += out_len;
+            }
+        }
+        pos += consumed;
+        conn.grpc_web_local_chunk_framing_len += consumed;
+        if (conn.grpc_web_local_chunk_framing_len > 32768u) return false;
+        if (status == ChunkStatus::Done) break;
+    }
+    if (pos != 0) {
+        const u32 suffix = available - pos;
+        u8* recv_data = const_cast<u8*>(conn.recv_buf.data());
+        for (u32 i = 0; i < suffix; i++)
+            recv_data[conn.req_header_end + i] = recv_data[conn.req_header_end + pos + i];
+        conn.recv_buf.set_len(conn.req_header_end + suffix);
+        conn.downstream_req_size += pos;
+        conn.req_size += pos;
+    }
+    if (conn.grpc_web_local_chunk_parser.state == ChunkedParser::State::Complete) {
+        if (conn.grpc_web_local_chunk_mode == static_cast<u8>(GrpcWebContentType::Text)) {
+            if (conn.grpc_web_local_chunk_decoder.finish() != GrpcWebCodecStatus::Ok ||
+                !grpc_web_validate_native_unary_request(conn.grpc_web_local_chunk_native,
+                                                        conn.grpc_web_local_chunk_native_len))
+                return false;
+        } else if (!grpc_web_validate_native_unary_request(conn.grpc_web_local_chunk_payload,
+                                                           conn.grpc_web_local_chunk_payload_len))
+            return false;
+        conn.grpc_web_local_chunk_done = true;
+        conn.grpc_web_local_chunk_active = false;
+    }
+    return true;
+}
+
+inline bool start_local_grpc_web_chunked_body(Connection& conn) {
+    HttpParser parser;
+    ParsedRequest parsed;
+    parser.reset();
+    parsed.reset();
+    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &parsed) != ParseStatus::Complete)
+        return false;
+    bool ambiguous = false;
+    const GrpcWebContentType mode = grpc_request_mode(parsed, &ambiguous);
+    bool candidate = false;
+    for (u32 i = 0; i < parsed.header_count; i++)
+        if (http_header_name_eq_ci(
+                parsed.headers[i].name.ptr, parsed.headers[i].name.len, "content-type", 12))
+            candidate |= grpc_web_content_type_candidate(parsed.headers[i].value);
+    if (!candidate) return false;
+    if (ambiguous || (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text))
+        return false;
+    // Chunked local collection owns the complete request boundary and does not
+    // extend the ordinary HTTP/1 keep-alive/pipeline contract.
+    conn.keep_alive = false;
+    if (conn.json_arena.current == nullptr && (conn.json_arena.backend.pool == nullptr ||
+                                               !conn.json_arena.init(conn.json_arena.backend.pool)))
+        return false;
+    conn.grpc_web_local_chunk_mode = static_cast<u8>(mode);
+    conn.grpc_web_local_chunk_payload = mode == GrpcWebContentType::Binary
+                                            ? static_cast<u8*>(conn.json_arena.alloc(8197))
+                                            : nullptr;
+    conn.grpc_web_local_chunk_native =
+        mode == GrpcWebContentType::Text ? static_cast<u8*>(conn.json_arena.alloc(8197)) : nullptr;
+    if ((mode == GrpcWebContentType::Binary && !conn.grpc_web_local_chunk_payload) ||
+        (mode == GrpcWebContentType::Text && !conn.grpc_web_local_chunk_native))
+        return false;
+    conn.grpc_web_local_chunk_payload_len = 0;
+    conn.grpc_web_local_chunk_framing_len = 0;
+    conn.grpc_web_local_chunk_parser.reset();
+    conn.grpc_web_local_chunk_decoder.init();
+    conn.grpc_web_local_chunk_native_len = 0;
+    conn.grpc_web_local_chunk_active = true;
+    conn.grpc_web_local_chunk_done = false;
+    return collect_local_grpc_web_chunked_body(conn);
+}
+
 template <typename Loop>
 void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -3036,16 +3158,20 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     } else if (route && route->action == RouteAction::JitHandler && route->fn) {
         if (route->needs_req_body) {
             if (conn.req_body_mode == BodyMode::Chunked) {
-                conn.resp_status = 400;
-                format_static_response(conn,
-                                       400,
-                                       /*keep_alive=*/false,
-                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head),
-                                       ordinary_local_response_version(conn));
-                conn.keep_alive = false;
-                conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
-                return;
+                if (!start_local_grpc_web_chunked_body(conn)) {
+                    conn.resp_status = 400;
+                    conn.keep_alive = false;
+                    format_static_response(
+                        conn, 400, false, false, ordinary_local_response_version(conn));
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                if (!conn.grpc_web_local_chunk_done) {
+                    conn.transition_to_reading_body(&on_jit_request_body_recvd<Loop>);
+                    if (!loop->submit_recv(conn)) loop->close_conn(conn);
+                    return;
+                }
             }
             if (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) {
                 conn.transition_to_reading_body(&on_jit_request_body_recvd<Loop>);
@@ -3061,6 +3187,15 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         ctx->resume_event_result = 0;
         ctx->route_param_count = route_param_count;
         for (u32 i = 0; i < route_param_count; i++) ctx->route_params[i] = route_params[i];
+        if (route->needs_req_body && !prepare_local_grpc_web_request_body(
+                                         conn, conn.recv_buf.data(), conn.recv_buf.len(), ctx)) {
+            conn.resp_status = 400;
+            conn.keep_alive = false;
+            format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
         conn.send_buf.reset();
         const u32 jit_request_len =
             conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
@@ -3095,6 +3230,109 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     }
 }
 
+inline bool prepare_local_grpc_web_request_body(Connection& conn,
+                                                const u8* request,
+                                                u32 request_len,
+                                                jit::HandlerCtx* ctx) {
+    if (conn.grpc_web_local_chunk_done) {
+        if (conn.grpc_web_local_chunk_mode == static_cast<u8>(GrpcWebContentType::Text)) {
+            if (!grpc_web_validate_native_unary_request(conn.grpc_web_local_chunk_native,
+                                                        conn.grpc_web_local_chunk_native_len))
+                return false;
+            ctx->req_body_override_ptr = conn.grpc_web_local_chunk_native;
+            ctx->req_body_override_len = conn.grpc_web_local_chunk_native_len;
+            ctx->req_body_override_valid = 1;
+            return true;
+        }
+        ctx->req_body_override_ptr = conn.grpc_web_local_chunk_payload;
+        ctx->req_body_override_len = conn.grpc_web_local_chunk_payload_len;
+        ctx->req_body_override_valid = 1;
+        return true;
+    }
+    HttpParser parser;
+    ParsedRequest parsed;
+    parser.reset();
+    parsed.reset();
+    if (parser.parse(request, request_len, &parsed) != ParseStatus::Complete) return true;
+    bool ambiguous = false;
+    const GrpcWebContentType mode = grpc_request_mode(parsed, &ambiguous);
+    bool web_candidate = false;
+    for (u32 i = 0; i < parsed.header_count; i++) {
+        if (http_header_name_eq_ci(
+                parsed.headers[i].name.ptr, parsed.headers[i].name.len, "content-type", 12))
+            web_candidate |= grpc_web_content_type_candidate(parsed.headers[i].value);
+    }
+    if (!web_candidate) return true;
+    if (ambiguous || (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text))
+        return false;
+    if ((!parsed.has_content_length && !parsed.chunked) ||
+        (mode == GrpcWebContentType::Binary && parsed.content_length > 8197u) ||
+        (mode == GrpcWebContentType::Text && parsed.content_length > kGrpcWebLocalBodyCap))
+        return false;
+    u32 header_end = 0;
+    for (u32 i = 3; i < request_len; i++) {
+        if (request[i - 3] == '\r' && request[i - 2] == '\n' && request[i - 1] == '\r' &&
+            request[i] == '\n') {
+            header_end = i + 1;
+            break;
+        }
+    }
+    if (header_end == 0) return false;
+    if (conn.json_arena.current == nullptr && (conn.json_arena.backend.pool == nullptr ||
+                                               !conn.json_arena.init(conn.json_arena.backend.pool)))
+        return false;
+    u32 body_len = parsed.content_length;
+    const u8* body = request + header_end;
+    if (parsed.chunked) {
+        ChunkedParser probe;
+        probe.reset();
+        u32 pos = 0;
+        while (pos < request_len - header_end && probe.state != ChunkedParser::State::Complete) {
+            u32 consumed = 0, out_start = 0, out_len = 0;
+            const ChunkStatus status = probe.feed(
+                body + pos, request_len - header_end - pos, &consumed, &out_start, &out_len);
+            if (status == ChunkStatus::Error || consumed == 0) return false;
+            pos += consumed;
+        }
+        if (probe.state != ChunkedParser::State::Complete || pos != request_len - header_end)
+            return false;
+        // grpc-web's normalizer consumes the decoded envelope. Reassemble the
+        // chunk payload into the arena so chunk framing never reaches it.
+        u8* decoded = static_cast<u8*>(conn.json_arena.alloc(8197));
+        if (!decoded) return false;
+        ChunkedParser decode;
+        decode.reset();
+        u32 pos2 = 0, decoded_len = 0;
+        while (pos2 < request_len - header_end) {
+            u32 consumed = 0, out_start = 0, out_len = 0;
+            const ChunkStatus status = decode.feed(
+                body + pos2, request_len - header_end - pos2, &consumed, &out_start, &out_len);
+            if (status == ChunkStatus::Error || consumed == 0) return false;
+            if (out_len > 8197u - decoded_len) return false;
+            if (out_len) {
+                for (u32 i = 0; i < out_len; i++)
+                    decoded[decoded_len + i] = body[pos2 + out_start + i];
+                decoded_len += out_len;
+            }
+            pos2 += consumed;
+            if (status == ChunkStatus::Done) break;
+        }
+        body = decoded;
+        body_len = decoded_len;
+    } else if (parsed.content_length > request_len - header_end) {
+        return false;
+    }
+    u8* normalized = static_cast<u8*>(conn.json_arena.alloc(8197));
+    if (!normalized) return false;
+    u32 normalized_len = 0;
+    if (!grpc_web_normalize_unary_request(mode, body, body_len, normalized, 8197, &normalized_len))
+        return false;
+    ctx->req_body_override_ptr = normalized;
+    ctx->req_body_override_len = normalized_len;
+    ctx->req_body_override_valid = 1;
+    return true;
+}
+
 template <typename Loop>
 void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -3104,12 +3342,33 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    if (conn.req_body_mode != BodyMode::ContentLength || conn.req_body_remaining == 0) {
+    if (conn.req_body_mode == BodyMode::Chunked) {
+        if (!conn.grpc_web_local_chunk_active && !conn.grpc_web_local_chunk_done &&
+            !start_local_grpc_web_chunked_body(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        if (conn.grpc_web_local_chunk_active && !collect_local_grpc_web_chunked_body(conn)) {
+            conn.resp_status = 400;
+            conn.keep_alive = false;
+            format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+        if (!conn.grpc_web_local_chunk_done) {
+            conn.transition_to_reading_body(&on_jit_request_body_recvd<Loop>);
+            if (!loop->submit_recv(conn)) loop->close_conn(conn);
+            return;
+        }
+        conn.req_body_remaining = 0;
+    } else if (conn.req_body_mode != BodyMode::ContentLength || conn.req_body_remaining == 0) {
         loop->close_conn(conn);
         return;
     }
 
     u32 consume = static_cast<u32>(ev.result);
+    if (conn.req_body_mode == BodyMode::Chunked) consume = 0;
     if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
     conn.req_body_remaining -= consume;
     conn.downstream_req_size += consume;
@@ -3146,6 +3405,15 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     ctx->resume_event_result = 0;
     ctx->route_param_count = route_param_count;
     for (u32 i = 0; i < route_param_count; i++) ctx->route_params[i] = route_params[i];
+    if (!prepare_local_grpc_web_request_body(
+            conn, conn.recv_buf.data(), conn.recv_buf.len(), ctx)) {
+        conn.resp_status = 400;
+        conn.keep_alive = false;
+        format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
     conn.send_buf.reset();
     auto outcome = invoke_jit_handler(route->fn,
                                       static_cast<void*>(&conn),
@@ -3796,6 +4064,19 @@ void handle_jit_outcome(Loop* loop,
     if (conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
         outcome.kind != JitDispatchOutcome::Kind::Forward) {
         loop->close_conn(conn);
+        return;
+    }
+    // The bounded H1 chunk collector stages the Web payload for local body
+    // readers. Forward replay is deliberately unsupported for this framing
+    // shape until a separate request rewriter exists; fail before any upstream
+    // connect or send rather than exposing a header/successor mixup.
+    if (outcome.kind == JitDispatchOutcome::Kind::Forward && conn.grpc_web_local_chunk_done) {
+        conn.pending_handler_fn = nullptr;
+        conn.resp_status = 400;
+        conn.keep_alive = false;
+        format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
     switch (outcome.kind) {

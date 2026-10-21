@@ -15,6 +15,7 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/grpc_web.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/protobuf_array.h"
@@ -36,6 +37,29 @@
 using namespace rut;
 using namespace rut::rir;
 using namespace rut::jit;
+
+TEST(jit, grpc_web_unary_normalization) {
+    const u8 framed[] = {0, 0, 0, 0, 3, 'a', 'b', 'c'};
+    u8 out[8197]{};
+    u32 out_len = 0;
+    CHECK(grpc_web_normalize_unary_request(
+        GrpcWebContentType::Binary, framed, sizeof(framed), out, sizeof(out), &out_len));
+    CHECK_EQ(out_len, sizeof(framed));
+    CHECK(__builtin_memcmp(out, framed, sizeof(framed)) == 0);
+    const char text[] = "AAAAAANhYmM=";
+    out_len = 0;
+    CHECK(grpc_web_normalize_unary_request(GrpcWebContentType::Text,
+                                           reinterpret_cast<const u8*>(text),
+                                           sizeof(text) - 1,
+                                           out,
+                                           sizeof(out),
+                                           &out_len));
+    CHECK_EQ(out_len, sizeof(framed));
+    CHECK(__builtin_memcmp(out, framed, sizeof(framed)) == 0);
+    const u8 compressed[] = {1, 0, 0, 0, 0};
+    CHECK(!grpc_web_normalize_unary_request(
+        GrpcWebContentType::Binary, compressed, sizeof(compressed), out, sizeof(out), &out_len));
+}
 
 extern "C" u32 rut_helper_regex_scratch_cache_entry_count_for_test();
 extern "C" u32 rut_helper_regex_scratch_cache_count_for_test();
