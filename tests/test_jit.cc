@@ -18,6 +18,7 @@
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/protobuf_array.h"
+#include "rut/runtime/protobuf_struct_array.h"
 #include "rut/runtime/protobuf_value.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
@@ -22878,6 +22879,89 @@ TEST(jit, protobuf_repeated_message_tree_with_scalar_arrays) {
     pool.destroy();
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit, protobuf_struct_array_helper_rejects_unknown_operation_bits) {
+    const u32 words[] = {4, 4, 1, 1, 5, 0, 0};
+    u8 schema[sizeof(words)];
+    for (u32 i = 0; i < sizeof(words); ++i)
+        schema[i] = static_cast<u8>(words[i / 4] >> (8 * (i % 4)));
+    const u64 valid = protobuf::kStructArray | protobuf::kRepeated | (u64{0x1fffffff} << 8) | 11;
+    u8 has = 0;
+    const char* data = nullptr;
+    u32 length = 0;
+    i64 number = 0;
+    rut_helper_protobuf(nullptr,
+                        nullptr,
+                        valid,
+                        "",
+                        0,
+                        nullptr,
+                        0,
+                        reinterpret_cast<const char*>(schema),
+                        sizeof(schema),
+                        0,
+                        &has,
+                        &data,
+                        &length,
+                        &number);
+    CHECK_EQ(has, 1u);
+    CHECK(data != nullptr);
+    CHECK_EQ(length, 0u);
+    rut_helper_protobuf(nullptr,
+                        nullptr,
+                        valid | protobuf::kEncode,
+                        "",
+                        0,
+                        "",
+                        0,
+                        reinterpret_cast<const char*>(schema),
+                        sizeof(schema),
+                        0,
+                        &has,
+                        &data,
+                        &length,
+                        &number);
+    CHECK_EQ(has, 1u);
+    CHECK(data != nullptr);
+    CHECK_EQ(length, 0u);
+    for (u32 bit = 40; bit <= 59; ++bit) {
+        const u64 invalid = valid | (u64{1} << bit);
+        rut_helper_protobuf(nullptr,
+                            nullptr,
+                            invalid,
+                            "",
+                            0,
+                            nullptr,
+                            0,
+                            reinterpret_cast<const char*>(schema),
+                            sizeof(schema),
+                            0,
+                            &has,
+                            &data,
+                            &length,
+                            &number);
+        CHECK_EQ(has, 0u);
+        CHECK(data == nullptr);
+        CHECK_EQ(length, 0u);
+        rut_helper_protobuf(nullptr,
+                            nullptr,
+                            invalid | protobuf::kEncode,
+                            "",
+                            0,
+                            "",
+                            0,
+                            reinterpret_cast<const char*>(schema),
+                            sizeof(schema),
+                            0,
+                            &has,
+                            &data,
+                            &length,
+                            &number);
+        CHECK_EQ(has, 0u);
+        CHECK(data == nullptr);
+        CHECK_EQ(length, 0u);
+    }
 }
 
 TEST(jit, protobuf_array_helper_shared_budget_and_failure) {

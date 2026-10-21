@@ -544,3 +544,39 @@ TEST(protobuf_array, enum_truncated_varints_limits_and_output_capacity) {
     CHECK_EQ(values[1], 0);
     CHECK_EQ(values[2], 12345);
 }
+
+TEST(protobuf_array, rejects_unknown_operation_bits_before_narrowing_tag) {
+    const u64 kOp = kRepeated | (u64{1} << 8) | 5;
+    const u8 kInput[] = {8, 7};
+    const i32 kValue = 7;
+    // Every bit above the 29-bit field number and below the public array flags
+    // is invalid, including kExplicitPresence and kStructArray.
+    for (u32 bit = 37; bit < 62; ++bit) {
+        const u64 kInvalid = kOp | (u64{1} << bit);
+        ArrayPlan plan{17, 19};
+        CHECK_FALSE(plan_array(kInvalid, view(kInput, sizeof(kInput)), plan));
+        CHECK_EQ(plan.count, 17u);
+        CHECK_EQ(plan.bytes, 19u);
+        i32 slot = 123;
+        CHECK_FALSE(fill_array(
+            kInvalid, view(kInput, sizeof(kInput)), reinterpret_cast<u8*>(&slot), nullptr, {1, 0}));
+        CHECK_EQ(slot, 123);
+        u8 output[8] = {99};
+        Str result = lit_str("unchanged");
+        CHECK_FALSE(encode_array(kInvalid | kEncode,
+                                 lit_str(""),
+                                 reinterpret_cast<const u8*>(&kValue),
+                                 1,
+                                 output,
+                                 sizeof(output),
+                                 result));
+        CHECK_EQ(output[0], 99u);
+        CHECK(result.eq(lit_str("unchanged")));
+    }
+    ArrayPlan valid{};
+    REQUIRE(plan_array(kOp, view(kInput, sizeof(kInput)), valid));
+    CHECK_EQ(valid.count, 1u);
+    // The highest legal field number must remain accepted.
+    REQUIRE(plan_array(kRepeated | (u64{0x1fffffff} << 8) | 5, lit_str(""), valid));
+    CHECK_EQ(valid.count, 0u);
+}
