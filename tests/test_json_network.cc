@@ -289,6 +289,67 @@ TEST(json_network, dynamic_grpc_web_head_fallback_preserves_version_and_suppress
     pool.destroy();
 }
 
+TEST(json_network, static_grpc_web_rejection_preserves_http10_error_framing) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->json_arena.backend.pool = &pool;
+
+    // The declared payload length is two bytes, but only one payload byte is
+    // present. This reaches the configured static gRPC-Web conversion path and
+    // must use the ordinary local 500 formatter after rejecting the frame.
+    const u8 malformed[] = {0, 0, 0, 0, 2, 'x'};
+    RouteConfig cfg;
+    const u16 body_idx =
+        cfg.add_response_body_view(reinterpret_cast<const char*>(malformed), sizeof(malformed));
+    REQUIRE(body_idx != 0);
+    const char* keys[] = {"content-type", "grpc-status"};
+    const u32 key_lens[] = {12, 11};
+    const char* values[] = {"application/grpc-web", "0"};
+    const u32 value_lens[] = {20, 1};
+    const u16 headers_idx = cfg.add_response_header_set(keys, key_lens, values, value_lens, 2);
+    REQUIRE(headers_idx != 0);
+
+    const char* methods[] = {"GET", "HEAD"};
+    for (const char* method : methods) {
+        const std::string request =
+            std::string(method) + " /grpc-web HTTP/1.0\r\nHost: test\r\n\r\n";
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = &cfg;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_body_idx = body_idx;
+        outcome.response_headers_idx = headers_idx;
+        handle_jit_outcome(&loop, *conn, outcome, nullptr, true);
+
+        const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+        CHECK(response.starts_with("HTTP/1.0 500 Internal Server Error\r\n"));
+        const size_t body_start = response.find("\r\n\r\n");
+        REQUIRE(body_start != std::string::npos);
+        CHECK(response.find("Content-Length: 21\r\n") != std::string::npos);
+        CHECK(response.find("Connection: close\r\n") != std::string::npos);
+        if (method[0] == 'H') {
+            CHECK_EQ(response.size(), body_start + 4);
+        } else {
+            CHECK(response.ends_with("Internal Server Error"));
+        }
+        CHECK_EQ(conn->resp_status, 500u);
+        CHECK_FALSE(conn->keep_alive);
+    }
+    loop.free_conn(*conn);
+    pool.destroy();
+}
+
 TEST(json_network, http2_response_owns_body_before_next_handler) {
     JsonProgram program;
     REQUIRE(program.init());

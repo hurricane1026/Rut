@@ -4011,7 +4011,8 @@ void handle_jit_outcome(Loop* loop,
                 if (!response_formatted) {
                     conn.resp_status = 500;
                     conn.keep_alive = false;
-                    format_static_response(conn, 500, false, is_head);
+                    format_static_response(
+                        conn, 500, false, is_head, ordinary_local_response_version(conn));
                     release_completed_jit_json(conn);
                     conn.transition_to_sending(&on_response_sent<Loop>);
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
