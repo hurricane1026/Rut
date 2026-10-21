@@ -17,11 +17,18 @@ inline u32 array_element_size(u8 type) {
     if (type == 3 || type == 16 || type == 18 || type == 7 || type == 13) return sizeof(i64);
     return 0;
 }
+// Validate the full operation before narrowing the field number. Otherwise high
+// flags (including singular presence) can disappear during the u32 conversion.
+inline bool valid_array_operation(u64 op) {
+    constexpr u64 kAllowed = kRepeated | kEncode | (u64{0x1fffffff} << 8) | 255;
+    return (op & ~kAllowed) == 0;
+}
 // Two bounded scans: validate/count, then fill caller-provided contiguous slots.
 // The caller keeps the input immutable between scans. String payloads are copied
 // into a separate, exact-sized byte allocation; no slot borrows receive storage.
 template <typename Visit>
 inline bool walk_array(u64 op, Str input, Visit visit) {
+    if (!valid_array_operation(op)) return false;
     const u32 tag = static_cast<u32>((op & ~(kRepeated | kEncode)) >> 8);
     const u8 type = static_cast<u8>(op);
     if (!tag || tag > 0x1fffffff || !array_element_size(type) || input.len > kMaxMessageBytes ||
@@ -85,6 +92,7 @@ inline bool plan_array(u64 op, Str input, ArrayPlan& out) {
     return true;
 }
 inline bool fill_array(u64 op, Str input, u8* slots, u8* payload, const ArrayPlan& plan) {
+    if (!valid_array_operation(op)) return false;
     const u8 type = static_cast<u8>(op);
     const u32 stride = array_element_size(type);
     u32 copied = 0, count = 0;
@@ -117,6 +125,7 @@ inline bool fill_array(u64 op, Str input, u8* slots, u8* payload, const ArrayPla
 }
 inline bool encode_array(
     u64 op, Str prefix, const u8* slots, u32 count, u8* output, u32 capacity, Str& result) {
+    if (!valid_array_operation(op)) return false;
     const u8 type = static_cast<u8>(op);
     const u32 stride = array_element_size(type);
     const u32 tag = static_cast<u32>((op & ~(kRepeated | kEncode)) >> 8);
