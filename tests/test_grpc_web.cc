@@ -247,6 +247,215 @@ TEST(grpc_web, trailer_envelope_is_framed_lowercase_and_bounded) {
     CHECK(memcmp(output + 5, "x-tag: one\r\nx-tag: two\r\n", 24) == 0);
 }
 
+TEST(grpc_web, local_response_encodes_message_and_trailer_once) {
+    const u8 message[] = {0, 0, 0, 0, 1, 'x'};
+    const Str details{"opaque", 6};
+    u8 binary[256]{};
+    u32 binary_len = 0;
+    REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Binary,
+                                           message,
+                                           sizeof(message),
+                                           0,
+                                           Str{"ok", 2},
+                                           details,
+                                           binary,
+                                           sizeof(binary),
+                                           binary_len));
+    CHECK_EQ(binary_len, 78u);
+    CHECK(memcmp(binary, message, sizeof(message)) == 0);
+
+    u8 text[256]{};
+    u32 text_len = 0;
+    REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Text,
+                                           message,
+                                           sizeof(message),
+                                           0,
+                                           Str{"ok", 2},
+                                           details,
+                                           text,
+                                           sizeof(text),
+                                           text_len));
+    GrpcWebBase64Decoder decoder{};
+    decoder.init();
+    u8 decoded[256]{};
+    u32 consumed = 0;
+    u32 decoded_len = 0;
+    REQUIRE(decoder.feed(text,
+                         text_len,
+                         consumed,
+                         decoded,
+                         sizeof(decoded),
+                         decoded_len) == GrpcWebCodecStatus::Ok);
+    CHECK_EQ(consumed, text_len);
+    REQUIRE(decoder.finish() == GrpcWebCodecStatus::Ok);
+    CHECK_EQ(decoded_len, binary_len);
+    CHECK(memcmp(decoded, binary, binary_len) == 0);
+}
+
+TEST(grpc_web, local_response_enforces_bounds_and_text_modulo_boundaries) {
+    u8 output[16352]{};
+    u32 written = 0;
+    for (u32 payload = 1; payload <= 3; payload++) {
+        u8 frame[8] = {0, 0, 0, 0, static_cast<u8>(payload), 0, 0, 0};
+        for (u32 i = 0; i < payload; i++) frame[5 + i] = static_cast<u8>('a' + i);
+        REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Text,
+                                               frame,
+                                               5 + payload,
+                                               0,
+                                               {},
+                                               {},
+                                               output,
+                                               sizeof(output),
+                                               written));
+        GrpcWebBase64Decoder decoder{};
+        decoder.init();
+        u8 decoded[64]{};
+        u32 consumed = 0, decoded_len = 0;
+        REQUIRE(decoder.feed(output,
+                             written,
+                             consumed,
+                             decoded,
+                             sizeof(decoded),
+                             decoded_len) == GrpcWebCodecStatus::Ok);
+        REQUIRE(decoder.finish() == GrpcWebCodecStatus::Ok);
+        CHECK_EQ(decoded[0], 0u);
+        CHECK(memcmp(decoded, frame, 5 + payload) == 0);
+        CHECK_EQ(decoded[4], payload);
+        u8 expected_trailer[64]{};
+        u32 expected_trailer_len = 0;
+        const GrpcWebTrailer expected_trailers[] = {{{"grpc-status", 11}, {"0", 1}}};
+        REQUIRE(grpc_web_encode_trailer_envelope(expected_trailers,
+                                                 1,
+                                                 expected_trailer,
+                                                 sizeof(expected_trailer),
+                                                 expected_trailer_len));
+        CHECK_EQ(decoded_len, 5 + payload + expected_trailer_len);
+        CHECK(memcmp(decoded + 5 + payload, expected_trailer, expected_trailer_len) == 0);
+    }
+
+    // An empty native body is represented by a trailer-only grpc-web frame.
+    REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Text,
+                                           nullptr,
+                                           0,
+                                           0,
+                                           {},
+                                           {},
+                                           output,
+                                           sizeof(output),
+                                           written));
+    GrpcWebBase64Decoder empty_decoder{};
+    empty_decoder.init();
+    u8 empty_decoded[64]{};
+    u32 empty_consumed = 0, empty_len = 0;
+    REQUIRE(empty_decoder.feed(output,
+                               written,
+                               empty_consumed,
+                               empty_decoded,
+                               sizeof(empty_decoded),
+                               empty_len) == GrpcWebCodecStatus::Ok);
+    REQUIRE(empty_decoder.finish() == GrpcWebCodecStatus::Ok);
+    CHECK_EQ(empty_consumed, written);
+    CHECK_EQ(empty_decoded[0], 0x80u);
+
+    u8 maximum[8197]{};
+    maximum[0] = 0;
+    maximum[1] = 0;
+    maximum[2] = 0;
+    maximum[3] = 0x20;
+    maximum[4] = 0;
+    for (u32 i = 5; i < sizeof(maximum); i++) maximum[i] = 'x';
+    char message[1024];
+    char details[1024];
+    for (u32 i = 0; i < sizeof(message); i++) message[i] = 'm';
+    for (u32 i = 0; i < sizeof(details); i++) details[i] = 'd';
+    REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Text,
+                                           maximum,
+                                           sizeof(maximum),
+                                           16,
+                                           {message, sizeof(message)},
+                                           {details, sizeof(details)},
+                                           output,
+                                           sizeof(output),
+                                           written));
+    CHECK(written < sizeof(output));
+    GrpcWebBase64Decoder maximum_decoder{};
+    maximum_decoder.init();
+    u8 maximum_decoded[12288]{};
+    u32 maximum_consumed = 0, maximum_len = 0;
+    REQUIRE(maximum_decoder.feed(output,
+                                 written,
+                                 maximum_consumed,
+                                 maximum_decoded,
+                                 sizeof(maximum_decoded),
+                                 maximum_len) == GrpcWebCodecStatus::Ok);
+    REQUIRE(maximum_decoder.finish() == GrpcWebCodecStatus::Ok);
+    CHECK_EQ(maximum_consumed, written);
+    GrpcWebTrailer maximum_trailers[] = {{{"grpc-status", 11}, {"16", 2}},
+                                         {{"grpc-message", 12}, {message, sizeof(message)}},
+                                         {{"grpc-status-details-bin", 23},
+                                          {details, sizeof(details)}}};
+    u8 expected_maximum_trailer[8192]{};
+    u32 expected_maximum_trailer_len = 0;
+    REQUIRE(grpc_web_encode_trailer_envelope(maximum_trailers,
+                                             3,
+                                             expected_maximum_trailer,
+                                             sizeof(expected_maximum_trailer),
+                                             expected_maximum_trailer_len));
+    CHECK_EQ(maximum_len, sizeof(maximum) + expected_maximum_trailer_len);
+    CHECK_EQ(written, 4u * ((maximum_len + 2u) / 3u));
+    CHECK(memcmp(maximum_decoded, maximum, sizeof(maximum)) == 0);
+    CHECK(memcmp(maximum_decoded + sizeof(maximum),
+                 expected_maximum_trailer,
+                 expected_maximum_trailer_len) == 0);
+    CHECK(!grpc_web_encode_local_response(GrpcWebContentType::Text,
+                                          maximum,
+                                          sizeof(maximum),
+                                          16,
+                                          {message, sizeof(message)},
+                                          {details, sizeof(details)},
+                                          output,
+                                          written - 1,
+                                          written));
+    CHECK(!grpc_web_encode_local_response(GrpcWebContentType::Binary,
+                                          maximum,
+                                          sizeof(maximum),
+                                          0,
+                                          {},
+                                          {},
+                                          output,
+                                          16,
+                                          written));
+    u8 compressed[] = {1, 0, 0, 0, 0};
+    CHECK(!grpc_web_encode_local_response(GrpcWebContentType::Binary,
+                                          compressed,
+                                          sizeof(compressed),
+                                          0,
+                                          {},
+                                          {},
+                                          output,
+                                          sizeof(output),
+                                          written));
+    u8 mismatch[] = {0, 0, 0, 0, 2, 'x'};
+    CHECK(!grpc_web_encode_local_response(GrpcWebContentType::Binary,
+                                          mismatch,
+                                          sizeof(mismatch),
+                                          0,
+                                          {},
+                                          {},
+                                          output,
+                                          sizeof(output),
+                                          written));
+    CHECK(!grpc_web_encode_local_response(GrpcWebContentType::Binary,
+                                          nullptr,
+                                          0,
+                                          17,
+                                          {},
+                                          {},
+                                          output,
+                                          sizeof(output),
+                                          written));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

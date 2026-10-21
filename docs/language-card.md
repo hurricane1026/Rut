@@ -1170,6 +1170,19 @@ kTLS integration also remain unimplemented. See [ebpf.md](ebpf.md).
 
 ### Local unary gRPC responses over HTTP/2
 
+Local responses may opt into grpc-web by using exactly one
+`application/grpc-web`/`application/grpc-web-text` content type, optionally
+with `+proto`. The handler body contract is one native uncompressed gRPC frame
+with at most an 8 KiB payload, or empty for trailers-only; request bodies are
+not automatically decoded by this response adapter. HTTP status is 200 and
+`grpc-status` is canonical 0–16, with at most one 1,024-byte
+`grpc-message` and `grpc-status-details-bin`. The runtime emits the message
+and one 0x80 trailer frame in the body, continuously base64-encoding both in
+text mode, and removes grpc trailer fields from initial headers. Details are
+opaque encoded metadata and are preserved without decoding, subject to the
+existing trailer metadata validation. Invalid, duplicate, oversized, non-200,
+or HEAD responses fail with HTTP 500 before publication.
+
 A local handler can return `response(200, headers: {"content-type":
 "application/grpc+proto", "grpc-status": "0"}, body: framed)` after composing
 `grpc.decode` and `grpc.encode` (or the low-level envelope and protobuf helpers). For these explicitly
