@@ -9062,16 +9062,37 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             Client web_client;
             CHECK(web_client.init(get_port(lfd)));
             auto local_web = [&](u32 index, bool text, const char* path, bool empty) {
-                const int sid =
-                    text ? web_client.request_native_raw(index,
-                                                         framed,
-                                                         sizeof(framed),
-                                                         "1H",
-                                                         nullptr,
-                                                         path,
-                                                         "application/grpc+proto")
-                         : web_client.request_web(
-                               index, framed, sizeof(framed), false, 1, true, "1H", path);
+                u8 request_text[256]{};
+                u32 request_text_len = 0;
+                if (text) {
+                    GrpcWebBase64Encoder encoder{};
+                    encoder.init();
+                    u32 consumed = 0;
+                    u32 prefix_len = 0;
+                    CHECK_EQ(encoder.feed(framed,
+                                           sizeof(framed),
+                                           consumed,
+                                           request_text,
+                                           sizeof(request_text),
+                                           prefix_len),
+                             GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(consumed, sizeof(framed));
+                    u32 suffix_len = 0;
+                    CHECK_EQ(encoder.flush(request_text + prefix_len,
+                                           sizeof(request_text) - prefix_len,
+                                           suffix_len),
+                             GrpcWebCodecStatus::Ok);
+                    request_text_len = prefix_len + suffix_len;
+                }
+                const int sid = web_client.request_web(
+                    index,
+                    text ? request_text : framed,
+                    text ? request_text_len : static_cast<u32>(sizeof(framed)),
+                    text,
+                    1,
+                    true,
+                    "1H",
+                    path);
                 CHECK(sid > 0);
                 CHECK(web_client.until(index, true));
                 const auto& rpc = web_client.rpcs[index];
@@ -9302,11 +9323,35 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         REQUIRE(fd >= 0);
         timeval timeout{5, 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        u8 request_body[128]{};
+        u32 request_body_len = sizeof(h1_framed);
+        if (text) {
+            GrpcWebBase64Encoder encoder{};
+            encoder.init();
+            u32 consumed = 0, written = 0;
+            REQUIRE(encoder.feed(h1_framed,
+                                 sizeof(h1_framed),
+                                 consumed,
+                                 request_body,
+                                 sizeof(request_body),
+                                 written) == GrpcWebCodecStatus::Ok);
+            REQUIRE_EQ(consumed, sizeof(h1_framed));
+            const u32 encoded_prefix_len = written;
+            u32 flushed = 0;
+            REQUIRE(encoder.flush(request_body + encoded_prefix_len,
+                                  sizeof(request_body) - encoded_prefix_len,
+                                  flushed) ==
+                    GrpcWebCodecStatus::Ok);
+            request_body_len = encoded_prefix_len + flushed;
+        } else {
+            memcpy(request_body, h1_framed, sizeof(h1_framed));
+        }
+        const char* request_type = text ? "application/grpc-web-text" : "application/grpc-web";
         std::string request = std::string("POST ") + path +
-                              " HTTP/1.1\r\nHost: localhost\r\nContent-Type: "
-                              "application/grpc+proto\r\nContent-Length: " +
-                              std::to_string(sizeof(h1_framed)) + "\r\nConnection: close\r\n\r\n";
-        request.append(reinterpret_cast<const char*>(h1_framed), sizeof(h1_framed));
+                              " HTTP/1.1\r\nHost: localhost\r\nContent-Type: " + request_type +
+                              "\r\nContent-Length: " + std::to_string(request_body_len) +
+                              "\r\nConnection: close\r\n\r\n";
+        request.append(reinterpret_cast<const char*>(request_body), request_body_len);
         REQUIRE(send_all(fd, request.data(), request.size()));
         u8 wire[32768]{};
         u32 wire_len = 0;
