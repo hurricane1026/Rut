@@ -5,6 +5,7 @@
 namespace rut {
 
 enum class GrpcWebContentType : u8 { Other, Native, Binary, Text };
+constexpr u32 kGrpcWebLocalBodyCap = 16352;  // 16 KiB SliceArena slice minus its header.
 
 inline bool grpc_web_token_equal(Str value, Str token) {
     if (value.len != token.len) return false;
@@ -245,6 +246,84 @@ struct GrpcWebTrailer {
     Str name;
     Str value;
 };
+
+inline bool grpc_web_encode_trailer_envelope(
+    const GrpcWebTrailer* trailers, u32 count, u8* output, u32 capacity, u32& written);
+
+// Encode the complete body for a local unary response. The input message is
+// already one native, uncompressed gRPC frame (or empty); the output owns both
+// that frame and the terminal 0x80 trailer frame. Text mode feeds both frames
+// through one encoder so padding is emitted only once at the end.
+inline bool grpc_web_encode_local_response(GrpcWebContentType mode,
+                                           const u8* message,
+                                           u32 message_len,
+                                           u8 status,
+                                           Str grpc_message,
+                                           Str grpc_details,
+                                           u8* output,
+                                           u32 capacity,
+                                           u32& written) {
+    written = 0;
+    if ((message_len && !message) || !output || status > 16) return false;
+    if (message_len) {
+        if (message_len < 5 || message[0] != 0) return false;
+        u32 payload = 0;
+        for (u32 i = 1; i < 5; i++) payload = (payload << 8) | message[i];
+        if (payload != message_len - 5 || payload > 8192) return false;
+    }
+    char status_digits[2] = {static_cast<char>('0' + status / 10),
+                             static_cast<char>('0' + status % 10)};
+    const Str status_value = status >= 10 ? Str{status_digits, 2} : Str{status_digits + 1, 1};
+    GrpcWebTrailer trailers[3] = {{{"grpc-status", 11}, status_value},
+                                  {{"grpc-message", 12}, grpc_message},
+                                  {{"grpc-status-details-bin", 23}, grpc_details}};
+    u32 trailer_count = 1;
+    if (grpc_message.ptr != nullptr) trailers[trailer_count++] = trailers[1];
+    if (grpc_details.ptr != nullptr) trailers[trailer_count++] = trailers[2];
+
+    if (mode == GrpcWebContentType::Binary) {
+        if (message_len > capacity) return false;
+        if (message_len) __builtin_memcpy(output, message, message_len);
+        u32 trailer_len = 0;
+        if (!grpc_web_encode_trailer_envelope(
+                trailers, trailer_count, output + message_len, capacity - message_len, trailer_len))
+            return false;
+        written = message_len + trailer_len;
+        return true;
+    }
+    if (mode != GrpcWebContentType::Text) return false;
+    GrpcWebBase64Encoder encoder;
+    encoder.init();
+    u32 consumed = 0;
+    u32 n = 0;
+    auto feed = [&](const u8* bytes, u32 len) {
+        while (consumed < len) {
+            u32 used = 0;
+            u32 produced = 0;
+            const auto st = encoder.feed(bytes + consumed,
+                                         len - consumed,
+                                         used,
+                                         output + written,
+                                         capacity - written,
+                                         produced);
+            consumed += used;
+            written += produced;
+            if (st != GrpcWebCodecStatus::Ok) return false;
+        }
+        return true;
+    };
+    if (!feed(message, message_len)) return false;
+    u8 trailer[4096];
+    if (!grpc_web_encode_trailer_envelope(trailers, trailer_count, trailer, sizeof(trailer), n))
+        return false;
+    consumed = 0;
+    if (!feed(trailer, n)) return false;
+    u32 flushed = 0;
+    if (encoder.flush(output + written, capacity - written, flushed) != GrpcWebCodecStatus::Ok)
+        return false;
+    written += flushed;
+    return true;
+}
 
 inline bool grpc_web_metadata_name_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '!' ||

@@ -8175,6 +8175,21 @@ transcoding and local gRPC status/trailer generation remain separate work.
 
 ### Local unary response completion
 
+An explicit local response with `application/grpc-web` or
+`application/grpc-web-text` (optionally `+proto`) uses the same bounded unary
+contract over HTTP/1.1 and HTTP/2. The handler supplies one native,
+uncompressed gRPC envelope with at most an 8 KiB payload, or an empty body for
+trailers-only. HTTP status must be 200, exactly one grpc-web content type and
+canonical `grpc-status` (0–16) are required, and at most one 1,024-byte
+`grpc-message` and `grpc-status-details-bin` value may be present. The runtime
+removes those fields from initial headers, emits one 0x80 trailer frame after
+the message, and canonicalizes the content type. Text mode base64-encodes the
+message and trailer frames continuously with one final padding operation.
+Details values are treated as opaque encoded metadata and must satisfy the
+existing trailer metadata byte validation; they are not decoded or rewritten.
+Malformed, duplicate, over-limit, non-200, and HEAD responses fail closed with
+HTTP 500 before publication.
+
 Explicit local HTTP/2 responses with native gRPC content type and grpc-status
 validate the canonical status and a single uncompressed bounded message before
 staging DATA. The two existing owned-output slots carry an additional numeric

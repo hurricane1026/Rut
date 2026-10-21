@@ -1057,6 +1057,96 @@ struct ResponseHeaderKV {
     const char* value_data;
     u32 value_len;
 };
+
+// Convert an explicit local grpc-web response into its owned wire body and
+// remove grpc trailer metadata from the HTTP header list. The caller allocates
+// `body_out` from the request arena, so the result remains valid until the
+// existing local response formatter has copied it into send_buf.
+inline bool prepare_local_grpc_web_response(GrpcWebContentType mode,
+                                            const u8* input,
+                                            u32 input_len,
+                                            ResponseHeaderKV* headers,
+                                            u32* header_count,
+                                            u8* body_out,
+                                            u32 body_capacity,
+                                            const char** body_data,
+                                            u32* body_len) {
+    if ((mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text) ||
+        headers == nullptr || header_count == nullptr || body_out == nullptr ||
+        body_data == nullptr || body_len == nullptr)
+        return false;
+    u32 content_types = 0;
+    u32 statuses = 0;
+    u32 messages = 0;
+    u32 details = 0;
+    u8 status = 255;
+    Str message{};
+    Str detail{};
+    for (u32 i = 0; i < *header_count; i++) {
+        const auto& h = headers[i];
+        if (http_header_name_eq_ci(h.key_data, h.key_len, "content-type", 12)) {
+            content_types++;
+            if (grpc_web_content_type({h.value_data, h.value_len}) != mode) return false;
+        } else if (http_header_name_eq_ci(h.key_data, h.key_len, "grpc-status", 11)) {
+            statuses++;
+            if ((h.value_len != 1 && h.value_len != 2) ||
+                (h.value_len == 2 &&
+                 (h.value_data[0] != '1' || h.value_data[1] < '0' || h.value_data[1] > '6')))
+                return false;
+            u32 parsed = 0;
+            for (u32 j = 0; j < h.value_len; j++) {
+                if (h.value_data[j] < '0' || h.value_data[j] > '9') return false;
+                parsed = parsed * 10 + static_cast<u32>(h.value_data[j] - '0');
+            }
+            if (parsed > 16) return false;
+            status = static_cast<u8>(parsed);
+        } else if (http_header_name_eq_ci(h.key_data, h.key_len, "grpc-message", 12)) {
+            messages++;
+            if (messages > 1 || h.value_len > 1024) return false;
+            message = {h.value_data, h.value_len};
+        } else if (http_header_name_eq_ci(h.key_data, h.key_len, "grpc-status-details-bin", 23)) {
+            details++;
+            if (details > 1 || h.value_len > 1024) return false;
+            detail = {h.value_data, h.value_len};
+        }
+    }
+    if (content_types != 1 || statuses != 1 || status > 16) return false;
+    u32 encoded = 0;
+    if (!grpc_web_encode_local_response(mode,
+                                        input,
+                                        input_len,
+                                        status,
+                                        messages ? message : Str{},
+                                        details ? detail : Str{},
+                                        body_out,
+                                        body_capacity,
+                                        encoded))
+        return false;
+    static constexpr char kBinaryType[] = "application/grpc-web";
+    static constexpr char kTextType[] = "application/grpc-web-text";
+    const char* canonical = mode == GrpcWebContentType::Text ? kTextType : kBinaryType;
+    const u32 canonical_len = mode == GrpcWebContentType::Text ? 25 : 20;
+    for (u32 i = 0; i < *header_count;) {
+        const bool trailer =
+            http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "grpc-status", 11) ||
+            http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "grpc-message", 12) ||
+            http_header_name_eq_ci(
+                headers[i].key_data, headers[i].key_len, "grpc-status-details-bin", 23);
+        if (http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "content-type", 12)) {
+            headers[i].value_data = canonical;
+            headers[i].value_len = canonical_len;
+        }
+        if (!trailer) {
+            i++;
+            continue;
+        }
+        for (u32 j = i + 1; j < *header_count; j++) headers[j - 1] = headers[j];
+        --*header_count;
+    }
+    *body_data = reinterpret_cast<const char*>(body_out);
+    *body_len = encoded;
+    return true;
+}
 // `headers_only` omits the successful-response body, for either staged-body
 // ownership or HEAD; `fallback_headers_only` carries HEAD semantics into overflow.
 bool format_response_with_body_and_headers(Connection& conn,
@@ -3727,33 +3817,77 @@ void handle_jit_outcome(Loop* loop,
                 ResponseHeaderKV headers[kMaxHeaders];
                 u32 count = 0;
                 bool suppress_type = false;
-                const bool ok = conn.jit_response_body_valid &&
-                                collect_effective_response_headers(conn,
-                                                                   cfg,
-                                                                   outcome.response_headers_idx,
-                                                                   headers,
-                                                                   kMaxHeaders,
-                                                                   &count,
-                                                                   &suppress_type) &&
-                                format_response_with_body_and_headers(
-                                    conn,
-                                    outcome.status_code,
-                                    conn.jit_response_body.ptr,
-                                    conn.jit_response_body.len,
-                                    headers,
-                                    count,
-                                    effective_keep_alive,
-                                    false,
-                                    suppress_type,
-                                    conn.jit_response_head,
-                                    false,
-                                    conn.req_http_version == static_cast<u8>(HttpVersion::Http10)
-                                        ? HttpVersion::Http10
-                                        : HttpVersion::Http11);
+                const bool collected =
+                    conn.jit_response_body_valid &&
+                    collect_effective_response_headers(conn,
+                                                       cfg,
+                                                       outcome.response_headers_idx,
+                                                       headers,
+                                                       kMaxHeaders,
+                                                       &count,
+                                                       &suppress_type);
+                const char* response_body = conn.jit_response_body.ptr;
+                u32 response_body_len = conn.jit_response_body.len;
+                bool ok = collected;
+                if (ok) {
+                    GrpcWebContentType mode = GrpcWebContentType::Other;
+                    bool web_candidate = false;
+                    for (u32 i = 0; i < count; i++) {
+                        if (!http_header_name_eq_ci(
+                                headers[i].key_data, headers[i].key_len, "Content-Type", 12))
+                            continue;
+                        mode = grpc_web_content_type({headers[i].value_data, headers[i].value_len});
+                        web_candidate |= grpc_web_content_type_candidate(
+                            {headers[i].value_data, headers[i].value_len});
+                    }
+                    if (web_candidate) {
+                        if (outcome.status_code != 200 || conn.jit_response_head) {
+                            ok = false;
+                        } else {
+                            if (conn.json_arena.current == nullptr &&
+                                (conn.json_arena.backend.pool == nullptr ||
+                                 !conn.json_arena.init(conn.json_arena.backend.pool)))
+                                ok = false;
+                            u8* transformed =
+                                static_cast<u8*>(conn.json_arena.alloc(kGrpcWebLocalBodyCap));
+                            ok = transformed != nullptr &&
+                                 prepare_local_grpc_web_response(
+                                     mode,
+                                     reinterpret_cast<const u8*>(response_body),
+                                     response_body_len,
+                                     headers,
+                                     &count,
+                                     transformed,
+                                     kGrpcWebLocalBodyCap,
+                                     &response_body,
+                                     &response_body_len);
+                        }
+                    }
+                }
+                if (ok)
+                    ok = format_response_with_body_and_headers(
+                        conn,
+                        outcome.status_code,
+                        response_body,
+                        response_body_len,
+                        headers,
+                        count,
+                        effective_keep_alive,
+                        false,
+                        suppress_type,
+                        conn.jit_response_head,
+                        false,
+                        conn.req_http_version == static_cast<u8>(HttpVersion::Http10)
+                            ? HttpVersion::Http10
+                            : HttpVersion::Http11);
                 if (!ok) {
                     conn.resp_status = 500;
                     conn.keep_alive = false;
-                    format_static_response(conn, 500, false);
+                    format_static_response(conn,
+                                           500,
+                                           false,
+                                           conn.jit_response_head,
+                                           ordinary_local_response_version(conn));
                 }
                 release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);
@@ -3762,11 +3896,11 @@ void handle_jit_outcome(Loop* loop,
             }
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
-            const bool segmented_body = has_body && outcome.status_code >= 200 &&
-                                        outcome.status_code != 204 && outcome.status_code != 205 &&
-                                        outcome.status_code != 304 &&
-                                        cfg->response_bodies[outcome.response_body_idx - 1].len >
-                                            RouteConfig::kResponseBodyPoolBytes;
+            bool segmented_body = has_body && outcome.status_code >= 200 &&
+                                  outcome.status_code != 204 && outcome.status_code != 205 &&
+                                  outcome.status_code != 304 &&
+                                  cfg->response_bodies[outcome.response_body_idx - 1].len >
+                                      RouteConfig::kResponseBodyPoolBytes;
             bool direct_file_body = false;
             // io_uring can send a sealed memfd after the header completes. Keep
             // the segmented formatter header-only for every large body; this
@@ -3832,6 +3966,57 @@ void handle_jit_outcome(Loop* loop,
                     body_data = reason;
                     body_len = reason_len;
                     body_is_fallback = true;
+                }
+                GrpcWebContentType local_web_mode = GrpcWebContentType::Other;
+                bool local_web_candidate = false;
+                for (u32 i = 0; i < header_count; i++) {
+                    if (!http_header_name_eq_ci(
+                            kvs[i].key_data, kvs[i].key_len, "Content-Type", 12))
+                        continue;
+                    local_web_mode = grpc_web_content_type({kvs[i].value_data, kvs[i].value_len});
+                    local_web_candidate |=
+                        grpc_web_content_type_candidate({kvs[i].value_data, kvs[i].value_len});
+                }
+                if (local_web_candidate) {
+                    if (outcome.status_code != 200 || is_head) response_formatted = false;
+                    if (!has_body && !body_idx_invalid) {
+                        body_data = nullptr;
+                        body_len = 0;
+                        body_is_fallback = false;
+                    }
+                    u8* transformed = nullptr;
+                    if (response_formatted && conn.json_arena.current == nullptr &&
+                        (conn.json_arena.backend.pool == nullptr ||
+                         !conn.json_arena.init(conn.json_arena.backend.pool)))
+                        response_formatted = false;
+                    if (response_formatted)
+                        transformed = static_cast<u8*>(conn.json_arena.alloc(kGrpcWebLocalBodyCap));
+                    if (!response_formatted || transformed == nullptr ||
+                        !prepare_local_grpc_web_response(local_web_mode,
+                                                         reinterpret_cast<const u8*>(body_data),
+                                                         body_len,
+                                                         kvs,
+                                                         &header_count,
+                                                         transformed,
+                                                         kGrpcWebLocalBodyCap,
+                                                         &body_data,
+                                                         &body_len)) {
+                        response_formatted = false;
+                    } else {
+                        body_is_fallback = false;
+                        segmented_body = false;
+                        direct_file_body = false;
+                    }
+                }
+                if (!response_formatted) {
+                    conn.resp_status = 500;
+                    conn.keep_alive = false;
+                    format_static_response(
+                        conn, 500, false, is_head, ordinary_local_response_version(conn));
+                    release_completed_jit_json(conn);
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
                 }
                 response_formatted =
                     format_response_with_body_and_headers(conn,

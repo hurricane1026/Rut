@@ -124,6 +124,352 @@ TEST(json_network, http1_json_body_head_and_keepalive) {
     pool.destroy();
 }
 
+TEST(json_network, local_grpc_web_static_frames_fit_and_keepalive_recycles) {
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 41;
+    // Keep current null so handle_jit_outcome exercises lazy arena setup.
+    conn->json_arena.backend.pool = &pool;
+    u8 send_storage[SlicePool::kSliceSize];
+    u8* original_send_slice = conn->send_slice;
+    const u32 original_send_capacity = SmallLoop::kBufSize;
+    conn->send_buf.bind(send_storage, sizeof(send_storage));
+
+    constexpr u32 kMaxEncoded = 16384;
+    u8 expected[kMaxEncoded]{};
+    u8 native[8197]{};
+    const GrpcWebContentType modes[] = {GrpcWebContentType::Binary, GrpcWebContentType::Text};
+    const u32 frame_lengths[] = {8193, 8194, 8195, 8196, 8197};
+    for (const GrpcWebContentType mode : modes) {
+        for (const u32 frame_len : frame_lengths) {
+            native[0] = 0;
+            const u32 payload_len = frame_len - 5;
+            native[1] = static_cast<u8>(payload_len >> 24);
+            native[2] = static_cast<u8>(payload_len >> 16);
+            native[3] = static_cast<u8>(payload_len >> 8);
+            native[4] = static_cast<u8>(payload_len);
+            for (u32 i = 5; i < frame_len; ++i) native[i] = static_cast<u8>('a' + (i % 23));
+
+            RouteConfig cfg;
+            const u16 body_idx =
+                cfg.add_response_body_view(reinterpret_cast<const char*>(native), frame_len);
+            REQUIRE(body_idx != 0);
+            const char* keys[] = {"content-type", "grpc-status"};
+            const u32 key_lens[] = {12, 11};
+            const char* values[] = {mode == GrpcWebContentType::Text ? "application/grpc-web-text"
+                                                                     : "application/grpc-web",
+                                    "0"};
+            const u32 value_lens[] = {mode == GrpcWebContentType::Text ? 25u : 20u, 1};
+            const u16 headers_idx =
+                cfg.add_response_header_set(keys, key_lens, values, value_lens, 2);
+            REQUIRE(headers_idx != 0);
+
+            JitDispatchOutcome outcome{};
+            outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+            outcome.status_code = 200;
+            outcome.response_body_idx = body_idx;
+            outcome.response_headers_idx = headers_idx;
+            const char* request =
+                "POST /grpc-web HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n";
+            conn->recv_buf.reset();
+            conn->send_buf.reset();
+            REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request),
+                                            __builtin_strlen(request)),
+                       __builtin_strlen(request));
+            capture_request_metadata(*conn);
+            conn->request_config = &cfg;
+            handle_jit_outcome(loop.get(), *conn, outcome, nullptr, true);
+
+            u32 expected_len = 0;
+            REQUIRE(grpc_web_encode_local_response(
+                mode, native, frame_len, 0, {}, {}, expected, sizeof(expected), expected_len));
+            const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+            const std::string response(wire, conn->send_buf.len());
+            CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+            CHECK(response.find("Content-Length: " + std::to_string(expected_len)) !=
+                  std::string::npos);
+            const size_t body_start = response.find("\r\n\r\n");
+            REQUIRE(body_start != std::string::npos);
+            CHECK_EQ(response.size() - (body_start + 4), expected_len);
+            CHECK_EQ(memcmp(response.data() + body_start + 4, expected, expected_len), 0);
+            CHECK(conn->keep_alive);
+            CHECK_EQ(conn->local_body_remaining, 0u);
+            CHECK_EQ(conn->local_response_size, 0u);
+
+            REQUIRE(conn->on_send != nullptr);
+            const auto send_done = conn->on_send;
+            send_done(
+                loop.get(),
+                *conn,
+                {conn->id, static_cast<i32>(conn->send_buf.len()), 0, 0, IoEventType::Send, 0});
+            CHECK(conn->state == ConnState::ReadingHeader || conn->state == ConnState::ReadingBody);
+
+            const char* successor = "GET /next HTTP/1.1\r\nHost: test\r\n\r\n";
+            conn->recv_buf.reset();
+            conn->send_buf.reset();
+            REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(successor),
+                                            __builtin_strlen(successor)),
+                       __builtin_strlen(successor));
+            capture_request_metadata(*conn);
+            conn->request_config = nullptr;
+            JitDispatchOutcome next{};
+            next.kind = JitDispatchOutcome::Kind::ReturnStatus;
+            next.status_code = 200;
+            handle_jit_outcome(loop.get(), *conn, next, nullptr, true);
+            const std::string next_response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                            conn->send_buf.len());
+            CHECK(next_response.starts_with("HTTP/1.1 200 OK\r\n"));
+            CHECK(next_response.ends_with("OK"));
+            CHECK(next_response.find("Content-Length: 2") != std::string::npos);
+            CHECK(next_response.find("Connection: keep-alive") != std::string::npos);
+            REQUIRE(conn->on_send != nullptr);
+            const auto successor_send_done = conn->on_send;
+            successor_send_done(
+                loop.get(),
+                *conn,
+                {conn->id, static_cast<i32>(conn->send_buf.len()), 0, 0, IoEventType::Send, 0});
+            CHECK(conn->state == ConnState::ReadingHeader || conn->state == ConnState::ReadingBody);
+        }
+    }
+    conn->send_buf.bind(original_send_slice, original_send_capacity);
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, dynamic_grpc_web_head_fallback_preserves_version_and_suppresses_body) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->json_arena.backend.pool = &pool;
+
+    u8 native[] = {0, 0, 0, 0, 1, 'x'};
+    const char* keys[] = {"content-type", "grpc-status"};
+    const u32 key_lens[] = {12, 11};
+    const char* values[] = {"application/grpc-web", "0"};
+    const u32 value_lens[] = {20, 1};
+    RouteConfig cfg;
+    const u16 headers_idx = cfg.add_response_header_set(keys, key_lens, values, value_lens, 2);
+    REQUIRE(headers_idx != 0);
+
+    const char* request = "HEAD /grpc-web HTTP/1.0\r\nHost: test\r\n\r\n";
+    REQUIRE_EQ(
+        conn->recv_buf.write(reinterpret_cast<const u8*>(request), __builtin_strlen(request)),
+        __builtin_strlen(request));
+    capture_request_metadata(*conn);
+    conn->request_config = &cfg;
+    conn->jit_response_body = {reinterpret_cast<const char*>(native), sizeof(native)};
+    conn->jit_response_body_valid = true;
+    conn->jit_response_head = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 0xffffu;
+    outcome.response_headers_idx = headers_idx;
+    handle_jit_outcome(&loop, *conn, outcome, nullptr, true);
+
+    const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+    CHECK(response.starts_with("HTTP/1.0 500 Internal Server Error\r\n"));
+    const size_t body_start = response.find("\r\n\r\n");
+    REQUIRE(body_start != std::string::npos);
+    CHECK_EQ(response.size(), body_start + 4);
+    CHECK(response.find("Content-Length: 21\r\n") != std::string::npos);
+    CHECK(response.find("Connection: close\r\n") != std::string::npos);
+    CHECK_EQ(conn->resp_status, 500u);
+    CHECK_FALSE(conn->keep_alive);
+    loop.free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, static_grpc_web_rejection_preserves_http10_error_framing) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->json_arena.backend.pool = &pool;
+
+    // The declared payload length is two bytes, but only one payload byte is
+    // present. This reaches the configured static gRPC-Web conversion path and
+    // must use the ordinary local 500 formatter after rejecting the frame.
+    const u8 malformed[] = {0, 0, 0, 0, 2, 'x'};
+    RouteConfig cfg;
+    const u16 body_idx =
+        cfg.add_response_body_view(reinterpret_cast<const char*>(malformed), sizeof(malformed));
+    REQUIRE(body_idx != 0);
+    const char* keys[] = {"content-type", "grpc-status"};
+    const u32 key_lens[] = {12, 11};
+    const char* values[] = {"application/grpc-web", "0"};
+    const u32 value_lens[] = {20, 1};
+    const u16 headers_idx = cfg.add_response_header_set(keys, key_lens, values, value_lens, 2);
+    REQUIRE(headers_idx != 0);
+
+    const char* methods[] = {"GET", "HEAD"};
+    for (const char* method : methods) {
+        const std::string request =
+            std::string(method) + " /grpc-web HTTP/1.0\r\nHost: test\r\n\r\n";
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = &cfg;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_body_idx = body_idx;
+        outcome.response_headers_idx = headers_idx;
+        handle_jit_outcome(&loop, *conn, outcome, nullptr, true);
+
+        const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+        CHECK(response.starts_with("HTTP/1.0 500 Internal Server Error\r\n"));
+        const size_t body_start = response.find("\r\n\r\n");
+        REQUIRE(body_start != std::string::npos);
+        CHECK(response.find("Content-Length: 21\r\n") != std::string::npos);
+        CHECK(response.find("Connection: close\r\n") != std::string::npos);
+        if (method[0] == 'H') {
+            CHECK_EQ(response.size(), body_start + 4);
+        } else {
+            CHECK(response.ends_with("Internal Server Error"));
+        }
+        CHECK_EQ(conn->resp_status, 500u);
+        CHECK_FALSE(conn->keep_alive);
+    }
+    loop.free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, unsupported_grpc_web_suffix_fails_closed_on_h1_and_h2) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn);
+    conn->json_arena.backend.pool = &pool;
+    const u8 native[] = {0, 0, 0, 0, 1, 'x'};
+    const char* keys[] = {"content-type", "grpc-status"};
+    const u32 key_lens[] = {12, 11};
+    const char* values[] = {"application/grpc-web+json", "0"};
+    const u32 value_lens[] = {25, 1};
+    RouteConfig cfg;
+    const u16 body_idx =
+        cfg.add_response_body_view(reinterpret_cast<const char*>(native), sizeof(native));
+    const u16 headers_idx = cfg.add_response_header_set(keys, key_lens, values, value_lens, 2);
+    REQUIRE(body_idx != 0);
+    REQUIRE(headers_idx != 0);
+
+    const auto assert_h1_500 = [&](const RouteConfig& response_cfg, JitDispatchOutcome outcome) {
+        const char request[] = "POST /grpc-web HTTP/1.1\r\nHost: test\r\n\r\n";
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+                   sizeof(request) - 1);
+        capture_request_metadata(*conn);
+        conn->request_config = &response_cfg;
+        handle_jit_outcome(&loop, *conn, outcome, nullptr, true);
+        const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+        CHECK(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+        CHECK(response.find("grpc-status:") == std::string::npos);
+        CHECK_EQ(conn->resp_status, 500u);
+    };
+
+    JitDispatchOutcome dynamic{};
+    dynamic.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    dynamic.status_code = 200;
+    dynamic.response_body_idx = 0xffffu;
+    dynamic.response_headers_idx = headers_idx;
+    conn->jit_response_body = {reinterpret_cast<const char*>(native), sizeof(native)};
+    conn->jit_response_body_valid = true;
+    assert_h1_500(cfg, dynamic);
+
+    const char* mixed_types[] = {"application/grpc-web+json", "text/plain"};
+    const u32 mixed_type_lens[] = {25, 10};
+    for (u32 order = 0; order < 2; ++order) {
+        RouteConfig mixed_cfg;
+        const char* mixed_keys[] = {"content-type", "grpc-status"};
+        const u32 mixed_key_lens[] = {12, 11};
+        const char* mixed_values[] = {mixed_types[order], "0"};
+        const u32 mixed_value_lens[] = {mixed_type_lens[order], 1};
+        const u16 mixed_headers_idx = mixed_cfg.add_response_header_set(
+            mixed_keys, mixed_key_lens, mixed_values, mixed_value_lens, 2);
+        REQUIRE(mixed_headers_idx != 0);
+        conn->resp_header_mutation_count = 1;
+        conn->resp_header_mutations[0] = {{"content-type", 12},
+                                          {mixed_types[1 - order], mixed_type_lens[1 - order]},
+                                          Connection::RespHeaderMutationMode::Add};
+        JitDispatchOutcome mixed = dynamic;
+        mixed.response_headers_idx = mixed_headers_idx;
+        assert_h1_500(mixed_cfg, mixed);
+    }
+    conn->resp_header_mutation_count = 0;
+
+    JitDispatchOutcome statik{};
+    statik.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    statik.status_code = 200;
+    statik.response_body_idx = body_idx;
+    statik.response_headers_idx = headers_idx;
+    assert_h1_500(cfg, statik);
+
+    auto h2 = std::make_unique<Http2Conn>();
+    conn->h2 = h2.get();
+    h2->init();
+    h2->nstreams = 1;
+    h2->streams[0].id = 1;
+    h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+    conn->epoch_held = true;
+    conn->resp_header_mutation_count = 2;
+    conn->resp_header_mutations[0] = {{"content-type", 12},
+                                      {"application/grpc-web+json", 25},
+                                      Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[1] = {
+        {"grpc-status", 11}, {"0", 1}, Connection::RespHeaderMutationMode::Set};
+    conn->jit_response_body_valid = true;
+    conn->jit_response_body = {reinterpret_cast<const char*>(native), sizeof(native)};
+    JitDispatchOutcome h2_outcome{};
+    h2_outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    h2_outcome.status_code = 200;
+    h2_outcome.response_body_idx = 0xffffu;
+    u8 response[1024];
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    h2_emit_outcome(dispatch, 1, h2_outcome, nullptr, false);
+    CHECK_EQ(h2->outbound_stream, 0u);
+    Http2FrameHeader frame{};
+    REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &frame), ParseStatus::Complete);
+    hpack::DynamicTable decoder;
+    decoder.init(kDefaultHeaderTableSize);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(decoder,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    REQUIRE_EQ(count, 1u);
+    CHECK(decoded[0].name.eq(lit_str(":status")));
+    CHECK(decoded[0].value.eq(lit_str("500")));
+    conn->epoch_held = false;
+    conn->h2 = nullptr;
+    loop.free_conn(*conn);
+    pool.destroy();
+}
+
 TEST(json_network, http2_response_owns_body_before_next_handler) {
     JsonProgram program;
     REQUIRE(program.init());
@@ -466,6 +812,113 @@ TEST(json_network, queued_large_dynamic_body_transfers_slice_ownership) {
     h2_clear_outbound(*h2);
     CHECK_FALSE(slice_is_in_use(pool, queued_slice));
     conn->h2 = nullptr;
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, queued_static_grpc_web_response_uses_owned_transformed_body) {
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(conn->json_arena.init(&pool));
+    conn->epoch_held = true;
+    auto h2 = std::make_unique<Http2Conn>();
+    h2->init();
+    conn->h2 = h2.get();
+    h2->nstreams = 2;
+    h2->streams[0] = {1, Http2StreamState::Open, 0, 0, true};
+    h2->streams[1] = {3, Http2StreamState::Open, 0, 0, true};
+
+    u8 native[8197]{};
+    native[3] = 0x20;
+    for (u32 i = 5; i < sizeof(native); i++) native[i] = 'q';
+    RouteConfig cfg;
+    const u16 body_idx =
+        cfg.add_response_body_view(reinterpret_cast<const char*>(native), sizeof(native));
+    REQUIRE(body_idx != 0);
+    const char* keys[] = {"content-type", "grpc-status"};
+    const u32 key_lens[] = {12, 11};
+    const char* values[] = {"application/grpc-web", "0"};
+    const u32 value_lens[] = {20, 1};
+    const u16 headers_idx = cfg.add_response_header_set(keys, key_lens, values, value_lens, 2);
+    REQUIRE(headers_idx != 0);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = body_idx;
+    outcome.response_headers_idx = headers_idx;
+    u8 response[4096]{};
+    H2Dispatch<SmallLoop> first{loop.get(), conn, response, sizeof(response), 0, false};
+    h2_emit_outcome(first, 1, outcome, &cfg, false);
+    REQUIRE_EQ(h2->outbound_stream, 1u);
+    CHECK_EQ(h2->outbound_source, H2OutboundBodySource::JitDynamic);
+    REQUIRE(h2->jit_outbound_slice != nullptr);
+    const u8* first_slice = h2->jit_outbound_slice;
+    CHECK_EQ(h2->outbound_body[0], 0u);
+    CHECK_EQ(h2->outbound_body[8197], 0x80u);
+    u8 expected_body[16384]{};
+    const u32 expected_body_len = h2->outbound_body_len;
+    REQUIRE(expected_body_len <= sizeof(expected_body));
+    __builtin_memcpy(expected_body, h2->outbound_body, expected_body_len);
+
+    h2_emit_outcome(first, 3, outcome, &cfg, false);
+    REQUIRE_EQ(h2->queued_stream, 3u);
+    CHECK_EQ(h2->queued_source, H2OutboundBodySource::JitDynamic);
+    REQUIRE(h2->jit_queued_slice != nullptr);
+    const u8* queued_slice = h2->jit_queued_slice;
+    CHECK(queued_slice != first_slice);
+    h2->conn_send_window = 5;
+    h2->streams[0].send_window = 5;
+    H2PumpStatus status{};
+    CHECK_EQ(h2_pump_outbound(*h2, response, sizeof(response), status), kFrameHeaderSize + 5u);
+    CHECK(status == H2PumpStatus::Produced);
+    h2->conn_send_window = 65535;
+    h2->streams[0].send_window = 65535;
+    h2_clear_primary_outbound(*h2);
+    h2_promote_queued(*h2);
+    CHECK_FALSE(slice_is_in_use(pool, first_slice));
+    REQUIRE_EQ(h2->outbound_stream, 3u);
+    CHECK_EQ(h2->outbound_source, H2OutboundBodySource::JitDynamic);
+    CHECK_EQ(h2->outbound_body[8197], 0x80u);
+    CHECK_EQ(h2->outbound_body, queued_slice);
+    h2->conn_send_window = 0;
+    h2->streams[1].send_window = 0;
+    CHECK_EQ(h2_pump_outbound(*h2, response, sizeof(response), status), 0u);
+    CHECK(status == H2PumpStatus::Blocked);
+    CHECK_EQ(h2->outbound_body_offset, 0u);
+    __builtin_memset(cfg.body_pool, 'z', cfg.body_pool_used);
+    __builtin_memset(cfg.header_bytes_pool, 'z', cfg.header_bytes_pool_used);
+    __builtin_memset(native, 'z', sizeof(native));
+    conn->json_arena.destroy();
+    CHECK_EQ(memcmp(h2->outbound_body, expected_body, expected_body_len), 0);
+    h2->nstreams = 3;
+    h2->streams[2] = {5, Http2StreamState::Open, 0, 0, true};
+    h2->conn_send_window = 65535;
+    h2->streams[1].send_window = 65535;
+    H2Dispatch<SmallLoop> third{loop.get(), conn, response, sizeof(response), 0, false};
+    REQUIRE(h2_stage_owned_response(third,
+                                    5,
+                                    200,
+                                    nullptr,
+                                    0,
+                                    h2->outbound_body,
+                                    h2->outbound_body_len,
+                                    H2OutboundBodySource::JitDynamic,
+                                    nullptr));
+    REQUIRE(h2->jit_queued_slice != nullptr);
+    const u8* reset_slice = h2->jit_queued_slice;
+    H2Dispatch<SmallLoop> reset_dispatch{loop.get(), conn, response, sizeof(response), 0, false};
+    h2_on_reset_dispatch_cb<SmallLoop>(&reset_dispatch, *h2, 5, Http2Error::Cancel);
+    CHECK_EQ(h2->queued_stream, 0u);
+    CHECK_EQ(h2->jit_queued_slice, nullptr);
+    CHECK_FALSE(slice_is_in_use(pool, reset_slice));
+    CHECK(slice_is_in_use(pool, queued_slice));
+    h2_clear_outbound(*h2);
+    conn->h2 = nullptr;
+    conn->json_arena.destroy();
     loop->free_conn(*conn);
     pool.destroy();
 }
@@ -975,6 +1428,165 @@ TEST(json_network, grpc_local_trailers_follow_data_without_flow_control_credit) 
     CHECK(h2_pump_outbound(*h2, bytes, sizeof(bytes), status) != 0);
     CHECK(h2_pump_outbound(*h2, bytes, sizeof(bytes), status) != 0);
     check_message_header(false, Str{"", 0});
+}
+
+TEST(json_network, grpc_web_local_outcome_stages_owned_binary_and_text_body) {
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    REQUIRE(conn->json_arena.init(&pool));
+    auto h2 = std::make_unique<Http2Conn>();
+    conn->h2 = h2.get();
+    const u8 native[] = {0, 0, 0, 0, 1, 'x'};
+    const char* types[] = {"application/grpc-web", "application/grpc-web-text"};
+    for (u32 mode = 0; mode < 2; mode++) {
+        h2->init();
+        h2->nstreams = 1;
+        h2->streams[0].id = 1;
+        h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+        conn->epoch_held = true;
+        conn->jit_response_body_valid = true;
+        conn->jit_response_body = {reinterpret_cast<const char*>(native), sizeof(native)};
+        conn->resp_header_mutation_count = 4;
+        conn->resp_header_mutations[0] = {{"content-type", 12},
+                                          {types[mode], mode ? 25u : 20u},
+                                          Connection::RespHeaderMutationMode::Set};
+        conn->resp_header_mutations[1] = {
+            {"grpc-status", 11}, {"0", 1}, Connection::RespHeaderMutationMode::Set};
+        conn->resp_header_mutations[2] = {
+            {"grpc-message", 12}, {"ok", 2}, Connection::RespHeaderMutationMode::Set};
+        conn->resp_header_mutations[3] = {{"grpc-status-details-bin", 23},
+                                          {"opaque", 6},
+                                          Connection::RespHeaderMutationMode::Set};
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_body_idx = 0xffffu;
+        u8 response[2048];
+        H2Dispatch<SmallLoop> dispatch{loop.get(), conn, response, sizeof(response), 0, false};
+        h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+        REQUIRE_EQ(h2->outbound_stream, 1u);
+        CHECK_EQ(h2->outbound_grpc_status, 255u);
+        CHECK_EQ(h2->outbound_body[0], mode == 0 ? 0 : static_cast<u8>('A'));
+        // The staged body is owned independently of both the JIT input and arena.
+        conn->jit_response_body.ptr = nullptr;
+        conn->json_arena.destroy();
+        CHECK(h2->outbound_body_len > sizeof(native));
+        if (mode == 0) {
+            CHECK_EQ(h2->outbound_body[0], 0u);
+            CHECK_EQ(h2->outbound_body[5], 'x');
+            CHECK_EQ(h2->outbound_body[6], 0x80u);
+        } else {
+            GrpcWebBase64Decoder decoder{};
+            decoder.init();
+            u8 decoded[256]{};
+            u32 consumed = 0, written = 0;
+            REQUIRE(decoder.feed(h2->outbound_body,
+                                 h2->outbound_body_len,
+                                 consumed,
+                                 decoded,
+                                 sizeof(decoded),
+                                 written) == GrpcWebCodecStatus::Ok);
+            REQUIRE(decoder.finish() == GrpcWebCodecStatus::Ok);
+            CHECK_EQ(decoded[0], 0u);
+            CHECK_EQ(decoded[5], 'x');
+            CHECK_EQ(decoded[6], 0x80u);
+        }
+        u8 wire[2048];
+        H2PumpStatus pump_status{};
+        h2->conn_send_window = 65535;
+        h2->streams[0].send_window = 65535;
+        const u32 wire_len = h2_pump_outbound(*h2, wire, sizeof(wire), pump_status);
+        REQUIRE(wire_len > kFrameHeaderSize);
+        Http2FrameHeader data_frame{};
+        REQUIRE_EQ(parse_frame_header(wire, wire_len, &data_frame), ParseStatus::Complete);
+        CHECK_EQ(data_frame.type, static_cast<u8>(Http2FrameType::Data));
+        CHECK_EQ(data_frame.flags & http2_flag::kEndStream, http2_flag::kEndStream);
+        CHECK_EQ(h2_pump_outbound(*h2, wire, sizeof(wire), pump_status), 0u);
+        h2_clear_outbound(*h2);
+        conn->epoch_held = false;
+        REQUIRE(conn->json_arena.init(&pool));
+    }
+    h2->init();
+    h2->nstreams = 1;
+    h2->streams[0].id = 1;
+    h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+    conn->epoch_held = true;
+    conn->jit_response_body_valid = true;
+    conn->jit_response_body = {nullptr, 0};
+    conn->resp_header_mutation_count = 2;
+    conn->resp_header_mutations[0] = {{"content-type", 12},
+                                      {"application/grpc-web", 20},
+                                      Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[1] = {
+        {"grpc-status", 11}, {"0", 1}, Connection::RespHeaderMutationMode::Set};
+    JitDispatchOutcome trailers_only{};
+    trailers_only.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    trailers_only.status_code = 200;
+    trailers_only.response_body_idx = 0xffffu;
+    u8 trailers_response[1024];
+    H2Dispatch<SmallLoop> trailers_dispatch{
+        loop.get(), conn, trailers_response, sizeof(trailers_response), 0, false};
+    h2_emit_outcome(trailers_dispatch, 1, trailers_only, nullptr, false);
+    REQUIRE_EQ(h2->outbound_stream, 1u);
+    CHECK_EQ(h2->outbound_body[0], 0x80u);
+    CHECK_EQ(h2->outbound_grpc_status, 255u);
+    conn->json_arena.destroy();
+    h2_clear_outbound(*h2);
+    conn->epoch_held = false;
+    conn->h2 = nullptr;
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, grpc_web_local_http1_outcome_writes_body_and_trailers_only) {
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    const u8 message[] = {0, 0, 0, 0, 1, 'x'};
+    const char* types[] = {"application/grpc-web", "application/grpc-web-text"};
+    for (u32 mode = 0; mode < 2; mode++) {
+        for (u32 empty = 0; empty < 2; empty++) {
+            REQUIRE(conn->json_arena.init(&pool));
+            conn->req_method = static_cast<u8>(LogHttpMethod::Post);
+            conn->req_http_version = static_cast<u8>(HttpVersion::Http11);
+            conn->jit_response_body_valid = true;
+            conn->jit_response_body = {reinterpret_cast<const char*>(empty ? nullptr : message),
+                                       empty ? 0u : static_cast<u32>(sizeof(message))};
+            conn->resp_header_mutation_count = 2;
+            conn->resp_header_mutations[0] = {{"content-type", 12},
+                                              {types[mode], mode ? 25u : 20u},
+                                              Connection::RespHeaderMutationMode::Set};
+            conn->resp_header_mutations[1] = {
+                {"grpc-status", 11}, {"0", 1}, Connection::RespHeaderMutationMode::Set};
+            JitDispatchOutcome outcome{};
+            outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+            outcome.status_code = 200;
+            outcome.response_body_idx = 0xffffu;
+            conn->send_buf.reset();
+            handle_jit_outcome(loop.get(), *conn, outcome, nullptr, true);
+            const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+            CHECK(wire.find("HTTP/1.1 200") == 0);
+            CHECK(wire.find("content-type: ") != std::string::npos ||
+                  wire.find("Content-Type: ") != std::string::npos);
+            CHECK(wire.find("content-length: ") != std::string::npos ||
+                  wire.find("Content-Length: ") != std::string::npos);
+            const size_t header_end = wire.find("\r\n\r\n");
+            REQUIRE(header_end != std::string::npos);
+            CHECK(wire.find("grpc-status:", 0) == std::string::npos ||
+                  wire.find("grpc-status:", 0) >= header_end + 4);
+            CHECK(wire.size() > header_end + 4);
+        }
+    }
+    loop->free_conn(*conn);
+    pool.destroy();
 }
 
 TEST(json_network, grpc_local_response_rejects_invalid_status_or_frame_before_staging) {

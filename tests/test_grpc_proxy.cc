@@ -459,7 +459,7 @@ struct Client {
              web_content_type = false;
         std::unique_ptr<u8[]> raw;
         std::unique_ptr<u8[]> response;
-    } rpcs[17];
+    } rpcs[32];
     nghttp2_session* session = nullptr;
     bool goaway = false;
     u32 window_updates = 0;
@@ -653,7 +653,8 @@ struct Client {
                     bool text,
                     u32 chunk,
                     bool content_length = false,
-                    const char* timeout = "1H") {
+                    const char* timeout = "1H",
+                    const char* path = "/test.Echo/Call") {
         auto& rpc = rpcs[index];
         if (body_len > Rpc::kWebBufferCap) return -1;
         if (!rpc.raw) rpc.raw = std::make_unique<u8[]>(Rpc::kWebBufferCap);
@@ -668,7 +669,7 @@ struct Client {
             nv(":method", "POST"),
             nv(":scheme", "http"),
             nv(":authority", "grpc.test"),
-            nv(":path", "/test.Echo/Call"),
+            nv(":path", path),
             nv("content-type", text ? "application/grpc-web-text" : "application/grpc-web"),
             nv("grpc-timeout", timeout)};
         size_t count = 6;
@@ -8864,7 +8865,7 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
     char path[] = "/tmp/rut-pb-network-XXXXXX";
     const int file = mkstemp(path);
     REQUIRE(file >= 0);
-    char source[8192];
+    char source[16384];
     const int length = snprintf(
         source,
         sizeof(source),
@@ -8919,7 +8920,18 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "\"grpc-status\": \"0\"}, body: framed) }\n"
         "route POST \"/local.Error/Call\" { return response(200, headers: {"
         "\"content-type\": \"application/grpc\", \"grpc-status\": \"7\", "
-        "\"grpc-message\": \"denied\"}) }\n",
+        "\"grpc-message\": \"denied\"}) }\n"
+        "route POST \"/local.WebBinary/Call\" { guard let payload = grpc.unframe(req.body) else { "
+        "return 422 } "
+        "guard let framed = grpc.frame(payload) else { return 500 } return response(200, headers: {"
+        "\"content-type\": \"application/grpc-web\", \"grpc-status\": \"0\"}, body: framed) }\n"
+        "route POST \"/local.WebText/Call\" { guard let payload = grpc.unframe(req.body) else { "
+        "return 422 } "
+        "guard let framed = grpc.frame(payload) else { return 500 } return response(200, headers: {"
+        "\"content-type\": \"application/grpc-web-text\", \"grpc-status\": \"0\"}, body: framed) "
+        "}\n"
+        "route POST \"/local.WebEmpty/Call\" { return response(200, headers: {"
+        "\"content-type\": \"application/grpc-web\", \"grpc-status\": \"0\"}) }\n",
         get_port(server->listen_fd),
         kStatusDetailsOracleBase64);
     const bool written = length > 0 && length < static_cast<int>(sizeof(source)) &&
@@ -9047,6 +9059,73 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             };
             local_rpc(10);
             local_rpc(11);
+            Client web_client;
+            CHECK(web_client.init(get_port(lfd)));
+            auto local_web = [&](u32 index, bool text, const char* path, bool empty) {
+                const int sid =
+                    text ? web_client.request_native_raw(index,
+                                                         framed,
+                                                         sizeof(framed),
+                                                         "1H",
+                                                         nullptr,
+                                                         path,
+                                                         "application/grpc+proto")
+                         : web_client.request_web(
+                               index, framed, sizeof(framed), false, 1, true, "1H", path);
+                CHECK(sid > 0);
+                CHECK(web_client.until(index, true));
+                const auto& rpc = web_client.rpcs[index];
+                if (!rpc.web_content_type)
+                    fprintf(stderr,
+                            "local web index %u path %s status=%u response=%u end=%d\n",
+                            index,
+                            path,
+                            rpc.http_status,
+                            rpc.response_len,
+                            rpc.response_end);
+                CHECK(rpc.web_content_type);
+                u8 decoded[256]{};
+                u32 decoded_len = 0;
+                if (text) {
+                    GrpcWebBase64Decoder decoder{};
+                    decoder.init();
+                    u32 consumed = 0, written = 0;
+                    CHECK_EQ(decoder.feed(rpc.response.get(),
+                                          rpc.response_len,
+                                          consumed,
+                                          decoded,
+                                          sizeof(decoded),
+                                          written),
+                             GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(consumed, rpc.response_len);
+                    decoded_len = written;
+                } else {
+                    decoded_len = rpc.response_len;
+                    CHECK_LE(decoded_len, sizeof(decoded));
+                    if (decoded_len <= sizeof(decoded))
+                        memcpy(decoded, rpc.response.get(), decoded_len);
+                }
+                GrpcWebTrailer trailer[] = {{{"grpc-status", 11}, {"0", 1}}};
+                u8 expected_trailer[64]{};
+                u32 expected_trailer_len = 0;
+                REQUIRE(grpc_web_encode_trailer_envelope(
+                    trailer, 1, expected_trailer, sizeof(expected_trailer), expected_trailer_len));
+                const u32 expected_len =
+                    (empty ? 0u : static_cast<u32>(sizeof(framed))) + expected_trailer_len;
+                CHECK_EQ(decoded_len, expected_len);
+                if (decoded_len == expected_len) {
+                    if (!empty) CHECK(memcmp(decoded, framed, sizeof(framed)) == 0);
+                    const u32 trailer_offset = empty ? 0u : static_cast<u32>(sizeof(framed));
+                    CHECK_EQ(decoded[trailer_offset], 0x80u);
+                    CHECK(memcmp(decoded + trailer_offset,
+                                 expected_trailer,
+                                 expected_trailer_len) == 0);
+                }
+            };
+            local_web(0, false, "/local.WebBinary/Call", false);
+            local_web(1, true, "/local.WebText/Call", false);
+            local_web(2, false, "/local.WebEmpty/Call", true);
             // Hold response DATA at zero window, cancel, then reuse the connection.
             nghttp2_settings_entry zero_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 0};
             CHECK_EQ(nghttp2_submit_settings(client.session, NGHTTP2_FLAG_NONE, &zero_window, 1),
@@ -9217,6 +9296,66 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             }
         }
     }
+    const u8 h1_framed[] = {0, 0, 0, 0, 3, 0xff, 0xfe, 0xfd};
+    auto h1_local_web = [&](const char* path, bool text, bool empty) {
+        const i32 fd = connect_to(get_port(lfd));
+        REQUIRE(fd >= 0);
+        timeval timeout{5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        std::string request = std::string("POST ") + path +
+                              " HTTP/1.1\r\nHost: localhost\r\nContent-Type: "
+                              "application/grpc+proto\r\nContent-Length: " +
+                              std::to_string(sizeof(h1_framed)) + "\r\nConnection: close\r\n\r\n";
+        request.append(reinterpret_cast<const char*>(h1_framed), sizeof(h1_framed));
+        REQUIRE(send_all(fd, request.data(), request.size()));
+        u8 wire[32768]{};
+        u32 wire_len = 0;
+        while (wire_len < sizeof(wire)) {
+            const ssize_t n = recv(fd, wire + wire_len, sizeof(wire) - wire_len, 0);
+            if (n <= 0) break;
+            wire_len += static_cast<u32>(n);
+        }
+        close(fd);
+        const auto framing = grpc_web_test_response_framing(wire, wire_len);
+        REQUIRE(framing.valid && framing.headers_complete && framing.has_content_length);
+        CHECK(framing.web);
+        CHECK_EQ(framing.text, text);
+        const std::string header(reinterpret_cast<const char*>(wire), framing.body_offset);
+        CHECK(header.find("grpc-status:") == std::string::npos);
+        CHECK(header.find("grpc-message:") == std::string::npos);
+        CHECK(header.find("grpc-status-details-bin:") == std::string::npos);
+        REQUIRE_EQ(framing.content_length, wire_len - framing.body_offset);
+        u8 decoded[256]{};
+        u32 decoded_len = 0;
+        if (text) {
+            GrpcWebBase64Decoder decoder{};
+            decoder.init();
+            u32 consumed = 0;
+            REQUIRE(decoder.feed(wire + framing.body_offset,
+                                 framing.content_length,
+                                 consumed,
+                                 decoded,
+                                 sizeof(decoded),
+                                 decoded_len) == GrpcWebCodecStatus::Ok);
+            REQUIRE_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+        } else {
+            decoded_len = static_cast<u32>(framing.content_length);
+            REQUIRE(decoded_len <= sizeof(decoded));
+            memcpy(decoded, wire + framing.body_offset, decoded_len);
+        }
+        GrpcWebTrailer trailer[] = {{{"grpc-status", 11}, {"0", 1}}};
+        u8 expected[64]{};
+        u32 expected_len = 0;
+        REQUIRE(
+            grpc_web_encode_trailer_envelope(trailer, 1, expected, sizeof(expected), expected_len));
+        const u32 frame_len = empty ? 0u : static_cast<u32>(sizeof(h1_framed));
+        REQUIRE_EQ(decoded_len, frame_len + expected_len);
+        if (!empty) CHECK(memcmp(decoded, h1_framed, sizeof(h1_framed)) == 0);
+        CHECK(memcmp(decoded + frame_len, expected, expected_len) == 0);
+    };
+    h1_local_web("/local.WebBinary/Call", false, false);
+    h1_local_web("/local.WebText/Call", true, false);
+    h1_local_web("/local.WebEmpty/Call", false, true);
     shard->stop();
     shard->join();
     shard->loop->force_close_all();
