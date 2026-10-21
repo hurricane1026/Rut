@@ -9318,7 +9318,7 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         }
     }
     const u8 h1_framed[] = {0, 0, 0, 0, 3, 0xff, 0xfe, 0xfd};
-    auto h1_local_web = [&](const char* path, bool text, bool empty) {
+    auto h1_local_web = [&](const char* path, bool text, bool empty, bool chunked = false) {
         const i32 fd = connect_to(get_port(lfd));
         REQUIRE(fd >= 0);
         timeval timeout{5, 0};
@@ -9349,10 +9349,25 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         const char* request_type = text ? "application/grpc-web-text" : "application/grpc-web";
         std::string request = std::string("POST ") + path +
                               " HTTP/1.1\r\nHost: localhost\r\nContent-Type: " + request_type +
-                              "\r\nContent-Length: " + std::to_string(request_body_len) +
+                              (chunked ? "\r\nTransfer-Encoding: chunked" :
+                                         ("\r\nContent-Length: " + std::to_string(request_body_len))) +
                               "\r\nConnection: close\r\n\r\n";
-        request.append(reinterpret_cast<const char*>(request_body), request_body_len);
-        REQUIRE(send_all(fd, request.data(), request.size()));
+        if (!chunked) {
+            request.append(reinterpret_cast<const char*>(request_body), request_body_len);
+            REQUIRE(send_all(fd, request.data(), request.size()));
+        } else {
+            REQUIRE(send_all(fd, request.data(), request.size()));
+            for (u32 off = 0; off < request_body_len;) {
+                const u32 take = (off % 3) + 1 < request_body_len - off ? (off % 3) + 1
+                                                                         : request_body_len - off;
+                const std::string chunk = std::to_string(take) + "\r\n" +
+                                          std::string(reinterpret_cast<const char*>(request_body + off), take) +
+                                          "\r\n";
+                REQUIRE(send_all(fd, chunk.data(), chunk.size()));
+                off += take;
+            }
+            REQUIRE(send_all(fd, "0\r\n\r\n", 7));
+        }
         u8 wire[32768]{};
         u32 wire_len = 0;
         while (wire_len < sizeof(wire)) {
@@ -9400,6 +9415,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
     };
     h1_local_web("/local.WebBinary/Call", false, false);
     h1_local_web("/local.WebText/Call", true, false);
+    h1_local_web("/local.WebBinary/Call", false, false, true);
+    h1_local_web("/local.WebText/Call", true, false, true);
     h1_local_web("/local.WebEmpty/Call", false, true);
     shard->stop();
     shard->join();
