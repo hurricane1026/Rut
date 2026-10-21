@@ -4,6 +4,7 @@
 // send slice: retiring an RPC never frees memory referenced by an async SQE.
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/grpc_protocol.h"
+#include "rut/runtime/grpc_timeout.h"
 #include "rut/runtime/receive_headroom.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/upstream_pool.h"
@@ -69,37 +70,6 @@ inline void grpc_detach(Http2Conn& h, GrpcExchange* x) {
 inline void grpc_pop(u8* buf, u32& len, u32 n) {
     len -= n;
     if (len) __builtin_memmove(buf, buf + n, len);
-}
-inline bool grpc_timeout(Str value, u64* micros) {
-    if (value.len < 2 || value.len > 9) return false;
-    u64 n = 0;
-    for (u32 i = 0; i + 1 < value.len; i++) {
-        if (value.ptr[i] < '0' || value.ptr[i] > '9') return false;
-        n = n * 10 + static_cast<u32>(value.ptr[i] - '0');
-    }
-    switch (value.ptr[value.len - 1]) {
-        case 'H':
-            n *= 3600000000ull;
-            break;
-        case 'M':
-            n *= 60000000ull;
-            break;
-        case 'S':
-            n *= 1000000ull;
-            break;
-        case 'm':
-            n *= 1000;
-            break;
-        case 'u':
-            break;
-        case 'n':
-            n = (n + 999) / 1000;
-            break;
-        default:
-            return false;
-    }
-    *micros = n;
-    return true;
 }
 inline bool grpc_request_deadline(
     const hpack::Header* hs, u32 n, u64 base_us, bool& timeout_present, u64& deadline_us) {
