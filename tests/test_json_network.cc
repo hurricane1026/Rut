@@ -22,6 +22,7 @@
 
 using namespace rut;
 
+
 static bool slice_is_in_use(const SlicePool& pool, const u8* ptr) {
     if (!ptr || !pool.base || !pool.in_use_map || pool.count == 0) return false;
     const u64 base = reinterpret_cast<u64>(pool.base);
@@ -2110,4 +2111,33 @@ TEST(json_network, grpc_local_response_rejects_invalid_status_or_frame_before_st
     CHECK_EQ(h2->queued_stream, 0u);
     conn->h2 = nullptr;
     loop->free_conn(*conn);
+}
+
+TEST(json_network, h2_grpc_web_reset_releases_parked_normalization_arena) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn);
+    conn->json_arena.backend.pool = &pool;
+    REQUIRE(conn->json_arena.init(&pool));
+    REQUIRE(conn->json_arena.alloc(8197) != nullptr);
+    Http2Conn h2;
+    h2.init();
+    h2.async_stream = 1;
+    conn->h2 = &h2;
+    auto* ctx = conn->reset_jit_ctx();
+    ctx->req_body_override_ptr = reinterpret_cast<const u8*>(1);
+    ctx->req_body_override_len = 6;
+    ctx->req_body_override_valid = 1;
+    u8 response[1]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    h2_on_reset_dispatch_cb<SmallLoop>(&dispatch, h2, 1, Http2Error::Cancel);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK(conn->json_arena.current == nullptr);
+    CHECK_FALSE(conn->jit_ctx()->req_body_override_valid);
+    conn->h2 = nullptr;
+    loop.free_conn(*conn);
+    pool.destroy();
 }

@@ -3371,7 +3371,14 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     }
 
     u32 consume = static_cast<u32>(ev.result);
-    if (conn.req_body_mode == BodyMode::Chunked) consume = 0;
+    if (conn.req_body_mode == BodyMode::Chunked) {
+        // Chunked collector compaction does not own access-log accounting.
+        // Every newly received wire byte must be counted here, including bytes
+        // that complete an invalid request.
+        conn.downstream_req_size += consume;
+        conn.req_size += consume;
+        consume = 0;
+    }
     if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
     conn.req_body_remaining -= consume;
     conn.downstream_req_size += consume;
