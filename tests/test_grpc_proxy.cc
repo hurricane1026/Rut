@@ -9417,6 +9417,35 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
     h1_local_web("/local.WebText/Call", true, false);
     h1_local_web("/local.WebBinary/Call", false, false, true);
     h1_local_web("/local.WebText/Call", true, false, true);
+    auto h1_bad_web = [&](const u8* body, u32 body_len, bool text, bool chunked) {
+        const i32 fd = connect_to(get_port(lfd));
+        REQUIRE(fd >= 0);
+        timeval timeout{5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        const char* type = text ? "application/grpc-web-text" : "application/grpc-web";
+        std::string request = std::string("POST /local.WebBinary/Call HTTP/1.1\r\nHost: localhost\r\nContent-Type: ") +
+                              type + (chunked ? "\r\nTransfer-Encoding: chunked" :
+                                                 ("\r\nContent-Length: " + std::to_string(body_len))) +
+                              "\r\nConnection: close\r\n\r\n";
+        REQUIRE(send_all(fd, request.data(), request.size()));
+        if (chunked) {
+            const std::string chunk = std::to_string(body_len) + "\r\n" +
+                                      std::string(reinterpret_cast<const char*>(body), body_len) +
+                                      "\r\n0\r\n\r\n";
+            REQUIRE(send_all(fd, chunk.data(), chunk.size()));
+        } else {
+            REQUIRE(send_all(fd, reinterpret_cast<const char*>(body), body_len));
+        }
+        char response[1024]{};
+        const ssize_t n = recv(fd, response, sizeof(response) - 1, 0);
+        close(fd);
+        REQUIRE(n > 0);
+        if (n > 0) CHECK(strncmp(response, "HTTP/1.1 400", 12) == 0);
+    };
+    const u8 compressed[] = {1, 0, 0, 0, 0};
+    const u8 truncated[] = {0, 0, 0, 0};
+    h1_bad_web(compressed, sizeof(compressed), false, false);
+    h1_bad_web(truncated, sizeof(truncated), false, true);
     h1_local_web("/local.WebEmpty/Call", false, true);
     shard->stop();
     shard->join();
