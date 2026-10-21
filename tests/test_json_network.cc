@@ -1039,6 +1039,50 @@ TEST(json_network, grpc_local_response_rejects_invalid_status_or_frame_before_st
                 headers[j].name.eq(lit_str(":status")) && headers[j].value.eq(lit_str("500"));
         CHECK(failed_closed);
     }
+    h2->init();
+    h2->nstreams = 1;
+    h2->streams[0].id = 1;
+    h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+    h2->hpack_enc.init(kDefaultHeaderTableSize);
+    conn->epoch_held = true;
+    conn->jit_response_body_valid = true;
+    conn->jit_response_body = {nullptr, 0};
+    conn->resp_header_mutation_overflow = false;
+    conn->resp_header_mutation_count = 2;
+    conn->resp_header_mutations[0] = {
+        {"content-type", 12}, {"text/plain", 10}, Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[1] = {
+        {"grpc-message", 12}, {"ordinary%20value", 16}, Connection::RespHeaderMutationMode::Set};
+    JitDispatchOutcome ordinary_outcome{};
+    ordinary_outcome.status_code = 200;
+    ordinary_outcome.response_body_idx = 0xffffu;
+    u8 ordinary_response[1024];
+    H2Dispatch<SmallLoop> ordinary_dispatch{
+        loop.get(), conn, ordinary_response, sizeof(ordinary_response), 0, false};
+    h2_emit_outcome(ordinary_dispatch, 1, ordinary_outcome, nullptr, false);
+    Http2FrameHeader ordinary_frame{};
+    REQUIRE_EQ(parse_frame_header(ordinary_response, ordinary_dispatch.resp_len, &ordinary_frame),
+               ParseStatus::Complete);
+    hpack::DynamicTable ordinary_decoder;
+    ordinary_decoder.init(kDefaultHeaderTableSize);
+    hpack::Header ordinary_headers[4];
+    u8 ordinary_scratch[256];
+    u32 ordinary_count = 0;
+    REQUIRE(hpack::decode_header_block(ordinary_decoder,
+                                       ordinary_response + kFrameHeaderSize,
+                                       ordinary_frame.length,
+                                       ordinary_scratch,
+                                       sizeof(ordinary_scratch),
+                                       ordinary_headers,
+                                       4,
+                                       &ordinary_count));
+    bool ordinary_message = false;
+    for (u32 i = 0; i < ordinary_count; ++i)
+        if (ordinary_headers[i].name.eq(lit_str("grpc-message"))) {
+            ordinary_message = true;
+            CHECK(ordinary_headers[i].value.eq(lit_str("ordinary%20value")));
+        }
+    CHECK(ordinary_message);
     auto reject_message_headers = [&](const Str& message, bool duplicate) {
         h2->init();
         h2->nstreams = 1;

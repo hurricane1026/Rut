@@ -1027,6 +1027,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         messages = 0;
     Str grpc_message{};
     char grpc_message_storage[Http2Conn::kGrpcMessageCap];
+    bool grpc_message_captured = false;
     bool native_grpc = false;
     for (u32 i = 0; i < nhdrs; ++i) {
         if (grpc_header_name(hdrs[i].name, {"content-type", 12})) {
@@ -1058,6 +1059,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             if (grpc_message.len != 0)
                 __builtin_memcpy(grpc_message_storage, grpc_message.ptr, grpc_message.len);
             grpc_message.ptr = grpc_message_storage;
+            grpc_message_captured = true;
         }
         grpc_status = static_cast<u8>(single ? value.ptr[0] - '0' : 10 + value.ptr[1] - '0');
         if (body_len) {
@@ -1125,14 +1127,14 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                                      grpc_status,
                                      grpc_message.ptr,
                                      grpc_message.len,
-                                     messages == 1)) {
+                                     grpc_message_captured)) {
             if (!d.overflow) h2_emit_status(d, stream_id, 500);
         }
     } else {
         // The response header array can share storage with the output buffer. Keep
         // grpc-message in owned bytes while the END_STREAM HEADERS block is built;
         // this also makes trailers-only responses safe across response-buffer reuse.
-        if (messages == 1) hdrs[grpc_message_index].value = grpc_message;
+        if (grpc_message_captured) hdrs[grpc_message_index].value = grpc_message;
         h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, nullptr, 0);
     }
 }
