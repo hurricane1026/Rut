@@ -124,6 +124,122 @@ TEST(json_network, http1_json_body_head_and_keepalive) {
     pool.destroy();
 }
 
+TEST(json_network, local_grpc_web_static_frames_fit_and_keepalive_recycles) {
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 41;
+    // Keep current null so handle_jit_outcome exercises lazy arena setup.
+    conn->json_arena.backend.pool = &pool;
+    u8 send_storage[SlicePool::kSliceSize];
+    u8* original_send_slice = conn->send_slice;
+    const u32 original_send_capacity = SmallLoop::kBufSize;
+    conn->send_buf.bind(send_storage, sizeof(send_storage));
+
+    constexpr u32 kMaxEncoded = 16384;
+    u8 expected[kMaxEncoded]{};
+    u8 native[8197]{};
+    const GrpcWebContentType modes[] = {GrpcWebContentType::Binary, GrpcWebContentType::Text};
+    const u32 frame_lengths[] = {8193, 8194, 8195, 8196, 8197};
+    for (const GrpcWebContentType mode : modes) {
+        for (const u32 frame_len : frame_lengths) {
+            native[0] = 0;
+            const u32 payload_len = frame_len - 5;
+            native[1] = static_cast<u8>(payload_len >> 24);
+            native[2] = static_cast<u8>(payload_len >> 16);
+            native[3] = static_cast<u8>(payload_len >> 8);
+            native[4] = static_cast<u8>(payload_len);
+            for (u32 i = 5; i < frame_len; ++i) native[i] = static_cast<u8>('a' + (i % 23));
+
+            RouteConfig cfg;
+            const u16 body_idx =
+                cfg.add_response_body_view(reinterpret_cast<const char*>(native), frame_len);
+            REQUIRE(body_idx != 0);
+            const char* keys[] = {"content-type", "grpc-status"};
+            const u32 key_lens[] = {12, 11};
+            const char* values[] = {mode == GrpcWebContentType::Text ? "application/grpc-web-text"
+                                                                     : "application/grpc-web",
+                                    "0"};
+            const u32 value_lens[] = {mode == GrpcWebContentType::Text ? 25u : 20u, 1};
+            const u16 headers_idx =
+                cfg.add_response_header_set(keys, key_lens, values, value_lens, 2);
+            REQUIRE(headers_idx != 0);
+
+            JitDispatchOutcome outcome{};
+            outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+            outcome.status_code = 200;
+            outcome.response_body_idx = body_idx;
+            outcome.response_headers_idx = headers_idx;
+            const char* request =
+                "POST /grpc-web HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n";
+            conn->recv_buf.reset();
+            conn->send_buf.reset();
+            REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request),
+                                            __builtin_strlen(request)),
+                       __builtin_strlen(request));
+            capture_request_metadata(*conn);
+            conn->request_config = &cfg;
+            handle_jit_outcome(loop.get(), *conn, outcome, nullptr, true);
+
+            u32 expected_len = 0;
+            REQUIRE(grpc_web_encode_local_response(
+                mode, native, frame_len, 0, {}, {}, expected, sizeof(expected), expected_len));
+            const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+            const std::string response(wire, conn->send_buf.len());
+            CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+            CHECK(response.find("Content-Length: " + std::to_string(expected_len)) !=
+                  std::string::npos);
+            const size_t body_start = response.find("\r\n\r\n");
+            REQUIRE(body_start != std::string::npos);
+            CHECK_EQ(response.size() - (body_start + 4), expected_len);
+            CHECK_EQ(memcmp(response.data() + body_start + 4, expected, expected_len), 0);
+            CHECK(conn->keep_alive);
+            CHECK_EQ(conn->local_body_remaining, 0u);
+            CHECK_EQ(conn->local_response_size, 0u);
+
+            REQUIRE(conn->on_send != nullptr);
+            const auto send_done = conn->on_send;
+            send_done(
+                loop.get(),
+                *conn,
+                {conn->id, static_cast<i32>(conn->send_buf.len()), 0, 0, IoEventType::Send, 0});
+            CHECK(conn->state == ConnState::ReadingHeader || conn->state == ConnState::ReadingBody);
+
+            const char* successor = "GET /next HTTP/1.1\r\nHost: test\r\n\r\n";
+            conn->recv_buf.reset();
+            conn->send_buf.reset();
+            REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(successor),
+                                            __builtin_strlen(successor)),
+                       __builtin_strlen(successor));
+            capture_request_metadata(*conn);
+            conn->request_config = nullptr;
+            JitDispatchOutcome next{};
+            next.kind = JitDispatchOutcome::Kind::ReturnStatus;
+            next.status_code = 200;
+            handle_jit_outcome(loop.get(), *conn, next, nullptr, true);
+            const std::string next_response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                            conn->send_buf.len());
+            CHECK(next_response.starts_with("HTTP/1.1 200 OK\r\n"));
+            CHECK(next_response.ends_with("OK"));
+            CHECK(next_response.find("Content-Length: 2") != std::string::npos);
+            CHECK(next_response.find("Connection: keep-alive") != std::string::npos);
+            REQUIRE(conn->on_send != nullptr);
+            const auto successor_send_done = conn->on_send;
+            successor_send_done(
+                loop.get(),
+                *conn,
+                {conn->id, static_cast<i32>(conn->send_buf.len()), 0, 0, IoEventType::Send, 0});
+            CHECK(conn->state == ConnState::ReadingHeader || conn->state == ConnState::ReadingBody);
+        }
+    }
+    conn->send_buf.bind(original_send_slice, original_send_capacity);
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
 TEST(json_network, http2_response_owns_body_before_next_handler) {
     JsonProgram program;
     REQUIRE(program.init());
