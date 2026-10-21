@@ -1715,6 +1715,9 @@ extern "C" void rut_helper_protobuf(void* conn,
     Str view{};
     i64 scalar = 0;
     if (op & protobuf::kStructArray) {
+        constexpr u64 kAllowed = protobuf::kStructArray | protobuf::kRepeated | protobuf::kEncode |
+                                 (u64{0x1fffffff} << 8) | 255;
+        if (op & ~kAllowed) return;
         const u32 tag = static_cast<u32>(
             (op & ~(protobuf::kStructArray | protobuf::kRepeated | protobuf::kEncode)) >> 8);
         if (!(op & protobuf::kRepeated) || static_cast<u8>(op) != 11) return;
