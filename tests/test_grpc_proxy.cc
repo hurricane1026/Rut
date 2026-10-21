@@ -9360,7 +9360,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             for (u32 off = 0; off < request_body_len;) {
                 const u32 take = (off % 3) + 1 < request_body_len - off ? (off % 3) + 1
                                                                          : request_body_len - off;
-                const std::string chunk = std::to_string(take) + "\r\n" +
+                const std::string extension = off == 0 ? ";" + std::string(17000, 'x') : "";
+                const std::string chunk = std::to_string(take) + extension + "\r\n" +
                                           std::string(reinterpret_cast<const char*>(request_body + off), take) +
                                           "\r\n";
                 REQUIRE(send_all(fd, chunk.data(), chunk.size()));
