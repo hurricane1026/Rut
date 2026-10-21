@@ -3346,6 +3346,9 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (conn.req_body_mode == BodyMode::Chunked) {
+        // Count newly received wire bytes before collection can return early.
+        conn.downstream_req_size += static_cast<u32>(ev.result);
+        conn.req_size += static_cast<u32>(ev.result);
         if (!conn.grpc_web_local_chunk_active && !conn.grpc_web_local_chunk_done &&
             !start_local_grpc_web_chunked_body(conn)) {
             loop->close_conn(conn);
@@ -3372,11 +3375,6 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     u32 consume = static_cast<u32>(ev.result);
     if (conn.req_body_mode == BodyMode::Chunked) {
-        // Chunked collector compaction does not own access-log accounting.
-        // Every newly received wire byte must be counted here, including bytes
-        // that complete an invalid request.
-        conn.downstream_req_size += consume;
-        conn.req_size += consume;
         consume = 0;
     }
     if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
