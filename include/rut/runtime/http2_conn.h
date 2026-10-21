@@ -231,6 +231,10 @@ struct Http2Conn {
     bool outbound_final_staged;
     H2OutboundBodySource outbound_source;
     u8 outbound_grpc_status;  // 0..16: trailers follow DATA; 255: ordinary HTTP.
+    static constexpr u32 kGrpcMessageCap = 1024;
+    char outbound_grpc_message[kGrpcMessageCap];
+    u32 outbound_grpc_message_len;
+    bool outbound_grpc_message_present;
     u32 queued_stream;
     const RouteConfig* queued_config;
     const u8* queued_body;
@@ -239,6 +243,9 @@ struct Http2Conn {
     bool queued_final_staged;
     H2OutboundBodySource queued_source;
     u8 queued_grpc_status;
+    char queued_grpc_message[kGrpcMessageCap];
+    u32 queued_grpc_message_len;
+    bool queued_grpc_message_present;
     // Small JIT bodies fit inline; larger (up to one SlicePool slice) bodies
     // borrow a pool slice until their final DATA frame or cancellation.
     u8 jit_outbound_body[8192];

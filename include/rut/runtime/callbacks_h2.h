@@ -203,6 +203,11 @@ inline void h2_promote_queued(Http2Conn& h2) {
     h2.outbound_final_staged = h2.queued_final_staged;
     h2.outbound_source = h2.queued_source;
     h2.outbound_grpc_status = h2.queued_grpc_status;
+    h2.outbound_grpc_message_len = h2.queued_grpc_message_len;
+    h2.outbound_grpc_message_present = h2.queued_grpc_message_present;
+    if (h2.outbound_grpc_message_len != 0)
+        __builtin_memcpy(
+            h2.outbound_grpc_message, h2.queued_grpc_message, h2.outbound_grpc_message_len);
     if (h2.outbound_source == H2OutboundBodySource::JitDynamic) {
         if (h2.jit_queued_slice != nullptr) {
             h2.jit_outbound_slice = h2.jit_queued_slice;
@@ -223,6 +228,8 @@ inline void h2_promote_queued(Http2Conn& h2) {
     h2.queued_final_staged = false;
     h2.queued_source = H2OutboundBodySource::None;
     h2.queued_grpc_status = 255;
+    h2.queued_grpc_message_len = 0;
+    h2.queued_grpc_message_present = false;
 }
 
 inline void h2_clear_primary_outbound(Http2Conn& h2) {
@@ -238,6 +245,8 @@ inline void h2_clear_primary_outbound(Http2Conn& h2) {
     h2.outbound_final_staged = false;
     h2.outbound_source = H2OutboundBodySource::None;
     h2.outbound_grpc_status = 255;
+    h2.outbound_grpc_message_len = 0;
+    h2.outbound_grpc_message_present = false;
 }
 
 inline void h2_clear_queued_outbound(Http2Conn& h2) {
@@ -253,6 +262,8 @@ inline void h2_clear_queued_outbound(Http2Conn& h2) {
     h2.queued_final_staged = false;
     h2.queued_source = H2OutboundBodySource::None;
     h2.queued_grpc_status = 255;
+    h2.queued_grpc_message_len = 0;
+    h2.queued_grpc_message_present = false;
 }
 
 enum class H2PumpStatus : u8 { Blocked, Produced, Invalid };
@@ -288,13 +299,18 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
         const u32 length = h2.outbound_grpc_status < 10 ? 1u : 2u;
         value[0] = static_cast<char>('0' + h2.outbound_grpc_status / (length == 1 ? 1 : 10));
         value[1] = static_cast<char>('0' + h2.outbound_grpc_status % 10);
-        const hpack::Header trailers[] = {{{"grpc-status", 11}, {value, length}}};
+        hpack::Header trailers[2] = {{{"grpc-status", 11}, {value, length}}};
+        u32 trailer_count = 1;
+        if (h2.outbound_grpc_message_present) {
+            trailers[trailer_count++] = {{"grpc-message", 12},
+                                         {h2.outbound_grpc_message, h2.outbound_grpc_message_len}};
+        }
         // A peer SETTINGS_HEADER_TABLE_SIZE may have armed a dynamic-table
         // resize while DATA was flow-control stalled. Stage the trailer with a
         // copy of the connection encoder and commit it only when the complete
         // HEADERS frame fits, so a retry cannot consume the pending update.
-        const u32 n =
-            http2_write_headers(out, cap, h2.outbound_stream, trailers, 1, true, h2.hpack_enc);
+        const u32 n = http2_write_headers(
+            out, cap, h2.outbound_stream, trailers, trailer_count, true, h2.hpack_enc);
         if (!n) return 0;
         h2.outbound_final_staged = true;
         status = H2PumpStatus::Produced;
@@ -349,9 +365,15 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
                              u32 body_len,
                              H2OutboundBodySource source,
                              const RouteConfig* cfg,
-                             u8 grpc_status = 255) {
+                             u8 grpc_status = 255,
+                             const char* grpc_message = nullptr,
+                             u32 grpc_message_len = 0,
+                             bool grpc_message_present = false) {
     Http2Conn& h2 = *d.conn->h2;
     if (body_len == 0 || !d.conn->epoch_held || h2.find_stream(stream_id) == nullptr) return false;
+    if (grpc_message_len > Http2Conn::kGrpcMessageCap ||
+        (grpc_message_len != 0 && grpc_message == nullptr))
+        return false;
     const bool queued = h2.outbound_stream != 0;
     if (d.resp_len > d.resp_cap) {
         d.overflow = true;
@@ -419,6 +441,10 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         h2.queued_final_staged = false;
         h2.queued_source = source;
         h2.queued_grpc_status = grpc_status;
+        h2.queued_grpc_message_len = grpc_message_len;
+        h2.queued_grpc_message_present = grpc_message_present;
+        if (grpc_message_len != 0)
+            __builtin_memcpy(h2.queued_grpc_message, grpc_message, grpc_message_len);
         h2.jit_queued_slice = body_slice;
         h2.jit_queued_pool = body_pool;
     } else {
@@ -431,6 +457,10 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         h2.outbound_final_staged = false;
         h2.outbound_source = source;
         h2.outbound_grpc_status = grpc_status;
+        h2.outbound_grpc_message_len = grpc_message_len;
+        h2.outbound_grpc_message_present = grpc_message_present;
+        if (grpc_message_len != 0)
+            __builtin_memcpy(h2.outbound_grpc_message, grpc_message, grpc_message_len);
         h2.jit_outbound_slice = body_slice;
         h2.jit_outbound_pool = body_pool;
     }
@@ -993,7 +1023,10 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         }
     }
     u8 grpc_status = 255;
-    u32 grpc_status_index = nhdrs, content_types = 0, statuses = 0;
+    u32 grpc_status_index = nhdrs, grpc_message_index = nhdrs, content_types = 0, statuses = 0,
+        messages = 0;
+    Str grpc_message{};
+    char grpc_message_storage[Http2Conn::kGrpcMessageCap];
     bool native_grpc = false;
     for (u32 i = 0; i < nhdrs; ++i) {
         if (grpc_header_name(hdrs[i].name, {"content-type", 12})) {
@@ -1004,16 +1037,27 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             ++statuses;
             grpc_status_index = i;
         }
+        if (grpc_header_name(hdrs[i].name, {"grpc-message", 12})) {
+            ++messages;
+            grpc_message_index = i;
+        }
     }
     if (native_grpc && statuses) {
         const Str value = hdrs[grpc_status_index].value;
+        if (messages == 1) grpc_message = hdrs[grpc_message_index].value;
         const bool single = value.len == 1 && value.ptr[0] >= '0' && value.ptr[0] <= '9';
         const bool two =
             value.len == 2 && value.ptr[0] == '1' && value.ptr[1] >= '0' && value.ptr[1] <= '6';
-        if (content_types != 1 || statuses != 1 || (!single && !two) || o.status_code != 200 ||
-            is_head) {
+        if (content_types != 1 || statuses != 1 || messages > 1 ||
+            grpc_message.len > Http2Conn::kGrpcMessageCap || (!single && !two) ||
+            o.status_code != 200 || is_head) {
             h2_emit_status(d, stream_id, 500);
             return;
+        }
+        if (messages == 1) {
+            if (grpc_message.len != 0)
+                __builtin_memcpy(grpc_message_storage, grpc_message.ptr, grpc_message.len);
+            grpc_message.ptr = grpc_message_storage;
         }
         grpc_status = static_cast<u8>(single ? value.ptr[0] - '0' : 10 + value.ptr[1] - '0');
         if (body_len) {
@@ -1028,8 +1072,15 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 500);
                 return;
             }
-            for (u32 j = grpc_status_index + 1; j < nhdrs; ++j) hdrs[j - 1] = hdrs[j];
-            --nhdrs;
+            for (u32 i = 0; i < nhdrs;) {
+                if (grpc_header_name(hdrs[i].name, {"grpc-status", 11}) ||
+                    grpc_header_name(hdrs[i].name, {"grpc-message", 12})) {
+                    for (u32 j = i + 1; j < nhdrs; ++j) hdrs[j - 1] = hdrs[j];
+                    --nhdrs;
+                } else {
+                    ++i;
+                }
+            }
         }
     }
     // Statuses that cannot carry a representation body are serialized without
@@ -1071,10 +1122,17 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                                          ? H2OutboundBodySource::JitDynamic
                                          : H2OutboundBodySource::RouteConfig,
                                      cfg,
-                                     grpc_status)) {
+                                     grpc_status,
+                                     grpc_message.ptr,
+                                     grpc_message.len,
+                                     messages == 1)) {
             if (!d.overflow) h2_emit_status(d, stream_id, 500);
         }
     } else {
+        // The response header array can share storage with the output buffer. Keep
+        // grpc-message in owned bytes while the END_STREAM HEADERS block is built;
+        // this also makes trailers-only responses safe across response-buffer reuse.
+        if (messages == 1) hdrs[grpc_message_index].value = grpc_message;
         h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, nullptr, 0);
     }
 }

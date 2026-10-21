@@ -1173,10 +1173,13 @@ kTLS integration also remain unimplemented. See [ebpf.md](ebpf.md).
 A local handler can return `response(200, headers: {"content-type":
 "application/grpc+proto", "grpc-status": "0"}, body: framed)` after composing
 `grpc.decode` and `grpc.encode` (or the low-level envelope and protobuf helpers). For these explicitly
-marked responses, HTTP/2 emits the status as trailing HEADERS after all DATA.
+marked responses, HTTP/2 emits `grpc-status` and an optional `grpc-message` as
+trailing HEADERS after all DATA. `grpc-message` is preserved byte-for-byte,
+including percent encoding, and is limited to 1,024 bytes.
 An empty response with the same headers is a trailers-only response; use a
 nonzero status for a failed RPC. Status values must be canonical decimal 0–16,
-with exactly one content type and one grpc-status. Nonempty bodies must contain
+with exactly one content type and one grpc-status; at most one grpc-message is
+accepted. Nonempty bodies must contain
 one complete uncompressed envelope with at most 8 KiB of payload. Invalid output
 fails closed with HTTP 500 before publishing a response body.
 
