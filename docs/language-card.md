@@ -1175,11 +1175,16 @@ A local handler can return `response(200, headers: {"content-type":
 `grpc.decode` and `grpc.encode` (or the low-level envelope and protobuf helpers). For these explicitly
 marked responses, HTTP/2 emits `grpc-status` and an optional `grpc-message` as
 trailing HEADERS after all DATA. `grpc-message` is preserved byte-for-byte,
-including percent encoding, and is limited to 1,024 bytes.
+including percent encoding, and is limited to 1,024 bytes. An optional
+`grpc-status-details-bin` is preserved as opaque bytes without base64
+decoding or re-encoding and has the same 1,024-byte limit.
 An empty response with the same headers is a trailers-only response; use a
 nonzero status for a failed RPC. Status values must be canonical decimal 0–16,
-with exactly one content type and one grpc-status; at most one grpc-message is
-accepted. Nonempty bodies must contain
+with exactly one content type and one grpc-status; at most one grpc-message and
+one grpc-status-details-bin are accepted. For a bodyful response, these gRPC
+fields are removed from the initial headers and emitted in terminal HEADERS;
+an empty response keeps them in its trailers-only HEADERS. Nonempty bodies
+must contain
 one complete uncompressed envelope with at most 8 KiB of payload. Invalid output
 fails closed with HTTP 500 before publishing a response body.
 

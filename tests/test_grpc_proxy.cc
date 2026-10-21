@@ -449,6 +449,10 @@ struct Client {
         bool message_in_trailers = false;
         u32 message_len = 0;
         char message[128]{};
+        u32 status_details_len = 0;
+        u32 status_details_count = 0;
+        bool status_details_in_trailers = false;
+        char status_details[128]{};
         u32 raw_len = 0, max_chunk = 0, response_len = 0;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
              meta = false, trailer = false, raw_request = false, compare_pattern = true,
@@ -530,6 +534,13 @@ struct Client {
                 v < sizeof(rpc.message) - 1 ? static_cast<u32>(v) : sizeof(rpc.message) - 1;
             memcpy(rpc.message, value, rpc.message_len);
             rpc.message[rpc.message_len] = '\0';
+        }
+        if (n == 23 && memcmp(name, "grpc-status-details-bin", n) == 0) {
+            rpc.status_details_count++;
+            rpc.status_details_in_trailers = (f->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+            rpc.status_details_len =
+                v < sizeof(rpc.status_details) ? static_cast<u32>(v) : sizeof(rpc.status_details);
+            memcpy(rpc.status_details, value, rpc.status_details_len);
         }
         if (n == 10 && memcmp(name, "x-meta-bin", n) == 0)
             rpc.meta = v == 8 && memcmp(value, "AAEC/w==", 8) == 0;
@@ -8831,6 +8842,7 @@ TEST(grpc_proxy, message_limits_snapshot_iouring) {
 #if RUT_GRPC_JIT
 #include "protobuf/enum_oracle.inc"
 #include "protobuf/repeated_oracle.inc"
+#include "protobuf/status_details_oracle.inc"
 
 template <typename Loop>
 void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
@@ -8882,7 +8894,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "/../protobuf/codec.proto\", \"example.RepeatedChild\", value) else { return 500 } "
         "guard let framed = grpc.frame(bytes) else { return 500 } "
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
-        "\"grpc-status\": \"0\", \"grpc-message\": \"permission%%20denied%%2Fok\"}, "
+        "\"grpc-status\": \"7\", \"grpc-message\": \"permission%%20denied\", "
+        "\"grpc-status-details-bin\": \"%s\"}, "
         "body: framed) }\n"
         "route POST \"/method.Echo/Call\" { "
         "guard let value = grpc.decode(\"" RUT_GRPC_FIXTURES
@@ -8907,7 +8920,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "route POST \"/local.Error/Call\" { return response(200, headers: {"
         "\"content-type\": \"application/grpc\", \"grpc-status\": \"7\", "
         "\"grpc-message\": \"denied\"}) }\n",
-        get_port(server->listen_fd));
+        get_port(server->listen_fd),
+        kStatusDetailsOracleBase64);
     const bool written = length > 0 && length < static_cast<int>(sizeof(source)) &&
                          write(file, source, length) == length;
     close(file);
@@ -9002,18 +9016,28 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             framed[0] = 0;
             codec(8, framed, sizeof(framed) - 1, 422, nullptr, 0, "/framed");
             codec(9, framed, sizeof(framed), 200, framed, sizeof(framed), "/framed");
-            auto local_rpc = [&](u32 index) {
+            auto local_rpc = [&](u32 index, const char* path = "/local.Echo/Call") {
                 CHECK(client.request_native_raw(
-                          index, framed, sizeof(framed), "1H", nullptr, "/local.Echo/Call") > 0);
+                          index, framed, sizeof(framed), "1H", nullptr, path) > 0);
                 client.rpcs[index].max_chunk = 1;
+                const bool data_complete = client.until(index, false);
+                CHECK(data_complete);
                 const bool completed = client.until(index, true);
                 CHECK(completed);
                 if (completed) {
-                    CHECK(client.rpcs[index].ok);
+                    CHECK(!client.rpcs[index].ok);
+                    CHECK_EQ(client.rpcs[index].status, 7u);
                     CHECK(client.rpcs[index].status_in_trailers);
                     CHECK(client.rpcs[index].message_in_trailers);
-                    CHECK_EQ(client.rpcs[index].message_len, 24u);
-                    CHECK(memcmp(client.rpcs[index].message, "permission%20denied%2Fok", 24) == 0);
+                    CHECK_EQ(client.rpcs[index].message_len, 19u);
+                    CHECK(memcmp(client.rpcs[index].message, "permission%20denied", 19) == 0);
+                    CHECK_EQ(client.rpcs[index].status_details_count, 1u);
+                    CHECK(client.rpcs[index].status_details_in_trailers);
+                    CHECK_EQ(client.rpcs[index].status_details_len,
+                             sizeof(kStatusDetailsOracleBase64) - 1);
+                    CHECK(memcmp(client.rpcs[index].status_details,
+                                 kStatusDetailsOracleBase64,
+                                 sizeof(kStatusDetailsOracleBase64) - 1) == 0);
                     CHECK_EQ(client.rpcs[index].http_status, 200u);
                     CHECK_EQ(client.rpcs[index].response_len, sizeof(framed));
                     if (client.rpcs[index].response_len == sizeof(framed))
@@ -9035,6 +9059,7 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                 if (!client.step()) break;
             CHECK_EQ(client.rpcs[12].http_status, 200u);
             CHECK_EQ(client.rpcs[12].response_len, 0u);
+            CHECK_EQ(client.rpcs[12].status_details_count, 0u);
             CHECK_EQ(nghttp2_submit_rst_stream(
                          client.session, NGHTTP2_FLAG_NONE, stalled, NGHTTP2_CANCEL),
                      0);
@@ -9058,7 +9083,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                       15, maximum, sizeof(maximum), "1H", nullptr, "/local.Echo/Call") > 0);
             client.rpcs[15].max_chunk = 17;
             CHECK(client.until(15, true));
-            CHECK(client.rpcs[15].ok && client.rpcs[15].status_in_trailers);
+            CHECK(!client.rpcs[15].ok && client.rpcs[15].status_in_trailers);
+            CHECK_EQ(client.rpcs[15].status, 7u);
             CHECK_EQ(client.rpcs[15].response_len, sizeof(maximum));
             if (client.rpcs[15].response_len == sizeof(maximum))
                 CHECK(memcmp(client.rpcs[15].response.get(), maximum, sizeof(maximum)) == 0);

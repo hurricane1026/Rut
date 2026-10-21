@@ -833,6 +833,10 @@ TEST(json_network, grpc_local_trailers_follow_data_without_flow_control_credit) 
     __builtin_memcpy(h2->outbound_grpc_message, first_message, sizeof(first_message) - 1);
     h2->outbound_grpc_message_len = sizeof(first_message) - 1;
     h2->outbound_grpc_message_present = true;
+    const char first_details[] = "opaque-details";
+    __builtin_memcpy(h2->outbound_grpc_status_details, first_details, sizeof(first_details) - 1);
+    h2->outbound_grpc_status_details_len = sizeof(first_details) - 1;
+    h2->outbound_grpc_status_details_present = true;
     stream->send_window = 2;
     h2->conn_send_window = 5;
     u8 bytes[128];
@@ -870,11 +874,15 @@ TEST(json_network, grpc_local_trailers_follow_data_without_flow_control_credit) 
                                        4,
                                        &trailer_count));
     bool saw_message = false;
+    bool saw_details = false;
     for (u32 i = 0; i < trailer_count; ++i)
         if (trailer_headers[i].name.eq(lit_str("grpc-message"))) {
             saw_message = trailer_headers[i].value.eq(lit_str("first%20message"));
-        }
+        } else if (trailer_headers[i].name.eq(lit_str("grpc-status-details-bin")))
+            saw_details =
+                trailer_headers[i].value.eq(Str{first_details, sizeof(first_details) - 1});
     CHECK(saw_message);
+    CHECK(saw_details);
     CHECK_EQ(h2_pump_outbound(*h2, bytes, sizeof(bytes), status), 0u);
     h2_clear_outbound(*h2);
     CHECK_EQ(h2->outbound_grpc_status, 255u);
@@ -888,6 +896,10 @@ TEST(json_network, grpc_local_trailers_follow_data_without_flow_control_credit) 
     __builtin_memcpy(h2->queued_grpc_message, second_message, sizeof(second_message) - 1);
     h2->queued_grpc_message_len = sizeof(second_message) - 1;
     h2->queued_grpc_message_present = true;
+    const char second_details[] = "queued-details";
+    __builtin_memcpy(h2->queued_grpc_status_details, second_details, sizeof(second_details) - 1);
+    h2->queued_grpc_status_details_len = sizeof(second_details) - 1;
+    h2->queued_grpc_status_details_present = true;
     h2_promote_queued(*h2);
     CHECK_EQ(h2->outbound_stream, 3u);
     CHECK_EQ(h2->outbound_grpc_status, 7u);
@@ -895,12 +907,20 @@ TEST(json_network, grpc_local_trailers_follow_data_without_flow_control_credit) 
     CHECK_EQ(h2->outbound_grpc_message_len, sizeof(second_message) - 1);
     CHECK(__builtin_memcmp(h2->outbound_grpc_message, second_message, sizeof(second_message) - 1) ==
           0);
+    CHECK(h2->outbound_grpc_status_details_present);
+    CHECK_EQ(h2->outbound_grpc_status_details_len, sizeof(second_details) - 1);
+    CHECK(__builtin_memcmp(
+              h2->outbound_grpc_status_details, second_details, sizeof(second_details) - 1) == 0);
     CHECK_EQ(h2->queued_grpc_status, 255u);
     CHECK(!h2->queued_grpc_message_present);
     CHECK_EQ(h2->queued_grpc_message_len, 0u);
+    CHECK(!h2->queued_grpc_status_details_present);
+    CHECK_EQ(h2->queued_grpc_status_details_len, 0u);
     h2_clear_outbound(*h2);
     CHECK(!h2->outbound_grpc_message_present);
     CHECK_EQ(h2->outbound_grpc_message_len, 0u);
+    CHECK(!h2->outbound_grpc_status_details_present);
+    CHECK_EQ(h2->outbound_grpc_status_details_len, 0u);
     h2->outbound_stream = 1;
     h2->outbound_body = body;
     h2->outbound_body_len = sizeof(body);
@@ -1114,10 +1134,65 @@ TEST(json_network, grpc_local_response_rejects_invalid_status_or_frame_before_st
         REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &frame), ParseStatus::Complete);
         CHECK_EQ(frame.flags & http2_flag::kEndStream, http2_flag::kEndStream);
     };
+    auto reject_details_headers = [&](const Str& details, bool duplicate) {
+        h2->init();
+        h2->nstreams = 1;
+        h2->streams[0].id = 1;
+        h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+        conn->epoch_held = true;
+        conn->jit_response_body_valid = true;
+        conn->jit_response_body = {good, 5};
+        conn->resp_header_mutation_count = duplicate ? 4 : 3;
+        conn->resp_header_mutations[0] = {{"content-type", 12},
+                                          {"application/grpc", 16},
+                                          Connection::RespHeaderMutationMode::Set};
+        conn->resp_header_mutations[1] = {
+            {"grpc-status", 11}, {"0", 1}, Connection::RespHeaderMutationMode::Set};
+        conn->resp_header_mutations[2] = {
+            {"grpc-status-details-bin", 23}, details, Connection::RespHeaderMutationMode::Set};
+        if (duplicate)
+            conn->resp_header_mutations[3] = {{"GRPC-STATUS-DETAILS-BIN", 23},
+                                              {"duplicate", 9},
+                                              Connection::RespHeaderMutationMode::Add};
+        JitDispatchOutcome outcome{};
+        outcome.status_code = 200;
+        outcome.response_body_idx = 0xffffu;
+        u8 response[2048];
+        H2Dispatch<SmallLoop> dispatch{loop.get(), conn, response, sizeof(response), 0, false};
+        h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+        CHECK_EQ(h2->outbound_stream, 0u);
+        CHECK_EQ(h2->queued_stream, 0u);
+        CHECK(!h2->outbound_grpc_status_details_present);
+        CHECK_EQ(h2->outbound_grpc_status_details_len, 0u);
+        CHECK(!h2->queued_grpc_status_details_present);
+        CHECK_EQ(h2->queued_grpc_status_details_len, 0u);
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &frame), ParseStatus::Complete);
+        hpack::DynamicTable decoder;
+        decoder.init(kDefaultHeaderTableSize);
+        hpack::Header headers[4];
+        u8 scratch[256];
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(decoder,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           4,
+                                           &count));
+        bool failed_closed = false;
+        for (u32 i = 0; i < count; ++i)
+            failed_closed |=
+                headers[i].name.eq(lit_str(":status")) && headers[i].value.eq(lit_str("500"));
+        CHECK(failed_closed);
+    };
     char oversized_message[1025];
     __builtin_memset(oversized_message, 'a', sizeof(oversized_message));
     reject_message_headers({"denied", 6}, true);
     reject_message_headers({oversized_message, sizeof(oversized_message)}, false);
+    reject_details_headers({"opaque-details", 14}, true);
+    reject_details_headers({oversized_message, sizeof(oversized_message)}, false);
     char boundary_message[1024];
     __builtin_memset(boundary_message, 'b', sizeof(boundary_message));
     h2->init();
@@ -1145,6 +1220,140 @@ TEST(json_network, grpc_local_response_rejects_invalid_status_or_frame_before_st
     CHECK_EQ(h2->outbound_stream, 1u);
     CHECK(h2->outbound_grpc_message_present);
     CHECK_EQ(h2->outbound_grpc_message_len, 1024u);
+    conn->resp_header_mutation_count = 3;
+    char accepted_details[] = "boundary-details";
+    const char expected_details_storage[] = "boundary-details";
+    const Str expected_details{expected_details_storage, sizeof(expected_details_storage) - 1};
+    conn->resp_header_mutations[2] = {{"grpc-status-details-bin", 23},
+                                      {accepted_details, sizeof(accepted_details) - 1},
+                                      Connection::RespHeaderMutationMode::Set};
+    u8 details_boundary_response[4096];
+    H2Dispatch<SmallLoop> details_boundary_dispatch{
+        loop.get(), conn, details_boundary_response, sizeof(details_boundary_response), 0, false};
+    h2->init();
+    h2->nstreams = 1;
+    h2->streams[0].id = 1;
+    h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+    conn->epoch_held = true;
+    conn->jit_response_body_valid = true;
+    conn->jit_response_body = {good, 5};
+    conn->resp_header_mutation_overflow = false;
+    h2_emit_outcome(details_boundary_dispatch, 1, boundary_outcome, nullptr, false);
+    CHECK_EQ(h2->outbound_stream, 1u);
+    CHECK(h2->outbound_grpc_status_details_present);
+    CHECK_EQ(h2->outbound_grpc_status_details_len, sizeof(accepted_details) - 1);
+    Http2FrameHeader initial_frame{};
+    REQUIRE_EQ(parse_frame_header(
+                   details_boundary_response, details_boundary_dispatch.resp_len, &initial_frame),
+               ParseStatus::Complete);
+    hpack::DynamicTable wire_decoder;
+    wire_decoder.init(kDefaultHeaderTableSize);
+    hpack::Header initial_headers[8];
+    u8 initial_scratch[2048];
+    u32 initial_count = 0;
+    REQUIRE(hpack::decode_header_block(wire_decoder,
+                                       details_boundary_response + kFrameHeaderSize,
+                                       initial_frame.length,
+                                       initial_scratch,
+                                       sizeof(initial_scratch),
+                                       initial_headers,
+                                       8,
+                                       &initial_count));
+    for (u32 i = 0; i < initial_count; ++i)
+        CHECK(!initial_headers[i].name.eq(lit_str("grpc-status-details-bin")));
+    h2_commit_owned_hpack(details_boundary_dispatch);
+    __builtin_memset(accepted_details, 'z', sizeof(accepted_details) - 1);
+    h2->conn_send_window = 5;
+    h2->streams[0].send_window = 5;
+    u8 wire[2048];
+    H2PumpStatus wire_status{};
+    CHECK(h2_pump_outbound(*h2, wire, sizeof(wire), wire_status) != 0);
+    CHECK_EQ(wire[4] & 1u, 0u);
+    h2->conn_send_window = 5;
+    h2->streams[0].send_window = 5;
+    u32 wire_len = h2_pump_outbound(*h2, wire, sizeof(wire), wire_status);
+    if (wire_len != 0 && wire[3] != 1) {
+        h2->conn_send_window = 5;
+        h2->streams[0].send_window = 5;
+        wire_len = h2_pump_outbound(*h2, wire, sizeof(wire), wire_status);
+    }
+    CHECK(wire_len > 9u);
+    CHECK_EQ(wire[3], 1u);
+    Http2FrameHeader final_frame{};
+    REQUIRE_EQ(parse_frame_header(wire, wire_len, &final_frame), ParseStatus::Complete);
+    h2_clear_outbound(*h2);
+    CHECK_EQ(final_frame.flags & http2_flag::kEndStream, http2_flag::kEndStream);
+    hpack::Header final_headers[8];
+    u8 final_scratch[2048];
+    u32 final_count = 0;
+    REQUIRE(hpack::decode_header_block(wire_decoder,
+                                       wire + kFrameHeaderSize,
+                                       final_frame.length,
+                                       final_scratch,
+                                       sizeof(final_scratch),
+                                       final_headers,
+                                       8,
+                                       &final_count));
+    bool preserved_details = false;
+    for (u32 i = 0; i < final_count; ++i)
+        if (final_headers[i].name.eq(lit_str("grpc-status-details-bin"))) {
+            preserved_details = final_headers[i].value.eq(expected_details);
+        }
+    CHECK(preserved_details);
+    h2->init();
+    h2->nstreams = 1;
+    h2->streams[0].id = 1;
+    h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+    conn->epoch_held = true;
+    conn->jit_response_body_valid = true;
+    conn->jit_response_body = {nullptr, 0};
+    conn->resp_header_mutation_count = 3;
+    conn->resp_header_mutations[0] = {
+        {"content-type", 12}, {"application/grpc", 16}, Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[1] = {
+        {"grpc-status", 11}, {"7", 1}, Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[2] = {{"grpc-status-details-bin", 23},
+                                      {accepted_details, sizeof(accepted_details) - 1},
+                                      Connection::RespHeaderMutationMode::Set};
+    u8 bodyless_response[2048];
+    H2Dispatch<SmallLoop> bodyless_dispatch{
+        loop.get(), conn, bodyless_response, sizeof(bodyless_response), 0, false};
+    JitDispatchOutcome bodyless_outcome{};
+    bodyless_outcome.status_code = 200;
+    bodyless_outcome.response_body_idx = 0xffffu;
+    h2_emit_outcome(bodyless_dispatch, 1, bodyless_outcome, nullptr, false);
+    Http2FrameHeader bodyless_frame{};
+    REQUIRE_EQ(parse_frame_header(bodyless_response, bodyless_dispatch.resp_len, &bodyless_frame),
+               ParseStatus::Complete);
+    CHECK_EQ(bodyless_frame.flags & http2_flag::kEndStream, http2_flag::kEndStream);
+    hpack::DynamicTable bodyless_decoder;
+    bodyless_decoder.init(kDefaultHeaderTableSize);
+    hpack::Header bodyless_headers[8];
+    u8 bodyless_scratch[2048];
+    u32 bodyless_count = 0;
+    REQUIRE(hpack::decode_header_block(bodyless_decoder,
+                                       bodyless_response + kFrameHeaderSize,
+                                       bodyless_frame.length,
+                                       bodyless_scratch,
+                                       sizeof(bodyless_scratch),
+                                       bodyless_headers,
+                                       8,
+                                       &bodyless_count));
+    bool bodyless_details = false;
+    bool bodyless_status = false;
+    u32 bodyless_details_count = 0;
+    for (u32 i = 0; i < bodyless_count; ++i)
+        if (bodyless_headers[i].name.eq(lit_str("grpc-status-details-bin"))) {
+            ++bodyless_details_count;
+            bodyless_details =
+                bodyless_headers[i].value.eq(Str{accepted_details, sizeof(accepted_details) - 1});
+        } else if (bodyless_headers[i].name.eq(lit_str("grpc-status")))
+            bodyless_status = bodyless_headers[i].value.eq(lit_str("7"));
+    CHECK(bodyless_details);
+    CHECK_EQ(bodyless_details_count, 1u);
+    CHECK(bodyless_status);
+    CHECK_EQ(h2->outbound_stream, 0u);
+    CHECK_EQ(h2->queued_stream, 0u);
     conn->h2 = nullptr;
     loop->free_conn(*conn);
 }

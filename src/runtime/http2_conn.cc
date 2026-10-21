@@ -113,6 +113,8 @@ void Http2Conn::init() {
     outbound_grpc_status = 255;
     outbound_grpc_message_len = 0;
     outbound_grpc_message_present = false;
+    outbound_grpc_status_details_len = 0;
+    outbound_grpc_status_details_present = false;
     queued_stream = 0;
     queued_config = nullptr;
     queued_body = nullptr;
@@ -123,6 +125,8 @@ void Http2Conn::init() {
     queued_grpc_status = 255;
     queued_grpc_message_len = 0;
     queued_grpc_message_present = false;
+    queued_grpc_status_details_len = 0;
+    queued_grpc_status_details_present = false;
     jit_outbound_slice = nullptr;
     jit_outbound_pool = nullptr;
     jit_queued_slice = nullptr;
@@ -145,6 +149,8 @@ void h2_clear_outbound(Http2Conn& h2) {
     h2.outbound_grpc_status = 255;
     h2.outbound_grpc_message_len = 0;
     h2.outbound_grpc_message_present = false;
+    h2.outbound_grpc_status_details_len = 0;
+    h2.outbound_grpc_status_details_present = false;
 
     if (h2.jit_queued_slice != nullptr && h2.jit_queued_pool != nullptr)
         h2.jit_queued_pool->free(h2.jit_queued_slice);
@@ -160,6 +166,8 @@ void h2_clear_outbound(Http2Conn& h2) {
     h2.queued_grpc_status = 255;
     h2.queued_grpc_message_len = 0;
     h2.queued_grpc_message_present = false;
+    h2.queued_grpc_status_details_len = 0;
+    h2.queued_grpc_status_details_present = false;
 }
 
 Http2Stream* Http2Conn::find_stream(u32 id) {
