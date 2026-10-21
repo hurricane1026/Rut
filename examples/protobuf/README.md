@@ -79,7 +79,7 @@ nested values. Inputs are raw protobuf payloads, without gRPC envelopes.
 
 `examples/protobuf-repeated.rut` shows `example.Batch` with immutable scalar
 arrays. POST `0a 03 01 02 00 12 01 78 12 00` to `/protobuf/repeated`;
-the response is `08 01 08 02 08 00 12 01 78 12 00`. The packed values
+the response is `0a 03 01 02 00 12 01 78 12 00`. The packed values
 `[1, 2, 0]` become one packed numeric field by default; both string elements (`"x"`, `""`)
 are preserved.
 
