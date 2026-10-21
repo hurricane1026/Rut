@@ -1089,7 +1089,10 @@ inline bool prepare_local_grpc_web_response(GrpcWebContentType mode,
             if (grpc_web_content_type({h.value_data, h.value_len}) != mode) return false;
         } else if (http_header_name_eq_ci(h.key_data, h.key_len, "grpc-status", 11)) {
             statuses++;
-            if (!h.value_len || h.value_len > 2) return false;
+            if ((h.value_len != 1 && h.value_len != 2) ||
+                (h.value_len == 2 &&
+                 (h.value_data[0] != '1' || h.value_data[1] < '0' || h.value_data[1] > '6')))
+                return false;
             u32 parsed = 0;
             for (u32 j = 0; j < h.value_len; j++) {
                 if (h.value_data[j] < '0' || h.value_data[j] > '9') return false;
@@ -3889,11 +3892,11 @@ void handle_jit_outcome(Loop* loop,
             }
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
-            const bool segmented_body = has_body && outcome.status_code >= 200 &&
-                                        outcome.status_code != 204 && outcome.status_code != 205 &&
-                                        outcome.status_code != 304 &&
-                                        cfg->response_bodies[outcome.response_body_idx - 1].len >
-                                            RouteConfig::kResponseBodyPoolBytes;
+            bool segmented_body = has_body && outcome.status_code >= 200 &&
+                                  outcome.status_code != 204 && outcome.status_code != 205 &&
+                                  outcome.status_code != 304 &&
+                                  cfg->response_bodies[outcome.response_body_idx - 1].len >
+                                      RouteConfig::kResponseBodyPoolBytes;
             bool direct_file_body = false;
             // io_uring can send a sealed memfd after the header completes. Keep
             // the segmented formatter header-only for every large body; this
@@ -3961,16 +3964,16 @@ void handle_jit_outcome(Loop* loop,
                     body_is_fallback = true;
                 }
                 GrpcWebContentType local_web_mode = GrpcWebContentType::Other;
-                u32 local_web_types = 0;
+                bool local_web_candidate = false;
                 for (u32 i = 0; i < header_count; i++) {
                     if (!http_header_name_eq_ci(
                             kvs[i].key_data, kvs[i].key_len, "Content-Type", 12))
                         continue;
                     local_web_mode = grpc_web_content_type({kvs[i].value_data, kvs[i].value_len});
-                    local_web_types++;
+                    local_web_candidate |= local_web_mode == GrpcWebContentType::Binary ||
+                                           local_web_mode == GrpcWebContentType::Text;
                 }
-                if (local_web_types == 1 && (local_web_mode == GrpcWebContentType::Binary ||
-                                             local_web_mode == GrpcWebContentType::Text)) {
+                if (local_web_candidate) {
                     if (outcome.status_code != 200 || is_head) response_formatted = false;
                     if (!has_body && !body_idx_invalid) {
                         body_data = nullptr;
@@ -3997,6 +4000,8 @@ void handle_jit_outcome(Loop* loop,
                         response_formatted = false;
                     } else {
                         body_is_fallback = false;
+                        segmented_body = false;
+                        direct_file_body = false;
                     }
                 }
                 if (!response_formatted) {

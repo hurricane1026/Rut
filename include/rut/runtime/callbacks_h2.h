@@ -990,7 +990,11 @@ inline bool prepare_local_grpc_web_h2_response(GrpcWebContentType mode,
             if (grpc_web_content_type(headers[i].value) != mode) return false;
         } else if (grpc_header_name(headers[i].name, {"grpc-status", 11})) {
             statuses++;
-            if (!headers[i].value.len || headers[i].value.len > 2) return false;
+            if ((headers[i].value.len != 1 && headers[i].value.len != 2) ||
+                (headers[i].value.len == 2 &&
+                 (headers[i].value.ptr[0] != '1' || headers[i].value.ptr[1] < '0' ||
+                  headers[i].value.ptr[1] > '6')))
+                return false;
             u32 parsed = 0;
             for (u32 j = 0; j < headers[i].value.len; j++) {
                 const char c = headers[i].value.ptr[j];
@@ -1128,14 +1132,14 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         }
     }
     GrpcWebContentType local_web_mode = GrpcWebContentType::Other;
-    u32 local_web_types = 0;
+    bool local_web_candidate = false;
     for (u32 i = 0; i < nhdrs; i++) {
         if (!grpc_header_name(hdrs[i].name, {"content-type", 12})) continue;
         local_web_mode = grpc_web_content_type(hdrs[i].value);
-        local_web_types++;
+        local_web_candidate |= local_web_mode == GrpcWebContentType::Binary ||
+                               local_web_mode == GrpcWebContentType::Text;
     }
-    bool local_web = local_web_types == 1 && (local_web_mode == GrpcWebContentType::Binary ||
-                                              local_web_mode == GrpcWebContentType::Text);
+    bool local_web = local_web_candidate;
     if (local_web) {
         if (o.status_code != 200 || is_head) {
             local_web = false;
