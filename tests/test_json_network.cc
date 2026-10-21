@@ -81,6 +81,148 @@ route POST "/json" {
     }
 };
 
+static u32 web_admission_calls;
+static u32 web_admission_body_len;
+static u8 web_admission_flag;
+static u64 web_admission_handler(void*, jit::HandlerCtx* ctx, const u8* raw, u32 len, void*) {
+    ++web_admission_calls;
+    const char* body = nullptr;
+    rut_helper_req_body_ctx(raw, len, ctx, &body, &web_admission_body_len);
+    web_admission_flag = web_admission_body_len ? static_cast<u8>(body[0]) : 255;
+    return jit::HandlerResult::make_status(422).pack();
+}
+
+TEST(json_network, grpc_web_runtime_admission_precedes_handler) {
+    const std::string valid("\0\0\0\0\1x", 6);
+    struct Case {
+        const char* method;
+        const char* headers;
+        std::string body;
+        bool accepted;
+        bool fail_arena = false;
+    };
+    const Case cases[] = {
+        {"POST", "Content-Type: application/grpc-web\r\n", valid, true},
+        {"POST", "Content-Type: application/grpc-web+proto\r\n", valid, true},
+        {"POST", "Content-Type: application/grpc-web-text+proto\r\n", "AAAAAAF4", true},
+        // Each source byte is independently padded, including the frame prefix.
+        {"POST", "Content-Type: application/grpc-web-text\r\n", "AA==AA==AA==AA==AQ==eA==", true},
+        {"GET", "Content-Type: application/grpc-web\r\n", valid, false},
+        {"POST", "Content-Type: application/grpc-web+json\r\n", valid, false},
+        {"POST",
+         "Content-Type: application/grpc-web\r\nContent-Type: text/plain\r\n",
+         valid,
+         false},
+        {"POST",
+         "Content-Type: text/plain\r\nContent-Type: application/grpc-web\r\n",
+         valid,
+         false},
+        {"POST", "Content-Type: application/grpc-web\r\n", std::string("\1\0\0\0\1x", 6), false},
+        {"POST", "Content-Type: application/grpc-web\r\n", std::string("\x80\0\0\0\1x", 6), false},
+        {"POST", "Content-Type: application/grpc-web\r\n", valid.substr(0, 5), false},
+        {"POST", "Content-Type: application/grpc-web\r\n", valid + valid, false},
+        {"POST", "Content-Type: application/grpc-web\r\n", std::string("\0\0\0\0\2x", 6), false},
+        {"POST", "Content-Type: application/grpc-web-text\r\n", "AAAAAAF!", false},
+        {"POST", "Content-Type: application/grpc-web-text\r\n", "A===", false},
+        {"POST", "Content-Type: application/grpc-web-text\r\n", "AB==", false},
+        {"POST",
+         "Content-Type: application/grpc-web\r\n",
+         std::string("\0\0\0\x20\0", 5) + std::string(8192, 'x'),
+         true},
+        {"POST",
+         "Content-Type: application/grpc-web\r\n",
+         std::string("\0\0\0\x20\1", 5) + std::string(8193, 'x'),
+         false},
+        {"POST", "Content-Type: application/grpc-web\r\n", valid, false, true},
+    };
+    for (const auto& item : cases) {
+        const std::string request = std::string(item.method) + " /body HTTP/1.1\r\nHost: test\r\n" +
+                                    item.headers +
+                                    "Content-Length: " + std::to_string(item.body.size()) +
+                                    "\r\nConnection: close\r\n\r\n" + item.body;
+        for (bool h2_path : {false, true}) {
+            auto loop = std::make_unique<SmallLoop>();
+            loop->setup();
+            SlicePool pool;
+            REQUIRE(pool.init(16));
+            auto config = std::make_unique<RouteConfig>();
+            REQUIRE(config->add_jit_handler("/body", 0, &web_admission_handler, true));
+            const RouteConfig* config_ptr = config.get();
+            loop->config_ptr = &config_ptr;
+            auto* conn = loop->alloc_conn();
+            REQUIRE(conn);
+            conn->fd = 41;
+            conn->json_arena.backend.pool = item.fail_arena ? nullptr : &pool;
+            web_admission_calls = 0;
+            web_admission_body_len = 0;
+            web_admission_flag = 255;
+            if (!h2_path) {
+                u8 input[16384];
+                conn->recv_buf.bind(input, sizeof(input));
+                REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()),
+                                                request.size()),
+                           request.size());
+                on_header_received<SmallLoop>(
+                    loop.get(),
+                    *conn,
+                    IoEvent{
+                        conn->id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+                CHECK_EQ(conn->resp_status, item.accepted ? 422u : 400u);
+            } else {
+                auto h2 = std::make_unique<Http2Conn>();
+                h2->init();
+                h2->nstreams = 1;
+                h2->streams[0].id = 1;
+                h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+                conn->h2 = h2.get();
+                u8 response[1024];
+                H2Dispatch<SmallLoop> dispatch{
+                    loop.get(), conn, response, sizeof(response), 0, false};
+                h2_invoke_emit(dispatch,
+                               1,
+                               &config->routes[0],
+                               nullptr,
+                               0,
+                               config.get(),
+                               reinterpret_cast<const u8*>(request.data()),
+                               request.size(),
+                               true,
+                               true);
+                Http2FrameHeader frame{};
+                REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &frame),
+                           ParseStatus::Complete);
+                hpack::DynamicTable decoder;
+                decoder.init(kDefaultHeaderTableSize);
+                hpack::Header headers[8];
+                u8 scratch[512];
+                u32 count = 0;
+                REQUIRE(hpack::decode_header_block(decoder,
+                                                   response + kFrameHeaderSize,
+                                                   frame.length,
+                                                   scratch,
+                                                   sizeof(scratch),
+                                                   headers,
+                                                   8,
+                                                   &count));
+                bool status_matches = false;
+                for (u32 i = 0; i < count; ++i)
+                    if (headers[i].name.eq(lit_str(":status")))
+                        status_matches =
+                            headers[i].value.eq(item.accepted ? lit_str("422") : lit_str("400"));
+                CHECK(status_matches);
+                conn->h2 = nullptr;
+            }
+            CHECK_EQ(web_admission_calls, item.accepted ? 1u : 0u);
+            if (item.accepted) {
+                CHECK_EQ(web_admission_flag, 0u);
+                CHECK_EQ(web_admission_body_len, item.body.size() >= 8197 ? 8197u : 6u);
+            }
+            loop->free_conn(*conn);
+            pool.destroy();
+        }
+    }
+}
+
 TEST(json_network, http1_json_body_head_and_keepalive) {
     JsonProgram program;
     REQUIRE(program.init());

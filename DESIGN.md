@@ -8173,7 +8173,32 @@ These operations bridge opaque message bytes to the payload codec; HTTP/JSON
 transcoding and local gRPC status/trailer generation remain separate work.
 
 
-### Local unary response completion
+### Local unary request views and response completion
+
+Body-reading POST JIT routes validate gRPC-Web binary/text requests before
+invoking user code. One uncompressed native envelope with a payload of at most
+8 KiB is exposed through `req.body`; `+proto` is accepted and JSON suffixes,
+duplicate content types, trailer frames, concatenated messages and malformed
+envelopes are rejected with HTTP 400. Text uses the existing incremental
+Base64 decoder, including independently padded flush blocks.
+Existing transport buffering limits still apply to encoded Content-Length
+and HTTP/2 bodies independently of the decoded payload budget.
+
+`HandlerCtx` carries a request-body view override backed by the request Arena.
+The body helper consults that view while other request helpers and forwarding
+continue to use the transport representation where forwarding is supported.
+Body-reading HTTP/2 Forward remains unsupported and returns HTTP 503.
+The view survives yields and is
+cleared with the request context. HTTP/2 retains its synthesized transport
+request and validates incoming Content-Length against raw DATA before exposing
+the decoded view. HTTP/1.1 Content-Length retains the original wire buffer.
+The new HTTP/1.1 chunked local collector consumes fragments incrementally,
+bounds chunk framing to 32 KiB and does not mix a same-read successor into the
+RPC body. It closes after the local response. A Forward outcome on this new
+chunked path is rejected before upstream publication, including after a yield;
+chunked JIT forwarding remains unsupported. Direct proxy routes and header-only
+handlers do not use this transformation. This adds no streaming handler,
+automatic service dispatch, CORS policy, JSON mapping or local deadline support.
 
 An explicit local response with `application/grpc-web` or
 `application/grpc-web-text` (optionally `+proto`) uses the same bounded unary
