@@ -3883,7 +3883,11 @@ void handle_jit_outcome(Loop* loop,
                 if (!ok) {
                     conn.resp_status = 500;
                     conn.keep_alive = false;
-                    format_static_response(conn, 500, false);
+                    format_static_response(conn,
+                                           500,
+                                           false,
+                                           conn.jit_response_head,
+                                           ordinary_local_response_version(conn));
                 }
                 release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);

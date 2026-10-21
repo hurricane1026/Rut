@@ -240,6 +240,55 @@ TEST(json_network, local_grpc_web_static_frames_fit_and_keepalive_recycles) {
     pool.destroy();
 }
 
+TEST(json_network, dynamic_grpc_web_head_fallback_preserves_version_and_suppresses_body) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->json_arena.backend.pool = &pool;
+
+    u8 native[] = {0, 0, 0, 0, 1, 'x'};
+    const char* keys[] = {"content-type", "grpc-status"};
+    const u32 key_lens[] = {12, 11};
+    const char* values[] = {"application/grpc-web", "0"};
+    const u32 value_lens[] = {20, 1};
+    RouteConfig cfg;
+    const u16 headers_idx = cfg.add_response_header_set(keys, key_lens, values, value_lens, 2);
+    REQUIRE(headers_idx != 0);
+
+    const char* request = "HEAD /grpc-web HTTP/1.0\r\nHost: test\r\n\r\n";
+    REQUIRE_EQ(
+        conn->recv_buf.write(reinterpret_cast<const u8*>(request), __builtin_strlen(request)),
+        __builtin_strlen(request));
+    capture_request_metadata(*conn);
+    conn->request_config = &cfg;
+    conn->jit_response_body = {reinterpret_cast<const char*>(native), sizeof(native)};
+    conn->jit_response_body_valid = true;
+    conn->jit_response_head = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 0xffffu;
+    outcome.response_headers_idx = headers_idx;
+    handle_jit_outcome(&loop, *conn, outcome, nullptr, true);
+
+    const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+    CHECK(response.starts_with("HTTP/1.0 500 Internal Server Error\r\n"));
+    const size_t body_start = response.find("\r\n\r\n");
+    REQUIRE(body_start != std::string::npos);
+    CHECK_EQ(response.size(), body_start + 4);
+    CHECK(response.find("Content-Length: 21\r\n") != std::string::npos);
+    CHECK(response.find("Connection: close\r\n") != std::string::npos);
+    CHECK_EQ(conn->resp_status, 500u);
+    CHECK_FALSE(conn->keep_alive);
+    loop.free_conn(*conn);
+    pool.destroy();
+}
+
 TEST(json_network, http2_response_owns_body_before_next_handler) {
     JsonProgram program;
     REQUIRE(program.init());
