@@ -3831,16 +3831,16 @@ void handle_jit_outcome(Loop* loop,
                 bool ok = collected;
                 if (ok) {
                     GrpcWebContentType mode = GrpcWebContentType::Other;
-                    u32 type_count = 0;
+                    bool web_candidate = false;
                     for (u32 i = 0; i < count; i++) {
                         if (!http_header_name_eq_ci(
                                 headers[i].key_data, headers[i].key_len, "Content-Type", 12))
                             continue;
                         mode = grpc_web_content_type({headers[i].value_data, headers[i].value_len});
-                        type_count++;
+                        web_candidate |= grpc_web_content_type_candidate(
+                            {headers[i].value_data, headers[i].value_len});
                     }
-                    if (type_count == 1 &&
-                        (mode == GrpcWebContentType::Binary || mode == GrpcWebContentType::Text)) {
+                    if (web_candidate) {
                         if (outcome.status_code != 200 || conn.jit_response_head) {
                             ok = false;
                         } else {
@@ -3974,8 +3974,8 @@ void handle_jit_outcome(Loop* loop,
                             kvs[i].key_data, kvs[i].key_len, "Content-Type", 12))
                         continue;
                     local_web_mode = grpc_web_content_type({kvs[i].value_data, kvs[i].value_len});
-                    local_web_candidate |= local_web_mode == GrpcWebContentType::Binary ||
-                                           local_web_mode == GrpcWebContentType::Text;
+                    local_web_candidate |=
+                        grpc_web_content_type_candidate({kvs[i].value_data, kvs[i].value_len});
                 }
                 if (local_web_candidate) {
                     if (outcome.status_code != 200 || is_head) response_formatted = false;

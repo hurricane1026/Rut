@@ -1136,8 +1136,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     for (u32 i = 0; i < nhdrs; i++) {
         if (!grpc_header_name(hdrs[i].name, {"content-type", 12})) continue;
         local_web_mode = grpc_web_content_type(hdrs[i].value);
-        local_web_candidate |= local_web_mode == GrpcWebContentType::Binary ||
-                               local_web_mode == GrpcWebContentType::Text;
+        local_web_candidate |= grpc_web_content_type_candidate(hdrs[i].value);
     }
     bool local_web = local_web_candidate;
     if (local_web) {

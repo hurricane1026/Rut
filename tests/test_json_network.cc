@@ -350,6 +350,126 @@ TEST(json_network, static_grpc_web_rejection_preserves_http10_error_framing) {
     pool.destroy();
 }
 
+TEST(json_network, unsupported_grpc_web_suffix_fails_closed_on_h1_and_h2) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn);
+    conn->json_arena.backend.pool = &pool;
+    const u8 native[] = {0, 0, 0, 0, 1, 'x'};
+    const char* keys[] = {"content-type", "grpc-status"};
+    const u32 key_lens[] = {12, 11};
+    const char* values[] = {"application/grpc-web+json", "0"};
+    const u32 value_lens[] = {25, 1};
+    RouteConfig cfg;
+    const u16 body_idx =
+        cfg.add_response_body_view(reinterpret_cast<const char*>(native), sizeof(native));
+    const u16 headers_idx = cfg.add_response_header_set(keys, key_lens, values, value_lens, 2);
+    REQUIRE(body_idx != 0);
+    REQUIRE(headers_idx != 0);
+
+    const auto assert_h1_500 = [&](const RouteConfig& response_cfg, JitDispatchOutcome outcome) {
+        const char request[] = "POST /grpc-web HTTP/1.1\r\nHost: test\r\n\r\n";
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+                   sizeof(request) - 1);
+        capture_request_metadata(*conn);
+        conn->request_config = &response_cfg;
+        handle_jit_outcome(&loop, *conn, outcome, nullptr, true);
+        const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+        CHECK(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+        CHECK(response.find("grpc-status:") == std::string::npos);
+        CHECK_EQ(conn->resp_status, 500u);
+    };
+
+    JitDispatchOutcome dynamic{};
+    dynamic.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    dynamic.status_code = 200;
+    dynamic.response_body_idx = 0xffffu;
+    dynamic.response_headers_idx = headers_idx;
+    conn->jit_response_body = {reinterpret_cast<const char*>(native), sizeof(native)};
+    conn->jit_response_body_valid = true;
+    assert_h1_500(cfg, dynamic);
+
+    const char* mixed_types[] = {"application/grpc-web+json", "text/plain"};
+    const u32 mixed_type_lens[] = {25, 10};
+    for (u32 order = 0; order < 2; ++order) {
+        RouteConfig mixed_cfg;
+        const char* mixed_keys[] = {"content-type", "grpc-status"};
+        const u32 mixed_key_lens[] = {12, 11};
+        const char* mixed_values[] = {mixed_types[order], "0"};
+        const u32 mixed_value_lens[] = {mixed_type_lens[order], 1};
+        const u16 mixed_headers_idx = mixed_cfg.add_response_header_set(
+            mixed_keys, mixed_key_lens, mixed_values, mixed_value_lens, 2);
+        REQUIRE(mixed_headers_idx != 0);
+        conn->resp_header_mutation_count = 1;
+        conn->resp_header_mutations[0] = {{"content-type", 12},
+                                          {mixed_types[1 - order], mixed_type_lens[1 - order]},
+                                          Connection::RespHeaderMutationMode::Add};
+        JitDispatchOutcome mixed = dynamic;
+        mixed.response_headers_idx = mixed_headers_idx;
+        assert_h1_500(mixed_cfg, mixed);
+    }
+    conn->resp_header_mutation_count = 0;
+
+    JitDispatchOutcome statik{};
+    statik.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    statik.status_code = 200;
+    statik.response_body_idx = body_idx;
+    statik.response_headers_idx = headers_idx;
+    assert_h1_500(cfg, statik);
+
+    auto h2 = std::make_unique<Http2Conn>();
+    conn->h2 = h2.get();
+    h2->init();
+    h2->nstreams = 1;
+    h2->streams[0].id = 1;
+    h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+    conn->epoch_held = true;
+    conn->resp_header_mutation_count = 2;
+    conn->resp_header_mutations[0] = {{"content-type", 12},
+                                      {"application/grpc-web+json", 25},
+                                      Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[1] = {
+        {"grpc-status", 11}, {"0", 1}, Connection::RespHeaderMutationMode::Set};
+    conn->jit_response_body_valid = true;
+    conn->jit_response_body = {reinterpret_cast<const char*>(native), sizeof(native)};
+    JitDispatchOutcome h2_outcome{};
+    h2_outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    h2_outcome.status_code = 200;
+    h2_outcome.response_body_idx = 0xffffu;
+    u8 response[1024];
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    h2_emit_outcome(dispatch, 1, h2_outcome, nullptr, false);
+    CHECK_EQ(h2->outbound_stream, 0u);
+    Http2FrameHeader frame{};
+    REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &frame), ParseStatus::Complete);
+    hpack::DynamicTable decoder;
+    decoder.init(kDefaultHeaderTableSize);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(decoder,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    REQUIRE_EQ(count, 1u);
+    CHECK(decoded[0].name.eq(lit_str(":status")));
+    CHECK(decoded[0].value.eq(lit_str("500")));
+    conn->epoch_held = false;
+    conn->h2 = nullptr;
+    loop.free_conn(*conn);
+    pool.destroy();
+}
+
 TEST(json_network, http2_response_owns_body_before_next_handler) {
     JsonProgram program;
     REQUIRE(program.init());
