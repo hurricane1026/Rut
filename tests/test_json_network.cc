@@ -2357,3 +2357,123 @@ TEST(json_network, chunked_web_handler_event_wait_never_submits_upstream_io) {
         }
     }
 }
+
+TEST(json_network, web_admission_errors_preserve_head_and_malformed_header_rules) {
+    struct Case {
+        const char* method;
+        const char* headers;
+        bool chunked;
+        bool accepted;
+    };
+    const Case cases[] = {
+        {"HEAD", "Content-Type: application/grpc-web\r\n", false, false},
+        {"HEAD", "Content-Type: application/grpc-web\r\n", true, false},
+        {"HEAD", "Content-Type: application/grpc-web\r\nBroken\r\n", false, false},
+        {"POST", "Content-Type: application/grpc-web\r\nBroken\r\n", false, false},
+        {"POST", "Broken\r\nContent-Type: application/grpc-web\r\n", false, false},
+        {"POST", "Broken\r\ncOnTeNt-TyPe:\tapplication/grpc-web-text+proto; x=y\r\n", false, false},
+        {"POST", "Content-Type: text/plain\r\nBroken\r\n", false, true},
+    };
+    for (const auto& item : cases) {
+        auto loop = std::make_unique<SmallLoop>();
+        loop->setup();
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(config->add_jit_handler("/body", 0, &web_admission_handler, true));
+        const RouteConfig* config_ptr = config.get();
+        loop->config_ptr = &config_ptr;
+        auto* conn = loop->alloc_conn();
+        REQUIRE(conn);
+        conn->fd = 41;
+        conn->json_arena.backend.pool = &pool;
+        const std::string body("\0\0\0\0\1x", 6);
+        const std::string request =
+            std::string(item.method) + " /body HTTP/1.1\r\nHost: test\r\n" +
+            (item.chunked ? "Transfer-Encoding: chunked\r\n" : "Content-Length: 6\r\n") +
+            item.headers + "\r\n" + (item.chunked ? "6\r\n" + body + "\r\n0\r\n\r\n" : body);
+        u8 input[4096];
+        conn->recv_buf.bind(input, sizeof(input));
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        web_admission_calls = 0;
+        on_header_received<SmallLoop>(
+            loop.get(),
+            *conn,
+            IoEvent{conn->id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+        CHECK_EQ(web_admission_calls, item.accepted ? 1u : 0u);
+        CHECK_EQ(conn->resp_status, item.accepted ? 422u : 400u);
+        if (item.method[0] == 'H') {
+            const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                       conn->send_buf.len());
+            const auto end = response.find("\r\n\r\n");
+            REQUIRE(end != std::string::npos);
+            CHECK_EQ(response.size(), end + 4);
+        }
+        loop->free_conn(*conn);
+        pool.destroy();
+    }
+}
+
+static u32 web_downstream_calls;
+static bool web_downstream_normalized;
+static u64 web_downstream_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    ++web_downstream_calls;
+    web_downstream_normalized = ctx->req_body_override_valid && ctx->req_body_override_len == 6 &&
+                                ctx->req_body_override_ptr[5] == 'x';
+    if (ctx->state == 0) return jit::HandlerResult::make_yield(1, web_event_kind).pack();
+    return jit::HandlerResult::make_status(422).pack();
+}
+
+TEST(json_network, chunked_web_downstream_waits_preserve_normalized_body) {
+    const std::string request =
+        std::string(
+            "POST /body HTTP/1.1\r\nHost: test\r\n"
+            "Content-Type: application/grpc-web\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n") +
+        std::string("\0\0\0\0\1x", 6) + "\r\n0\r\n\r\n";
+    for (auto kind : {jit::YieldKind::Send, jit::YieldKind::Recv, jit::YieldKind::Any}) {
+        auto loop = std::make_unique<SmallLoop>();
+        loop->setup();
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(config->add_jit_handler("/body", 0, &web_downstream_handler, true));
+        const RouteConfig* config_ptr = config.get();
+        loop->config_ptr = &config_ptr;
+        auto* conn = loop->alloc_conn();
+        REQUIRE(conn);
+        conn->fd = 41;
+        conn->json_arena.backend.pool = &pool;
+        u8 input[4096];
+        conn->recv_buf.bind(input, sizeof(input));
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        web_event_kind = kind;
+        web_downstream_calls = 0;
+        web_downstream_normalized = false;
+        on_header_received<SmallLoop>(
+            loop.get(),
+            *conn,
+            IoEvent{conn->id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+        if (kind != jit::YieldKind::Send) {
+            REQUIRE(conn->pending_handler_fn != nullptr);
+            CHECK_EQ(web_downstream_calls, 1u);
+            bool recv_submitted = false;
+            for (u32 i = 0; i < loop->backend.op_count; ++i)
+                recv_submitted |= loop->backend.ops[i].type == MockOp::Recv &&
+                                  loop->backend.ops[i].fd == conn->fd;
+            CHECK(recv_submitted);
+            conn->resume_event_kind = jit::YieldKind::Recv;
+            conn->resume_event_result = 1;
+            resume_jit_handler(loop.get(), *conn);
+        }
+        CHECK_EQ(web_downstream_calls, 2u);
+        CHECK(web_downstream_normalized);
+        CHECK_EQ(conn->resp_status, 422u);
+        CHECK_EQ(conn->upstream_fd, -1);
+        loop->free_conn(*conn);
+        pool.destroy();
+    }
+}

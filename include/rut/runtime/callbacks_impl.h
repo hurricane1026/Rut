@@ -3163,8 +3163,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 if (!start_local_grpc_web_chunked_body(conn)) {
                     conn.resp_status = 400;
                     conn.keep_alive = false;
-                    format_static_response(
-                        conn, 400, false, false, ordinary_local_response_version(conn));
+                    format_static_response(conn,
+                                           400,
+                                           false,
+                                           http1_request_is_head(conn),
+                                           ordinary_local_response_version(conn));
                     conn.transition_to_sending(&on_response_sent<Loop>);
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                     return;
@@ -3193,7 +3196,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                          conn, conn.recv_buf.data(), conn.recv_buf.len(), ctx)) {
             conn.resp_status = 400;
             conn.keep_alive = false;
-            format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+            format_static_response(conn,
+                                   400,
+                                   false,
+                                   http1_request_is_head(conn),
+                                   ordinary_local_response_version(conn));
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
@@ -3255,7 +3262,33 @@ inline bool prepare_local_grpc_web_request_body(Connection& conn,
     ParsedRequest parsed;
     parser.reset();
     parsed.reset();
-    if (parser.parse(request, request_len, &parsed) != ParseStatus::Complete) return true;
+    if (parser.parse(request, request_len, &parsed) != ParseStatus::Complete) {
+        // Preserve the legacy fallback only for ordinary requests. Inspect
+        // complete raw header lines even after the parser's first error.
+        u32 start = 0;
+        while (start + 1 < request_len) {
+            u32 end = start;
+            while (end + 1 < request_len && !(request[end] == '\r' && request[end + 1] == '\n'))
+                ++end;
+            if (end + 1 >= request_len || end == start) break;
+            u32 colon = start;
+            while (colon < end && request[colon] != ':') ++colon;
+            u32 value_start = colon < end ? colon + 1 : end;
+            while (value_start < end &&
+                   (request[value_start] == ' ' || request[value_start] == '\t'))
+                ++value_start;
+            if (colon < end &&
+                http_header_name_eq_ci(reinterpret_cast<const char*>(request + start),
+                                       colon - start,
+                                       "content-type",
+                                       12) &&
+                grpc_web_content_type_candidate(
+                    {reinterpret_cast<const char*>(request + value_start), end - value_start}))
+                return false;
+            start = end + 2;
+        }
+        return true;
+    }
     bool ambiguous = false;
     const GrpcWebContentType mode = grpc_request_mode(parsed, &ambiguous);
     bool web_candidate = false;
@@ -3357,7 +3390,11 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         if (conn.grpc_web_local_chunk_active && !collect_local_grpc_web_chunked_body(conn)) {
             conn.resp_status = 400;
             conn.keep_alive = false;
-            format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+            format_static_response(conn,
+                                   400,
+                                   false,
+                                   http1_request_is_head(conn),
+                                   ordinary_local_response_version(conn));
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
@@ -3417,7 +3454,8 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             conn, conn.recv_buf.data(), conn.recv_buf.len(), ctx)) {
         conn.resp_status = 400;
         conn.keep_alive = false;
-        format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+        format_static_response(
+            conn, 400, false, http1_request_is_head(conn), ordinary_local_response_version(conn));
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
@@ -4026,13 +4064,20 @@ void handle_jit_outcome(Loop* loop,
     // shape until a separate request rewriter exists; fail before any
     // preflight, upstream connect, or send rather than exposing a header /
     // successor mixup.
-    if ((outcome.kind == JitDispatchOutcome::Kind::Forward ||
-         outcome.kind == JitDispatchOutcome::Kind::EventYield) &&
+    const bool upstream_event = outcome.kind == JitDispatchOutcome::Kind::EventYield &&
+                                (outcome.yield_kind == jit::YieldKind::HttpGet ||
+                                 outcome.yield_kind == jit::YieldKind::HttpPost ||
+                                 outcome.yield_kind == jit::YieldKind::Forward ||
+                                 outcome.yield_kind == jit::YieldKind::UpstreamConnect ||
+                                 outcome.yield_kind == jit::YieldKind::UpstreamSend ||
+                                 outcome.yield_kind == jit::YieldKind::UpstreamRecv);
+    if ((outcome.kind == JitDispatchOutcome::Kind::Forward || upstream_event) &&
         conn.grpc_web_local_chunk_done) {
         conn.pending_handler_fn = nullptr;
         conn.resp_status = 400;
         conn.keep_alive = false;
-        format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+        format_static_response(
+            conn, 400, false, http1_request_is_head(conn), ordinary_local_response_version(conn));
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
