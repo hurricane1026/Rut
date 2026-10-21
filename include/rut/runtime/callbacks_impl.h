@@ -3264,7 +3264,8 @@ inline bool prepare_local_grpc_web_request_body(Connection& conn,
             web_candidate |= grpc_web_content_type_candidate(parsed.headers[i].value);
     }
     if (!web_candidate) return true;
-    if (ambiguous || (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text))
+    if (parsed.method != HttpMethod::POST ||
+        ambiguous || (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text))
         return false;
     if ((!parsed.has_content_length && !parsed.chunked) ||
         (mode == GrpcWebContentType::Binary && parsed.content_length > 8197u) ||
