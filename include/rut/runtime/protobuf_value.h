@@ -10,8 +10,8 @@ inline constexpr u32 kMaxMessageBytes = 8192;
 inline constexpr u64 kGrpcUnframe = 4;
 inline constexpr u64 kGrpcFrame = 5;
 inline constexpr u64 kEncode = u64{1} << 63;
-// Singular scalar operations only: decode fails if no correctly typed field is
-// present; encode retains explicit zero/false/empty values. Callers omit the
+// Singular scalar/message operations: decode fails if no correctly typed field
+// is present; encode retains explicit zero/false/empty values. Callers omit the
 // encode operation entirely for an absent field. This flag adds no DSL syntax.
 inline constexpr u64 kExplicitPresence = u64{1} << 60;
 // No schema reflection: the compiler embeds the field number/type in each op.
@@ -91,7 +91,6 @@ inline bool apply(
     if (!kTag || kTag > 0x1fffffff || kType > 18 || !kType || kType == 1 || kType == 2 ||
         kType == 4 || kType == 6 || kType == 10)
         return false;
-    if (kPresence && kType == 11) return false;
     const u8 kWire = kType == 9 || kType == 11 || kType == 12 ? 2
                      : kType == 7 || kType == 15              ? 5
                      : kType == 16                            ? 1
@@ -115,7 +114,8 @@ inline bool apply(
                 while ((nested_status = nested.next(child)) == Status::Field) {
                 }
                 if (nested_status != Status::End) return false;
-                if (field.size > capacity - merged || field.size > kMaxMessageBytes - merged)
+                if (merged > capacity || field.size > capacity - merged ||
+                    field.size > kMaxMessageBytes - merged || (field.size && !output))
                     return false;
                 if (field.size) __builtin_memcpy(output + merged, field.bytes, field.size);
                 merged += field.size;

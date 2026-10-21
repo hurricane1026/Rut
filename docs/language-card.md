@@ -476,7 +476,9 @@ descriptor loader retains and validates proto3 optional synthetic-oneof metadata
 the source loader accepts `optional` and creates matching synthetic declarations.
 Executable DSL codecs still reject these presence-aware fields. The internal wire-tree codec can retain
 explicit scalar presence. The scalar helper also distinguishes absent fields from
-present zero/false/empty values and can encode explicit defaults; compiler
+present zero/false/empty values and can encode explicit defaults. Singular
+message helpers distinguish absence from present empty messages, preserve
+presence across duplicate merges, and validate each duplicate independently; compiler
 wiring into DSL optional fields remains unsupported. See
 [the example and source grammar limits](../examples/protobuf/README.md).
 Proto3 enum fields use `i32` (and `[i32]` for repeated fields), preserving unknown
