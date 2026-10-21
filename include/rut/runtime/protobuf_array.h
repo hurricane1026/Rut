@@ -3,6 +3,7 @@
 
 namespace rut::protobuf {
 inline constexpr u64 kRepeated = u64{1} << 62;
+inline constexpr u64 kPacked = u64{1} << 59;
 inline constexpr u32 kMaxArrayElements = 512;
 inline constexpr u32 kMaxRequestArrayElements = 4096;
 inline constexpr u32 kMaxRequestValueBytes = 262144;
@@ -20,8 +21,10 @@ inline u32 array_element_size(u8 type) {
 // Validate the full operation before narrowing the field number. Otherwise high
 // flags (including singular presence) can disappear during the u32 conversion.
 inline bool valid_array_operation(u64 op) {
-    constexpr u64 kAllowed = kRepeated | kEncode | (u64{0x1fffffff} << 8) | 255;
-    return (op & ~kAllowed) == 0;
+    constexpr u64 kAllowed = kRepeated | kEncode | kPacked | (u64{0x1fffffff} << 8) | 255;
+    const u8 type = static_cast<u8>(op);
+    return (op & ~kAllowed) == 0 &&
+           (!(op & kPacked) || (array_element_size(type) && type != 9 && type != 12));
 }
 // Two bounded scans: validate/count, then fill caller-provided contiguous slots.
 // The caller keeps the input immutable between scans. String payloads are copied
@@ -29,7 +32,7 @@ inline bool valid_array_operation(u64 op) {
 template <typename Visit>
 inline bool walk_array(u64 op, Str input, Visit visit) {
     if (!valid_array_operation(op)) return false;
-    const u32 tag = static_cast<u32>((op & ~(kRepeated | kEncode)) >> 8);
+    const u32 tag = static_cast<u32>((op & ~(kRepeated | kEncode | kPacked)) >> 8);
     const u8 type = static_cast<u8>(op);
     if (!tag || tag > 0x1fffffff || !array_element_size(type) || input.len > kMaxMessageBytes ||
         (input.len && !input.ptr))
@@ -128,13 +131,21 @@ inline bool encode_array(
     if (!valid_array_operation(op)) return false;
     const u8 type = static_cast<u8>(op);
     const u32 stride = array_element_size(type);
-    const u32 tag = static_cast<u32>((op & ~(kRepeated | kEncode)) >> 8);
+    const u32 tag = static_cast<u32>((op & ~(kRepeated | kEncode | kPacked)) >> 8);
     if (!stride || !tag || tag > 0x1fffffff || count > kMaxArrayElements || (count && !slots) ||
         !prefix.ptr || prefix.len > kMaxMessageBytes || prefix.len > capacity || !output)
         return false;
     if (prefix.len) __builtin_memcpy(output, prefix.ptr, prefix.len);
     Writer writer(output + prefix.len, capacity - prefix.len);
     const u8 wire = type == 9 || type == 12 ? 2 : type == 7 || type == 15 ? 5 : type == 16 ? 1 : 0;
+    const bool packed = (op & kPacked) != 0;
+    u8 payload[kMaxMessageBytes];
+    u32 payload_size = 0;
+    auto append = [&](u8 byte) {
+        if (payload_size == sizeof(payload)) return false;
+        payload[payload_size++] = byte;
+        return true;
+    };
     for (u32 i = 0; i < count; ++i) {
         const u8* slot = slots + static_cast<u64>(i) * stride;
         i64 scalar = 0;
@@ -156,9 +167,25 @@ inline bool encode_array(
             return false;
         const u64 value =
             type == 17 || type == 18 ? zigzag_encode(scalar) : static_cast<u64>(scalar);
-        if (!writer.write({tag, wire, value, reinterpret_cast<const u8*>(bytes.ptr), bytes.len}))
+        if (packed) {
+            u64 remaining = value;
+            if (wire == 0) {
+                while (remaining >= 128) {
+                    if (!append(static_cast<u8>(remaining) | 128)) return false;
+                    remaining >>= 7;
+                }
+                if (!append(static_cast<u8>(remaining))) return false;
+            } else {
+                for (u32 j = 0; j < (wire == 1 ? 8u : 4u); ++j) {
+                    if (!append(static_cast<u8>(remaining))) return false;
+                    remaining >>= 8;
+                }
+            }
+        } else if (!writer.write(
+                       {tag, wire, value, reinterpret_cast<const u8*>(bytes.ptr), bytes.len}))
             return false;
     }
+    if (packed && count && !writer.write({tag, 2, 0, payload, payload_size})) return false;
     if (writer.size() > kMaxMessageBytes - prefix.len) return false;
     result = {reinterpret_cast<const char*>(output), prefix.len + writer.size()};
     return true;

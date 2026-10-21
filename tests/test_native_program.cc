@@ -675,7 +675,10 @@ TEST(native_program, protobuf_repeated_codecs_survive_source_and_schema_removal)
     auto& conn = connections[0];
     conn.reset();
     conn.json_arena.backend.pool = &pool;
+    // Keep the request unpacked to cover decoding both wire forms; encoding
+    // follows the proto3 schema default and returns packed numeric values.
     const u8 kPayload[] = {8, 1, 8, 2, 8, 0, 18, 1, 'x', 18, 0};
+    const u8 kExpected[] = {10, 3, 1, 2, 0, 18, 1, 'x', 18, 0};
     char request[128];
     const int header = snprintf(request,
                                 sizeof(request),
@@ -691,8 +694,8 @@ TEST(native_program, protobuf_repeated_codecs_survive_source_and_schema_removal)
                                      nullptr));
     CHECK_EQ(result.status_code, 200u);
     CHECK(conn.jit_response_body_valid);
-    REQUIRE_EQ(conn.jit_response_body.len, sizeof(kPayload));
-    CHECK_EQ(memcmp(conn.jit_response_body.ptr, kPayload, sizeof(kPayload)), 0);
+    REQUIRE_EQ(conn.jit_response_body.len, sizeof(kExpected));
+    CHECK_EQ(memcmp(conn.jit_response_body.ptr, kExpected, sizeof(kExpected)), 0);
     conn.reset();
     connections.destroy();
     pool.destroy();
@@ -798,9 +801,12 @@ TEST(native_program, grpc_enum_and_reserved_codecs_survive_source_and_schema_rem
     auto& conn = connections[0];
     conn.reset();
     conn.json_arena.backend.pool = &pool;
+    // Keep the request history unpacked to cover decoding that wire form;
+    // encoding follows the proto3 packed default for repeated enums.
     const u8 kPayload[] = {0,   0,   0,   0,   15,  8,   123, 16, 255, 255,
                            255, 255, 255, 255, 255, 255, 255, 1,  16,  0};
-    const auto& expected = kPayload;
+    const u8 expected[] = {0,   0,   0,   0,   15,  8,   123, 18,  11, 255,
+                           255, 255, 255, 255, 255, 255, 255, 255, 1,  0};
     char request[8400];
     const int header = snprintf(request,
                                 sizeof(request),

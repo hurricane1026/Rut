@@ -549,9 +549,10 @@ TEST(protobuf_array, rejects_unknown_operation_bits_before_narrowing_tag) {
     const u64 kOp = kRepeated | (u64{1} << 8) | 5;
     const u8 kInput[] = {8, 7};
     const i32 kValue = 7;
-    // Every bit above the 29-bit field number and below the public array flags
-    // is invalid, including kExplicitPresence and kStructArray.
+    // Reserved bits above the field number are invalid, including singular
+    // presence and struct-array dispatch. The packed numeric flag is allowed.
     for (u32 bit = 37; bit < 62; ++bit) {
+        if (bit == 59) continue;  // packed numeric array encoding is supported.
         const u64 kInvalid = kOp | (u64{1} << bit);
         ArrayPlan plan{17, 19};
         CHECK_FALSE(plan_array(kInvalid, view(kInput, sizeof(kInput)), plan));
@@ -579,4 +580,79 @@ TEST(protobuf_array, rejects_unknown_operation_bits_before_narrowing_tag) {
     // The highest legal field number must remain accepted.
     REQUIRE(plan_array(kRepeated | (u64{0x1fffffff} << 8) | 5, lit_str(""), valid));
     CHECK_EQ(valid.count, 0u);
+}
+
+#include "protobuf/packed_array_oracle.inc"
+TEST(protobuf_array, packed_encoding_matches_google_for_all_numeric_carriers) {
+    const u8 kTypes[] = {3, 5, 7, 8, 13, 14, 15, 16, 17, 18};
+    const Str kExpected[] = {view(kPacked3, sizeof(kPacked3)),
+                             view(kPacked5, sizeof(kPacked5)),
+                             view(kPacked7, sizeof(kPacked7)),
+                             view(kPacked8, sizeof(kPacked8)),
+                             view(kPacked13, sizeof(kPacked13)),
+                             view(kPacked14, sizeof(kPacked14)),
+                             view(kPacked15, sizeof(kPacked15)),
+                             view(kPacked16, sizeof(kPacked16)),
+                             view(kPacked17, sizeof(kPacked17)),
+                             view(kPacked18, sizeof(kPacked18))};
+    for (u32 i = 0; i < 10; ++i) {
+        const u8 type = kTypes[i];
+        const i32 narrow[] = {-1, 0, 150};
+        const i64 wide[] = {-1, 0, 150};
+        const i64 positive[] = {1, 0, 150};
+        const u8 boolean[] = {0, 1, 0};
+        const u8* slots = type == 8                       ? boolean
+                          : type == 7 || type == 13       ? reinterpret_cast<const u8*>(positive)
+                          : array_element_size(type) == 4 ? reinterpret_cast<const u8*>(narrow)
+                                                          : reinterpret_cast<const u8*>(wide);
+        const u64 op = kRepeated | kPacked | (u64{1} << 8) | type;
+        u8 output[64]{};
+        Str result{};
+        REQUIRE(encode_array(op | kEncode, lit_str(""), slots, 3, output, sizeof(output), result));
+        CHECK(result.eq(kExpected[i]));
+        ArrayPlan plan{};
+        REQUIRE(plan_array(op, result, plan));
+        CHECK_EQ(plan.count, 3u);
+        for (u32 capacity = 0; capacity < kExpected[i].len; ++capacity)
+            CHECK_FALSE(
+                encode_array(op | kEncode, lit_str(""), slots, 3, output, capacity, result));
+        REQUIRE(
+            encode_array(op | kEncode, lit_str(""), nullptr, 0, output, sizeof(output), result));
+        CHECK_EQ(result.len, 0u);
+    }
+    ArrayPlan plan{};
+    CHECK_FALSE(plan_array(kRepeated | kPacked | (u64{1} << 8) | 9, lit_str(""), plan));
+    CHECK_FALSE(plan_array(kRepeated | kPacked | (u64{1} << 8) | 12, lit_str(""), plan));
+}
+
+TEST(protobuf_array, native_message_layout_preserves_packed_numeric_hint) {
+    u8 description[28];
+    const u32 words[] = {16, 8, 1, 1, 5 | 256 | 512, 0, 0};
+    for (u32 n = 0; n < 7; ++n)
+        for (u32 i = 0; i < 4; ++i) description[n * 4 + i] = static_cast<u8>(words[n] >> (i * 8));
+    const u8 input[] = {10, 4, 8, 1, 8, 0};
+    const u8 expected[] = {10, 4, 10, 2, 1, 0};
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    Str values{};
+    REQUIRE(decode_struct_array(
+        1, view(description, sizeof(description)), view(input, sizeof(input)), &arena, values));
+    u8 output[32]{};
+    Str encoded{};
+    REQUIRE(encode_struct_array(1,
+                                view(description, sizeof(description)),
+                                lit_str(""),
+                                values,
+                                output,
+                                sizeof(output),
+                                encoded));
+    CHECK(encoded.eq(view(expected, sizeof(expected))));
+    // A packed hint is invalid for singular or length-delimited fields.
+    description[16] = 9;
+    struct_array_detail::Layout invalid{};
+    CHECK_FALSE(struct_array_detail::layout(view(description, sizeof(description)), invalid));
+    arena.destroy();
+    pool.destroy();
 }

@@ -488,7 +488,7 @@ is added. The first declared value must be zero, names must be unique in their
 protobuf scope, and duplicate numbers require `option allow_alias = true`.
 Enum declarations are bounded to 1,024 types and 16,384 values per schema; custom
 options and enum JSON names remain unsupported. Packed and unpacked repeated enum
-inputs may mix; encoding emits unpacked values.
+inputs may mix; encoding follows the schema packed setting (proto3 defaults to packed).
 Message and enum `reserved` declarations support quoted names, individual numbers,
 inclusive ranges and `to max`. Compilation rejects name/number reuse, reversed or
 overlapping ranges, duplicate names and out-of-range bounds, regardless of declaration
@@ -500,7 +500,7 @@ Repeated scalar and acyclic message arrays support `.count` (i32), `.isEmpty` (b
 (optional element). `let items: [i32] = message.values` aliases immutable,
 request-owned storage. Empty arrays return nil from `.first`; repeated defaults
 are retained. Numeric scalar packed/unpacked inputs may mix; encoding emits
-unpacked scalars and length-delimited message entries.
+numeric scalars using the schema packed setting and length-delimited message entries.
 Limits: 512 elements per array, 4,096 across the request Arena, and the shared
 256 KiB value budget. Decode returns nil on limit/allocation failure. Strings
 and bytes own their payloads. Message arrays contain native structs; unwrap

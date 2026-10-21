@@ -8,13 +8,14 @@ namespace rut::protobuf {
 inline constexpr u64 kStructArray = u64{1} << 61;
 
 // Compiler-owned, little-endian layout: size, alignment, field count, followed
-// by (tag, type | repeated<<8, offset, child-layout length, child-layout bytes).
+// by (tag, type | repeated<<8 | packed<<9, offset, child-layout length, child-layout bytes).
 // Only native bool/i32/i64/Str/array/struct carriers are admitted. No source
 // schema, descriptor object, or filesystem lookup survives compilation.
 namespace struct_array_detail {
 struct FieldLayout {
     u32 tag = 0, type = 0, offset = 0;
     bool repeated = false;
+    bool packed = false;
     Str child{};
 };
 struct Layout {
@@ -42,10 +43,14 @@ inline bool layout(Str bytes, Layout& out, u32 depth = 0) {
         u32 flags = 0, length = 0;
         if (!word(bytes, cursor, field.tag) || !word(bytes, cursor, flags) ||
             !word(bytes, cursor, field.offset) || !word(bytes, cursor, length) || !field.tag ||
-            field.tag > 0x1fffffff || flags > 511 || length > bytes.len - cursor)
+            field.tag > 0x1fffffff || flags > 1023 || length > bytes.len - cursor)
             return false;
         field.type = flags & 255;
         field.repeated = flags & 256;
+        field.packed = flags & 512;
+        if (field.packed && (!field.repeated || !array_element_size(static_cast<u8>(field.type)) ||
+                             field.type == 9 || field.type == 12))
+            return false;
         field.child = {bytes.ptr + cursor, length};
         cursor += length;
         u32 size = array_element_size(static_cast<u8>(field.type));
@@ -306,7 +311,7 @@ inline bool encode_message(
             } else {
                 Str encoded;
                 if (!budget.array(array.len, array_element_size(static_cast<u8>(f.type))) ||
-                    !encode_array(array_op(f.tag, f.type) | kEncode,
+                    !encode_array(array_op(f.tag, f.type) | kEncode | (f.packed ? kPacked : 0),
                                   {"", 0},
                                   reinterpret_cast<const u8*>(array.ptr),
                                   array.len,
