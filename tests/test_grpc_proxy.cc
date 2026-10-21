@@ -446,6 +446,9 @@ struct Client {
         u32 sent = 0, received = 0, size = 0;
         u32 status = 99, http_status = 0;
         bool status_in_trailers = false;
+        bool message_in_trailers = false;
+        u32 message_len = 0;
+        char message[128]{};
         u32 raw_len = 0, max_chunk = 0, response_len = 0;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
              meta = false, trailer = false, raw_request = false, compare_pattern = true,
@@ -520,6 +523,13 @@ struct Client {
             rpc.status_in_trailers = (f->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
             rpc.status = 0;
             for (size_t i = 0; i < v; i++) rpc.status = rpc.status * 10 + value[i] - '0';
+        }
+        if (n == 12 && memcmp(name, "grpc-message", n) == 0) {
+            rpc.message_in_trailers = (f->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+            rpc.message_len =
+                v < sizeof(rpc.message) - 1 ? static_cast<u32>(v) : sizeof(rpc.message) - 1;
+            memcpy(rpc.message, value, rpc.message_len);
+            rpc.message[rpc.message_len] = '\0';
         }
         if (n == 10 && memcmp(name, "x-meta-bin", n) == 0)
             rpc.meta = v == 8 && memcmp(value, "AAEC/w==", 8) == 0;
@@ -8872,7 +8882,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "/../protobuf/codec.proto\", \"example.RepeatedChild\", value) else { return 500 } "
         "guard let framed = grpc.frame(bytes) else { return 500 } "
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
-        "\"grpc-status\": \"0\"}, body: framed) }\n"
+        "\"grpc-status\": \"0\", \"grpc-message\": \"permission%%20denied%%2Fok\"}, "
+        "body: framed) }\n"
         "route POST \"/method.Echo/Call\" { "
         "guard let value = grpc.decode(\"" RUT_GRPC_FIXTURES
         "/../protobuf/codec.proto\", \"/example.UnaryCodec/Echo\", req.body) else { "
@@ -8894,7 +8905,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "return response(200, headers: {\"content-type\": \"application/grpc+proto\", "
         "\"grpc-status\": \"0\"}, body: framed) }\n"
         "route POST \"/local.Error/Call\" { return response(200, headers: {"
-        "\"content-type\": \"application/grpc\", \"grpc-status\": \"7\"}) }\n",
+        "\"content-type\": \"application/grpc\", \"grpc-status\": \"7\", "
+        "\"grpc-message\": \"denied\"}) }\n",
         get_port(server->listen_fd));
     const bool written = length > 0 && length < static_cast<int>(sizeof(source)) &&
                          write(file, source, length) == length;
@@ -8999,6 +9011,9 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                 if (completed) {
                     CHECK(client.rpcs[index].ok);
                     CHECK(client.rpcs[index].status_in_trailers);
+                    CHECK(client.rpcs[index].message_in_trailers);
+                    CHECK_EQ(client.rpcs[index].message_len, 24u);
+                    CHECK(memcmp(client.rpcs[index].message, "permission%20denied%2Fok", 24) == 0);
                     CHECK_EQ(client.rpcs[index].http_status, 200u);
                     CHECK_EQ(client.rpcs[index].response_len, sizeof(framed));
                     if (client.rpcs[index].response_len == sizeof(framed))
@@ -9031,6 +9046,9 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             CHECK(client.until(14, true));
             CHECK_EQ(client.rpcs[14].status, 7u);
             CHECK(client.rpcs[14].status_in_trailers);
+            CHECK(client.rpcs[14].message_in_trailers);
+            CHECK_EQ(client.rpcs[14].message_len, 6u);
+            CHECK(memcmp(client.rpcs[14].message, "denied", 6) == 0);
             CHECK_EQ(client.rpcs[14].response_len, 0u);
             // Maximum codec payload plus envelope exceeds the inline JIT body.
             // It must survive arena release in a separately owned pool slice.
