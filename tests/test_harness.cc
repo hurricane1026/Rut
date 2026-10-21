@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <type_traits>
 
 #include <fcntl.h>
@@ -1448,6 +1449,68 @@ TEST(harness_source_target, jit_memory_failure_is_reported_and_cleaned) {
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
     CHECK(!target.program.jit_inited);
 }
+
+static u32 scenario_web_handler_calls;
+static u64 scenario_web_count_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++scenario_web_handler_calls;
+    return jit::HandlerResult::make_status(299).pack();
+}
+
+TEST(harness_scenario, grpc_web_fixed_body_matches_runtime_admission) {
+    TempSource source;
+    REQUIRE(
+        source.write("route POST \"/body\" { wait(1) guard let payload = grpc.unframe(req.body) "
+                     "else { return 422 } "
+                     "return 204 }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/body", 5};
+    scenario.method = kRouteMethodPost;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    struct Case {
+        const char* headers;
+        std::string body;
+        bool valid;
+    };
+    const std::string binary("\0\0\0\0\1x", 6);
+    const Case cases[] = {
+        {"Content-Type: application/grpc-web\r\n", binary, true},
+        {"Content-Type: application/grpc-web-text+proto\r\n", "AAAAAAF4", true},
+        {"Content-Type: application/grpc-web-text\r\n", "AA==AA==AA==AA==AQ==eA==", true},
+        {"Content-Type: application/grpc-web\r\n", std::string("\1\0\0\0\1x", 6), false},
+        {"Content-Type: application/grpc-web\r\n", binary + binary, false},
+        {"Content-Type: application/grpc-web-text\r\n", "AAAAAAF!", false},
+        {"Content-Type: application/grpc-web+json\r\n", binary, false},
+        {"Content-Type: application/grpc-web\r\nContent-Type: text/plain\r\n", binary, false},
+    };
+    const auto compiled = target.program.config.routes[0].fn;
+    for (const auto& item : cases) {
+        const std::string request =
+            "POST /body HTTP/1.1\r\nHost: test\r\n" + std::string(item.headers) +
+            "Content-Length: " + std::to_string(item.body.size()) + "\r\n\r\n" + item.body;
+        scenario.request_data = reinterpret_cast<const u8*>(request.data());
+        scenario.request_len = request.size();
+        target.program.config.routes[0].fn = item.valid ? compiled : &scenario_web_count_handler;
+        scenario_web_handler_calls = 0;
+        const auto result = harness::drive_scenario(scenario, spec);
+        REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+        REQUIRE(result.has_terminal);
+        CHECK_EQ(result.terminal.status_code, item.valid ? 204u : 400u);
+        CHECK_EQ(scenario_web_handler_calls, 0u);
+        CHECK_EQ(result.connection_invariant_violations, 0u);
+        CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    }
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 #endif
 
 int main(int argc, char** argv) {

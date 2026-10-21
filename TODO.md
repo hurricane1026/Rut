@@ -638,6 +638,9 @@ canonical spelling for common gateway tasks.
   覆盖畸形帧、8 KiB 边界、原生产物与双后端 HTTP/2 分片测试，不含本地 RPC 服务分发。
 - [x] HTTP/2 本地 unary 响应：显式 gRPC content-type/status、DATA 后 trailers、
   流控/取消/复用；不含服务 schema 自动绑定、本地 deadline 或流式 handler。
+- [x] 本地 unary gRPC-Web 请求视图：binary/text（含独立 padding 块）归一化为单条
+  未压缩 native frame，8 KiB payload；H1 Content-Length/chunked 与 H2 DATA 分片；
+  chunked 本地响应关闭连接、Forward 仍拒绝；不代表完整 M6 完成。
 - [x] unary RPC 方法编解码绑定：编译期选择请求/响应类型与字段编号，自动 framing，
   拒绝流式方法，覆盖 JIT、独立原生产物与双后端互通；路由分发仍显式配置。
 - [x] proto3 open enum：顶层/嵌套/导入与别名校验，i32 数值载体，未知/负值保留，

@@ -145,6 +145,39 @@ TEST(native_program, links_with_closed_stderr) {
     CHECK(loaded);
 }
 
+TEST(native_program, request_body_view_survives_compiler_exit_and_context_reset) {
+    Source source;
+    REQUIRE(
+        source.append("route POST \"/body\" { guard req.body == \"native-view\" else { "
+                      "return 400 } return 204 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 1u);
+    const auto& route = owner.p->config.routes[0];
+    CHECK(route.needs_req_body);
+    const char request[] = "POST /body HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\nwire";
+    Connection conn{};
+    auto run = [&](jit::HandlerCtx& ctx) {
+        return jit::HandlerResult::unpack(route.fn(
+            &conn, &ctx, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+    };
+    auto* ctx = conn.reset_jit_ctx();
+    CHECK_EQ(run(*ctx).status_code, 400u);
+    const u8 normalized[] = "native-view";
+    ctx->req_body_override_ptr = normalized;
+    ctx->req_body_override_len = sizeof(normalized) - 1;
+    ctx->req_body_override_valid = 1;
+    CHECK_EQ(run(*ctx).status_code, 204u);
+    // A valid empty view must not fall back to the wire body.
+    ctx->req_body_override_len = 0;
+    CHECK_EQ(run(*ctx).status_code, 400u);
+    ctx = conn.reset_jit_ctx();
+    CHECK_EQ(ctx->req_body_override_valid, 0u);
+    CHECK_EQ(run(*ctx).status_code, 400u);
+}
+
 TEST(native_program, regex_and_independent_program_lifetimes) {
     Source source;
     REQUIRE(

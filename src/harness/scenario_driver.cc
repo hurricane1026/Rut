@@ -437,24 +437,36 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         HandlerExecution execution{};
         execution.init(
             route->fn, &connection.connection, scenario.request_data, scenario.request_len);
-        execution.frame.context.route_param_count = route_param_count;
-        for (u32 i = 0; i < route_param_count; i++)
-            execution.frame.context.route_params[i] = route_params[i];
-        DeterministicHandlerSpec driver{};
-        driver.execution = execution;
-        driver.environment = runtime_environment;
-        driver.initial_semantic_events = out.harness.semantic_events;
-        driver.initial_virtual_time_us = scenario.now_us;
-        driver.auto_complete_timers = scenario.auto_complete_timers;
-        HarnessSpec handler_harness = harness;
-        handler_harness.layer = ExecutionLayer::Handler;
-        const HandlerExecutionResult driven =
-            drive_handler_deterministically(driver, handler_harness);
-        const u32 state_resets = out.harness.state_resets;
-        out.harness = driven.harness;
-        out.harness.state_resets += state_resets;
-        out.terminal = driven.terminal;
-        out.has_terminal = driven.has_terminal;
+        if (route->needs_req_body &&
+            !prepare_local_grpc_web_request_body(connection.connection,
+                                                 scenario.request_data,
+                                                 scenario.request_len,
+                                                 &execution.frame.context)) {
+            out.terminal = jit::HandlerResult::make_status(400);
+            out.has_terminal = true;
+            out.harness.outcome = Outcome::Passed;
+            out.harness.phase = Phase::Observe;
+            out.harness.cleanup = CleanupOutcome::Clean;
+        } else {
+            execution.frame.context.route_param_count = route_param_count;
+            for (u32 i = 0; i < route_param_count; i++)
+                execution.frame.context.route_params[i] = route_params[i];
+            DeterministicHandlerSpec driver{};
+            driver.execution = execution;
+            driver.environment = runtime_environment;
+            driver.initial_semantic_events = out.harness.semantic_events;
+            driver.initial_virtual_time_us = scenario.now_us;
+            driver.auto_complete_timers = scenario.auto_complete_timers;
+            HarnessSpec handler_harness = harness;
+            handler_harness.layer = ExecutionLayer::Handler;
+            const HandlerExecutionResult driven =
+                drive_handler_deterministically(driver, handler_harness);
+            const u32 state_resets = out.harness.state_resets;
+            out.harness = driven.harness;
+            out.harness.state_resets += state_resets;
+            out.terminal = driven.terminal;
+            out.has_terminal = driven.has_terminal;
+        }
     }
 
     if (out.harness.outcome == Outcome::Passed && out.has_terminal)

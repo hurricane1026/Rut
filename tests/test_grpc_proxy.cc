@@ -974,7 +974,13 @@ void streaming_case(rut::test::TestCase* _tc,
     u32 logs = 0;
     u32 statuses[17]{};
     bool large_call = false;
+    u32 logged_requests[20]{};
+    u32 logged_responses[20]{};
     while (shard->log_ring->pop(entry)) {
+        if (logs < 20) {
+            logged_requests[logs] = entry.req_size;
+            logged_responses[logs] = entry.resp_size;
+        }
         logs++;
         CHECK_EQ(entry.status, 200u);
         CHECK_EQ(entry.method, static_cast<u8>(LogHttpMethod::Post));
@@ -989,6 +995,14 @@ void streaming_case(rut::test::TestCase* _tc,
         if (entry.req_size == 200000 && entry.resp_size == 200000) large_call = true;
     }
     CHECK_EQ(logs, 20u);
+    if (!large_call) {
+        for (u32 i = 0; i < logs && i < 20; ++i)
+            fprintf(stderr,
+                    "grpc access log[%u]: req=%u resp=%u\n",
+                    i,
+                    logged_requests[i],
+                    logged_responses[i]);
+    }
     CHECK(large_call);
     for (u32 code = 0; code < 17; code++) CHECK_EQ(statuses[code], metrics.grpc_completed[code]);
     if (shard->loop->listen_fd >= 0) {
@@ -8849,6 +8863,69 @@ template <typename Loop>
 void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
+    struct WireRecorder {
+        int listener = -1;
+        pthread_t thread{};
+        bool started = false;
+        std::atomic<bool> stop{false};
+        std::atomic<u32> count{0};
+        std::string requests[4];
+        bool start() {
+            listener = create_listen_socket(0).value_or(-1);
+            if (listener < 0) return false;
+            started =
+                pthread_create(
+                    &thread,
+                    nullptr,
+                    [](void* opaque) -> void* {
+                        auto* self = static_cast<WireRecorder*>(opaque);
+                        while (!self->stop.load() && self->count.load() < 4) {
+                            pollfd ready{self->listener, POLLIN, 0};
+                            if (poll(&ready, 1, 50) <= 0) continue;
+                            const int fd = accept(self->listener, nullptr, nullptr);
+                            if (fd < 0) continue;
+                            timeval timeout{5, 0};
+                            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+                            std::string raw;
+                            char bytes[2048];
+                            while (raw.size() < 16384) {
+                                const ssize_t n = recv(fd, bytes, sizeof(bytes), 0);
+                                if (n <= 0) break;
+                                raw.append(bytes, n);
+                                HttpParser parser;
+                                parser.reset();
+                                ParsedRequest parsed;
+                                parsed.reset();
+                                if (parser.parse(reinterpret_cast<const u8*>(raw.data()),
+                                                 raw.size(),
+                                                 &parsed) == ParseStatus::Complete &&
+                                    parsed.has_content_length &&
+                                    raw.size() >= parser.header_end + parsed.content_length)
+                                    break;
+                            }
+                            const u32 index = self->count.load();
+                            self->requests[index] = raw;
+                            self->count.store(index + 1);
+                            const char response[] =
+                                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: "
+                                "close\r\n\r\n";
+                            send_all(fd, response, sizeof(response) - 1);
+                            close(fd);
+                        }
+                        return nullptr;
+                    },
+                    this) == 0;
+            return started;
+        }
+        ~WireRecorder() {
+            stop.store(true);
+            if (listener >= 0) {
+                if (started) pthread_join(thread, nullptr);
+                close(listener);
+            }
+        }
+    } recorder;
+    REQUIRE(recorder.start());
     auto shard = std::make_unique<Shard<Loop>>();
     const int lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
@@ -8870,6 +8947,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         source,
         sizeof(source),
         "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
+        "upstream never { host: \"127.0.0.1\", port: 9 }\n"
+        "upstream wire { host: \"127.0.0.1\", port: %u }\n"
         "route POST \"/test.Echo/Call\" { return forward(grpc) }\n"
         "route POST \"/codec\" { "
         "guard let value = protobuf.decode(\"" RUT_GRPC_FIXTURES
@@ -8931,8 +9010,19 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "\"content-type\": \"application/grpc-web-text\", \"grpc-status\": \"0\"}, body: framed) "
         "}\n"
         "route POST \"/local.WebEmpty/Call\" { return response(200, headers: {"
-        "\"content-type\": \"application/grpc-web\", \"grpc-status\": \"0\"}) }\n",
+        "\"content-type\": \"application/grpc-web\", \"grpc-status\": \"0\"}) }\n"
+        "route POST \"/local.WebForward/Call\" { guard req.body != \"\" else { return 422 } "
+        "return forward(never) }\n"
+        "route POST \"/local.WebWire/Call\" { guard let payload = grpc.unframe(req.body) else { "
+        "return 422 } return forward(wire) }\n"
+        "route POST \"/local.WebWaitForward/Call\" { guard req.body != \"\" else { return 422 } "
+        "wait(1) return forward(never) }\n"
+        "route POST \"/local.WebWait/Call\" { wait(1) "
+        "guard let payload = grpc.unframe(req.body) else { return 422 } "
+        "return response(200, headers: {\"content-type\": \"application/grpc-web-text\", "
+        "\"grpc-status\": \"0\"}) }\n",
         get_port(server->listen_fd),
+        get_port(recorder.listener),
         kStatusDetailsOracleBase64);
     const bool written = length > 0 && length < static_cast<int>(sizeof(source)) &&
                          write(file, source, length) == length;
@@ -9061,17 +9151,42 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             local_rpc(11);
             Client web_client;
             CHECK(web_client.init(get_port(lfd)));
-            auto local_web = [&](u32 index, bool text, const char* path, bool empty) {
-                const int sid =
-                    text ? web_client.request_native_raw(index,
-                                                         framed,
-                                                         sizeof(framed),
-                                                         "1H",
-                                                         nullptr,
-                                                         path,
-                                                         "application/grpc+proto")
-                         : web_client.request_web(
-                               index, framed, sizeof(framed), false, 1, true, "1H", path);
+            auto local_web = [&](u32 index,
+                                 bool text,
+                                 const char* path,
+                                 bool empty,
+                                 bool content_length = true) {
+                u8 request_text[256]{};
+                u32 request_text_len = 0;
+                if (text) {
+                    GrpcWebBase64Encoder encoder{};
+                    encoder.init();
+                    u32 consumed = 0;
+                    u32 prefix_len = 0;
+                    CHECK_EQ(encoder.feed(framed,
+                                          sizeof(framed),
+                                          consumed,
+                                          request_text,
+                                          sizeof(request_text),
+                                          prefix_len),
+                             GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(consumed, sizeof(framed));
+                    u32 suffix_len = 0;
+                    CHECK_EQ(encoder.flush(request_text + prefix_len,
+                                           sizeof(request_text) - prefix_len,
+                                           suffix_len),
+                             GrpcWebCodecStatus::Ok);
+                    request_text_len = prefix_len + suffix_len;
+                }
+                const int sid = web_client.request_web(
+                    index,
+                    text ? request_text : framed,
+                    text ? request_text_len : static_cast<u32>(sizeof(framed)),
+                    text,
+                    1,
+                    content_length,
+                    "1H",
+                    path);
                 CHECK(sid > 0);
                 CHECK(web_client.until(index, true));
                 const auto& rpc = web_client.rpcs[index];
@@ -9126,6 +9241,14 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             local_web(0, false, "/local.WebBinary/Call", false);
             local_web(1, true, "/local.WebText/Call", false);
             local_web(2, false, "/local.WebEmpty/Call", true);
+            local_web(3, false, "/local.WebBinary/Call", false, false);
+            local_web(4, true, "/local.WebText/Call", false, false);
+            REQUIRE(web_client.request_web(
+                        5, framed, sizeof(framed), false, 1, true, "1H", "/local.WebWire/Call") >
+                    0);
+            REQUIRE(web_client.until(5, true));
+            CHECK_EQ(web_client.rpcs[5].http_status, 503u);
+            CHECK_EQ(recorder.count.load(), 0u);
             // Hold response DATA at zero window, cancel, then reuse the connection.
             nghttp2_settings_entry zero_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 0};
             CHECK_EQ(nghttp2_submit_settings(client.session, NGHTTP2_FLAG_NONE, &zero_window, 1),
@@ -9297,17 +9420,59 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         }
     }
     const u8 h1_framed[] = {0, 0, 0, 0, 3, 0xff, 0xfe, 0xfd};
-    auto h1_local_web = [&](const char* path, bool text, bool empty) {
+    auto h1_local_web = [&](const char* path, bool text, bool empty, bool chunked = false) {
         const i32 fd = connect_to(get_port(lfd));
         REQUIRE(fd >= 0);
         timeval timeout{5, 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        std::string request = std::string("POST ") + path +
-                              " HTTP/1.1\r\nHost: localhost\r\nContent-Type: "
-                              "application/grpc+proto\r\nContent-Length: " +
-                              std::to_string(sizeof(h1_framed)) + "\r\nConnection: close\r\n\r\n";
-        request.append(reinterpret_cast<const char*>(h1_framed), sizeof(h1_framed));
-        REQUIRE(send_all(fd, request.data(), request.size()));
+        u8 request_body[128]{};
+        u32 request_body_len = sizeof(h1_framed);
+        if (text) {
+            GrpcWebBase64Encoder encoder{};
+            encoder.init();
+            u32 consumed = 0, written = 0;
+            REQUIRE(encoder.feed(h1_framed,
+                                 sizeof(h1_framed),
+                                 consumed,
+                                 request_body,
+                                 sizeof(request_body),
+                                 written) == GrpcWebCodecStatus::Ok);
+            REQUIRE_EQ(consumed, sizeof(h1_framed));
+            const u32 encoded_prefix_len = written;
+            u32 flushed = 0;
+            REQUIRE(encoder.flush(request_body + encoded_prefix_len,
+                                  sizeof(request_body) - encoded_prefix_len,
+                                  flushed) == GrpcWebCodecStatus::Ok);
+            request_body_len = encoded_prefix_len + flushed;
+        } else {
+            memcpy(request_body, h1_framed, sizeof(h1_framed));
+        }
+        const char* request_type = text ? "application/grpc-web-text" : "application/grpc-web";
+        std::string request =
+            std::string("POST ") + path +
+            " HTTP/1.1\r\nHost: localhost\r\nContent-Type: " + request_type +
+            (chunked ? "\r\nTransfer-Encoding: chunked"
+                     : ("\r\nContent-Length: " + std::to_string(request_body_len))) +
+            "\r\nConnection: close\r\n\r\n";
+        if (!chunked) {
+            request.append(reinterpret_cast<const char*>(request_body), request_body_len);
+            REQUIRE(send_all(fd, request.data(), request.size()));
+        } else {
+            REQUIRE(send_all(fd, request.data(), request.size()));
+            for (u32 off = 0; off < request_body_len;) {
+                const u32 take =
+                    (off % 3) + 1 < request_body_len - off ? (off % 3) + 1 : request_body_len - off;
+                char chunk_size[16]{};
+                snprintf(chunk_size, sizeof(chunk_size), "%x", take);
+                const std::string extension = off == 0 ? ";" + std::string(17000, 'x') : "";
+                const std::string chunk =
+                    std::string(chunk_size) + extension + "\r\n" +
+                    std::string(reinterpret_cast<const char*>(request_body + off), take) + "\r\n";
+                REQUIRE(send_all(fd, chunk.data(), chunk.size()));
+                off += take;
+            }
+            REQUIRE(send_all(fd, "0\r\n\r\n", 5));
+        }
         u8 wire[32768]{};
         u32 wire_len = 0;
         while (wire_len < sizeof(wire)) {
@@ -9355,6 +9520,124 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
     };
     h1_local_web("/local.WebBinary/Call", false, false);
     h1_local_web("/local.WebText/Call", true, false);
+    h1_local_web("/local.WebBinary/Call", false, false, true);
+    h1_local_web("/local.WebText/Call", true, false, true);
+    h1_local_web("/local.WebWait/Call", true, true, true);
+    for (bool text : {false, true}) {
+        u8 encoded[256];
+        u32 size = sizeof(h1_framed);
+        if (text) {
+            GrpcWebBase64Encoder encoder;
+            encoder.init();
+            u32 consumed = 0, written = 0, flushed = 0;
+            REQUIRE_EQ(
+                encoder.feed(
+                    h1_framed, sizeof(h1_framed), consumed, encoded, sizeof(encoded), written),
+                GrpcWebCodecStatus::Ok);
+            REQUIRE_EQ(encoder.flush(encoded + written, sizeof(encoded) - written, flushed),
+                       GrpcWebCodecStatus::Ok);
+            size = written + flushed;
+        } else {
+            memcpy(encoded, h1_framed, sizeof(h1_framed));
+        }
+        const char* type = text ? "application/grpc-web-text" : "application/grpc-web";
+        std::string request =
+            std::string("POST /local.WebWire/Call HTTP/1.1\r\nHost: test\r\nContent-Type: ") +
+            type + "\r\nContent-Length: " + std::to_string(size) + "\r\nConnection: close\r\n\r\n";
+        request.append(reinterpret_cast<const char*>(encoded), size);
+        const int fd = connect_to(get_port(lfd));
+        REQUIRE(fd >= 0);
+        timeval timeout{5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        REQUIRE(send_all(fd, request.data(), request.size()));
+        char response[1024];
+        const ssize_t response_len = recv(fd, response, sizeof(response), 0);
+        close(fd);
+        REQUIRE(response_len > 0);
+        CHECK(std::string(response, response_len).starts_with("HTTP/1.1 200"));
+        const u32 index = text ? 1u : 0u;
+        REQUIRE_EQ(recorder.count.load(), index + 1);
+        const auto& captured = recorder.requests[index];
+        HttpParser parser;
+        parser.reset();
+        ParsedRequest parsed;
+        parsed.reset();
+        REQUIRE_EQ(
+            parser.parse(reinterpret_cast<const u8*>(captured.data()), captured.size(), &parsed),
+            ParseStatus::Complete);
+        CHECK_EQ(parsed.content_length, size);
+        REQUIRE_EQ(captured.size() - parser.header_end, size);
+        CHECK(memcmp(captured.data() + parser.header_end, encoded, size) == 0);
+        bool original_type = false;
+        for (u32 i = 0; i < parsed.header_count; ++i)
+            if (grpc_header_name(parsed.headers[i].name, lit_str("content-type")))
+                original_type =
+                    parsed.headers[i].value.eq(Str{type, static_cast<u32>(strlen(type))});
+        CHECK(original_type);
+    }
+    // A complete successor in the same write is never part of this RPC body.
+    // Chunked local requests deliberately close instead of reusing the connection.
+    for (const char* path :
+         {"/local.WebBinary/Call", "/local.WebForward/Call", "/local.WebWaitForward/Call"}) {
+        const i32 fd = connect_to(get_port(lfd));
+        REQUIRE(fd >= 0);
+        timeval timeout{5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        std::string request =
+            std::string("POST ") + path +
+            " HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/grpc-web\r\n"
+            "Transfer-Encoding: chunked\r\n\r\n";
+        char size[16];
+        snprintf(size, sizeof(size), "%x", static_cast<unsigned>(sizeof(h1_framed)));
+        request += std::string(size) + "\r\n";
+        request.append(reinterpret_cast<const char*>(h1_framed), sizeof(h1_framed));
+        request +=
+            "\r\n0\r\n\r\nPOST /local.Error/Call HTTP/1.1\r\nHost: localhost\r\n"
+            "Content-Length: 0\r\n\r\n";
+        REQUIRE(send_all(fd, request.data(), request.size()));
+        std::string response;
+        char buffer[1024];
+        ssize_t n = 0;
+        while ((n = recv(fd, buffer, sizeof(buffer), 0)) > 0) response.append(buffer, n);
+        CHECK_EQ(n, 0);
+        close(fd);
+        const bool forwards = strstr(path, "Forward") != nullptr;
+        CHECK(response.starts_with(forwards ? "HTTP/1.1 400" : "HTTP/1.1 200"));
+        CHECK(response.find("Connection: close") != std::string::npos);
+        CHECK(response.find("HTTP/1.1", 1) == std::string::npos);
+    }
+    auto h1_bad_web = [&](const char* path, const u8* body, u32 body_len, bool text, bool chunked) {
+        const i32 fd = connect_to(get_port(lfd));
+        REQUIRE(fd >= 0);
+        timeval timeout{5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        const char* type = text ? "application/grpc-web-text" : "application/grpc-web";
+        std::string request = std::string("POST ") + path +
+                              " HTTP/1.1\r\nHost: localhost\r\nContent-Type: " + type +
+                              (chunked ? "\r\nTransfer-Encoding: chunked"
+                                       : ("\r\nContent-Length: " + std::to_string(body_len))) +
+                              "\r\nConnection: close\r\n\r\n";
+        REQUIRE(send_all(fd, request.data(), request.size()));
+        if (chunked) {
+            const std::string chunk = std::to_string(body_len) + "\r\n" +
+                                      std::string(reinterpret_cast<const char*>(body), body_len) +
+                                      "\r\n0\r\n\r\n";
+            REQUIRE(send_all(fd, chunk.data(), chunk.size()));
+        } else {
+            REQUIRE(send_all(fd, reinterpret_cast<const char*>(body), body_len));
+        }
+        char response[1024]{};
+        const ssize_t n = recv(fd, response, sizeof(response) - 1, 0);
+        close(fd);
+        REQUIRE(n > 0);
+        if (n > 0) {
+            CHECK(strncmp(response, "HTTP/1.1 400", 12) == 0);
+        }
+    };
+    const u8 compressed[] = {1, 0, 0, 0, 0};
+    const u8 truncated[] = {0, 0, 0, 0};
+    h1_bad_web("/local.WebBinary/Call", compressed, sizeof(compressed), false, false);
+    h1_bad_web("/local.WebBinary/Call", truncated, sizeof(truncated), false, true);
     h1_local_web("/local.WebEmpty/Call", false, true);
     shard->stop();
     shard->join();

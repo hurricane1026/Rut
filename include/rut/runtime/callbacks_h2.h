@@ -60,6 +60,7 @@ inline void h2_release_completed_jit_json(Connection& conn) {
     conn.json_arena.destroy();
     conn.jit_response_body = {};
     conn.jit_response_body_valid = false;
+    if (conn.handler_ctx != nullptr) conn.reset_jit_ctx();
 }
 
 inline bool h2_prepare_forward_request(
@@ -1493,6 +1494,63 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     ctx->route_param_count = param_count;
     for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = params[i];
 
+    if (route->needs_req_body) {
+        HttpParser parser;
+        ParsedRequest parsed;
+        parser.reset();
+        parsed.reset();
+        bool web_candidate = false;
+        if (parser.parse(synth, synth_len, &parsed) != ParseStatus::Complete) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        bool ambiguous = false;
+        const GrpcWebContentType mode = grpc_request_mode(parsed, &ambiguous);
+        for (u32 i = 0; i < parsed.header_count; i++) {
+            if (http_header_name_eq_ci(
+                    parsed.headers[i].name.ptr, parsed.headers[i].name.len, "content-type", 12))
+                web_candidate |= grpc_web_content_type_candidate(parsed.headers[i].value);
+        }
+        u32 header_end = 0;
+        for (u32 i = 3; i < synth_len; i++) {
+            if (synth[i - 3] == '\r' && synth[i - 2] == '\n' && synth[i - 1] == '\r' &&
+                synth[i] == '\n') {
+                header_end = i + 1;
+                break;
+            }
+        }
+        if (web_candidate &&
+            (parsed.method != HttpMethod::POST || ambiguous ||
+             (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text) ||
+             !parsed.has_content_length || parsed.chunked || header_end == 0 ||
+             parsed.content_length > synth_len - header_end)) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        if (web_candidate) {
+            if (d.conn->json_arena.current == nullptr &&
+                (d.conn->json_arena.backend.pool == nullptr ||
+                 !d.conn->json_arena.init(d.conn->json_arena.backend.pool))) {
+                h2_emit_status(d, stream_id, 400);
+                return;
+            }
+            u8* normalized = static_cast<u8*>(d.conn->json_arena.alloc(8197));
+            u32 normalized_len = 0;
+            if (!normalized || !grpc_web_normalize_unary_request(mode,
+                                                                 synth + header_end,
+                                                                 parsed.content_length,
+                                                                 normalized,
+                                                                 8197,
+                                                                 &normalized_len)) {
+                h2_emit_status(d, stream_id, 400);
+                return;
+            }
+            ctx->req_body_override_ptr = normalized;
+            ctx->req_body_override_len = normalized_len;
+            ctx->req_body_override_valid = 1;
+        }
+    }
+
     JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
@@ -2207,6 +2265,7 @@ void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error 
                   }) {
         if (auto* x = grpc_find(c, stream_id)) grpc_release(d->loop, x, true);
     }
+    if (c.async_stream != 0 && c.async_stream == stream_id) h2_release_completed_jit_json(*d->conn);
     const bool kOutboundOwner = c.outbound_stream == stream_id;
     if (d->close_after_process) return;
     if (kOutboundOwner && d->owned_hpack_pending && d->owned_stream == stream_id) {

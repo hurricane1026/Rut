@@ -156,7 +156,10 @@ struct alignas(alignof(u64)) HandlerCtx {
     u32 slot_count;           // number of 8-byte slots following this header
     u32 resume_event_kind;    // YieldKind value that resumed this handler
     i32 resume_event_result;  // IoEvent::result for event waits
-    u32 route_param_count;    // number of populated route_params entries
+    const u8* req_body_override_ptr;
+    u32 req_body_override_len;
+    u32 req_body_override_valid;
+    u32 route_param_count;  // number of populated route_params entries
     u32 reserved0;
     RouteParam route_params[kMaxRouteParams];
 

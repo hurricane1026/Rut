@@ -257,12 +257,12 @@ struct Ctx {
         return fn_req_path_only;
     }
 
-    // void rut_helper_req_body(ptr, i32, ptr, ptr)
+    // void rut_helper_req_body_ctx(ptr, i32, ptr, ptr, ptr)
     LLVMValueRef get_req_body() {
         if (!fn_req_body) {
-            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, ptr_ty};
-            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
-            fn_req_body = LLVMAddFunction(llvm_mod, "rut_helper_req_body", ft);
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 5, 0);
+            fn_req_body = LLVMAddFunction(llvm_mod, "rut_helper_req_body_ctx", ft);
         }
         return fn_req_body;
     }
@@ -843,9 +843,10 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::ReqBody: {
             LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "body.ptr");
             LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "body.len");
-            LLVMValueRef args[] = {c.param_req_data, c.param_req_len, out_ptr, out_len};
+            LLVMValueRef args[] = {
+                c.param_req_data, c.param_req_len, c.param_ctx, out_ptr, out_len};
             LLVMBuildCall2(
-                c.builder, LLVMGlobalGetValueType(c.get_req_body()), c.get_req_body(), args, 4, "");
+                c.builder, LLVMGlobalGetValueType(c.get_req_body()), c.get_req_body(), args, 5, "");
             LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "body.p");
             LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "body.l");
             LLVMValueRef strval = LLVMGetUndef(c.str_ty);

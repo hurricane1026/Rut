@@ -1168,13 +1168,34 @@ activate kernel forwarding: live socket handoff remains ⏳. `firewall {}`/XDP a
 kTLS integration also remain unimplemented. See [ebpf.md](ebpf.md).
 
 
-### Local unary gRPC responses over HTTP/1.1 and HTTP/2
+### Local unary gRPC-Web requests and responses
+
+For a POST JIT route that reads `req.body`, binary/text gRPC-Web input
+(`application/grpc-web` or `application/grpc-web-text`, optionally `+proto`)
+is validated before the handler runs. The handler sees exactly one native,
+uncompressed gRPC envelope, so `grpc.unframe(req.body)` and `grpc.decode(...)`
+work with either representation. Payloads are limited to 8 KiB. Independently
+padded base64 flush blocks are supported; malformed encoding, unsupported
+suffixes, duplicate content types, compressed messages, trailer frames,
+multiple messages and incomplete envelopes fail with HTTP 400. Existing
+Content-Length and HTTP/2 request buffering limits still apply to encoded
+bytes; the 8 KiB decoded payload limit does not enlarge those transport buffers.
+
+HTTP/1.1 accepts Content-Length and chunked bodies; HTTP/2 accepts fragmented
+DATA. The decoded view is request-owned and survives handler yields. The
+transport body and Content-Type remain unchanged for existing supported
+forwarding paths. Body-reading HTTP/2 handlers that choose Forward remain
+unsupported (HTTP 503). The new HTTP/1.1 chunked local path closes the
+connection after its response and does not execute a pipelined successor;
+returning Forward on that path, including after a yield, fails with HTTP 400
+before contacting the upstream. Chunk framing is bounded to 32 KiB. Header-only
+routes and direct proxy routes retain their existing body handling.
 
 Local responses may opt into grpc-web by using exactly one
 `application/grpc-web`/`application/grpc-web-text` content type, optionally
 with `+proto`. The handler body contract is one native uncompressed gRPC frame
-with at most an 8 KiB payload, or empty for trailers-only; request bodies are
-not automatically decoded by this response adapter. HTTP status is 200 and
+with at most an 8 KiB payload, or empty for trailers-only. Response adaptation
+is explicitly selected by the response content type. HTTP status is 200 and
 `grpc-status` is canonical 0–16, with at most one 1,024-byte
 `grpc-message` and `grpc-status-details-bin`. The runtime emits the message
 and one 0x80 trailer frame in the body, continuously base64-encoding both in

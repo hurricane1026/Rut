@@ -2,6 +2,7 @@
 
 #include "core/placement_new.h"
 #include "rut/common/shard_limits.h"
+#include "rut/jit/handler_abi.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/cache_table.h"
@@ -178,6 +179,19 @@ void rut_helper_req_body(const u8* req_data, u32 req_len, const char** out_ptr, 
 
     *out_ptr = reinterpret_cast<const char*>(req_data + pc.header_end);
     *out_len = req.content_length;
+}
+
+void rut_helper_req_body_ctx(const u8* req_data,
+                             u32 req_len,
+                             rut::jit::HandlerCtx* ctx,
+                             const char** out_ptr,
+                             u32* out_len) {
+    if (ctx && ctx->req_body_override_valid) {
+        *out_ptr = reinterpret_cast<const char*>(ctx->req_body_override_ptr);
+        *out_len = ctx->req_body_override_len;
+        return;
+    }
+    rut_helper_req_body(req_data, req_len, out_ptr, out_len);
 }
 
 void rut_helper_req_http_version(const u8* req_data,
