@@ -1519,7 +1519,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             }
         }
         if (web_candidate &&
-            (ambiguous ||
+            (parsed.method != HttpMethod::POST || ambiguous ||
              (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text) ||
              !parsed.has_content_length || parsed.chunked || header_end == 0 ||
              parsed.content_length > synth_len - header_end)) {

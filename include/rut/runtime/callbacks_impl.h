@@ -2518,7 +2518,8 @@ inline bool start_local_grpc_web_chunked_body(Connection& conn) {
                 parsed.headers[i].name.ptr, parsed.headers[i].name.len, "content-type", 12))
             candidate |= grpc_web_content_type_candidate(parsed.headers[i].value);
     if (!candidate) return false;
-    if (ambiguous || (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text))
+    if (parsed.method != HttpMethod::POST ||
+        ambiguous || (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text))
         return false;
     // Chunked local collection owns the complete request boundary and does not
     // extend the ordinary HTTP/1 keep-alive/pipeline contract.
