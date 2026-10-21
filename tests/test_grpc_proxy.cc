@@ -974,7 +974,13 @@ void streaming_case(rut::test::TestCase* _tc,
     u32 logs = 0;
     u32 statuses[17]{};
     bool large_call = false;
+    u32 logged_requests[20]{};
+    u32 logged_responses[20]{};
     while (shard->log_ring->pop(entry)) {
+        if (logs < 20) {
+            logged_requests[logs] = entry.req_size;
+            logged_responses[logs] = entry.resp_size;
+        }
         logs++;
         CHECK_EQ(entry.status, 200u);
         CHECK_EQ(entry.method, static_cast<u8>(LogHttpMethod::Post));
@@ -989,6 +995,14 @@ void streaming_case(rut::test::TestCase* _tc,
         if (entry.req_size == 200000 && entry.resp_size == 200000) large_call = true;
     }
     CHECK_EQ(logs, 20u);
+    if (!large_call) {
+        for (u32 i = 0; i < logs && i < 20; ++i)
+            fprintf(stderr,
+                    "grpc access log[%u]: req=%u resp=%u\n",
+                    i,
+                    logged_requests[i],
+                    logged_responses[i]);
+    }
     CHECK(large_call);
     for (u32 code = 0; code < 17; code++) CHECK_EQ(statuses[code], metrics.grpc_completed[code]);
     if (shard->loop->listen_fd >= 0) {
