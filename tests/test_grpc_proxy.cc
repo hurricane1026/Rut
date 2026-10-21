@@ -8921,12 +8921,15 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         "route POST \"/local.Error/Call\" { return response(200, headers: {"
         "\"content-type\": \"application/grpc\", \"grpc-status\": \"7\", "
         "\"grpc-message\": \"denied\"}) }\n"
-        "route POST \"/local.WebBinary/Call\" { guard let payload = grpc.unframe(req.body) else { return 422 } "
+        "route POST \"/local.WebBinary/Call\" { guard let payload = grpc.unframe(req.body) else { "
+        "return 422 } "
         "guard let framed = grpc.frame(payload) else { return 500 } return response(200, headers: {"
         "\"content-type\": \"application/grpc-web\", \"grpc-status\": \"0\"}, body: framed) }\n"
-        "route POST \"/local.WebText/Call\" { guard let payload = grpc.unframe(req.body) else { return 422 } "
+        "route POST \"/local.WebText/Call\" { guard let payload = grpc.unframe(req.body) else { "
+        "return 422 } "
         "guard let framed = grpc.frame(payload) else { return 500 } return response(200, headers: {"
-        "\"content-type\": \"application/grpc-web-text\", \"grpc-status\": \"0\"}, body: framed) }\n"
+        "\"content-type\": \"application/grpc-web-text\", \"grpc-status\": \"0\"}, body: framed) "
+        "}\n"
         "route POST \"/local.WebEmpty/Call\" { return response(200, headers: {"
         "\"content-type\": \"application/grpc-web\", \"grpc-status\": \"0\"}) }\n",
         get_port(server->listen_fd),
@@ -9059,22 +9062,16 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             Client web_client;
             CHECK(web_client.init(get_port(lfd)));
             auto local_web = [&](u32 index, bool text, const char* path, bool empty) {
-                const int sid = text
-                                    ? web_client.request_native_raw(index,
-                                                                 framed,
-                                                                 sizeof(framed),
-                                                                 "1H",
-                                                                 nullptr,
-                                                                 path,
-                                                                 "application/grpc+proto")
-                                    : web_client.request_web(index,
+                const int sid =
+                    text ? web_client.request_native_raw(index,
                                                          framed,
                                                          sizeof(framed),
-                                                         false,
-                                                         1,
-                                                         true,
                                                          "1H",
-                                                         path);
+                                                         nullptr,
+                                                         path,
+                                                         "application/grpc+proto")
+                         : web_client.request_web(
+                               index, framed, sizeof(framed), false, 1, true, "1H", path);
                 CHECK(sid > 0);
                 CHECK(web_client.until(index, true));
                 const auto& rpc = web_client.rpcs[index];
@@ -9112,13 +9109,10 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                 GrpcWebTrailer trailer[] = {{{"grpc-status", 11}, {"0", 1}}};
                 u8 expected_trailer[64]{};
                 u32 expected_trailer_len = 0;
-                REQUIRE(grpc_web_encode_trailer_envelope(trailer,
-                                                         1,
-                                                         expected_trailer,
-                                                         sizeof(expected_trailer),
-                                                         expected_trailer_len));
-                const u32 expected_len = (empty ? 0u : static_cast<u32>(sizeof(framed))) +
-                                         expected_trailer_len;
+                REQUIRE(grpc_web_encode_trailer_envelope(
+                    trailer, 1, expected_trailer, sizeof(expected_trailer), expected_trailer_len));
+                const u32 expected_len =
+                    (empty ? 0u : static_cast<u32>(sizeof(framed))) + expected_trailer_len;
                 CHECK_EQ(decoded_len, expected_len);
                 if (decoded_len == expected_len) {
                     if (!empty) CHECK(memcmp(decoded, framed, sizeof(framed)) == 0);
@@ -9309,7 +9303,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         timeval timeout{5, 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         std::string request = std::string("POST ") + path +
-                              " HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/grpc+proto\r\nContent-Length: " +
+                              " HTTP/1.1\r\nHost: localhost\r\nContent-Type: "
+                              "application/grpc+proto\r\nContent-Length: " +
                               std::to_string(sizeof(h1_framed)) + "\r\nConnection: close\r\n\r\n";
         request.append(reinterpret_cast<const char*>(h1_framed), sizeof(h1_framed));
         REQUIRE(send_all(fd, request.data(), request.size()));
@@ -9336,8 +9331,12 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
             GrpcWebBase64Decoder decoder{};
             decoder.init();
             u32 consumed = 0;
-            REQUIRE(decoder.feed(wire + framing.body_offset, framing.content_length, consumed,
-                                 decoded, sizeof(decoded), decoded_len) == GrpcWebCodecStatus::Ok);
+            REQUIRE(decoder.feed(wire + framing.body_offset,
+                                 framing.content_length,
+                                 consumed,
+                                 decoded,
+                                 sizeof(decoded),
+                                 decoded_len) == GrpcWebCodecStatus::Ok);
             REQUIRE_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
         } else {
             decoded_len = static_cast<u32>(framing.content_length);
@@ -9347,7 +9346,8 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
         GrpcWebTrailer trailer[] = {{{"grpc-status", 11}, {"0", 1}}};
         u8 expected[64]{};
         u32 expected_len = 0;
-        REQUIRE(grpc_web_encode_trailer_envelope(trailer, 1, expected, sizeof(expected), expected_len));
+        REQUIRE(
+            grpc_web_encode_trailer_envelope(trailer, 1, expected, sizeof(expected), expected_len));
         const u32 frame_len = empty ? 0u : static_cast<u32>(sizeof(h1_framed));
         REQUIRE_EQ(decoded_len, frame_len + expected_len);
         if (!empty) CHECK(memcmp(decoded, h1_framed, sizeof(h1_framed)) == 0);

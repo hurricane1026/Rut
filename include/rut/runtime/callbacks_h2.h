@@ -978,8 +978,8 @@ inline bool prepare_local_grpc_web_h2_response(GrpcWebContentType mode,
                                                u32 capacity,
                                                const u8** body,
                                                u32* body_len) {
-    if ((mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text) ||
-        !headers || !header_count || !output || !body || !body_len)
+    if ((mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text) || !headers ||
+        !header_count || !output || !body || !body_len)
         return false;
     u32 content_types = 0, statuses = 0, messages = 0, details = 0;
     u8 status = 255;
@@ -1134,9 +1134,8 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         local_web_mode = grpc_web_content_type(hdrs[i].value);
         local_web_types++;
     }
-    bool local_web = local_web_types == 1 &&
-                     (local_web_mode == GrpcWebContentType::Binary ||
-                      local_web_mode == GrpcWebContentType::Text);
+    bool local_web = local_web_types == 1 && (local_web_mode == GrpcWebContentType::Binary ||
+                                              local_web_mode == GrpcWebContentType::Text);
     if (local_web) {
         if (o.status_code != 200 || is_head) {
             local_web = false;
@@ -1148,18 +1147,17 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                     return;
                 }
             }
-            u8* transformed =
-                static_cast<u8*>(d.conn->json_arena.alloc(kGrpcWebLocalBodyCap));
-            local_web = transformed != nullptr &&
-                        prepare_local_grpc_web_h2_response(local_web_mode,
-                                                           body,
-                                                           body_len,
-                                                           hdrs,
-                                                           &nhdrs,
-                                                           transformed,
-                                                           kGrpcWebLocalBodyCap,
-                                                           &body,
-                                                           &body_len);
+            u8* transformed = static_cast<u8*>(d.conn->json_arena.alloc(kGrpcWebLocalBodyCap));
+            local_web =
+                transformed != nullptr && prepare_local_grpc_web_h2_response(local_web_mode,
+                                                                             body,
+                                                                             body_len,
+                                                                             hdrs,
+                                                                             &nhdrs,
+                                                                             transformed,
+                                                                             kGrpcWebLocalBodyCap,
+                                                                             &body,
+                                                                             &body_len);
         }
         if (!local_web) {
             h2_emit_status(d, stream_id, 500);

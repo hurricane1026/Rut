@@ -1072,8 +1072,8 @@ inline bool prepare_local_grpc_web_response(GrpcWebContentType mode,
                                             const char** body_data,
                                             u32* body_len) {
     if ((mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text) ||
-        headers == nullptr || header_count == nullptr || body_out == nullptr || body_data == nullptr ||
-        body_len == nullptr)
+        headers == nullptr || header_count == nullptr || body_out == nullptr ||
+        body_data == nullptr || body_len == nullptr)
         return false;
     u32 content_types = 0;
     u32 statuses = 0;
@@ -1124,12 +1124,11 @@ inline bool prepare_local_grpc_web_response(GrpcWebContentType mode,
     const char* canonical = mode == GrpcWebContentType::Text ? kTextType : kBinaryType;
     const u32 canonical_len = mode == GrpcWebContentType::Text ? 25 : 20;
     for (u32 i = 0; i < *header_count;) {
-        const bool trailer = http_header_name_eq_ci(headers[i].key_data, headers[i].key_len,
-                                                    "grpc-status", 11) ||
-                             http_header_name_eq_ci(headers[i].key_data, headers[i].key_len,
-                                                    "grpc-message", 12) ||
-                             http_header_name_eq_ci(headers[i].key_data, headers[i].key_len,
-                                                    "grpc-status-details-bin", 23);
+        const bool trailer =
+            http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "grpc-status", 11) ||
+            http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "grpc-message", 12) ||
+            http_header_name_eq_ci(
+                headers[i].key_data, headers[i].key_len, "grpc-status-details-bin", 23);
         if (http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "content-type", 12)) {
             headers[i].value_data = canonical;
             headers[i].value_len = canonical_len;
@@ -3815,14 +3814,15 @@ void handle_jit_outcome(Loop* loop,
                 ResponseHeaderKV headers[kMaxHeaders];
                 u32 count = 0;
                 bool suppress_type = false;
-                const bool collected = conn.jit_response_body_valid &&
-                                        collect_effective_response_headers(conn,
-                                                                           cfg,
-                                                                           outcome.response_headers_idx,
-                                                                           headers,
-                                                                           kMaxHeaders,
-                                                                           &count,
-                                                                           &suppress_type);
+                const bool collected =
+                    conn.jit_response_body_valid &&
+                    collect_effective_response_headers(conn,
+                                                       cfg,
+                                                       outcome.response_headers_idx,
+                                                       headers,
+                                                       kMaxHeaders,
+                                                       &count,
+                                                       &suppress_type);
                 const char* response_body = conn.jit_response_body.ptr;
                 u32 response_body_len = conn.jit_response_body.len;
                 bool ok = collected;
@@ -3966,13 +3966,11 @@ void handle_jit_outcome(Loop* loop,
                     if (!http_header_name_eq_ci(
                             kvs[i].key_data, kvs[i].key_len, "Content-Type", 12))
                         continue;
-                    local_web_mode = grpc_web_content_type(
-                        {kvs[i].value_data, kvs[i].value_len});
+                    local_web_mode = grpc_web_content_type({kvs[i].value_data, kvs[i].value_len});
                     local_web_types++;
                 }
-                if (local_web_types == 1 &&
-                    (local_web_mode == GrpcWebContentType::Binary ||
-                     local_web_mode == GrpcWebContentType::Text)) {
+                if (local_web_types == 1 && (local_web_mode == GrpcWebContentType::Binary ||
+                                             local_web_mode == GrpcWebContentType::Text)) {
                     if (outcome.status_code != 200 || is_head) response_formatted = false;
                     if (!has_body && !body_idx_invalid) {
                         body_data = nullptr;
@@ -3985,8 +3983,7 @@ void handle_jit_outcome(Loop* loop,
                          !conn.json_arena.init(conn.json_arena.backend.pool)))
                         response_formatted = false;
                     if (response_formatted)
-                        transformed =
-                            static_cast<u8*>(conn.json_arena.alloc(kGrpcWebLocalBodyCap));
+                        transformed = static_cast<u8*>(conn.json_arena.alloc(kGrpcWebLocalBodyCap));
                     if (!response_formatted || transformed == nullptr ||
                         !prepare_local_grpc_web_response(local_web_mode,
                                                          reinterpret_cast<const u8*>(body_data),

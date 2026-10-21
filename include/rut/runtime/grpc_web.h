@@ -285,11 +285,8 @@ inline bool grpc_web_encode_local_response(GrpcWebContentType mode,
         if (message_len > capacity) return false;
         if (message_len) __builtin_memcpy(output, message, message_len);
         u32 trailer_len = 0;
-        if (!grpc_web_encode_trailer_envelope(trailers,
-                                               trailer_count,
-                                               output + message_len,
-                                               capacity - message_len,
-                                               trailer_len))
+        if (!grpc_web_encode_trailer_envelope(
+                trailers, trailer_count, output + message_len, capacity - message_len, trailer_len))
             return false;
         written = message_len + trailer_len;
         return true;
@@ -317,8 +314,7 @@ inline bool grpc_web_encode_local_response(GrpcWebContentType mode,
     };
     if (!feed(message, message_len)) return false;
     u8 trailer[4096];
-    if (!grpc_web_encode_trailer_envelope(
-            trailers, trailer_count, trailer, sizeof(trailer), n))
+    if (!grpc_web_encode_trailer_envelope(trailers, trailer_count, trailer, sizeof(trailer), n))
         return false;
     consumed = 0;
     if (!feed(trailer, n)) return false;

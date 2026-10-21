@@ -490,7 +490,8 @@ TEST(json_network, queued_static_grpc_web_response_uses_owned_transformed_body) 
     native[3] = 0x20;
     for (u32 i = 5; i < sizeof(native); i++) native[i] = 'q';
     RouteConfig cfg;
-    const u16 body_idx = cfg.add_response_body_view(reinterpret_cast<const char*>(native), sizeof(native));
+    const u16 body_idx =
+        cfg.add_response_body_view(reinterpret_cast<const char*>(native), sizeof(native));
     REQUIRE(body_idx != 0);
     const char* keys[] = {"content-type", "grpc-status"};
     const u32 key_lens[] = {12, 11};
@@ -1171,8 +1172,9 @@ TEST(json_network, grpc_web_local_outcome_stages_owned_binary_and_text_body) {
     conn->jit_response_body_valid = true;
     conn->jit_response_body = {nullptr, 0};
     conn->resp_header_mutation_count = 2;
-    conn->resp_header_mutations[0] = {
-        {"content-type", 12}, {"application/grpc-web", 20}, Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[0] = {{"content-type", 12},
+                                      {"application/grpc-web", 20},
+                                      Connection::RespHeaderMutationMode::Set};
     conn->resp_header_mutations[1] = {
         {"grpc-status", 11}, {"0", 1}, Connection::RespHeaderMutationMode::Set};
     JitDispatchOutcome trailers_only{};

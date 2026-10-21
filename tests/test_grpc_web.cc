@@ -280,12 +280,8 @@ TEST(grpc_web, local_response_encodes_message_and_trailer_once) {
     u8 decoded[256]{};
     u32 consumed = 0;
     u32 decoded_len = 0;
-    REQUIRE(decoder.feed(text,
-                         text_len,
-                         consumed,
-                         decoded,
-                         sizeof(decoded),
-                         decoded_len) == GrpcWebCodecStatus::Ok);
+    REQUIRE(decoder.feed(text, text_len, consumed, decoded, sizeof(decoded), decoded_len) ==
+            GrpcWebCodecStatus::Ok);
     CHECK_EQ(consumed, text_len);
     REQUIRE(decoder.finish() == GrpcWebCodecStatus::Ok);
     CHECK_EQ(decoded_len, binary_len);
@@ -311,12 +307,8 @@ TEST(grpc_web, local_response_enforces_bounds_and_text_modulo_boundaries) {
         decoder.init();
         u8 decoded[64]{};
         u32 consumed = 0, decoded_len = 0;
-        REQUIRE(decoder.feed(output,
-                             written,
-                             consumed,
-                             decoded,
-                             sizeof(decoded),
-                             decoded_len) == GrpcWebCodecStatus::Ok);
+        REQUIRE(decoder.feed(output, written, consumed, decoded, sizeof(decoded), decoded_len) ==
+                GrpcWebCodecStatus::Ok);
         REQUIRE(decoder.finish() == GrpcWebCodecStatus::Ok);
         CHECK_EQ(decoded[0], 0u);
         CHECK(memcmp(decoded, frame, 5 + payload) == 0);
@@ -334,25 +326,15 @@ TEST(grpc_web, local_response_enforces_bounds_and_text_modulo_boundaries) {
     }
 
     // An empty native body is represented by a trailer-only grpc-web frame.
-    REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Text,
-                                           nullptr,
-                                           0,
-                                           0,
-                                           {},
-                                           {},
-                                           output,
-                                           sizeof(output),
-                                           written));
+    REQUIRE(grpc_web_encode_local_response(
+        GrpcWebContentType::Text, nullptr, 0, 0, {}, {}, output, sizeof(output), written));
     GrpcWebBase64Decoder empty_decoder{};
     empty_decoder.init();
     u8 empty_decoded[64]{};
     u32 empty_consumed = 0, empty_len = 0;
-    REQUIRE(empty_decoder.feed(output,
-                               written,
-                               empty_consumed,
-                               empty_decoded,
-                               sizeof(empty_decoded),
-                               empty_len) == GrpcWebCodecStatus::Ok);
+    REQUIRE(empty_decoder.feed(
+                output, written, empty_consumed, empty_decoded, sizeof(empty_decoded), empty_len) ==
+            GrpcWebCodecStatus::Ok);
     REQUIRE(empty_decoder.finish() == GrpcWebCodecStatus::Ok);
     CHECK_EQ(empty_consumed, written);
     CHECK_EQ(empty_decoded[0], 0x80u);
@@ -390,10 +372,10 @@ TEST(grpc_web, local_response_enforces_bounds_and_text_modulo_boundaries) {
                                  maximum_len) == GrpcWebCodecStatus::Ok);
     REQUIRE(maximum_decoder.finish() == GrpcWebCodecStatus::Ok);
     CHECK_EQ(maximum_consumed, written);
-    GrpcWebTrailer maximum_trailers[] = {{{"grpc-status", 11}, {"16", 2}},
-                                         {{"grpc-message", 12}, {message, sizeof(message)}},
-                                         {{"grpc-status-details-bin", 23},
-                                          {details, sizeof(details)}}};
+    GrpcWebTrailer maximum_trailers[] = {
+        {{"grpc-status", 11}, {"16", 2}},
+        {{"grpc-message", 12}, {message, sizeof(message)}},
+        {{"grpc-status-details-bin", 23}, {details, sizeof(details)}}};
     u8 expected_maximum_trailer[8192]{};
     u32 expected_maximum_trailer_len = 0;
     REQUIRE(grpc_web_encode_trailer_envelope(maximum_trailers,
@@ -416,15 +398,8 @@ TEST(grpc_web, local_response_enforces_bounds_and_text_modulo_boundaries) {
                                           output,
                                           written - 1,
                                           written));
-    CHECK(!grpc_web_encode_local_response(GrpcWebContentType::Binary,
-                                          maximum,
-                                          sizeof(maximum),
-                                          0,
-                                          {},
-                                          {},
-                                          output,
-                                          16,
-                                          written));
+    CHECK(!grpc_web_encode_local_response(
+        GrpcWebContentType::Binary, maximum, sizeof(maximum), 0, {}, {}, output, 16, written));
     u8 compressed[] = {1, 0, 0, 0, 0};
     CHECK(!grpc_web_encode_local_response(GrpcWebContentType::Binary,
                                           compressed,
@@ -445,15 +420,8 @@ TEST(grpc_web, local_response_enforces_bounds_and_text_modulo_boundaries) {
                                           output,
                                           sizeof(output),
                                           written));
-    CHECK(!grpc_web_encode_local_response(GrpcWebContentType::Binary,
-                                          nullptr,
-                                          0,
-                                          17,
-                                          {},
-                                          {},
-                                          output,
-                                          sizeof(output),
-                                          written));
+    CHECK(!grpc_web_encode_local_response(
+        GrpcWebContentType::Binary, nullptr, 0, 17, {}, {}, output, sizeof(output), written));
 }
 
 int main(int argc, char** argv) {
