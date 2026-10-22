@@ -78,7 +78,7 @@ struct UpstreamTarget {
     u32 max_inflight = 0;
 
     // Active health-check config from `health_check: { ... }`. HTTP/1 uses
-    // hc_path/hc_expected_status; plaintext HTTP/2 uses the fixed gRPC Health
+    // hc_path/hc_expected_status; HTTP/2 uses the fixed gRPC Health
     // Check method and hc_service. Strings are not NUL-terminated; use lengths.
     UpstreamTlsSpec tls{};
     GrpcRetryPolicy grpc_retry{};
@@ -1468,7 +1468,7 @@ public:
                                         u32 interval_ms) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
-        if (!up.http2 || up.tls.enabled || (service_len != 0 && service == nullptr) ||
+        if (!up.http2 || (service_len != 0 && service == nullptr) ||
             service_len > UpstreamTarget::kMaxHealthServiceLen || interval_ms == 0)
             return false;
         if (!protobuf::utf8({service, service_len})) return false;

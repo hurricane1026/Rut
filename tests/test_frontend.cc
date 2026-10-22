@@ -40039,8 +40039,6 @@ TEST(frontend, health_probe_protocol_fields_are_validated) {
         "protocol: .http2, health_check: { path: \"/healthz\", interval: 2s }",
         "protocol: .http2, health_check: { path: \"\", interval: 2s }",
         "protocol: .http2, health_check: { interval: 2s, status: 200 }",
-        "protocol: .http2, tls: { ca: \"ca.pem\", server_name: \"backend.example\" }, "
-        "health_check: { interval: 2s }",
         "protocol: .http11, health_check: { interval: 2s, service: \"api\" }",
         "protocol: .http2, health_check: { interval: 2s, service: \"bad\xFFname\" }",
     };
@@ -40057,6 +40055,35 @@ TEST(frontend, health_probe_protocol_fields_are_validated) {
         auto hir = analyze_file_heap(ast.value());
         CHECK(!hir);
     }
+}
+
+TEST(frontend, grpc_health_probe_retains_tls_configuration) {
+    auto tokens =
+        lex(lit("upstream api { host: \"127.0.0.1\", port: 50051, "
+                "protocol: .http2, tls: { ca: \"ca.pem\", "
+                "server_name: \"backend.example\" }, "
+                "health_check: { interval: 2s, service: \"api.Service\" } }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    const auto& upstream = cfg.upstreams[0];
+    CHECK(upstream.http2);
+    CHECK(upstream.hc_enabled);
+    CHECK(upstream.tls.enabled);
+    const Str server_name{upstream.tls.server_name, 15};
+    const Str service{upstream.hc_service, upstream.hc_service_len};
+    CHECK(server_name.eq(lit_str("backend.example")));
+    CHECK(service.eq(lit_str("api.Service")));
+    rir.destroy();
 }
 
 TEST(frontend, string_literals_decode_expression_escapes) {

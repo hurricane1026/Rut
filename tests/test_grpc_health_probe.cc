@@ -1,4 +1,4 @@
-// Focused tests for the active plaintext gRPC Health HTTP/2 probe builder and
+// Focused tests for the active gRPC Health HTTP/2 probe builder and
 // bounded response decoder. The integration path is exercised separately in
 // test_integration.cc against a loopback HTTP/2 backend.
 #include "rut/runtime/callbacks_impl.h"
@@ -26,6 +26,10 @@ struct ProbeHarness {
         recv_submits++;
         return true;
     }
+    bool submit_send(Connection& conn, const u8* bytes, u32 len) {
+        return submit_send_upstream(conn, bytes, len);
+    }
+    bool submit_recv(Connection& conn) { return submit_recv_upstream(conn); }
     void free_health_probe(Connection&) { frees++; }
 };
 
@@ -120,6 +124,62 @@ TEST(grpc_health_probe, request_encodes_128_byte_service_length_as_varint) {
         pos += kFrameHeaderSize + frame.length;
     }
     CHECK(service_found);
+}
+
+TEST(grpc_health_probe, tls_request_uses_https_and_configured_authority) {
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("grpc", 0x7f000001, 50051);
+    REQUIRE(id.has_value());
+    UpstreamTarget& target = cfg.upstreams[id.value()];
+    target.http2 = true;
+    target.tls.enabled = true;
+    for (u32 i = 0; i < sizeof("health.example.test"); ++i)
+        target.tls.server_name[i] = "health.example.test"[i];
+
+    u8 storage[SlicePool::kSliceSize];
+    Connection conn{};
+    conn.reset();
+    conn.bind_request_receive_buffer(storage, sizeof(storage));
+    Http2Conn h2{};
+    conn.h2 = &h2;
+    REQUIRE(build_grpc_health_probe_request(conn, target, 0));
+
+    u32 pos = kClientPrefaceLen;
+    bool headers_found = false;
+    while (pos + kFrameHeaderSize <= conn.recv_buf.len()) {
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(conn.recv_buf.data() + pos, conn.recv_buf.len() - pos, &frame) ==
+                ParseStatus::Complete);
+        REQUIRE(pos + kFrameHeaderSize + frame.length <= conn.recv_buf.len());
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers)) {
+            hpack::DynamicTable dynamic{};
+            dynamic.init(4096);
+            hpack::Header decoded[8];
+            u8 arena[512];
+            u32 count = 0;
+            REQUIRE(hpack::decode_header_block(dynamic,
+                                               conn.recv_buf.data() + pos + kFrameHeaderSize,
+                                               frame.length,
+                                               arena,
+                                               sizeof(arena),
+                                               decoded,
+                                               8,
+                                               &count));
+            bool scheme_ok = false;
+            bool authority_ok = false;
+            for (u32 i = 0; i < count; ++i) {
+                if (decoded[i].name.eq({":scheme", 7}))
+                    scheme_ok = decoded[i].value.eq({"https", 5});
+                if (decoded[i].name.eq({":authority", 10}))
+                    authority_ok = decoded[i].value.eq({"health.example.test:50051", 25});
+            }
+            CHECK(scheme_ok);
+            CHECK(authority_ok);
+            headers_found = true;
+        }
+        pos += kFrameHeaderSize + frame.length;
+    }
+    CHECK(headers_found);
 }
 
 TEST(grpc_health_probe, client_processes_data_and_continued_trailers) {

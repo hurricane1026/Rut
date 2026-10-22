@@ -88,6 +88,21 @@ int no_client_key_password(char*, int, int, void*) {
     return 0;
 }
 
+// Upstream TLS clients use HTTP/2 exclusively. Reject a peer that did not
+// negotiate h2 during certificate verification, before SSL_write can send any
+// HTTP/2 application bytes.
+int verify_h2_peer(int preverified, X509_STORE_CTX* store) {
+    if (!preverified) return 0;
+    SSL* ssl =
+        static_cast<SSL*>(X509_STORE_CTX_get_ex_data(store, SSL_get_ex_data_X509_STORE_CTX_idx()));
+    const u8* protocol = nullptr;
+    unsigned protocol_len = 0;
+    if (ssl) SSL_get0_alpn_selected(ssl, &protocol, &protocol_len);
+    if (protocol && protocol_len == 2 && protocol[0] == 'h' && protocol[1] == '2') return 1;
+    X509_STORE_CTX_set_error(store, X509_V_ERR_APPLICATION_VERIFICATION);
+    return 0;
+}
+
 // Wire-format ALPN protocol names (1-byte length prefix per RFC 7301).
 constexpr u8 kAlpnH2[] = {2, 'h', '2'};
 constexpr u8 kAlpnHttp11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
@@ -257,7 +272,7 @@ core::Expected<void, Error> init_tls_client_context(TlsClientContext& ctx,
         destroy_tls_client_context(ctx);
         return core::make_unexpected(Error::make(ENOMEM, Error::Source::Socket));
     }
-    SSL_CTX_set_verify(ctx.ssl_ctx, SSL_VERIFY_PEER, nullptr);
+    SSL_CTX_set_verify(ctx.ssl_ctx, SSL_VERIFY_PEER, verify_h2_peer);
     SSL_CTX_set_default_passwd_cb(ctx.ssl_ctx, no_client_key_password);
     if (SSL_CTX_set_min_proto_version(ctx.ssl_ctx, TLS1_2_VERSION) != 1 ||
         SSL_CTX_load_verify_locations(ctx.ssl_ctx, spec.ca, nullptr) != 1 ||

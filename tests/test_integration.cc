@@ -2482,12 +2482,15 @@ struct GrpcHealthProbeServer {
     std::atomic<bool> serving{false};
     std::atomic<bool> running{false};
     std::atomic<u32> requests{0};
+    std::atomic<bool> stall_response{false};
     bool started = false;
     pthread_t thread{};
+    TlsServerContext* tls_context = nullptr;
+    bool tls_enabled = false;
 
     ~GrpcHealthProbeServer() { teardown(); }
 
-    static bool respond(i32 fd, bool is_serving) {
+    static bool respond(i32 fd, bool is_serving, SSL* ssl = nullptr) {
         u8 response[512];
         u32 length = 0;
         Http2Settings settings{};
@@ -2511,7 +2514,14 @@ struct GrpcHealthProbeServer {
             response + length, sizeof(response) - length, 1, trailers, 1, true, encoder);
         if (trailer_len == 0) return false;
         length += trailer_len;
-        return send_all(fd, reinterpret_cast<const char*>(response), length);
+        if (ssl == nullptr) return send_all(fd, reinterpret_cast<const char*>(response), length);
+        u32 sent = 0;
+        while (sent < length) {
+            const i32 n = SSL_write(ssl, response + sent, static_cast<i32>(length - sent));
+            if (n <= 0) return false;
+            sent += static_cast<u32>(n);
+        }
+        return true;
     }
 
     static void* run(void* arg) {
@@ -2522,14 +2532,30 @@ struct GrpcHealthProbeServer {
             const i32 client = accept(server->listen_fd, nullptr, nullptr);
             if (client < 0) continue;
             set_socket_timeouts(client, 2);
+            SSL* ssl = nullptr;
+            if (server->tls_enabled) {
+                auto created = create_tls_server_ssl(server->tls_context, client);
+                if (!created) {
+                    close(client);
+                    continue;
+                }
+                ssl = created.value();
+                if (SSL_accept(ssl) != 1) {
+                    destroy_tls_server_ssl(ssl);
+                    close(client);
+                    continue;
+                }
+            }
             u8 request[4096];
             u32 total = 0;
             bool complete = false;
             while (total < sizeof(request) && !complete) {
-                const i32 n = recv_timeout(client,
-                                           reinterpret_cast<char*>(request + total),
-                                           sizeof(request) - total,
-                                           1000);
+                const i32 n =
+                    ssl ? SSL_read(ssl, request + total, static_cast<i32>(sizeof(request) - total))
+                        : recv_timeout(client,
+                                       reinterpret_cast<char*>(request + total),
+                                       sizeof(request) - total,
+                                       1000);
                 if (n <= 0) break;
                 total += static_cast<u32>(n);
                 if (total < kClientPrefaceLen) continue;
@@ -2549,24 +2575,60 @@ struct GrpcHealthProbeServer {
             }
             if (complete) {
                 server->requests.fetch_add(1, std::memory_order_relaxed);
-                (void)respond(client, server->serving.load(std::memory_order_acquire));
+                if (server->stall_response.load(std::memory_order_acquire)) {
+                    if (ssl) {
+                        u8 settings[64];
+                        Http2Settings peer_settings{};
+                        peer_settings.set_defaults();
+                        const u32 settings_len = write_settings_frame(settings, peer_settings);
+                        u32 sent = 0;
+                        while (sent < settings_len) {
+                            const i32 n = SSL_write(
+                                ssl, settings + sent, static_cast<i32>(settings_len - sent));
+                            if (n <= 0) break;
+                            sent += static_cast<u32>(n);
+                        }
+                    }
+                    while (server->running.load(std::memory_order_acquire)) {
+                        pollfd wait{client, POLLIN, 0};
+                        if (poll(&wait, 1, 10) > 0 && (wait.revents & (POLLIN | POLLHUP))) {
+                            u8 ignored;
+                            const i32 n =
+                                ssl ? SSL_read(ssl, &ignored, 1) : recv(client, &ignored, 1, 0);
+                            if (n <= 0) break;
+                        }
+                    }
+                } else {
+                    (void)respond(client, server->serving.load(std::memory_order_acquire), ssl);
+                }
                 // The client acknowledges our SETTINGS when it parses them
                 // before the terminal response. Drain that optional ACK so a
                 // split recv does not race an immediate peer close.
                 pollfd ack{client, POLLIN, 0};
-                if (poll(&ack, 1, 100) > 0) {
+                if (ssl == nullptr && poll(&ack, 1, 100) > 0) {
                     u8 ignored[64];
                     (void)recv(client, ignored, sizeof(ignored), 0);
                 }
             }
+            if (ssl) destroy_tls_server_ssl(ssl);
             close(client);
         }
         return nullptr;
     }
 
-    bool setup() {
+    bool setup(bool enable_tls = false, bool offer_h2 = true) {
+        tls_enabled = enable_tls;
+        if (tls_enabled) {
+            auto context = create_tls_server_context(kTestCertPath, kTestKeyPath, offer_h2);
+            if (!context) return false;
+            tls_context = context.value();
+        }
         auto socket = create_listen_socket(0);
-        if (!socket.has_value()) return false;
+        if (!socket.has_value()) {
+            if (tls_context) destroy_tls_server_context(tls_context);
+            tls_context = nullptr;
+            return false;
+        }
         listen_fd = socket.value();
         port = get_port(listen_fd);
         running.store(true, std::memory_order_release);
@@ -2574,6 +2636,8 @@ struct GrpcHealthProbeServer {
             running.store(false, std::memory_order_release);
             close(listen_fd);
             listen_fd = -1;
+            if (tls_context) destroy_tls_server_context(tls_context);
+            tls_context = nullptr;
             return false;
         }
         started = true;
@@ -2589,6 +2653,10 @@ struct GrpcHealthProbeServer {
         if (listen_fd >= 0) {
             close(listen_fd);
             listen_fd = -1;
+        }
+        if (tls_context) {
+            destroy_tls_server_context(tls_context);
+            tls_context = nullptr;
         }
     }
 };
@@ -2710,6 +2778,135 @@ TEST(active_health_e2e, grpc_http2_check_marks_backend_and_recovers) {
     close(listen_fd);
     destroy_real_loop(loop);
     backend.teardown();
+}
+
+TEST(active_health_e2e, grpc_tls_check_validates_peer_and_alpn_before_request) {
+    using namespace rut;
+    GrpcHealthProbeServer backend;
+    GrpcHealthProbeServer no_alpn_backend;
+    REQUIRE(backend.setup(/*enable_tls=*/true, /*offer_h2=*/true));
+    REQUIRE(no_alpn_backend.setup(/*enable_tls=*/true, /*offer_h2=*/false));
+    backend.serving.store(true, std::memory_order_release);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("grpc-tls", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    UpstreamTarget& target = cfg.upstreams[uid];
+    target.http2 = true;
+    target.tls.enabled = true;
+    for (u32 i = 0; i < sizeof(kTestCertPath); ++i) target.tls.ca[i] = kTestCertPath[i];
+    for (u32 i = 0; i < sizeof(kTestCertPath); ++i) target.tls.cert[i] = kTestCertPath[i];
+    for (u32 i = 0; i < sizeof(kTestKeyPath); ++i) target.tls.key[i] = kTestKeyPath[i];
+    constexpr char kServerName[] = "localhost";
+    for (u32 i = 0; i < sizeof(kServerName); ++i) target.tls.server_name[i] = kServerName[i];
+    REQUIRE(valid_upstream_tls(target.tls));
+    REQUIRE(cfg.set_upstream_grpc_health_check(uid, nullptr, 0, /*interval_ms=*/1));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    record_active_probe_result(uid, 0, /*healthy=*/true, monotonic_us());
+
+    auto pump = [&]() {
+        IoEvent events[64];
+        for (int it = 0; it < 200 && loop->active_count() > 0; ++it) {
+            const u32 count = loop->backend.wait(events, 64, loop->conns, RealLoop::kMaxConns);
+            for (u32 i = 0; i < count; ++i) loop->dispatch(events[i]);
+        }
+    };
+    auto probe = [&]() {
+        loop->health_probe_deadline_ns[uid] = 0;
+        loop->sweep_health_probes();
+        pump();
+    };
+
+    loop->sweep_health_probes();
+    probe();
+    CHECK_EQ(backend.requests.load(std::memory_order_acquire), 1u);
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+
+    // Keep the TLS 1.3 success above, then constrain the same linked-OpenSSL
+    // fixture to TLS 1.2 to verify ALPN is already available to certificate
+    // verification at both protocol versions.
+    REQUIRE(SSL_CTX_set_max_proto_version(backend.tls_context->ssl_ctx, TLS1_2_VERSION) == 1);
+    probe();
+    CHECK_EQ(backend.requests.load(std::memory_order_acquire), 2u);
+
+    // The chain is trusted, but the configured hostname is not: TLS must fail
+    // before the client writes the H2 preface or Health request.
+    constexpr char kWrongName[] = "wrong.example.test";
+    for (u32 i = 0; i < sizeof(target.tls.server_name); ++i) target.tls.server_name[i] = 0;
+    for (u32 i = 0; i < sizeof(kWrongName); ++i) target.tls.server_name[i] = kWrongName[i];
+    probe();
+    CHECK_EQ(backend.requests.load(std::memory_order_acquire), 2u);
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+
+    for (u32 i = 0; i < sizeof(target.tls.server_name); ++i) target.tls.server_name[i] = 0;
+    for (u32 i = 0; i < sizeof(kServerName); ++i) target.tls.server_name[i] = kServerName[i];
+    target.addrs[0].sin_port = htons(no_alpn_backend.port);
+    probe();
+    CHECK_EQ(no_alpn_backend.requests.load(std::memory_order_acquire), 0u);
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+
+    // Leave a synchronous TLS SETTINGS ACK completion queued and force-close
+    // the probe to exercise detached-fd, SSL, context, and slot reclamation.
+    target.addrs[0].sin_port = htons(backend.port);
+    backend.stall_response.store(true, std::memory_order_release);
+    const u32 free_slots_before = loop->free_conn_slots();
+    auto start_stalled_probe_until_io = [&]() {
+        loop->health_probe_deadline_ns[uid] = 0;
+        loop->sweep_health_probes();
+        bool pending_send_queued = false;
+        for (int it = 0; it < 16 && !pending_send_queued; ++it) {
+            IoEvent events[64];
+            const u32 count = loop->backend.wait(events, 64, loop->conns, RealLoop::kMaxConns);
+            for (u32 i = 0; i < count; ++i) loop->dispatch(events[i]);
+            for (u32 i = 0; i < RealLoop::kMaxConns; ++i) {
+                const Connection& conn = loop->conns[i];
+                pending_send_queued |= conn.is_health_probe && conn.tls_active &&
+                                       conn.on_send == &on_probe_h2_control_sent<RealLoop> &&
+                                       loop->backend.pending_count != 0;
+            }
+        }
+        return pending_send_queued;
+    };
+
+    loop->upstream_timeout = 1;
+    REQUIRE(start_stalled_probe_until_io());
+    loop->dispatch(IoEvent{0, 1, 0, 0, IoEventType::Timeout, 0, 0});
+    loop->dispatch(IoEvent{0, 1, 0, 0, IoEventType::Timeout, 0, 0});
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK_EQ(loop->free_conn_slots(), free_slots_before);
+    CHECK_EQ(loop->backend.pending_count, 0u);
+
+    // A separate stalled attempt is force-closed with the same send window open.
+    loop->upstream_timeout = 30;
+    REQUIRE(start_stalled_probe_until_io());
+    loop->force_close_all();
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK_EQ(loop->free_conn_slots(), free_slots_before);
+    CHECK_EQ(loop->backend.pending_count, 0u);
+    Connection* reused = loop->alloc_conn();
+    REQUIRE(reused != nullptr);
+    const u32 reused_id = reused->id;
+    loop->free_conn(*reused);
+    IoEvent after_close[8];
+    const u32 after_close_count =
+        loop->backend.wait(after_close, 8, loop->conns, RealLoop::kMaxConns);
+    for (u32 i = 0; i < after_close_count; ++i)
+        CHECK(!(after_close[i].type == IoEventType::Send && after_close[i].conn_id == reused_id));
+
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+    backend.teardown();
+    no_alpn_backend.teardown();
 }
 
 // An active-probe failure must keep the backend OUT of rotation until a probe

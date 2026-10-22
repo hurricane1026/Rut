@@ -902,6 +902,19 @@ u32 EpollBackend::cancel(i32 fd,
                          bool /*has_upstream*/) {
     invalidate_fd_interest(conn_id, fd);
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    // Synchronous TLS sends can queue a completion before control returns to
+    // the event loop. A probe may be force-closed in that window; discard its
+    // queued completions for this connection id before the slot is reused.
+    u32 kept = 0;
+    for (u32 i = 0; i < pending_count; ++i) {
+        if (pending_completions[i].conn_id == conn_id) continue;
+        if (kept != i) pending_completions[kept] = pending_completions[i];
+        ++kept;
+    }
+    if (kept != pending_count) {
+        pending_count = kept;
+        pending_streak = 0;
+    }
     return 0;
 }
 
