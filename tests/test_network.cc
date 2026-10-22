@@ -88710,6 +88710,57 @@ TEST(local_grpc_deadline_backend, cancel_ealready_retires_dispatch_owners_in_bot
     }
 }
 
+TEST(local_grpc_deadline_backend, async_cancel_owner_gates_http1_successor_until_both_cqes) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    REQUIRE(guard.loop->pool.init(SlicePool::capacity_for_connections(1), 0).has_value());
+    auto* conn = guard.loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->upstream_episode = 1;
+    REQUIRE(guard.loop->arm_local_grpc_deadline(*conn, 1234567));
+    const u32 generation = conn->local_grpc_deadline_timer.owner_generation;
+    guard.loop->disarm_local_grpc_deadline(*conn);
+    CHECK(conn->local_grpc_deadline_timer.cancel_owned);
+    CHECK(guard.loop->defer_http1_request_boundary(*conn));
+    CHECK(conn->http1_boundary_deferred);
+    guard.loop->maybe_publish_http1_boundary_ready(*conn);
+    CHECK_FALSE(conn->http1_boundary_ready);
+
+    IoEvent target{conn->id, -ECANCELED, 0, 0, IoEventType::LocalGrpcDeadlineTimer, 0};
+    target.non_upstream_generation = generation;
+    IoEvent cancel = target;
+    cancel.type = IoEventType::LocalGrpcDeadlineCancel;
+    cancel.result = -ENOENT;
+    guard.loop->dispatch(target);
+    CHECK_FALSE(conn->local_grpc_deadline_timer.reusable());
+    CHECK_FALSE(conn->http1_boundary_ready);
+    guard.loop->dispatch(cancel);
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    CHECK(conn->http1_boundary_ready);
+    CHECK_EQ(conn->pending_ops, 0u);
+
+    // A successor can arm a fresh owner after the first target/cancel pair;
+    // exercise the reverse CQE order as well.
+    conn->http1_boundary_ready = false;
+    REQUIRE(guard.loop->arm_local_grpc_deadline(*conn, 1234568));
+    const u32 successor_generation = conn->local_grpc_deadline_timer.owner_generation;
+    CHECK_NE(successor_generation, generation);
+    guard.loop->disarm_local_grpc_deadline(*conn);
+    target.non_upstream_generation = successor_generation;
+    cancel.non_upstream_generation = successor_generation;
+    guard.loop->dispatch(cancel);
+    CHECK_FALSE(conn->local_grpc_deadline_timer.reusable());
+    CHECK_FALSE(conn->http1_boundary_ready);
+    guard.loop->dispatch(target);
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    CHECK(conn->http1_boundary_ready);
+    CHECK_EQ(conn->pending_ops, 0u);
+    guard.loop->close_conn(*conn);
+    guard.loop->pool.destroy();
+}
+
 TEST(local_grpc_deadline_backend, epoll_retains_exact_long_deadline_across_horizon_wakes) {
     EpollEventLoop loop;
     REQUIRE(loop.init_slot_storage(1).has_value());
@@ -88754,3 +88805,56 @@ TEST(local_grpc_deadline_backend, epoll_retains_exact_long_deadline_across_horiz
     loop.destroy_slot_storage();
 }
 #endif  // __linux__
+
+#ifdef __linux__
+static u32 local_deadline_socket_calls;
+static u64 local_deadline_socket_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++local_deadline_socket_calls;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+TEST(local_grpc_deadline, iouring_slow_body_real_socket_status_four) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init(2)) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    i32 sockets[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
+    struct Peer {
+        i32 fd;
+        ~Peer() { close(fd); }
+    } peer{sockets[1]};
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->fd = sockets[0];
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(config->add_jit_handler("/body", 0, &local_deadline_socket_handler, true));
+    const RouteConfig* config_ptr = config.get();
+    loop->config_ptr = &config_ptr;
+    const char request[] =
+        "POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: application/grpc-web\r\n"
+        "grpc-timeout: 1m\r\nContent-Length: 6\r\n\r\nx";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+               sizeof(request) - 1);
+    local_deadline_socket_calls = 0;
+    on_header_received<IoUringEventLoop>(
+        loop, *conn, {conn->id, sizeof(request) - 1, 0, 0, IoEventType::Recv, 0});
+    REQUIRE(conn->local_grpc_deadline.present);
+    char wire[1024]{};
+    i32 received = -1;
+    const i64 end = test_mono_ms() + 2000;
+    while (test_mono_ms() < end) {
+        IoEvent events[16]{};
+        const u32 count = loop->backend.wait(events, 16, loop->conns, loop->connection_capacity);
+        loop->dispatch_batch(events, count);
+        received = recv(peer.fd, wire, sizeof(wire) - 1, MSG_DONTWAIT);
+        if (received > 0) break;
+    }
+    REQUIRE_GT(received, 0);
+    CHECK_EQ(local_deadline_socket_calls, 0u);
+    const std::string response(wire, received);
+    CHECK(response.find("HTTP/1.1 200") == 0);
+    CHECK(response.find("grpc-status: 4") != std::string::npos);
+    CHECK(response.find("Connection: close") != std::string::npos);
+    if (conn->fd >= 0) loop->close_conn(*conn);
+}
+#endif

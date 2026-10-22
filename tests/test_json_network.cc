@@ -92,6 +92,531 @@ static u64 web_admission_handler(void*, jit::HandlerCtx* ctx, const u8* raw, u32
     return jit::HandlerResult::make_status(422).pack();
 }
 
+struct H1DeadlineLoop : SmallLoop {
+    bool active_deadline_at_send = false;
+    bool submit_send(Connection& conn, const u8* bytes, u32 len) {
+        active_deadline_at_send |=
+            conn.on_local_grpc_deadline != nullptr || conn.local_grpc_deadline.present;
+        return SmallLoop::submit_send(conn, bytes, len);
+    }
+    bool arm_local_grpc_deadline(Connection& conn, u64 absolute_us) {
+        return conn.local_grpc_deadline_timer.arm(absolute_us);
+    }
+    void disarm_local_grpc_deadline(Connection& conn) {
+        if (conn.local_grpc_deadline_timer.target_owned)
+            conn.local_grpc_deadline_timer.reclaim_target(
+                conn.local_grpc_deadline_timer.owner_generation);
+        conn.on_local_grpc_deadline = nullptr;
+        conn.local_grpc_deadline.reset();
+    }
+    void disarm_yield_timer(Connection& conn) { conn.yield_armed = false; }
+};
+
+static u32 h1_deadline_handler_calls;
+static u64 h1_deadline_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++h1_deadline_handler_calls;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+TEST(json_network, h1_grpc_web_zero_timeout_expires_before_handler_binary_and_text) {
+    const std::string binary_body("\0\0\0\0\1x", 6);
+    for (const char* content_type : {"application/grpc-web", "application/grpc-web-text"}) {
+        const std::string body = content_type[20] == '-' ? "AAAAAAF4" : binary_body;
+        const std::string request =
+            std::string("POST /body HTTP/1.1\r\nHost: test\r\n") + "Content-Type: " + content_type +
+            "\r\ngrpc-timeout: 0n\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
+            body;
+        auto loop = std::make_unique<H1DeadlineLoop>();
+        loop->setup();
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(config->add_jit_handler("/body", 0, &h1_deadline_handler, true));
+        const RouteConfig* config_ptr = config.get();
+        loop->config_ptr = &config_ptr;
+        auto* conn = loop->alloc_conn();
+        REQUIRE(conn);
+        conn->fd = 41;
+        conn->json_arena.backend.pool = &pool;
+        u8 input[1024];
+        conn->recv_buf.bind(input, sizeof(input));
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        h1_deadline_handler_calls = 0;
+        on_header_received<H1DeadlineLoop>(
+            loop.get(),
+            *conn,
+            {conn->id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+        CHECK_EQ(h1_deadline_handler_calls, 0u);
+        CHECK_EQ(conn->resp_status, 200u);
+        CHECK(conn->send_buf.len() > 0);
+        CHECK(conn->on_local_grpc_deadline == nullptr);
+        loop->free_conn(*conn);
+        pool.destroy();
+    }
+}
+
+static u64 h1_deadline_yield_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    ++h1_deadline_handler_calls;
+    if (ctx->state == 0) return jit::HandlerResult::make_yield(1, jit::YieldKind::Timer).pack();
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+TEST(json_network, h1_grpc_web_deadline_rejects_invalid_duplicate_and_expires_partial_bodies) {
+    const std::string body("\0\0\0\0\1x", 6);
+    const char* bad_headers[] = {"grpc-timeout: 1S\r\ngrpc-timeout: 2S\r\n",
+                                 "grpc-timeout: bad\r\n"};
+    for (const char* extra : bad_headers) {
+        const std::string request = std::string("POST /body HTTP/1.1\r\nHost: test\r\n") +
+                                    "Content-Type: application/grpc-web\r\n" + extra +
+                                    "Content-Length: 6\r\n\r\n" + body;
+        auto loop = std::make_unique<H1DeadlineLoop>();
+        loop->setup();
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(config->add_jit_handler("/body", 0, &h1_deadline_handler, true));
+        const RouteConfig* config_ptr = config.get();
+        loop->config_ptr = &config_ptr;
+        auto* conn = loop->alloc_conn();
+        REQUIRE(conn);
+        conn->fd = 41;
+        conn->json_arena.backend.pool = &pool;
+        u8 input[1024];
+        conn->recv_buf.bind(input, sizeof(input));
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        h1_deadline_handler_calls = 0;
+        on_header_received<H1DeadlineLoop>(
+            loop.get(),
+            *conn,
+            {conn->id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(h1_deadline_handler_calls, 0u);
+        CHECK_FALSE(conn->local_grpc_deadline_timer.target_owned);
+        loop->free_conn(*conn);
+        pool.destroy();
+    }
+
+    const std::string partial_header =
+        "POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: application/grpc-web\r\n"
+        "grpc-timeout: 1S\r\nContent-Length: 6\r\n\r\n";
+    auto loop = std::make_unique<H1DeadlineLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(config->add_jit_handler("/body", 0, &h1_deadline_handler, true));
+    const RouteConfig* config_ptr = config.get();
+    loop->config_ptr = &config_ptr;
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->fd = 41;
+    conn->json_arena.backend.pool = &pool;
+    u8 input[1024];
+    conn->recv_buf.bind(input, sizeof(input));
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(partial_header.data()),
+                                    partial_header.size()),
+               partial_header.size());
+    on_header_received<H1DeadlineLoop>(
+        loop.get(),
+        *conn,
+        {conn->id, static_cast<i32>(partial_header.size()), 0, 0, IoEventType::Recv, 0});
+    REQUIRE(conn->on_local_grpc_deadline != nullptr);
+    auto timeout = conn->on_local_grpc_deadline;
+    timeout(loop.get(), *conn, {conn->id, -ETIME, 0, 0, IoEventType::LocalGrpcDeadlineTimer, 0});
+    CHECK_EQ(conn->resp_status, 200u);
+    CHECK_FALSE(conn->keep_alive);
+    const std::string binary_wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                  conn->send_buf.len());
+    CHECK(binary_wire.find("grpc-status: 4\r\n") != std::string::npos);
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    loop->free_conn(*conn);
+    pool.destroy();
+
+    const std::string chunked_header =
+        "POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: application/grpc-web-text\r\n"
+        "grpc-timeout: 1S\r\nTransfer-Encoding: chunked\r\n\r\n";
+    auto text_loop = std::make_unique<H1DeadlineLoop>();
+    text_loop->setup();
+    SlicePool text_pool;
+    REQUIRE(text_pool.init(16));
+    auto text_config = std::make_unique<RouteConfig>();
+    REQUIRE(text_config->add_jit_handler("/body", 0, &h1_deadline_handler, true));
+    const RouteConfig* text_config_ptr = text_config.get();
+    text_loop->config_ptr = &text_config_ptr;
+    auto* text_conn = text_loop->alloc_conn();
+    REQUIRE(text_conn);
+    text_conn->fd = 41;
+    text_conn->json_arena.backend.pool = &text_pool;
+    u8 text_input[1024];
+    text_conn->recv_buf.bind(text_input, sizeof(text_input));
+    REQUIRE_EQ(text_conn->recv_buf.write(reinterpret_cast<const u8*>(chunked_header.data()),
+                                         chunked_header.size()),
+               chunked_header.size());
+    on_header_received<H1DeadlineLoop>(
+        text_loop.get(),
+        *text_conn,
+        {text_conn->id, static_cast<i32>(chunked_header.size()), 0, 0, IoEventType::Recv, 0});
+    REQUIRE(text_conn->on_local_grpc_deadline != nullptr);
+    auto text_timeout = text_conn->on_local_grpc_deadline;
+    text_timeout(text_loop.get(),
+                 *text_conn,
+                 {text_conn->id, -ETIME, 0, 0, IoEventType::LocalGrpcDeadlineTimer, 0});
+    CHECK_EQ(text_conn->resp_status, 200u);
+    const std::string text_wire(reinterpret_cast<const char*>(text_conn->send_buf.data()),
+                                text_conn->send_buf.len());
+    CHECK(text_wire.find("gAAAABBncnBjLXN0YXR1czogNA0K") != std::string::npos);
+    CHECK(text_conn->local_grpc_deadline_timer.reusable());
+    text_loop->free_conn(*text_conn);
+    text_pool.destroy();
+}
+
+TEST(json_network, h1_grpc_web_unsupported_timer_backend_preserves_legacy_requests) {
+    for (const char* timeout : {"1S", "bad"}) {
+        auto loop = std::make_unique<SmallLoop>();
+        loop->setup();
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(config->add_jit_handler("/body", 0, &h1_deadline_handler, true));
+        const RouteConfig* active = config.get();
+        loop->config_ptr = &active;
+        auto* conn = loop->alloc_conn();
+        REQUIRE(conn);
+        conn->fd = 41;
+        conn->json_arena.backend.pool = &pool;
+        const std::string request =
+            std::string(
+                "POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: application/grpc-web\r\n") +
+            "grpc-timeout: " + timeout + "\r\nContent-Length: 6\r\n\r\n" +
+            std::string("\0\0\0\0\1x", 6);
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        h1_deadline_handler_calls = 0;
+        on_header_received<SmallLoop>(
+            loop.get(),
+            *conn,
+            {conn->id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+        CHECK_EQ(h1_deadline_handler_calls, 1u);
+        CHECK_EQ(conn->resp_status, 204u);
+        CHECK_FALSE(conn->local_grpc_deadline.present);
+        CHECK(conn->local_grpc_deadline_timer.reusable());
+        loop->free_conn(*conn);
+        pool.destroy();
+    }
+}
+
+TEST(json_network, h1_grpc_web_expiry_wins_over_malformed_envelopes) {
+    for (bool fragmented : {false, true}) {
+        auto loop = std::make_unique<H1DeadlineLoop>();
+        loop->setup();
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(config->add_jit_handler("/body", 0, &h1_deadline_handler, true));
+        const RouteConfig* active = config.get();
+        loop->config_ptr = &active;
+        auto* conn = loop->alloc_conn();
+        REQUIRE(conn);
+        conn->fd = 41;
+        conn->json_arena.backend.pool = &pool;
+        const std::string header =
+            std::string(
+                "POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: application/grpc-web\r\n") +
+            (fragmented ? "grpc-timeout: 1S\r\n" : "grpc-timeout: 0n\r\n") +
+            "Content-Length: 6\r\n\r\n";
+        const std::string malformed("\1\0\0\0\1x", 6);
+        const std::string request = header + (fragmented ? std::string() : malformed);
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        h1_deadline_handler_calls = 0;
+        on_header_received<H1DeadlineLoop>(
+            loop.get(),
+            *conn,
+            {conn->id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+        if (fragmented) {
+            REQUIRE(conn->on_local_grpc_deadline != nullptr);
+            conn->local_grpc_deadline.deadline_us = monotonic_us() - 1;
+            REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(malformed.data()),
+                                            malformed.size()),
+                       malformed.size());
+            on_jit_request_body_recvd<H1DeadlineLoop>(
+                loop.get(),
+                *conn,
+                {conn->id, static_cast<i32>(malformed.size()), 0, 0, IoEventType::Recv, 0});
+        }
+        CHECK_EQ(h1_deadline_handler_calls, 0u);
+        CHECK_EQ(conn->resp_status, 200u);
+        const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+        CHECK(wire.find("grpc-status: 4") != std::string::npos);
+        CHECK(conn->local_grpc_deadline_timer.reusable());
+        loop->free_conn(*conn);
+        pool.destroy();
+    }
+}
+
+TEST(json_network, h1_grpc_web_expiry_replaces_formatted_unsent_segmented_response) {
+    auto loop = std::make_unique<H1DeadlineLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->fd = 41;
+    conn->json_arena.backend.pool = &pool;
+    conn->local_grpc_deadline.present = true;
+    conn->local_grpc_deadline.deadline_us = monotonic_us() - 1;
+    conn->local_grpc_deadline_mode = static_cast<u8>(GrpcWebContentType::Binary);
+    conn->on_local_grpc_deadline = &on_local_grpc_deadline_expired<H1DeadlineLoop>;
+    REQUIRE(loop->arm_local_grpc_deadline(*conn, conn->local_grpc_deadline.deadline_us));
+    format_static_response(*conn, 200, true);
+    const u8 staged[] = "unsent normal response";
+    conn->local_body_cursor = staged;
+    conn->local_body_base = staged;
+    conn->local_body_remaining = sizeof(staged);
+    conn->local_body_send_len = sizeof(staged);
+    conn->local_body_file_fd = 123;
+    conn->local_response_size = 100000;
+    CHECK_FALSE(prepare_local_grpc_deadline_publication(loop.get(), *conn));
+    CHECK_FALSE(loop->active_deadline_at_send);
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    CHECK_EQ(conn->local_body_remaining, 0u);
+    CHECK_EQ(conn->local_body_send_len, 0u);
+    CHECK_EQ(conn->local_body_file_fd, -1);
+    CHECK(conn->local_body_base == nullptr);
+    const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                           conn->send_buf.len());
+    CHECK(wire.find("grpc-status: 4") != std::string::npos);
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, h1_grpc_web_malformed_chunk_settles_before_response_publication) {
+    auto loop = std::make_unique<H1DeadlineLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(config->add_jit_handler("/body", 0, &h1_deadline_handler, true));
+    const RouteConfig* active = config.get();
+    loop->config_ptr = &active;
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->fd = 41;
+    conn->json_arena.backend.pool = &pool;
+    const char request[] =
+        "POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: application/grpc-web\r\n"
+        "grpc-timeout: 1S\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+               sizeof(request) - 1);
+    h1_deadline_handler_calls = 0;
+    on_header_received<H1DeadlineLoop>(
+        loop.get(), *conn, {conn->id, sizeof(request) - 1, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(h1_deadline_handler_calls, 0u);
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_FALSE(loop->active_deadline_at_send);
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, h1_grpc_web_timer_yield_expiry_does_not_resume) {
+    const std::string body("\0\0\0\0\1x", 6);
+    const std::string request =
+        "POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: application/grpc-web\r\n"
+        "grpc-timeout: 1S\r\nContent-Length: 6\r\n\r\n" +
+        body;
+    auto loop = std::make_unique<H1DeadlineLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(config->add_jit_handler("/body", 0, &h1_deadline_yield_handler, true));
+    const RouteConfig* config_ptr = config.get();
+    loop->config_ptr = &config_ptr;
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->fd = 41;
+    conn->json_arena.backend.pool = &pool;
+    u8 input[1024];
+    conn->recv_buf.bind(input, sizeof(input));
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+               request.size());
+    h1_deadline_handler_calls = 0;
+    on_header_received<H1DeadlineLoop>(
+        loop.get(),
+        *conn,
+        {conn->id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(h1_deadline_handler_calls, 1u);
+    REQUIRE(conn->on_local_grpc_deadline != nullptr);
+    auto timeout = conn->on_local_grpc_deadline;
+    timeout(loop.get(), *conn, {conn->id, -ETIME, 0, 0, IoEventType::LocalGrpcDeadlineTimer, 0});
+    CHECK_EQ(h1_deadline_handler_calls, 1u);
+    CHECK_EQ(conn->resp_status, 200u);
+    CHECK(conn->on_local_grpc_deadline == nullptr);
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, h1_grpc_web_deadline_rejects_forward_and_event_yields_before_io) {
+    for (auto kind : {JitDispatchOutcome::Kind::Forward, JitDispatchOutcome::Kind::EventYield}) {
+        for (auto yield : {jit::YieldKind::Send, jit::YieldKind::Recv, jit::YieldKind::HttpGet}) {
+            auto loop = std::make_unique<H1DeadlineLoop>();
+            loop->setup();
+            auto* conn = loop->alloc_conn();
+            REQUIRE(conn);
+            conn->fd = 41;
+            conn->local_grpc_deadline.present = true;
+            conn->local_grpc_deadline.deadline_us = monotonic_us() + 1000000;
+            conn->local_grpc_deadline_mode = static_cast<u8>(GrpcWebContentType::Binary);
+            conn->on_local_grpc_deadline = &on_local_grpc_deadline_expired<H1DeadlineLoop>;
+            REQUIRE(loop->arm_local_grpc_deadline(*conn, conn->local_grpc_deadline.deadline_us));
+            JitDispatchOutcome outcome{};
+            outcome.kind = kind;
+            outcome.yield_kind = yield;
+            handle_jit_outcome(loop.get(), *conn, outcome, &h1_deadline_handler, true, nullptr);
+            CHECK_EQ(conn->resp_status, 400u);
+            CHECK_FALSE(loop->active_deadline_at_send);
+            CHECK(conn->local_grpc_deadline_timer.reusable());
+            CHECK(conn->pending_handler_fn == nullptr);
+            for (u32 i = 0; i < loop->backend.op_count; ++i) {
+                const auto& op = loop->backend.ops[i];
+                CHECK(op.type != MockOp::Connect);
+                CHECK(op.type != MockOp::Recv);
+                if (op.type == MockOp::Send) CHECK_EQ(op.fd, conn->fd);
+            }
+            loop->free_conn(*conn);
+        }
+    }
+}
+
+static u64 h1_deadline_overrun_handler(void* opaque, jit::HandlerCtx*, const u8*, u32, void*) {
+    auto& conn = *static_cast<Connection*>(opaque);
+    ++h1_deadline_handler_calls;
+    // Model a synchronous handler that crosses the request's absolute boundary.
+    conn.local_grpc_deadline.deadline_us = monotonic_us() - 1;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+TEST(json_network, h1_grpc_web_sync_outcome_deadline_arbitration) {
+    for (bool overrun : {false, true}) {
+        auto loop = std::make_unique<H1DeadlineLoop>();
+        loop->setup();
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(config->add_jit_handler(
+            "/body", 0, overrun ? &h1_deadline_overrun_handler : &h1_deadline_handler, true));
+        const RouteConfig* active = config.get();
+        loop->config_ptr = &active;
+        auto* conn = loop->alloc_conn();
+        REQUIRE(conn);
+        conn->fd = 41;
+        conn->json_arena.backend.pool = &pool;
+        const std::string request =
+            std::string(
+                "POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: application/grpc-web\r\n") +
+            "grpc-timeout: 1S\r\nContent-Length: 6\r\n\r\n" + std::string("\0\0\0\0\1x", 6);
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        h1_deadline_handler_calls = 0;
+        on_header_received<H1DeadlineLoop>(
+            loop.get(),
+            *conn,
+            {conn->id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+        CHECK_EQ(h1_deadline_handler_calls, 1u);
+        CHECK_EQ(conn->resp_status, overrun ? 200u : 204u);
+        CHECK(conn->on_local_grpc_deadline == nullptr);
+        CHECK_FALSE(conn->local_grpc_deadline.present);
+        CHECK(conn->local_grpc_deadline_timer.reusable());
+        CHECK_FALSE(loop->active_deadline_at_send);
+        const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+        CHECK_EQ(wire.find("grpc-status: 4") != std::string::npos, overrun);
+        loop->free_conn(*conn);
+        pool.destroy();
+    }
+}
+
+#ifdef __linux__
+TEST(json_network, h1_grpc_web_slow_body_real_epoll_socket) {
+    // Use the production timer heap, send backend and real socket ownership.
+    // The request stops in the middle of either transport framing shape.
+    for (bool chunked : {false, true}) {
+        struct Cleanup {
+            RealLoop* loop = nullptr;
+            Connection* conn = nullptr;
+            i32 peer = -1;
+            bool initialized = false;
+            ~Cleanup() {
+                if (initialized) {
+                    if (conn && conn->fd >= 0) loop->close_conn(*conn);
+                    loop->shutdown();
+                }
+                if (peer >= 0) close(peer);
+                destroy_real_loop(loop);
+            }
+        } guard;
+        guard.loop = create_real_loop();
+        REQUIRE(guard.loop);
+        REQUIRE(guard.loop->init(0, -1, 0).has_value());
+        guard.initialized = true;
+        i32 sockets[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
+        guard.peer = sockets[1];
+        guard.conn = guard.loop->alloc_conn();
+        REQUIRE(guard.conn);
+        auto& conn = *guard.conn;
+        conn.fd = sockets[0];
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(config->add_jit_handler("/body", 0, &h1_deadline_handler, true));
+        const RouteConfig* config_ptr = config.get();
+        guard.loop->config_ptr = &config_ptr;
+        const std::string request =
+            std::string("POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: ") +
+            (chunked ? "application/grpc-web-text\r\n" : "application/grpc-web\r\n") +
+            "grpc-timeout: 1m\r\n" +
+            (chunked ? "Transfer-Encoding: chunked\r\n\r\n8\r\nAA" : "Content-Length: 6\r\n\r\nx");
+        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+                   request.size());
+        h1_deadline_handler_calls = 0;
+        on_header_received<RealLoop>(
+            guard.loop,
+            conn,
+            {conn.id, static_cast<i32>(request.size()), 0, 0, IoEventType::Recv, 0});
+        REQUIRE(conn.local_grpc_deadline.present);
+        const u64 deadline = conn.local_grpc_deadline.deadline_us;
+        while (monotonic_us() < deadline) usleep(100);
+        guard.loop->drain_yield_heap();
+        CHECK_EQ(h1_deadline_handler_calls, 0u);
+        CHECK(conn.req_body_abandoned);
+        CHECK_FALSE(conn.keep_alive);
+        CHECK(conn.local_grpc_deadline_timer.reusable());
+        char wire[1024]{};
+        const i32 received = recv_timeout(guard.peer, wire, sizeof(wire) - 1, 1000);
+        REQUIRE_GT(received, 0);
+        const std::string response(wire, received);
+        CHECK(response.find("HTTP/1.1 200") == 0);
+        CHECK(response.find("Connection: close") != std::string::npos);
+        CHECK(response.find(chunked ? "gAAAABBncnBjLXN0YXR1czogNA0K" : "grpc-status: 4") !=
+              std::string::npos);
+        // A late receive is discarded through the abandoned-upload path.
+        const u32 response_len = conn.send_buf.len();
+        guard.loop->handle_unhandled_recv(conn, {conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0});
+        CHECK_EQ(conn.resp_status, 200u);
+        CHECK_EQ(conn.send_buf.len(), response_len);
+        CHECK_GE(conn.fd, 0);
+    }
+}
+#endif
+
 TEST(json_network, grpc_web_runtime_admission_precedes_handler) {
     const std::string valid("\0\0\0\0\1x", 6);
     struct Case {

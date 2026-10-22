@@ -8198,7 +8198,21 @@ RPC body. It closes after the local response. A Forward outcome on this new
 chunked path is rejected before upstream publication, including after a yield;
 chunked JIT forwarding remains unsupported. Direct proxy routes and header-only
 handlers do not use this transformation. This adds no streaming handler,
-automatic service dispatch, CORS policy, JSON mapping or local deadline support.
+automatic service dispatch, CORS policy or JSON mapping.
+
+On Linux epoll/io_uring backends, body-reading HTTP/1.1 local gRPC-Web POST
+routes accept an optional `grpc-timeout` using the existing bounded timeout
+grammar and an absolute request-start deadline.
+Malformed or duplicate timeout fields fail with HTTP 400 before handler entry.
+The deadline also covers synchronous handler execution through response
+publication. Expiry while collecting the body or waiting in a timer yield emits
+HTTP 200 with a trailers-only gRPC-Web status 4 response in the admitted binary/text mode, then
+closes the connection. Terminal responses settle the timer before publication.
+With a local deadline active, Forward and event-based yields fail before I/O;
+timer yields remain supported. HTTP/2 and kqueue local deadlines remain
+unimplemented; backends without a local timer retain legacy handling of
+`grpc-timeout`. Once an admitted deadline expires, timeout wins over a late
+body-validation error.
 
 An explicit local response with `application/grpc-web` or
 `application/grpc-web-text` (optionally `+proto`) uses the same bounded unary
