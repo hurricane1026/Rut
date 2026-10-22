@@ -156,6 +156,10 @@ struct KqueueEventLoop : EventLoopCRTP<KqueueEventLoop> {
     KqueueBackend backend;
     TimerWheel timer;
     kqueue_yield::YieldHeap yield_heap;
+    // Exact absolute microseconds for local gRPC deadlines.  This is kept
+    // separate from the nanosecond yield heap so the key is never rounded or
+    // saturated while the kernel timer advances through its wake horizon.
+    kqueue_yield::YieldHeap local_grpc_deadline_heap;
     // Absolute deadline currently programmed into the one-shot yield timer.
     // 0 means disarmed. Used to avoid redundant kevent syscalls
     // when a new push does not change the heap's top.
@@ -282,9 +286,17 @@ public:
         epoch = nullptr;
         jit_code_ptr = nullptr;
         free_top = kMaxConns;
+        yield_heap.clear();
+        local_grpc_deadline_heap.clear();
+        yield_timer_armed_ns = 0;
         timer.init();
         for (u32 i = 0; i < kMaxConns; i++) {
             conns[i].reset();
+            conns[i].on_local_grpc_deadline = nullptr;
+            conns[i].local_grpc_deadline.reset();
+            conns[i].local_grpc_deadline_mode = 0;
+            conns[i].local_grpc_deadline_stream = 0;
+            conns[i].local_grpc_deadline_timer = {};
             conns[i].id = i;
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
@@ -398,7 +410,17 @@ public:
     }
 
     void shutdown() {
+        for (u32 i = 0; i < kMaxConns; i++) {
+            conns[i].on_local_grpc_deadline = nullptr;
+            conns[i].local_grpc_deadline.reset();
+            conns[i].local_grpc_deadline_mode = 0;
+            conns[i].local_grpc_deadline_stream = 0;
+            conns[i].local_grpc_deadline_timer = {};
+        }
         backend.shutdown();
+        yield_heap.clear();
+        local_grpc_deadline_heap.clear();
+        yield_timer_armed_ns = 0;
         h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
@@ -677,6 +699,7 @@ public:
             upstream_release(c.upstream_slot_uid);
             c.upstream_slot_held = false;
         }
+        disarm_local_grpc_deadline(c);
         // If a yield is scheduled, drop its heap entry now so a long wait
         // doesn't keep an unused heap slot occupied until its deadline. Both a
         // pending JIT handler and a @throttle-paused proxy pump park on the heap
@@ -764,17 +787,48 @@ public:
     // every push and after every drain. Uses yield_timer_armed_ns to skip
     // redundant kevent calls.
     void rearm_yield_timer() {
-        if (yield_heap.empty()) {
+        if (yield_heap.empty() && local_grpc_deadline_heap.empty()) {
             if (yield_timer_armed_ns != 0) {
                 backend.arm_yield_timer(0);
                 yield_timer_armed_ns = 0;
             }
             return;
         }
-        u64 top = yield_heap.top().deadline_ns;
+        u64 top = yield_heap.empty() ? ~u64{0} : yield_heap.top().deadline_ns;
+        if (!local_grpc_deadline_heap.empty()) {
+            const u64 now_ns = kqueue_yield::monotonic_ns();
+            constexpr u64 kWakeHorizonNs = 3'600'000'000'000ull;
+            constexpr u64 kMaxTimerNs = ~u64{0};
+            const u64 horizon =
+                now_ns > kMaxTimerNs - kWakeHorizonNs ? kMaxTimerNs : now_ns + kWakeHorizonNs;
+            const u64 deadline_us = local_grpc_deadline_heap.top().deadline_ns;
+            const u64 wake_ns = deadline_us > horizon / 1000 ? horizon : deadline_us * 1000;
+            if (wake_ns < top) top = wake_ns;
+        }
         if (top == yield_timer_armed_ns) return;
         backend.arm_yield_timer(top);
         yield_timer_armed_ns = top;
+    }
+
+    [[nodiscard]] bool arm_local_grpc_deadline(Connection& conn, u64 absolute_us) {
+        if (!conn.local_grpc_deadline_timer.arm(absolute_us)) return false;
+        const u32 generation = conn.local_grpc_deadline_timer.owner_generation;
+        if (!local_grpc_deadline_heap.push(absolute_us, generation, conn.id)) {
+            conn.local_grpc_deadline_timer.reclaim_target(generation);
+            return false;
+        }
+        rearm_yield_timer();
+        return true;
+    }
+
+    void disarm_local_grpc_deadline(Connection& conn) {
+        conn.on_local_grpc_deadline = nullptr;
+        conn.local_grpc_deadline.reset();
+        if (local_grpc_deadline_heap.remove_by_conn(conn.id) > 0) {
+            conn.local_grpc_deadline_timer.reclaim_target(
+                conn.local_grpc_deadline_timer.owner_generation);
+            rearm_yield_timer();
+        }
     }
 
     void disarm_yield_timer(Connection& conn) {
@@ -806,6 +860,26 @@ public:
     // the timer fired).
     void drain_yield_heap() {
         u64 now = kqueue_yield::monotonic_ns();
+        // Local RPC deadlines have priority over same-tick handler wakes.
+        // A deadline callback can close/settle the handler, so yield entries
+        // must not resume that connection afterward.
+        while (!local_grpc_deadline_heap.empty() &&
+               local_grpc_deadline_heap.top().deadline_ns <= now / 1000) {
+            const auto entry = local_grpc_deadline_heap.top();
+            local_grpc_deadline_heap.pop();
+            if (entry.conn_id >= kMaxConns) continue;
+            auto& c = conns[entry.conn_id];
+            if (!c.local_grpc_deadline_timer.reclaim_target(entry.handler_gen)) continue;
+            if (c.fd < 0 || !c.on_local_grpc_deadline) continue;
+            auto callback = c.on_local_grpc_deadline;
+            c.on_local_grpc_deadline = nullptr;
+            IoEvent event{};
+            event.type = IoEventType::LocalGrpcDeadlineTimer;
+            event.conn_id = c.id;
+            event.result = -ETIME;
+            event.non_upstream_generation = entry.handler_gen;
+            callback(this, c, event);
+        }
         while (!yield_heap.empty() && yield_heap.top().deadline_ns <= now) {
             auto entry = yield_heap.top();
             yield_heap.pop();

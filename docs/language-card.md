@@ -1191,7 +1191,7 @@ returning Forward on that path, including after a yield, fails with HTTP 400
 before contacting the upstream. Chunk framing is bounded to 32 KiB. Header-only
 routes and direct proxy routes retain their existing body handling.
 
-On Linux epoll/io_uring backends, body-reading HTTP/1.1 local gRPC-Web POST
+On epoll, io_uring and kqueue backends, body-reading HTTP/1.1 local gRPC-Web POST
 routes accept optional `grpc-timeout`
 with the existing timeout grammar, measured from request start. Invalid or
 duplicate values return HTTP 400 before handler entry. Expiry during body
@@ -1199,7 +1199,7 @@ collection, synchronous handler execution, or a timer yield returns HTTP 200
 with a trailers-only `grpc-status: 4`
 envelope in binary/text mode and closes the connection. An active local deadline
 rejects Forward and event-based yields before I/O; timer yields remain supported.
-HTTP/2 and kqueue local deadline enforcement are not implemented; backends
+HTTP/2 local deadline enforcement is not implemented; backends
 without a local timer retain legacy `grpc-timeout` handling. After expiry,
 timeout wins over late body-validation errors.
 
