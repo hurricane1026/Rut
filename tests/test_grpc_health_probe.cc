@@ -307,6 +307,168 @@ TEST(grpc_health_probe, rejects_non_serving_or_malformed_responses) {
     CHECK(!health_probe_serving_response(h2));
 }
 
+TEST(grpc_health_probe, initial_grpc_status_cannot_replace_terminal_trailer_status) {
+    RouteConfig config{};
+    auto uid = config.add_upstream("grpc", 0x7f000001, 50051);
+    REQUIRE(uid.has_value());
+    UpstreamTarget& target = config.upstreams[uid.value()];
+    target.http2 = true;
+    const RouteConfig* active_config = &config;
+    ProbeHarness loop{};
+    loop.config_ptr = &active_config;
+    Connection conn{};
+    Http2Conn h2{};
+    u8 request_storage[SlicePool::kSliceSize];
+    u8 send_storage[SlicePool::kSliceSize];
+    u8 upstream_storage[SlicePool::kSliceSize];
+    prepare_probe_connection(conn,
+                             h2,
+                             config,
+                             request_storage,
+                             sizeof(request_storage),
+                             send_storage,
+                             sizeof(send_storage),
+                             upstream_storage,
+                             sizeof(upstream_storage));
+    REQUIRE(build_grpc_health_probe_request(conn, target, 0));
+    h2.cb_ctx = nullptr;
+    h2.on_headers = &on_probe_h2_headers;
+    h2.on_trailers = &on_probe_h2_trailers;
+    h2.on_data = &on_probe_h2_data;
+    h2.on_reset = &on_probe_h2_reset;
+    REQUIRE(h2.find_stream(1) != nullptr);
+    h2.find_stream(1)->state = Http2StreamState::HalfClosedLocal;
+    conn.reset_request_receive_buffer();
+    set_probe_in_flight(uid.value(), 0, true);
+
+    hpack::Encoder encoder;
+    encoder.init(4096);
+    u8 wire[256];
+    u32 wire_len = write_settings_frame(wire, h2.our_settings);
+    REQUIRE(wire_len != 0);
+    const hpack::Header initial_headers[] = {{{":status", 7}, {"200", 3}},
+                                             {{"content-type", 12}, {"application/grpc", 16}},
+                                             {{"grpc-status", 11}, {"0", 1}}};
+    const u32 initial_len = http2_write_headers(
+        wire + wire_len, sizeof(wire) - wire_len, 1, initial_headers, 3, false, encoder);
+    REQUIRE(initial_len != 0);
+    wire_len += initial_len;
+    const u8 body[] = {0, 0, 0, 0, 2, 0x08, 0x01};
+    const u32 data_len = http2_write_data(wire + wire_len, 1, body, sizeof(body), false);
+    REQUIRE(data_len != 0);
+    wire_len += data_len;
+    const hpack::Header terminal_header[] = {{{"x-finish", 8}, {"yes", 3}}};
+    const u32 trailer_len = http2_write_headers(
+        wire + wire_len, sizeof(wire) - wire_len, 1, terminal_header, 1, true, encoder);
+    REQUIRE(trailer_len != 0);
+    wire_len += trailer_len;
+    REQUIRE(append_bytes(conn.upstream_recv_buf, wire, wire_len));
+
+    on_probe_h2_response<ProbeHarness>(
+        &loop, conn, IoEvent{conn.id, 1, 0, 0, IoEventType::UpstreamRecv, 0});
+    CHECK(h2.health_probe_malformed);
+    CHECK_EQ(loop.frees, 1u);
+    CHECK(!probe_in_flight(uid.value(), 0));
+    CHECK(backend_ejected(uid.value(), 0, monotonic_us()));
+}
+
+TEST(grpc_health_probe, driver_drains_allowed_goaway_and_rejects_excluded_stream) {
+    RouteConfig config{};
+    auto uid = config.add_upstream("grpc", 0x7f000001, 50051);
+    REQUIRE(uid.has_value());
+    UpstreamTarget& target = config.upstreams[uid.value()];
+    target.http2 = true;
+    const RouteConfig* active_config = &config;
+
+    const auto run_case = [&](bool include_trailers_before_goaway,
+                              u32 last_stream_id,
+                              bool expect_healthy) {
+        ProbeHarness loop{};
+        loop.config_ptr = &active_config;
+        Connection conn{};
+        Http2Conn h2{};
+        u8 request_storage[SlicePool::kSliceSize];
+        u8 send_storage[SlicePool::kSliceSize];
+        u8 upstream_storage[SlicePool::kSliceSize];
+        prepare_probe_connection(conn,
+                                 h2,
+                                 config,
+                                 request_storage,
+                                 sizeof(request_storage),
+                                 send_storage,
+                                 sizeof(send_storage),
+                                 upstream_storage,
+                                 sizeof(upstream_storage));
+        REQUIRE(build_grpc_health_probe_request(conn, target, 0));
+        h2.cb_ctx = nullptr;
+        h2.on_headers = &on_probe_h2_headers;
+        h2.on_trailers = &on_probe_h2_trailers;
+        h2.on_data = &on_probe_h2_data;
+        h2.on_reset = &on_probe_h2_reset;
+        REQUIRE(h2.find_stream(1) != nullptr);
+        h2.find_stream(1)->state = Http2StreamState::HalfClosedLocal;
+        conn.reset_request_receive_buffer();
+        record_active_probe_result(uid.value(), 0, false, monotonic_us());
+        set_probe_in_flight(uid.value(), 0, true);
+
+        hpack::Encoder encoder;
+        encoder.init(4096);
+        u8 wire[256];
+        u32 wire_len = write_settings_frame(wire, h2.our_settings);
+        REQUIRE(wire_len != 0);
+        const hpack::Header headers[] = {{{":status", 7}, {"200", 3}},
+                                         {{"content-type", 12}, {"application/grpc", 16}}};
+        const u32 headers_len = http2_write_headers(
+            wire + wire_len, sizeof(wire) - wire_len, 1, headers, 2, false, encoder);
+        REQUIRE(headers_len != 0);
+        wire_len += headers_len;
+        const u8 body[] = {0, 0, 0, 0, 2, 0x08, 0x01};
+        const u32 data_len = http2_write_data(wire + wire_len, 1, body, sizeof(body), false);
+        REQUIRE(data_len != 0);
+        wire_len += data_len;
+
+        u8 trailer_frame[128];
+        const hpack::Header trailers[] = {{{"grpc-status", 11}, {"0", 1}}};
+        const u32 trailer_len = http2_write_headers(
+            trailer_frame, sizeof(trailer_frame), 1, trailers, 1, true, encoder);
+        REQUIRE(trailer_len != 0);
+        if (include_trailers_before_goaway) {
+            REQUIRE(wire_len + trailer_len <= sizeof(wire));
+            for (u32 i = 0; i < trailer_len; ++i) wire[wire_len++] = trailer_frame[i];
+        }
+        u8 goaway_frame[kFrameHeaderSize + 8];
+        const u32 goaway_len = write_goaway(goaway_frame, last_stream_id, Http2Error::NoError);
+        REQUIRE(wire_len + goaway_len <= sizeof(wire));
+        for (u32 i = 0; i < goaway_len; ++i) wire[wire_len++] = goaway_frame[i];
+        REQUIRE(append_bytes(conn.upstream_recv_buf, wire, wire_len));
+
+        on_probe_h2_response<ProbeHarness>(
+            &loop, conn, IoEvent{conn.id, 1, 0, 0, IoEventType::UpstreamRecv, 0});
+        if (!include_trailers_before_goaway && last_stream_id == 1) {
+            CHECK_EQ(loop.frees, 0u);
+            CHECK_EQ(conn.on_upstream_send, &on_probe_h2_control_sent<ProbeHarness>);
+            const u32 control_len = conn.send_buf.len();
+            REQUIRE(control_len != 0);
+            on_probe_h2_control_sent<ProbeHarness>(
+                &loop,
+                conn,
+                IoEvent{
+                    conn.id, static_cast<i32>(control_len), 0, 0, IoEventType::UpstreamSend, 0});
+            CHECK_EQ(loop.recv_submits, 1u);
+            REQUIRE(append_bytes(conn.upstream_recv_buf, trailer_frame, trailer_len));
+            on_probe_h2_response<ProbeHarness>(
+                &loop, conn, IoEvent{conn.id, 1, 0, 0, IoEventType::UpstreamRecv, 0});
+        }
+        CHECK_EQ(loop.frees, 1u);
+        CHECK(!probe_in_flight(uid.value(), 0));
+        CHECK_EQ(backend_ejected(uid.value(), 0, monotonic_us()), !expect_healthy);
+    };
+
+    run_case(/*include_trailers_before_goaway=*/false, /*last_stream_id=*/1, true);
+    run_case(/*include_trailers_before_goaway=*/true, /*last_stream_id=*/1, true);
+    run_case(/*include_trailers_before_goaway=*/true, /*last_stream_id=*/0, false);
+}
+
 TEST(grpc_health_probe, short_request_and_control_sends_preserve_preread_h2_response) {
     RouteConfig config{};
     auto uid = config.add_upstream("grpc", 0x7f000001, 50051);
@@ -353,10 +515,21 @@ TEST(grpc_health_probe, short_request_and_control_sends_preserve_preread_h2_resp
         response + response_len, sizeof(response) - response_len, 1, headers, 2, false, encoder);
     REQUIRE(headers_len != 0);
     response_len += headers_len;
+    response_len +=
+        health_put_frame(response + response_len, Http2FrameType::Data, 0, 1, nullptr, 0);
     const u8 body[] = {0, 0, 0, 0, 2, 0x08, 0x01};
-    const u32 data_len = http2_write_data(response + response_len, 1, body, sizeof(body), false);
-    REQUIRE(data_len != 0);
-    response_len += data_len;
+    const u32 first_data_len =
+        http2_write_data(response + response_len, 1, body, sizeof(body) - 1, false);
+    REQUIRE(first_data_len != 0);
+    response_len += first_data_len;
+    response_len +=
+        health_put_frame(response + response_len, Http2FrameType::Data, 0, 1, nullptr, 0);
+    const u32 last_data_len =
+        http2_write_data(response + response_len, 1, body + sizeof(body) - 1, 1, false);
+    REQUIRE(last_data_len != 0);
+    response_len += last_data_len;
+    response_len +=
+        health_put_frame(response + response_len, Http2FrameType::Data, 0, 1, nullptr, 0);
     const hpack::Header trailer[] = {{{"grpc-status", 11}, {"0", 1}}};
     u8 trailer_frame[128];
     const u32 trailer_len =

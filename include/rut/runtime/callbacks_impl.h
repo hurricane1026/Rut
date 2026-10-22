@@ -399,6 +399,14 @@ inline void on_probe_h2_headers(
     // ordinary metadata is irrelevant to the eventual gRPC response.
     if (status_code >= 100 && status_code < 200) return;
 
+    u8 initial_grpc_status = 0;
+    bool initial_grpc_status_seen = false;
+    if (!health_probe_grpc_status(headers, count, initial_grpc_status, initial_grpc_status_seen) ||
+        initial_grpc_status_seen) {
+        h2.health_probe_malformed = true;
+        return;
+    }
+
     bool content_type = false;
     for (u32 i = 0; i < count; ++i) {
         const auto& header = headers[i];
@@ -421,9 +429,6 @@ inline void on_probe_h2_headers(
     h2.health_probe_http_status = status_code;
     h2.health_probe_content_type_valid = true;
     h2.health_probe_initial_headers = true;
-    if (!health_probe_grpc_status(
-            headers, count, h2.health_probe_grpc_status, h2.health_probe_grpc_status_seen))
-        h2.health_probe_malformed = true;
     if (end_stream) h2.health_probe_terminal = true;
 }
 
@@ -442,10 +447,11 @@ inline void on_probe_h2_data(
         h2.health_probe_malformed = true;
         return;
     }
+    const bool prefix_was_incomplete = h2.health_probe_prefix_len < 5;
     u32 pos = 0;
     while (pos < len && h2.health_probe_prefix_len < 5)
         h2.health_probe_prefix[h2.health_probe_prefix_len++] = data[pos++];
-    if (h2.health_probe_prefix_len == 5) {
+    if (prefix_was_incomplete && h2.health_probe_prefix_len == 5) {
         if (h2.health_probe_prefix[0] != 0) {
             h2.health_probe_malformed = true;
             return;
@@ -815,7 +821,8 @@ void on_probe_h2_response(void* lp, Connection& conn, IoEvent ev) {
                                      conn.send_buf.write_avail(),
                                      &control_len);
     if (result.consumed != 0) conn.upstream_recv_buf.consume(result.consumed);
-    if (result.close || h2->peer_goaway || h2->health_probe_malformed) {
+    if (result.close || (h2->peer_goaway && h2->peer_last_stream < 1) ||
+        h2->health_probe_malformed) {
         record_probe_if_current(loop, conn, false, monotonic_us());
         free_probe_conn(loop, conn);
         return;
