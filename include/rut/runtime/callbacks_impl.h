@@ -1892,6 +1892,24 @@ void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
 }
 
 template <typename Loop>
+void settle_local_grpc_deadline(Loop* loop, Connection& conn) {
+    const bool owned = conn.local_grpc_deadline.present || conn.local_grpc_deadline_mode != 0 ||
+                       conn.local_grpc_deadline_stream != 0 ||
+                       conn.local_grpc_deadline_timer.target_owned ||
+                       conn.local_grpc_deadline_timer.cancel_owned;
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->disarm_local_grpc_deadline(c);
+                  }) {
+        if (owned) loop->disarm_local_grpc_deadline(conn);
+    } else {
+        conn.on_local_grpc_deadline = nullptr;
+        conn.local_grpc_deadline.reset();
+    }
+    conn.local_grpc_deadline_mode = 0;
+    conn.local_grpc_deadline_stream = 0;
+}
+
+template <typename Loop>
 bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len) {
     throttle_advance(conn, len);
     return loop->submit_send(conn, buf, len);
@@ -2436,6 +2454,66 @@ inline bool prepare_local_grpc_web_request_body(Connection& conn,
                                                 const u8* request,
                                                 u32 request_len,
                                                 jit::HandlerCtx* ctx);
+
+template <typename Loop>
+void on_local_grpc_deadline_expired(void* lp, Connection& conn, IoEvent ev);
+
+template <typename Loop>
+bool admit_local_grpc_web_deadline(Loop* loop,
+                                   Connection& conn,
+                                   const u8* request,
+                                   u32 request_len) {
+    HttpParser parser;
+    ParsedRequest parsed;
+    parser.reset();
+    parsed.reset();
+    // Preserve the existing non-Web malformed-header policy. The existing
+    // body admission rejects malformed Web candidates before invoking code.
+    if (parser.parse(request, request_len, &parsed) != ParseStatus::Complete) return true;
+    bool ambiguous = false;
+    const GrpcWebContentType mode = grpc_request_mode(parsed, &ambiguous);
+    bool candidate = false;
+    for (u32 i = 0; i < parsed.header_count; i++) {
+        if (http_header_name_eq_ci(
+                parsed.headers[i].name.ptr, parsed.headers[i].name.len, "content-type", 12))
+            candidate |= grpc_web_content_type_candidate(parsed.headers[i].value);
+    }
+    if (!candidate) return true;
+    LocalGrpcDeadline deadline;
+    for (u32 i = 0; i < parsed.header_count; i++) {
+        if (!http_header_name_eq_ci(
+                parsed.headers[i].name.ptr, parsed.headers[i].name.len, "grpc-timeout", 12))
+            continue;
+        if (local_grpc_deadline_from_value(parsed.headers[i].value, conn.req_start_us, deadline) !=
+            LocalGrpcDeadlineParse::Present)
+            return false;
+    }
+    // grpc-timeout is an opt-in extension for existing local grpc-web H1
+    // handling. Requests without it retain the legacy body/handler path.
+    if (!deadline.present) return true;
+    if (parsed.method != HttpMethod::POST || ambiguous ||
+        (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text))
+        return false;
+    conn.local_grpc_deadline = deadline;
+    conn.local_grpc_deadline_mode = static_cast<u8>(mode);
+    conn.on_local_grpc_deadline = &on_local_grpc_deadline_expired<Loop>;
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->arm_local_grpc_deadline(c, u64{0});
+                  }) {
+        if (!loop->arm_local_grpc_deadline(conn, deadline.deadline_us)) {
+            conn.on_local_grpc_deadline = nullptr;
+            conn.local_grpc_deadline.reset();
+            conn.local_grpc_deadline_mode = 0;
+            return false;
+        }
+    } else {
+        conn.on_local_grpc_deadline = nullptr;
+        conn.local_grpc_deadline.reset();
+        conn.local_grpc_deadline_mode = 0;
+        return false;
+    }
+    return true;
+}
 
 inline bool collect_local_grpc_web_chunked_body(Connection& conn) {
     if (!conn.grpc_web_local_chunk_active || conn.recv_buf.len() < conn.req_header_end)
@@ -3159,6 +3237,19 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     } else if (route && route->action == RouteAction::JitHandler && route->fn) {
         if (route->needs_req_body) {
+            if (!admit_local_grpc_web_deadline(
+                    loop, conn, conn.recv_buf.data(), conn.req_header_end)) {
+                conn.resp_status = 400;
+                conn.keep_alive = false;
+                format_static_response(conn,
+                                       400,
+                                       false,
+                                       http1_request_is_head(conn),
+                                       ordinary_local_response_version(conn));
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             if (conn.req_body_mode == BodyMode::Chunked) {
                 if (!start_local_grpc_web_chunked_body(conn)) {
                     conn.resp_status = 400;
@@ -3168,6 +3259,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                            false,
                                            http1_request_is_head(conn),
                                            ordinary_local_response_version(conn));
+                    settle_local_grpc_deadline(loop, conn);
                     conn.transition_to_sending(&on_response_sent<Loop>);
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                     return;
@@ -3201,8 +3293,20 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                    false,
                                    http1_request_is_head(conn),
                                    ordinary_local_response_version(conn));
+            settle_local_grpc_deadline(loop, conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+        if (conn.local_grpc_deadline.expired(monotonic_us()) &&
+            conn.on_local_grpc_deadline != nullptr) {
+            auto callback = conn.on_local_grpc_deadline;
+            conn.on_local_grpc_deadline = nullptr;
+            IoEvent timeout{};
+            timeout.conn_id = conn.id;
+            timeout.type = IoEventType::LocalGrpcDeadlineTimer;
+            timeout.result = -ETIME;
+            callback(loop, conn, timeout);
             return;
         }
         conn.send_buf.reset();
@@ -3395,6 +3499,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                                    false,
                                    http1_request_is_head(conn),
                                    ordinary_local_response_version(conn));
+            settle_local_grpc_deadline(loop, conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
@@ -3456,8 +3561,20 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         conn.keep_alive = false;
         format_static_response(
             conn, 400, false, http1_request_is_head(conn), ordinary_local_response_version(conn));
+        settle_local_grpc_deadline(loop, conn);
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
+    if (conn.local_grpc_deadline.expired(monotonic_us()) &&
+        conn.on_local_grpc_deadline != nullptr) {
+        auto callback = conn.on_local_grpc_deadline;
+        conn.on_local_grpc_deadline = nullptr;
+        IoEvent timeout{};
+        timeout.conn_id = conn.id;
+        timeout.type = IoEventType::LocalGrpcDeadlineTimer;
+        timeout.result = -ETIME;
+        callback(loop, conn, timeout);
         return;
     }
     conn.send_buf.reset();
@@ -3695,6 +3812,74 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     if (!loop->submit_recv(conn)) loop->close_conn(conn);
+}
+
+template <typename Loop>
+void on_local_grpc_deadline_expired(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result != -ETIME || conn.local_grpc_deadline_mode == 0 || conn.fd < 0 ||
+        conn.send_armed || conn.on_send != nullptr) {
+        if (conn.fd >= 0) loop->close_conn(conn);
+        return;
+    }
+    conn.pending_handler_fn = nullptr;
+    if constexpr (requires(Loop* candidate, Connection& c) { candidate->disarm_yield_timer(c); }) {
+        loop->disarm_yield_timer(conn);
+    }
+    const GrpcWebContentType mode = static_cast<GrpcWebContentType>(conn.local_grpc_deadline_mode);
+    if (conn.json_arena.current == nullptr &&
+        (conn.json_arena.backend.pool == nullptr ||
+         !conn.json_arena.init(conn.json_arena.backend.pool))) {
+        loop->close_conn(conn);
+        return;
+    }
+    u8* transformed = static_cast<u8*>(conn.json_arena.alloc(kGrpcWebLocalBodyCap));
+    static constexpr char kBinaryType[] = "application/grpc-web";
+    static constexpr char kTextType[] = "application/grpc-web-text";
+    static constexpr char kStatus[] = "4";
+    ResponseHeaderKV headers[2] = {
+        {"content-type",
+         12,
+         mode == GrpcWebContentType::Text ? kTextType : kBinaryType,
+         mode == GrpcWebContentType::Text ? 25u : 20u},
+        {"grpc-status", 11, kStatus, 1},
+    };
+    u32 header_count = 2;
+    const char* body = nullptr;
+    u32 body_len = 0;
+    if (transformed == nullptr ||
+        !prepare_local_grpc_web_response(mode,
+                                         nullptr,
+                                         0,
+                                         headers,
+                                         &header_count,
+                                         transformed,
+                                         kGrpcWebLocalBodyCap,
+                                         &body,
+                                         &body_len) ||
+        !format_response_with_body_and_headers(conn,
+                                               200,
+                                               body,
+                                               body_len,
+                                               headers,
+                                               header_count,
+                                               false,
+                                               false,
+                                               false,
+                                               false,
+                                               false,
+                                               ordinary_local_response_version(conn))) {
+        loop->close_conn(conn);
+        return;
+    }
+    // The timeout response owns the connection. Late receive completions must
+    // use the existing abandoned-upload path rather than publish a body error.
+    conn.req_body_abandoned = true;
+    conn.keep_alive = false;
+    conn.resp_status = 200;
+    settle_local_grpc_deadline(loop, conn);
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len())) loop->close_conn(conn);
 }
 
 template <typename Loop>
@@ -4059,6 +4244,19 @@ void handle_jit_outcome(Loop* loop,
                         jit::HandlerFn fn,
                         bool keep_alive,
                         const RouteEntry* selected_route) {
+    // User code may run across the deadline without yielding. Arbitrate before
+    // accepting any outcome or settling the timer for a normal response.
+    if (conn.local_grpc_deadline.expired(monotonic_us()) &&
+        conn.on_local_grpc_deadline != nullptr) {
+        auto callback = conn.on_local_grpc_deadline;
+        conn.on_local_grpc_deadline = nullptr;
+        IoEvent timeout{};
+        timeout.conn_id = conn.id;
+        timeout.type = IoEventType::LocalGrpcDeadlineTimer;
+        timeout.result = -ETIME;
+        callback(loop, conn, timeout);
+        return;
+    }
     // The bounded H1 chunk collector stages the Web payload for local body
     // readers. Forward replay is deliberately unsupported for this framing
     // shape until a separate request rewriter exists; fail before any
@@ -4071,6 +4269,23 @@ void handle_jit_outcome(Loop* loop,
                                  outcome.yield_kind == jit::YieldKind::UpstreamConnect ||
                                  outcome.yield_kind == jit::YieldKind::UpstreamSend ||
                                  outcome.yield_kind == jit::YieldKind::UpstreamRecv);
+    if (conn.local_grpc_deadline.present && outcome.kind != JitDispatchOutcome::Kind::TimerYield &&
+        outcome.kind != JitDispatchOutcome::Kind::EventYield &&
+        outcome.kind != JitDispatchOutcome::Kind::Forward)
+        settle_local_grpc_deadline(loop, conn);
+    if (conn.local_grpc_deadline.present &&
+        (outcome.kind == JitDispatchOutcome::Kind::Forward ||
+         outcome.kind == JitDispatchOutcome::Kind::EventYield)) {
+        conn.pending_handler_fn = nullptr;
+        conn.resp_status = 400;
+        conn.keep_alive = false;
+        format_static_response(
+            conn, 400, false, http1_request_is_head(conn), ordinary_local_response_version(conn));
+        settle_local_grpc_deadline(loop, conn);
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
     if ((outcome.kind == JitDispatchOutcome::Kind::Forward || upstream_event) &&
         conn.grpc_web_local_chunk_done) {
         conn.pending_handler_fn = nullptr;
@@ -4443,6 +4658,7 @@ void handle_jit_outcome(Loop* loop,
             // the request rather than resume early and silently violate
             // wait(ms) semantics.
             conn.pending_handler_fn = nullptr;
+            settle_local_grpc_deadline(loop, conn);
             conn.resp_status = 500;
             format_static_response(conn,
                                    500,
@@ -4467,6 +4683,7 @@ void handle_jit_outcome(Loop* loop,
             conn.transition_to_exec_handler_wait();
             auto send_bad_gateway = [&](bool ordinary_local_error = false) {
                 conn.pending_handler_fn = nullptr;
+                settle_local_grpc_deadline(loop, conn);
                 conn.resp_status = kStatusBadGateway;
                 format_static_response(conn,
                                        502,
@@ -5696,6 +5913,17 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
     // both here; branch on protocol.
     if (conn.protocol == ConnProtocol::Http2) {
         h2_resume_jit_handler<Loop>(loop, conn);
+        return;
+    }
+    if (conn.local_grpc_deadline.expired(monotonic_us()) &&
+        conn.on_local_grpc_deadline != nullptr) {
+        auto callback = conn.on_local_grpc_deadline;
+        conn.on_local_grpc_deadline = nullptr;
+        IoEvent timeout{};
+        timeout.conn_id = conn.id;
+        timeout.type = IoEventType::LocalGrpcDeadlineTimer;
+        timeout.result = -ETIME;
+        callback(loop, conn, timeout);
         return;
     }
     // A yielded handler can resume while still on the keepalive wheel

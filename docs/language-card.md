@@ -1191,6 +1191,16 @@ returning Forward on that path, including after a yield, fails with HTTP 400
 before contacting the upstream. Chunk framing is bounded to 32 KiB. Header-only
 routes and direct proxy routes retain their existing body handling.
 
+On Linux epoll/io_uring backends, body-reading HTTP/1.1 local gRPC-Web POST
+routes accept optional `grpc-timeout`
+with the existing timeout grammar, measured from request start. Invalid or
+duplicate values return HTTP 400 before handler entry. Expiry during body
+collection, synchronous handler execution, or a timer yield returns HTTP 200
+with a trailers-only `grpc-status: 4`
+envelope in binary/text mode and closes the connection. An active local deadline
+rejects Forward and event-based yields before I/O; timer yields remain supported.
+HTTP/2 and kqueue local deadline enforcement are not implemented.
+
 Local responses may opt into grpc-web by using exactly one
 `application/grpc-web`/`application/grpc-web-text` content type, optionally
 with `+proto`. The handler body contract is one native uncompressed gRPC frame
@@ -1226,7 +1236,7 @@ Bodies and the pending numeric status survive flow-control stalls, queued
 response promotion and cancellation. Trailers consume no DATA flow-control
 credit. This local path uses ordinary HTTP request/response accounting, not the
 upstream gRPC proxy exchange counters. It does not generate service route dispatch,
-enforce grpc-timeout for local work, expose streaming RPC handlers, or perform
+enforce grpc-timeout for local HTTP/2 work, expose streaming RPC handlers, or perform
 HTTP/JSON transcoding. See
 [the local endpoint](../examples/grpc-local.rut) and
 [client instructions](../examples/grpc/README.md#local-unary-rpc).
