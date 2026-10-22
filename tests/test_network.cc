@@ -19,6 +19,9 @@
 #ifdef __linux__
 #include "rut/runtime/tls_iouring.h"
 #endif
+#ifdef __APPLE__
+#include "rut/runtime/kqueue_event_loop.h"
+#endif
 #include "rut/platform/socket.h"
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
@@ -9969,6 +9972,101 @@ void stage_strict_tls_send_owner(Connection& conn,
     conn.response_read_deadline_send_owner_active = true;
 }
 #endif  // __linux__
+
+#ifdef __APPLE__
+static u64 kqueue_deadline_yield_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_status(200).pack();
+}
+
+TEST(local_grpc_deadline_backend, kqueue_retains_exact_long_deadline_across_horizon_wakes) {
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->resp_status = 0;
+    conn->on_local_grpc_deadline = +[](void*, Connection& c, IoEvent) { c.resp_status++; };
+    const u64 deadline = kqueue_yield::monotonic_ns() / 1000 + 99'999'999ull * 3'600'000'000ull;
+    REQUIRE(loop->arm_local_grpc_deadline(*conn, deadline));
+    CHECK_EQ(loop->local_grpc_deadline_heap.top().deadline_ns, deadline);
+    const u64 first_wake = loop->yield_timer_armed_ns;
+    CHECK_GT(first_wake, kqueue_yield::monotonic_ns());
+    loop->drain_yield_heap();
+    CHECK_EQ(conn->resp_status, 0u);
+    CHECK(conn->local_grpc_deadline_timer.target_owned);
+    CHECK_EQ(loop->local_grpc_deadline_heap.top().deadline_ns, deadline);
+    loop->rearm_yield_timer();
+    CHECK_GE(loop->yield_timer_armed_ns, first_wake);
+    CHECK_EQ(loop->local_grpc_deadline_heap.top().deadline_ns, deadline);
+    loop->disarm_local_grpc_deadline(*conn);
+    CHECK(loop->local_grpc_deadline_heap.empty());
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    conn->on_local_grpc_deadline = +[](void*, Connection& c, IoEvent) { c.resp_status++; };
+    REQUIRE(loop->arm_local_grpc_deadline(*conn, kqueue_yield::monotonic_ns() / 1000 - 1));
+    loop->drain_yield_heap();
+    CHECK_EQ(conn->resp_status, 1u);
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+
+    conn->pending_handler_fn = &kqueue_deadline_yield_handler;
+    conn->pending_yield_kind = jit::YieldKind::Timer;
+    conn->yield_armed = true;
+    REQUIRE(loop->yield_heap.push(kqueue_yield::monotonic_ns() - 1, conn->handler_gen, conn->id));
+    conn->on_local_grpc_deadline = +[](void*, Connection& c, IoEvent) {
+        c.resp_status++;
+        c.pending_handler_fn = nullptr;
+    };
+    REQUIRE(loop->arm_local_grpc_deadline(*conn, kqueue_yield::monotonic_ns() / 1000 - 1));
+    loop->drain_yield_heap();
+    CHECK_EQ(conn->resp_status, 2u);
+    CHECK(conn->pending_handler_fn == nullptr);
+    conn->yield_armed = false;
+
+    const u32 reused_id = conn->id;
+    conn->on_local_grpc_deadline = +[](void*, Connection&, IoEvent) {};
+    REQUIRE(loop->arm_local_grpc_deadline(*conn, kqueue_yield::monotonic_ns() / 1000 + 60'000'000));
+    loop->close_conn(*conn);
+    CHECK(loop->local_grpc_deadline_heap.empty());
+    auto* reused = loop->alloc_conn();
+    REQUIRE(reused);
+    CHECK_EQ(reused->id, reused_id);
+    CHECK(reused->local_grpc_deadline_timer.reusable());
+    // Shutdown with a real owned target, rather than only a synthetic heap
+    // entry: Connection::reset deliberately preserves asynchronous owners.
+    reused->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(reused->fd, 0);
+    const i32 old_fd = reused->fd;
+    reused->on_local_grpc_deadline = +[](void*, Connection&, IoEvent) {};
+    REQUIRE(
+        loop->arm_local_grpc_deadline(*reused, kqueue_yield::monotonic_ns() / 1000 + 60'000'000));
+    REQUIRE(reused->local_grpc_deadline_timer.target_owned);
+    REQUIRE(loop->yield_heap.push(kqueue_yield::monotonic_ns() + 1, 1, reused_id));
+    loop->shutdown();
+    close(old_fd);
+    CHECK(reused->local_grpc_deadline_timer.reusable());
+    CHECK(loop->yield_heap.empty());
+    CHECK(loop->local_grpc_deadline_heap.empty());
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    CHECK(loop->yield_heap.empty());
+    CHECK(loop->local_grpc_deadline_heap.empty());
+    auto* fresh = loop->alloc_conn();
+    REQUIRE(fresh);
+    CHECK_EQ(fresh->id, reused_id);
+    CHECK(fresh->local_grpc_deadline_timer.reusable());
+    fresh->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(fresh->fd, 0);
+    fresh->on_local_grpc_deadline = +[](void*, Connection&, IoEvent) {};
+    REQUIRE(
+        loop->arm_local_grpc_deadline(*fresh, kqueue_yield::monotonic_ns() / 1000 + 60'000'000));
+    loop->disarm_local_grpc_deadline(*fresh);
+    close(fresh->fd);
+    fresh->fd = -1;
+    loop->free_conn(*fresh);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+#endif  // __APPLE__
 
 TEST(http2, response_headers_body_length_is_transactional_and_nonterminal) {
     hpack::Encoder enc;

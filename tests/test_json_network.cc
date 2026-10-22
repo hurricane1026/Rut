@@ -545,8 +545,7 @@ TEST(json_network, h1_grpc_web_sync_outcome_deadline_arbitration) {
     }
 }
 
-#ifdef __linux__
-TEST(json_network, h1_grpc_web_slow_body_real_epoll_socket) {
+TEST(json_network, h1_grpc_web_slow_body_real_sync_backend_socket) {
     // Use the production timer heap, send backend and real socket ownership.
     // The request stops in the middle of either transport framing shape.
     for (bool chunked : {false, true}) {
@@ -569,8 +568,10 @@ TEST(json_network, h1_grpc_web_slow_body_real_epoll_socket) {
         REQUIRE(guard.loop->init(0, -1, 0).has_value());
         guard.initialized = true;
         i32 sockets[2];
-        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
         guard.peer = sockets[1];
+        REQUIRE_EQ(fcntl(sockets[0], F_SETFL, O_NONBLOCK), 0);
+        REQUIRE_EQ(fcntl(sockets[1], F_SETFL, O_NONBLOCK), 0);
         guard.conn = guard.loop->alloc_conn();
         REQUIRE(guard.conn);
         auto& conn = *guard.conn;
@@ -615,7 +616,6 @@ TEST(json_network, h1_grpc_web_slow_body_real_epoll_socket) {
         CHECK_GE(conn.fd, 0);
     }
 }
-#endif
 
 TEST(json_network, grpc_web_runtime_admission_precedes_handler) {
     const std::string valid("\0\0\0\0\1x", 6);
