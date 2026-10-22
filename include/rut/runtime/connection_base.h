@@ -16,6 +16,8 @@
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/listener_context.h"
+#include "rut/runtime/local_grpc_deadline.h"
+#include "rut/runtime/local_grpc_deadline_timer.h"
 #include "rut/runtime/response_body_chain.h"
 #include "rut/runtime/tls_engine.h"
 #include "rut/runtime/ws_terminate.h"
@@ -820,6 +822,12 @@ struct ConnectionBase {
     ResponseReadTimerPhase response_read_timer_phase = ResponseReadTimerPhase::None;
     bool response_read_timer_target_owned = false;
     bool response_read_timer_cancel_owned = false;
+
+    LocalGrpcDeadlineTimerOwner local_grpc_deadline_timer;
+    LocalGrpcDeadline local_grpc_deadline;
+    Callback on_local_grpc_deadline = nullptr;
+    u32 local_grpc_deadline_stream = 0;
+    u8 local_grpc_deadline_mode = 0;
 
     template <typename Self, typename Visitor>
     static void visit_response_read_timer_owner_fields(Self& c, Visitor&& visit) {
@@ -1939,6 +1947,12 @@ struct ConnectionBase {
         chain_direct_recv_owner = {};
         relay_owner = {};
         on_recv = nullptr;
+        // The transport owner deliberately survives reset: its timespec may
+        // still be referenced by a retiring timeout SQE.
+        local_grpc_deadline.reset();
+        on_local_grpc_deadline = nullptr;
+        local_grpc_deadline_stream = 0;
+        local_grpc_deadline_mode = 0;
         on_send = nullptr;
         on_close = nullptr;
         on_upstream_recv = nullptr;

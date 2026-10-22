@@ -355,6 +355,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
                 break;
             case IoEventType::HandlerTimer:
             case IoEventType::ResponseReadTimer:
+            case IoEventType::LocalGrpcDeadlineTimer:
+            case IoEventType::LocalGrpcDeadlineCancel:
             case IoEventType::RelayRead:
             case IoEventType::RelayWrite:
             case IoEventType::Count:
@@ -854,6 +856,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             case IoEventType::RelayWrite:
                 break;
             case IoEventType::ResponseReadTimer:
+            case IoEventType::LocalGrpcDeadlineTimer:
+            case IoEventType::LocalGrpcDeadlineCancel:
             case IoEventType::Count:
                 break;
         }

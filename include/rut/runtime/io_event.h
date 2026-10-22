@@ -27,10 +27,12 @@ enum class IoEventType : u8 {
                         //   drains its min-heap to find which conns to resume.
     ResponseReadTimer,  // Generic precise response-read transport timer.
                         // Kept distinct from JIT and TimerWheel wakeups.
+    LocalGrpcDeadlineTimer,
+    LocalGrpcDeadlineCancel,
     Count,
 };
 
-static_assert(static_cast<u8>(IoEventType::Count) == 11u,
+static_assert(static_cast<u8>(IoEventType::Count) == 13u,
               "IoEventType should keep all runtime event tags and remain small");
 
 // Future upstream-event token layout in the existing 64-bit user_data budget:
@@ -215,6 +217,22 @@ inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current
     return io_event_uses_upstream_episode(event.type) &&
            (event.upstream_episode == kInvalidUpstreamEventEpisode ||
             (event.upstream_episode != 0 && event.upstream_episode != current_episode));
+}
+
+inline constexpr bool valid_local_grpc_deadline_transport_event(const IoEvent& event) {
+    if ((event.type != IoEventType::LocalGrpcDeadlineTimer &&
+         event.type != IoEventType::LocalGrpcDeadlineCancel) ||
+        event.non_upstream_generation == 0 || event.non_upstream_generation > 0x7fffffffu)
+        return false;
+    IoEvent canonical = event;
+    canonical.type = IoEventType::ResponseReadTimer;
+    if (event.type == IoEventType::LocalGrpcDeadlineCancel)
+        canonical.non_upstream_generation |= kResponseReadTimerCancelBit;
+    // A cancel racing the timeout may complete with -EALREADY. It still
+    // retires the cancel SQE; the target remains owned until its own CQE.
+    if (event.type == IoEventType::LocalGrpcDeadlineCancel && event.result == -EALREADY)
+        canonical.result = -ENOENT;
+    return valid_response_read_timer_transport_event(canonical);
 }
 
 }  // namespace rut

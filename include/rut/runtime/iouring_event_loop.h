@@ -3139,7 +3139,8 @@ public:
             conns[cid].relay_owner.read_cancel_owned || conns[cid].relay_owner.write_cancel_owned ||
             conns[cid].relay_owner.read_cancel_retry || conns[cid].relay_owner.write_cancel_retry ||
             conns[cid].relay_owner.close_pending || conns[cid].relay_owner.segment_len != 0 ||
-            !conns[cid].response_read_timer_owner_is_neutral())
+            !conns[cid].response_read_timer_owner_is_neutral() ||
+            !conns[cid].local_grpc_deadline_timer.reusable())
             return;
         bool was_pending = false;
         for (u32 i = 0; i < pending_free_count; i++) {
@@ -3185,6 +3186,12 @@ public:
         u32 remaining = 0;
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
+            // A failed cancel enqueue retains custody on the pending-free
+            // list and is retried after SQ progress, even for long deadlines.
+            auto& local_owner = conns[cid].local_grpc_deadline_timer;
+            if (local_owner.target_owned && !local_owner.cancel_owned &&
+                backend.cancel_local_grpc_deadline_timer(cid, conns[cid]))
+                conns[cid].pending_ops++;
             if (!response_read_batch_reuse_pinned(cid) && conns[cid].pending_ops == 0 &&
                 !strict_upstream_retirement_blocks_reclaim(conns[cid]) &&
                 !conns[cid].chain_direct_recv_owner.active && !conns[cid].relay_owner.active() &&
@@ -3194,7 +3201,8 @@ public:
                 !conns[cid].relay_owner.read_cancel_retry &&
                 !conns[cid].relay_owner.write_cancel_retry &&
                 !conns[cid].relay_owner.close_pending && conns[cid].relay_owner.segment_len == 0 &&
-                conns[cid].response_read_timer_owner_is_neutral()) {
+                conns[cid].response_read_timer_owner_is_neutral() &&
+                conns[cid].local_grpc_deadline_timer.reusable()) {
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
@@ -3320,8 +3328,8 @@ public:
         if (c.pending_ops == 0 && !c.chain_direct_recv_owner.active &&
             !response_read_batch_reuse_pinned(cid) &&
             !strict_upstream_retirement_blocks_reclaim(c) &&
-            c.response_read_timer_owner_is_neutral() && !c.relay_owner.active() &&
-            !c.relay_owner.read_armed && !c.relay_owner.write_armed &&
+            c.response_read_timer_owner_is_neutral() && c.local_grpc_deadline_timer.reusable() &&
+            !c.relay_owner.active() && !c.relay_owner.read_armed && !c.relay_owner.write_armed &&
             !c.relay_owner.read_cancel_owned && !c.relay_owner.write_cancel_owned &&
             !c.relay_owner.read_cancel_retry && !c.relay_owner.write_cancel_retry &&
             !c.relay_owner.close_pending && c.relay_owner.segment_len == 0) {
@@ -7385,6 +7393,7 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
+        disarm_local_grpc_deadline(c);
         if (c.tls_out_inflight) {
             // TLS close custody belongs to the actual ciphertext SQE, not the
             // logical plaintext continuation. The common ledger survives
@@ -7611,6 +7620,25 @@ public:
     // catastrophic SQ pressure (IORING_OP_TIMEOUT fails even after
     // flush+retry) AND the requested wait exceeds what the 1-second
     // wheel fallback can represent (~63s). Caller fails the request.
+    [[nodiscard]] bool arm_local_grpc_deadline(Connection& conn, u64 absolute_us) {
+        if (!conn.local_grpc_deadline_timer.reusable() ||
+            !backend.add_local_grpc_deadline_timer(conn.id, conn, absolute_us))
+            return false;
+        conn.pending_ops++;
+        return true;
+    }
+
+    void disarm_local_grpc_deadline(Connection& conn) {
+        conn.on_local_grpc_deadline = nullptr;
+        conn.local_grpc_deadline.reset();
+        if (conn.local_grpc_deadline_timer.target_owned &&
+            !conn.local_grpc_deadline_timer.cancel_owned &&
+            backend.cancel_local_grpc_deadline_timer(conn.id, conn))
+            conn.pending_ops++;
+        // If the SQ is unavailable, retain target ownership until its CQE.
+        // pending_ops prevents freeing the timespec or reusing the slot.
+    }
+
     [[nodiscard]] bool schedule_yield_timer(Connection& conn, u32 ms) {
         timer.remove(&conn);
         // Ensure a recv is in flight so peer disconnect during wait(ms)
@@ -8937,6 +8965,29 @@ public:
                         break;
                     }
                     on_response_splice_event(conn, ev);
+                }
+                break;
+            case IoEventType::LocalGrpcDeadlineTimer:
+            case IoEventType::LocalGrpcDeadlineCancel:
+                if (ev.conn_id < slots_initialized &&
+                    valid_local_grpc_deadline_transport_event(ev)) {
+                    auto& c = conns[ev.conn_id];
+                    auto& owner = c.local_grpc_deadline_timer;
+                    const bool target = ev.type == IoEventType::LocalGrpcDeadlineTimer;
+                    const bool consumed = target ? owner.reclaim_target(ev.non_upstream_generation)
+                                                 : owner.reclaim_cancel(ev.non_upstream_generation);
+                    if (!consumed) break;
+                    if (c.pending_ops > 0) c.pending_ops--;
+                    if (target && c.fd >= 0 && c.on_local_grpc_deadline) {
+                        if (ev.result == -ETIME) {
+                            auto callback = c.on_local_grpc_deadline;
+                            c.on_local_grpc_deadline = nullptr;
+                            callback(this, c, ev);
+                        } else if (ev.result != -ECANCELED) {
+                            close_conn(c);
+                        }
+                    }
+                    if (c.fd < 0 && c.pending_ops == 0 && owner.reusable()) reclaim_slot(c.id);
                 }
                 break;
             case IoEventType::ResponseReadTimer:

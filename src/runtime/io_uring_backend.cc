@@ -1072,6 +1072,55 @@ bool IoUringBackend::cancel_response_read_timer(u32 conn_id, Connection& conn) {
     return true;
 }
 
+bool IoUringBackend::add_local_grpc_deadline_timer(u32 conn_id, Connection& conn, u64 absolute_us) {
+    if (conn_id >= connection_capacity || conn.id != conn_id || absolute_us == 0 ||
+        !conn.local_grpc_deadline_timer.arm(absolute_us))
+        return false;
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) {
+        conn.local_grpc_deadline_timer.reclaim_target(
+            conn.local_grpc_deadline_timer.owner_generation);
+        return false;
+    }
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_TIMEOUT;
+    sqe->fd = -1;
+    sqe->addr = reinterpret_cast<u64>(&conn.local_grpc_deadline_timer.timespec_sec);
+    sqe->len = 1;
+    sqe->off = 0;
+    sqe->timeout_flags = IORING_TIMEOUT_ABS;
+    sqe->user_data = encode_user_data(conn_id,
+                                      IoEventType::LocalGrpcDeadlineTimer,
+                                      conn.local_grpc_deadline_timer.owner_generation);
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
+bool IoUringBackend::cancel_local_grpc_deadline_timer(u32 conn_id, Connection& conn) {
+    auto& owner = conn.local_grpc_deadline_timer;
+    if (conn_id >= connection_capacity || conn.id != conn_id || !owner.target_owned ||
+        owner.cancel_owned || owner.owner_generation == 0)
+        return false;
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) {
+        owner.cancel_owned = false;
+        owner.cancel_generation = 0;
+        owner.phase = LocalGrpcDeadlineTimerPhase::Armed;
+        return false;
+    }
+    const u32 generation = owner.owner_generation;
+    if (!owner.request_cancel()) return false;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_ASYNC_CANCEL;
+    sqe->fd = -1;
+    sqe->addr = encode_user_data(conn_id, IoEventType::LocalGrpcDeadlineTimer, generation);
+    sqe->user_data = encode_user_data(conn_id, IoEventType::LocalGrpcDeadlineCancel, generation);
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 void IoUringBackend::cancel_accept() {
     if (ring_fd < 0) return;
     io_uring_sqe* sqe = get_sqe_flushing();
@@ -2190,12 +2239,18 @@ u32 IoUringBackend::wait(
         events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
         // Forward the decoded aux so dispatch can recognize a pause cancel's own
         // completion (UpstreamRecv + kPauseCancelAux); 0 for every normal op.
-        events[count].aux = (type == IoEventType::Send || type == IoEventType::ResponseReadTimer)
+        events[count].aux = (type == IoEventType::Send || type == IoEventType::ResponseReadTimer ||
+                             type == IoEventType::LocalGrpcDeadlineTimer ||
+                             type == IoEventType::LocalGrpcDeadlineCancel)
                                 ? 0
                                 : static_cast<u8>(aux);
         events[count].upstream_episode = upstream_episode;
         events[count].non_upstream_generation =
-            (type == IoEventType::Send || type == IoEventType::ResponseReadTimer) ? aux : 0;
+            (type == IoEventType::Send || type == IoEventType::ResponseReadTimer ||
+             type == IoEventType::LocalGrpcDeadlineTimer ||
+             type == IoEventType::LocalGrpcDeadlineCancel)
+                ? aux
+                : 0;
         // Selected-buffer completions were handled above, so a recv -ENOBUFS
         // here is the kernel reporting an empty provided ring. The downstream
         // target (aux 0) is flagged too when the multishot ended (no F_MORE):
