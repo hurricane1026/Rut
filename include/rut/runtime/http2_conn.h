@@ -83,6 +83,10 @@ struct Http2Conn {
     static constexpr u32 kHeaderBlockCap = 16384 + 32;  // header block plus late gRPC timeout
     static constexpr u32 kHeaderScratchCap = 16384;     // decoded name/value bytes
     static constexpr u32 kMaxHeadersPerReq = 64;
+    struct BufferedHeadersTimestamp {
+        u32 stream_id;
+        u64 received_us;
+    };
 
     // Delivered when a stream's header block completes (END_HEADERS). `headers`
     // points into engine scratch valid only for the call.
@@ -210,6 +214,13 @@ struct Http2Conn {
     // transfers these to the Connection atomically with schedule_yield_timer.
     u32 async_stream;
     u64 async_headers_received_us;
+    // Arrival time captured for an initial HEADERS frame buffered behind the
+    // one-at-a-time async request gate. The frame remains unconsumed until the
+    // gate opens, but gRPC timeout accounting starts at wire arrival.
+    BufferedHeadersTimestamp buffered_headers_timestamps[kMaxStreams];
+    bool capture_buffered_headers_time(u32 stream_id, u64 received_us);
+    u64 take_buffered_headers_time(u32 stream_id);
+    void clear_buffered_headers_time(u32 stream_id);
     bool async_is_head;
     H2AsyncKind async_kind;
     const RouteConfig* async_cfg;
@@ -351,7 +362,8 @@ u32 http2_write_response_headers(u8* out,
                                  const hpack::Header* hdrs,
                                  u32 nhdrs,
                                  u32 body_len,
-                                 bool end_stream);
+                                 bool end_stream,
+                                 bool include_content_length = true);
 
 u32 http2_write_head_response_headers(u8* out,
                                       u32 out_cap,

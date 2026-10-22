@@ -1942,6 +1942,28 @@ TEST(grpc_proxy, local_h2_deadline_arm_failure_closes_connection) {
     CHECK(loop.closed);
 }
 
+TEST(grpc_proxy, timer_yield_rearm_failure_is_fatal_after_local_deadline_expires) {
+    LocalDeadlineTimerFixture loop;
+    loop.arm_ok = false;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init_client();
+    conn.h2 = &h2;
+    auto* expired = h2.open_stream(1);
+    auto* async = h2.open_stream(3);
+    REQUIRE(expired != nullptr);
+    REQUIRE(async != nullptr);
+    expired->local_deadline_present = true;
+    expired->local_deadline_expired = true;
+    async->local_deadline_present = false;
+    h2.async_stream = async->id;
+    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_resume_at_us = monotonic_us() + 100000;
+    CHECK_FALSE(grpc_refresh_timer(&loop, conn));
+    CHECK_EQ(loop.arms, 1u);
+}
+
 TEST(grpc_proxy, local_h2_deadline_replaces_flow_stalled_native_owner) {
     Http2Conn h2;
     h2.init_client();

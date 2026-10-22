@@ -2665,7 +2665,7 @@ bool grpc_refresh_timer(Loop* loop, Connection& conn) {
     if (delay > 3600000000ull) delay = 3600000000ull;
     if constexpr (!(requires { loop->arm_throttle_timer(conn, delay * 1000); })) {
         g.timer_deadline_us = 0;
-        if (!has_local_deadline) return true;
+        if (!has_local_deadline && !has_async_resume) return true;
         return false;
     } else if (!loop->arm_throttle_timer(conn, delay * 1000)) {
         g.timer_deadline_us = 0;
@@ -2728,7 +2728,7 @@ bool grpc_refresh_timer(Loop* loop, Connection& conn) {
         // An active local deadline that cannot be re-armed must not remain on
         // the stream with no future wakeup. The caller closes on false, so it
         // can stop touching the connection immediately after this returns.
-        if (has_local_deadline) return false;
+        if (has_local_deadline || has_async_resume) return false;
         for (u32 i = 0; i < downstream_count; i++) {
             auto& snapshot = downstreams[i];
             if (snapshot.conn->h2 != snapshot.h2 ||
@@ -2748,7 +2748,9 @@ inline bool grpc_replace_expired_native_owner(Http2Conn& h2, const Http2Stream& 
     if (!outbound_owner && !queued_owner) return true;
     if (stream.grpc_protocol_mode != H2GrpcProtocolMode::Native) return false;
     if (outbound_owner) {
-        if (h2.outbound_grpc_status > 16 || h2.outbound_final_staged) return false;
+        if (h2.outbound_grpc_status > 16 || h2.outbound_final_staged ||
+            h2.outbound_body_offset != 0)
+            return false;
         h2.outbound_body_offset = h2.outbound_body_len;
         h2.outbound_grpc_status = 4;
         h2.outbound_grpc_message_len = 0;
@@ -2756,7 +2758,8 @@ inline bool grpc_replace_expired_native_owner(Http2Conn& h2, const Http2Stream& 
         h2.outbound_grpc_status_details_len = 0;
         h2.outbound_grpc_status_details_present = false;
     } else {
-        if (h2.queued_grpc_status > 16) return false;
+        if (h2.queued_grpc_status > 16 || h2.queued_final_staged || h2.queued_body_offset != 0)
+            return false;
         h2.queued_body_offset = h2.queued_body_len;
         h2.queued_grpc_status = 4;
         h2.queued_grpc_message_len = 0;

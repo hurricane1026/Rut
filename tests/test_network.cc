@@ -10119,6 +10119,34 @@ TEST(http2, response_headers_body_length_is_transactional_and_nonterminal) {
     CHECK(saw_length);
     CHECK(saw_test);
 
+    // Trailer-bearing native gRPC responses may replace an unstaged body with
+    // grpc-status: 4, so their initial HEADERS must not promise the old length.
+    hpack::Encoder grpc_enc;
+    grpc_enc.init(kDefaultHeaderTableSize);
+    u8 grpc_headers[8192]{};
+    const u32 grpc_n = http2_write_response_headers(
+        grpc_headers, sizeof(grpc_headers), grpc_enc, 5, 200, headers, 1, 9000, false, false);
+    REQUIRE_GT(grpc_n, 0u);
+    Http2FrameHeader grpc_frame{};
+    REQUIRE_EQ(parse_frame_header(grpc_headers, grpc_n, &grpc_frame), ParseStatus::Complete);
+    hpack::DynamicTable grpc_dec;
+    grpc_dec.init(kDefaultHeaderTableSize);
+    hpack::Header grpc_decoded[8];
+    u8 grpc_scratch[256]{};
+    u32 grpc_count = 0;
+    REQUIRE(hpack::decode_header_block(grpc_dec,
+                                       grpc_headers + kFrameHeaderSize,
+                                       grpc_frame.length,
+                                       grpc_scratch,
+                                       sizeof(grpc_scratch),
+                                       grpc_decoded,
+                                       8,
+                                       &grpc_count));
+    bool grpc_has_length = false;
+    for (u32 i = 0; i < grpc_count; i++)
+        grpc_has_length |= grpc_decoded[i].name.eq({"content-length", 14});
+    CHECK_FALSE(grpc_has_length);
+
     // A failed staging attempt must not consume encoder state or partially write.
     u8 too_small[8]{};
     CHECK_EQ(http2_write_response_headers(

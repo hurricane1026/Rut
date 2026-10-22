@@ -450,6 +450,8 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
     }
     if (!d.owned_hpack_pending) d.owned_hpack_after = h2.hpack_enc;
     auto& enc = d.owned_hpack_after;
+    const Http2Stream* stream = h2.find_stream(stream_id);
+    const bool kNativeGrpc = stream && stream->grpc_protocol_mode == H2GrpcProtocolMode::Native;
     const u32 n = http2_write_response_headers(d.resp + d.resp_len,
                                                d.resp_cap - d.resp_len,
                                                enc,
@@ -458,7 +460,8 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
                                                hdrs,
                                                nhdrs,
                                                body_len,
-                                               false);
+                                               false,
+                                               !kNativeGrpc);
     if (n == 0) {
         if (body_slice != nullptr) body_pool->free(body_slice);
         if (d.resp_len != 0) d.overflow = true;
@@ -585,9 +588,34 @@ void h2_emit_status(H2Dispatch<Loop>& d, u32 stream_id, u16 status) {
 // outbound owner is being staged. The encoder is copied and committed together
 // with the response, so a failed fit cannot leave HPACK state ahead of the wire.
 template <typename Loop>
+bool h2_send_pending_deadline_reset(Loop* loop, Connection& conn);
+template <typename Loop>
+void h2_async_epoch_enter(Loop* loop, Connection& conn);
+
+template <typename Loop>
 bool h2_publish_expired_local(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
-    if (!h2 || conn.send_armed || h2->outbound_stream || h2->queued_stream) return false;
+    if (!h2 || conn.send_armed) return false;
+    if (h2->outbound_stream || h2->queued_stream) {
+        // The single/queued outbound slots can be flow-control blocked for an
+        // arbitrary time. Expired streams behind an unrelated owner therefore
+        // get a deterministic RST_STREAM without waiting for that owner's window.
+        for (u32 i = 0; i < h2->nstreams; ++i) {
+            auto& candidate = h2->streams[i];
+            if (candidate.state == Http2StreamState::Closed || !candidate.local_deadline_expired ||
+                candidate.grpc_protocol_mode == H2GrpcProtocolMode::None ||
+                candidate.id == h2->outbound_stream || candidate.id == h2->queued_stream ||
+                candidate.id == h2->deadline_reset_stream ||
+                candidate.id == h2->deadline_reset_stream_queued)
+                continue;
+            if (h2->deadline_reset_stream == 0)
+                h2->deadline_reset_stream = candidate.id;
+            else if (h2->deadline_reset_stream_queued == 0)
+                h2->deadline_reset_stream_queued = candidate.id;
+            break;
+        }
+        return h2_send_pending_deadline_reset(loop, conn);
+    }
     Http2Stream* stream = nullptr;
     for (u32 i = 0; i < h2->nstreams; ++i) {
         auto& candidate = h2->streams[i];
@@ -634,6 +662,7 @@ bool h2_publish_expired_local(Loop* loop, Connection& conn) {
             // The timeout envelope must obey both HTTP/2 flow-control windows.
             // Stage only its HEADERS here; the ordinary outbound pump publishes
             // DATA after both connection and stream credit become available.
+            h2_async_epoch_enter(loop, conn);
             if (!conn.epoch_held) {
                 loop->close_conn(conn);
                 return true;
@@ -2718,6 +2747,14 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     if (conn.h2 != flushed_h2 || conn.handler_gen != flushed_gen || conn.send_armed) return;
     if (h2_publish_expired_local(loop, conn)) return;
+    if (conn.h2 && conn.h2->grpc.active == 0 && !conn.h2->grpc.upstream &&
+        conn.h2->grpc.timer_deadline_us == 0 && conn.h2->outbound_stream == 0 &&
+        conn.h2->queued_stream == 0 && conn.h2->async_stream == 0 &&
+        conn.h2->deadline_reset_stream == 0 && conn.h2->deadline_reset_stream_queued == 0 &&
+        !conn.send_armed) {
+        if constexpr (requires { loop->timer.refresh(&conn, loop->keepalive_timeout); })
+            loop->timer.refresh(&conn, loop->keepalive_timeout);
+    }
     // A stream is suspended (wait() or proxy): now that its batch has flushed,
     // start what it waits on — arm the resume timer, or open the upstream
     // connection — instead of reading more frames (one suspended stream at a

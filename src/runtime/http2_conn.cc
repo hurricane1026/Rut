@@ -88,6 +88,7 @@ void Http2Conn::init() {
     pending_local_mutation_bytes = 0;
     async_stream = 0;
     async_headers_received_us = 0;
+    for (u32 i = 0; i < kMaxStreams; ++i) buffered_headers_timestamps[i] = {};
     async_is_head = false;
     async_kind = H2AsyncKind::None;
     async_cfg = nullptr;
@@ -135,6 +136,33 @@ void Http2Conn::init() {
     response_flush_pending = false;
     deadline_reset_stream = 0;
     deadline_reset_stream_queued = 0;
+}
+
+bool Http2Conn::capture_buffered_headers_time(u32 stream_id, u64 received_us) {
+    BufferedHeadersTimestamp* free_slot = nullptr;
+    for (auto& entry : buffered_headers_timestamps) {
+        if (entry.stream_id == stream_id) return true;
+        if (entry.stream_id == 0 && free_slot == nullptr) free_slot = &entry;
+    }
+    if (free_slot == nullptr) return false;
+    free_slot->stream_id = stream_id;
+    free_slot->received_us = received_us;
+    return true;
+}
+
+u64 Http2Conn::take_buffered_headers_time(u32 stream_id) {
+    for (auto& entry : buffered_headers_timestamps) {
+        if (entry.stream_id != stream_id) continue;
+        const u64 received_us = entry.received_us;
+        entry = {};
+        return received_us;
+    }
+    return 0;
+}
+
+void Http2Conn::clear_buffered_headers_time(u32 stream_id) {
+    for (auto& entry : buffered_headers_timestamps)
+        if (entry.stream_id == stream_id) entry = {};
 }
 
 void h2_clear_outbound(Http2Conn& h2) {
@@ -329,7 +357,8 @@ static u32 http2_write_response_impl(u8* out,
                                      const u8* body,
                                      u32 body_len,
                                      bool headers_only,
-                                     bool end_stream) {
+                                     bool end_stream,
+                                     bool include_content_length = true) {
     // Encode the header block: :status, caller headers, then content-length when
     // there's a body. Sized for the bounded route-config header set + slack.
     u8 hblock[8192];
@@ -351,7 +380,8 @@ static u32 http2_write_response_impl(u8* out,
     static constexpr u32 kHpackFieldOverhead = 11;  // 1 prefix + 5 + 5 length octets
     // Room the trailing content-length line needs when there's a body, reserved
     // during the loop so the loop can't fill hblock and then overflow on the CL.
-    const u32 kClReserve = body_len > 0 ? 14 + 10 + kHpackFieldOverhead : 0;
+    const bool kEmitContentLength = body_len > 0 && include_content_length;
+    const u32 kClReserve = kEmitContentLength ? 14 + 10 + kHpackFieldOverhead : 0;
     for (u32 i = 0; i < nhdrs; i++) {
         if (hb + hdrs[i].name.len + hdrs[i].value.len + kHpackFieldOverhead + kClReserve >
             sizeof(hblock))
@@ -379,7 +409,7 @@ static u32 http2_write_response_impl(u8* out,
         }
         hb += enc.encode(hblock + hb, name, hdrs[i].value);
     }
-    if (body_len > 0) {
+    if (kEmitContentLength) {
         char clbuf[10];
         const u32 kClLen = u32_to_dec(body_len, clbuf);
         if (hb + 14 + kClLen + kHpackFieldOverhead > sizeof(hblock)) return 0;  // (reserved above)
@@ -413,11 +443,22 @@ u32 http2_write_response_headers(u8* out,
                                  const hpack::Header* hdrs,
                                  u32 nhdrs,
                                  u32 body_len,
-                                 bool end_stream) {
+                                 bool end_stream,
+                                 bool include_content_length) {
     if (body_len != 0 && end_stream) return 0;
     auto staged = enc;
-    const u32 n = http2_write_response_impl(
-        out, out_cap, staged, stream_id, status, hdrs, nhdrs, nullptr, body_len, true, end_stream);
+    const u32 n = http2_write_response_impl(out,
+                                            out_cap,
+                                            staged,
+                                            stream_id,
+                                            status,
+                                            hdrs,
+                                            nhdrs,
+                                            nullptr,
+                                            body_len,
+                                            true,
+                                            end_stream,
+                                            include_content_length);
     if (n != 0) enc = staged;
     return n;
 }
@@ -788,6 +829,7 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
 }
 
 Http2Error reset_known_stream(Http2Conn& c, u32 stream_id, Http2Error error, OutWriter& w) {
+    c.clear_buffered_headers_time(stream_id);
     Http2Stream* s = c.find_stream(stream_id);
     if (!w.room(kFrameHeaderSize + 4)) return Http2Error::InternalError;
     w.len += write_rst_stream(w.out + w.len, stream_id, error);
@@ -895,6 +937,7 @@ static Http2Error handle_frame(Http2Conn& c,
                 c.last_stream_id = h.stream_id;
                 new_stream = true;
                 if (!s) {
+                    c.clear_buffered_headers_time(h.stream_id);
                     if (w.room(kFrameHeaderSize + 4))
                         w.len +=
                             write_rst_stream(w.out + w.len, h.stream_id, Http2Error::RefusedStream);
@@ -902,7 +945,8 @@ static Http2Error handle_frame(Http2Conn& c,
                 }
                 // grpc-timeout is measured from arrival of the initial HEADERS
                 // frame, including time spent receiving CONTINUATION frames.
-                s->headers_received_us = monotonic_us();
+                const u64 received_us = c.take_buffered_headers_time(h.stream_id);
+                s->headers_received_us = received_us ? received_us : monotonic_us();
             }
             if (s->got_headers) {
                 // A second HEADERS block on an already-open stream is either
@@ -1165,6 +1209,34 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
         }
     }
 
+    // Record initial HEADERS arrival for every structurally complete frame
+    // header in this receive batch before the serving gate can stop parsing at
+    // the first parked request. This scan never reads HPACK or advances `pos`.
+    const u64 batch_received_us = monotonic_us();
+    const u32 batch_last_stream_id = last_stream_id;
+    bool timestamp_ledger_full = false;
+    u32 scan_pos = pos;
+    while (len - scan_pos >= kFrameHeaderSize) {
+        Http2FrameHeader scan_header{};
+        parse_frame_header(in + scan_pos, len - scan_pos, &scan_header);
+        if (scan_header.length > our_settings.max_frame_size) break;
+        if (!client && scan_header.type == static_cast<u8>(Http2FrameType::Headers) &&
+            scan_header.stream_id != 0 && (scan_header.stream_id & 1u) != 0 &&
+            scan_header.stream_id > batch_last_stream_id &&
+            find_stream(scan_header.stream_id) == nullptr &&
+            !capture_buffered_headers_time(scan_header.stream_id, batch_received_us))
+            timestamp_ledger_full = true;
+        if (len - scan_pos < kFrameHeaderSize + scan_header.length) break;
+        scan_pos += kFrameHeaderSize + scan_header.length;
+    }
+    if (timestamp_ledger_full) {
+        if (w.room(kFrameHeaderSize + 8))
+            w.len += write_goaway(w.out + w.len, last_stream_id, Http2Error::EnhanceYourCalm);
+        goaway_sent = true;
+        *out_written = w.len;
+        return {pos, true};
+    }
+
     while (true) {
         if (conn_recv_credit && w.room(kFrameHeaderSize + 4)) {
             w.len += write_window_update(w.out + w.len, 0, conn_recv_credit);
@@ -1239,6 +1311,7 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
         const Http2Error kErr = handle_frame(*this, h, in + pos + kFrameHeaderSize, w);
         pos += kFrameHeaderSize + h.length;
         if (kErr != Http2Error::NoError) {
+            clear_buffered_headers_time(h.stream_id);
             if (w.room(kFrameHeaderSize + 8))
                 w.len += write_goaway(w.out + w.len, last_stream_id, kErr);
             goaway_sent = true;
