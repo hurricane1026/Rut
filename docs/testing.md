@@ -1,5 +1,36 @@
 # Testing Notes
 
+## Compiler and JIT leak checks
+
+Build the frontend and loader with ASan/UBSan, keeping JIT support enabled
+for the loader tests:
+
+```bash
+cmake -S . -B build-san-jit -G Ninja \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Debug -DRUT_SANITIZE=ON -DRUT_ENABLE_JIT=ON
+cmake --build build-san-jit --target test_frontend test_serve_loader
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+  build-san-jit/tests/test_frontend
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+  build-san-jit/tests/test_serve_loader \
+  serve_loader.exact_strict_local_response_source_reaches_runtime_config \
+  serve_loader.pre_route_source_installs_full_owned_deduplicated_selector_table
+```
+
+The loader selection covers successful LLVM module verification and owned
+local/pre-route policy loading. `LLVMVerifyModule` can allocate an empty
+diagnostic even on success; the JIT must release it with `LLVMDisposeMessage`
+on both success and failure. No LLVM leak suppression is needed for this path.
+JIT-generated instructions are not sanitizer-instrumented; the compiler and
+loader are. A run with `detect_leaks=0`, including the runtime sanitizer CI job,
+provides ASan/UBSan evidence only and does not establish leak cleanliness.
+
+Frontend fixtures own manually constructed HIR/MIR modules through scope guards.
+Synthesized protocol and impl function names use the HIR's shared,
+mmap-backed generated-name arena. HIR copies retain that owner; dropping its
+last reference releases the names together.
+
 ## Connection State Invariants
 
 `Connection::state` is debug and metrics state. Runtime dispatch is driven by
