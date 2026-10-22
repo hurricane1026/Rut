@@ -88911,6 +88911,38 @@ static u64 local_deadline_socket_handler(void*, jit::HandlerCtx*, const u8*, u32
     return jit::HandlerResult::make_status(204).pack();
 }
 
+TEST(local_grpc_deadline, h2_stream_timeout_metadata_isolated_and_clears_on_lifecycle) {
+    Http2Conn h2;
+    h2.init_client();
+    auto* stream = h2.open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->local_deadline_present = true;
+    stream->local_deadline_us = 1'000'100u;
+    CHECK(stream->local_deadline_present);
+
+    auto* stream2 = h2.open_stream(3);
+    REQUIRE(stream2 != nullptr);
+    stream2->local_deadline_present = true;
+    stream2->local_deadline_us = 2'000'100u;
+    CHECK(stream2->local_deadline_present);
+    CHECK(stream->local_deadline_present);
+    h2_close_stream(&h2, 1);
+    CHECK_FALSE(stream->local_deadline_present);
+    CHECK_FALSE(stream->local_deadline_expired);
+    CHECK(stream2->local_deadline_present);
+    stream2->local_deadline_expired = true;
+    h2_on_reset_cb(nullptr, h2, 3, Http2Error::Cancel);
+    CHECK_FALSE(stream2->local_deadline_present);
+    CHECK_FALSE(stream2->local_deadline_expired);
+
+    stream->state = Http2StreamState::Closed;
+    stream->recv_unconsumed = 0;
+    auto* reused = h2.open_stream(5);
+    REQUIRE(reused != nullptr);
+    CHECK_FALSE(reused->local_deadline_present);
+    CHECK_FALSE(reused->local_deadline_expired);
+}
+
 TEST(local_grpc_deadline, iouring_slow_body_real_socket_status_four) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init(2)) SKIP("io_uring unavailable");

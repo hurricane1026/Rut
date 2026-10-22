@@ -42,6 +42,17 @@ struct Http2Stream {
     u32 recv_credit;
     u32 recv_unconsumed;
     u64 headers_received_us;
+    // Local unary deadline metadata. Scheduler/publication integration is
+    // added separately for streams owned by a local JIT route.
+    u64 local_deadline_us;
+    bool local_deadline_present;
+    bool local_deadline_expired;
+
+    void clear_local_deadline() {
+        local_deadline_us = 0;
+        local_deadline_present = false;
+        local_deadline_expired = false;
+    }
 };
 
 struct Http2Conn;

@@ -178,6 +178,7 @@ void grpc_refresh_timer(Loop*, Connection&);
 // long-lived keep-alive connection even though none are active.
 inline void h2_close_stream(Http2Conn* h2, u32 stream_id) {
     if (Http2Stream* s = h2->find_stream(stream_id)) {
+        s->clear_local_deadline();
         // We've serialized our END_STREAM response. If the peer already finished
         // its side (HalfClosedRemote), the stream is fully closed and its slot is
         // reusable. If the peer is still sending (Open) — e.g. a request without
@@ -2244,6 +2245,7 @@ void h2_on_data_cb(
 // is released by the post-process path once async_stream is clear.
 inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
     (void)ctx;
+    if (Http2Stream* stream = c.find_stream(stream_id)) stream->clear_local_deadline();
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
     if (c.pending_stream == stream_id) h2_clear_pending(c);
     if (c.outbound_stream == stream_id) {

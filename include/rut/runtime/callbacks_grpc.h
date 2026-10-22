@@ -2608,8 +2608,17 @@ void grpc_request_trailers(void* ctx, Http2Conn& h, u32 sid, const hpack::Header
 template <typename Loop>
 void grpc_refresh_timer(Loop* loop, Connection& conn) {
     auto& g = conn.h2->grpc;
-    if (g.upstream) return;
     u64 earliest = 0;
+    bool has_local_deadline = false;
+    for (u32 i = 0; i < conn.h2->nstreams; i++) {
+        const auto& stream = conn.h2->streams[i];
+        if (stream.state == Http2StreamState::Closed || !stream.local_deadline_present ||
+            stream.local_deadline_expired)
+            continue;
+        has_local_deadline = true;
+        if (!earliest || stream.local_deadline_us < earliest) earliest = stream.local_deadline_us;
+    }
+    if (g.upstream && !has_local_deadline) return;
     for (auto* x : g.streams)
         if (x && !x->failure) {
             if (x->deadline_us && (!earliest || x->deadline_us < earliest))
@@ -2704,6 +2713,12 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
     conn.yield_armed = false;
     conn.h2->grpc.timer_deadline_us = 0;
     const u64 now = monotonic_us();
+    for (u32 i = 0; i < conn.h2->nstreams; i++) {
+        auto& stream = conn.h2->streams[i];
+        if (stream.state != Http2StreamState::Closed && stream.local_deadline_present &&
+            !stream.local_deadline_expired && now >= stream.local_deadline_us)
+            stream.local_deadline_expired = true;
+    }
     Http2Conn* downstream_h2 = conn.h2;
     const u32 downstream_handler_gen = conn.handler_gen;
     struct UpstreamSnapshot {
