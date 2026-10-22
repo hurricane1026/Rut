@@ -39552,6 +39552,8 @@ TEST(state_invariant, jit_event_helpers_map_runtime_events) {
                 break;
             case IoEventType::Accept:
             case IoEventType::ResponseReadTimer:
+            case IoEventType::LocalGrpcDeadlineTimer:
+            case IoEventType::LocalGrpcDeadlineCancel:
             case IoEventType::RelayRead:
             case IoEventType::RelayWrite:
             case IoEventType::Count:
@@ -88605,6 +88607,18 @@ TEST(http2, buffered_upload_promotion_failure_closes_once) {
     loop->shutdown();
 }
 
+TEST(local_grpc_deadline_backend, cancel_ealready_transport_validation_is_portable) {
+    IoEvent cancel{0, -EALREADY, 0, 0, IoEventType::LocalGrpcDeadlineCancel, 0};
+    cancel.non_upstream_generation = 7;
+    CHECK(valid_local_grpc_deadline_transport_event(cancel));
+    cancel.aux = 1;
+    CHECK_FALSE(valid_local_grpc_deadline_transport_event(cancel));
+    cancel.aux = 0;
+    cancel.type = IoEventType::LocalGrpcDeadlineTimer;
+    CHECK_FALSE(valid_local_grpc_deadline_transport_event(cancel));
+}
+
+#ifdef __linux__
 TEST(local_grpc_deadline_backend, absolute_sqe_and_cancel_tokens_preserve_owner) {
     ScopedTlsRawSendLoop guard;
     REQUIRE(guard.init());
@@ -88659,12 +88673,6 @@ TEST(local_grpc_deadline_backend, absolute_sqe_and_cancel_tokens_preserve_owner)
 TEST(local_grpc_deadline_backend, cancel_ealready_retires_dispatch_owners_in_both_orders) {
     IoEvent cancel{0, -EALREADY, 0, 0, IoEventType::LocalGrpcDeadlineCancel, 0};
     cancel.non_upstream_generation = 7;
-    CHECK(valid_local_grpc_deadline_transport_event(cancel));
-    cancel.aux = 1;
-    CHECK_FALSE(valid_local_grpc_deadline_transport_event(cancel));
-    cancel.aux = 0;
-    cancel.type = IoEventType::LocalGrpcDeadlineTimer;
-    CHECK_FALSE(valid_local_grpc_deadline_transport_event(cancel));
     for (u32 order = 0; order < 2; order++) {
         ScopedTlsRawSendLoop guard;
         REQUIRE(guard.init());
@@ -88745,3 +88753,4 @@ TEST(local_grpc_deadline_backend, epoll_retains_exact_long_deadline_across_horiz
     loop.pool.destroy();
     loop.destroy_slot_storage();
 }
+#endif  // __linux__
