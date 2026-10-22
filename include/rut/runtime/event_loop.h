@@ -1316,9 +1316,8 @@ public:
                 break;
             case IoEventType::LocalGrpcDeadlineTimer:
             case IoEventType::LocalGrpcDeadlineCancel:
-                // Concrete proactors own local deadline timer retirement.
-                break;
             case IoEventType::Count:
+                // Concrete proactors own local deadline timer retirement.
                 break;
         }
     }
