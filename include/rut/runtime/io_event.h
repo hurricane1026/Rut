@@ -228,6 +228,10 @@ inline constexpr bool valid_local_grpc_deadline_transport_event(const IoEvent& e
     canonical.type = IoEventType::ResponseReadTimer;
     if (event.type == IoEventType::LocalGrpcDeadlineCancel)
         canonical.non_upstream_generation |= kResponseReadTimerCancelBit;
+    // A cancel racing the timeout may complete with -EALREADY. It still
+    // retires the cancel SQE; the target remains owned until its own CQE.
+    if (event.type == IoEventType::LocalGrpcDeadlineCancel && event.result == -EALREADY)
+        canonical.result = -ENOENT;
     return valid_response_read_timer_transport_event(canonical);
 }
 

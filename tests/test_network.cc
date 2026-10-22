@@ -88655,3 +88655,93 @@ TEST(local_grpc_deadline_backend, absolute_sqe_and_cancel_tokens_preserve_owner)
     CHECK(conn.local_grpc_deadline_timer.reclaim_cancel(event.non_upstream_generation));
     CHECK(conn.local_grpc_deadline_timer.reusable());
 }
+
+TEST(local_grpc_deadline_backend, cancel_ealready_retires_dispatch_owners_in_both_orders) {
+    IoEvent cancel{0, -EALREADY, 0, 0, IoEventType::LocalGrpcDeadlineCancel, 0};
+    cancel.non_upstream_generation = 7;
+    CHECK(valid_local_grpc_deadline_transport_event(cancel));
+    cancel.aux = 1;
+    CHECK_FALSE(valid_local_grpc_deadline_transport_event(cancel));
+    cancel.aux = 0;
+    cancel.type = IoEventType::LocalGrpcDeadlineTimer;
+    CHECK_FALSE(valid_local_grpc_deadline_transport_event(cancel));
+    for (u32 order = 0; order < 2; order++) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init());
+        REQUIRE(guard.loop->pool.init(SlicePool::capacity_for_connections(1), 0).has_value());
+        auto* conn = guard.loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn->fd, 0);
+        REQUIRE(guard.loop->arm_local_grpc_deadline(*conn, 1234567));
+        const u32 generation = conn->local_grpc_deadline_timer.owner_generation;
+        CHECK_EQ(conn->pending_ops, 1u);
+        guard.loop->disarm_local_grpc_deadline(*conn);
+        REQUIRE(conn->local_grpc_deadline_timer.cancel_owned);
+        CHECK_EQ(conn->pending_ops, 2u);
+        guard.loop->close_conn(*conn);
+        CHECK_EQ(guard.loop->free_top, 0u);
+        CHECK_EQ(guard.loop->pending_free_count, 1u);
+        cancel.type = IoEventType::LocalGrpcDeadlineCancel;
+        cancel.non_upstream_generation = generation;
+        IoEvent target = cancel;
+        target.type = IoEventType::LocalGrpcDeadlineTimer;
+        target.result = -ECANCELED;
+        guard.loop->dispatch(order == 0 ? cancel : target);
+        CHECK_EQ(conn->pending_ops, 1u);
+        CHECK_FALSE(conn->local_grpc_deadline_timer.reusable());
+        CHECK_EQ(guard.loop->free_top, 0u);
+        guard.loop->dispatch(order == 0 ? target : cancel);
+        CHECK_EQ(conn->pending_ops, 0u);
+        CHECK(conn->local_grpc_deadline_timer.reusable());
+        CHECK_EQ(guard.loop->pending_free_count, 0u);
+        CHECK_EQ(guard.loop->free_top, 1u);
+        guard.loop->dispatch(cancel);  // duplicate cannot retire a successor
+        CHECK_EQ(guard.loop->free_top, 1u);
+        guard.loop->pool.destroy();
+    }
+}
+
+TEST(local_grpc_deadline_backend, epoll_retains_exact_long_deadline_across_horizon_wakes) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init_slot_storage(1).has_value());
+    REQUIRE(loop.pool.init(SlicePool::capacity_for_connections(1), 0).has_value());
+    loop.timer.init();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->resp_status = 0;
+    conn->on_local_grpc_deadline = +[](void*, Connection& c, IoEvent) { c.resp_status++; };
+    u64 duration = 0;
+    REQUIRE(grpc_timeout({"99999999H", 9}, &duration));
+    const u64 deadline = monotonic_us() + duration;
+    REQUIRE(loop.arm_local_grpc_deadline(*conn, deadline));
+    CHECK_EQ(loop.local_grpc_deadline_heap.top().deadline_ns, deadline);
+    const u64 first_wake = loop.yield_timer_armed_ns;
+    CHECK_GT(first_wake, epoll_yield::monotonic_ns());
+    loop.drain_yield_heap();
+    CHECK_EQ(conn->resp_status, 0u);
+    CHECK(conn->local_grpc_deadline_timer.target_owned);
+    CHECK_EQ(loop.local_grpc_deadline_heap.top().deadline_ns, deadline);
+    // The timerfd horizon advances while the exact RPC deadline stays put.
+    usleep(1000);
+    loop.rearm_yield_timerfd();
+    CHECK_GT(loop.yield_timer_armed_ns, first_wake);
+    CHECK_EQ(loop.local_grpc_deadline_heap.top().deadline_ns, deadline);
+    loop.disarm_local_grpc_deadline(*conn);
+    CHECK(loop.local_grpc_deadline_heap.empty());
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    // An ordinary already-due deadline still fires exactly once.
+    conn->on_local_grpc_deadline = +[](void*, Connection& c, IoEvent) { c.resp_status++; };
+    REQUIRE(loop.arm_local_grpc_deadline(*conn, monotonic_us() - 1));
+    loop.drain_yield_heap();
+    CHECK_EQ(conn->resp_status, 1u);
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    loop.drain_yield_heap();
+    CHECK_EQ(conn->resp_status, 1u);
+    close(conn->fd);
+    conn->fd = -1;
+    loop.pool.destroy();
+    loop.destroy_slot_storage();
+}

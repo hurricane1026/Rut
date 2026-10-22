@@ -181,6 +181,7 @@ struct EpollEventLoop : EventLoopCRTP<EpollEventLoop> {
     EpollBackend backend;
     TimerWheel timer;
     epoll_yield::YieldHeap yield_heap;
+    // Exact absolute microseconds; yield_heap separately uses nanoseconds.
     epoll_yield::YieldHeap local_grpc_deadline_heap;
     // Absolute deadline currently programmed into backend.yield_timer_fd.
     // 0 means disarmed. Used to avoid redundant timerfd_settime syscalls
@@ -1056,10 +1057,11 @@ public:
     // yield_heap is full AND the wait exceeds what the 1-second wheel
     // fallback can represent (~63s). Caller fails the request.
     [[nodiscard]] bool arm_local_grpc_deadline(Connection& conn, u64 absolute_us) {
-        if (absolute_us > ~u64{0} / 1000 || !conn.local_grpc_deadline_timer.arm(absolute_us))
-            return false;
+        if (!conn.local_grpc_deadline_timer.arm(absolute_us)) return false;
         const u32 generation = conn.local_grpc_deadline_timer.owner_generation;
-        if (!local_grpc_deadline_heap.push(absolute_us * 1000, generation, conn.id)) {
+        // This independent heap stores exact microseconds in the generic
+        // heap's deadline key. Only timerfd programming converts to nanoseconds.
+        if (!local_grpc_deadline_heap.push(absolute_us, generation, conn.id)) {
             conn.local_grpc_deadline_timer.reclaim_target(generation);
             return false;
         }
@@ -1118,10 +1120,17 @@ public:
             }
             return;
         }
-        u64 top = yield_heap.empty() ? local_grpc_deadline_heap.top().deadline_ns
-                                     : yield_heap.top().deadline_ns;
-        if (!local_grpc_deadline_heap.empty() && local_grpc_deadline_heap.top().deadline_ns < top)
-            top = local_grpc_deadline_heap.top().deadline_ns;
+        u64 top = yield_heap.empty() ? ~u64{0} : yield_heap.top().deadline_ns;
+        if (!local_grpc_deadline_heap.empty()) {
+            const u64 now_ns = epoll_yield::monotonic_ns();
+            constexpr u64 kWakeHorizonNs = 3'600'000'000'000ull;
+            constexpr u64 kMaxTimerNs = ~u64{0};
+            const u64 horizon =
+                now_ns > kMaxTimerNs - kWakeHorizonNs ? kMaxTimerNs : now_ns + kWakeHorizonNs;
+            const u64 deadline_us = local_grpc_deadline_heap.top().deadline_ns;
+            const u64 wake_ns = deadline_us > horizon / 1000 ? horizon : deadline_us * 1000;
+            if (wake_ns < top) top = wake_ns;
+        }
         if (top == yield_timer_armed_ns) return;
         backend.arm_yield_timerfd(top);
         yield_timer_armed_ns = top;
@@ -1159,7 +1168,7 @@ public:
         // Process RPC expiry before same-tick handler wakes. A handler must
         // never execute another state after its absolute deadline.
         while (!local_grpc_deadline_heap.empty() &&
-               local_grpc_deadline_heap.top().deadline_ns <= now) {
+               local_grpc_deadline_heap.top().deadline_ns <= now / 1000) {
             const auto entry = local_grpc_deadline_heap.top();
             local_grpc_deadline_heap.pop();
             if (entry.conn_id >= connection_capacity) continue;
