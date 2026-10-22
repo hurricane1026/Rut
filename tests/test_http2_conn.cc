@@ -2095,6 +2095,173 @@ TEST(h2_serving, timer_resume_parks_grpc_local_result_and_preserves_mutation_ali
     }
 }
 
+TEST(h2_serving, expired_local_grpc_publishes_native_and_web_status_four) {
+    const H2GrpcProtocolMode modes[] = {
+        H2GrpcProtocolMode::Native, H2GrpcProtocolMode::WebBinary, H2GrpcProtocolMode::WebText};
+    for (H2GrpcProtocolMode mode : modes) {
+        FakeH2Loop loop;
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        u8 send_storage[8192]{};
+        conn.send_buf.bind(send_storage, sizeof(send_storage));
+        h2.nstreams = 1;
+        h2.streams[0] = {};
+        h2.streams[0].id = 1;
+        h2.streams[0].state = Http2StreamState::HalfClosedRemote;
+        h2.streams[0].local_deadline_present = true;
+        h2.streams[0].local_deadline_expired = true;
+        h2.streams[0].grpc_protocol_mode = mode;
+
+        CHECK(h2_publish_expired_local(&loop, conn));
+        CHECK(loop.send_submitted);
+        CHECK_EQ(h2.streams[0].state, Http2StreamState::Closed);
+        Http2FrameHeader headers_frame;
+        REQUIRE(parse_frame_header(send_storage, conn.send_buf.len(), &headers_frame) ==
+                ParseStatus::Complete);
+        CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
+        CHECK((headers_frame.flags & http2_flag::kEndStream) ==
+              (mode == H2GrpcProtocolMode::Native ? http2_flag::kEndStream : 0));
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header decoded[8];
+        u8 scratch[512];
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           send_storage + kFrameHeaderSize,
+                                           headers_frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           8,
+                                           &count));
+        bool status200 = false;
+        bool grpc4 = false;
+        bool content_type = false;
+        for (u32 i = 0; i < count; ++i) {
+            status200 |= decoded[i].name.eq({":status", 7}) && decoded[i].value.eq({"200", 3});
+            grpc4 |= decoded[i].name.eq({"grpc-status", 11}) && decoded[i].value.eq({"4", 1});
+            if (decoded[i].name.eq({"content-type", 12})) {
+                content_type = mode == H2GrpcProtocolMode::WebText
+                                   ? decoded[i].value.eq({"application/grpc-web-text", 25})
+                                   : (mode == H2GrpcProtocolMode::WebBinary
+                                          ? decoded[i].value.eq({"application/grpc-web", 20})
+                                          : decoded[i].value.eq({"application/grpc", 16}));
+            }
+        }
+        CHECK(status200);
+        CHECK(content_type);
+        if (mode == H2GrpcProtocolMode::Native) {
+            CHECK(grpc4);
+        } else {
+            const u32 body_offset = kFrameHeaderSize + headers_frame.length;
+            Http2FrameHeader body_frame;
+            REQUIRE(parse_frame_header(send_storage + body_offset,
+                                       conn.send_buf.len() - body_offset,
+                                       &body_frame) == ParseStatus::Complete);
+            CHECK_EQ(body_frame.type, static_cast<u8>(Http2FrameType::Data));
+            CHECK((body_frame.flags & http2_flag::kEndStream) != 0);
+            u8 envelope[64]{};
+            u32 envelope_len = 0;
+            const u8* body = send_storage + body_offset + kFrameHeaderSize;
+            if (mode == H2GrpcProtocolMode::WebText) {
+                GrpcWebBase64Decoder decoder{};
+                decoder.init();
+                u32 consumed = 0;
+                REQUIRE(decoder.feed(body,
+                                     body_frame.length,
+                                     consumed,
+                                     envelope,
+                                     sizeof(envelope),
+                                     envelope_len) == GrpcWebCodecStatus::Ok);
+                CHECK_EQ(consumed, body_frame.length);
+                CHECK(decoder.finish() == GrpcWebCodecStatus::Ok);
+            } else {
+                envelope_len = body_frame.length;
+                __builtin_memcpy(envelope, body, envelope_len);
+            }
+            REQUIRE(envelope_len >= 5);
+            CHECK_EQ(envelope[0], 0x80u);  // trailer envelope
+            const u32 trailer_len = (static_cast<u32>(envelope[1]) << 24) |
+                                    (static_cast<u32>(envelope[2]) << 16) |
+                                    (static_cast<u32>(envelope[3]) << 8) | envelope[4];
+            CHECK_EQ(trailer_len, 16u);
+            REQUIRE_EQ(envelope_len, 5u + trailer_len);
+            CHECK_EQ(memcmp(envelope + 5, "grpc-status: 4\r\n", 16), 0);
+        }
+    }
+}
+
+TEST(h2_serving, expired_local_deadline_releases_parked_json_outcome_once) {
+    FakeH2Loop loop;
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    u8 send_storage[8192]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    REQUIRE(conn.json_arena.init(&loop.pool));
+    REQUIRE(conn.json_arena.alloc(16) != nullptr);
+    conn.jit_response_body_valid = true;
+    conn.jit_response_body = {"{\"ok\":true}", 11};
+    h2.nstreams = 1;
+    h2.streams[0] = {};
+    h2.streams[0].id = 1;
+    h2.streams[0].state = Http2StreamState::Open;
+    h2.streams[0].local_deadline_present = true;
+    h2.streams[0].local_deadline_expired = true;
+    h2.streams[0].grpc_protocol_mode = H2GrpcProtocolMode::Native;
+    h2.pending_stream = 1;
+    h2.pending_local_outcome = true;
+    h2_async_epoch_enter(&loop, conn);
+
+    CHECK(h2_publish_expired_local(&loop, conn));
+
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_FALSE(h2.pending_local_outcome);
+    CHECK_FALSE(conn.epoch_held);
+    CHECK_EQ(loop.epoch_leaves, 1u);
+    CHECK(conn.json_arena.current == nullptr);
+    CHECK_FALSE(conn.jit_response_body_valid);
+    CHECK(loop.send_submitted);
+}
+
+TEST(h2_serving, expired_timer_yield_is_settled_once_as_status_four) {
+    FakeH2Loop loop;
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    u8 send_storage[8192]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    h2.nstreams = 1;
+    h2.streams[0] = {};
+    h2.streams[0].id = 1;
+    h2.streams[0].state = Http2StreamState::HalfClosedRemote;
+    h2.streams[0].local_deadline_present = true;
+    h2.streams[0].local_deadline_us = monotonic_us() - 1;
+    h2.streams[0].grpc_protocol_mode = H2GrpcProtocolMode::Native;
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_cfg = nullptr;
+    conn.pending_handler_fn = &h2_grpc_local_status;
+    conn.epoch_held = true;
+    loop.epoch_enters = 1;
+    g_h2_grpc_jit_calls = 0;
+
+    h2_resume_jit_handler(&loop, conn);
+
+    CHECK_EQ(g_h2_grpc_jit_calls, 0u);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK_FALSE(conn.epoch_held);
+    CHECK_EQ(loop.epoch_leaves, 1u);
+    CHECK(loop.send_submitted);
+}
+
 TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
     auto run = [&](u32 expected, u32 actual, bool mutate_concurrently) {
         struct Result {

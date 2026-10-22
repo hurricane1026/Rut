@@ -80,7 +80,7 @@ inline bool grpc_request_deadline(
         u64 timeout = 0;
         if (timeout_present || !grpc_timeout(hs[i].value, &timeout)) return false;
         timeout_present = true;
-        deadline_us = base_us + timeout;
+        deadline_us = UINT64_MAX - base_us < timeout ? UINT64_MAX : base_us + timeout;
     }
     return true;
 }
@@ -2726,6 +2726,7 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
             stream.local_deadline_expired = true;
             if (conn.h2->async_stream == stream.id && conn.h2->async_kind == H2AsyncKind::Timer) {
                 conn.pending_handler_fn = nullptr;
+                h2_release_completed_jit_json(conn);
                 h2_clear_async(*conn.h2);
                 h2_async_epoch_leave(loop, conn);
             }
@@ -2796,8 +2797,11 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
     }
     if (conn.h2 != downstream_h2 || conn.handler_gen != downstream_handler_gen) return;
     grpc_refresh_timer(loop, conn);
-    if (conn.h2 == downstream_h2 && conn.handler_gen == downstream_handler_gen)
+    if (conn.h2 == downstream_h2 && conn.handler_gen == downstream_handler_gen) {
         grpc_kick_downstream(loop, conn);
+        if (conn.h2 == downstream_h2 && conn.handler_gen == downstream_handler_gen)
+            h2_publish_expired_local(loop, conn);
+    }
 }
 
 // Conservative active-session probes: no idle pool traffic, no probes during
