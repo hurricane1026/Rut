@@ -2324,7 +2324,8 @@ template <typename Loop>
     conn.handler_state = h2->async_state;
     conn.pending_yield_kind = jit::YieldKind::Timer;
     conn.transition_to_exec_handler_wait();
-    return loop->schedule_yield_timer(conn, h2->async_timer_ms);
+    grpc_refresh_timer(loop, conn);
+    return conn.yield_armed;
 }
 
 // Defined in callbacks_impl.h (needs the upstream helpers): open the upstream

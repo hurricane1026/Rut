@@ -2774,6 +2774,17 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
             continue;
         grpc_drive_upstream(loop, *snapshot.conn);
     }
+    if (conn.h2 == downstream_h2 && conn.handler_gen == downstream_handler_gen &&
+        conn.h2->async_stream != 0 && conn.h2->async_kind == H2AsyncKind::Timer &&
+        conn.h2->async_resume_at_us != 0 && now >= conn.h2->async_resume_at_us) {
+        bool local_expired = false;
+        if (auto* stream = conn.h2->find_stream(conn.h2->async_stream))
+            local_expired = stream->local_deadline_expired;
+        if (!local_expired) {
+            conn.h2->async_resume_at_us = 0;
+            h2_resume_jit_handler(loop, conn);
+        }
+    }
     if (conn.h2 != downstream_h2 || conn.handler_gen != downstream_handler_gen) return;
     grpc_refresh_timer(loop, conn);
     if (conn.h2 == downstream_h2 && conn.handler_gen == downstream_handler_gen)

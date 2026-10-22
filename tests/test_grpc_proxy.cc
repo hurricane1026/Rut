@@ -1646,6 +1646,9 @@ TEST(grpc_proxy, local_h2_deadline_is_nearest_and_rearms_after_expiry) {
     first->local_deadline_us = now + 1000;
     second->local_deadline_present = true;
     second->local_deadline_us = now + 200000;
+    h2.async_stream = second->id;
+    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_resume_at_us = now + 100000;
 
     GrpcExchange proxy;
     proxy.init();
@@ -1662,10 +1665,13 @@ TEST(grpc_proxy, local_h2_deadline_is_nearest_and_rearms_after_expiry) {
     CHECK(first->local_deadline_expired);
     CHECK_FALSE(second->local_deadline_expired);
     CHECK_FALSE(proxy.failure);
-    CHECK_EQ(h2.grpc.timer_deadline_us, second->local_deadline_us);
+    CHECK_EQ(h2.grpc.timer_deadline_us, h2.async_resume_at_us);
     CHECK_GE(loop.arms, 2u);
     CHECK_GT(loop.last_delay_ns, 0u);
     second->local_deadline_present = false;
+    h2.async_stream = 0;
+    h2.async_kind = H2AsyncKind::None;
+    h2.async_resume_at_us = 0;
     grpc_refresh_timer(&loop, conn);
     CHECK_EQ(h2.grpc.timer_deadline_us, proxy.deadline_us);
     h2.grpc.streams[0] = nullptr;
