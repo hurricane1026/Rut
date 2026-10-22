@@ -3,6 +3,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/protobuf_value.h"
 #include "rut/runtime/route_method.h"
 #include <memory>
 
@@ -3743,8 +3744,10 @@ struct Parser {
                     if (!rbrk) return core::make_unexpected(rbrk.error());
                 } else if (field_name.eq({"health_check", 12})) {
                     // `health_check: { path: "...", interval: <dur>, status: N }`
-                    // — active-health config (data only this slice). path and
-                    // interval are required; status defaults to 200. Mirrors the
+                    // or `health_check: { interval: <dur>, service: "..." }`
+                    // — HTTP status or gRPC Health configuration. Protocol-specific
+                    // required/forbidden fields are checked after the whole upstream
+                    // is parsed, since `protocol` may follow this block. Mirrors the
                     // dict-field error style above (dup/unknown/missing).
                     if (item.upstream.hc_enabled)
                         return frontend_error(
@@ -3791,6 +3794,7 @@ struct Parser {
                                                           path_text);
                             }
                             item.upstream.hc_path_lit = path_text;
+                            item.upstream.hc_path_set = true;
                             seen_path = true;
                         } else if (hc_key.eq({"interval", 8})) {
                             if (seen_interval)
@@ -3839,7 +3843,22 @@ struct Parser {
                                                       span_from(*lit.value()),
                                                       lit.value()->text);
                             item.upstream.hc_expected_status = static_cast<u16>(sv);
+                            item.upstream.hc_status_set = true;
                             seen_status = true;
+                        } else if (hc_key.eq({"service", 7})) {
+                            if (item.upstream.hc_service_set)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto lit = expect(TokenType::StringLit);
+                            if (!lit) return core::make_unexpected(lit.error());
+                            const Str service = lit.value()->text;
+                            if (service.len > 128 || !protobuf::utf8(service))
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*lit.value()),
+                                                      service);
+                            item.upstream.hc_service_lit = service;
+                            item.upstream.hc_service_set = true;
                         } else {
                             return frontend_error(FrontendError::UnexpectedToken,
                                                   span_from(*hc_field.value()),
@@ -3850,10 +3869,8 @@ struct Parser {
                     }
                     auto hc_rbrace = expect(TokenType::RBrace);
                     if (!hc_rbrace) return core::make_unexpected(hc_rbrace.error());
-                    if (!seen_path || !seen_interval) {
-                        // path before interval in the dict order; name the first
-                        // missing required field so the user knows what to add.
-                        const Str detail = !seen_path ? Str{"path", 4} : Str{"interval", 8};
+                    if (!seen_interval) {
+                        const Str detail{"interval", 8};
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, span_from(*field.value()), detail);
                     }

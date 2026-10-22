@@ -512,6 +512,7 @@ struct MirUpstream {
     bool http2 = false;
     bool hc_enabled = false;
     Str hc_path{};
+    Str hc_service{};
     u32 hc_interval_ms = 0;
     u16 hc_expected_status = 200;
 };

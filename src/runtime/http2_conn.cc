@@ -39,6 +39,18 @@ void Http2Conn::init() {
     conn_recv_credit = 0;
     hpack_dec.init(kDefaultHeaderTableSize);
     hpack_enc.init(kDefaultHeaderTableSize);
+    health_probe_http_status = 0;
+    health_probe_grpc_status = 255;
+    health_probe_initial_headers = false;
+    health_probe_content_type_valid = false;
+    health_probe_grpc_status_seen = false;
+    health_probe_message_complete = false;
+    health_probe_terminal = false;
+    health_probe_malformed = false;
+    for (u32 i = 0; i < sizeof(health_probe_prefix); ++i) health_probe_prefix[i] = 0;
+    health_probe_prefix_len = 0;
+    health_probe_message_expected = 0;
+    health_probe_message_len = 0;
     our_settings.set_defaults();
     // Advertise our limits: bounded concurrent streams; keep the default window.
     our_settings.max_concurrent_streams = kMaxStreams;

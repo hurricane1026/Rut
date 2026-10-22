@@ -377,7 +377,7 @@ public:
     u32 connection_capacity = 0;
     // Active health-check probing requires synchronous probe teardown; the
     // io_uring loop doesn't support that yet, so sweep_health_probes only re-arms
-    // deadlines here and issues no connects (epoll-only this slice).
+    // deadlines here and issues no connects (readiness backends handle probes).
     static constexpr bool kSupportsHealthProbe = false;
     static constexpr bool kSupportsExplicitFirstResponseDeadline = true;
     static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;

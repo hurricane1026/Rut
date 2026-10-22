@@ -382,7 +382,11 @@ struct AstUpstreamDecl {
     u32 max_response_message_bytes = 0;
     bool http2 = false;
     bool hc_enabled = false;
-    Str hc_path_lit{};             // raw `path:` string literal
+    Str hc_path_lit{};  // raw `path:` string literal
+    bool hc_path_set = false;
+    Str hc_service_lit{};  // gRPC Health service name; empty selects all services
+    bool hc_service_set = false;
+    bool hc_status_set = false;
     u32 hc_interval_ms = 0;        // `interval:` DurLit converted to ms
     u16 hc_expected_status = 200;  // `status:` IntLit (optional, default 200)
 };
