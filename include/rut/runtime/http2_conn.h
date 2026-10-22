@@ -224,6 +224,8 @@ struct Http2Conn {
     bool async_request_has_content_length;
     u32 async_request_content_length;
     u32 async_timer_ms;
+    // Absolute wake point for aggregate TimerYield arbitration.
+    u64 async_resume_at_us;
     jit::HandlerFn async_fn;
     u16 async_state;
     // Proxy suspension only: selected upstream and the running count of upstream

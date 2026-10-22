@@ -1081,6 +1081,20 @@ struct GrpcDriveFixture {
     bool upstream_acquire(u16, u32) { return true; }
     void upstream_release(u16) { released++; }
 };
+struct LocalDeadlineTimerFixture : GrpcDriveFixture {
+    u64 last_delay_ns = 0;
+    u32 arms = 0;
+    u32 disarms = 0;
+    bool arm_throttle_timer(Connection&, u64 delay_ns) {
+        last_delay_ns = delay_ns;
+        arms++;
+        return true;
+    }
+    void disarm_yield_timer(Connection& conn) {
+        disarms++;
+        conn.yield_armed = false;
+    }
+};
 struct SyncCloseGrpcDriveFixture : GrpcDriveFixture {
     bool submit_send(Connection&, const u8*, u32) { return false; }
     void close_conn(Connection& conn) {
@@ -1614,6 +1628,48 @@ TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
     CHECK_EQ(up_stream->state, Http2StreamState::Closed);
     CHECK_GT(loop.sends, 0u);
     CHECK(downstream.on_send == &pending_send);
+}
+
+TEST(grpc_proxy, local_h2_deadline_is_nearest_and_rearms_after_expiry) {
+    LocalDeadlineTimerFixture loop;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init_client();
+    conn.h2 = &h2;
+    auto* first = h2.open_stream(1);
+    auto* second = h2.open_stream(3);
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    const u64 now = monotonic_us();
+    first->local_deadline_present = true;
+    first->local_deadline_us = now + 1000;
+    second->local_deadline_present = true;
+    second->local_deadline_us = now + 200000;
+
+    GrpcExchange proxy;
+    proxy.init();
+    proxy.deadline_us = now + 300000;
+    h2.grpc.streams[0] = &proxy;
+    h2.grpc.active = 1;
+    grpc_refresh_timer(&loop, conn);
+    CHECK_EQ(loop.arms, 1u);
+    CHECK_EQ(h2.grpc.timer_deadline_us, first->local_deadline_us);
+    CHECK(h2.grpc.timer_deadline_us < second->local_deadline_us);
+
+    first->local_deadline_us = monotonic_us() - 1;
+    grpc_deadline_fired(&loop, conn);
+    CHECK(first->local_deadline_expired);
+    CHECK_FALSE(second->local_deadline_expired);
+    CHECK_FALSE(proxy.failure);
+    CHECK_EQ(h2.grpc.timer_deadline_us, second->local_deadline_us);
+    CHECK_GE(loop.arms, 2u);
+    CHECK_GT(loop.last_delay_ns, 0u);
+    second->local_deadline_present = false;
+    grpc_refresh_timer(&loop, conn);
+    CHECK_EQ(h2.grpc.timer_deadline_us, proxy.deadline_us);
+    h2.grpc.streams[0] = nullptr;
+    h2.grpc.active = 0;
 }
 
 TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {

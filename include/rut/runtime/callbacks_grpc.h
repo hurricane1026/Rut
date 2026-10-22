@@ -2618,6 +2618,9 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
         has_local_deadline = true;
         if (!earliest || stream.local_deadline_us < earliest) earliest = stream.local_deadline_us;
     }
+    if (conn.h2->async_stream != 0 && conn.h2->async_kind == H2AsyncKind::Timer &&
+        conn.h2->async_resume_at_us != 0 && (!earliest || conn.h2->async_resume_at_us < earliest))
+        earliest = conn.h2->async_resume_at_us;
     if (g.upstream && !has_local_deadline) return;
     for (auto* x : g.streams)
         if (x && !x->failure) {

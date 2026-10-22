@@ -1344,6 +1344,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_request_has_content_length = false;
     h2.async_request_content_length = 0;
     h2.async_timer_ms = 0;
+    h2.async_resume_at_us = 0;
     h2.async_fn = nullptr;
     h2.async_state = 0;
     h2.async_upstream_id = 0;
@@ -1414,6 +1415,7 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
         open_request != nullptr && open_request->has_content_length;
     h2->async_request_content_length = open_request != nullptr ? open_request->content_length : 0;
     h2->async_timer_ms = o.timer_ms;
+    h2->async_resume_at_us = monotonic_us() + static_cast<u64>(o.timer_ms) * 1000;
     h2->async_fn = fn;
     h2->async_state = static_cast<u16>(o.next_state);
     return true;
@@ -2729,6 +2731,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
         retain_json = true;
         h2->async_timer_ms = kOutcome.timer_ms;
+        h2->async_resume_at_us = monotonic_us() + static_cast<u64>(kOutcome.timer_ms) * 1000;
         h2->async_state = static_cast<u16>(kOutcome.next_state);
         if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
         return;
