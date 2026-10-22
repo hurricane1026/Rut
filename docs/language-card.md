@@ -1199,9 +1199,23 @@ collection, synchronous handler execution, or a timer yield returns HTTP 200
 with a trailers-only `grpc-status: 4`
 envelope in binary/text mode and closes the connection. An active local deadline
 rejects Forward and event-based yields before I/O; timer yields remain supported.
-HTTP/2 local deadline enforcement is not implemented; backends
-without a local timer retain legacy `grpc-timeout` handling. After expiry,
-timeout wins over late body-validation errors.
+Backends without a local HTTP/1 deadline timer retain legacy `grpc-timeout`
+handling.
+HTTP/2 body-reading local unary gRPC POST routes accept the same optional
+`grpc-timeout` for native gRPC and binary/text gRPC-Web. The deadline starts at
+HEADERS arrival and covers body collection, synchronous handler execution and
+timer yields. Invalid or duplicate values return HTTP 400 before handler entry.
+Expiry publishes HTTP 200 with native trailers-only `grpc-status: 4`, or a
+binary/text gRPC-Web trailers envelope and ends that stream's response; the
+connection and other streams remain usable. If the peer upload is still open,
+the stream stays half-closed locally until its DATA or END_STREAM arrives. A
+busy send finishes before the timeout response is staged. HTTP/1 terminal
+responses settle the precise timer before publication; HTTP/2 recomputes the
+aggregate timer at a safe send boundary after serialization. Active local
+deadlines reject Forward and event-based yields with HTTP 400; timer yields
+remain supported. If the deadline timer cannot be armed, the connection closes
+without publishing a success response. After expiry, timeout wins over late
+body-validation errors.
 
 Local responses may opt into grpc-web by using exactly one
 `application/grpc-web`/`application/grpc-web-text` content type, optionally
@@ -1238,7 +1252,6 @@ Bodies and the pending numeric status survive flow-control stalls, queued
 response promotion and cancellation. Trailers consume no DATA flow-control
 credit. This local path uses ordinary HTTP request/response accounting, not the
 upstream gRPC proxy exchange counters. It does not generate service route dispatch,
-enforce grpc-timeout for local HTTP/2 work, expose streaming RPC handlers, or perform
-HTTP/JSON transcoding. See
+expose streaming RPC handlers, or perform HTTP/JSON transcoding. See
 [the local endpoint](../examples/grpc-local.rut) and
 [client instructions](../examples/grpc/README.md#local-unary-rpc).

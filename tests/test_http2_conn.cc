@@ -582,19 +582,148 @@ TEST(http2_conn, continuation_assembles_header_block) {
     ch.type = static_cast<u8>(Http2FrameType::Continuation);
     ch.flags = http2_flag::kEndHeaders;
     ch.stream_id = 1;
-    write_frame_header(frame + fn, ch);
-    frame[fn + kFrameHeaderSize] = 0x84;
-    fn += kFrameHeaderSize + 1;
     u8 in[128];
     u32 inlen = with_preface(in, frame, fn);
     u8 out[256];
     u32 ow = 0;
     Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
     CHECK_FALSE(r.close);
+    auto* partial = c.find_stream(1);
+    REQUIRE(partial != nullptr);
+    CHECK_GT(partial->headers_received_us, 0u);
+    const u64 initial_headers_us = partial->headers_received_us;
+    CHECK_EQ(cap.headers_calls, 0u);
+    write_frame_header(frame, ch);
+    frame[kFrameHeaderSize] = 0x84;
+    ow = 0;
+    r = c.process(frame, kFrameHeaderSize + 1, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
     CHECK_EQ(cap.headers_calls, 1u);
+    CHECK_EQ(c.find_stream(1)->headers_received_us, initial_headers_us);
     CHECK_EQ(cap.nh, 2u);
     CHECK(name_is(cap, 0, ":method"));
     CHECK(name_is(cap, 1, ":path"));
+}
+
+TEST(http2_conn, async_gate_preserves_buffered_initial_headers_arrival_time) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.last_stream_id = 1;
+    c.async_stream = 1;
+    u8 frame[2 * (kFrameHeaderSize + 2)];
+    Http2FrameHeader headers{};
+    headers.length = 2;
+    headers.type = static_cast<u8>(Http2FrameType::Headers);
+    headers.flags = http2_flag::kEndHeaders | http2_flag::kEndStream;
+    headers.stream_id = 3;
+    write_frame_header(frame, headers);
+    frame[kFrameHeaderSize] = 0x82;      // :method GET
+    frame[kFrameHeaderSize + 1] = 0x84;  // :path /
+    headers.stream_id = 5;
+    write_frame_header(frame + kFrameHeaderSize + 2, headers);
+    frame[2 * kFrameHeaderSize + 2] = 0x82;
+    frame[2 * kFrameHeaderSize + 3] = 0x84;
+    u8 in[64];
+    const u32 inlen = with_preface(in, frame, sizeof(frame));
+    u8 out[256];
+    u32 out_written = 0;
+    const u64 before = monotonic_us();
+    Http2Result result = c.process(in, inlen, out, sizeof(out), &out_written);
+    const u64 after = monotonic_us();
+    CHECK_FALSE(result.close);
+    CHECK_EQ(result.consumed, kClientPrefaceLen);
+    CHECK_EQ(c.buffered_headers_timestamps[0].stream_id, 3u);
+    CHECK_EQ(c.buffered_headers_timestamps[1].stream_id, 5u);
+    CHECK_GE(c.buffered_headers_timestamps[0].received_us, before);
+    CHECK_LE(c.buffered_headers_timestamps[0].received_us, after);
+    const u64 arrival = c.buffered_headers_timestamps[0].received_us;
+    CHECK_EQ(c.buffered_headers_timestamps[1].received_us, arrival);
+    const u32 frame_offset = kClientPrefaceLen;
+
+    result = c.process(in + frame_offset, inlen - frame_offset, out, sizeof(out), &out_written);
+    CHECK_FALSE(result.close);
+    CHECK_EQ(result.consumed, 0u);
+    CHECK_EQ(c.buffered_headers_timestamps[0].received_us, arrival);
+    CHECK_EQ(c.buffered_headers_timestamps[1].received_us, arrival);
+
+    c.async_stream = 0;
+    result = c.process(in + frame_offset, inlen - frame_offset, out, sizeof(out), &out_written);
+    CHECK_FALSE(result.close);
+    CHECK_EQ(cap.headers_calls, 2u);
+    REQUIRE(c.find_stream(3) != nullptr);
+    CHECK_EQ(c.find_stream(3)->headers_received_us, arrival);
+    REQUIRE(c.find_stream(5) != nullptr);
+    CHECK_EQ(c.find_stream(5)->headers_received_us, arrival);
+    CHECK_EQ(c.buffered_headers_timestamps[0].stream_id, 0u);
+    CHECK_EQ(c.buffered_headers_timestamps[1].stream_id, 0u);
+}
+
+TEST(http2_conn, buffered_headers_timestamp_survives_partial_payload_retry) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.last_stream_id = 1;
+    c.async_stream = 1;
+    u8 header[kFrameHeaderSize];
+    Http2FrameHeader h{};
+    h.length = 2;
+    h.type = static_cast<u8>(Http2FrameType::Headers);
+    h.flags = http2_flag::kEndHeaders | http2_flag::kEndStream;
+    h.stream_id = 3;
+    write_frame_header(header, h);
+    u8 input[kClientPrefaceLen + kFrameHeaderSize + 2];
+    const u32 prefix = with_preface(input, header, sizeof(header));
+    const u32 frame_offset = kClientPrefaceLen;
+    u8 out[256];
+    u32 out_written = 0;
+    Http2Result result = c.process(input, prefix, out, sizeof(out), &out_written);
+    CHECK_FALSE(result.close);
+    CHECK_EQ(c.buffered_headers_timestamps[0].stream_id, 3u);
+    const u64 arrival = c.buffered_headers_timestamps[0].received_us;
+    input[prefix] = 0x82;
+    input[prefix + 1] = 0x84;
+    result =
+        c.process(input + frame_offset, prefix + 2 - frame_offset, out, sizeof(out), &out_written);
+    CHECK_FALSE(result.close);
+    CHECK_EQ(c.buffered_headers_timestamps[0].received_us, arrival);
+    c.async_stream = 0;
+    result =
+        c.process(input + frame_offset, prefix + 2 - frame_offset, out, sizeof(out), &out_written);
+    CHECK_FALSE(result.close);
+    REQUIRE(c.find_stream(3) != nullptr);
+    CHECK_EQ(c.find_stream(3)->headers_received_us, arrival);
+}
+
+TEST(http2_conn, buffered_headers_timestamp_ledger_overflow_fails_closed_before_parse) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.last_stream_id = 1;
+    c.async_stream = 1;
+    u8 frames[Http2Conn::kMaxStreams * (kFrameHeaderSize + 2) + kFrameHeaderSize + 2]{};
+    u32 frame_len = 0;
+    for (u32 i = 0; i <= Http2Conn::kMaxStreams; ++i) {
+        Http2FrameHeader h{};
+        h.length = 2;
+        h.type = static_cast<u8>(Http2FrameType::Headers);
+        h.flags = http2_flag::kEndHeaders | http2_flag::kEndStream;
+        h.stream_id = 3 + i * 2;
+        write_frame_header(frames + frame_len, h);
+        frames[frame_len + kFrameHeaderSize] = 0x82;
+        frames[frame_len + kFrameHeaderSize + 1] = 0x84;
+        frame_len += kFrameHeaderSize + 2;
+    }
+    u8 input[kClientPrefaceLen + sizeof(frames)];
+    const u32 inlen = with_preface(input, frames, frame_len);
+    u8 out[256];
+    u32 out_written = 0;
+    const Http2Result result = c.process(input, inlen, out, sizeof(out), &out_written);
+    CHECK(result.close);
+    CHECK_EQ(result.consumed, kClientPrefaceLen);
+    CHECK_EQ(cap.headers_calls, 0u);
+    CHECK_EQ(c.last_stream_id, 1u);
+    CHECK(has_frame(out, out_written, Http2FrameType::Goaway, 0, 0));
 }
 
 TEST(http2_conn, push_promise_from_client_is_protocol_error) {
@@ -2093,6 +2222,330 @@ TEST(h2_serving, timer_resume_parks_grpc_local_result_and_preserves_mutation_ali
         CHECK(status);
         CHECK_EQ(resumed_header, actual == 3);
     }
+}
+
+TEST(h2_serving, expired_local_grpc_publishes_native_and_web_status_four) {
+    const H2GrpcProtocolMode modes[] = {
+        H2GrpcProtocolMode::Native, H2GrpcProtocolMode::WebBinary, H2GrpcProtocolMode::WebText};
+    for (H2GrpcProtocolMode mode : modes) {
+        FakeH2Loop loop;
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        u8 send_storage[8192]{};
+        conn.send_buf.bind(send_storage, sizeof(send_storage));
+        h2.nstreams = 1;
+        h2.streams[0] = {};
+        h2.streams[0].id = 1;
+        h2.streams[0].state = Http2StreamState::HalfClosedRemote;
+        h2.streams[0].local_deadline_present = true;
+        h2.streams[0].local_deadline_expired = true;
+        h2.streams[0].grpc_protocol_mode = mode;
+        h2.conn_send_window = 64;
+        h2.streams[0].send_window = 64;
+
+        CHECK(h2_publish_expired_local(&loop, conn));
+        CHECK(loop.send_submitted);
+        Http2FrameHeader headers_frame;
+        REQUIRE(parse_frame_header(send_storage, conn.send_buf.len(), &headers_frame) ==
+                ParseStatus::Complete);
+        CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
+        CHECK((headers_frame.flags & http2_flag::kEndStream) ==
+              (mode == H2GrpcProtocolMode::Native ? http2_flag::kEndStream : 0));
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header decoded[8];
+        u8 scratch[512];
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           send_storage + kFrameHeaderSize,
+                                           headers_frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           8,
+                                           &count));
+        bool status200 = false;
+        bool grpc4 = false;
+        bool content_type = false;
+        bool content_length = false;
+        for (u32 i = 0; i < count; ++i) {
+            status200 |= decoded[i].name.eq({":status", 7}) && decoded[i].value.eq({"200", 3});
+            grpc4 |= decoded[i].name.eq({"grpc-status", 11}) && decoded[i].value.eq({"4", 1});
+            if (decoded[i].name.eq({"content-length", 14}))
+                content_length = mode == H2GrpcProtocolMode::WebText
+                                     ? decoded[i].value.eq({"28", 2})
+                                     : decoded[i].value.eq({"21", 2});
+            if (decoded[i].name.eq({"content-type", 12})) {
+                content_type = mode == H2GrpcProtocolMode::WebText
+                                   ? decoded[i].value.eq({"application/grpc-web-text", 25})
+                                   : (mode == H2GrpcProtocolMode::WebBinary
+                                          ? decoded[i].value.eq({"application/grpc-web", 20})
+                                          : decoded[i].value.eq({"application/grpc", 16}));
+            }
+        }
+        CHECK(status200);
+        CHECK(content_type);
+        if (mode != H2GrpcProtocolMode::Native) CHECK(content_length);
+        if (mode == H2GrpcProtocolMode::Native) {
+            CHECK(grpc4);
+            CHECK_EQ(loop.epoch_enters, 0u);
+            CHECK_EQ(h2.streams[0].state, Http2StreamState::Closed);
+        } else {
+            CHECK_EQ(loop.epoch_enters, 1u);
+            CHECK(conn.epoch_held);
+            const u32 body_offset = kFrameHeaderSize + headers_frame.length;
+            CHECK_EQ(body_offset, conn.send_buf.len());  // first send carries HEADERS only
+            CHECK_EQ(h2.outbound_stream, 1u);
+            CHECK_EQ(h2.outbound_body_offset, 0u);
+            u8 data_wire[256];
+            H2PumpStatus pump_status = H2PumpStatus::Blocked;
+            const u32 data_wire_len =
+                h2_pump_outbound(h2, data_wire, sizeof(data_wire), pump_status);
+            REQUIRE_EQ(pump_status, H2PumpStatus::Produced);
+            Http2FrameHeader body_frame;
+            REQUIRE(parse_frame_header(data_wire, data_wire_len, &body_frame) ==
+                    ParseStatus::Complete);
+            CHECK_EQ(body_frame.type, static_cast<u8>(Http2FrameType::Data));
+            CHECK((body_frame.flags & http2_flag::kEndStream) != 0);
+            u8 envelope[64]{};
+            u32 envelope_len = 0;
+            const u8* body = data_wire + kFrameHeaderSize;
+            if (mode == H2GrpcProtocolMode::WebText) {
+                GrpcWebBase64Decoder decoder{};
+                decoder.init();
+                u32 consumed = 0;
+                REQUIRE(decoder.feed(body,
+                                     body_frame.length,
+                                     consumed,
+                                     envelope,
+                                     sizeof(envelope),
+                                     envelope_len) == GrpcWebCodecStatus::Ok);
+                CHECK_EQ(consumed, body_frame.length);
+                CHECK(decoder.finish() == GrpcWebCodecStatus::Ok);
+            } else {
+                envelope_len = body_frame.length;
+                __builtin_memcpy(envelope, body, envelope_len);
+            }
+            REQUIRE(envelope_len >= 5);
+            CHECK_EQ(envelope[0], 0x80u);  // trailer envelope
+            const u32 trailer_len = (static_cast<u32>(envelope[1]) << 24) |
+                                    (static_cast<u32>(envelope[2]) << 16) |
+                                    (static_cast<u32>(envelope[3]) << 8) | envelope[4];
+            CHECK_EQ(trailer_len, 16u);
+            REQUIRE_EQ(envelope_len, 5u + trailer_len);
+            CHECK_EQ(memcmp(envelope + 5, "grpc-status: 4\r\n", 16), 0);
+            h2_close_stream(&h2, 1);  // final DATA completion closes the local side
+            CHECK_EQ(h2.streams[0].state, Http2StreamState::Closed);
+        }
+    }
+}
+
+TEST(h2_serving, unrelated_flow_stalled_owner_does_not_block_expired_stream_reset) {
+    FakeH2Loop loop;
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    u8 send_storage[8192]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    h2.nstreams = 2;
+    h2.streams[0] = {};
+    h2.streams[0].id = 1;
+    h2.streams[0].state = Http2StreamState::HalfClosedRemote;
+    h2.streams[0].grpc_protocol_mode = H2GrpcProtocolMode::Native;
+    h2.streams[1] = {};
+    h2.streams[1].id = 3;
+    h2.streams[1].state = Http2StreamState::HalfClosedRemote;
+    h2.streams[1].grpc_protocol_mode = H2GrpcProtocolMode::Native;
+    h2.streams[1].local_deadline_present = true;
+    h2.streams[1].local_deadline_expired = true;
+    h2.outbound_stream = 1;
+    h2.outbound_body = reinterpret_cast<const u8*>("body");
+    h2.outbound_body_len = 4;
+    h2.outbound_grpc_status = 0;
+    h2.conn_send_window = 0;
+    h2.streams[0].send_window = 0;
+    CHECK(h2_publish_expired_local(&loop, conn));
+    CHECK(loop.send_submitted);
+    CHECK_EQ(h2.outbound_stream, 1u);  // retained behind the closed window
+    CHECK_EQ(h2.streams[1].state, Http2StreamState::Closed);
+    Http2FrameHeader rst{};
+    REQUIRE(parse_frame_header(conn.send_buf.data(), conn.send_buf.len(), &rst) ==
+            ParseStatus::Complete);
+    CHECK_EQ(rst.type, static_cast<u8>(Http2FrameType::RstStream));
+    CHECK_EQ(rst.stream_id, 3u);
+}
+
+TEST(h2_serving, completed_last_owner_restores_keepalive_timer_wheel) {
+    FakeH2Loop loop;
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    u8 send_storage[16]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    conn.send_buf.write(send_storage, 1);
+    conn.keep_alive = true;
+    CHECK(conn.timer_node.empty());
+    on_h2_sent<FakeH2Loop>(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Send, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_FALSE(conn.timer_node.empty());
+}
+
+TEST(h2_serving, expired_web_timeout_waits_for_both_flow_control_windows) {
+    for (const auto mode : {H2GrpcProtocolMode::WebBinary, H2GrpcProtocolMode::WebText}) {
+        FakeH2Loop loop;
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        conn.epoch_held = true;
+        u8 send_storage[8192]{};
+        conn.send_buf.bind(send_storage, sizeof(send_storage));
+        h2.nstreams = 2;
+        h2.streams[0] = {};
+        h2.streams[0].id = 1;
+        h2.streams[0].state = Http2StreamState::HalfClosedRemote;
+        h2.streams[0].local_deadline_expired = true;
+        h2.streams[0].grpc_protocol_mode = mode;
+        h2.streams[1] = {};
+        h2.streams[1].id = 3;
+        h2.streams[1].state = Http2StreamState::Open;
+        h2.streams[1].grpc_protocol_mode = H2GrpcProtocolMode::Native;
+        h2.conn_send_window = 0;
+        h2.streams[0].send_window = 0;
+        h2.streams[1].send_window = 0;
+
+        CHECK(h2_publish_expired_local(&loop, conn));
+        CHECK(loop.send_submitted);
+        Http2FrameHeader headers_frame{};
+        REQUIRE(parse_frame_header(send_storage, conn.send_buf.len(), &headers_frame) ==
+                ParseStatus::Complete);
+        CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
+        CHECK_FALSE((headers_frame.flags & http2_flag::kEndStream) != 0);
+        CHECK_EQ(conn.send_buf.len(), kFrameHeaderSize + headers_frame.length);
+        CHECK_EQ(h2.outbound_stream, 1u);
+        CHECK_EQ(h2.outbound_body_offset, 0u);
+        const u32 body_len = h2.outbound_body_len;
+        CHECK_EQ(body_len, mode == H2GrpcProtocolMode::WebBinary ? 21u : 28u);
+        CHECK_EQ(h2.streams[1].state, Http2StreamState::Open);
+        CHECK_FALSE(h2.streams[1].local_deadline_expired);
+        CHECK_EQ(h2.streams[1].send_window, 0);
+
+        u8 wire[128];
+        H2PumpStatus status = H2PumpStatus::Blocked;
+        CHECK_EQ(h2_pump_outbound(h2, wire, sizeof(wire), status), 0u);
+        CHECK(status == H2PumpStatus::Blocked);
+        h2.conn_send_window = 64;
+        CHECK_EQ(h2_pump_outbound(h2, wire, sizeof(wire), status), 0u);
+        CHECK(status == H2PumpStatus::Blocked);  // stream window still blocks
+        h2.conn_send_window = 0;
+        h2.streams[0].send_window = 64;
+        CHECK_EQ(h2_pump_outbound(h2, wire, sizeof(wire), status), 0u);
+        CHECK(status == H2PumpStatus::Blocked);  // connection window still blocks
+        h2.conn_send_window = 64;
+        const u32 data_len = h2_pump_outbound(h2, wire, sizeof(wire), status);
+        REQUIRE_EQ(status, H2PumpStatus::Produced);
+        REQUIRE_EQ(data_len, kFrameHeaderSize + body_len);
+        CHECK_EQ(h2.conn_send_window, 64u - body_len);
+        CHECK_EQ(h2.streams[0].send_window, 64 - static_cast<i32>(body_len));
+        Http2FrameHeader data_frame{};
+        REQUIRE(parse_frame_header(wire, data_len, &data_frame) == ParseStatus::Complete);
+        CHECK_EQ(data_frame.type, static_cast<u8>(Http2FrameType::Data));
+        CHECK((data_frame.flags & http2_flag::kEndStream) != 0);
+        u8 raw[64];
+        u32 raw_len = 0;
+        const u8* body = wire + kFrameHeaderSize;
+        if (mode == H2GrpcProtocolMode::WebText) {
+            GrpcWebBase64Decoder decoder{};
+            decoder.init();
+            u32 consumed = 0;
+            CHECK(decoder.feed(body, body_len, consumed, raw, sizeof(raw), raw_len) ==
+                  GrpcWebCodecStatus::Ok);
+            CHECK_EQ(consumed, body_len);
+            CHECK(decoder.finish() == GrpcWebCodecStatus::Ok);
+            body = raw;
+        } else {
+            raw_len = body_len;
+        }
+        REQUIRE_EQ(raw_len, 21u);
+        CHECK_EQ(body[0], 0x80u);
+        CHECK_EQ(memcmp(body + 5, "grpc-status: 4\r\n", 16), 0);
+    }
+}
+
+TEST(h2_serving, expired_local_deadline_releases_parked_json_outcome_once) {
+    FakeH2Loop loop;
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    u8 send_storage[8192]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    REQUIRE(conn.json_arena.init(&loop.pool));
+    REQUIRE(conn.json_arena.alloc(16) != nullptr);
+    conn.jit_response_body_valid = true;
+    conn.jit_response_body = {"{\"ok\":true}", 11};
+    h2.nstreams = 1;
+    h2.streams[0] = {};
+    h2.streams[0].id = 1;
+    h2.streams[0].state = Http2StreamState::Open;
+    h2.streams[0].local_deadline_present = true;
+    h2.streams[0].local_deadline_expired = true;
+    h2.streams[0].grpc_protocol_mode = H2GrpcProtocolMode::Native;
+    h2.pending_stream = 1;
+    h2.pending_local_outcome = true;
+    h2_async_epoch_enter(&loop, conn);
+
+    CHECK(h2_publish_expired_local(&loop, conn));
+
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_FALSE(h2.pending_local_outcome);
+    CHECK_FALSE(conn.epoch_held);
+    CHECK_EQ(loop.epoch_leaves, 1u);
+    CHECK(conn.json_arena.current == nullptr);
+    CHECK_FALSE(conn.jit_response_body_valid);
+    CHECK(loop.send_submitted);
+}
+
+TEST(h2_serving, expired_timer_yield_is_settled_once_as_status_four) {
+    FakeH2Loop loop;
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    u8 send_storage[8192]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    h2.nstreams = 1;
+    h2.streams[0] = {};
+    h2.streams[0].id = 1;
+    h2.streams[0].state = Http2StreamState::HalfClosedRemote;
+    h2.streams[0].local_deadline_present = true;
+    h2.streams[0].local_deadline_us = monotonic_us() - 1;
+    h2.streams[0].grpc_protocol_mode = H2GrpcProtocolMode::Native;
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_cfg = nullptr;
+    conn.pending_handler_fn = &h2_grpc_local_status;
+    conn.epoch_held = true;
+    loop.epoch_enters = 1;
+    g_h2_grpc_jit_calls = 0;
+
+    h2_resume_jit_handler(&loop, conn);
+
+    CHECK_EQ(g_h2_grpc_jit_calls, 0u);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK_FALSE(conn.epoch_held);
+    CHECK_EQ(loop.epoch_leaves, 1u);
+    CHECK(loop.send_submitted);
 }
 
 TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {

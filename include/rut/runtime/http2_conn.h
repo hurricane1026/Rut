@@ -30,6 +30,7 @@ enum class Http2StreamState : u8 {
 // stream is being forwarded to an h1 upstream (resumed by upstream I/O).
 enum class H2AsyncKind : u8 { None, Timer, Proxy };
 enum class H2OutboundBodySource : u8 { None, RouteConfig, ProxySynth, JitDynamic };
+enum class H2GrpcProtocolMode : u8 { None, Native, WebBinary, WebText };
 
 struct Http2Stream {
     u32 id;
@@ -42,6 +43,19 @@ struct Http2Stream {
     u32 recv_credit;
     u32 recv_unconsumed;
     u64 headers_received_us;
+    // Local unary deadline metadata. Scheduler/publication integration is
+    // added separately for streams owned by a local JIT route.
+    u64 local_deadline_us;
+    bool local_deadline_present;
+    bool local_deadline_expired;
+    H2GrpcProtocolMode grpc_protocol_mode;
+
+    void clear_local_deadline() {
+        local_deadline_us = 0;
+        local_deadline_present = false;
+        local_deadline_expired = false;
+        grpc_protocol_mode = H2GrpcProtocolMode::None;
+    }
 };
 
 struct Http2Conn;
@@ -69,6 +83,10 @@ struct Http2Conn {
     static constexpr u32 kHeaderBlockCap = 16384 + 32;  // header block plus late gRPC timeout
     static constexpr u32 kHeaderScratchCap = 16384;     // decoded name/value bytes
     static constexpr u32 kMaxHeadersPerReq = 64;
+    struct BufferedHeadersTimestamp {
+        u32 stream_id;
+        u64 received_us;
+    };
 
     // Delivered when a stream's header block completes (END_HEADERS). `headers`
     // points into engine scratch valid only for the call.
@@ -196,6 +214,13 @@ struct Http2Conn {
     // transfers these to the Connection atomically with schedule_yield_timer.
     u32 async_stream;
     u64 async_headers_received_us;
+    // Arrival time captured for an initial HEADERS frame buffered behind the
+    // one-at-a-time async request gate. The frame remains unconsumed until the
+    // gate opens, but gRPC timeout accounting starts at wire arrival.
+    BufferedHeadersTimestamp buffered_headers_timestamps[kMaxStreams];
+    bool capture_buffered_headers_time(u32 stream_id, u64 received_us);
+    u64 take_buffered_headers_time(u32 stream_id);
+    void clear_buffered_headers_time(u32 stream_id);
     bool async_is_head;
     H2AsyncKind async_kind;
     const RouteConfig* async_cfg;
@@ -213,6 +238,8 @@ struct Http2Conn {
     bool async_request_has_content_length;
     u32 async_request_content_length;
     u32 async_timer_ms;
+    // Absolute wake point for aggregate TimerYield arbitration.
+    u64 async_resume_at_us;
     jit::HandlerFn async_fn;
     u16 async_state;
     // Proxy suspension only: selected upstream and the running count of upstream
@@ -262,6 +289,10 @@ struct Http2Conn {
     u8* jit_queued_slice;
     SlicePool* jit_queued_pool;
     bool response_flush_pending;
+    // Deferred RST for a local deadline that expires while a Web response owns
+    // the serialized output slot. The timer cannot overwrite an armed send.
+    u32 deadline_reset_stream;
+    u32 deadline_reset_stream_queued;
 
     // Set callbacks (any may be null) then call init().
     void init();
@@ -331,7 +362,8 @@ u32 http2_write_response_headers(u8* out,
                                  const hpack::Header* hdrs,
                                  u32 nhdrs,
                                  u32 body_len,
-                                 bool end_stream);
+                                 bool end_stream,
+                                 bool include_content_length = true);
 
 u32 http2_write_head_response_headers(u8* out,
                                       u32 out_cap,

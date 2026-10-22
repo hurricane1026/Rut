@@ -583,7 +583,7 @@ TEST(json_network, h1_grpc_web_slow_body_real_sync_backend_socket) {
         const std::string request =
             std::string("POST /body HTTP/1.1\r\nHost: test\r\nContent-Type: ") +
             (chunked ? "application/grpc-web-text\r\n" : "application/grpc-web\r\n") +
-            "grpc-timeout: 1m\r\n" +
+            "grpc-timeout: 100m\r\n" +
             (chunked ? "Transfer-Encoding: chunked\r\n\r\n8\r\nAA" : "Content-Length: 6\r\n\r\nx");
         REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
                    request.size());

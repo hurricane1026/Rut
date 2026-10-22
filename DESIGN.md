@@ -8202,17 +8202,26 @@ automatic service dispatch, CORS policy or JSON mapping.
 
 On epoll, io_uring and kqueue backends, body-reading HTTP/1.1 local gRPC-Web POST
 routes accept an optional `grpc-timeout` using the existing bounded timeout
-grammar and an absolute request-start deadline.
+grammar and an absolute request-start deadline. Body-reading local unary HTTP/2
+POST routes accept the same field for native gRPC and binary/text gRPC-Web,
+using HEADERS arrival as the deadline origin.
 Malformed or duplicate timeout fields fail with HTTP 400 before handler entry.
 The deadline also covers synchronous handler execution through response
 publication. Expiry while collecting the body or waiting in a timer yield emits
-HTTP 200 with a trailers-only gRPC-Web status 4 response in the admitted binary/text mode, then
-closes the connection. Terminal responses settle the timer before publication.
+HTTP 200 with a trailers-only gRPC-Web status 4 response in the admitted
+binary/text mode, then closes the HTTP/1 connection. Backends without a local
+HTTP/1 deadline timer retain legacy `grpc-timeout` handling. On HTTP/2, expiry
+emits HTTP 200 with native trailers-only `grpc-status: 4` or a binary/text
+gRPC-Web trailers envelope and ends the expired stream's response; the
+connection and other streams remain usable. If the peer upload is open, the
+stream stays half-closed locally until its DATA or END_STREAM arrives. A pending
+send finishes before the timeout response is staged. HTTP/1 terminal responses
+settle the precise timer before publication; HTTP/2 recomputes the aggregate
+timer at a safe send boundary after serialization.
 With a local deadline active, Forward and event-based yields fail before I/O;
-timer yields remain supported. HTTP/2 local deadlines remain unimplemented;
-backends without a local timer retain legacy handling of
-`grpc-timeout`. Once an admitted deadline expires, timeout wins over a late
-body-validation error.
+timer yields remain supported. If an HTTP/2 local deadline timer cannot be
+armed, the connection closes without a success response. Once an admitted
+deadline expires, timeout wins over a late body-validation error.
 
 An explicit local response with `application/grpc-web` or
 `application/grpc-web-text` (optionally `+proto`) uses the same bounded unary
@@ -8246,8 +8255,7 @@ grpc-status-details-bin headers fail closed (header names are compared
 case-insensitively), and percent-encoded/opaque bytes are preserved without
 decoding. No new connection-base allocation, keyword,
 helper ABI or external runtime dependency is introduced. This is local unary
-response transport, not generated service dispatch, deadline scheduling or a
-streaming Rut API.
+response transport, not generated service dispatch or a streaming Rut API.
 
 
 ### Compile-time unary method codecs

@@ -10119,6 +10119,34 @@ TEST(http2, response_headers_body_length_is_transactional_and_nonterminal) {
     CHECK(saw_length);
     CHECK(saw_test);
 
+    // Trailer-bearing native gRPC responses may replace an unstaged body with
+    // grpc-status: 4, so their initial HEADERS must not promise the old length.
+    hpack::Encoder grpc_enc;
+    grpc_enc.init(kDefaultHeaderTableSize);
+    u8 grpc_headers[8192]{};
+    const u32 grpc_n = http2_write_response_headers(
+        grpc_headers, sizeof(grpc_headers), grpc_enc, 5, 200, headers, 1, 9000, false, false);
+    REQUIRE_GT(grpc_n, 0u);
+    Http2FrameHeader grpc_frame{};
+    REQUIRE_EQ(parse_frame_header(grpc_headers, grpc_n, &grpc_frame), ParseStatus::Complete);
+    hpack::DynamicTable grpc_dec;
+    grpc_dec.init(kDefaultHeaderTableSize);
+    hpack::Header grpc_decoded[8];
+    u8 grpc_scratch[256]{};
+    u32 grpc_count = 0;
+    REQUIRE(hpack::decode_header_block(grpc_dec,
+                                       grpc_headers + kFrameHeaderSize,
+                                       grpc_frame.length,
+                                       grpc_scratch,
+                                       sizeof(grpc_scratch),
+                                       grpc_decoded,
+                                       8,
+                                       &grpc_count));
+    bool grpc_has_length = false;
+    for (u32 i = 0; i < grpc_count; i++)
+        grpc_has_length |= grpc_decoded[i].name.eq({"content-length", 14});
+    CHECK_FALSE(grpc_has_length);
+
     // A failed staging attempt must not consume encoder state or partially write.
     u8 too_small[8]{};
     CHECK_EQ(http2_write_response_headers(
@@ -88909,6 +88937,40 @@ static u32 local_deadline_socket_calls;
 static u64 local_deadline_socket_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     ++local_deadline_socket_calls;
     return jit::HandlerResult::make_status(204).pack();
+}
+
+TEST(local_grpc_deadline, h2_stream_timeout_metadata_isolated_and_clears_on_lifecycle) {
+    Http2Conn h2;
+    h2.init_client();
+    auto* stream = h2.open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->local_deadline_present = true;
+    stream->local_deadline_us = 1'000'100u;
+    stream->grpc_protocol_mode = H2GrpcProtocolMode::Native;
+    CHECK(stream->local_deadline_present);
+
+    auto* stream2 = h2.open_stream(3);
+    REQUIRE(stream2 != nullptr);
+    stream2->local_deadline_present = true;
+    stream2->local_deadline_us = 2'000'100u;
+    CHECK(stream2->local_deadline_present);
+    CHECK(stream->local_deadline_present);
+    h2_close_stream(&h2, 1);
+    CHECK_FALSE(stream->local_deadline_present);
+    CHECK_FALSE(stream->local_deadline_expired);
+    CHECK_EQ(stream->grpc_protocol_mode, H2GrpcProtocolMode::None);
+    CHECK(stream2->local_deadline_present);
+    stream2->local_deadline_expired = true;
+    h2_on_reset_cb(nullptr, h2, 3, Http2Error::Cancel);
+    CHECK_FALSE(stream2->local_deadline_present);
+    CHECK_FALSE(stream2->local_deadline_expired);
+
+    stream->state = Http2StreamState::Closed;
+    stream->recv_unconsumed = 0;
+    auto* reused = h2.open_stream(5);
+    REQUIRE(reused != nullptr);
+    CHECK_FALSE(reused->local_deadline_present);
+    CHECK_FALSE(reused->local_deadline_expired);
 }
 
 TEST(local_grpc_deadline, iouring_slow_body_real_socket_status_four) {
