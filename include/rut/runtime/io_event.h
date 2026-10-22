@@ -219,4 +219,16 @@ inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current
             (event.upstream_episode != 0 && event.upstream_episode != current_episode));
 }
 
+inline constexpr bool valid_local_grpc_deadline_transport_event(const IoEvent& event) {
+    if ((event.type != IoEventType::LocalGrpcDeadlineTimer &&
+         event.type != IoEventType::LocalGrpcDeadlineCancel) ||
+        event.non_upstream_generation == 0 || event.non_upstream_generation > 0x7fffffffu)
+        return false;
+    IoEvent canonical = event;
+    canonical.type = IoEventType::ResponseReadTimer;
+    if (event.type == IoEventType::LocalGrpcDeadlineCancel)
+        canonical.non_upstream_generation |= kResponseReadTimerCancelBit;
+    return valid_response_read_timer_transport_event(canonical);
+}
+
 }  // namespace rut

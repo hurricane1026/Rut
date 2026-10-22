@@ -51,6 +51,22 @@ TEST(local_grpc_deadline_timer, cancel_before_submit_is_represented_without_reus
     CHECK_EQ(owner.timespec_nsec, 0);
 }
 
+TEST(local_grpc_deadline_timer, refuses_generation_wrap_and_preserves_owned_timespec) {
+    LocalGrpcDeadlineTimerOwner owner;
+    owner.generation = LocalGrpcDeadlineTimerOwner::kGenerationMask - 1;
+    REQUIRE(owner.arm(1234567));
+    const u32 generation = owner.owner_generation;
+    REQUIRE(owner.request_cancel());
+    REQUIRE(owner.reclaim_target(generation));
+    CHECK_EQ(owner.timespec_sec, 1);
+    CHECK_EQ(owner.timespec_nsec, 234567000);
+    CHECK_FALSE(owner.arm(2000000));
+    REQUIRE(owner.reclaim_cancel(generation));
+    CHECK(owner.reusable());
+    CHECK_FALSE(owner.arm(2000000));
+    CHECK_FALSE(owner.reclaim_target(generation));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -181,6 +181,7 @@ struct EpollEventLoop : EventLoopCRTP<EpollEventLoop> {
     EpollBackend backend;
     TimerWheel timer;
     epoll_yield::YieldHeap yield_heap;
+    epoll_yield::YieldHeap local_grpc_deadline_heap;
     // Absolute deadline currently programmed into backend.yield_timer_fd.
     // 0 means disarmed. Used to avoid redundant timerfd_settime syscalls
     // when a new push does not change the heap's top.
@@ -274,8 +275,16 @@ public:
             conns.destroy();
             return core::make_unexpected(y.error());
         }
+        auto local = local_grpc_deadline_heap.init(capacity);
+        if (!local) {
+            yield_heap.destroy();
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(local.error());
+        }
         auto b = backend.init_state_storage(capacity);
         if (!b) {
+            local_grpc_deadline_heap.destroy();
             yield_heap.destroy();
             free_stack.destroy();
             conns.destroy();
@@ -297,6 +306,7 @@ public:
         free_top = 0;
         backend.destroy_state_storage();
         yield_heap.destroy();
+        local_grpc_deadline_heap.destroy();
         free_stack.destroy();
         conns.destroy();
     }
@@ -998,6 +1008,7 @@ public:
         // throttle_paused, not pending_handler_fn, so a client that disconnects
         // behind a long low-rate throttle would otherwise leave a stale entry
         // until its deadline. Rearm in case this conn owned the heap's top.
+        disarm_local_grpc_deadline(c);
         if (c.pending_handler_fn || c.throttle_paused || c.yield_armed) {
             if (yield_heap.remove_by_conn(c.id) > 0) rearm_yield_timerfd();
         }
@@ -1044,6 +1055,28 @@ public:
     // Returns false if the request can't be scheduled faithfully —
     // yield_heap is full AND the wait exceeds what the 1-second wheel
     // fallback can represent (~63s). Caller fails the request.
+    [[nodiscard]] bool arm_local_grpc_deadline(Connection& conn, u64 absolute_us) {
+        if (absolute_us > ~u64{0} / 1000 || !conn.local_grpc_deadline_timer.arm(absolute_us))
+            return false;
+        const u32 generation = conn.local_grpc_deadline_timer.owner_generation;
+        if (!local_grpc_deadline_heap.push(absolute_us * 1000, generation, conn.id)) {
+            conn.local_grpc_deadline_timer.reclaim_target(generation);
+            return false;
+        }
+        rearm_yield_timerfd();
+        return true;
+    }
+
+    void disarm_local_grpc_deadline(Connection& conn) {
+        conn.on_local_grpc_deadline = nullptr;
+        conn.local_grpc_deadline.reset();
+        if (local_grpc_deadline_heap.remove_by_conn(conn.id) > 0) {
+            conn.local_grpc_deadline_timer.reclaim_target(
+                conn.local_grpc_deadline_timer.owner_generation);
+            rearm_yield_timerfd();
+        }
+    }
+
     [[nodiscard]] bool schedule_yield_timer(Connection& conn, u32 ms) {
         timer.remove(&conn);
         // Epoll is level-triggered: with all callback slots null during
@@ -1078,14 +1111,17 @@ public:
     // every push and after every drain. Uses yield_timer_armed_ns to skip
     // redundant timerfd_settime calls.
     void rearm_yield_timerfd() {
-        if (yield_heap.empty()) {
+        if (yield_heap.empty() && local_grpc_deadline_heap.empty()) {
             if (yield_timer_armed_ns != 0) {
                 backend.arm_yield_timerfd(0);
                 yield_timer_armed_ns = 0;
             }
             return;
         }
-        u64 top = yield_heap.top().deadline_ns;
+        u64 top = yield_heap.empty() ? local_grpc_deadline_heap.top().deadline_ns
+                                     : yield_heap.top().deadline_ns;
+        if (!local_grpc_deadline_heap.empty() && local_grpc_deadline_heap.top().deadline_ns < top)
+            top = local_grpc_deadline_heap.top().deadline_ns;
         if (top == yield_timer_armed_ns) return;
         backend.arm_yield_timerfd(top);
         yield_timer_armed_ns = top;
@@ -1120,6 +1156,25 @@ public:
     // the timer fired).
     void drain_yield_heap() {
         u64 now = epoll_yield::monotonic_ns();
+        // Process RPC expiry before same-tick handler wakes. A handler must
+        // never execute another state after its absolute deadline.
+        while (!local_grpc_deadline_heap.empty() &&
+               local_grpc_deadline_heap.top().deadline_ns <= now) {
+            const auto entry = local_grpc_deadline_heap.top();
+            local_grpc_deadline_heap.pop();
+            if (entry.conn_id >= connection_capacity) continue;
+            auto& c = conns[entry.conn_id];
+            if (!c.local_grpc_deadline_timer.reclaim_target(entry.handler_gen)) continue;
+            if (c.fd < 0 || !c.on_local_grpc_deadline) continue;
+            auto callback = c.on_local_grpc_deadline;
+            c.on_local_grpc_deadline = nullptr;
+            IoEvent event{};
+            event.type = IoEventType::LocalGrpcDeadlineTimer;
+            event.conn_id = c.id;
+            event.result = -ETIME;
+            event.non_upstream_generation = entry.handler_gen;
+            callback(this, c, event);
+        }
         while (!yield_heap.empty() && yield_heap.top().deadline_ns <= now) {
             auto entry = yield_heap.top();
             yield_heap.pop();

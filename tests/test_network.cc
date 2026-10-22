@@ -88604,3 +88604,54 @@ TEST(http2, buffered_upload_promotion_failure_closes_once) {
     CHECK_EQ(loop->pending_free_count, 0u);
     loop->shutdown();
 }
+
+TEST(local_grpc_deadline_backend, absolute_sqe_and_cancel_tokens_preserve_owner) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    auto& backend = guard.loop->backend;
+    auto& conn = guard.loop->conns[0];
+    REQUIRE(backend.add_local_grpc_deadline_timer(0, conn, 1234567));
+    REQUIRE_EQ(guard.sq_tail, 1u);
+    const auto& timer = guard.sq_entries[0];
+    CHECK_EQ(timer.opcode, IORING_OP_TIMEOUT);
+    CHECK_EQ(timer.off, 0u);
+    CHECK_EQ(timer.timeout_flags, IORING_TIMEOUT_ABS);
+    CHECK_EQ(timer.addr, reinterpret_cast<u64>(&conn.local_grpc_deadline_timer.timespec_sec));
+    CHECK_EQ(conn.local_grpc_deadline_timer.timespec_sec, 1);
+    CHECK_EQ(conn.local_grpc_deadline_timer.timespec_nsec, 234567000);
+    const u32 generation = conn.local_grpc_deadline_timer.owner_generation;
+    CHECK_EQ(timer.user_data,
+             IoUringBackend::encode_user_data(0, IoEventType::LocalGrpcDeadlineTimer, generation));
+    REQUIRE(backend.cancel_local_grpc_deadline_timer(0, conn));
+    REQUIRE_EQ(guard.sq_tail, 2u);
+    const auto& cancel = guard.sq_entries[1];
+    CHECK_EQ(cancel.opcode, IORING_OP_ASYNC_CANCEL);
+    CHECK_EQ(cancel.addr, timer.user_data);
+    CHECK_EQ(cancel.user_data,
+             IoUringBackend::encode_user_data(0, IoEventType::LocalGrpcDeadlineCancel, generation));
+    CHECK_FALSE(backend.add_local_grpc_deadline_timer(0, conn, 9999999));
+    CHECK_EQ(conn.local_grpc_deadline_timer.timespec_nsec, 234567000);
+    // Decode a real CQ ring entry through the backend, rather than manufacturing
+    // a high-level event that could conceal generation loss in wait().
+    guard.sq_head = guard.sq_tail;
+    backend.pending = 0;
+    guard.cq_entries[0].user_data = timer.user_data;
+    guard.cq_entries[0].res = -ETIME;
+    guard.cq_tail = 1;
+    IoEvent event{};
+    REQUIRE_EQ(backend.wait(&event, 1, guard.loop->conns, 1), 1u);
+    CHECK_EQ(event.type, IoEventType::LocalGrpcDeadlineTimer);
+    CHECK_EQ(event.non_upstream_generation, generation);
+    CHECK_EQ(event.result, -ETIME);
+    CHECK(conn.local_grpc_deadline_timer.reclaim_target(event.non_upstream_generation));
+    CHECK_FALSE(conn.local_grpc_deadline_timer.reusable());
+    CHECK_EQ(conn.local_grpc_deadline_timer.timespec_nsec, 234567000);
+    guard.cq_entries[1].user_data = cancel.user_data;
+    guard.cq_entries[1].res = -ENOENT;
+    guard.cq_tail = 2;
+    REQUIRE_EQ(backend.wait(&event, 1, guard.loop->conns, 1), 1u);
+    CHECK_EQ(event.type, IoEventType::LocalGrpcDeadlineCancel);
+    CHECK_EQ(event.non_upstream_generation, generation);
+    CHECK(conn.local_grpc_deadline_timer.reclaim_cancel(event.non_upstream_generation));
+    CHECK(conn.local_grpc_deadline_timer.reusable());
+}

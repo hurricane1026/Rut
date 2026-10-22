@@ -23,10 +23,10 @@ struct LocalGrpcDeadlineTimerOwner {
     }
 
     bool arm(u64 absolute_us) {
-        if (!reusable() || absolute_us == 0) return false;
-        u32 next = (generation + 1) & kGenerationMask;
-        if (next == 0) next = 1;
-        generation = next;
+        // A retired token must never identify a later timer, even after the
+        // connection slot has been reused. Exhaustion quarantines this owner.
+        if (!reusable() || absolute_us == 0 || generation == kGenerationMask) return false;
+        generation++;
         owner_generation = generation;
         cancel_generation = 0;
         timespec_sec = static_cast<i64>(absolute_us / 1000000ull);
@@ -71,5 +71,8 @@ struct LocalGrpcDeadlineTimerOwner {
         return true;
     }
 };
+
+static_assert(__builtin_offsetof(LocalGrpcDeadlineTimerOwner, timespec_sec) == 0);
+static_assert(__builtin_offsetof(LocalGrpcDeadlineTimerOwner, timespec_nsec) == sizeof(i64));
 
 }  // namespace rut
