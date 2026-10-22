@@ -248,17 +248,9 @@ inline bool grpc_web_test_decode_text_response(const std::vector<u8>& response,
 }
 
 inline bool grpc_web_test_h1_abort_partial_upload(EchoServer& server, u16 port) {
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    const int fd = connect_test_loopback(port);
     if (fd < 0) return false;
     set_socket_timeouts(fd, 5);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
-    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        close(fd);
-        return false;
-    }
     static constexpr char kRequest[] =
         "POST /test.Echo/Call HTTP/1.1\r\n"
         "Host: localhost\r\n"
@@ -286,13 +278,13 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                                       const std::vector<u8>* expected_body = nullptr,
                                       const char* extra_headers = "",
                                       std::atomic<u32>* tls_retry_count = nullptr) {
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    const int fd = connect_test_loopback(port);
     if (fd < 0) {
         fprintf(stderr,
-                "grpc_web_test_h1_exchange failed stage=socket errno=%d rc=%d ssl_error=%d "
+                "grpc_web_test_h1_exchange failed stage=connect errno=%d rc=%d ssl_error=%d "
                 "openssl_error=%lu wrote=0 read=0\n",
                 errno,
-                fd,
+                -1,
                 0,
                 0ul);
         return false;
@@ -322,15 +314,6 @@ inline bool grpc_web_test_h1_exchange(u16 port,
         return false;
     };
     set_socket_timeouts(fd, 5);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
-    errno = 0;
-    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        const int error_number = errno;
-        return fail("connect", error_number, -1, 0, 0);
-    }
     if (tls) {
         ERR_clear_error();
         errno = 0;
@@ -1337,14 +1320,9 @@ TEST(grpc_proxy, h1_expect_continue_body_is_rejected_before_rpc) {
     shard->route_config = &config;
     REQUIRE(shard->spawn(-1));
 
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    const int fd = connect_test_loopback(get_port(listener));
     REQUIRE(fd >= 0);
     set_socket_timeouts(fd, 5);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(get_port(listener));
-    REQUIRE(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     static constexpr char kHeaders[] =
         "POST /test.Echo/Call HTTP/1.1\r\n"
         "Host: localhost\r\n"
@@ -1625,6 +1603,27 @@ TEST(grpc_proxy, h1_binary_tls_handshake_retries_eintr) {
     }
     sigaction(SIGUSR1, &old_action, nullptr);
     CHECK(server.served.load(std::memory_order_acquire));
+}
+TEST(grpc_proxy, test_loopback_connect_retries_eintr) {
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    REQUIRE(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    REQUIRE(listen(listener, 1) == 0);
+    loopback_connect_retry_probe = {};
+    const int fd = connect_test_loopback(get_port(listener), 5000, &connect_eintr_then_real);
+    CHECK(fd >= 0);
+    CHECK_EQ(loopback_connect_retry_probe.calls, 2);
+    if (fd >= 0) {
+        const int accepted = accept(listener, nullptr, nullptr);
+        CHECK(accepted >= 0);
+        if (accepted >= 0) close(accepted);
+        close(fd);
+    }
+    close(listener);
 }
 TEST(grpc_proxy, h1_binary_tls_truncated_content_length_fails) {
     GrpcWebTlsGateServer server;
