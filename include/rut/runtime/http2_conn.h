@@ -30,6 +30,7 @@ enum class Http2StreamState : u8 {
 // stream is being forwarded to an h1 upstream (resumed by upstream I/O).
 enum class H2AsyncKind : u8 { None, Timer, Proxy };
 enum class H2OutboundBodySource : u8 { None, RouteConfig, ProxySynth, JitDynamic };
+enum class H2GrpcProtocolMode : u8 { None, Native, WebBinary, WebText };
 
 struct Http2Stream {
     u32 id;
@@ -47,11 +48,13 @@ struct Http2Stream {
     u64 local_deadline_us;
     bool local_deadline_present;
     bool local_deadline_expired;
+    H2GrpcProtocolMode grpc_protocol_mode;
 
     void clear_local_deadline() {
         local_deadline_us = 0;
         local_deadline_present = false;
         local_deadline_expired = false;
+        grpc_protocol_mode = H2GrpcProtocolMode::None;
     }
 };
 

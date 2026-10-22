@@ -88918,6 +88918,7 @@ TEST(local_grpc_deadline, h2_stream_timeout_metadata_isolated_and_clears_on_life
     REQUIRE(stream != nullptr);
     stream->local_deadline_present = true;
     stream->local_deadline_us = 1'000'100u;
+    stream->grpc_protocol_mode = H2GrpcProtocolMode::Native;
     CHECK(stream->local_deadline_present);
 
     auto* stream2 = h2.open_stream(3);
@@ -88929,6 +88930,7 @@ TEST(local_grpc_deadline, h2_stream_timeout_metadata_isolated_and_clears_on_life
     h2_close_stream(&h2, 1);
     CHECK_FALSE(stream->local_deadline_present);
     CHECK_FALSE(stream->local_deadline_expired);
+    CHECK_EQ(stream->grpc_protocol_mode, H2GrpcProtocolMode::None);
     CHECK(stream2->local_deadline_present);
     stream2->local_deadline_expired = true;
     h2_on_reset_cb(nullptr, h2, 3, Http2Error::Cancel);
