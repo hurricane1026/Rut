@@ -2610,6 +2610,9 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
     auto& g = conn.h2->grpc;
     u64 earliest = 0;
     bool has_local_deadline = false;
+    const bool has_async_resume = conn.h2->async_stream != 0 &&
+                                  conn.h2->async_kind == H2AsyncKind::Timer &&
+                                  conn.h2->async_resume_at_us != 0;
     for (u32 i = 0; i < conn.h2->nstreams; i++) {
         const auto& stream = conn.h2->streams[i];
         if (stream.state == Http2StreamState::Closed || !stream.local_deadline_present ||
@@ -2621,7 +2624,7 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
     if (conn.h2->async_stream != 0 && conn.h2->async_kind == H2AsyncKind::Timer &&
         conn.h2->async_resume_at_us != 0 && (!earliest || conn.h2->async_resume_at_us < earliest))
         earliest = conn.h2->async_resume_at_us;
-    if (g.upstream && !has_local_deadline) return;
+    if (g.upstream && !has_local_deadline && !has_async_resume) return;
     for (auto* x : g.streams)
         if (x && !x->failure) {
             if (x->deadline_us && (!earliest || x->deadline_us < earliest))
@@ -2719,8 +2722,14 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
     for (u32 i = 0; i < conn.h2->nstreams; i++) {
         auto& stream = conn.h2->streams[i];
         if (stream.state != Http2StreamState::Closed && stream.local_deadline_present &&
-            !stream.local_deadline_expired && now >= stream.local_deadline_us)
+            !stream.local_deadline_expired && now >= stream.local_deadline_us) {
             stream.local_deadline_expired = true;
+            if (conn.h2->async_stream == stream.id && conn.h2->async_kind == H2AsyncKind::Timer) {
+                conn.pending_handler_fn = nullptr;
+                h2_clear_async(*conn.h2);
+                h2_async_epoch_leave(loop, conn);
+            }
+        }
     }
     Http2Conn* downstream_h2 = conn.h2;
     const u32 downstream_handler_gen = conn.handler_gen;
