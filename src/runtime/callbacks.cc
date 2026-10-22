@@ -1209,9 +1209,9 @@ template void h2_proxy_fail<NativeReactorEventLoop>(NativeReactorEventLoop*, Con
 template void grpc_tick<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 template void grpc_deadline_fired<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 template void throttle_resume<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
-// Active health-check probes are EPOLL ONLY this slice (IoUringEventLoop's sweep
-// re-arms deadlines but issues no probes), so only the epoll instantiation is
-// emitted. This pulls in the on_probe_* callbacks + free_probe_conn transitively.
+// Active health-check probes run on the platform-native readiness loop
+// (epoll/kqueue); io_uring re-arms deadlines but issues no probes. This platform-
+// selected instantiation also pulls in the on_probe_* callbacks transitively.
 template bool start_health_probe<NativeReactorEventLoop>(NativeReactorEventLoop*, u16, u32);
 
 // Out-of-line definition (declared in callbacks.h, documented in callbacks_impl.h)

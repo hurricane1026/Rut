@@ -187,16 +187,17 @@ inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
     return idx;
 }
 
-// --- Active health-check probes (Phase 5 slice 2) — EPOLL ONLY ---
+// --- Active health-check probes (readiness backends: epoll/kqueue) ---
 //
 // A probe is a Connection with fd == -1 (no downstream client) whose upstream_fd
 // is a fresh socket to ONE backend of an hc_enabled upstream. The 1s sweep
-// (EventLoopCRTP::sweep_health_probes) calls start_health_probe per backend; the
-// probe connects, sends `GET <hc_path> HTTP/1.1`, parses the response status, and
-// feeds the result into the SAME per-shard BackendHealth used by passive
-// ejection (record_backend_result), so select_backend honors both signals — no
-// parallel health state. Teardown goes through free_probe_conn (never the full
-// close_conn, which moves per-request metrics/epoch/access-log counters).
+// (EventLoopCRTP::sweep_health_probes) calls start_health_probe per backend. The
+// HTTP/1 mode sends `GET <hc_path>` and matches the status; HTTP/2 sends the
+// standard unary gRPC Health Check and validates its response. Both feed the
+// same per-shard BackendHealth used by passive ejection, so select_backend honors
+// both signals without parallel health state. Teardown goes through
+// free_probe_conn (never full close_conn, which moves per-request metrics/epoch/
+// access-log counters).
 //
 // Format "<ipv4>:<port>" (network-order sockaddr_in) for the probe Host header.
 // out must hold >= 22 bytes ("255.255.255.255:65535"). Returns bytes written.
@@ -243,12 +244,76 @@ inline void build_probe_request(Connection& conn, const UpstreamTarget& target, 
     buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1);
 }
 
+inline bool build_grpc_health_probe_request(Connection& conn,
+                                            const UpstreamTarget& target,
+                                            u32 backend_idx) {
+    if (conn.h2 == nullptr || target.tls.enabled || target.hc_service_len > 128) return false;
+    auto& h2 = *conn.h2;
+    h2.init_client();
+    if (h2.open_stream(1) == nullptr) return false;
+    Buffer& buf = conn.recv_buf;
+    buf.reset();
+    if (buf.write(kClientPreface, kClientPrefaceLen) != kClientPrefaceLen) return false;
+    u8 frame[128];
+    const u32 settings_len = write_settings_frame(frame, h2.our_settings);
+    if (buf.write(frame, settings_len) != settings_len) return false;
+
+    char authority[24];
+    const u32 authority_len = format_probe_host(authority, target.addrs[backend_idx]);
+    static constexpr char kPath[] = "/grpc.health.v1.Health/Check";
+    static constexpr char kPost[] = "POST";
+    static constexpr char kHttp[] = "http";
+    static constexpr char kContentType[] = "application/grpc";
+    static constexpr char kTrailers[] = "trailers";
+    const hpack::Header headers[] = {{{":method", 7}, {kPost, 4}},
+                                     {{":scheme", 7}, {kHttp, 4}},
+                                     {{":authority", 10}, {authority, authority_len}},
+                                     {{":path", 5}, {kPath, sizeof(kPath) - 1}},
+                                     {{"content-type", 12}, {kContentType, 16}},
+                                     {{"te", 2}, {kTrailers, 8}}};
+    u32 header_len = http2_write_headers(buf.write_ptr(),
+                                         buf.write_avail(),
+                                         1,
+                                         headers,
+                                         sizeof(headers) / sizeof(headers[0]),
+                                         false,
+                                         h2.hpack_enc);
+    if (header_len == 0) return false;
+    buf.commit(header_len);
+
+    u8 message[UpstreamTarget::kMaxHealthServiceLen + 3];
+    u32 message_len = 0;
+    if (target.hc_service_len != 0) {
+        message[message_len++] = 0x0a;  // field 1, length-delimited service
+        u32 service_len = target.hc_service_len;
+        while (service_len >= 0x80u) {
+            message[message_len++] = static_cast<u8>((service_len & 0x7fu) | 0x80u);
+            service_len >>= 7;
+        }
+        message[message_len++] = static_cast<u8>(service_len);
+        for (u32 i = 0; i < target.hc_service_len; ++i)
+            message[message_len++] = static_cast<u8>(target.hc_service[i]);
+    }
+    u8 envelope[5 + sizeof(message)];
+    envelope[0] = 0;  // uncompressed gRPC message
+    envelope[1] = static_cast<u8>(message_len >> 24);
+    envelope[2] = static_cast<u8>(message_len >> 16);
+    envelope[3] = static_cast<u8>(message_len >> 8);
+    envelope[4] = static_cast<u8>(message_len);
+    for (u32 i = 0; i < message_len; ++i) envelope[5 + i] = message[i];
+    const u32 data_payload_len = 5 + message_len;
+    if (buf.write_avail() < kFrameHeaderSize + data_payload_len) return false;
+    const u32 data_len = http2_write_data(buf.write_ptr(), 1, envelope, data_payload_len, true);
+    if (data_len != kFrameHeaderSize + data_payload_len) return false;
+    buf.commit(data_len);
+    return true;
+}
+
 template <typename Loop>
 void free_probe_conn(Loop* loop, Connection& conn) {
-    // Minimal teardown — close the probe socket (EPOLL_CTL_DEL first) and return
-    // the slot. Never touches metrics/epoch/access-log/keepalive (the probe is
-    // not a real request). free_health_probe is epoll-only; probes never run on
-    // io_uring this slice, so this is only instantiated for the epoll loop.
+    // Minimal teardown — remove the probe socket from the readiness poller, then
+    // return the slot. Never touches metrics/epoch/access-log/keepalive (the probe is
+    // not a real request). Probes do not run on io_uring this slice.
     //
     // Clearing the in-flight guard here covers every connected/sent/response
     // teardown path (success and error). The probe carries the SAME
@@ -278,6 +343,208 @@ template <typename Loop>
 void on_probe_sent(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void on_probe_connected(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void on_probe_h2_response(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void on_probe_h2_control_sent(void* lp, Connection& conn, IoEvent ev);
+
+inline bool health_probe_grpc_status(const hpack::Header* headers,
+                                     u32 count,
+                                     u8& status,
+                                     bool& present) {
+    for (u32 i = 0; i < count; ++i) {
+        if (!headers[i].name.eq({"grpc-status", 11})) continue;
+        if (present || headers[i].value.len == 0 || headers[i].value.len > 2) return false;
+        u32 value = 0;
+        for (u32 j = 0; j < headers[i].value.len; ++j) {
+            const char ch = headers[i].value.ptr[j];
+            if (ch < '0' || ch > '9') return false;
+            value = value * 10 + static_cast<u32>(ch - '0');
+        }
+        if (value > 16) return false;
+        status = static_cast<u8>(value);
+        present = true;
+    }
+    return true;
+}
+
+inline void on_probe_h2_headers(
+    void*, Http2Conn& h2, u32 stream_id, const hpack::Header* headers, u32 count, bool end_stream) {
+    if (stream_id != 1) {
+        h2.health_probe_malformed = true;
+        return;
+    }
+    u16 status_code = 0;
+    bool status_seen = false;
+    for (u32 i = 0; i < count; ++i) {
+        const auto& header = headers[i];
+        if (header.name.eq({":status", 7})) {
+            if (status_seen || header.value.len != 3) {
+                h2.health_probe_malformed = true;
+                return;
+            }
+            if (header.value.ptr[0] < '0' || header.value.ptr[0] > '9' ||
+                header.value.ptr[1] < '0' || header.value.ptr[1] > '9' ||
+                header.value.ptr[2] < '0' || header.value.ptr[2] > '9') {
+                h2.health_probe_malformed = true;
+                return;
+            }
+            status_code =
+                static_cast<u16>((header.value.ptr[0] - '0') * 100 +
+                                 (header.value.ptr[1] - '0') * 10 + header.value.ptr[2] - '0');
+            status_seen = true;
+        }
+    }
+    // Informational response headers do not establish the final response. Their
+    // ordinary metadata is irrelevant to the eventual gRPC response.
+    if (status_code >= 100 && status_code < 200) return;
+
+    u8 initial_grpc_status = 0;
+    bool initial_grpc_status_seen = false;
+    if (!health_probe_grpc_status(headers, count, initial_grpc_status, initial_grpc_status_seen) ||
+        initial_grpc_status_seen) {
+        h2.health_probe_malformed = true;
+        return;
+    }
+
+    bool content_type = false;
+    for (u32 i = 0; i < count; ++i) {
+        const auto& header = headers[i];
+        if (header.name.eq({"content-type", 12})) {
+            if (content_type || header.value.len < 16 ||
+                !ascii_ci_eq(
+                    reinterpret_cast<const u8*>(header.value.ptr), "application/grpc", 16) ||
+                (header.value.len > 16 && header.value.ptr[16] != '+' &&
+                 header.value.ptr[16] != ';')) {
+                h2.health_probe_malformed = true;
+                return;
+            }
+            content_type = true;
+        }
+    }
+    if (!status_seen || h2.health_probe_initial_headers || status_code != 200 || !content_type) {
+        h2.health_probe_malformed = true;
+        return;
+    }
+    h2.health_probe_http_status = status_code;
+    h2.health_probe_content_type_valid = true;
+    h2.health_probe_initial_headers = true;
+    if (end_stream) h2.health_probe_terminal = true;
+}
+
+inline void on_probe_h2_trailers(
+    void*, Http2Conn& h2, u32 stream_id, const hpack::Header* headers, u32 count, bool end_stream) {
+    if (stream_id != 1 || !end_stream || !h2.health_probe_initial_headers ||
+        !health_probe_grpc_status(
+            headers, count, h2.health_probe_grpc_status, h2.health_probe_grpc_status_seen))
+        h2.health_probe_malformed = true;
+    h2.health_probe_terminal = end_stream;
+}
+
+inline void on_probe_h2_data(
+    void*, Http2Conn& h2, u32 stream_id, const u8* data, u32 len, bool end_stream) {
+    if (stream_id != 1 || !h2.health_probe_initial_headers || h2.health_probe_terminal) {
+        h2.health_probe_malformed = true;
+        return;
+    }
+    const bool prefix_was_incomplete = h2.health_probe_prefix_len < 5;
+    u32 pos = 0;
+    while (pos < len && h2.health_probe_prefix_len < 5)
+        h2.health_probe_prefix[h2.health_probe_prefix_len++] = data[pos++];
+    if (prefix_was_incomplete && h2.health_probe_prefix_len == 5) {
+        if (h2.health_probe_prefix[0] != 0) {
+            h2.health_probe_malformed = true;
+            return;
+        }
+        h2.health_probe_message_expected = (static_cast<u32>(h2.health_probe_prefix[1]) << 24) |
+                                           (static_cast<u32>(h2.health_probe_prefix[2]) << 16) |
+                                           (static_cast<u32>(h2.health_probe_prefix[3]) << 8) |
+                                           static_cast<u32>(h2.health_probe_prefix[4]);
+        if (h2.health_probe_message_expected > Http2Conn::kHealthProbeMessageCap) {
+            h2.health_probe_malformed = true;
+            return;
+        }
+        h2.health_probe_message_complete = h2.health_probe_message_expected == 0;
+    }
+    if (pos < len) {
+        const u32 bytes = len - pos;
+        if (h2.health_probe_message_complete ||
+            bytes > h2.health_probe_message_expected - h2.health_probe_message_len) {
+            h2.health_probe_malformed = true;
+            return;
+        }
+        __builtin_memcpy(h2.health_probe_message + h2.health_probe_message_len, data + pos, bytes);
+        h2.health_probe_message_len += bytes;
+        h2.health_probe_message_complete =
+            h2.health_probe_message_len == h2.health_probe_message_expected;
+    }
+    if (end_stream) h2.health_probe_terminal = true;
+}
+
+inline void on_probe_h2_reset(void*, Http2Conn& h2, u32, Http2Error) {
+    h2.health_probe_malformed = true;
+    h2.health_probe_terminal = true;
+}
+
+inline bool health_probe_read_varint(const u8* bytes, u32 len, u32& pos, u64& value) {
+    value = 0;
+    for (u32 shift = 0; shift < 64 && pos < len; shift += 7) {
+        const u8 byte = bytes[pos++];
+        if (shift == 63 && (byte & 0xfeu) != 0) return false;
+        value |= static_cast<u64>(byte & 0x7fu) << shift;
+        if ((byte & 0x80u) == 0) return true;
+    }
+    return false;
+}
+
+inline bool health_probe_serving_response(const Http2Conn& h2) {
+    if (!h2.health_probe_terminal || h2.health_probe_malformed ||
+        !h2.health_probe_initial_headers || !h2.health_probe_content_type_valid ||
+        h2.health_probe_http_status != 200 || !h2.health_probe_grpc_status_seen ||
+        h2.health_probe_grpc_status != 0 || !h2.health_probe_message_complete ||
+        h2.health_probe_message_len != h2.health_probe_message_expected)
+        return false;
+    bool status_seen = false;
+    u64 status = 0;
+    u32 pos = 0;
+    while (pos < h2.health_probe_message_len) {
+        u64 key = 0;
+        if (!health_probe_read_varint(
+                h2.health_probe_message, h2.health_probe_message_len, pos, key) ||
+            (key >> 3) == 0 || (key >> 3) > 0x1fffffffu)
+            return false;
+        const u32 field = static_cast<u32>(key >> 3);
+        const u32 wire = static_cast<u32>(key & 7u);
+        if (wire == 3 || wire == 4 || wire > 5) return false;
+        if (field == 1 && wire != 0) return false;
+        if (wire == 0) {
+            u64 value = 0;
+            if (!health_probe_read_varint(
+                    h2.health_probe_message, h2.health_probe_message_len, pos, value))
+                return false;
+            if (field == 1) {
+                status_seen = true;
+                status = value;
+            }
+        } else if (wire == 1) {
+            if (h2.health_probe_message_len - pos < 8) return false;
+            pos += 8;
+        } else if (wire == 2) {
+            u64 length = 0;
+            if (!health_probe_read_varint(
+                    h2.health_probe_message, h2.health_probe_message_len, pos, length) ||
+                length > h2.health_probe_message_len - pos)
+                return false;
+            pos += static_cast<u32>(length);
+        } else if (wire == 5) {
+            if (h2.health_probe_message_len - pos < 4) return false;
+            pos += 4;
+        } else {
+            return false;
+        }
+    }
+    return status_seen && status == 1;
+}
 
 // Returns true iff a probe socket was actually submitted (a connect that may
 // queue one synchronous completion into the epoll pending ring). Returns false
@@ -349,7 +616,29 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     }
 
     conn.reset_request_receive_buffer();
-    build_probe_request(conn, target, backend_idx);
+    if (target.http2) {
+        if (target.tls.enabled) {
+            free_probe_conn(loop, conn);
+            return false;
+        }
+        bool h2_allocated = false;
+        if constexpr (requires { loop->alloc_h2(conn); }) h2_allocated = loop->alloc_h2(conn);
+        if (!h2_allocated || !build_grpc_health_probe_request(conn, target, backend_idx)) {
+            free_probe_conn(loop, conn);
+            return false;
+        }
+        // The probe owns this client-mode Http2Conn and its one response stream.
+        // Install the accumulator callbacks here: init_client() clears protocol
+        // state, while the ordinary gRPC proxy installs callbacks per receive
+        // episode because its callback context is stack-owned.
+        conn.h2->cb_ctx = nullptr;
+        conn.h2->on_headers = &on_probe_h2_headers;
+        conn.h2->on_trailers = &on_probe_h2_trailers;
+        conn.h2->on_data = &on_probe_h2_data;
+        conn.h2->on_reset = &on_probe_h2_reset;
+    } else {
+        build_probe_request(conn, target, backend_idx);
+    }
 
     conn.set_slots(nullptr, nullptr, nullptr, &on_probe_connected<Loop>);
     if (!loop->submit_connect(
@@ -401,6 +690,43 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.result < 0) {
         record_probe_if_current(loop, conn, /*healthy=*/false, monotonic_us());
         free_probe_conn(loop, conn);
+        return;
+    }
+    if (conn.h2 != nullptr) {
+        const u32 request_len = conn.recv_buf.len();
+        const u32 result = static_cast<u32>(ev.result);
+        if (conn.send_progress > request_len || result > request_len - conn.send_progress ||
+            result == 0) {
+            record_probe_if_current(loop, conn, false, monotonic_us());
+            free_probe_conn(loop, conn);
+            return;
+        }
+        conn.send_progress += result;
+        if (conn.send_progress < request_len) {
+            if (!loop->submit_send_upstream(conn,
+                                            conn.recv_buf.data() + conn.send_progress,
+                                            request_len - conn.send_progress))
+                free_probe_conn(loop, conn);
+            return;
+        }
+        conn.send_progress = 0;
+        if (conn.h2 != nullptr) {
+            Http2Stream* stream = conn.h2->find_stream(1);
+            if (stream == nullptr) {
+                record_probe_if_current(loop, conn, false, monotonic_us());
+                free_probe_conn(loop, conn);
+                return;
+            }
+            stream->state = Http2StreamState::HalfClosedLocal;
+        }
+        conn.reset_request_receive_buffer();
+        conn.set_slots(nullptr, nullptr, &on_probe_h2_response<Loop>, nullptr);
+        if (conn.upstream_recv_buf.len() > 0) {
+            IoEvent synth{conn.id, 1, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+            on_probe_h2_response<Loop>(lp, conn, synth);
+        } else if (!loop->submit_recv_upstream(conn)) {
+            free_probe_conn(loop, conn);
+        }
         return;
     }
     conn.set_slots(nullptr, nullptr, &on_probe_response<Loop>, nullptr);
@@ -468,6 +794,93 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     }
     record_active_probe_result(conn.upstream_idx, conn.upstream_backend_idx, healthy, kNowUs);
     free_probe_conn(loop, conn);
+}
+
+template <typename Loop>
+void on_probe_h2_response(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    Http2Conn* h2 = conn.h2;
+    if (h2 == nullptr) {
+        free_probe_conn(loop, conn);
+        return;
+    }
+    if (ev.aux == kLocalSubmitFailureAux) {
+        free_probe_conn(loop, conn);
+        return;
+    }
+    const bool eof = ev.result == 0;
+    if (ev.result < 0 || (eof && conn.upstream_recv_buf.len() == 0)) {
+        record_probe_if_current(loop, conn, false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    u32 control_len = 0;
+    Http2Result result = h2->process(conn.upstream_recv_buf.data(),
+                                     conn.upstream_recv_buf.len(),
+                                     conn.send_buf.write_ptr(),
+                                     conn.send_buf.write_avail(),
+                                     &control_len);
+    if (result.consumed != 0) conn.upstream_recv_buf.consume(result.consumed);
+    if (result.close || (h2->peer_goaway && h2->peer_last_stream < 1) ||
+        h2->health_probe_malformed) {
+        record_probe_if_current(loop, conn, false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    if (h2->health_probe_terminal) {
+        record_probe_if_current(loop, conn, health_probe_serving_response(*h2), monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    if (control_len != 0) {
+        conn.send_buf.commit(control_len);
+        conn.send_progress = 0;
+        conn.set_slots(nullptr, nullptr, nullptr, &on_probe_h2_control_sent<Loop>);
+        if (!loop->submit_send_upstream(conn, conn.send_buf.data(), conn.send_buf.len()))
+            free_probe_conn(loop, conn);
+        return;
+    }
+    if (eof) {
+        record_probe_if_current(loop, conn, false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    if (conn.upstream_recv_buf.write_avail() == 0) {
+        record_probe_if_current(loop, conn, false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    if (!loop->submit_recv_upstream(conn)) free_probe_conn(loop, conn);
+}
+
+template <typename Loop>
+void on_probe_h2_control_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.aux == kLocalSubmitFailureAux) {
+        free_probe_conn(loop, conn);
+        return;
+    }
+    const u32 send_len = conn.send_buf.len();
+    if (ev.result <= 0 || conn.send_progress > send_len ||
+        static_cast<u32>(ev.result) > send_len - conn.send_progress) {
+        record_probe_if_current(loop, conn, false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    conn.send_progress += static_cast<u32>(ev.result);
+    if (conn.send_progress < send_len) {
+        if (!loop->submit_send_upstream(
+                conn, conn.send_buf.data() + conn.send_progress, send_len - conn.send_progress))
+            free_probe_conn(loop, conn);
+        return;
+    }
+    conn.send_progress = 0;
+    conn.send_buf.reset();
+    // Resume parsing bytes retained while the SETTINGS/PING acknowledgement was
+    // sent. A synthetic positive result means "process buffered input, then arm
+    // another recv if it is incomplete"; it does not represent socket bytes.
+    IoEvent synth{conn.id, 1, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+    on_probe_h2_response<Loop>(lp, conn, synth);
 }
 
 u8 map_log_method(HttpMethod method);

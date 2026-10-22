@@ -361,14 +361,13 @@ public:
         }
     }
 
-    // --- Active health-check probes (`health_check { ... }`) — EPOLL ONLY ---
+    // --- Active health-check probes (`health_check { ... }`) — readiness loops ---
     // Per-upstream probe deadlines, mirroring timer_deadline_ns. Re-armed (from
     // activation) whenever the active config changes — same generation guard as
     // fire_due_timers — so an upstream's `interval` measures from config install,
     // not from a stale deadline. Lives in the CRTP base so the re-arm bookkeeping
-    // runs on BOTH backends; the actual probe issue is gated to epoll this slice
-    // (Derived::kSupportsHealthProbe), since only the epoll loop can synchronously
-    // tear a probe Connection down. io_uring probing is a deliberate follow-up.
+    // runs on both readiness backends; probe issue is gated by
+    // Derived::kSupportsHealthProbe. io_uring probing remains unsupported.
     u64 health_probe_deadline_ns[RouteConfig::kMaxUpstreams]{};
     const RouteConfig* health_armed_config = nullptr;
     u32 health_probe_sweep_cursor = 0;
@@ -391,7 +390,7 @@ public:
     // in that window would route off stale numeric-slot verdicts. It advances
     // health_armed_config, so the subsequent sweep on the Timeout path sees no
     // change and does NOT double-reset (reset happens exactly once per swap).
-    // Runs on BOTH backends (probe issue below stays epoll-only).
+    // Runs on every backend (probe issue below stays readiness-only).
     bool arm_health_on_config_change() {
         const RouteConfig** cfg_ptr = self().config_ptr;
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;

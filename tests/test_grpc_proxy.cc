@@ -7,6 +7,7 @@
 #include "test_helpers.h"
 
 #include <nghttp2/nghttp2.h>
+#include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #if RUT_GRPC_JIT
@@ -565,21 +566,46 @@ struct Client {
         static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].closed = true;
         return 0;
     }
-    bool init(u16 port, bool tls = false) {
+    bool init(u16 port, bool tls = false, const char* label = "client") {
+        auto fail = [&](const char* stage, int error, int result, int ssl_error = 0) {
+            fprintf(stderr,
+                    "grpc Client::init[%s] failed stage=%s errno=%d rc=%d ssl_error=%d "
+                    "openssl_error=%lu\n",
+                    label,
+                    stage,
+                    error,
+                    result,
+                    ssl_error,
+                    ERR_peek_error());
+            return false;
+        };
+        ERR_clear_error();
+        errno = 0;
         fd = connect_to(port);
-        if (fd < 0) return false;
+        if (fd < 0) return fail("connect", errno, -1);
         set_socket_timeouts(fd, 5);
         if (tls) {
+            ERR_clear_error();
+            errno = 0;
             tls_context = SSL_CTX_new(TLS_client_method());
-            if (!tls_context) return false;
+            if (!tls_context) return fail("ctx", errno, 0);
+            ERR_clear_error();
+            errno = 0;
             ssl = SSL_new(tls_context);
+            if (!ssl) return fail("new", errno, 0);
+            errno = 0;
+            if (!SSL_set_fd(ssl, fd)) return fail("setfd", errno, 0);
             const u8 alpn[] = {2, 'h', '2'};
-            if (!ssl || !SSL_set_fd(ssl, fd) || SSL_set_alpn_protos(ssl, alpn, sizeof(alpn)) != 0 ||
-                SSL_connect(ssl) != 1)
-                return false;
+            errno = 0;
+            if (SSL_set_alpn_protos(ssl, alpn, sizeof(alpn)) != 0) return fail("alpn", errno, -1);
+            ERR_clear_error();
+            errno = 0;
+            const int rc = SSL_connect(ssl);
+            if (rc != 1) return fail("SSL_connect", errno, rc, SSL_get_error(ssl, rc));
         }
-        nghttp2_session_callbacks* cb;
-        nghttp2_session_callbacks_new(&cb);
+        nghttp2_session_callbacks* cb = nullptr;
+        const int callbacks_rc = nghttp2_session_callbacks_new(&cb);
+        if (callbacks_rc != 0) return fail("nghttp2_callbacks", errno, callbacks_rc);
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, &receive);
         nghttp2_session_callbacks_set_on_header_callback(cb, &header);
         nghttp2_session_callbacks_set_on_stream_close_callback(cb, &closed);
@@ -587,8 +613,10 @@ struct Client {
         nghttp2_session_callbacks_set_on_frame_send_callback(cb, &frame_send);
         const int rc = nghttp2_session_client_new(&session, cb, this);
         nghttp2_session_callbacks_del(cb);
-        nghttp2_submit_settings(session, 0, nullptr, 0);
-        return rc == 0;
+        if (rc != 0) return fail("nghttp2_session", errno, rc);
+        const int settings_rc = nghttp2_submit_settings(session, 0, nullptr, 0);
+        if (settings_rc != 0) return fail("nghttp2_settings", errno, settings_rc);
+        return true;
     }
     int request(u32 index,
                 u32 bytes,
@@ -850,7 +878,9 @@ void streaming_case(rut::test::TestCase* _tc,
     // No REQUIRE after spawning: always stop/join before destroying config.
     {
         Client a, b;
-        const bool connected = a.init(get_port(lfd), tls) && b.init(get_port(lfd), tls);
+        const bool a_connected = a.init(get_port(lfd), tls, "a");
+        const bool b_connected = a_connected && b.init(get_port(lfd), tls, "b");
+        const bool connected = a_connected && b_connected;
         CHECK(connected);
         if (connected) {
             CHECK_EQ(a.request(0, large_first ? 200000 : 128, false), 1);
@@ -9465,6 +9495,20 @@ TEST(grpc_proxy, message_limits_snapshot_epoll) {
 }
 TEST(grpc_proxy, message_limits_snapshot_iouring) {
     message_limit_snapshot_case<IoUringEventLoop>(_tc);
+}
+
+struct LoopbackConnectRetryProbe {
+    int calls = 0;
+};
+LoopbackConnectRetryProbe loopback_connect_retry_probe;
+int connect_eintr_then_real(int fd, const sockaddr* addr, socklen_t addr_len) {
+    auto& probe = loopback_connect_retry_probe;
+    probe.calls++;
+    if (probe.calls == 1) {
+        errno = EINTR;
+        return -1;
+    }
+    return ::connect(fd, addr, addr_len);
 }
 
 #include "grpc_web_h1_cases.h"

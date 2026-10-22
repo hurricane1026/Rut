@@ -529,8 +529,15 @@ transport, malformed protobuf, budget exhaustion or oversized encoded output
 return nil; an explicit empty envelope is valid. These operations use the existing
 protobuf subset and do not generate routes or status headers.
 
-JSON transcoding and gRPC health probes are not implemented by this
-option; `health_check` with `.http2` is rejected.
+JSON transcoding is not implemented by this option. An `.http2` upstream may
+use `health_check: { interval: 5s, service: "package.Service" }` to issue the
+standard unary `/grpc.health.v1.Health/Check` probe. `service` is optional,
+accepts at most 128 valid UTF-8 bytes, and defaults to the empty string, which
+asks the server for overall health. A probe marks the backend healthy only for
+HTTP 200, a gRPC content type, `grpc-status:
+0`, and a valid `HealthCheckResponse` with status `SERVING`. Probes use plaintext
+HTTP/2; TLS probes, `Watch`, and active probes from the io_uring backend are not
+supported. HTTP/1 health checks retain the `path` and optional `status` form.
 
 Binary and base64-text gRPC-Web can use the same `.http2` upstream through
 HTTP/2 or HTTP/1.1 POST requests. Content types are `application/grpc-web` and

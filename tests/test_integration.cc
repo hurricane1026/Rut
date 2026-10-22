@@ -2473,7 +2473,127 @@ struct HealthProbeServer {
     }
 };
 
-// Active health checks (slice 2, epoll): the built-in probe sweep connects to an
+// Minimal plaintext HTTP/2 server for the gRPC Health probe integration path.
+// It consumes one complete client request, then returns a unary Check response
+// whose protobuf enum can switch between NOT_SERVING and SERVING.
+struct GrpcHealthProbeServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> serving{false};
+    std::atomic<bool> running{false};
+    std::atomic<u32> requests{0};
+    bool started = false;
+    pthread_t thread{};
+
+    ~GrpcHealthProbeServer() { teardown(); }
+
+    static bool respond(i32 fd, bool is_serving) {
+        u8 response[512];
+        u32 length = 0;
+        Http2Settings settings{};
+        settings.set_defaults();
+        length = write_settings_frame(response, settings);
+        hpack::Encoder encoder;
+        encoder.init(4096);
+        const hpack::Header initial[] = {{{":status", 7}, {"200", 3}},
+                                         {{"content-type", 12}, {"application/grpc", 16}}};
+        const u32 headers_len = http2_write_headers(
+            response + length, sizeof(response) - length, 1, initial, 2, false, encoder);
+        if (headers_len == 0) return false;
+        length += headers_len;
+        const u8 envelope[] = {0, 0, 0, 0, 2, 0x08, static_cast<u8>(is_serving ? 1 : 2)};
+        const u32 data_len =
+            http2_write_data(response + length, 1, envelope, sizeof(envelope), false);
+        if (data_len == 0) return false;
+        length += data_len;
+        const hpack::Header trailers[] = {{{"grpc-status", 11}, {"0", 1}}};
+        const u32 trailer_len = http2_write_headers(
+            response + length, sizeof(response) - length, 1, trailers, 1, true, encoder);
+        if (trailer_len == 0) return false;
+        length += trailer_len;
+        return send_all(fd, reinterpret_cast<const char*>(response), length);
+    }
+
+    static void* run(void* arg) {
+        auto* server = static_cast<GrpcHealthProbeServer*>(arg);
+        while (server->running.load(std::memory_order_acquire)) {
+            pollfd listener{server->listen_fd, POLLIN, 0};
+            if (poll(&listener, 1, 20) <= 0) continue;
+            const i32 client = accept(server->listen_fd, nullptr, nullptr);
+            if (client < 0) continue;
+            set_socket_timeouts(client, 2);
+            u8 request[4096];
+            u32 total = 0;
+            bool complete = false;
+            while (total < sizeof(request) && !complete) {
+                const i32 n = recv_timeout(client,
+                                           reinterpret_cast<char*>(request + total),
+                                           sizeof(request) - total,
+                                           1000);
+                if (n <= 0) break;
+                total += static_cast<u32>(n);
+                if (total < kClientPrefaceLen) continue;
+                u32 pos = kClientPrefaceLen;
+                while (pos + kFrameHeaderSize <= total) {
+                    Http2FrameHeader frame{};
+                    if (parse_frame_header(request + pos, total - pos, &frame) !=
+                        ParseStatus::Complete)
+                        break;
+                    const u32 frame_end = pos + kFrameHeaderSize + frame.length;
+                    if (frame_end > total) break;
+                    if (frame.type == static_cast<u8>(Http2FrameType::Data) &&
+                        (frame.flags & http2_flag::kEndStream))
+                        complete = true;
+                    pos = frame_end;
+                }
+            }
+            if (complete) {
+                server->requests.fetch_add(1, std::memory_order_relaxed);
+                (void)respond(client, server->serving.load(std::memory_order_acquire));
+                // The client acknowledges our SETTINGS when it parses them
+                // before the terminal response. Drain that optional ACK so a
+                // split recv does not race an immediate peer close.
+                pollfd ack{client, POLLIN, 0};
+                if (poll(&ack, 1, 100) > 0) {
+                    u8 ignored[64];
+                    (void)recv(client, ignored, sizeof(ignored), 0);
+                }
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto socket = create_listen_socket(0);
+        if (!socket.has_value()) return false;
+        listen_fd = socket.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Active health checks on readiness loops: the built-in probe sweep connects to an
 // hc_enabled backend, GETs the health path, and feeds the result into the SHARED
 // BackendHealth via record_backend_result. A backend that answers the probe with
 // 503 (!= hc_expected_status) is ejected once it crosses the consecutive-failure
@@ -2533,6 +2653,57 @@ TEST(active_health_e2e, probe_ejects_failing_backend_then_recovers) {
     loop->health_probe_deadline_ns[uid] = 0;
     loop->sweep_health_probes();
     pump();
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+    backend.teardown();
+}
+
+TEST(active_health_e2e, grpc_http2_check_marks_backend_and_recovers) {
+    using namespace rut;
+    GrpcHealthProbeServer backend;
+    REQUIRE(backend.setup());
+    backend.serving.store(false, std::memory_order_release);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("grpc", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    cfg.upstreams[uid].http2 = true;
+    REQUIRE(cfg.set_upstream_grpc_health_check(uid, nullptr, 0, /*interval_ms=*/1));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    record_active_probe_result(uid, 0, /*healthy=*/true, monotonic_us());
+
+    auto pump = [&]() {
+        IoEvent events[64];
+        for (int it = 0; it < 200 && loop->active_count() > 0; ++it) {
+            const u32 count = loop->backend.wait(events, 64, loop->conns, RealLoop::kMaxConns);
+            for (u32 i = 0; i < count; ++i) loop->dispatch(events[i]);
+        }
+    };
+
+    loop->sweep_health_probes();  // config install
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    pump();
+    CHECK_EQ(backend.requests.load(std::memory_order_acquire), 1u);
+    CHECK(backend_ejected(uid, 0, monotonic_us()));  // NOT_SERVING
+
+    backend.serving.store(true, std::memory_order_release);
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    pump();
+    CHECK_EQ(backend.requests.load(std::memory_order_acquire), 2u);
     CHECK(!backend_ejected(uid, 0, monotonic_us()));
 
     loop->shutdown();
@@ -3194,6 +3365,43 @@ TEST(active_health, route_config_rejects_invalid_probe_config) {
     CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/99));
     CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/600));
     CHECK(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/204));
+}
+
+TEST(active_health, grpc_route_config_validates_utf8_and_service_bound) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("grpc", 0x7F000001, 50051);
+    REQUIRE(id.has_value());
+    const u32 uid = id.value();
+    cfg.upstreams[uid].http2 = true;
+    const char service[] = "réplica.Service";
+    REQUIRE(cfg.set_upstream_grpc_health_check(
+        uid, service, sizeof(service) - 1, /*interval_ms=*/1000));
+    CHECK_EQ(cfg.upstreams[uid].hc_service_len, sizeof(service) - 1);
+    const Str configured_service{cfg.upstreams[uid].hc_service, cfg.upstreams[uid].hc_service_len};
+    CHECK(configured_service.eq({service, sizeof(service) - 1}));
+
+    char too_long[UpstreamTarget::kMaxHealthServiceLen + 1];
+    __builtin_memset(too_long, 'x', sizeof(too_long));
+    const char invalid_utf8[] = {static_cast<char>(0xff)};
+    CHECK(
+        !cfg.set_upstream_grpc_health_check(uid, too_long, sizeof(too_long), /*interval_ms=*/1000));
+    CHECK(!cfg.set_upstream_grpc_health_check(uid, invalid_utf8, 1, /*interval_ms=*/1000));
+    CHECK(!cfg.set_upstream_grpc_health_check(uid, nullptr, 0, /*interval_ms=*/0));
+    cfg.upstreams[uid].tls.enabled = true;
+    CHECK(!cfg.set_upstream_grpc_health_check(uid, nullptr, 0, /*interval_ms=*/1000));
+
+    RouteConfig http1{};
+    auto http1_id = http1.add_upstream("http", 0x7F000001, 8080);
+    REQUIRE(http1_id.has_value());
+    CHECK(!http1.set_upstream_grpc_health_check(http1_id.value(), nullptr, 0, 1000));
+
+    // The legacy HTTP/1 setter previously accepted direct callers with TLS
+    // metadata; keep that API behavior unchanged while the new gRPC setter
+    // rejects TLS probes until a TLS probe transport exists.
+    http1.upstreams[http1_id.value()].tls.enabled = true;
+    CHECK(http1.set_upstream_health_check(
+        http1_id.value(), "/health", 7, /*interval_ms=*/1000, /*status=*/200));
 }
 
 TEST(active_health, sweep_keeps_due_deadline_on_probe_deferral) {
@@ -21996,7 +22204,8 @@ TEST(route, upstream_health_check_status_defaults_to_200) {
     rir.destroy();
 }
 
-// `health_check` missing the required `path` key is rejected at parse time.
+// `path` is protocol-specific, so its absence is rejected after the whole
+// upstream has been parsed and its protocol is known.
 TEST(route, upstream_health_check_missing_path_rejected) {
     using namespace rut;
     const char* src =
@@ -22008,7 +22217,9 @@ TEST(route, upstream_health_check_missing_path_rejected) {
     auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
-    CHECK(!ast);  // parser rejects: required `path` missing
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    CHECK(!analyze_file(*ast_owned));
 }
 
 // `health_check` missing the required `interval` key is rejected at parse time.

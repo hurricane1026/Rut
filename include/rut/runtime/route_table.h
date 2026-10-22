@@ -14,6 +14,7 @@
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/protobuf_value.h"
 #include "rut/runtime/rate_limit_key.h"
 #include "rut/runtime/route_art.h"
 #include "rut/runtime/route_canon.h"   // canonicalize_request
@@ -76,10 +77,9 @@ struct UpstreamTarget {
     // cap the runtime answers 503 before connecting.
     u32 max_inflight = 0;
 
-    // Active health-check config from `health_check: { ... }` (data only — no
-    // probing wired up yet). hc_enabled gates the rest; hc_path is the probe
-    // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe
-    // period, hc_expected_status the status that marks a backend healthy.
+    // Active health-check config from `health_check: { ... }`. HTTP/1 uses
+    // hc_path/hc_expected_status; plaintext HTTP/2 uses the fixed gRPC Health
+    // Check method and hc_service. Strings are not NUL-terminated; use lengths.
     UpstreamTlsSpec tls{};
     GrpcRetryPolicy grpc_retry{};
     u32 max_request_message_bytes = 0;
@@ -88,6 +88,9 @@ struct UpstreamTarget {
     bool hc_enabled = false;
     char hc_path[64];
     u32 hc_path_len = 0;
+    static constexpr u32 kMaxHealthServiceLen = 128;
+    char hc_service[kMaxHealthServiceLen + 1];
+    u32 hc_service_len = 0;
     u32 hc_interval_ms = 0;
     u16 hc_expected_status = 200;
 
@@ -1426,17 +1429,16 @@ public:
         return true;
     }
 
-    // Attach active health-check config to an upstream (by id). Data only — no
-    // probing is performed yet. `path` (length `path_len`, not required to be
-    // NUL-terminated) is the probe path; `interval_ms` the probe period;
-    // `status` the status code that marks a backend healthy. Returns false on a
-    // bad upstream id, an over-long path, a non-origin-form path (empty, missing
-    // the leading '/', or containing bytes that would break the request line),
-    // or an impossible expected HTTP status.
+    // Attach HTTP/1 active health-check config to an upstream (by id). `path`
+    // (length `path_len`, not required to be NUL-terminated) is the probe path;
+    // `interval_ms` the period; `status` the expected HTTP status. Returns false
+    // on a bad upstream id, an HTTP/2 target, an over-long or invalid origin-form
+    // path, or an impossible expected status.
     bool set_upstream_health_check(
         u32 uid, const char* path, u32 path_len, u32 interval_ms, u16 status) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
+        if (up.http2) return false;
         if (path == nullptr) return false;
         if (path_len >= sizeof(up.hc_path)) return false;
         if (interval_ms == 0) return false;
@@ -1453,8 +1455,29 @@ public:
         for (u32 i = 0; i < path_len; i++) up.hc_path[i] = path[i];
         up.hc_path[path_len] = '\0';
         up.hc_path_len = path_len;
+        up.hc_service_len = 0;
         up.hc_interval_ms = interval_ms;
         up.hc_expected_status = status;
+        up.hc_enabled = true;
+        return true;
+    }
+
+    bool set_upstream_grpc_health_check(u32 uid,
+                                        const char* service,
+                                        u32 service_len,
+                                        u32 interval_ms) {
+        if (uid >= upstream_count) return false;
+        UpstreamTarget& up = upstreams[uid];
+        if (!up.http2 || up.tls.enabled || (service_len != 0 && service == nullptr) ||
+            service_len > UpstreamTarget::kMaxHealthServiceLen || interval_ms == 0)
+            return false;
+        if (!protobuf::utf8({service, service_len})) return false;
+        up.hc_path_len = 0;
+        up.hc_service_len = service_len;
+        for (u32 i = 0; i < service_len; i++) up.hc_service[i] = service[i];
+        up.hc_service[service_len] = '\0';
+        up.hc_interval_ms = interval_ms;
+        up.hc_expected_status = 200;
         up.hc_enabled = true;
         return true;
     }

@@ -16792,12 +16792,24 @@ static FrontendResult<HirModule*> analyze_file_internal(
             up.ip = ip;
             up.port = static_cast<u16>(port_value);
         }
-        // Active health-check config (parser already validated path/interval
-        // presence + ranges). Carried verbatim; no probing in this slice.
-        if (item.upstream.http2 && item.upstream.hc_enabled)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  item.upstream.addr_span,
-                                  {"HTTP/2 health checks are not supported", 37});
+        // Health-check fields are protocol-specific. HTTP/1 keeps its existing
+        // path/status form. HTTP/2 uses the standard gRPC Health Check RPC, whose
+        // method is fixed and whose service name is optional. TLS probes are
+        // explicitly rejected until the probe path can perform TLS.
+        if (item.upstream.hc_enabled) {
+            if (item.upstream.http2) {
+                if (item.upstream.hc_path_set || item.upstream.hc_status_set ||
+                    item.upstream.tls.enabled)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.upstream.addr_span,
+                                          {"HTTP/2 health_check accepts service only", 40});
+            } else if (item.upstream.hc_path_lit.len == 0 || item.upstream.hc_service_set) {
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    item.upstream.addr_span,
+                    {"HTTP/1 health_check requires path and rejects service", 53});
+            }
+        }
         up.max_request_message_bytes = item.upstream.max_request_message_bytes;
         up.max_response_message_bytes = item.upstream.max_response_message_bytes;
         if ((up.max_request_message_bytes || up.max_response_message_bytes) && !item.upstream.http2)
@@ -16811,6 +16823,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.http2 = item.upstream.http2;
         up.hc_enabled = item.upstream.hc_enabled;
         up.hc_path = item.upstream.hc_path_lit;
+        up.hc_service = item.upstream.hc_service_lit;
         up.hc_interval_ms = item.upstream.hc_interval_ms;
         up.hc_expected_status = item.upstream.hc_expected_status;
         if (!mod.upstreams.push(up))

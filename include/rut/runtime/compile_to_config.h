@@ -559,8 +559,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             for (u32 b = 0; b < up.extra_count; b++) {
                 if (!cfg.add_upstream_backend(i, up.extra_ips[b], up.extra_ports[b])) return false;
             }
-            // Attach active health-check config (data only; the frontend already
-            // validated path/interval). Fails only on an over-long path.
+            // Attach the protocol-specific active health-check config after
+            // applying HTTP version and TLS settings to the runtime target.
             if (!valid_upstream_tls(up.tls) || (up.tls.enabled && !up.http2)) return false;
             if ((up.max_request_message_bytes || up.max_response_message_bytes) && !up.http2)
                 return false;
@@ -571,12 +571,15 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
             if (up.hc_enabled) {
-                if (!cfg.set_upstream_health_check(i,
-                                                   up.hc_path.ptr,
-                                                   up.hc_path.len,
-                                                   up.hc_interval_ms,
-                                                   up.hc_expected_status))
-                    return false;
+                const bool health_ok =
+                    up.http2 ? cfg.set_upstream_grpc_health_check(
+                                   i, up.hc_service.ptr, up.hc_service.len, up.hc_interval_ms)
+                             : cfg.set_upstream_health_check(i,
+                                                             up.hc_path.ptr,
+                                                             up.hc_path.len,
+                                                             up.hc_interval_ms,
+                                                             up.hc_expected_status);
+                if (!health_ok) return false;
             }
         }
     } else {
@@ -606,7 +609,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
         // Attach active health-check config onto the pre-bound upstreams too —
         // the caller bound only addresses, so without this the hc fields stay at
         // their defaults (hc_enabled == false) and no probes ever run. Mirrors the
-        // empty-upstreams branch above. Fails only on an over-long path.
+        // empty-upstreams branch above.
         for (u32 i = 0; i < mod.upstream_count; i++) {
             const auto& up = mod.upstreams[i];
             if (!valid_upstream_tls(up.tls) || (up.tls.enabled && !up.http2)) return false;
@@ -619,12 +622,15 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
             if (up.hc_enabled) {
-                if (!cfg.set_upstream_health_check(i,
-                                                   up.hc_path.ptr,
-                                                   up.hc_path.len,
-                                                   up.hc_interval_ms,
-                                                   up.hc_expected_status))
-                    return false;
+                const bool health_ok =
+                    up.http2 ? cfg.set_upstream_grpc_health_check(
+                                   i, up.hc_service.ptr, up.hc_service.len, up.hc_interval_ms)
+                             : cfg.set_upstream_health_check(i,
+                                                             up.hc_path.ptr,
+                                                             up.hc_path.len,
+                                                             up.hc_interval_ms,
+                                                             up.hc_expected_status);
+                if (!health_ok) return false;
             }
         }
     }

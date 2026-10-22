@@ -1661,10 +1661,13 @@ rejections retain the existing HTTP error path and are not counted as admitted
 RPCs. The source live-log writer retains its configured bytes-only output.
 
 Header-only route handlers can forward gRPC. Body-dependent handlers,
-HTTP/1-specific forwarding policies, JSON transcoding and gRPC health checks
-remain outside this path. The frontend rejects
-`.http2` combined with the HTTP/1 health-check configuration. See
-[examples/grpc.rut](examples/grpc.rut) and the language card.
+HTTP/1-specific forwarding policies and JSON transcoding remain outside this
+path. HTTP/2 upstreams support active unary gRPC Health `Check` probes over
+plaintext HTTP/2; TLS probes and `Watch` are unsupported. HTTP/1 upstreams keep
+their existing path/status health-check form. Active probes run on epoll and
+kqueue readiness loops; io_uring does not issue probes. See
+[examples/grpc.rut](examples/grpc.rut) and the language card for the current
+configuration and response criteria.
 
 The gRPC-Web bridge accepts HTTP/2 and HTTP/1.1 POST requests with binary
 `application/grpc-web` or base64 `application/grpc-web-text`, with optional

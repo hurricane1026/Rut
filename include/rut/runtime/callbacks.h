@@ -288,15 +288,13 @@ void h2_proxy_fail(Loop* loop, Connection& conn, u16 status);
 template <typename Loop>
 void throttle_resume(Loop* loop, Connection& conn);
 
-// Start one built-in active health-check probe to (upstream_idx, backend_idx):
-// connect a fresh socket, GET <hc_path>, parse the status, and feed the result
-// into the shared BackendHealth via record_backend_result. Invoked from the
-// per-shard 1s sweep (EventLoopCRTP::sweep_health_probes). Defined in
-// callbacks_impl.h; EPOLL ONLY this slice. No-op if the slot pool is exhausted
-// (never starve real traffic with probes).
-// Returns true iff a probe socket was submitted (may consume one epoll
-// pending-ring slot); false if skipped/aborted before submit. sweep_health_probes
-// budgets probes against the fixed ring using this.
+// Start one built-in HTTP/1 or gRPC HTTP/2 health probe to
+// (upstream_idx, backend_idx), then feed its verdict into shared BackendHealth.
+// Invoked from the per-shard 1s sweep (EventLoopCRTP::sweep_health_probes).
+// Defined in callbacks_impl.h; supported by epoll/kqueue, not io_uring. No-op if
+// the slot pool is exhausted (never starve real traffic with probes).
+// Returns true iff a probe socket was submitted; false if skipped/aborted before
+// submit. sweep_health_probes budgets probes against the backend event capacity.
 template <typename Loop>
 bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx);
 

@@ -40009,15 +40009,54 @@ TEST(frontend, upstream_protocol_rejects_unknown_and_duplicate_values) {
     }
 }
 
-TEST(frontend, upstream_http2_rejects_http1_health_probe) {
+TEST(frontend, upstream_http2_grpc_health_probe_reaches_runtime_config) {
     const char* src =
         "upstream grpc { host: \"127.0.0.1\", port: 50051, protocol: .http2, "
-        "health_check: { path: \"/healthz\", interval: 2s } }\n";
+        "health_check: { interval: 2s, service: \"réplica.Service\" } }\n";
     auto tokens = lex(lit(src));
     REQUIRE(tokens);
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
-    CHECK(!analyze_file_heap(ast.value()));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK(cfg.upstreams[0].http2);
+    CHECK(cfg.upstreams[0].hc_enabled);
+    CHECK_EQ(cfg.upstreams[0].hc_interval_ms, 2000u);
+    const Str service{cfg.upstreams[0].hc_service, cfg.upstreams[0].hc_service_len};
+    CHECK_EQ(service.len, 16u);
+    CHECK(service.eq(lit_str("réplica.Service")));
+    rir.destroy();
+}
+
+TEST(frontend, health_probe_protocol_fields_are_validated) {
+    const char* invalid[] = {
+        "protocol: .http2, health_check: { path: \"/healthz\", interval: 2s }",
+        "protocol: .http2, health_check: { path: \"\", interval: 2s }",
+        "protocol: .http2, health_check: { interval: 2s, status: 200 }",
+        "protocol: .http2, tls: { ca: \"ca.pem\", server_name: \"backend.example\" }, "
+        "health_check: { interval: 2s }",
+        "protocol: .http11, health_check: { interval: 2s, service: \"api\" }",
+        "protocol: .http2, health_check: { interval: 2s, service: \"bad\xFFname\" }",
+    };
+    for (const char* fields : invalid) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { host: \"127.0.0.1\", port: 50051, %s }",
+                 fields);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        if (!ast) continue;
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(!hir);
+    }
 }
 
 TEST(frontend, string_literals_decode_expression_escapes) {

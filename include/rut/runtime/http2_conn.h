@@ -120,6 +120,22 @@ struct Http2Conn {
 
     hpack::DynamicTable hpack_dec;
     hpack::Encoder hpack_enc;  // response-side encoder (dynamic indexing)
+    // Bounded accumulator used only by the one-stream active gRPC Health probe.
+    // Kept on the pooled HTTP/2 object so probe callbacks remain connection-owned.
+    u16 health_probe_http_status;
+    u8 health_probe_grpc_status;
+    bool health_probe_initial_headers;
+    bool health_probe_content_type_valid;
+    bool health_probe_grpc_status_seen;
+    bool health_probe_message_complete;
+    bool health_probe_terminal;
+    bool health_probe_malformed;
+    u8 health_probe_prefix[5];
+    u8 health_probe_prefix_len;
+    u32 health_probe_message_expected;
+    u32 health_probe_message_len;
+    static constexpr u32 kHealthProbeMessageCap = 1024;
+    u8 health_probe_message[kHealthProbeMessageCap];
     Http2Settings our_settings;
     Http2Settings peer_settings;
     i64 conn_send_window;

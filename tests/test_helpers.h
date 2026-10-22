@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -1180,19 +1181,99 @@ inline u16 get_port(i32 fd) {
     return __builtin_bswap16(a.sin_port);
 }
 
-inline i32 connect_to(u16 port) {
-    i32 fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port = __builtin_bswap16(port);
-    a.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
-    if (connect(fd, reinterpret_cast<struct sockaddr*>(&a), sizeof(a)) < 0) {
-        close(fd);
-        return -1;
+inline i64 test_mono_ms();
+
+using TestLoopbackConnect = int (*)(int, const sockaddr*, socklen_t);
+
+inline i32 connect_test_loopback(u16 port,
+                                 i64 timeout_ms = 5000,
+                                 TestLoopbackConnect connector = ::connect) {
+    const i64 deadline = test_mono_ms() + timeout_ms;
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = __builtin_bswap16(port);
+    addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
+    for (;;) {
+        if (test_mono_ms() >= deadline) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        const i32 fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        const int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            const int error = errno;
+            close(fd);
+            errno = error;
+            return -1;
+        }
+        const int connect_rc =
+            connector(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+        if (connect_rc < 0 && errno == EINTR) {
+            close(fd);
+            continue;
+        }
+        if (connect_rc < 0 && errno != EINPROGRESS && errno != EALREADY) {
+            const int error = errno;
+            close(fd);
+            errno = error;
+            return -1;
+        }
+        if (connect_rc < 0) {
+            struct pollfd pfd{fd, POLLOUT, 0};
+            for (;;) {
+                const i64 remaining = deadline - test_mono_ms();
+                if (remaining <= 0) break;
+                const int rc = poll(&pfd, 1, static_cast<int>(remaining));
+                if (rc < 0 && errno == EINTR) continue;
+                if (rc < 0) {
+                    const int error = errno;
+                    close(fd);
+                    errno = error;
+                    return -1;
+                }
+                if (rc == 0) break;
+                int socket_error = 0;
+                socklen_t socket_error_len = sizeof(socket_error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len) < 0) {
+                    const int error = errno;
+                    close(fd);
+                    errno = error;
+                    return -1;
+                }
+                if (socket_error == EINPROGRESS || socket_error == EALREADY) continue;
+                if (socket_error == EINTR) break;
+                if (socket_error != 0) {
+                    close(fd);
+                    errno = socket_error;
+                    return -1;
+                }
+                if (fcntl(fd, F_SETFL, flags) < 0) {
+                    const int error = errno;
+                    close(fd);
+                    errno = error;
+                    return -1;
+                }
+                return fd;
+            }
+            const int error = test_mono_ms() >= deadline ? ETIMEDOUT : EINTR;
+            close(fd);
+            if (error == EINTR) continue;
+            errno = error;
+            return -1;
+        }
+        if (fcntl(fd, F_SETFL, flags) < 0) {
+            const int error = errno;
+            close(fd);
+            errno = error;
+            return -1;
+        }
+        return fd;
     }
-    return fd;
+}
+
+inline i32 connect_to(u16 port) {
+    return connect_test_loopback(port);
 }
 
 inline i32 create_bound_client_socket(u16 client_port, u16* out_bound_port = nullptr) {
