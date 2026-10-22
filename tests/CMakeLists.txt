@@ -21,6 +21,13 @@ target_include_directories(test_framework PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 add_test(NAME test_framework COMMAND test_framework)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_forked_control_tree test_forked_control_tree.cc)
+    target_include_directories(test_forked_control_tree PRIVATE
+        ${PROJECT_SOURCE_DIR}/testing)
+    add_test(NAME test_forked_control_tree COMMAND test_forked_control_tree)
+    set_tests_properties(test_forked_control_tree PROPERTIES LABELS "unit" TIMEOUT 30)
+endif()
 set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
 add_test(NAME test_framework_sharding COMMAND test_framework --sharding-self-test)
 set_tests_properties(test_framework_sharding PROPERTIES LABELS "unit" TIMEOUT 30)
