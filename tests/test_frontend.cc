@@ -4771,6 +4771,9 @@ TEST(frontend, parse_return_response_byte_body_rejects_bad_escapes) {
     const char* cases[] = {
         "route GET \"/x\" { return response(200, body: b\"a\\q\") }\n",
         "route GET \"/x\" { return response(200, body: b\"a\\x1\") }\n",
+        "route GET \"/x\" { return response(200, body: b\"a\\x\") }\n",
+        "route GET \"/x\" { return response(200, body: b\"a\\xGG\") }\n",
+        "route GET \"/x\" { return response(200, body: b \"a\") }\n",
     };
     for (const char* src : cases) {
         auto lexed = lex(lit(src));
@@ -4779,6 +4782,55 @@ TEST(frontend, parse_return_response_byte_body_rejects_bad_escapes) {
         REQUIRE(!ast);
         CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
     }
+}
+
+TEST(frontend, ordinary_byte_body_decoded_capacity_boundary) {
+    for (u32 length : {4096u, 4097u}) {
+        std::string source = "route GET \"/x\" { return response(200, body: b\"";
+        for (u32 i = 0; i < length; ++i) source += i % 2 == 0 ? "\\x00" : "\\xff";
+        source += "\") }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        if (length == 4097u) {
+            REQUIRE_FALSE(ast);
+            CHECK_EQ(ast.error().code, FrontendError::TooManyItems);
+            CHECK_EQ(ast.error().span.line, 1u);
+            continue;
+        }
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK_EQ(rir.module.response_body_count, 1u);
+        if (rir.module.response_body_count == 1u) {
+            const auto body = rir.module.response_bodies[0];
+            CHECK_EQ(body.len, 4096u);
+            for (u32 i = 0; i < body.len; ++i)
+                CHECK_EQ(static_cast<u8>(body.ptr[i]), i % 2 == 0 ? 0u : 255u);
+        }
+        rir.destroy();
+    }
+}
+
+TEST(frontend, ordinary_string_body_preserves_literal_backslash_spelling) {
+    const char* source = "route GET \"/x\" { return response(200, body: \"a\\nb\") }\n";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.response_body_count, 1u);
+    if (rir.module.response_body_count == 1u) CHECK(rir.module.response_bodies[0].eq(lit("a\\nb")));
+    rir.destroy();
 }
 
 TEST(frontend, imported_byte_body_survives_imported_ast_teardown) {

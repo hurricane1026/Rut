@@ -218,6 +218,31 @@ TEST(serve_loader, large_response_body_borrows_the_pinned_module_storage) {
     CHECK_EQ(program.config.response_body_count, 0u);
 }
 
+TEST(serve_loader, ordinary_byte_body_rejection_publishes_no_partial_config) {
+    const std::string prefix =
+        "route GET \"/valid\" { return 200 }\n"
+        "route GET \"/invalid\" { return response(200, body: ";
+    const std::string over_capacity = "b\"" + std::string(4097, 'x') + "\"";
+    for (const std::string& body : {std::string("b\"\\q\""),
+                                    std::string("b\"\\x1\""),
+                                    std::string("b \"x\""),
+                                    over_capacity}) {
+        const std::string source = prefix + body + ") }\n";
+        const std::string path =
+            write_file("/tmp/rut_ordinary_byte_body_rejection", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError error;
+        const bool loaded = load_rut_program(path.c_str(), program, error);
+        CHECK_FALSE(loaded);
+        CHECK(error.stage == LoadStage::Parse);
+        CHECK(error.has_diag);
+        CHECK_EQ(error.diag.span.line, 2u);
+        CHECK_EQ(program.config.route_count, 0u);
+        CHECK_EQ(program.config.response_body_count, 0u);
+        program.destroy();
+    }
+}
+
 TEST(serve_loader, large_response_body_gets_a_sealed_file_closed_on_destroy) {
     const std::string big(RouteConfig::kFileBodyMinLen, 'q');
     const std::string small(RouteConfig::kFileBodyMinLen - 1u, 's');
