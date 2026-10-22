@@ -27,10 +27,12 @@ enum class IoEventType : u8 {
                         //   drains its min-heap to find which conns to resume.
     ResponseReadTimer,  // Generic precise response-read transport timer.
                         // Kept distinct from JIT and TimerWheel wakeups.
+    LocalGrpcDeadlineTimer,
+    LocalGrpcDeadlineCancel,
     Count,
 };
 
-static_assert(static_cast<u8>(IoEventType::Count) == 11u,
+static_assert(static_cast<u8>(IoEventType::Count) == 13u,
               "IoEventType should keep all runtime event tags and remain small");
 
 // Future upstream-event token layout in the existing 64-bit user_data budget:

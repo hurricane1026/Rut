@@ -157,6 +157,8 @@ public:
             case IoEventType::Timeout:
             case IoEventType::HandlerTimer:
             case IoEventType::ResponseReadTimer:
+            case IoEventType::LocalGrpcDeadlineTimer:
+            case IoEventType::LocalGrpcDeadlineCancel:
             case IoEventType::Count:
                 // Relay completions are consumed by the concrete proactor's
                 // dedicated state machine; they must never enter Recv/Send

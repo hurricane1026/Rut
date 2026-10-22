@@ -400,6 +400,8 @@ struct IoUringBackend {
                                  u32 deadline_generation,
                                  u32 upstream_episode);
     bool cancel_response_read_timer(u32 conn_id, Connection& conn);
+    bool add_local_grpc_deadline_timer(u32 conn_id, Connection& conn, u64 absolute_us);
+    bool cancel_local_grpc_deadline_timer(u32 conn_id, Connection& conn);
 
     // Cancel outstanding operations for a connection (by user_data match).
     // Only submits cancel SQEs for op types actually in flight.
