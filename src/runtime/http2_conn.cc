@@ -133,6 +133,8 @@ void Http2Conn::init() {
     jit_queued_slice = nullptr;
     jit_queued_pool = nullptr;
     response_flush_pending = false;
+    deadline_reset_stream = 0;
+    deadline_reset_stream_queued = 0;
 }
 
 void h2_clear_outbound(Http2Conn& h2) {
@@ -898,6 +900,9 @@ static Http2Error handle_frame(Http2Conn& c,
                             write_rst_stream(w.out + w.len, h.stream_id, Http2Error::RefusedStream);
                     return Http2Error::NoError;
                 }
+                // grpc-timeout is measured from arrival of the initial HEADERS
+                // frame, including time spent receiving CONTINUATION frames.
+                s->headers_received_us = monotonic_us();
             }
             if (s->got_headers) {
                 // A second HEADERS block on an already-open stream is either

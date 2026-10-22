@@ -1116,6 +1116,10 @@ struct GrpcDriveFixture {
     void upstream_release(u16) { released++; }
 };
 struct LocalDeadlineTimerFixture : GrpcDriveFixture {
+    struct PauseBackend {
+        u32 pauses = 0;
+        void pause_recv(u32) { pauses++; }
+    } backend;
     u64 last_delay_ns = 0;
     u32 arms = 0;
     u32 disarms = 0;
@@ -1918,6 +1922,291 @@ TEST(grpc_proxy, local_h2_deadline_is_nearest_and_rearms_after_expiry) {
     CHECK_EQ(h2.grpc.timer_deadline_us, proxy.deadline_us);
     h2.grpc.streams[0] = nullptr;
     h2.grpc.active = 0;
+}
+
+TEST(grpc_proxy, local_h2_deadline_arm_failure_closes_connection) {
+    LocalDeadlineTimerFixture loop;
+    loop.arm_ok = false;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init_client();
+    conn.h2 = &h2;
+    auto* stream = h2.open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->local_deadline_present = true;
+    stream->local_deadline_us = monotonic_us() + 100000;
+    CHECK_FALSE(grpc_refresh_timer(&loop, conn));
+    CHECK_FALSE(loop.closed);
+    loop.close_conn(conn);
+    CHECK(loop.closed);
+}
+
+TEST(grpc_proxy, local_h2_deadline_replaces_flow_stalled_native_owner) {
+    Http2Conn h2;
+    h2.init_client();
+    auto* stream = h2.open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->grpc_protocol_mode = H2GrpcProtocolMode::Native;
+    h2.outbound_stream = 1;
+    h2.outbound_body = reinterpret_cast<const u8*>("response");
+    h2.outbound_body_len = 8;
+    h2.outbound_grpc_status = 0;
+    CHECK(grpc_replace_expired_native_owner(h2, *stream));
+    CHECK_EQ(h2.outbound_body_offset, 8u);
+    CHECK_EQ(h2.outbound_grpc_status, 4u);
+    CHECK_FALSE(h2.outbound_grpc_message_present);
+    CHECK_FALSE(h2.outbound_grpc_status_details_present);
+
+    stream->id = 3;
+    h2.outbound_stream = 1;
+    h2.queued_stream = 3;
+    h2.queued_body = reinterpret_cast<const u8*>("queued");
+    h2.queued_body_len = 6;
+    h2.queued_grpc_status = 0;
+    CHECK(grpc_replace_expired_native_owner(h2, *stream));
+    CHECK_EQ(h2.queued_body_offset, 6u);
+    CHECK_EQ(h2.queued_grpc_status, 4u);
+}
+
+TEST(grpc_proxy, local_h2_web_deadline_sends_stream_reset) {
+    GrpcDriveFixture loop;
+    Connection conn;
+    conn.reset();
+    u8 send_storage[SlicePool::kSliceSize];
+    conn.send_slice = send_storage;
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    Http2Conn h2;
+    h2.init_client();
+    conn.h2 = &h2;
+    auto* stream = h2.open_stream(1);
+    REQUIRE(stream != nullptr);
+    auto* queued = h2.open_stream(3);
+    REQUIRE(queued != nullptr);
+    stream->grpc_protocol_mode = H2GrpcProtocolMode::WebBinary;
+    queued->grpc_protocol_mode = H2GrpcProtocolMode::WebBinary;
+    h2.outbound_stream = 1;
+    h2.queued_stream = 3;
+    h2.deadline_reset_stream = 1;
+    h2.deadline_reset_stream_queued = 3;
+    CHECK(h2_send_pending_deadline_reset(&loop, conn));
+    CHECK_EQ(loop.sends, 1u);
+    CHECK_EQ(h2.deadline_reset_stream, 3u);
+    CHECK_EQ(h2.deadline_reset_stream_queued, 0u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_EQ(h2.queued_stream, 3u);
+    CHECK_EQ(stream->state, Http2StreamState::Closed);
+    CHECK_EQ(conn.send_buf.data()[3], static_cast<u8>(Http2FrameType::RstStream));
+    CHECK_EQ(conn.send_buf.data()[12], static_cast<u8>(Http2Error::Cancel));
+    CHECK(h2_send_pending_deadline_reset(&loop, conn));
+    CHECK_EQ(loop.sends, 2u);
+    CHECK_EQ(h2.queued_stream, 0u);
+    CHECK_EQ(queued->state, Http2StreamState::Closed);
+}
+
+TEST(grpc_proxy, local_h2_primary_reset_promotes_queued_survivor_after_rst_send) {
+    GrpcDriveFixture loop;
+    Connection conn;
+    conn.reset();
+    u8 send_storage[SlicePool::kSliceSize];
+    conn.send_slice = send_storage;
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    Http2Conn h2;
+    h2.init_client();
+    conn.h2 = &h2;
+    auto* expired = h2.open_stream(1);
+    auto* survivor = h2.open_stream(3);
+    REQUIRE(expired != nullptr);
+    REQUIRE(survivor != nullptr);
+    expired->grpc_protocol_mode = H2GrpcProtocolMode::WebBinary;
+    survivor->grpc_protocol_mode = H2GrpcProtocolMode::WebBinary;
+    const u8 message[] = {0, 0, 0, 0, 1, 'x'};
+    u32 body_len = 0;
+    REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Binary,
+                                           message,
+                                           sizeof(message),
+                                           0,
+                                           {},
+                                           {},
+                                           h2.jit_queued_body,
+                                           sizeof(h2.jit_queued_body),
+                                           body_len));
+    h2.outbound_stream = expired->id;
+    h2.outbound_source = H2OutboundBodySource::JitDynamic;
+    h2.outbound_body = h2.jit_outbound_body;
+    h2.outbound_body_len = 32;
+    h2.outbound_grpc_status = 255;
+    h2.queued_stream = survivor->id;
+    h2.queued_source = H2OutboundBodySource::JitDynamic;
+    h2.queued_body = h2.jit_queued_body;
+    h2.queued_body_len = body_len;
+    h2.queued_grpc_status = 255;
+    h2.deadline_reset_stream = expired->id;
+
+    CHECK(h2_send_pending_deadline_reset(&loop, conn));
+    CHECK_EQ(h2.outbound_stream, survivor->id);
+    CHECK_EQ(h2.queued_stream, 0u);
+    CHECK_EQ(conn.send_buf.data()[3], static_cast<u8>(Http2FrameType::RstStream));
+    CHECK_EQ(loop.sends, 1u);
+    const u32 rst_len = conn.send_buf.len();
+    on_h2_sent<GrpcDriveFixture>(
+        &loop, conn, {conn.id, static_cast<i32>(rst_len), 0, 0, IoEventType::Send, 0});
+    CHECK_EQ(loop.sends, 2u);
+    Http2FrameHeader data{};
+    REQUIRE(parse_frame_header(conn.send_buf.data(), conn.send_buf.len(), &data) ==
+            ParseStatus::Complete);
+    CHECK_EQ(data.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK_EQ(data.stream_id, survivor->id);
+}
+
+TEST(grpc_proxy, local_h2_web_deadline_replaces_unpublished_body_at_same_length) {
+    Http2Conn h2;
+    h2.init_client();
+    auto* binary = h2.open_stream(1);
+    auto* text = h2.open_stream(3);
+    REQUIRE(binary != nullptr);
+    REQUIRE(text != nullptr);
+    binary->grpc_protocol_mode = H2GrpcProtocolMode::WebBinary;
+    text->grpc_protocol_mode = H2GrpcProtocolMode::WebText;
+
+    const u8 message[] = {0, 0, 0, 0, 3, 'r', 'u', 't'};
+    u32 binary_len = 0;
+    REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Binary,
+                                           message,
+                                           sizeof(message),
+                                           0,
+                                           {},
+                                           {},
+                                           h2.jit_outbound_body,
+                                           sizeof(h2.jit_outbound_body),
+                                           binary_len));
+    h2.outbound_stream = binary->id;
+    h2.outbound_source = H2OutboundBodySource::JitDynamic;
+    h2.outbound_body = h2.jit_outbound_body;
+    h2.outbound_body_len = binary_len;
+    h2.outbound_grpc_status = 255;
+
+    u32 text_len = 0;
+    REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Text,
+                                           message,
+                                           sizeof(message),
+                                           0,
+                                           {},
+                                           {},
+                                           h2.jit_queued_body,
+                                           sizeof(h2.jit_queued_body),
+                                           text_len));
+    h2.queued_stream = text->id;
+    h2.queued_source = H2OutboundBodySource::JitDynamic;
+    h2.queued_body = h2.jit_queued_body;
+    h2.queued_body_len = text_len;
+    h2.queued_grpc_status = 255;
+
+    CHECK(grpc_replace_expired_web_owner(h2, *binary));
+    CHECK(grpc_replace_expired_web_owner(h2, *text));
+    CHECK_EQ(h2.outbound_body_len, binary_len);  // serialized Content-Length remains exact
+    CHECK_EQ(h2.queued_body_len, text_len);
+    CHECK_EQ(h2.outbound_grpc_status, 255u);
+    CHECK_EQ(h2.queued_grpc_status, 255u);
+
+    auto check_data = [&](u32 expected_stream, u32 expected_len, bool text_mode) {
+        u8 wire[256];
+        H2PumpStatus status = H2PumpStatus::Blocked;
+        const u32 wire_len = h2_pump_outbound(h2, wire, sizeof(wire), status);
+        REQUIRE_EQ(status, H2PumpStatus::Produced);
+        REQUIRE_EQ(wire_len, kFrameHeaderSize + expected_len);
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(wire, wire_len, &frame) == ParseStatus::Complete);
+        CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Data));
+        CHECK_EQ(frame.stream_id, expected_stream);
+        CHECK((frame.flags & http2_flag::kEndStream) != 0);
+        CHECK_EQ(frame.length, expected_len);
+        u8 decoded[128];
+        const u8* body = wire + kFrameHeaderSize;
+        u32 body_len = frame.length;
+        if (text_mode) {
+            GrpcWebBase64Decoder decoder{};
+            decoder.init();
+            u32 consumed = 0;
+            body_len = 0;
+            CHECK(decoder.feed(body, frame.length, consumed, decoded, sizeof(decoded), body_len) ==
+                  GrpcWebCodecStatus::Ok);
+            CHECK_EQ(consumed, frame.length);
+            CHECK(decoder.finish() == GrpcWebCodecStatus::Ok);
+            body = decoded;
+        }
+        CHECK_GE(body_len, 21u);
+        CHECK_EQ(body[0], 0x80u);
+        const char expected[] = "grpc-status: 4\r\n";
+        bool found_status = false;
+        for (u32 i = 5; i + sizeof(expected) - 1 <= body_len; i++)
+            if (memcmp(body + i, expected, sizeof(expected) - 1) == 0) found_status = true;
+        CHECK(found_status);
+    };
+
+    check_data(binary->id, binary_len, false);
+    h2_clear_primary_outbound(h2);
+    h2_promote_queued(h2);  // same promotion used after the primary send completion
+    CHECK_EQ(h2.outbound_stream, text->id);
+    check_data(text->id, text_len, true);
+
+    auto* partial = h2.open_stream(5);
+    REQUIRE(partial != nullptr);
+    partial->grpc_protocol_mode = H2GrpcProtocolMode::WebBinary;
+    h2.outbound_stream = partial->id;
+    h2.outbound_source = H2OutboundBodySource::JitDynamic;
+    h2.outbound_body = h2.jit_outbound_body;
+    h2.outbound_body_len = 32;
+    h2.outbound_body_offset = 1;
+    h2.outbound_grpc_status = 255;
+    CHECK_FALSE(grpc_replace_expired_web_owner(h2, *partial));
+}
+
+TEST(grpc_proxy, local_h2_web_status4_text_encoder_handles_all_tail_sizes) {
+    for (u32 payload_len = 0; payload_len < 3; payload_len++) {
+        u8 message[7] = {0, 0, 0, 0, static_cast<u8>(payload_len), 'a', 'b'};
+        u8 body[128];
+        u32 body_len = 0;
+        REQUIRE(grpc_web_encode_local_response(GrpcWebContentType::Text,
+                                               message,
+                                               5 + payload_len,
+                                               0,
+                                               {},
+                                               {},
+                                               body,
+                                               sizeof(body),
+                                               body_len));
+        CHECK(grpc_web_status4_body(body, body_len, true));
+        GrpcWebBase64Decoder decoder{};
+        decoder.init();
+        u8 decoded[64];
+        u32 consumed = 0;
+        u32 decoded_len = 0;
+        CHECK(decoder.feed(body, body_len, consumed, decoded, sizeof(decoded), decoded_len) ==
+              GrpcWebCodecStatus::Ok);
+        CHECK_EQ(consumed, body_len);
+        CHECK(decoder.finish() == GrpcWebCodecStatus::Ok);
+        CHECK_EQ(decoded_len, 26u + payload_len);  // exact original decoded Content-Length
+        CHECK_EQ(decoded[0], 0x80u);
+        CHECK_EQ(memcmp(decoded + 5, "grpc-status: 4\r\n", 16), 0);
+    }
+}
+
+TEST(grpc_proxy, h2_timer_yield_pauses_receive_before_aggregate_timer) {
+    LocalDeadlineTimerFixture loop;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init_client();
+    conn.h2 = &h2;
+    auto* stream = h2.open_stream(1);
+    REQUIRE(stream != nullptr);
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_timer_ms = 10;
+    CHECK(h2_arm_async_timer(&loop, conn));
+    CHECK_EQ(loop.backend.pauses, 1u);
+    CHECK(conn.yield_armed);
 }
 
 TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {

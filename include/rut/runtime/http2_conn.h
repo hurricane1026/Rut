@@ -278,6 +278,10 @@ struct Http2Conn {
     u8* jit_queued_slice;
     SlicePool* jit_queued_pool;
     bool response_flush_pending;
+    // Deferred RST for a local deadline that expires while a Web response owns
+    // the serialized output slot. The timer cannot overwrite an armed send.
+    u32 deadline_reset_stream;
+    u32 deadline_reset_stream_queued;
 
     // Set callbacks (any may be null) then call init().
     void init();

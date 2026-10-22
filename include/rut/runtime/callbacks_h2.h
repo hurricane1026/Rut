@@ -172,7 +172,7 @@ void grpc_request_trailers(void*, Http2Conn&, u32, const hpack::Header*, u32, bo
 template <typename Loop>
 bool grpc_grow_recv(Loop*, Connection&);
 template <typename Loop>
-void grpc_refresh_timer(Loop*, Connection&);
+bool grpc_refresh_timer(Loop*, Connection&);
 
 // Append a response (HEADERS + optional DATA body) for a stream, encoded with
 // the connection's dynamic-indexing encoder. `hdrs[0..nhdrs)` are extra
@@ -600,6 +600,7 @@ bool h2_publish_expired_local(Loop* loop, Connection& conn) {
     if (!stream) return false;
     const u32 sid = stream->id;
     const H2GrpcProtocolMode mode = stream->grpc_protocol_mode;
+    const bool web = mode == H2GrpcProtocolMode::WebBinary || mode == H2GrpcProtocolMode::WebText;
     const bool pending_json_owner = h2->pending_stream == sid && h2->pending_local_outcome;
     if (h2->pending_stream == sid) h2_clear_pending(*h2);
     if (pending_json_owner) h2_release_completed_jit_json(conn);
@@ -630,20 +631,46 @@ bool h2_publish_expired_local(Loop* loop, Connection& conn) {
                 web_mode, nullptr, 0, 4, {}, {}, body, sizeof(body), body_len)) {
             const hpack::Header headers[] = {
                 {{"content-type", 12}, {content_type, content_type_len}}};
-            wire_len =
-                http2_write_response(wire, sizeof(wire), enc, sid, 200, headers, 1, body, body_len);
+            // The timeout envelope must obey both HTTP/2 flow-control windows.
+            // Stage only its HEADERS here; the ordinary outbound pump publishes
+            // DATA after both connection and stream credit become available.
+            if (!conn.epoch_held) {
+                loop->close_conn(conn);
+                return true;
+            }
+            conn.send_buf.reset();
+            H2Dispatch<Loop> dispatch{
+                loop, &conn, conn.send_buf.write_ptr(), conn.send_buf.write_avail(), 0, false};
+            if (!h2_stage_owned_response(dispatch,
+                                         sid,
+                                         200,
+                                         headers,
+                                         1,
+                                         body,
+                                         body_len,
+                                         H2OutboundBodySource::JitDynamic,
+                                         nullptr,
+                                         255)) {
+                loop->close_conn(conn);
+                return true;
+            }
+            h2_commit_owned_hpack(dispatch);
+            conn.send_buf.commit(dispatch.resp_len);
+            wire_len = dispatch.resp_len;
         }
     }
     if (!wire_len) {
         loop->close_conn(conn);
         return true;
     }
-    h2->hpack_enc = enc;
-    h2_close_stream(h2, sid);
-    h2_async_epoch_leave(loop, conn);
+    if (!web) {
+        h2->hpack_enc = enc;
+        h2_close_stream(h2, sid);
+        h2_async_epoch_leave(loop, conn);
+        conn.send_buf.reset();
+        conn.send_buf.write(wire, wire_len);
+    }
     conn.send_progress = 0;
-    conn.send_buf.reset();
-    conn.send_buf.write(wire, wire_len);
     conn.keep_alive = true;
     conn.transition_to_sending(&on_h2_sent<Loop>);
     if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) loop->close_conn(conn);
@@ -1954,7 +1981,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                          u32 nheaders,
                          bool end_stream) {
     if (d.close_after_process) return;
-    if (auto* stream = d.conn->h2->find_stream(stream_id))
+    if (auto* stream = d.conn->h2->find_stream(stream_id); stream && !stream->headers_received_us)
         stream->headers_received_us = monotonic_us();
     const RouteConfig* config = d.conn->request_config;
     const bool has_strict_inventory =
@@ -2183,7 +2210,13 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                                                                 : H2GrpcProtocolMode::WebBinary);
                 stream->local_deadline_present = true;
                 stream->local_deadline_us = deadline_us;
-                grpc_refresh_timer(d.loop, *d.conn);
+                if (!grpc_refresh_timer(d.loop, *d.conn)) {
+                    stream->clear_local_deadline();
+                    d.loop->close_conn(*d.conn);
+                    d.close_after_process = true;
+                    d.resp_len = 0;
+                    return;
+                }
                 if (!d.conn->yield_armed || d.conn->h2 == nullptr ||
                     d.conn->h2->grpc.timer_deadline_us == 0) {
                     d.close_after_process = true;
@@ -2478,6 +2511,39 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void on_h2_sent(void* lp, Connection& conn, IoEvent ev);
 
+template <typename Loop>
+bool h2_send_pending_deadline_reset(Loop* loop, Connection& conn) {
+    Http2Conn* h2 = conn.h2;
+    if (!h2 || conn.send_armed || h2->deadline_reset_stream == 0) return false;
+    const u32 sid = h2->deadline_reset_stream;
+    h2->deadline_reset_stream = h2->deadline_reset_stream_queued;
+    h2->deadline_reset_stream_queued = 0;
+    if (h2->outbound_stream == sid) {
+        h2_clear_primary_outbound(*h2);
+        // Keep a queued survivor alive after the reset frame completes. If the
+        // queued stream is itself the next deadline reset, leave it queued so
+        // the next RST remains ahead of all DATA on this connection.
+        if (h2->queued_stream != 0 && h2->queued_stream != h2->deadline_reset_stream)
+            h2_promote_queued(*h2);
+    }
+    if (h2->queued_stream == sid) h2_clear_queued_outbound(*h2);
+    u8 wire[kFrameHeaderSize + 4];
+    write_rst_stream(wire, sid, Http2Error::Cancel);
+    h2_close_stream(h2, sid);
+    if (auto* stream = h2->find_stream(sid)) {
+        stream->state = Http2StreamState::Closed;
+        stream->clear_local_deadline();
+    }
+    if (h2->outbound_stream == 0 && h2->queued_stream == 0) h2_async_epoch_leave(loop, conn);
+    conn.send_buf.reset();
+    conn.send_buf.write(wire, sizeof(wire));
+    conn.send_progress = 0;
+    conn.keep_alive = true;
+    conn.transition_to_sending(&on_h2_sent<Loop>);
+    if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) loop->close_conn(conn);
+    return true;
+}
+
 // Transfer the parked async resume point (Http2Conn async_*) onto the Connection
 // and arm the precise yield timer — atomically leaving the keepalive wheel, the
 // same sequence the HTTP/1 TimerYield path uses. Done only once the suspended
@@ -2492,11 +2558,19 @@ template <typename Loop>
     conn.handler_state = h2->async_state;
     conn.pending_yield_kind = jit::YieldKind::Timer;
     conn.transition_to_exec_handler_wait();
+    // The aggregate grpc timer replaces schedule_yield_timer for H2 streams.
+    // Preserve its epoll/kqueue behavior: with no receive callback installed,
+    // leave level-triggered read interest disabled until the timer resumes us.
+    if constexpr (loop_backend_async_io<Loop>()) {
+        if (!loop->submit_recv(conn) || !conn.recv_armed) return false;
+    } else if constexpr (requires { loop->backend.pause_recv(conn.id); }) {
+        loop->backend.pause_recv(conn.id);
+    }
     const u64 now = monotonic_us();
     const u64 delay_us = static_cast<u64>(h2->async_timer_ms) * 1000;
     h2->async_resume_at_us = UINT64_MAX - now < delay_us ? UINT64_MAX : now + delay_us;
     const u32 handler_gen = conn.handler_gen;
-    grpc_refresh_timer(loop, conn);
+    if (!grpc_refresh_timer(loop, conn)) return false;
     return conn.h2 == h2 && conn.handler_gen == handler_gen && conn.yield_armed &&
            h2->grpc.timer_deadline_us != 0;
 }
@@ -2517,7 +2591,7 @@ void h2_begin_suspended_io(Loop* loop, Connection& conn) {
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }
-    if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
+    if (!h2_arm_async_timer<Loop>(loop, conn) && conn.fd >= 0) loop->close_conn(conn);
 }
 
 // Send-completion callback for the h2 path (partial-send aware, mirrors
@@ -2556,6 +2630,7 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
 
     conn.send_progress = 0;
     conn.send_buf.reset();
+    if (h2_send_pending_deadline_reset(loop, conn)) return;
     if (conn.h2 && conn.h2->outbound_stream != 0) {
         if (conn.h2->outbound_final_staged) {
             const u32 stream_id = conn.h2->outbound_stream;
@@ -2605,6 +2680,26 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
             }
         }
     }
+    if (conn.h2 && conn.h2->outbound_stream == 0 && conn.h2->queued_stream != 0) {
+        h2_promote_queued(*conn.h2);
+        H2PumpStatus queued_status = H2PumpStatus::Blocked;
+        const u32 queued_n = h2_pump_outbound(
+            *conn.h2, conn.send_buf.write_ptr(), conn.send_buf.write_avail(), queued_status);
+        if (queued_status == H2PumpStatus::Invalid) {
+            h2_clear_outbound(*conn.h2);
+            loop->close_conn(conn);
+            return;
+        }
+        conn.send_buf.commit(queued_n);
+        if (queued_n != 0) {
+            conn.transition_to_sending(&on_h2_sent<Loop>);
+            if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+                h2_clear_outbound(*conn.h2);
+                loop->close_conn(conn);
+            }
+            return;
+        }
+    }
     if (conn.h2 && conn.h2->outbound_stream == 0) conn.h2->response_flush_pending = false;
     if (!conn.keep_alive) {  // engine signalled a connection error
         loop->close_conn(conn);
@@ -2616,7 +2711,10 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
                       loop->grpc_upstreams;
                       loop->pool.alloc_bulk();
                   }) {
-        if (flushed_h2) grpc_refresh_timer(loop, conn);
+        if (flushed_h2 && !grpc_refresh_timer(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
     }
     if (conn.h2 != flushed_h2 || conn.handler_gen != flushed_gen || conn.send_armed) return;
     if (h2_publish_expired_local(loop, conn)) return;
@@ -2733,7 +2831,10 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
                       loop->grpc_upstreams;
                       loop->pool.alloc_bulk();
                   }) {
-        if (conn.h2->grpc.timer_deadline_us) grpc_refresh_timer(loop, conn);
+        if (conn.h2->grpc.timer_deadline_us && !grpc_refresh_timer(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
         if (conn.h2->grpc.active == 0 && conn.h2->grpc.timer_deadline_us == 0 &&
             conn.h2->outbound_stream == 0 && !conn.send_armed) {
             if constexpr (requires { loop->timer.refresh(&conn, loop->keepalive_timeout); })
@@ -2767,7 +2868,10 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         if (ctrl_len == 0 && d.resp_len == 0) {
             Http2Conn* timer_h2 = conn.h2;
             const u32 timer_gen = conn.handler_gen;
-            if (timer_h2->grpc.timer_deadline_us) grpc_refresh_timer(loop, conn);
+            if (timer_h2->grpc.timer_deadline_us && !grpc_refresh_timer(loop, conn)) {
+                loop->close_conn(conn);
+                return;
+            }
             if (conn.h2 != timer_h2 || conn.handler_gen != timer_gen || conn.send_armed) return;
             h2_begin_suspended_io<Loop>(loop, conn);
             return;
@@ -2798,7 +2902,10 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     if (!kClose && ctrl_len == 0 && d.resp_len == 0 && !d.owned_hpack_pending) {
         Http2Conn* timer_h2 = conn.h2;
         const u32 timer_gen = conn.handler_gen;
-        if (timer_h2->grpc.timer_deadline_us) grpc_refresh_timer(loop, conn);
+        if (timer_h2->grpc.timer_deadline_us && !grpc_refresh_timer(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
         if (conn.h2 != timer_h2 || conn.handler_gen != timer_gen || conn.send_armed) return;
     }
 

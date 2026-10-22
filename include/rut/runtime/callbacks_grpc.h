@@ -15,7 +15,7 @@ inline bool backend_ejected(u16 upstream_id, u32 backend_idx, u64 now_us);
 inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success, u64 now_us);
 
 template <typename Loop>
-void grpc_refresh_timer(Loop*, Connection&);
+bool grpc_refresh_timer(Loop*, Connection&);
 template <typename Loop>
 void grpc_drive_upstream(Loop*, Connection&);
 template <typename Loop>
@@ -160,8 +160,17 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
             stream->manual_window = false;
         grpc_detach(*down->h2, x);
         if (!down->h2->grpc.busy) {
-            grpc_refresh_timer(loop, *down);
-            if (!down->h2->grpc.active && !down->h2->grpc.timer_deadline_us) {
+            Http2Conn* down_h2 = down->h2;
+            const u32 down_gen = down->handler_gen;
+            if (!grpc_refresh_timer(loop, *down)) {
+                loop->close_conn(*down);
+                down = nullptr;
+            } else if (down->h2 != down_h2 || down->handler_gen != down_gen) {
+                down = nullptr;
+            }
+            if (down == nullptr) {
+                // Timer re-arm failure closed the downstream connection.
+            } else if (!down->h2->grpc.active && !down->h2->grpc.timer_deadline_us) {
                 if constexpr (requires { loop->timer.refresh(down, loop->keepalive_timeout); })
                     loop->timer.refresh(down, loop->keepalive_timeout);
             }
@@ -288,7 +297,8 @@ void grpc_connection_closed(void* lp, Connection& conn) {
                     x->retry_reason = 14;
                     Connection* down = x->downstream;
                     grpc_detach_retry_attempt(loop, *x);
-                    if (down && down->h2) grpc_refresh_timer(loop, *down);
+                    if (down && down->h2 && !grpc_refresh_timer(loop, *down))
+                        loop->close_conn(*down);
                     continue;
                 }
             }
@@ -1402,8 +1412,9 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
         g.busy = false;
         for (u32 i = 0; i < downstream_count; ++i)
             if (downstreams[i].conn && downstreams[i].conn->h2 == downstreams[i].h2 &&
-                downstreams[i].conn->handler_gen == downstreams[i].handler_gen)
-                grpc_refresh_timer(loop, *downstreams[i].conn);
+                downstreams[i].conn->handler_gen == downstreams[i].handler_gen &&
+                !grpc_refresh_timer(loop, *downstreams[i].conn))
+                loop->close_conn(*downstreams[i].conn);
         loop->close_conn(conn);
         return;
     }
@@ -1419,7 +1430,10 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
         if (!snapshot.conn || snapshot.conn->h2 != snapshot.h2 ||
             snapshot.conn->handler_gen != snapshot.handler_gen)
             continue;
-        grpc_refresh_timer(loop, *snapshot.conn);
+        if (!grpc_refresh_timer(loop, *snapshot.conn)) {
+            loop->close_conn(*snapshot.conn);
+            continue;
+        }
         grpc_kick_downstream(loop, *snapshot.conn);
     }
     grpc_drive_upstream(loop, conn);
@@ -2106,7 +2120,11 @@ bool grpc_start_impl(Loop* loop,
     if (x->failure) {
         x->response_end = true;
         grpc_detach_upstream_exchange(loop, *up->h2, *x);
-        grpc_refresh_timer(loop, down);
+        if (!grpc_refresh_timer(loop, down)) {
+            loop->close_conn(down);
+            if (fresh) loop->close_conn(*up);
+            return true;
+        }
         grpc_kick_downstream(loop, down);
         if (fresh) loop->close_conn(*up);
         return true;
@@ -2127,7 +2145,7 @@ bool grpc_start_impl(Loop* loop,
             if (grpc_submit_next_connect(loop, *up)) {
                 loop->timer.refresh(up, 1);
                 loop->timer.refresh(&down, 1);
-                grpc_refresh_timer(loop, down);
+                if (!grpc_refresh_timer(loop, down)) loop->close_conn(down);
                 return true;
             }
             g.c5_exhausted = true;
@@ -2145,7 +2163,11 @@ bool grpc_start_impl(Loop* loop,
         grpc_drive_upstream(loop, *up);
     loop->timer.refresh(up, 1);
     loop->timer.refresh(&down, 1);
-    grpc_refresh_timer(loop, down);
+    if (!grpc_refresh_timer(loop, down)) {
+        loop->close_conn(down);
+        if (fresh) loop->close_conn(*up);
+        return true;
+    }
     return true;
 }
 
@@ -2606,7 +2628,7 @@ void grpc_request_trailers(void* ctx, Http2Conn& h, u32 sid, const hpack::Header
 }
 
 template <typename Loop>
-void grpc_refresh_timer(Loop* loop, Connection& conn) {
+bool grpc_refresh_timer(Loop* loop, Connection& conn) {
     auto& g = conn.h2->grpc;
     u64 earliest = 0;
     bool has_local_deadline = false;
@@ -2624,7 +2646,7 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
     if (conn.h2->async_stream != 0 && conn.h2->async_kind == H2AsyncKind::Timer &&
         conn.h2->async_resume_at_us != 0 && (!earliest || conn.h2->async_resume_at_us < earliest))
         earliest = conn.h2->async_resume_at_us;
-    if (g.upstream && !has_local_deadline && !has_async_resume) return;
+    if (g.upstream && !has_local_deadline && !has_async_resume) return true;
     for (auto* x : g.streams)
         if (x && !x->failure) {
             if (x->deadline_us && (!earliest || x->deadline_us < earliest))
@@ -2632,18 +2654,19 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
             if (x->retry_pending && x->retry_at_us && (!earliest || x->retry_at_us < earliest))
                 earliest = x->retry_at_us;
         }
-    if (earliest == g.timer_deadline_us) return;
+    if (earliest == g.timer_deadline_us) return true;
     if (g.timer_deadline_us) {
         if constexpr (requires { loop->disarm_yield_timer(conn); }) loop->disarm_yield_timer(conn);
     }
     g.timer_deadline_us = earliest;
-    if (!earliest) return;
+    if (!earliest) return true;
     const u64 now = monotonic_us();
     u64 delay = earliest > now ? earliest - now : 1;
     if (delay > 3600000000ull) delay = 3600000000ull;
     if constexpr (!(requires { loop->arm_throttle_timer(conn, delay * 1000); })) {
         g.timer_deadline_us = 0;
-        return;
+        if (!has_local_deadline) return true;
+        return false;
     } else if (!loop->arm_throttle_timer(conn, delay * 1000)) {
         g.timer_deadline_us = 0;
         struct UpstreamSnapshot {
@@ -2702,6 +2725,10 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
                 continue;
             grpc_drive_upstream(loop, *snapshot.conn);
         }
+        // An active local deadline that cannot be re-armed must not remain on
+        // the stream with no future wakeup. The caller closes on false, so it
+        // can stop touching the connection immediately after this returns.
+        if (has_local_deadline) return false;
         for (u32 i = 0; i < downstream_count; i++) {
             auto& snapshot = downstreams[i];
             if (snapshot.conn->h2 != snapshot.h2 ||
@@ -2709,9 +2736,153 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
                 continue;
             grpc_kick_downstream(loop, *snapshot.conn);
         }
-        return;
+        return true;
     }
     conn.yield_armed = true;
+    return true;
+}
+
+inline bool grpc_replace_expired_native_owner(Http2Conn& h2, const Http2Stream& stream) {
+    const bool outbound_owner = h2.outbound_stream == stream.id;
+    const bool queued_owner = h2.queued_stream == stream.id;
+    if (!outbound_owner && !queued_owner) return true;
+    if (stream.grpc_protocol_mode != H2GrpcProtocolMode::Native) return false;
+    if (outbound_owner) {
+        if (h2.outbound_grpc_status > 16 || h2.outbound_final_staged) return false;
+        h2.outbound_body_offset = h2.outbound_body_len;
+        h2.outbound_grpc_status = 4;
+        h2.outbound_grpc_message_len = 0;
+        h2.outbound_grpc_message_present = false;
+        h2.outbound_grpc_status_details_len = 0;
+        h2.outbound_grpc_status_details_present = false;
+    } else {
+        if (h2.queued_grpc_status > 16) return false;
+        h2.queued_body_offset = h2.queued_body_len;
+        h2.queued_grpc_status = 4;
+        h2.queued_grpc_message_len = 0;
+        h2.queued_grpc_message_present = false;
+        h2.queued_grpc_status_details_len = 0;
+        h2.queued_grpc_status_details_present = false;
+    }
+    return true;
+}
+
+// A local Web response has already serialized Content-Length into its HEADERS
+// block, so a deadline envelope may replace the body only at the exact same
+// wire length. The owner is JIT-owned storage (inline or SlicePool-backed), and
+// DATA publication advances body_offset before submitting the send.
+inline bool grpc_web_status4_body(u8* body, u32 wire_len, bool text) {
+    if (!body || wire_len == 0) return false;
+    u32 raw_len = wire_len;
+    if (text) {
+        if ((wire_len & 3u) != 0) return false;
+        u32 padding = 0;
+        if (wire_len && body[wire_len - 1] == '=') {
+            padding = 1;
+            if (wire_len > 1 && body[wire_len - 2] == '=') padding = 2;
+        }
+        raw_len = (wire_len / 4) * 3 - padding;
+    }
+    if (raw_len < 21) return false;
+
+    const GrpcWebTrailer status{{"grpc-status", 11}, {"4", 1}};
+    u32 written = 0;
+    if (!grpc_web_encode_trailer_envelope(&status, 1, body, raw_len, written) || written != 21)
+        return false;
+    const u32 padding = raw_len - written;
+    if (padding != 0) {
+        if (padding < 5) return false;
+        // A valid, ignorable metadata field with OWS provides the exact body
+        // length while retaining the original Content-Length. The line length
+        // is 1-byte name + ": " + value + CRLF.
+        body[written++] = 'x';
+        body[written++] = ':';
+        body[written++] = ' ';
+        for (u32 i = 0; i < padding - 5; i++) body[written++] = ' ';
+        body[written++] = '\r';
+        body[written++] = '\n';
+        const u32 payload_len = raw_len - 5;
+        body[1] = static_cast<u8>(payload_len >> 24);
+        body[2] = static_cast<u8>(payload_len >> 16);
+        body[3] = static_cast<u8>(payload_len >> 8);
+        body[4] = static_cast<u8>(payload_len);
+    }
+    if (!text) return written == wire_len;
+
+    // Encode backwards in place: base64 expands, so later output groups never
+    // overwrite source bytes that have not been read yet.
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    u32 source = raw_len - raw_len % 3;
+    u32 dest = wire_len;
+    const u32 tail = raw_len % 3;
+    if (tail != 0) {
+        dest -= 4;
+        const u32 a = body[source];
+        body[dest] = static_cast<u8>(alphabet[a >> 2]);
+        if (tail == 1) {
+            body[dest + 1] = static_cast<u8>(alphabet[(a & 3) << 4]);
+            body[dest + 2] = '=';
+            body[dest + 3] = '=';
+        } else {
+            const u32 b = body[source + 1];
+            body[dest + 1] = static_cast<u8>(alphabet[((a & 3) << 4) | (b >> 4)]);
+            body[dest + 2] = static_cast<u8>(alphabet[(b & 15) << 2]);
+            body[dest + 3] = '=';
+        }
+    }
+    while (source >= 3) {
+        source -= 3;
+        dest -= 4;
+        const u32 a = body[source], b = body[source + 1], c = body[source + 2];
+        body[dest] = static_cast<u8>(alphabet[a >> 2]);
+        body[dest + 1] = static_cast<u8>(alphabet[((a & 3) << 4) | (b >> 4)]);
+        body[dest + 2] = static_cast<u8>(alphabet[((b & 15) << 2) | (c >> 6)]);
+        body[dest + 3] = static_cast<u8>(alphabet[c & 63]);
+    }
+    return dest == 0 && written == raw_len && ((raw_len + 2) / 3) * 4 == wire_len;
+}
+
+inline bool grpc_replace_expired_web_owner(Http2Conn& h2, const Http2Stream& stream) {
+    const bool outbound_owner = h2.outbound_stream == stream.id;
+    const bool queued_owner = h2.queued_stream == stream.id;
+    if (!outbound_owner && !queued_owner) return true;
+    if (stream.grpc_protocol_mode != H2GrpcProtocolMode::WebBinary &&
+        stream.grpc_protocol_mode != H2GrpcProtocolMode::WebText)
+        return false;
+    if (outbound_owner) {
+        const bool owned_storage =
+            (h2.jit_outbound_slice && h2.outbound_body == h2.jit_outbound_slice) ||
+            (!h2.jit_outbound_slice && h2.outbound_body == h2.jit_outbound_body);
+        if (h2.outbound_body_offset != 0 || h2.outbound_final_staged ||
+            h2.outbound_source != H2OutboundBodySource::JitDynamic || !owned_storage)
+            return false;
+        if (!grpc_web_status4_body(const_cast<u8*>(h2.outbound_body),
+                                   h2.outbound_body_len,
+                                   stream.grpc_protocol_mode == H2GrpcProtocolMode::WebText))
+            return false;
+        h2.outbound_grpc_status = 255;
+        h2.outbound_grpc_message_len = 0;
+        h2.outbound_grpc_message_present = false;
+        h2.outbound_grpc_status_details_len = 0;
+        h2.outbound_grpc_status_details_present = false;
+        return true;
+    }
+    const bool owned_storage = (h2.jit_queued_slice && h2.queued_body == h2.jit_queued_slice) ||
+                               (!h2.jit_queued_slice && h2.queued_body == h2.jit_queued_body);
+    if (h2.queued_body_offset != 0 || h2.queued_final_staged ||
+        h2.queued_source != H2OutboundBodySource::JitDynamic || !owned_storage)
+        return false;
+    if (!grpc_web_status4_body(const_cast<u8*>(h2.queued_body),
+                               h2.queued_body_len,
+                               stream.grpc_protocol_mode == H2GrpcProtocolMode::WebText))
+        return false;
+    h2.queued_grpc_status = 255;
+    h2.queued_grpc_message_len = 0;
+    h2.queued_grpc_message_present = false;
+    h2.queued_grpc_status_details_len = 0;
+    h2.queued_grpc_status_details_present = false;
+    return true;
 }
 
 template <typename Loop>
@@ -2724,6 +2895,27 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
         if (stream.state != Http2StreamState::Closed && stream.local_deadline_present &&
             !stream.local_deadline_expired && now >= stream.local_deadline_us) {
             stream.local_deadline_expired = true;
+            // A flow-control-stalled local unary response already owns its
+            // HEADERS. Native gRPC can replace its trailers; Web can replace its
+            // whole body only before DATA publication and at the same serialized
+            // Content-Length. The send completion then uses the normal pump.
+            const bool has_staged_owner =
+                conn.h2->outbound_stream == stream.id || conn.h2->queued_stream == stream.id;
+            const bool owner_replaced = stream.grpc_protocol_mode == H2GrpcProtocolMode::Native
+                                            ? grpc_replace_expired_native_owner(*conn.h2, stream)
+                                            : grpc_replace_expired_web_owner(*conn.h2, stream);
+            if (!owner_replaced && has_staged_owner) {
+                if (conn.h2->deadline_reset_stream == 0)
+                    conn.h2->deadline_reset_stream = stream.id;
+                else if (conn.h2->deadline_reset_stream != stream.id &&
+                         conn.h2->deadline_reset_stream_queued == 0)
+                    conn.h2->deadline_reset_stream_queued = stream.id;
+            } else if (!owner_replaced) {
+                // Web trailers are encoded in the body and cannot be replaced
+                // with native HTTP/2 trailing HEADERS safely.
+                loop->close_conn(conn);
+                return;
+            }
             if (conn.h2->async_stream == stream.id && conn.h2->async_kind == H2AsyncKind::Timer) {
                 conn.pending_handler_fn = nullptr;
                 h2_release_completed_jit_json(conn);
@@ -2796,8 +2988,12 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
         }
     }
     if (conn.h2 != downstream_h2 || conn.handler_gen != downstream_handler_gen) return;
-    grpc_refresh_timer(loop, conn);
+    if (!grpc_refresh_timer(loop, conn)) {
+        loop->close_conn(conn);
+        return;
+    }
     if (conn.h2 == downstream_h2 && conn.handler_gen == downstream_handler_gen) {
+        if (h2_send_pending_deadline_reset(loop, conn)) return;
         grpc_kick_downstream(loop, conn);
         if (conn.h2 == downstream_h2 && conn.handler_gen == downstream_handler_gen)
             h2_publish_expired_local(loop, conn);
