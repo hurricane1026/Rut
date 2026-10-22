@@ -1471,6 +1471,7 @@ public:
         if (!up.http2 || (service_len != 0 && service == nullptr) ||
             service_len > UpstreamTarget::kMaxHealthServiceLen || interval_ms == 0)
             return false;
+        if (!valid_upstream_tls(up.tls)) return false;
         if (!protobuf::utf8({service, service_len})) return false;
         up.hc_path_len = 0;
         up.hc_service_len = service_len;

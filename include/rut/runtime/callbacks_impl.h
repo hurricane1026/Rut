@@ -718,8 +718,15 @@ void on_probe_connected(void* lp, Connection& conn, IoEvent ev) {
         free_probe_conn(loop, conn);
         return;
     }
-    if (conn.request_config == nullptr ||
-        conn.upstream_idx >= conn.request_config->upstream_count) {
+    // A health probe does not hold the request epoch. Hot reload may therefore
+    // reclaim its launch config while connect is pending; compare pointer values
+    // before dereferencing the non-owning snapshot.
+    const RouteConfig* active_config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    if (conn.request_config == nullptr || conn.request_config != active_config) {
+        free_probe_conn(loop, conn);
+        return;
+    }
+    if (conn.upstream_idx >= conn.request_config->upstream_count) {
         free_probe_conn(loop, conn);
         return;
     }
@@ -741,6 +748,9 @@ void on_probe_connected(void* lp, Connection& conn, IoEvent ev) {
                 return;
             }
             conn.fd = fd;
+            // Once detached, the socket is dispatched as a downstream fd. Map
+            // it before the initial SSL_write so handshake HUP/ERR is routed.
+            loop->backend.downstream_fd_map[conn.id] = fd;
             auto& context = conn.h2->grpc.client_tls;
             if (!init_tls_client_context(context, target.tls)) {
                 free_probe_conn(loop, conn);

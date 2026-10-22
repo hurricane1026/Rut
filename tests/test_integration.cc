@@ -2483,6 +2483,7 @@ struct GrpcHealthProbeServer {
     std::atomic<bool> running{false};
     std::atomic<u32> requests{0};
     std::atomic<bool> stall_response{false};
+    std::atomic<bool> close_on_accept{false};
     bool started = false;
     pthread_t thread{};
     TlsServerContext* tls_context = nullptr;
@@ -2531,6 +2532,10 @@ struct GrpcHealthProbeServer {
             if (poll(&listener, 1, 20) <= 0) continue;
             const i32 client = accept(server->listen_fd, nullptr, nullptr);
             if (client < 0) continue;
+            if (server->close_on_accept.load(std::memory_order_acquire)) {
+                close(client);
+                continue;
+            }
             set_socket_timeouts(client, 2);
             SSL* ssl = nullptr;
             if (server->tls_enabled) {
@@ -2784,8 +2789,11 @@ TEST(active_health_e2e, grpc_tls_check_validates_peer_and_alpn_before_request) {
     using namespace rut;
     GrpcHealthProbeServer backend;
     GrpcHealthProbeServer no_alpn_backend;
+    GrpcHealthProbeServer close_backend;
     REQUIRE(backend.setup(/*enable_tls=*/true, /*offer_h2=*/true));
     REQUIRE(no_alpn_backend.setup(/*enable_tls=*/true, /*offer_h2=*/false));
+    REQUIRE(close_backend.setup(/*enable_tls=*/true, /*offer_h2=*/true));
+    close_backend.close_on_accept.store(true, std::memory_order_release);
     backend.serving.store(true, std::memory_order_release);
 
     RouteConfig cfg{};
@@ -2847,6 +2855,20 @@ TEST(active_health_e2e, grpc_tls_check_validates_peer_and_alpn_before_request) {
     CHECK_EQ(backend.requests.load(std::memory_order_acquire), 2u);
     CHECK(backend_ejected(uid, 0, monotonic_us()));
 
+    // A peer that closes immediately after TCP accept must be reported through
+    // the detached TLS fd map, without waiting for the probe timeout.
+    record_active_probe_result(uid, 0, /*healthy=*/true, monotonic_us());
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+    target.addrs[0].sin_port = htons(close_backend.port);
+    loop->health_probe_deadline_ns[uid] = 0;
+    const u64 close_start_us = monotonic_us();
+    loop->sweep_health_probes();
+    pump();
+    const u64 close_elapsed_us = monotonic_us() - close_start_us;
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(close_elapsed_us < 500'000u);
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+
     for (u32 i = 0; i < sizeof(target.tls.server_name); ++i) target.tls.server_name[i] = 0;
     for (u32 i = 0; i < sizeof(kServerName); ++i) target.tls.server_name[i] = kServerName[i];
     target.addrs[0].sin_port = htons(no_alpn_backend.port);
@@ -2902,11 +2924,26 @@ TEST(active_health_e2e, grpc_tls_check_validates_peer_and_alpn_before_request) {
     for (u32 i = 0; i < after_close_count; ++i)
         CHECK(!(after_close[i].type == IoEventType::Send && after_close[i].conn_id == reused_id));
 
+    // A pending connect does not pin request_config. Replacing it with an
+    // inaccessible stale pointer must be rejected before the callback reads it.
+    target.addrs[0].sin_port = htons(backend.port);
+    loop->upstream_timeout = 1;
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    Connection* pending_probe = nullptr;
+    for (u32 i = 0; i < RealLoop::kMaxConns; ++i)
+        if (loop->conns[i].is_health_probe) pending_probe = &loop->conns[i];
+    REQUIRE(pending_probe != nullptr);
+    pending_probe->request_config = reinterpret_cast<const RouteConfig*>(static_cast<uintptr_t>(1));
+    pump();
+    CHECK_EQ(loop->active_count(), 0u);
+
     loop->shutdown();
     close(listen_fd);
     destroy_real_loop(loop);
     backend.teardown();
     no_alpn_backend.teardown();
+    close_backend.teardown();
 }
 
 // An active-probe failure must keep the backend OUT of rotation until a probe
@@ -3587,6 +3624,15 @@ TEST(active_health, grpc_route_config_validates_utf8_and_service_bound) {
     CHECK(!cfg.set_upstream_grpc_health_check(uid, nullptr, 0, /*interval_ms=*/0));
     cfg.upstreams[uid].tls.enabled = true;
     CHECK(!cfg.set_upstream_grpc_health_check(uid, nullptr, 0, /*interval_ms=*/1000));
+    cfg.upstreams[uid].tls.ca[0] = 'x';
+    CHECK(!cfg.set_upstream_grpc_health_check(uid, nullptr, 0, /*interval_ms=*/1000));
+    cfg.upstreams[uid].tls.ca[0] = '\0';
+    for (u32 i = 0; i < sizeof(kTestCertPath); ++i) cfg.upstreams[uid].tls.ca[i] = kTestCertPath[i];
+    for (u32 i = 0; i < sizeof("localhost"); ++i)
+        cfg.upstreams[uid].tls.server_name[i] = "localhost"[i];
+    cfg.upstreams[uid].tls.enabled = true;
+    REQUIRE(valid_upstream_tls(cfg.upstreams[uid].tls));
+    CHECK(cfg.set_upstream_grpc_health_check(uid, nullptr, 0, /*interval_ms=*/1000));
 
     RouteConfig http1{};
     auto http1_id = http1.add_upstream("http", 0x7F000001, 8080);
@@ -3595,7 +3641,7 @@ TEST(active_health, grpc_route_config_validates_utf8_and_service_bound) {
 
     // The legacy HTTP/1 setter previously accepted direct callers with TLS
     // metadata; keep that API behavior unchanged while the new gRPC setter
-    // rejects TLS probes until a TLS probe transport exists.
+    // accepts only complete TLS specs.
     http1.upstreams[http1_id.value()].tls.enabled = true;
     CHECK(http1.set_upstream_health_check(
         http1_id.value(), "/health", 7, /*interval_ms=*/1000, /*status=*/200));

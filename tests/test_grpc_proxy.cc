@@ -16,6 +16,7 @@
 #include <atomic>
 #include <memory>
 
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -27,6 +28,88 @@ namespace {
 volatile sig_atomic_t grpc_test_signal_count = 0;
 void grpc_test_signal_handler(int) {
     grpc_test_signal_count = grpc_test_signal_count + 1;
+}
+
+bool grpc_test_tls_connect_until(SSL* ssl,
+                                 int fd,
+                                 u64 deadline_us,
+                                 bool inject_poll_eintr_after_want_read = false,
+                                 int* failure_errno = nullptr,
+                                 int* failure_ssl_error = nullptr,
+                                 bool* injected_poll_eintr = nullptr) {
+    const int original_flags = fcntl(fd, F_GETFL, 0);
+    if (original_flags < 0 || fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) < 0) return false;
+    bool connected = false;
+    int last_errno = 0;
+    int last_ssl_error = SSL_ERROR_NONE;
+    while (monotonic_us() < deadline_us) {
+        errno = 0;
+        const int rc = SSL_connect(ssl);
+        const int call_errno = errno;
+        if (rc == 1) {
+            connected = true;
+            break;
+        }
+        const int ssl_error = SSL_get_error(ssl, rc);
+        last_errno = call_errno;
+        last_ssl_error = ssl_error;
+
+        short events = 0;
+        if (ssl_error == SSL_ERROR_WANT_READ)
+            events = POLLIN;
+        else if (ssl_error == SSL_ERROR_WANT_WRITE)
+            events = POLLOUT;
+        else if (ssl_error == SSL_ERROR_SYSCALL && call_errno == EINTR) {
+            const int ssl_want = SSL_want(ssl);
+            if (ssl_want == SSL_READING)
+                events = POLLIN;
+            else if (ssl_want == SSL_WRITING)
+                events = POLLOUT;
+            else
+                continue;  // Retry the same SSL operation within the total deadline.
+        } else {
+            break;
+        }
+
+        while (monotonic_us() < deadline_us) {
+            const u64 now_us = monotonic_us();
+            if (now_us >= deadline_us) goto done;
+            const u64 remaining_us = deadline_us - now_us;
+            const int timeout_ms = static_cast<int>((remaining_us + 999) / 1000);
+            pollfd ready{fd, events, 0};
+            int poll_rc;
+            if (inject_poll_eintr_after_want_read && ssl_error == SSL_ERROR_WANT_READ) {
+                // SSL_connect has emitted ClientHello and returned a real
+                // WANT_READ. Inject one interrupted wait before polling for
+                // the server's handshake flight.
+                inject_poll_eintr_after_want_read = false;
+                if (injected_poll_eintr != nullptr) *injected_poll_eintr = true;
+                errno = EINTR;
+                poll_rc = -1;
+            } else {
+                poll_rc = poll(&ready, 1, timeout_ms);
+            }
+            if (poll_rc > 0) break;
+            if (poll_rc == 0) {
+                last_errno = ETIMEDOUT;
+                goto done;
+            }
+            if (errno != EINTR) {
+                last_errno = errno;
+                goto done;
+            }
+        }
+    }
+
+done:
+    if (!connected && monotonic_us() >= deadline_us) last_errno = ETIMEDOUT;
+    if (fcntl(fd, F_SETFL, original_flags) < 0) {
+        last_errno = errno;
+        connected = false;
+    }
+    if (failure_errno != nullptr) *failure_errno = last_errno;
+    if (failure_ssl_error != nullptr) *failure_ssl_error = last_ssl_error;
+    return connected;
 }
 
 u64 grpc_jit_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
@@ -464,6 +547,7 @@ struct Client {
     nghttp2_session* session = nullptr;
     bool goaway = false;
     u32 window_updates = 0;
+    bool tls_poll_eintr_injected = false;
     int fd = -1;
     static u8 byte_at(u32 i) { return static_cast<u8>((i * 17 + i / 256) & 255); }
     static ssize_t data(nghttp2_session* session,
@@ -566,7 +650,10 @@ struct Client {
         static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].closed = true;
         return 0;
     }
-    bool init(u16 port, bool tls = false, const char* label = "client") {
+    bool init(u16 port,
+              bool tls = false,
+              const char* label = "client",
+              bool inject_poll_eintr_after_want_read = false) {
         auto fail = [&](const char* stage, int error, int result, int ssl_error = 0) {
             fprintf(stderr,
                     "grpc Client::init[%s] failed stage=%s errno=%d rc=%d ssl_error=%d "
@@ -599,9 +686,17 @@ struct Client {
             errno = 0;
             if (SSL_set_alpn_protos(ssl, alpn, sizeof(alpn)) != 0) return fail("alpn", errno, -1);
             ERR_clear_error();
-            errno = 0;
-            const int rc = SSL_connect(ssl);
-            if (rc != 1) return fail("SSL_connect", errno, rc, SSL_get_error(ssl, rc));
+            const u64 deadline_us = monotonic_us() + 5'000'000;
+            int tls_errno = 0;
+            int tls_ssl_error = SSL_ERROR_NONE;
+            if (!grpc_test_tls_connect_until(ssl,
+                                             fd,
+                                             deadline_us,
+                                             inject_poll_eintr_after_want_read,
+                                             &tls_errno,
+                                             &tls_ssl_error,
+                                             &tls_poll_eintr_injected))
+                return fail("SSL_connect", tls_errno, -1, tls_ssl_error);
         }
         nghttp2_session_callbacks* cb = nullptr;
         const int callbacks_rc = nghttp2_session_callbacks_new(&cb);
@@ -796,7 +891,8 @@ void streaming_case(rut::test::TestCase* _tc,
                     bool tls = false,
                     bool upstream_tls = false,
                     bool mutual = false,
-                    bool large_first = false) {
+                    bool large_first = false,
+                    bool inject_poll_eintr_after_want_read = false) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start(upstream_tls, mutual));
     auto shard = std::make_unique<Shard<Loop>>();
@@ -878,10 +974,11 @@ void streaming_case(rut::test::TestCase* _tc,
     // No REQUIRE after spawning: always stop/join before destroying config.
     {
         Client a, b;
-        const bool a_connected = a.init(get_port(lfd), tls, "a");
+        const bool a_connected = a.init(get_port(lfd), tls, "a", inject_poll_eintr_after_want_read);
         const bool b_connected = a_connected && b.init(get_port(lfd), tls, "b");
         const bool connected = a_connected && b_connected;
         CHECK(connected);
+        if (inject_poll_eintr_after_want_read) CHECK(a.tls_poll_eintr_injected);
         if (connected) {
             CHECK_EQ(a.request(0, large_first ? 200000 : 128, false), 1);
             const bool echoed = a.until(0, false);
@@ -8819,6 +8916,35 @@ TEST(grpc_proxy, tls_downstream_jit_epoll) {
 }
 TEST(grpc_proxy, tls_downstream_jit_iouring) {
     streaming_case<IoUringEventLoop>(_tc, true);
+}
+TEST(grpc_proxy, tls_client_handshake_retries_poll_eintr_after_want_read) {
+    streaming_case<EpollEventLoop>(_tc, true, false, false, false, true);
+}
+TEST(grpc_proxy, tls_client_handshake_timeout_and_fatal_error_are_bounded) {
+    SSL_CTX* context = SSL_CTX_new(TLS_client_method());
+    REQUIRE(context != nullptr);
+    int sockets[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+    SSL* ssl = SSL_new(context);
+    REQUIRE(ssl != nullptr);
+    REQUIRE_EQ(SSL_set_fd(ssl, sockets[0]), 1);
+    const u64 timeout_start_us = monotonic_us();
+    int failure_errno = 0;
+    int failure_ssl_error = SSL_ERROR_NONE;
+    CHECK_FALSE(grpc_test_tls_connect_until(
+        ssl, sockets[0], timeout_start_us + 100'000, false, &failure_errno, &failure_ssl_error));
+    CHECK_EQ(failure_errno, ETIMEDOUT);
+    CHECK_EQ(failure_ssl_error, SSL_ERROR_WANT_READ);
+    CHECK(monotonic_us() - timeout_start_us < 500'000u);
+    close(sockets[1]);
+    const u64 fatal_start_us = monotonic_us();
+    CHECK_FALSE(grpc_test_tls_connect_until(
+        ssl, sockets[0], fatal_start_us + 100'000, false, &failure_errno, &failure_ssl_error));
+    CHECK(failure_ssl_error != SSL_ERROR_WANT_READ);
+    CHECK(monotonic_us() - fatal_start_us < 500'000u);
+    SSL_free(ssl);
+    SSL_CTX_free(context);
+    close(sockets[0]);
 }
 TEST(grpc_proxy, upstream_tls_epoll) {
     streaming_case<EpollEventLoop>(_tc, false, true);
