@@ -1314,6 +1314,10 @@ public:
                         reclaim_pending();
                 }
                 break;
+            case IoEventType::LocalGrpcDeadlineTimer:
+            case IoEventType::LocalGrpcDeadlineCancel:
+                // Concrete proactors own local deadline timer retirement.
+                break;
             case IoEventType::Count:
                 break;
         }

@@ -1437,6 +1437,8 @@ public:
                 }
                 break;
             case IoEventType::ResponseReadTimer:
+            case IoEventType::LocalGrpcDeadlineTimer:
+            case IoEventType::LocalGrpcDeadlineCancel:
             case IoEventType::Count:
                 // io_uring owns relay poll events; epoll stays on the copy
                 // fallback and must never route these into legacy callbacks.
