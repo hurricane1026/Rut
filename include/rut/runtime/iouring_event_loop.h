@@ -947,7 +947,7 @@ public:
             (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None &&
              c.http1_prebuilt_wait != 0) ||
             strict_upstream_retirement_blocks_reclaim(c) || idle_return_drain_blocks_boundary(c) ||
-            !c.response_read_timer_owner_is_neutral())
+            !c.response_read_timer_owner_is_neutral() || !c.local_grpc_deadline_timer.reusable())
             return;
         c.http1_boundary_ready = true;
         http1_boundary_ready_pending = true;
@@ -986,7 +986,8 @@ public:
             return true;
         }
         if (!strict_upstream_retirement_blocks_reclaim(c) &&
-            !idle_return_drain_blocks_boundary(c) && c.response_read_timer_owner_is_neutral())
+            !idle_return_drain_blocks_boundary(c) && c.response_read_timer_owner_is_neutral() &&
+            c.local_grpc_deadline_timer.reusable())
             return false;
         if (c.http1_boundary_deferred || c.http1_boundary_ready) {
             // A duplicate rendezvous cannot be resumed safely. Keep it parked;
@@ -2789,7 +2790,8 @@ public:
             c.http1_boundary_ready = false;
             if (!c.http1_boundary_deferred) continue;
             if (strict_upstream_retirement_blocks_reclaim(c) ||
-                idle_return_drain_blocks_boundary(c) || !c.response_read_timer_owner_is_neutral())
+                idle_return_drain_blocks_boundary(c) || !c.response_read_timer_owner_is_neutral() ||
+                !c.local_grpc_deadline_timer.reusable())
                 continue;
             const u32 expected_episode = c.http1_boundary_successor_episode;
 
@@ -8986,6 +8988,10 @@ public:
                         } else if (ev.result != -ECANCELED) {
                             close_conn(c);
                         }
+                    }
+                    if (owner.reusable()) {
+                        if (c.fd >= 0) maybe_publish_http1_boundary_ready(c);
+                        reclaim_pending();
                     }
                     if (c.fd < 0 && c.pending_ops == 0 && owner.reusable()) reclaim_slot(c.id);
                 }

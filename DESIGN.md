@@ -8210,7 +8210,9 @@ HTTP 200 with a trailers-only gRPC-Web status 4 response in the admitted binary/
 closes the connection. Terminal responses settle the timer before publication.
 With a local deadline active, Forward and event-based yields fail before I/O;
 timer yields remain supported. HTTP/2 and kqueue local deadlines remain
-unimplemented.
+unimplemented; backends without a local timer retain legacy handling of
+`grpc-timeout`. Once an admitted deadline expires, timeout wins over a late
+body-validation error.
 
 An explicit local response with `application/grpc-web` or
 `application/grpc-web-text` (optionally `+proto`) uses the same bounded unary

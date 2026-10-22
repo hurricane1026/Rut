@@ -88710,6 +88710,57 @@ TEST(local_grpc_deadline_backend, cancel_ealready_retires_dispatch_owners_in_bot
     }
 }
 
+TEST(local_grpc_deadline_backend, async_cancel_owner_gates_http1_successor_until_both_cqes) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    REQUIRE(guard.loop->pool.init(SlicePool::capacity_for_connections(1), 0).has_value());
+    auto* conn = guard.loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->upstream_episode = 1;
+    REQUIRE(guard.loop->arm_local_grpc_deadline(*conn, 1234567));
+    const u32 generation = conn->local_grpc_deadline_timer.owner_generation;
+    guard.loop->disarm_local_grpc_deadline(*conn);
+    CHECK(conn->local_grpc_deadline_timer.cancel_owned);
+    CHECK(guard.loop->defer_http1_request_boundary(*conn));
+    CHECK(conn->http1_boundary_deferred);
+    guard.loop->maybe_publish_http1_boundary_ready(*conn);
+    CHECK_FALSE(conn->http1_boundary_ready);
+
+    IoEvent target{conn->id, -ECANCELED, 0, 0, IoEventType::LocalGrpcDeadlineTimer, 0};
+    target.non_upstream_generation = generation;
+    IoEvent cancel = target;
+    cancel.type = IoEventType::LocalGrpcDeadlineCancel;
+    cancel.result = -ENOENT;
+    guard.loop->dispatch(target);
+    CHECK_FALSE(conn->local_grpc_deadline_timer.reusable());
+    CHECK_FALSE(conn->http1_boundary_ready);
+    guard.loop->dispatch(cancel);
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    CHECK(conn->http1_boundary_ready);
+    CHECK_EQ(conn->pending_ops, 0u);
+
+    // A successor can arm a fresh owner after the first target/cancel pair;
+    // exercise the reverse CQE order as well.
+    conn->http1_boundary_ready = false;
+    REQUIRE(guard.loop->arm_local_grpc_deadline(*conn, 1234568));
+    const u32 successor_generation = conn->local_grpc_deadline_timer.owner_generation;
+    CHECK_NE(successor_generation, generation);
+    guard.loop->disarm_local_grpc_deadline(*conn);
+    target.non_upstream_generation = successor_generation;
+    cancel.non_upstream_generation = successor_generation;
+    guard.loop->dispatch(cancel);
+    CHECK_FALSE(conn->local_grpc_deadline_timer.reusable());
+    CHECK_FALSE(conn->http1_boundary_ready);
+    guard.loop->dispatch(target);
+    CHECK(conn->local_grpc_deadline_timer.reusable());
+    CHECK(conn->http1_boundary_ready);
+    CHECK_EQ(conn->pending_ops, 0u);
+    guard.loop->close_conn(*conn);
+    guard.loop->pool.destroy();
+}
+
 TEST(local_grpc_deadline_backend, epoll_retains_exact_long_deadline_across_horizon_wakes) {
     EpollEventLoop loop;
     REQUIRE(loop.init_slot_storage(1).has_value());

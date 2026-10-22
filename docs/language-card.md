@@ -1199,7 +1199,9 @@ collection, synchronous handler execution, or a timer yield returns HTTP 200
 with a trailers-only `grpc-status: 4`
 envelope in binary/text mode and closes the connection. An active local deadline
 rejects Forward and event-based yields before I/O; timer yields remain supported.
-HTTP/2 and kqueue local deadline enforcement are not implemented.
+HTTP/2 and kqueue local deadline enforcement are not implemented; backends
+without a local timer retain legacy `grpc-timeout` handling. After expiry,
+timeout wins over late body-validation errors.
 
 Local responses may opt into grpc-web by using exactly one
 `application/grpc-web`/`application/grpc-web-text` content type, optionally
