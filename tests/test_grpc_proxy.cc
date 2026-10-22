@@ -9551,7 +9551,9 @@ void repeated_protobuf_network_case(rut::test::TestCase* _tc) {
                         5, framed, sizeof(framed), false, 1, true, "1H", "/local.WebWire/Call") >
                     0);
             REQUIRE(web_client.until(5, true));
-            CHECK_EQ(web_client.rpcs[5].http_status, 503u);
+            // An active grpc-timeout is rejected by the local admission fence
+            // before body forwarding; no upstream exchange is created.
+            CHECK_EQ(web_client.rpcs[5].http_status, 400u);
             CHECK_EQ(recorder.count.load(), 0u);
             // Hold response DATA at zero window, cancel, then reuse the connection.
             nghttp2_settings_entry zero_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 0};
