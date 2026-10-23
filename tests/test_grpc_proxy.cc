@@ -7,6 +7,7 @@
 #include "test_helpers.h"
 
 #include <nghttp2/nghttp2.h>
+#include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #if RUT_GRPC_JIT
@@ -572,21 +573,49 @@ struct Client {
         static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].closed = true;
         return 0;
     }
-    bool init(u16 port, bool tls = false) {
+    bool init(u16 port, bool tls = false, const char* client_name = "client") {
+        auto report_init_failure = [&](const char* stage, int result, int tls_error = 0) {
+            const int saved_errno = errno;
+            const unsigned long openssl_error = ERR_get_error();
+            char openssl_message[256]{};
+            if (openssl_error != 0)
+                ERR_error_string_n(openssl_error, openssl_message, sizeof(openssl_message));
+            fprintf(stderr,
+                    "grpc test client %s init failed at %s: port=%u fd=%d result=%d "
+                    "tls_error=%d errno=%d openssl_error=%s\n",
+                    client_name,
+                    stage,
+                    port,
+                    fd,
+                    result,
+                    tls_error,
+                    saved_errno,
+                    openssl_message[0] ? openssl_message : "none");
+            return false;
+        };
+        ERR_clear_error();
         fd = connect_to(port);
-        if (fd < 0) return false;
+        if (fd < 0) return report_init_failure("connect", fd);
         set_socket_timeouts(fd, 5);
         if (tls) {
             tls_context = SSL_CTX_new(TLS_client_method());
-            if (!tls_context) return false;
+            if (!tls_context) return report_init_failure("SSL_CTX_new", 0);
             ssl = SSL_new(tls_context);
             const u8 alpn[] = {2, 'h', '2'};
-            if (!ssl || !SSL_set_fd(ssl, fd) || SSL_set_alpn_protos(ssl, alpn, sizeof(alpn)) != 0 ||
-                SSL_connect(ssl) != 1)
-                return false;
+            if (!ssl) return report_init_failure("SSL_new", 0);
+            if (!SSL_set_fd(ssl, fd)) return report_init_failure("SSL_set_fd", 0);
+            const int alpn_rc = SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
+            if (alpn_rc != 0) return report_init_failure("SSL_set_alpn_protos", alpn_rc);
+            const int connect_rc = SSL_connect(ssl);
+            if (connect_rc != 1) {
+                const int tls_error = SSL_get_error(ssl, connect_rc);
+                return report_init_failure("SSL_connect", connect_rc, tls_error);
+            }
         }
         nghttp2_session_callbacks* cb;
-        nghttp2_session_callbacks_new(&cb);
+        const int callbacks_rc = nghttp2_session_callbacks_new(&cb);
+        if (callbacks_rc != 0 || !cb)
+            return report_init_failure("nghttp2_session_callbacks_new", callbacks_rc);
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, &receive);
         nghttp2_session_callbacks_set_on_header_callback(cb, &header);
         nghttp2_session_callbacks_set_on_stream_close_callback(cb, &closed);
@@ -594,8 +623,9 @@ struct Client {
         nghttp2_session_callbacks_set_on_frame_send_callback(cb, &frame_send);
         const int rc = nghttp2_session_client_new(&session, cb, this);
         nghttp2_session_callbacks_del(cb);
+        if (rc != 0 || !session) return report_init_failure("nghttp2_session_client_new", rc);
         nghttp2_submit_settings(session, 0, nullptr, 0);
-        return rc == 0;
+        return true;
     }
     int request(u32 index,
                 u32 bytes,
@@ -823,7 +853,7 @@ void streaming_case(rut::test::TestCase* _tc,
     // No REQUIRE after spawning: always stop/join before destroying config.
     {
         Client a, b;
-        const bool connected = a.init(get_port(lfd), tls) && b.init(get_port(lfd), tls);
+        const bool connected = a.init(get_port(lfd), tls, "a") && b.init(get_port(lfd), tls, "b");
         CHECK(connected);
         if (connected) {
             CHECK_EQ(a.request(0, large_first ? 200000 : 128, false), 1);
