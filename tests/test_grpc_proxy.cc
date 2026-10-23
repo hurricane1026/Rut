@@ -24,6 +24,17 @@
 using namespace rut;
 
 namespace {
+template <typename Call>
+inline bool grpc_web_test_ssl_call(SSL* ssl,
+                                   int fd,
+                                   u64 deadline_us,
+                                   int* result,
+                                   int* error_number,
+                                   int* ssl_error,
+                                   unsigned long* openssl_error,
+                                   std::atomic<u32>* retry_count,
+                                   Call&& call);
+
 volatile sig_atomic_t grpc_test_signal_count = 0;
 void grpc_test_signal_handler(int) {
     grpc_test_signal_count = grpc_test_signal_count + 1;
@@ -449,6 +460,7 @@ struct EchoServer {
 struct Client {
     SSL_CTX* tls_context = nullptr;
     SSL* ssl = nullptr;
+    std::atomic<u32> tls_connect_retries{0};
     struct Rpc {
         static constexpr u32 kWebBufferCap = 262144;
         u32 sent = 0, received = 0, size = 0;
@@ -582,7 +594,7 @@ struct Client {
                 ERR_error_string_n(openssl_error, openssl_message, sizeof(openssl_message));
             fprintf(stderr,
                     "grpc test client %s init failed at %s: port=%u fd=%d result=%d "
-                    "tls_error=%d errno=%d openssl_error=%s\n",
+                    "tls_error=%d errno=%d retries=%u openssl_error=%s\n",
                     client_name,
                     stage,
                     port,
@@ -590,6 +602,7 @@ struct Client {
                     result,
                     tls_error,
                     saved_errno,
+                    tls_connect_retries.load(std::memory_order_relaxed),
                     openssl_message[0] ? openssl_message : "none");
             return false;
         };
@@ -606,11 +619,22 @@ struct Client {
             if (!SSL_set_fd(ssl, fd)) return report_init_failure("SSL_set_fd", 0);
             const int alpn_rc = SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
             if (alpn_rc != 0) return report_init_failure("SSL_set_alpn_protos", alpn_rc);
-            const int connect_rc = SSL_connect(ssl);
-            if (connect_rc != 1) {
-                const int tls_error = SSL_get_error(ssl, connect_rc);
+            const u64 tls_deadline = monotonic_us() + 5000000;
+            int connect_rc = 0, connect_errno = 0, tls_error = 0;
+            unsigned long openssl_error = 0;
+            if (!grpc_web_test_ssl_call(ssl,
+                                        fd,
+                                        tls_deadline,
+                                        &connect_rc,
+                                        &connect_errno,
+                                        &tls_error,
+                                        &openssl_error,
+                                        &tls_connect_retries,
+                                        [&] { return SSL_connect(ssl); })) {
+                errno = connect_errno;
                 return report_init_failure("SSL_connect", connect_rc, tls_error);
             }
+            set_socket_timeouts(fd, 5);
         }
         nghttp2_session_callbacks* cb;
         const int callbacks_rc = nghttp2_session_callbacks_new(&cb);
@@ -9077,6 +9101,61 @@ TEST(grpc_proxy, message_limits_snapshot_iouring) {
 }
 
 #include "grpc_web_h1_cases.h"
+
+TEST(grpc_proxy, tls_client_init_retries_handshake_eintr) {
+    GrpcWebTlsGateServer server;
+    server.pause_handshake = true;
+    REQUIRE(server.start());
+
+    Client client;
+    struct ClientCall {
+        u16 port;
+        Client* client;
+        bool initialized = false;
+    } call{server.port, &client};
+    auto run_client = +[](void* ptr) -> void* {
+        auto* call = static_cast<ClientCall*>(ptr);
+        call->initialized = call->client->init(call->port, true, "signal-test");
+        return nullptr;
+    };
+
+    struct sigaction action{}, old_action{};
+    action.sa_handler = grpc_test_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    grpc_test_signal_count = 0;
+    REQUIRE(sigaction(SIGUSR1, &action, &old_action) == 0);
+
+    pthread_t client_thread{};
+    const int thread_result = pthread_create(&client_thread, nullptr, run_client, &call);
+    if (thread_result != 0) {
+        sigaction(SIGUSR1, &old_action, nullptr);
+        CHECK_EQ(thread_result, 0);
+        return;
+    }
+
+    const u64 hello_deadline = monotonic_us() + 3000000;
+    while (!server.client_hello_waiting.load(std::memory_order_acquire) &&
+           monotonic_us() < hello_deadline)
+        sched_yield();
+    const bool hello_arrived = server.client_hello_waiting.load(std::memory_order_acquire);
+    CHECK(hello_arrived);
+
+    const u64 signal_deadline = monotonic_us() + 2000000;
+    while (hello_arrived && client.tls_connect_retries.load(std::memory_order_relaxed) == 0 &&
+           monotonic_us() < signal_deadline) {
+        CHECK_EQ(pthread_kill(client_thread, SIGUSR1), 0);
+        sched_yield();
+    }
+    CHECK_GT(client.tls_connect_retries.load(std::memory_order_relaxed), 0u);
+
+    const u8 release = 1;
+    CHECK_EQ(write(server.gate[1], &release, 1), 1);
+    pthread_join(client_thread, nullptr);
+    CHECK_GT(grpc_test_signal_count, 0);
+    CHECK(call.initialized);
+    sigaction(SIGUSR1, &old_action, nullptr);
+}
 
 #if RUT_GRPC_JIT
 #include "protobuf/enum_oracle.inc"
