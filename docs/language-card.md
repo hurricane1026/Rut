@@ -1273,3 +1273,10 @@ unary `grpc.health.v1.Health/Check` wire contract with existing `grpc.decode` an
 legacy `example.BatchEcho` name, and `INVALID_ARGUMENT` for malformed requests.
 Streaming health `Watch` and a dynamic service registry remain unsupported by
 this example. See [the SDK interoperability check](../examples/grpc/README.md#local-standard-health-check).
+
+Local Health Check has separate [binary](../examples/grpc-health-web-binary.rut)
+and [text](../examples/grpc-health-web-text.rut) gRPC-Web example listeners with
+fixed-origin CORS and terminal status envelopes on success and failure. Response
+format is selected by the listener program, not automatically negotiated. The
+[standard-library HTTP/1.1 check](../examples/grpc/health_web_client.py) validates
+framing, error trailers, preflight and reuse without a Python gRPC dependency.
