@@ -198,8 +198,9 @@ it does not implement local deadline scheduling or streaming message handlers.
 `/grpc.health.v1.Health/Check` method directly in Rut. It decodes the standard
 request with the built-in protobuf compiler and encodes a typed response; no
 Python backend, generated bindings, or additional runtime dependency is needed.
-The empty service and `example.BatchEcho` return `SERVING`. An unknown service
-returns gRPC `NOT_FOUND` (5); malformed protobuf returns `INVALID_ARGUMENT` (3).
+The empty service and `grpc.health.v1.Health` return `SERVING`. The legacy
+`example.BatchEcho` name and other unknown services return gRPC `NOT_FOUND` (5);
+malformed protobuf returns `INVALID_ARGUMENT` (3).
 This is a static readiness example: replace its policy with your application's
 readiness decision before deploying it. It does not implement streaming `Watch`
 or a dynamic service registry.
@@ -211,8 +212,9 @@ build/src/rut 50052 examples/grpc-health.rut --backend epoll --shards 1 --no-pin
 examples/grpc/.venv/bin/python examples/grpc/health_client.py
 ```
 
-The client checks both successful service names, unknown-service and malformed
-requests, and a successful call after failures on the same channel. For TLS,
+The client checks the empty and advertised service names, rejects the legacy
+`example.BatchEcho` name and other unknown or malformed requests, and makes a
+successful call after failures on the same channel. For TLS,
 use the listener certificate/key arguments from above and run the client with
 `--target localhost:50052 --ca tests/fixtures/localhost_cert.pem`.
 The source schema includes the unary subset of the standard health protocol;

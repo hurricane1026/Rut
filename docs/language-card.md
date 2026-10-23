@@ -1268,7 +1268,8 @@ expose streaming RPC handlers, or perform HTTP/JSON transcoding. See
 
 The [local health example](../examples/grpc-health.rut) implements the standard
 unary `grpc.health.v1.Health/Check` wire contract with existing `grpc.decode` and
-`grpc.encode`. It reports static `SERVING` for its listener and one named service,
-`NOT_FOUND` for unknown services, and `INVALID_ARGUMENT` for malformed requests.
+`grpc.encode`. It reports static `SERVING` for its listener and the named
+`grpc.health.v1.Health` service, `NOT_FOUND` for unknown services including the
+legacy `example.BatchEcho` name, and `INVALID_ARGUMENT` for malformed requests.
 Streaming health `Watch` and a dynamic service registry remain unsupported by
 this example. See [the SDK interoperability check](../examples/grpc/README.md#local-standard-health-check).

@@ -24,13 +24,14 @@ def main():
             request_serializer=lambda value: value,
             response_deserializer=lambda value: value,
         )
-        for request in (b"", b"\x0a\x00", b"\x0a\x11example.BatchEcho", b"\x10\x01"):
-            # Omitted/explicit empty service, a named service, and an unknown field.
+        for request in (b"", b"\x0a\x00", b"\x0a\x15grpc.health.v1.Health", b"\x10\x01"):
+            # Omitted/explicit empty service, the advertised service, and an unknown field.
             response, call = check.with_call(request, timeout=5)
             assert response == b"\x08\x01", response
             assert call.code() == grpc.StatusCode.OK, call.code()
         for request, expected in (
             (b"\x0a\x07missing", grpc.StatusCode.NOT_FOUND),
+            (b"\x0a\x11example.BatchEcho", grpc.StatusCode.NOT_FOUND),
             (b"\x80", grpc.StatusCode.INVALID_ARGUMENT),
             (b"\x0a\x01\xff", grpc.StatusCode.INVALID_ARGUMENT),
         ):
