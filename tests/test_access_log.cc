@@ -1,6 +1,7 @@
 // Access log tests: SPSC ring buffer, text output, zstd compression, flusher.
 #include "fault_injection.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/access_log_host.h"
 #include "test.h"
 #include "test_helpers.h"
 #include <atomic>
@@ -149,6 +150,24 @@ static void write_request(Connection& c, const char* raw) {
     c.recv_buf.commit(len);
 }
 
+static AccessLogDownstreamHostSnapshot capture_test_downstream_host(const std::string& request,
+                                                                    bool strict_h1 = true) {
+    HttpParser parser;
+    ParsedRequest parsed{};
+    parser.reset();
+    const ParseStatus status = parser.parse(
+        reinterpret_cast<const u8*>(request.data()), static_cast<u32>(request.size()), &parsed);
+    AccessLogDownstreamHostSnapshot snapshot{};
+    capture_access_log_downstream_host_snapshot(snapshot,
+                                                7u,
+                                                parsed,
+                                                reinterpret_cast<const u8*>(request.data()),
+                                                static_cast<u32>(request.size()),
+                                                parser.header_end,
+                                                strict_h1 && status == ParseStatus::Complete);
+    return snapshot;
+}
+
 // === AccessLogEntry size ===
 
 TEST(access_log_entry, exact_public_layout_and_constants) {
@@ -177,6 +196,185 @@ TEST(access_log_entry, exact_public_layout_and_constants) {
     CHECK_EQ(sizeof(AccessLogEntry), 192u);
     CHECK_EQ(alignof(AccessLogEntry), 8u);
     CHECK_EQ(sizeof(AccessLogRing), 98432u);
+}
+
+TEST(access_log_downstream_host, pinned_schema_and_owned_capture_states) {
+    CHECK_EQ(kAccessLogDownstreamHostMax, 128u);
+    CHECK_EQ(kAccessLogDownstreamHostRecordSchema, 1u);
+    CHECK_EQ(kAccessLogDownstreamHostLineCapacity, 512u);
+    CHECK_EQ(sizeof(AccessLogDownstreamHostRecord), 136u);
+    CHECK_EQ(alignof(AccessLogDownstreamHostRecord), 4u);
+    CHECK_EQ(sizeof(AccessLogDownstreamHostSnapshot), 144u);
+    CHECK_EQ(alignof(AccessLogDownstreamHostSnapshot), 4u);
+    CHECK_EQ(static_cast<u8>(AccessLogDownstreamHostState::Unavailable), 0u);
+    CHECK_EQ(static_cast<u8>(AccessLogDownstreamHostState::Complete), 1u);
+    CHECK_EQ(static_cast<u8>(AccessLogDownstreamHostState::Empty), 2u);
+    CHECK_EQ(static_cast<u8>(AccessLogDownstreamHostState::Absent), 3u);
+    CHECK_EQ(static_cast<u8>(AccessLogDownstreamHostState::Duplicate), 4u);
+    CHECK_EQ(static_cast<u8>(AccessLogDownstreamHostState::OverLimit), 5u);
+    CHECK_EQ(static_cast<u8>(AccessLogDownstreamHostState::Invalid), 6u);
+
+    auto complete =
+        capture_test_downstream_host("GET / HTTP/1.1\r\nhOsT: \tEXample.test:80 \t\r\n\r\n");
+    CHECK_EQ(complete.episode, 7u);
+    CHECK(complete.original_header_end != 0u);
+    CHECK_EQ(complete.record.record_schema, 0u);
+    CHECK_EQ(complete.record.state, AccessLogDownstreamHostState::Complete);
+    CHECK_EQ(complete.record.observed_length, 15u);
+    CHECK_EQ(std::string(complete.record.value, complete.record.observed_length),
+             "EXample.test:80");
+
+    auto absent = capture_test_downstream_host("GET / HTTP/1.1\r\n\r\n");
+    CHECK_EQ(absent.record.state, AccessLogDownstreamHostState::Absent);
+    CHECK_EQ(absent.record.observed_length, 0u);
+    auto empty = capture_test_downstream_host("GET / HTTP/1.1\r\nHost:\r\n\r\n");
+    CHECK_EQ(empty.record.state, AccessLogDownstreamHostState::Empty);
+    auto duplicate =
+        capture_test_downstream_host("GET / HTTP/1.1\r\nHost: one\r\nhOST: two\r\n\r\n");
+    CHECK_EQ(duplicate.record.state, AccessLogDownstreamHostState::Duplicate);
+    CHECK_EQ(duplicate.record.observed_length, 0u);
+
+    std::string max_request = "GET / HTTP/1.1\r\nHost: ";
+    max_request.append(kAccessLogDownstreamHostMax, 'a');
+    max_request.append("\r\n\r\n");
+    auto max_value = capture_test_downstream_host(max_request);
+    CHECK_EQ(max_value.record.state, AccessLogDownstreamHostState::Complete);
+    CHECK_EQ(max_value.record.observed_length, kAccessLogDownstreamHostMax);
+    std::string long_request = "GET / HTTP/1.1\r\nHost: ";
+    long_request.append(kAccessLogDownstreamHostMax + 1u, 'b');
+    long_request.append("\r\n\r\n");
+    auto over_limit = capture_test_downstream_host(long_request);
+    CHECK_EQ(over_limit.record.state, AccessLogDownstreamHostState::OverLimit);
+    CHECK_EQ(over_limit.record.observed_length, kAccessLogDownstreamHostMax + 1u);
+    CHECK_EQ(over_limit.record.value[0], '\0');
+
+    auto incomplete = capture_test_downstream_host("GET / HTTP/1.1\r\nHost: x\r\n", false);
+    CHECK_EQ(incomplete.record.state, AccessLogDownstreamHostState::Unavailable);
+    CHECK_EQ(incomplete.episode, 7u);
+    CHECK_EQ(incomplete.original_header_end, 0u);
+
+    AccessLogDownstreamHostSnapshot poisoned{};
+    HttpParser parser;
+    ParsedRequest parsed{};
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    parser.reset();
+    REQUIRE(parser.parse(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u, &parsed) ==
+            ParseStatus::Complete);
+    parsed.headers[0].value.ptr = kRequest + sizeof(kRequest) - 1u;
+    parsed.headers[0].value.len = 1u;
+    capture_access_log_downstream_host_snapshot(poisoned,
+                                                9u,
+                                                parsed,
+                                                reinterpret_cast<const u8*>(kRequest),
+                                                sizeof(kRequest) - 1u,
+                                                parser.header_end,
+                                                true);
+    CHECK_EQ(poisoned.record.state, AccessLogDownstreamHostState::Invalid);
+    CHECK_EQ(poisoned.episode, 9u);
+
+    parsed.header_count = kMaxHeaders + 1u;
+    capture_access_log_downstream_host_snapshot(poisoned,
+                                                10u,
+                                                parsed,
+                                                reinterpret_cast<const u8*>(kRequest),
+                                                sizeof(kRequest) - 1u,
+                                                parser.header_end,
+                                                true);
+    CHECK_EQ(poisoned.record.state, AccessLogDownstreamHostState::Invalid);
+    CHECK_EQ(poisoned.episode, 10u);
+
+    AccessLogDownstreamHostRecord canonical{};
+    canonicalize_access_log_downstream_host_record(complete, 7u, canonical);
+    CHECK_EQ(canonical.record_schema, kAccessLogDownstreamHostRecordSchema);
+    CHECK_EQ(canonical.state, AccessLogDownstreamHostState::Complete);
+    CHECK_EQ(canonical.observed_length, 15u);
+    CHECK_EQ(canonical.value[0], 'E');
+    canonicalize_access_log_downstream_host_record(over_limit, 8u, canonical);
+    CHECK_EQ(canonical.state, AccessLogDownstreamHostState::Invalid);
+    CHECK_EQ(canonical.observed_length, 0u);
+    CHECK_EQ(canonical.value[0], '\0');
+    canonicalize_access_log_downstream_host_record(incomplete, 7u, canonical);
+    CHECK_EQ(canonical.state, AccessLogDownstreamHostState::Unavailable);
+    CHECK_EQ(canonical.record_schema, kAccessLogDownstreamHostRecordSchema);
+
+    complete.record.value[0] = 'z';
+    clear_access_log_downstream_host_snapshot(complete);
+    CHECK_EQ(complete.episode, 0u);
+    CHECK_EQ(complete.record.record_schema, 0u);
+    CHECK_EQ(complete.record.value[0], 'z');
+}
+
+TEST(access_log_downstream_host, serializer_is_versioned_hex_and_transactional) {
+    const AccessLogEntry entry = make_entry(502u, 1u, 0u, "/ignored");
+    AccessLogDownstreamHostRecord host{};
+    host.record_schema = kAccessLogDownstreamHostRecordSchema;
+    host.state = AccessLogDownstreamHostState::Complete;
+    host.observed_length = 15u;
+    static constexpr char kHost[] = "EXample.test:80";
+    for (u32 i = 0; i < sizeof(kHost) - 1u; i++) host.value[i] = kHost[i];
+    char line[kAccessLogDownstreamHostLineCapacity];
+    const u32 length = format_access_log_downstream_host_line(entry, host, line, sizeof(line));
+    CHECK_EQ(std::string(line, line + length),
+             "host1 request_bytes=256 status=502 host_state=complete host_length=15 "
+             "host_hex=4558616d706c652e746573743a3830 upstream_history=unavailable\n");
+
+    host = AccessLogDownstreamHostRecord{};
+    host.record_schema = kAccessLogDownstreamHostRecordSchema;
+    host.state = AccessLogDownstreamHostState::Complete;
+    host.observed_length = 1u;
+    host.value[0] = '\n';
+    const u32 unsafe_byte_length =
+        format_access_log_downstream_host_line(entry, host, line, sizeof(line));
+    CHECK(std::string(line, unsafe_byte_length).find("host_hex=0a") != std::string::npos);
+
+    memset(line, 'r', sizeof(line));
+    host.value[1] = 'x';
+    CHECK_EQ(format_access_log_downstream_host_line(entry, host, line, sizeof(line)), 0u);
+    CHECK_EQ(std::string(line, sizeof(line)), std::string(sizeof(line), 'r'));
+
+    host = AccessLogDownstreamHostRecord{};
+    host.record_schema = kAccessLogDownstreamHostRecordSchema;
+    host.state = AccessLogDownstreamHostState::Unavailable;
+    host.observed_length = 1u;
+    memset(line, 's', sizeof(line));
+    CHECK_EQ(format_access_log_downstream_host_line(entry, host, line, sizeof(line)), 0u);
+    CHECK_EQ(std::string(line, sizeof(line)), std::string(sizeof(line), 's'));
+
+    for (AccessLogDownstreamHostState state : {AccessLogDownstreamHostState::Unavailable,
+                                               AccessLogDownstreamHostState::Empty,
+                                               AccessLogDownstreamHostState::Absent,
+                                               AccessLogDownstreamHostState::Duplicate,
+                                               AccessLogDownstreamHostState::OverLimit,
+                                               AccessLogDownstreamHostState::Invalid}) {
+        host = AccessLogDownstreamHostRecord{};
+        host.record_schema = kAccessLogDownstreamHostRecordSchema;
+        host.state = state;
+        if (state == AccessLogDownstreamHostState::OverLimit)
+            host.observed_length = kAccessLogDownstreamHostMax + 1u;
+        const u32 state_length =
+            format_access_log_downstream_host_line(entry, host, line, sizeof(line));
+        CHECK(state_length > 0u);
+        CHECK(std::string(line, state_length).find("host_hex=-") != std::string::npos);
+    }
+
+    host = AccessLogDownstreamHostRecord{};
+    host.record_schema = kAccessLogDownstreamHostRecordSchema;
+    host.state = AccessLogDownstreamHostState::Complete;
+    host.observed_length = 1u;
+    host.value[0] = 'x';
+    char too_small[8];
+    memset(too_small, 'q', sizeof(too_small));
+    CHECK_EQ(format_access_log_downstream_host_line(entry, host, too_small, sizeof(too_small)), 0u);
+    CHECK_EQ(std::string(too_small, sizeof(too_small)), "qqqqqqqq");
+
+    host.record_schema = 0u;
+    CHECK_EQ(format_access_log_downstream_host_line(entry, host, line, sizeof(line)), 0u);
+    host.record_schema = kAccessLogDownstreamHostRecordSchema;
+    host.observed_length = 0u;
+    CHECK_EQ(format_access_log_downstream_host_line(entry, host, line, sizeof(line)), 0u);
+    host.observed_length = 1u;
+    host.reserved[0] = 1u;
+    CHECK_EQ(format_access_log_downstream_host_line(entry, host, line, sizeof(line)), 0u);
 }
 
 // === SPSC Ring: basic operations ===

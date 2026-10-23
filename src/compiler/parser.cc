@@ -3871,9 +3871,15 @@ struct Parser {
         if (!format_colon) return core::make_unexpected(format_colon.error());
         auto format = expect(TokenType::Ident);
         if (!format) return core::make_unexpected(format.error());
-        if (!format.value()->text.eq({"downstreamRequestBytes", 22}))
+        AccessLogFormatProfile format_profile = AccessLogFormatProfile::None;
+        if (format.value()->text.eq({"downstreamRequestBytes", 22})) {
+            format_profile = AccessLogFormatProfile::DownstreamRequestBytesLine;
+        } else if (format.value()->text.eq({"downstreamHost", 14})) {
+            format_profile = AccessLogFormatProfile::DownstreamHost;
+        } else {
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(*format.value()), format.value()->text);
+        }
         auto format_comma = expect(TokenType::Comma);
         if (!format_comma) return core::make_unexpected(format_comma.error());
 
@@ -3913,7 +3919,7 @@ struct Parser {
                                                  format_field.value()->line,
                                                  format_field.value()->col};
         item.access_log.format_value_span = span_from(*format.value());
-        item.access_log.format = AccessLogFormatProfile::DownstreamRequestBytesLine;
+        item.access_log.format = format_profile;
         item.access_log.publication_field_span = Span{publication_field.value()->start,
                                                       publication.value()->end,
                                                       publication_field.value()->line,

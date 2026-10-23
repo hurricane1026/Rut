@@ -35,9 +35,15 @@ timer cleanup, every: 1m { ... }  // background tasks (1s+ intervals; body: no r
 timer push, every: 5s, shard: 0 { ... }   // shard-pinned singleton (default: every shard)
 init { ... }    shutdown { ... }  // lifecycle hooks
 route GET "/health" { return 200 } // zero or more top-level route declarations
+accessLog { path: "/var/log/rut/access.log", format: downstreamRequestBytes, publication: live }
 ```
 
 `var` is allowed only inside func/handler bodies — never at top level.
+
+`accessLog` is optional process-start metadata in the main source file. The
+current reliable `live` publisher accepts `downstreamRequestBytes` (the
+existing request-length line) and `downstreamHost` (the bounded H1 Host
+observation profile described below). Imported files cannot declare it.
 
 ## Lexical
 
@@ -194,6 +200,31 @@ parseInt("42")        // ⏳ i32? — parse APIs for text (parseFloat, IP.parse,
                       //         CIDR.parse, Duration.parse) all pending
 200 as str            // ⏳ infallible conversion (`as` / checked `as?` pending)
 ```
+
+## Process access log
+
+```swift
+accessLog {
+    path: "/var/log/rut/host.log",
+    format: downstreamHost,
+    publication: live
+}
+```
+
+`downstreamHost` emits one versioned ASCII line per completed strict HTTP/1
+request:
+
+```text
+host1 request_bytes=<decimal> status=<decimal> host_state=<state> host_length=<decimal> host_hex=<hex-or-dash> upstream_history=unavailable
+```
+
+The Host value is the observed downstream semantic value after HTTP optional
+whitespace trimming. `host_hex` uses lowercase hex so arbitrary bytes cannot
+create a second line. States are `complete`, `empty`, `absent`, `duplicate`,
+`over_limit`, `unavailable`, and `invalid`; only `complete` carries bytes.
+`downstreamHost` does not change request acceptance, validate Host authority,
+or claim upstream-attempt history. H2 stream publication is not part of this
+profile. The existing `downstreamRequestBytes` output remains byte-identical.
 
 ## Request / Response
 

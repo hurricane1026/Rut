@@ -402,6 +402,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    bool access_log_compress,
                                    i32 access_log_level,
                                    SourceAccessLogFd* source_live_fd,
+                                   AccessLogFormatProfile source_live_format,
                                    const RouteConfig* route_config,
                                    bool serve_metrics,
                                    bool relay_stats_enabled) {
@@ -553,6 +554,9 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
 
     SourceLiveAccessLogSession source_live_session;
     SourceLiveAccessLogRingBinding source_live_bindings[kMaxShards]{};
+    SourceLiveAccessLogHostRingBinding source_live_host_bindings[kMaxShards]{};
+    const bool source_live_host_profile =
+        source_live_format == AccessLogFormatProfile::DownstreamHost;
     u32 source_live_ring_count = 0u;
     bool source_live_started = false;
     auto release_source_live_rings = [&]() {
@@ -584,8 +588,23 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
                 return {RunShardsOutcomeKind::Failure};
             }
-            source_live_bindings[i] = shards[i].live_access_log_binding();
             source_live_ring_count++;
+            if (source_live_host_profile) {
+                auto host_ring = shards[i].init_live_access_log_host_ring();
+                if (!host_ring) {
+                    write_str("Failed to init SourceLive Host sidecar for shard ");
+                    write_u32(i);
+                    write_str(" (reason=");
+                    write_u32(static_cast<u32>(host_ring.error()));
+                    write_str(")\n");
+                    (void)release_source_live_rings();
+                    for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
+                    return {RunShardsOutcomeKind::Failure};
+                }
+                source_live_host_bindings[i] = shards[i].live_access_log_host_binding();
+            } else {
+                source_live_bindings[i] = shards[i].live_access_log_binding();
+            }
         }
     }
 
@@ -598,9 +617,14 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
     pthread_sigmask(SIG_BLOCK, &wait_set, nullptr);
 
     if (source_live_fd != nullptr) {
-        auto started = source_live_session.start(static_cast<SourceAccessLogFd&&>(*source_live_fd),
-                                                 source_live_bindings,
-                                                 source_live_ring_count);
+        auto started =
+            source_live_host_profile
+                ? source_live_session.start_host(static_cast<SourceAccessLogFd&&>(*source_live_fd),
+                                                 source_live_host_bindings,
+                                                 source_live_ring_count)
+                : source_live_session.start(static_cast<SourceAccessLogFd&&>(*source_live_fd),
+                                            source_live_bindings,
+                                            source_live_ring_count);
         if (!started) {
             report_source_live_start_error(started.error());
             (void)release_source_live_rings();
@@ -609,7 +633,9 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         }
         source_live_started = true;
         for (u32 i = 0; i < shard_count; i++) {
-            auto attached = shards[i].attach_live_access_log(&source_live_session, i);
+            auto attached = source_live_host_profile
+                                ? shards[i].attach_live_access_log_host(&source_live_session, i)
+                                : shards[i].attach_live_access_log(&source_live_session, i);
             if (!attached) {
                 write_str("Failed to attach SourceLive access log producer for shard ");
                 write_u32(i);
@@ -1457,6 +1483,10 @@ int main(int argc, char** argv) {
     RunShardsOutcome outcome{};
     SourceAccessLogFd* source_live_fd_ptr =
         resolved_access_log->mode == AccessLogStartupMode::SourceLive ? &source_live_fd : nullptr;
+    const AccessLogFormatProfile source_live_format =
+        resolved_access_log->mode == AccessLogStartupMode::SourceLive
+            ? resolved_access_log->source_live.format
+            : AccessLogFormatProfile::None;
 #ifdef __APPLE__
     write_str(tls_server ? "Backend: kqueue (TLS, macOS development)\n"
                          : "Backend: kqueue (macOS development)\n");
@@ -1472,6 +1502,7 @@ int main(int argc, char** argv) {
                                           access_log_compress,
                                           access_log_level,
                                           source_live_fd_ptr,
+                                          source_live_format,
                                           route_config,
                                           serve_metrics,
                                           relay_stats_enabled);
@@ -1502,6 +1533,7 @@ int main(int argc, char** argv) {
             access_log_compress,
             access_log_level,
             source_live_fd_ptr,
+            source_live_format,
             route_config,
             serve_metrics,
             relay_stats_enabled);
@@ -1520,6 +1552,7 @@ int main(int argc, char** argv) {
                                                  access_log_compress,
                                                  access_log_level,
                                                  source_live_fd_ptr,
+                                                 source_live_format,
                                                  route_config,
                                                  serve_metrics,
                                                  relay_stats_enabled);
@@ -1538,6 +1571,7 @@ int main(int argc, char** argv) {
                                              access_log_compress,
                                              access_log_level,
                                              source_live_fd_ptr,
+                                             source_live_format,
                                              route_config,
                                              serve_metrics,
                                              relay_stats_enabled);

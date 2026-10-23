@@ -500,6 +500,32 @@ TEST(frontend, copied_access_log_scalars_and_spans_do_not_depend_on_borrowed_sou
     CHECK(saved_publication == AccessLogPublicationProfile::LiveEachRecord);
 }
 
+TEST(frontend, downstream_host_access_log_profile_is_named_and_round_trips) {
+    const std::string source =
+        "accessLog { path: \"/var/log/rut/host.log\", format: downstreamHost, publication: live }\n"
+        "route GET \"/\" { return 200 }\n";
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    REQUIRE(ast->items[0].kind == AstItemKind::AccessLog);
+    CHECK(ast->items[0].access_log.format == AccessLogFormatProfile::DownstreamHost);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->has_access_log);
+    CHECK(hir->access_log.format == AccessLogFormatProfile::DownstreamHost);
+    CHECK(hir->access_log.publication == AccessLogPublicationProfile::LiveEachRecord);
+    AccessLogSinkSpec spec{};
+    spec.present = true;
+    spec.format = AccessLogFormatProfile::DownstreamHost;
+    spec.publication = AccessLogPublicationProfile::LiveEachRecord;
+    static constexpr char kPath[] = "/var/log/rut/host.log";
+    spec.path_len = sizeof(kPath) - 1u;
+    for (u32 i = 0u; i < sizeof(kPath); i++) spec.path[i] = kPath[i];
+    CHECK(access_log_sink_spec_valid(spec));
+}
+
 TEST(frontend, access_log_path_boundaries_and_invalid_inventory_fail_closed) {
     const auto make_source = [](const std::string& path) {
         return "accessLog { path: \"" + path +

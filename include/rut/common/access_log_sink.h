@@ -10,6 +10,7 @@ inline constexpr u32 kAccessLogSinkPathMax = 255;
 enum class AccessLogFormatProfile : u8 {
     None = 0,
     DownstreamRequestBytesLine = 1,
+    DownstreamHost = 2,
 };
 
 enum class AccessLogPublicationProfile : u8 {
@@ -21,6 +22,7 @@ static_assert(std::is_same_v<std::underlying_type_t<AccessLogFormatProfile>, u8>
 static_assert(std::is_same_v<std::underlying_type_t<AccessLogPublicationProfile>, u8>);
 static_assert(static_cast<u8>(AccessLogFormatProfile::None) == 0u);
 static_assert(static_cast<u8>(AccessLogFormatProfile::DownstreamRequestBytesLine) == 1u);
+static_assert(static_cast<u8>(AccessLogFormatProfile::DownstreamHost) == 2u);
 static_assert(static_cast<u8>(AccessLogPublicationProfile::None) == 0u);
 static_assert(static_cast<u8>(AccessLogPublicationProfile::LiveEachRecord) == 1u);
 
@@ -71,7 +73,8 @@ inline bool access_log_sink_spec_valid(const AccessLogSinkSpec& spec) {
             if (byte != '\0') return false;
         return true;
     }
-    if (spec.format != AccessLogFormatProfile::DownstreamRequestBytesLine ||
+    if ((spec.format != AccessLogFormatProfile::DownstreamRequestBytesLine &&
+         spec.format != AccessLogFormatProfile::DownstreamHost) ||
         spec.publication != AccessLogPublicationProfile::LiveEachRecord ||
         spec.path_len > kAccessLogSinkPathMax || spec.path[spec.path_len] != '\0')
         return false;

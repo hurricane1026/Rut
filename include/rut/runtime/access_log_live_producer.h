@@ -25,6 +25,11 @@ public:
               SourceLiveAccessLogSession* session,
               u32 ring_index,
               SourceLiveAccessLogLeaseSlot* lease = nullptr);
+    bool init_host(LiveAccessLogRing* ring,
+                   SourceLiveAccessLogHostRing* host_ring,
+                   SourceLiveAccessLogSession* session,
+                   u32 ring_index,
+                   SourceLiveAccessLogLeaseSlot* lease);
     void reset();
 
     bool initialized() const { return ring_ != nullptr && session_ != nullptr; }
@@ -32,14 +37,18 @@ public:
     SourceLiveAccessLogSession* session() const { return session_; }
     SourceLiveAccessLogLeaseSlot* lease() const { return lease_; }
     u32 ring_index() const { return ring_index_; }
+    bool captures_downstream_host() const { return host_ring_ != nullptr; }
 
     SourceLiveAccessLogPublishResult publish(const AccessLogEntry& entry);
+    SourceLiveAccessLogPublishResult publish_host(const AccessLogEntry& entry,
+                                                  const AccessLogDownstreamHostRecord& host);
     void fail_protocol(i32 system_error = 0);
 
 private:
     LiveAccessLogRing* ring_ = nullptr;
     SourceLiveAccessLogSession* session_ = nullptr;
     SourceLiveAccessLogLeaseSlot* lease_ = nullptr;
+    SourceLiveAccessLogHostRing* host_ring_ = nullptr;
     u32 ring_index_ = 0u;
 };
 

@@ -74,6 +74,7 @@ struct Shard {
     // Per-shard access log ring (mmap'd, read by background flusher thread).
     AccessLogRing* log_ring = nullptr;
     LiveAccessLogRing* live_log_ring = nullptr;
+    SourceLiveAccessLogHostRing* live_log_host_ring = nullptr;
     SourceLiveAccessLogLeaseSlot live_log_lease{nullptr};
     SourceLiveAccessLogProducer live_log_producer{};
     CaptureRing* capture_ring = nullptr;
@@ -241,8 +242,34 @@ struct Shard {
         return live_log_ring;
     }
 
+    core::Expected<SourceLiveAccessLogHostRing*, ShardLiveAccessLogError>
+    init_live_access_log_host_ring() {
+        if (!loop || thread_spawned)
+            return core::make_unexpected(ShardLiveAccessLogError::InvalidLifecycle);
+        if (log_ring) return core::make_unexpected(ShardLiveAccessLogError::DualMode);
+        if (!live_log_ring) return core::make_unexpected(ShardLiveAccessLogError::NotAllocated);
+        if (live_log_host_ring)
+            return core::make_unexpected(ShardLiveAccessLogError::AlreadyAllocated);
+        if (live_log_lease.load(std::memory_order_acquire) != nullptr)
+            return core::make_unexpected(ShardLiveAccessLogError::LeaseHeld);
+        void* host_mem = mmap(nullptr,
+                              sizeof(SourceLiveAccessLogHostRing),
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS,
+                              -1,
+                              0);
+        if (host_mem == MAP_FAILED) return core::make_unexpected(ShardLiveAccessLogError::Mmap);
+        live_log_host_ring = new (host_mem) SourceLiveAccessLogHostRing();
+        live_log_host_ring->init(live_log_ring, &live_log_lease);
+        return live_log_host_ring;
+    }
+
     SourceLiveAccessLogRingBinding live_access_log_binding() {
         return {live_log_ring, &live_log_lease};
+    }
+
+    SourceLiveAccessLogHostRingBinding live_access_log_host_binding() {
+        return {live_log_ring, live_log_host_ring, &live_log_lease};
     }
 
     // Stage two. The caller owns and has already started session with this
@@ -262,6 +289,22 @@ struct Shard {
         return {};
     }
 
+    core::Expected<void, ShardLiveAccessLogError> attach_live_access_log_host(
+        SourceLiveAccessLogSession* session, u32 ring_index) {
+        if (!loop || thread_spawned)
+            return core::make_unexpected(ShardLiveAccessLogError::InvalidLifecycle);
+        if (log_ring) return core::make_unexpected(ShardLiveAccessLogError::DualMode);
+        if (!live_log_ring || !live_log_host_ring)
+            return core::make_unexpected(ShardLiveAccessLogError::NotAllocated);
+        if (live_log_producer.initialized())
+            return core::make_unexpected(ShardLiveAccessLogError::AlreadyAllocated);
+        if (!live_log_producer.init_host(
+                live_log_ring, live_log_host_ring, session, ring_index, &live_log_lease))
+            return core::make_unexpected(ShardLiveAccessLogError::SessionBinding);
+        loop->live_access_log = &live_log_producer;
+        return {};
+    }
+
     // Producers and shard thread must be quiescent. If attached, the process
     // owner must finish/join the writer first; this check prevents unmapping a
     // ring still borrowed by the writer.
@@ -272,6 +315,11 @@ struct Shard {
             return core::make_unexpected(ShardLiveAccessLogError::LeaseHeld);
         if (loop) loop->live_access_log = nullptr;
         live_log_producer.reset();
+        if (live_log_host_ring) {
+            live_log_host_ring->~SourceLiveAccessLogHostRing();
+            munmap(live_log_host_ring, sizeof(SourceLiveAccessLogHostRing));
+            live_log_host_ring = nullptr;
+        }
         live_log_ring->~LiveAccessLogRing();
         munmap(live_log_ring, sizeof(LiveAccessLogRing));
         live_log_ring = nullptr;
@@ -479,6 +527,11 @@ struct Shard {
         stop();
         join();
         if (loop) loop->live_access_log = nullptr;
+        if (live_log_host_ring && live_log_lease.load(std::memory_order_acquire) == nullptr) {
+            live_log_host_ring->~SourceLiveAccessLogHostRing();
+            munmap(live_log_host_ring, sizeof(SourceLiveAccessLogHostRing));
+            live_log_host_ring = nullptr;
+        }
         if (live_log_ring && live_log_lease.load(std::memory_order_acquire) == nullptr) {
             live_log_producer.reset();
             live_log_ring->~LiveAccessLogRing();
