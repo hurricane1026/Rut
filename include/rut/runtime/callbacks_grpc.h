@@ -977,6 +977,7 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
 template <typename Loop>
 void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
     if (auto* x = grpc_find(h, sid); x && !x->response_end) {
+        bool retry_deadline_exceeded = false;
         if (error == Http2Error::RefusedStream && grpc_retry_can_schedule(*x, 14, false)) {
             const u64 now = monotonic_us();
             const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
@@ -986,13 +987,16 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
                 x->retry_reason = 14;
                 return;
             }
+            retry_deadline_exceeded = true;
         }
         switch (static_cast<u32>(error)) {
             case static_cast<u32>(Http2Error::Cancel):
                 x->failure = 1;
                 break;
             case static_cast<u32>(Http2Error::RefusedStream):
-                x->failure = 14;
+                // Match trailers-only retries when backoff cannot fit before
+                // the original deadline; other refusals remain UNAVAILABLE.
+                x->failure = retry_deadline_exceeded ? 4 : 14;
                 break;
             case static_cast<u32>(Http2Error::EnhanceYourCalm):
                 x->failure = 8;

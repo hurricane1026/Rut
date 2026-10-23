@@ -4877,11 +4877,12 @@ TEST(grpc_proxy, grpc_retry_does_not_replay_after_downstream_response_commit) {
     shard->shutdown();
 }
 
-void grpc_retry_suppressed_deadline_case(rut::test::TestCase* _tc, bool web) {
+template <typename Loop>
+void grpc_retry_suppressed_deadline_case(rut::test::TestCase* _tc, bool web, bool refused = false) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
-    server->reply_mode = 1;
-    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    server->reply_mode = refused ? 10 : 1;
+    auto shard = std::make_unique<Shard<Loop>>();
     const int lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     if (!shard->init(0, lfd)) {
@@ -4891,7 +4892,7 @@ void grpc_retry_suppressed_deadline_case(rut::test::TestCase* _tc, bool web) {
     RouteConfig cfg;
     REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
     cfg.upstreams[0].http2 = true;
-    cfg.upstreams[0].grpc_retry = {2, 1024, 1u << 7, 500};
+    cfg.upstreams[0].grpc_retry = {2, 1024, refused ? (1u << 14) : (1u << 7), 500};
     REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
     shard->route_config = &cfg;
     REQUIRE(shard->spawn(-1));
@@ -4941,10 +4942,23 @@ void grpc_retry_suppressed_deadline_case(rut::test::TestCase* _tc, bool web) {
     shard->shutdown();
 }
 TEST(grpc_proxy, grpc_retry_is_suppressed_when_backoff_exceeds_deadline) {
-    grpc_retry_suppressed_deadline_case(_tc, false);
+    grpc_retry_suppressed_deadline_case<EpollEventLoop>(_tc, false);
 }
 TEST(grpc_proxy, grpc_web_retry_is_suppressed_when_backoff_exceeds_deadline) {
-    grpc_retry_suppressed_deadline_case(_tc, true);
+    grpc_retry_suppressed_deadline_case<EpollEventLoop>(_tc, true);
+}
+
+TEST(grpc_proxy, refused_retry_backoff_exceeds_deadline_epoll) {
+    grpc_retry_suppressed_deadline_case<EpollEventLoop>(_tc, false, true);
+}
+TEST(grpc_proxy, refused_retry_backoff_exceeds_deadline_iouring) {
+    grpc_retry_suppressed_deadline_case<IoUringEventLoop>(_tc, false, true);
+}
+TEST(grpc_proxy, web_refused_retry_backoff_exceeds_deadline_epoll) {
+    grpc_retry_suppressed_deadline_case<EpollEventLoop>(_tc, true, true);
+}
+TEST(grpc_proxy, web_refused_retry_backoff_exceeds_deadline_iouring) {
+    grpc_retry_suppressed_deadline_case<IoUringEventLoop>(_tc, true, true);
 }
 
 TEST(grpc_proxy, grpc_retry_unknown_requires_valid_backend_and_mutated_status) {

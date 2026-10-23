@@ -652,6 +652,8 @@ does not authorize replay, even when status 2 is configured for retry.
 Trailers-only responses must also satisfy their declared Content-Length before
 any retry or response staging; a mismatch ends the RPC with INTERNAL (status 13)
 without replay.
+When retry backoff cannot fit before the original deadline, both retryable
+responses and REFUSED_STREAM end with DEADLINE_EXCEEDED (status 4).
 See [the complete example](../examples/grpc.rut).
 
 Optional per-message wire limits are configured on an HTTP/2 upstream:
