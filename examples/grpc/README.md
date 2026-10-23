@@ -220,3 +220,33 @@ use the listener certificate/key arguments from above and run the client with
 The source schema includes the unary subset of the standard health protocol;
 ordinary generated Health `Check` stubs interoperate with the same wire format.
 This local service is separate from upstream `health_check` probing.
+
+## Local gRPC-Web health checks
+
+The local health service also has explicit HTTP/1.1 gRPC-Web listener programs:
+[the binary listener](../grpc-health-web-binary.rut) and
+[the text listener](../grpc-health-web-text.rut). Choose the response format at
+startup; these examples do not negotiate binary/text responses on one listener.
+Both use the standard `/grpc.health.v1.Health/Check` method, built-in protobuf
+codecs, and the same static service policy as the native example. Errors are
+trailers-only gRPC-Web envelopes, including NOT_FOUND and INVALID_ARGUMENT.
+The native example is unchanged.
+
+```bash
+build/src/rut 50052 examples/grpc-health-web-binary.rut --backend epoll --shards 1 --no-pin
+python3 examples/grpc/health_web_client.py --mode binary
+```
+
+For text responses, stop the binary listener and use
+`examples/grpc-health-web-text.rut` with client `--mode text`. The client uses
+only Python's standard library and checks protobuf responses, terminal trailer
+frames, continuous base64 text encoding, error status, connection reuse, and
+CORS preflight. It accepts `--url https://localhost:50052 --ca tests/fixtures/localhost_cert.pem` for a listener configured with the test TLS
+certificate/key above. The HTTP client exercises HTTP/1.1; HTTP/2 gRPC-Web is
+not covered by this example check.
+
+CORS permits the fixed demo origin `http://127.0.0.1:8080`, POST/OPTIONS, and
+the content-type/x-grpc-web/grpc-timeout/x-user-agent headers. It does not reflect
+arbitrary origins or enable credentials. Change the fixed origin for your
+browser deployment. The CORS headers are included in error responses too.
+These examples do not add streaming Health Watch or dynamic service readiness.

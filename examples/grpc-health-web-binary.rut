@@ -1,0 +1,30 @@
+// Local binary gRPC-Web Health Check endpoint.
+// Uses a separate listener program because local response content types are explicit.
+// The empty service checks this listener; grpc.health.v1.Health is the advertised service name.
+// Add application readiness policy here before returning SERVING.
+struct HealthReply { status: i32 }
+
+route POST "/grpc.health.v1.Health/Check" {
+    guard let request = grpc.decode("grpc/health.proto", "/grpc.health.v1.Health/Check", req.body) else {
+        return response(200, headers: {"content-type": "application/grpc-web+proto", "access-control-allow-origin": "http://127.0.0.1:8080", "grpc-status": "3"})
+    }
+    guard request.service == "" || request.service == "grpc.health.v1.Health" else {
+        return response(200, headers: {"content-type": "application/grpc-web+proto", "access-control-allow-origin": "http://127.0.0.1:8080", "grpc-status": "5"})
+    }
+    // Standard HealthCheckResponse.ServingStatus.SERVING is enum value 1.
+    let reply = HealthReply(status: 1)
+    guard let framed = grpc.encode("grpc/health.proto", "/grpc.health.v1.Health/Check", reply) else {
+        return response(200, headers: {"content-type": "application/grpc-web+proto", "access-control-allow-origin": "http://127.0.0.1:8080", "grpc-status": "13"})
+    }
+    return response(200, headers: {"content-type": "application/grpc-web+proto", "access-control-allow-origin": "http://127.0.0.1:8080", "grpc-status": "0"}, body: framed)
+}
+
+// Fixed browser demo origin, never reflected from untrusted request input.
+route OPTIONS "/grpc.health.v1.Health/Check" {
+    return response(204, headers: {
+        "access-control-allow-origin": "http://127.0.0.1:8080",
+        "access-control-allow-methods": "POST, OPTIONS",
+        "access-control-allow-headers": "content-type, x-grpc-web, grpc-timeout, x-user-agent",
+        "access-control-max-age": "600"
+    })
+}
