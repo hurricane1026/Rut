@@ -300,8 +300,9 @@ ordinary local-response framing for the other no-body statuses.
 For ordinary local HTTP/1 responses, a parsed `HEAD` request uses the selected
 publisher's status and representation headers, including its representation
 `Content-Length`, and emits no response body bytes. Large configured bodies do
-not start memory, file, or TLS body continuations for HEAD. This bounded runtime
-behavior does not change route matching, the explicit strict-local or proxy
+not start memory, file, or TLS body continuations for HEAD. This contract also applies to the closing 500 fallback when a dynamic JSON response
+cannot be published; that fallback preserves the captured HTTP/1 version.
+This behavior does not change route matching, the explicit strict-local or proxy
 response policies, or GET-only metrics and redirect admission. For HTTP/2, the
 bounded ordinary local JIT `ReturnStatus` HEAD case described above is the only
 ordinary response path changed; other HTTP/2 publishers and proxy/strict-local
