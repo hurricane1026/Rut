@@ -144,7 +144,7 @@ void grpc_observe(Loop* loop, GrpcExchange& x) {
     entry.grpc_status_plus_one = kStatus + 1;
     if (loop->access_log && loop->live_access_log)
         loop->live_access_log->fail_protocol(EINVAL);
-    else if (loop->live_access_log)
+    else if (loop->live_access_log && !loop->live_access_log->captures_downstream_host())
         (void)loop->live_access_log->publish(entry);
     else if (loop->access_log)
         (void)loop->access_log->push(entry);
