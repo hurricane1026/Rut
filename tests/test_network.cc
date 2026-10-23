@@ -1312,6 +1312,76 @@ TEST(target_transform, h1_forward_rejects_before_upstream_side_effects) {
     }
 }
 
+TEST(jit_response, h1_json_failure_preserves_method_version_and_terminal_send) {
+    for (const auto version : {HttpVersion::Http10, HttpVersion::Http11}) {
+        for (const auto method : {LogHttpMethod::Get, LogHttpMethod::Head}) {
+            // Exercise invalid body, invalid runtime headers, and formatter
+            // capacity failure through the actual JSON ReturnStatus branch.
+            for (u32 failure = 0; failure < 3; ++failure) {
+                SmallLoop loop;
+                loop.setup();
+                auto* conn = loop.alloc_conn();
+                REQUIRE(conn != nullptr);
+                conn->fd = 42;
+                conn->req_method = static_cast<u8>(method);
+                conn->req_http_version = static_cast<u8>(version);
+                conn->req_strict_h1_complete = true;
+                conn->jit_response_head = method == LogHttpMethod::Head;
+                conn->keep_alive = true;
+                char body[SmallLoop::kBufSize]{};
+                memset(body, 'x', sizeof(body));
+                conn->jit_response_body = {body,
+                                           failure == 2 ? static_cast<u32>(sizeof(body)) : 2u};
+                conn->jit_response_body_valid = failure != 0;
+                if (failure == 1) {
+                    conn->resp_header_mutation_overflow = true;
+                }
+                if (failure == 2) conn->send_buf.bind(loop.send_storage[conn->id], 128);
+                // HEAD does not copy the body, so force header capacity failure
+                // for that case too; enough room remains for the 500 fallback.
+                RouteConfig config{};
+                char value[200]{};
+                memset(value, 'h', sizeof(value));
+                JitDispatchOutcome outcome{};
+                outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+                outcome.status_code = 200;
+                outcome.response_body_idx = 0xffffu;
+                if (failure == 2) {
+                    const char* keys[] = {"X-Large"};
+                    const u32 key_lens[] = {7};
+                    const char* values[] = {value};
+                    const u32 value_lens[] = {sizeof(value)};
+                    outcome.response_headers_idx =
+                        config.add_response_header_set(keys, key_lens, values, value_lens, 1);
+                    REQUIRE_NE(outcome.response_headers_idx, 0u);
+                    conn->request_config = &config;
+                }
+                handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+                const char* prefix = version == HttpVersion::Http10 ? "HTTP/1.0" : "HTTP/1.1";
+                std::string expected = std::string(prefix) +
+                                       " 500 Internal Server Error\r\nContent-Length: 21\r\n"
+                                       "Connection: close\r\n\r\n";
+                if (method == LogHttpMethod::Get) expected += "Internal Server Error";
+                CHECK_EQ(std::string(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                     conn->send_buf.len()),
+                         expected);
+                CHECK_EQ(conn->resp_status, 500u);
+                CHECK_FALSE(conn->keep_alive);
+                CHECK_EQ(conn->json_arena.current, nullptr);
+                REQUIRE_EQ(conn->on_send, &on_response_sent<SmallLoop>);
+                const u32 id = conn->id;
+                const u32 length = conn->send_buf.len();
+                loop.inject_and_dispatch(make_ev(id, IoEventType::Send, 1));
+                REQUIRE_NE(loop.conns[id].fd, -1);
+                CHECK_EQ(loop.conns[id].send_progress, 1u);
+                loop.inject_and_dispatch(
+                    make_ev(id, IoEventType::Send, static_cast<i32>(length - 1u)));
+                CHECK_EQ(loop.conns[id].fd, -1);
+            }
+        }
+    }
+}
+
 TEST(jit_response, h1_json_body_is_copied_before_send_and_arena_reclaimed) {
     SmallLoop loop;
     loop.setup();

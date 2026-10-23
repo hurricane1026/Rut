@@ -5000,6 +5000,10 @@ strict-local, redirect, and proxy/failure policy responses remain HTTP/1.1;
 generic proxy/upstream error publishers also keep their existing HTTP/1.1
 default. Ordinary JIT-local error publishers, including EventYield invalid-target
 errors, use the captured request version. HTTP/2 serialization is separate.
+Dynamic JSON-body `ReturnStatus` failures follow the same ordinary local error
+contract: invalid body storage, header collection failure, or formatting overflow
+returns a closing 500 using the captured HTTP/1 version and suppresses its
+reason-phrase body for HEAD while retaining the representation Content-Length.
 
 ### 7.2 Routing
 

@@ -3670,33 +3670,32 @@ void handle_jit_outcome(Loop* loop,
                 ResponseHeaderKV headers[kMaxHeaders];
                 u32 count = 0;
                 bool suppress_type = false;
-                const bool ok = conn.jit_response_body_valid &&
-                                collect_effective_response_headers(conn,
-                                                                   cfg,
-                                                                   outcome.response_headers_idx,
-                                                                   headers,
-                                                                   kMaxHeaders,
-                                                                   &count,
-                                                                   &suppress_type) &&
-                                format_response_with_body_and_headers(
-                                    conn,
-                                    outcome.status_code,
-                                    conn.jit_response_body.ptr,
-                                    conn.jit_response_body.len,
-                                    headers,
-                                    count,
-                                    effective_keep_alive,
-                                    false,
-                                    suppress_type,
-                                    conn.jit_response_head,
-                                    false,
-                                    conn.req_http_version == static_cast<u8>(HttpVersion::Http10)
-                                        ? HttpVersion::Http10
-                                        : HttpVersion::Http11);
+                const bool ok =
+                    conn.jit_response_body_valid &&
+                    collect_effective_response_headers(conn,
+                                                       cfg,
+                                                       outcome.response_headers_idx,
+                                                       headers,
+                                                       kMaxHeaders,
+                                                       &count,
+                                                       &suppress_type) &&
+                    format_response_with_body_and_headers(conn,
+                                                          outcome.status_code,
+                                                          conn.jit_response_body.ptr,
+                                                          conn.jit_response_body.len,
+                                                          headers,
+                                                          count,
+                                                          effective_keep_alive,
+                                                          false,
+                                                          suppress_type,
+                                                          conn.jit_response_head,
+                                                          is_head,
+                                                          ordinary_local_response_version(conn));
                 if (!ok) {
                     conn.resp_status = 500;
                     conn.keep_alive = false;
-                    format_static_response(conn, 500, false);
+                    format_static_response(
+                        conn, 500, false, is_head, ordinary_local_response_version(conn));
                 }
                 release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);
