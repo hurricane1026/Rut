@@ -228,6 +228,13 @@ struct EchoServer {
                                       nv("grpc-message", "denied")};
                 return nghttp2_submit_response(session, s->id, error, 4, nullptr);
             }
+            if (mode == 13) {
+                nghttp2_nv error[] = {nv(":status", "200"),
+                                      nv("content-type", "application/grpc"),
+                                      nv("grpc-status", "7"),
+                                      nv("content-length", "1")};
+                return nghttp2_submit_response(session, s->id, error, 4, nullptr);
+            }
             if (mode == 10)
                 return nghttp2_submit_rst_stream(
                     session, NGHTTP2_FLAG_NONE, s->id, NGHTTP2_REFUSED_STREAM);
@@ -3222,7 +3229,7 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
     (void)_tc;
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
-    server->reply_mode = 1;  // First request gets trailers-only UNAUTHENTICATED.
+    server->reply_mode = mode == 5 ? 13 : 1;  // Mode 5 declares a missing response body.
     auto shard = std::make_unique<Shard<Loop>>();
     const int lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
@@ -3276,7 +3283,7 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
             const bool retried = mode == 1;
             CHECK_EQ(server->requests.load(), retried ? 2u : 1u);
             if (!web) {
-                CHECK_EQ(rpc.status, retried ? 0u : 7u);
+                CHECK_EQ(rpc.status, retried ? 0u : mode == 5 ? 13u : 7u);
                 CHECK_EQ(rpc.ok, retried);
             } else if (retried) {
                 u8 decoded[256];
@@ -3320,7 +3327,8 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
     CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
     CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
     CHECK_EQ(shard->shard_metrics.grpc_completed[0], mode == 1 ? 1u : 0u);
-    CHECK_EQ(shard->shard_metrics.grpc_completed[7], mode == 1 ? 0u : 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[7], mode == 1 || mode == 5 ? 0u : 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[13], mode == 5 ? 1u : 0u);
     CHECK_EQ(shard->shard_metrics.grpc_latency.count, 1u);
     shard->loop->force_close_all();
     if (shard->loop->listen_fd >= 0) {
@@ -3346,6 +3354,12 @@ TEST(grpc_proxy, grpc_retry_nonlisted_status_epoll) {
 }
 TEST(grpc_proxy, grpc_retry_nonlisted_status_iouring) {
     grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 2);
+}
+TEST(grpc_proxy, grpc_retry_rejects_trailers_only_length_mismatch_epoll) {
+    grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 5);
+}
+TEST(grpc_proxy, grpc_retry_rejects_trailers_only_length_mismatch_iouring) {
+    grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 5);
 }
 TEST(grpc_proxy, grpc_retry_malformed_native_is_transparent) {
     grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 3);
@@ -4978,6 +4992,56 @@ TEST(grpc_proxy, grpc_retry_unknown_requires_valid_backend_and_mutated_status) {
             CHECK_EQ(x.retry_pending, should_retry);
             CHECK_EQ(x.response_end, !should_retry);
             CHECK_EQ(x.response_headers_len == 0, should_retry);
+        }
+    }
+}
+
+TEST(grpc_proxy, terminal_response_length_checked_before_retry_and_output) {
+    for (u32 mode = 0; mode < 5; mode++) {
+        for (u32 length = 0; length < 2; length++) {
+            GrpcDriveFixture loop;
+            Connection upstream;
+            upstream.reset();
+            Connection downstream;
+            downstream.reset();
+            Http2Conn h;
+            h.init_client();
+            upstream.h2 = &h;
+            h.grpc.upstream = true;
+            REQUIRE(h.open_stream(1) != nullptr);
+            GrpcExchange x;
+            x.init();
+            x.upstream = &upstream;
+            x.downstream = &downstream;
+            x.upstream_stream = x.downstream_stream = 1;
+            x.slot_held = true;
+            x.web_mode = mode == 0  ? GrpcWebContentType::Native
+                         : mode % 2 ? GrpcWebContentType::Binary
+                                    : GrpcWebContentType::Text;
+            x.web_h1 = mode > 2;
+            x.retry_enabled = true;
+            x.retry_policy = {2, 1024, 1u << 7, 0};
+            x.replay_body.replayable = true;
+            x.replay_body.sealed = true;
+            x.replay_headers.valid = true;
+            x.replay_trailers.valid = true;
+            REQUIRE(grpc_attach(h, &x));
+            GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+            const hpack::Header response[] = {
+                {{":status", 7}, {"200", 3}},
+                {{"content-type", 12}, {"application/grpc", 16}},
+                {{"grpc-status", 11}, {"7", 1}},
+                {{"content-length", 14}, length ? Str{"1", 1} : Str{"0", 1}},
+            };
+            grpc_response_headers<GrpcDriveFixture>(&dispatch, h, 1, response, 4, true);
+            CHECK_EQ(x.retry_pending, length == 0);
+            CHECK_EQ(x.response_end, length != 0);
+            CHECK_EQ(x.failure, length ? 13u : 0u);
+            CHECK_EQ(x.response_headers_len, 0u);
+            CHECK_EQ(x.response_trailers_len, 0u);
+            CHECK_EQ(x.slot_held, length == 0);
+            CHECK_EQ(loop.released, length);
+            CHECK_EQ(grpc_find(h, 1) == nullptr, length != 0);
         }
     }
 }

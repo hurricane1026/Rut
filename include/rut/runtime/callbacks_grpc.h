@@ -735,6 +735,10 @@ void grpc_response_headers(
             }
         }
     }
+    // END_STREAM makes the body length final, including trailers-only replies.
+    // Reject mismatches before retry decisions or downstream output staging.
+    if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
+        invalid_content_length = true;
     if (web_response && content_type_count != 1) content_type = false;
     if (!status || !content_type || invalid_content_length) {
         switch (http_status) {
@@ -854,8 +858,6 @@ void grpc_response_headers(
     if (end) x->response_status = observed_status;
     if (end && (!grpc_has_status(hs, n) || !filtered_has_status)) x->failure = 2;
     if (web && end && !backend_terminal && !x->failure) x->failure = 2;
-    if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
-        x->failure = 13;
     if (x->response_end && !x->failure && x->upstream && grpc_has_status(hs, n))
         grpc_record_rpc_success(dispatch->loop, *x->upstream, monotonic_us());
     if (x->response_end) grpc_release_slot(dispatch->loop, *x);

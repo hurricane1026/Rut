@@ -1622,6 +1622,9 @@ original deadline. A status-based retry requires exactly one valid backend
 `grpc-status` (0–16), preserved as a valid matching status after response
 middleware. Malformed metadata remains UNKNOWN in telemetry and cannot
 authorize replay, even when status 2 is configured for retry.
+Trailers-only responses must also satisfy their declared Content-Length before
+any retry or response staging; a mismatch ends the RPC with INTERNAL (status 13)
+without replay.
 
 Optional `max_request_message_bytes` and `max_response_message_bytes` upstream
 fields bound the wire payload of each message independently. They are positive
