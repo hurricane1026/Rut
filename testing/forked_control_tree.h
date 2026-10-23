@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -12,6 +13,46 @@
 #include <unistd.h>
 
 namespace rut::test {
+
+inline volatile sig_atomic_t control_seek_failures = 0;
+
+enum class ControlProcfsCapability : unsigned char {
+    Supported,
+    Unsupported,
+    Error,
+};
+
+inline ControlProcfsCapability control_procfs_capability_from_errno(int error) {
+    return error == ENOENT ? ControlProcfsCapability::Unsupported : ControlProcfsCapability::Error;
+}
+
+inline bool control_rewind(FILE* file) {
+    if (control_seek_failures > 0) {
+        control_seek_failures = control_seek_failures - 1;
+        return false;
+    }
+    return fseek(file, 0, SEEK_SET) == 0;
+}
+
+inline ControlProcfsCapability probe_control_procfs_capability() {
+    char path[64] = {};
+    const int length =
+        snprintf(path, sizeof(path), "/proc/self/task/%ld/children", static_cast<long>(getpid()));
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(path))
+        return ControlProcfsCapability::Error;
+    FILE* file = fopen(path, "r");
+    if (file == nullptr) return control_procfs_capability_from_errno(errno);
+    errno = 0;
+    const int first = fgetc(file);
+    const bool read_error = first == EOF && ferror(file);
+    if (!control_rewind(file)) {
+        (void)fclose(file);
+        return ControlProcfsCapability::Error;
+    }
+    const int close_result = fclose(file);
+    return read_error || close_result != 0 ? ControlProcfsCapability::Error
+                                           : ControlProcfsCapability::Supported;
+}
 
 class ScopedChildSubreaper {
     int previous_ = 0;
@@ -71,6 +112,71 @@ inline long long control_now_ms() {
     return static_cast<long long>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
 }
 
+inline bool control_parse_child_pid(const char* token, pid_t self, pid_t& child_pid) {
+    if (token[0] == '\0') return false;
+    unsigned long value = 0;
+    for (const char* cursor = token; *cursor != '\0'; ++cursor) {
+        if (*cursor < '0' || *cursor > '9') return false;
+        const unsigned digit = static_cast<unsigned>(*cursor - '0');
+        if (value > (static_cast<unsigned long>(INT_MAX) - digit) / 10) return false;
+        value = value * 10 + digit;
+    }
+    child_pid = static_cast<pid_t>(value);
+    if (child_pid <= 0 || child_pid == self) return false;
+    return true;
+}
+
+inline bool control_next_child_token(FILE* children, char (&token)[32], bool& has_token) {
+    has_token = false;
+    int character = fgetc(children);
+    while (character != EOF && isspace(static_cast<unsigned char>(character)))
+        character = fgetc(children);
+    if (character == EOF) return !ferror(children);
+    has_token = true;
+    unsigned length = 0;
+    while (character != EOF && !isspace(static_cast<unsigned char>(character))) {
+        if (length + 1 >= sizeof(token)) return false;
+        token[length++] = static_cast<char>(character);
+        character = fgetc(children);
+    }
+    if (character == EOF && ferror(children)) return false;
+    token[length] = '\0';
+    return true;
+}
+
+inline bool control_validate_children(FILE* children, pid_t self, unsigned& count) {
+    if (!control_rewind(children)) return false;
+    clearerr(children);
+    count = 0;
+    char token[32];
+    bool has_token = false;
+    for (;;) {
+        if (!control_next_child_token(children, token, has_token)) return false;
+        if (!has_token) return true;
+        pid_t child = -1;
+        if (!control_parse_child_pid(token, self, child)) return false;
+        ++count;
+    }
+}
+
+inline bool control_signal_children(
+    FILE* children, pid_t self, pid_t worker, bool worker_reaped, bool& leftovers) {
+    if (!control_rewind(children)) return false;
+    clearerr(children);
+    char token[32];
+    bool has_token = false;
+    for (;;) {
+        if (!control_next_child_token(children, token, has_token)) return false;
+        if (!has_token) return true;
+        pid_t child = -1;
+        if (!control_parse_child_pid(token, self, child)) return false;
+        if (child != worker) leftovers = true;
+        if (child != worker || !worker_reaped) {
+            if (kill(child, SIGKILL) != 0 && errno != ESRCH) return false;
+        }
+    }
+}
+
 inline void fallback_control_cleanup(FILE* children,
                                      pid_t worker,
                                      bool worker_reaped,
@@ -90,21 +196,13 @@ inline void fallback_control_cleanup(FILE* children,
             if (result <= 0) break;
         }
         if (children != nullptr) {
-            rewind(children);
-            clearerr(children);
-            char token[32];
             const bool scan_failed = control_scan_failures > 0;
             if (scan_failed) control_scan_failures = control_scan_failures - 1;
-            while (!scan_failed && fscanf(children, "%31s", token) == 1) {
-                errno = 0;
-                char* end = nullptr;
-                const long child = strtol(token, &end, 10);
-                if (errno != 0 || end == token || *end != '\0' || child <= 0 || child > INT_MAX ||
-                    child == getpid())
-                    break;
-                if (child != worker || !worker_reaped)
-                    (void)kill(static_cast<pid_t>(child), SIGKILL);
-            }
+            unsigned count = 0;
+            bool ignored_leftovers = false;
+            if (!scan_failed && control_validate_children(children, getpid(), count))
+                (void)control_signal_children(
+                    children, getpid(), worker, worker_reaped, ignored_leftovers);
         }
         (void)poll(nullptr, 0, 5);
     }
@@ -132,21 +230,11 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
     FILE* children = children_owner.get();
     if (control_proc_open_failures > 0) control_proc_open_failures = control_proc_open_failures - 1;
     if (children == nullptr) return 125;
-    rewind(children);
-    clearerr(children);
-    char preflight_token[32];
-    while (fscanf(children, "%31s", preflight_token) == 1) {
-        char* end = nullptr;
-        errno = 0;
-        (void)strtol(preflight_token, &end, 10);
-        if (errno != 0 || end == preflight_token || *end != '\0') {
-            return 125;
-        }
-    }
-    if (ferror(children)) {
+    unsigned preflight_count = 0;
+    if (!control_validate_children(children, supervisor, preflight_count)) {
         return 125;
     }
-    rewind(children);
+    if (!control_rewind(children)) return 125;
     clearerr(children);
     if (control_fail_reopen_after_preflight) control_proc_open_failures = INT_MAX;
     const pid_t worker = fork();
@@ -222,32 +310,13 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
         }
         // Do not reap during this scan: each PID remains reserved by a child
         // until the next wait, so signals cannot hit an unrelated reused PID.
-        rewind(children);
-        clearerr(children);
-        char token[32];
         bool ok = true;
         const bool scan_failed = control_scan_failures > 0;
         if (scan_failed) control_scan_failures = control_scan_failures - 1;
-        while (!scan_failed && fscanf(children, "%31s", token) == 1) {
-            errno = 0;
-            char* end = nullptr;
-            const long child = strtol(token, &end, 10);
-            if (errno != 0 || end == token || *end != '\0' || child > INT_MAX) {
-                ok = false;
-                break;
-            }
-            const long long scan_time = control_now_ms();
-            if (scan_time < 0 || scan_time >= deadline) {
-                ok = false;
-                break;
-            }
-            if (child <= 0 || child == getpid()) {
-                ok = false;
-                break;
-            }
-            if (child != worker) leftovers = true;
-            if (kill(static_cast<pid_t>(child), SIGKILL) != 0 && errno != ESRCH) ok = false;
-        }
+        unsigned count = 0;
+        if (scan_failed || !control_validate_children(children, supervisor, count) ||
+            !control_signal_children(children, supervisor, worker, reaped, leftovers))
+            ok = false;
         if (scan_failed) ok = false;
         if (ferror(children)) ok = false;
         if (!ok) {

@@ -3579,6 +3579,22 @@ static bool forked_control_container_exists(const std::string& name) {
     return exists;
 }
 
+static bool require_forked_control_procfs(std::string& error) {
+    const rut::test::ControlProcfsCapability capability =
+        rut::test::probe_control_procfs_capability();
+    if (capability == rut::test::ControlProcfsCapability::Supported) return true;
+    if (capability == rut::test::ControlProcfsCapability::Unsupported) {
+        error =
+            "required forked-control oracle unsupported: /proc task children is absent "
+            "(CONFIG_CHECKPOINT_RESTORE)";
+    } else {
+        error =
+            "required forked-control oracle prerequisite failed: could not read /proc task "
+            "children";
+    }
+    return false;
+}
+
 // #551 self-check: prove an abnormally stalling forked differential control is
 // rejected and its complete owned subtree, container, and held port released.
 // The control stalls while holding a sentinel grandchild, a uniquely named
@@ -83710,6 +83726,10 @@ int main(int argc, char** argv) {
     }
     if (forked_control_cleanup_self_check) {
         std::string cleanup_error;
+        if (!require_forked_control_procfs(cleanup_error)) {
+            std::cerr << "FAIL [#551 forked-control cleanup self-check]: " << cleanup_error << "\n";
+            return 1;
+        }
         if (!run_forked_control_cleanup_self_check(cleanup_error)) {
             std::cerr << "FAIL [#551 forked-control cleanup self-check]: " << cleanup_error << "\n";
             return 1;
@@ -85324,6 +85344,12 @@ int main(int argc, char** argv) {
                                            std::to_string(getpid()) + "-" +
                                            (suffix ? suffix + 1 : "tmp");
         std::string differential_error;
+        if (!require_forked_control_procfs(differential_error)) {
+            std::cerr << "FAIL [#546 converter default-buffering 206 range incomplete "
+                         "clean-EOF differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
         if (!run_converter_default_buffering_206_range_incomplete_clean_eof_differential(
                 argv[2], container_name, differential_error)) {
             std::cerr << "FAIL [#546 converter default-buffering 206 range incomplete "

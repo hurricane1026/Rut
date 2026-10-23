@@ -23,7 +23,13 @@ bool wait_terminal(pid_t pid, int& status) {
     return false;
 }
 
-enum class ControlExit : unsigned char { Stall, UnexpectedStatus, Signal, ExpectedStatus };
+enum class ControlExit : unsigned char {
+    Stall,
+    ManyStalls,
+    UnexpectedStatus,
+    Signal,
+    ExpectedStatus
+};
 
 bool cleanup_case(ControlExit mode,
                   sig_atomic_t clock_failures = 0,
@@ -61,17 +67,21 @@ bool cleanup_case(ControlExit mode,
             [](void* opaque) -> int {
                 auto& context = *static_cast<Context*>(opaque);
                 close(context.channel[0]);
-                const pid_t kSentinel = fork();
-                if (kSentinel < 0) return 41;
-                if (kSentinel == 0) {
-                    close(context.channel[1]);
-                    // Native compilation also creates its own group. Such a child
-                    // must still be killed and reaped by this control's supervisor.
-                    if (setpgid(0, 0) != 0) _exit(42);
-                    for (;;) pause();
+                const unsigned sentinel_count = context.mode == ControlExit::ManyStalls ? 80 : 1;
+                pid_t first_sentinel = -1;
+                for (unsigned i = 0; i < sentinel_count; ++i) {
+                    const pid_t sentinel = fork();
+                    if (sentinel < 0) return 41;
+                    if (sentinel == 0) {
+                        close(context.channel[1]);
+                        if (setpgid(0, 0) != 0) _exit(42);
+                        for (;;) pause();
+                    }
+                    if (setpgid(sentinel, sentinel) != 0) return 44;
+                    if (first_sentinel < 0) first_sentinel = sentinel;
                 }
-                if (setpgid(kSentinel, kSentinel) != 0) return 44;
-                if (write(context.channel[1], &kSentinel, sizeof(kSentinel)) != sizeof(kSentinel))
+                if (write(context.channel[1], &first_sentinel, sizeof(first_sentinel)) !=
+                    sizeof(first_sentinel))
                     return 43;
                 close(context.channel[1]);
                 if (context.mode == ControlExit::UnexpectedStatus) return 87;
@@ -102,7 +112,9 @@ bool cleanup_case(ControlExit mode,
     if (kUnrelated == 0) _exit(73);
     if (kUnrelated < 0) ok = false;
     int control_status = 0;
-    if (mode == ControlExit::Stall && kill(kControl, SIGTERM) != 0) ok = false;
+    if ((mode == ControlExit::Stall || mode == ControlExit::ManyStalls) &&
+        kill(kControl, SIGTERM) != 0)
+        ok = false;
     if (!wait_terminal(kControl, control_status)) {
         (void)kill(kControl, SIGKILL);
         (void)wait_terminal(kControl, control_status);
@@ -112,11 +124,12 @@ bool cleanup_case(ControlExit mode,
     if (mode == ControlExit::Signal)
         ok = ok && WIFSIGNALED(control_status) && WTERMSIG(control_status) == SIGKILL;
     else {
-        const int expected_status = expected_status_override >= 0
-                                        ? expected_status_override
-                                        : (mode == ControlExit::Stall              ? 124
-                                           : mode == ControlExit::UnexpectedStatus ? 87
-                                                                                   : 125);
+        const int expected_status =
+            expected_status_override >= 0
+                ? expected_status_override
+                : (mode == ControlExit::Stall || mode == ControlExit::ManyStalls ? 124
+                   : mode == ControlExit::UnexpectedStatus                       ? 87
+                                                                                 : 125);
         ok = ok && WIFEXITED(control_status) && WEXITSTATUS(control_status) == expected_status;
     }
     if (sentinel > 0) {
@@ -204,6 +217,10 @@ TEST(forked_control, procfs_scan_failure_falls_back_and_reaps_tree) {
     CHECK(cleanup_case(ControlExit::UnexpectedStatus, 0, 0, 1, 125));
 }
 
+TEST(forked_control, large_children_snapshot_is_fully_reaped) {
+    CHECK(cleanup_case(ControlExit::ManyStalls));
+}
+
 TEST(forked_control, procfs_open_failure_before_worker_is_fail_closed) {
     rut::test::control_proc_open_failures = INT_MAX;
     int marker[2];
@@ -242,6 +259,50 @@ TEST(forked_control, clock_failure_falls_back_and_reaps_tree) {
     CHECK(cleanup_case(ControlExit::UnexpectedStatus, 1, 0, 0, 125));
 }
 
+TEST(forked_control, children_snapshot_rejects_malformed_pid_tokens) {
+    const char* invalid[] = {"-1", "0", "2147483648", "12x"};
+    for (const char* token : invalid) {
+        pid_t child = -1;
+        CHECK_FALSE(rut::test::control_parse_child_pid(token, getpid(), child));
+    }
+    pid_t self = -1;
+    CHECK_FALSE(rut::test::control_parse_child_pid("42", 42, self));
+    char snapshot_data[] = "2147483647\n";
+    FILE* snapshot = fmemopen(snapshot_data, sizeof(snapshot_data) - 1, "r");
+    REQUIRE(snapshot != nullptr);
+    unsigned count = 0;
+    CHECK(rut::test::control_validate_children(snapshot, getpid(), count));
+    fclose(snapshot);
+    char malformed_data[] = "000000000000000000000000000000001\n";
+    snapshot = fmemopen(malformed_data, sizeof(malformed_data) - 1, "r");
+    REQUIRE(snapshot != nullptr);
+    CHECK_FALSE(rut::test::control_validate_children(snapshot, getpid(), count));
+    fclose(snapshot);
+}
+
+TEST(forked_control, procfs_capability_classifies_unsupported_separately) {
+    CHECK_EQ(rut::test::control_procfs_capability_from_errno(ENOENT),
+             rut::test::ControlProcfsCapability::Unsupported);
+    CHECK_EQ(rut::test::control_procfs_capability_from_errno(EACCES),
+             rut::test::ControlProcfsCapability::Error);
+    rut::test::control_seek_failures = 1;
+    CHECK_EQ(rut::test::probe_control_procfs_capability(),
+             rut::test::ControlProcfsCapability::Error);
+    rut::test::control_seek_failures = 0;
+}
+
 int main(int argc, char** argv) {
+    const rut::test::ControlProcfsCapability capability =
+        rut::test::probe_control_procfs_capability();
+    if (capability == rut::test::ControlProcfsCapability::Unsupported) {
+        fprintf(stderr,
+                "SKIP: forked-control tests require /proc task children support "
+                "(CONFIG_CHECKPOINT_RESTORE)\n");
+        return 77;
+    }
+    if (capability == rut::test::ControlProcfsCapability::Error) {
+        fprintf(stderr, "ERROR: forked-control capability probe could not read procfs children\n");
+        return 1;
+    }
     return rut::test::run_all(argc, argv);
 }
