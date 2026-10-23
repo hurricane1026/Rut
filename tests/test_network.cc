@@ -22579,6 +22579,8 @@ static void check_transfer_encoding_rejection_response_version(rut::test::TestCa
 }
 
 TEST(request_admission, transfer_encoding_rejection_preserves_captured_http_version) {
+    static constexpr char kHttp10Chunked[] =
+        "POST / HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
     static constexpr char kHttp10[] =
         "GET / HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n";
     static constexpr char kHttp11[] =
@@ -22589,12 +22591,16 @@ TEST(request_admission, transfer_encoding_rejection_preserves_captured_http_vers
     for (bool async_backend : {false, true}) {
         if (async_backend) {
             check_transfer_encoding_rejection_response_version<AsyncSmallLoop>(
+                _tc, kHttp10Chunked, "HTTP/1.0 400 Bad Request\r\n", 0u);
+            check_transfer_encoding_rejection_response_version<AsyncSmallLoop>(
                 _tc, kHttp10, "HTTP/1.0 400 Bad Request\r\n", 0u);
             check_transfer_encoding_rejection_response_version<AsyncSmallLoop>(
                 _tc, kHttp11, "HTTP/1.1 400 Bad Request\r\n", 1u);
             check_transfer_encoding_rejection_response_version<AsyncSmallLoop>(
                 _tc, kParseErrorHttp10, "HTTP/1.1 400 Bad Request\r\n", 255u);
         } else {
+            check_transfer_encoding_rejection_response_version<SmallLoop>(
+                _tc, kHttp10Chunked, "HTTP/1.0 400 Bad Request\r\n", 0u);
             check_transfer_encoding_rejection_response_version<SmallLoop>(
                 _tc, kHttp10, "HTTP/1.0 400 Bad Request\r\n", 0u);
             check_transfer_encoding_rejection_response_version<SmallLoop>(
