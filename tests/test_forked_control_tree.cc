@@ -2,6 +2,7 @@
 #include "test.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -13,8 +14,8 @@
 
 namespace {
 
-bool wait_terminal(pid_t pid, int& status) {
-    for (unsigned i = 0; i < 600; ++i) {
+bool wait_terminal(pid_t pid, int& status, unsigned attempts = 600) {
+    for (unsigned i = 0; i < attempts; ++i) {
         const pid_t kResult = waitpid(pid, &status, WNOHANG);
         if (kResult == pid) return true;
         if (kResult < 0 && errno != EINTR) return false;
@@ -243,12 +244,154 @@ TEST(forked_control, procfs_open_failure_before_worker_is_fail_closed) {
     close(marker[1]);
     rut::test::control_proc_open_failures = 0;
     int status = 0;
-    CHECK(wait_terminal(child, status));
+    bool exited = wait_terminal(child, status);
+    CHECK(exited);
+    if (!exited) {
+        (void)kill(child, SIGKILL);
+        exited = wait_terminal(child, status);
+        CHECK(exited);
+    }
     CHECK(WIFEXITED(status));
     CHECK_EQ(WEXITSTATUS(status), 125);
     char marker_byte = 0;
-    CHECK_EQ(read(marker[0], &marker_byte, 1), 0);
+    pollfd marker_ready{marker[0], POLLIN | POLLHUP, 0};
+    CHECK(poll(&marker_ready, 1, 100) >= 0);
+    CHECK((marker_ready.revents & (POLLIN | POLLHUP)) != 0);
+    CHECK((marker_ready.revents & (POLLERR | POLLNVAL)) == 0);
+    if ((marker_ready.revents & (POLLIN | POLLHUP)) != 0 &&
+        (marker_ready.revents & (POLLERR | POLLNVAL)) == 0)
+        CHECK_EQ(read(marker[0], &marker_byte, 1), 0);
     close(marker[0]);
+}
+
+TEST(forked_control, procfs_read_failure_before_worker_is_fail_closed) {
+    rut::test::control_read_failures = INT_MAX;
+    int marker[2];
+    REQUIRE_EQ(pipe(marker), 0);
+    const pid_t child = fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        close(marker[0]);
+        struct Context {
+            int fd;
+        } context{marker[1]};
+        _exit(rut::test::supervise_forked_control(
+            [](void* opaque) -> int {
+                const auto& context = *static_cast<Context*>(opaque);
+                (void)write(context.fd, "x", 1);
+                return 86;
+            },
+            &context));
+    }
+    close(marker[1]);
+    rut::test::control_read_failures = 0;
+    int status = 0;
+    bool exited = wait_terminal(child, status);
+    CHECK(exited);
+    if (!exited) {
+        (void)kill(child, SIGKILL);
+        exited = wait_terminal(child, status);
+        CHECK(exited);
+    }
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), 125);
+    char marker_byte = 0;
+    pollfd marker_ready{marker[0], POLLIN | POLLHUP, 0};
+    CHECK(poll(&marker_ready, 1, 100) >= 0);
+    CHECK((marker_ready.revents & (POLLIN | POLLHUP)) != 0);
+    CHECK((marker_ready.revents & (POLLERR | POLLNVAL)) == 0);
+    if ((marker_ready.revents & (POLLIN | POLLHUP)) != 0 &&
+        (marker_ready.revents & (POLLERR | POLLNVAL)) == 0)
+        CHECK_EQ(read(marker[0], &marker_byte, 1), 0);
+    close(marker[0]);
+}
+
+TEST(forked_control, persistent_postlaunch_read_failure_is_bounded) {
+    rut::test::ScopedChildSubreaper subreaper;
+    REQUIRE(subreaper.enable());
+    rut::test::control_persistent_read_after_preflight = 1;
+    int channel[2];
+    REQUIRE_EQ(pipe(channel), 0);
+    const pid_t control = fork();
+    REQUIRE(control >= 0);
+    if (control == 0) {
+        close(channel[0]);
+        struct Context {
+            int fd;
+        } context{channel[1]};
+        _exit(rut::test::supervise_forked_control(
+            [](void* opaque) -> int {
+                const auto& context = *static_cast<Context*>(opaque);
+                const pid_t sentinel = fork();
+                if (sentinel < 0) return 41;
+                if (sentinel == 0) {
+                    close(context.fd);
+                    if (setpgid(0, 0) != 0) _exit(42);
+                    for (;;) pause();
+                }
+                if (setpgid(sentinel, sentinel) != 0) return 43;
+                (void)write(context.fd, &sentinel, sizeof(sentinel));
+                return 87;
+            },
+            &context));
+    }
+    close(channel[1]);
+    rut::test::control_persistent_read_after_preflight = 0;
+    pid_t sentinel = -1;
+    pollfd ready{channel[0], POLLIN | POLLHUP, 0};
+    const int ready_result = poll(&ready, 1, 3000);
+    CHECK(ready_result >= 0);
+    CHECK((ready.revents & (POLLERR | POLLNVAL)) == 0);
+    const bool sentinel_readable = ready_result > 0 && (ready.revents & POLLIN) != 0;
+    CHECK(sentinel_readable);
+    if (!sentinel_readable) {
+        (void)kill(control, SIGKILL);
+        int abandoned_status = 0;
+        CHECK(wait_terminal(control, abandoned_status));
+        (void)fcntl(channel[0], F_SETFL, O_NONBLOCK);
+        pid_t abandoned_sentinel = -1;
+        const ssize_t drained = read(channel[0], &abandoned_sentinel, sizeof(abandoned_sentinel));
+        if (drained == sizeof(abandoned_sentinel) && abandoned_sentinel > 0) {
+            int abandoned_sentinel_status = 0;
+            const pid_t observed = waitpid(abandoned_sentinel, &abandoned_sentinel_status, WNOHANG);
+            CHECK_EQ(observed, 0);
+            if (observed == 0) {
+                (void)kill(abandoned_sentinel, SIGKILL);
+                CHECK(wait_terminal(abandoned_sentinel, abandoned_sentinel_status));
+            }
+        }
+        close(channel[0]);
+        return;
+    }
+    CHECK_EQ(read(channel[0], &sentinel, sizeof(sentinel)), sizeof(sentinel));
+    close(channel[0]);
+    CHECK(sentinel > 0);
+    CHECK_EQ(getpgid(sentinel), sentinel);
+    const pid_t sibling = fork();
+    REQUIRE(sibling >= 0);
+    if (sibling == 0) _exit(73);
+    int status = 0;
+    const bool exited = wait_terminal(control, status, 2000);
+    CHECK(exited);
+    if (!exited) {
+        (void)kill(control, SIGKILL);
+        CHECK(wait_terminal(control, status));
+    }
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), 125);
+    if (sentinel > 0) {
+        int sentinel_status = 0;
+        const pid_t observed = waitpid(sentinel, &sentinel_status, WNOHANG);
+        CHECK_EQ(observed, 0);
+        if (observed == 0) {
+            CHECK_EQ(kill(sentinel, SIGKILL), 0);
+            CHECK(wait_terminal(sentinel, sentinel_status));
+        }
+    }
+    int sibling_status = 0;
+    CHECK(wait_terminal(sibling, sibling_status));
+    CHECK(WIFEXITED(sibling_status));
+    CHECK_EQ(WEXITSTATUS(sibling_status), 73);
 }
 
 TEST(forked_control, retained_children_fd_survives_reopen_failure) {

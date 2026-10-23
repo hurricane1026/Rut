@@ -77,6 +77,8 @@ public:
 inline volatile sig_atomic_t control_stop_requested = 0;
 inline volatile sig_atomic_t control_clock_failures = 0;
 inline volatile sig_atomic_t control_proc_open_failures = 0;
+inline volatile sig_atomic_t control_read_failures = 0;
+inline volatile sig_atomic_t control_persistent_read_after_preflight = 0;
 inline volatile sig_atomic_t control_fail_reopen_after_preflight = 0;
 inline volatile sig_atomic_t control_scan_failures = 0;
 inline void request_control_stop(int) {
@@ -127,6 +129,13 @@ inline bool control_parse_child_pid(const char* token, pid_t self, pid_t& child_
 }
 
 inline bool control_next_child_token(FILE* children, char (&token)[32], bool& has_token) {
+    if (control_read_failures > 0) {
+        control_read_failures = control_read_failures - 1;
+        // Test seam: model a persistent retained-stream read error; this is not stdio I/O.
+        errno = EIO;
+        has_token = false;
+        return false;
+    }
     has_token = false;
     int character = fgetc(children);
     while (character != EOF && isspace(static_cast<unsigned char>(character)))
@@ -200,6 +209,8 @@ inline void fallback_control_cleanup(FILE* children,
             if (scan_failed) control_scan_failures = control_scan_failures - 1;
             unsigned count = 0;
             bool ignored_leftovers = false;
+            // A permanent read/parse failure means unknown descendants remain undiscovered;
+            // bounded cleanup must never report that as successful cleanup.
             if (!scan_failed && control_validate_children(children, getpid(), count))
                 (void)control_signal_children(
                     children, getpid(), worker, worker_reaped, ignored_leftovers);
@@ -237,6 +248,7 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
     if (!control_rewind(children)) return 125;
     clearerr(children);
     if (control_fail_reopen_after_preflight) control_proc_open_failures = INT_MAX;
+    if (control_persistent_read_after_preflight) control_read_failures = INT_MAX;
     const pid_t worker = fork();
     if (worker < 0) {
         return 125;
@@ -321,6 +333,8 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
         if (ferror(children)) ok = false;
         if (!ok) {
             fallback_control_cleanup(children, worker, reaped, worker_group_owned);
+            // If the retained procfs stream remains unreadable, descendants that escaped
+            // before the failure cannot be discovered; this path is deliberately failure-only.
             return 125;
         }
         (void)poll(nullptr, 0, 5);
