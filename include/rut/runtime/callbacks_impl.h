@@ -486,7 +486,7 @@ PipelineTransitionResult pipeline_shift(Connection& conn);
 // Prove that recv_buf contains one complete, strictly parsed HTTP/1 request at
 // [0, req_initial_send_len), optionally followed by successor bytes.  This is
 // intentionally conservative: ambiguous Transfer-Encoding shapes are terminal
-// for ordinary local responses without changing proxy admission (#284).
+// for ordinary local responses as well as proxy admission.
 inline bool ordinary_local_response_request_boundary_reusable(const Connection& conn) {
     if (conn.protocol != ConnProtocol::Http11 || !conn.req_strict_h1_complete ||
         conn.req_malformed || conn.recv_buf.data() == nullptr || conn.req_header_end == 0 ||
@@ -2360,7 +2360,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             : raw_header_complete && pre_req.transfer_encoding != RequestTransferEncoding::None &&
                   pre_req.transfer_encoding != RequestTransferEncoding::Unparsed &&
                   (pre_req.transfer_encoding == RequestTransferEncoding::Unsupported ||
-                   pre_req.has_content_length);
+                   pre_req.has_content_length || pre_req.version != HttpVersion::Http11);
 
     conn.clear_response_accounting();
     capture_request_metadata(conn);
@@ -2523,7 +2523,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     }
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
-    // Requests with transfer codings outside the exact final-chunked subset
+    // Requests with transfer codings outside the HTTP/1.1 final-chunked subset
     // have no safe HTTP/1 body boundary for proxying. Reject them before route
     // handlers, upstream pool reuse/connect, or request mutations can observe
     // or publish the request. This follows the existing strict inventory and

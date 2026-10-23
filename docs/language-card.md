@@ -254,7 +254,8 @@ resumable, stream-owned runtime Response object.
 After existing strict inventory and pre-route fail-closed fences, HTTP/1
 request admission rejects unsupported or ambiguous `Transfer-Encoding` and
 every request combining `Content-Length` with `Transfer-Encoding` using `400`
-and connection close before route handlers or upstream effects. A final
+and connection close before route handlers or upstream effects. HTTP/1.0
+requests with any `Transfer-Encoding` are rejected. For HTTP/1.1, a final
 `chunked` coding remains supported, including `gzip, chunked`; the transparent
 proxy path preserves those request header and body bytes and uses the chunk
 boundary to keep any pipelined successor separate. Fragmented headers are

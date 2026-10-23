@@ -24,8 +24,9 @@ enum class HttpVersion : u8 {
     Unknown = 255,
 };
 
-// Conservative request Transfer-Encoding framing classification.  This is
-// metadata only: proxy admission keeps its historical behaviour until #284.
+// Conservative request Transfer-Encoding framing classification. HTTP/1
+// dispatch rejects unsupported or ambiguous framing before routing; HTTP/1.0
+// does not admit Transfer-Encoding even when the final coding is chunked.
 enum class RequestTransferEncoding : u8 {
     Unparsed,
     None,

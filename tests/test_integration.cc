@@ -27470,7 +27470,8 @@ static bool normalize_lowercase_date(char* data, u32 length) {
 #if RUT_ENABLE_JIT_TESTS
 template <typename Loop>
 static void run_public_source_transfer_encoding_rejection(rut::test::TestCase* _tc,
-                                                          const char* request) {
+                                                          const char* request,
+                                                          bool http10 = false) {
     using namespace rut;
 
     auto upstream_listener = create_listen_socket(0);
@@ -27569,9 +27570,10 @@ route POST "/" { return forward(backend) }
     set_socket_timeouts(client_fd, 3);
     REQUIRE(send_all(client_fd, request, static_cast<u32>(strlen(request))));
 
-    static constexpr char kExpected[] =
+    char expected[] =
         "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n"
         "\r\nBad Request";
+    if (http10) expected[7] = '0';
     char response[256]{};
     u32 response_len = 0;
     bool saw_eof = false;
@@ -27586,9 +27588,9 @@ route POST "/" { return forward(backend) }
         response_len += static_cast<u32>(count);
     }
     CHECK(saw_eof);
-    CHECK_EQ(response_len, sizeof(kExpected) - 1u);
-    if (response_len == sizeof(kExpected) - 1u)
-        CHECK_EQ(memcmp(response, kExpected, sizeof(kExpected) - 1u), 0);
+    CHECK_EQ(response_len, sizeof(expected) - 1u);
+    if (response_len == sizeof(expected) - 1u)
+        CHECK_EQ(memcmp(response, expected, sizeof(expected) - 1u), 0);
 
     // Give a wrongly admitted connect time to reach the bound upstream. Its
     // nonblocking accept queue must stay empty after the downstream was closed.
@@ -27619,6 +27621,44 @@ route POST "/" { return forward(backend) }
     if constexpr (requires(Loop* candidate) { candidate->pending_free_count; })
         CHECK_EQ(shard.loop->pending_free_count, 0u);
     CHECK_EQ(shard.loop->pool.in_use(), 0u);
+}
+
+template <typename Loop>
+static void run_public_source_transfer_encoding_matrix(rut::test::TestCase* _tc) {
+    // Every rejected request carries a plausible successor. Neither it nor
+    // the ambiguously framed first request may reach the recording listener.
+    const char* fields[] = {
+        "Transfer-Encoding: gzip\r\n",
+        "Transfer-Encoding: chunked, gzip\r\n",
+        "Transfer-Encoding: chunked, chunked\r\n",
+        "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding:\r\n",
+        "Transfer-Encoding: ,chunked\r\n",
+        "Transfer-Encoding: chunked,\r\n",
+        "Transfer-Encoding: chunked;foo=bar\r\n",
+        "Content-Length: 0\r\nTransfer-Encoding: gzip\r\n",
+        "Content-Length: 0\r\nTransfer-Encoding: chunked\r\n",
+    };
+    for (const char* field : fields) {
+        const std::string request = std::string("POST / HTTP/1.1\r\nHost: x\r\n") + field +
+                                    "\r\n0\r\n\r\nPOST / HTTP/1.1\r\nHost: later\r\n\r\n";
+        run_public_source_transfer_encoding_rejection<Loop>(_tc, request.c_str());
+    }
+    run_public_source_transfer_encoding_rejection<Loop>(
+        _tc,
+        "POST / HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0\r\n\r\nPOST / HTTP/1.1\r\nHost: later\r\n\r\n",
+        true);
+}
+
+TEST(request_framing, public_source_rejects_te_matrix_before_upstream_epoll) {
+    run_public_source_transfer_encoding_matrix<EpollEventLoop>(_tc);
+}
+
+TEST(request_framing, public_source_rejects_te_matrix_before_upstream_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    run_public_source_transfer_encoding_matrix<IoUringEventLoop>(_tc);
 }
 
 TEST(request_framing, public_source_rejects_unsupported_te_before_upstream_epoll) {

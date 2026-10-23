@@ -4980,8 +4980,9 @@ classification produced by the parser. After existing strict inventory and
 pre-route fail-closed fences, it rejects unsupported or ambiguous transfer-
 coding lists, and every request combining `Content-Length` with
 `Transfer-Encoding`, with `400` and connection close after the complete header
-arrives and before route handlers or upstream effects. A final `chunked`
-coding remains supported, including `gzip, chunked`. The transparent proxy path
+arrives and before route handlers or upstream effects. HTTP/1.0 requests with
+any `Transfer-Encoding` are rejected. For HTTP/1.1, a final `chunked` coding
+remains supported, including `gzip, chunked`. The transparent proxy path
 preserves the original header and chunk bytes, and uses the chunk parser to keep
 the request boundary separate from any pipelined successor. Incomplete headers
 remain pending until their end is received. On the parse-error fallback path,
