@@ -1582,10 +1582,12 @@ when that block is actually sent, including after connection setup or retry.
 Requests without the field remain without it. If the deadline has expired
 before send, the proxy returns DEADLINE_EXCEEDED (status 4) without sending the
 upstream request headers. Timers retain millisecond resolution. If a retryable
-response or REFUSED_STREAM arrives but its configured backoff cannot fit
-strictly before the original deadline, the RPC ends with DEADLINE_EXCEEDED
-(status 4), without binding another endpoint or forwarding the backend status. Completion and
-status metrics are recorded once. Upstream connection failures map to
+response, REFUSED_STREAM, GOAWAY rejection, or exhausted connection attempt
+cannot fit its configured backoff strictly before the original deadline, the
+RPC ends with DEADLINE_EXCEEDED (status 4), without binding another endpoint
+or forwarding the backend status. This applies only when the exchange is
+otherwise eligible for retry; ineligible transport failures remain UNAVAILABLE.
+Completion and status metrics are recorded once. Upstream connection failures map to
 UNAVAILABLE; expired deadlines map to DEADLINE_EXCEEDED. Configuration epochs
 remain pinned by active/pooled sessions until teardown.
 

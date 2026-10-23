@@ -279,6 +279,7 @@ void grpc_connection_closed(void* lp, Connection& conn) {
                 continue;
             }
             if (g.c5_exhausted && !g.preface_sent) x->retry_tried_mask |= g.connect_tried_mask;
+            bool retry_deadline_exceeded = false;
             if (g.c5_exhausted && !g.preface_sent && grpc_retry_can_schedule(*x, 14, false)) {
                 const u64 now = monotonic_us();
                 const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
@@ -291,9 +292,10 @@ void grpc_connection_closed(void* lp, Connection& conn) {
                     if (down && down->h2) grpc_refresh_timer(loop, *down);
                     continue;
                 }
+                retry_deadline_exceeded = true;
             }
             x->upstream = nullptr;
-            if (!x->response_end) x->failure = 14;
+            if (!x->response_end) x->failure = retry_deadline_exceeded ? 4 : 14;
             x->response_end = true;
             Connection* down = x->downstream;
             if (x->slot_held) {
@@ -1395,13 +1397,13 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
         if (!x || x->retry_pending || !grpc_rejected_by_goaway(h, *x)) continue;
         const u64 now = monotonic_us();
         const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
-        if (grpc_retry_can_schedule(*x, 14, false) &&
-            (!x->deadline_us || retry_at < x->deadline_us)) {
+        const bool retry_allowed = grpc_retry_can_schedule(*x, 14, false);
+        if (retry_allowed && (!x->deadline_us || retry_at < x->deadline_us)) {
             x->retry_pending = true;
             x->retry_at_us = retry_at > now ? retry_at : now + 1;
             x->retry_reason = 14;
         } else {
-            x->failure = 14;
+            x->failure = retry_allowed ? 4 : 14;
             x->response_end = true;
             grpc_detach_upstream_exchange(loop, h, *x);
         }

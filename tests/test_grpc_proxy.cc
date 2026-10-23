@@ -2612,6 +2612,73 @@ TEST(grpc_proxy, c5_exhaustion_retries_only_complete_logical_exchanges) {
     incomplete.replay_body.release();
 }
 
+void rejected_retry_deadline_case(rut::test::TestCase* _tc, bool connect_exhausted) {
+    for (u32 mode = 0; mode < 5; mode++) {
+        RetryCloseGrpcDriveFixture loop;
+        Connection upstream;
+        upstream.reset();
+        u8 recv_storage[64]{};
+        upstream.bind_request_receive_buffer(recv_storage, sizeof(recv_storage));
+        Http2Conn up_h2;
+        up_h2.init_client();
+        up_h2.preface_seen = up_h2.our_settings_sent = up_h2.peer_settings_seen = true;
+        up_h2.grpc.upstream = true;
+        up_h2.grpc.connecting = up_h2.grpc.c5_exhausted = connect_exhausted;
+        up_h2.grpc.preface_sent = !connect_exhausted;
+        upstream.h2 = &up_h2;
+        loop.grpc_upstreams = &upstream;
+        Connection downstream;
+        downstream.reset();
+        downstream.on_send = &pending_send;
+        Http2Conn down_h2;
+        down_h2.init_client();
+        downstream.h2 = &down_h2;
+        REQUIRE(up_h2.open_stream(1) != nullptr);
+        REQUIRE(down_h2.open_stream(1) != nullptr);
+        auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+        REQUIRE(x != nullptr);
+        x->init();
+        x->upstream = &upstream;
+        x->downstream = &downstream;
+        x->upstream_stream = x->downstream_stream = 1;
+        x->slot_held = true;
+        x->retry_enabled = mode != 0;
+        // Transport rejection retries do not depend on the status mask.
+        x->retry_policy = {2, 16, 1u << 7, 500};
+        x->replay_body.replayable = x->replay_body.sealed = true;
+        x->replay_headers.valid = x->replay_trailers.valid = true;
+        const u64 now = monotonic_us();
+        x->deadline_us = mode == 3   ? 0
+                         : mode == 4 ? now - 1
+                                     : now + (mode == 2 ? 60000000u : 50000u);
+        REQUIRE(grpc_attach(up_h2, x));
+        REQUIRE(grpc_attach(down_h2, x));
+        if (connect_exhausted) {
+            grpc_connection_closed<RetryCloseGrpcDriveFixture>(&loop, upstream);
+        } else {
+            const u32 len = write_goaway(recv_storage, 0, Http2Error::NoError);
+            upstream.recv_buf.commit(len);
+            grpc_on_upstream_data<RetryCloseGrpcDriveFixture>(
+                &loop, upstream, {upstream.id, static_cast<i32>(len), 0, 0, IoEventType::Recv, 0});
+        }
+        const bool pending = mode == 2 || mode == 3;
+        CHECK_EQ(x->retry_pending, pending);
+        CHECK_EQ(x->response_end, !pending);
+        CHECK_EQ(x->failure, pending ? 0u : mode == 0 ? 14u : 4u);
+        CHECK_EQ(x->slot_held, pending);
+        CHECK_EQ(loop.released, pending ? 0u : 1u);
+        CHECK(x->upstream == nullptr);
+        CHECK_EQ(up_h2.grpc.active, 0u);
+        CHECK_EQ(down_h2.grpc.active, 1u);
+    }
+}
+TEST(grpc_proxy, c5_exhaustion_retry_respects_original_deadline) {
+    rejected_retry_deadline_case(_tc, true);
+}
+TEST(grpc_proxy, encoded_goaway_retry_respects_original_deadline) {
+    rejected_retry_deadline_case(_tc, false);
+}
+
 TEST(grpc_proxy, c5_exhaustion_carries_tried_backends_into_logical_retry) {
     GrpcBackendHealthReset health_reset{};
     RetryCloseSelectionFixture loop;
