@@ -970,16 +970,31 @@ public:
         backend.pause_upstream_recv(c.id, c.upstream_episode, c.ws_client_send_pending);
     }
 
-    // Minimal teardown for a health-probe Connection (fd == -1, no downstream).
+    // Minimal teardown for a health-probe Connection (no downstream).
     // Deliberately does NOT touch metrics / epoch / access-log / keepalive — a
     // probe never ran a real request, so none of close_conn's per-request
     // side-effects apply. Removes the probe socket from epoll, closes it, drops
     // the fd-map + send-state bookkeeping, and returns the slot to the free list.
     void free_health_probe(Connection& c) {
         (void)backend.detach_upstream(c);
+        if (c.fd >= 0) {
+            backend.cancel(c.fd, c.id, c.recv_armed, c.send_armed);
+            ::close(c.fd);
+            c.fd = -1;
+        }
+        if (c.tls_active && c.tls) {
+            destroy_tls_server_ssl(c.tls);
+            c.tls = nullptr;
+            c.tls_active = false;
+            c.tls_handshake_complete = false;
+        }
+        if (c.h2 && c.h2->grpc.client_tls.ssl_ctx)
+            destroy_tls_client_context(c.h2->grpc.client_tls);
         if (c.id < connection_capacity) {
             backend.downstream_fd_map[c.id] = -1;
         }
+        backend.forget_fd_interest(c.id);
+        backend.clear_send_state(c.id);
         this->free_conn(c);  // timer.remove + free slices + return slot (no metrics)
     }
 
@@ -1278,8 +1293,8 @@ public:
                         // response within upstream_timeout. Record a health FAILURE
                         // for its backend (an unresponsive backend is unhealthy)
                         // and tear the probe down. MUST come first: a probe has
-                        // fd == -1, so falling through to respond_upstream_timeout
-                        // would client_send to fd -1. record_probe_if_current pins
+                        // this is_health_probe check must precede timeout handling
+                        // because a TLS probe has a downstream fd. record_probe_if_current pins
                         // the launching config, so a timeout straddling a hot
                         // reload frees without recording against the wrong
                         // upstream; free_probe_conn clears probe_in_flight so the
@@ -1506,11 +1521,10 @@ private:
 public:
     void force_close_all() {
         for (u32 i = 0; i < connection_capacity; i++) {
-            // A health probe deliberately has fd == -1 with upstream_fd >= 0 (no
-            // downstream socket), so the fd >= 0 guard alone would leak its
-            // upstream socket + slot when graceful drain hits its deadline mid-
+            // A health probe can own either an upstream_fd or a detached TLS fd,
+            // so the fd >= 0 guard alone would leak its socket + slot when drain hits mid-
             // probe. Route it through free_probe_conn (clears probe_in_flight,
-            // then free_health_probe closes upstream_fd + EPOLL_CTL_DEL + returns
+            // then free_health_probe closes/detaches its sockets + returns
             // the slot). free_health_probe touches only the still-live loop/backend
             // (epoll set, fd maps, slice pool), all valid here — force_close_all
             // runs inside run() before running_ is cleared. Mirrors the io_uring

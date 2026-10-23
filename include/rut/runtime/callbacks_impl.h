@@ -247,7 +247,7 @@ inline void build_probe_request(Connection& conn, const UpstreamTarget& target, 
 inline bool build_grpc_health_probe_request(Connection& conn,
                                             const UpstreamTarget& target,
                                             u32 backend_idx) {
-    if (conn.h2 == nullptr || target.tls.enabled || target.hc_service_len > 128) return false;
+    if (conn.h2 == nullptr || target.hc_service_len > 128) return false;
     auto& h2 = *conn.h2;
     h2.init_client();
     if (h2.open_stream(1) == nullptr) return false;
@@ -258,19 +258,40 @@ inline bool build_grpc_health_probe_request(Connection& conn,
     const u32 settings_len = write_settings_frame(frame, h2.our_settings);
     if (buf.write(frame, settings_len) != settings_len) return false;
 
-    char authority[24];
-    const u32 authority_len = format_probe_host(authority, target.addrs[backend_idx]);
+    char authority[264];
+    u32 authority_len = 0;
+    if (target.tls.enabled) {
+        const char* name = target.tls.server_name;
+        while (name[authority_len] && authority_len < sizeof(authority) - 8) {
+            authority[authority_len] = name[authority_len];
+            ++authority_len;
+        }
+        if (authority_len == 0 || name[authority_len] != '\0') return false;
+        authority[authority_len++] = ':';
+        u16 port = ntohs(target.addrs[backend_idx].sin_port);
+        char digits[5];
+        u32 digit_count = 0;
+        do {
+            digits[digit_count++] = static_cast<char>('0' + port % 10);
+            port = static_cast<u16>(port / 10);
+        } while (port != 0);
+        while (digit_count > 0) authority[authority_len++] = digits[--digit_count];
+    } else {
+        authority_len = format_probe_host(authority, target.addrs[backend_idx]);
+    }
     static constexpr char kPath[] = "/grpc.health.v1.Health/Check";
     static constexpr char kPost[] = "POST";
     static constexpr char kHttp[] = "http";
+    static constexpr char kHttps[] = "https";
     static constexpr char kContentType[] = "application/grpc";
     static constexpr char kTrailers[] = "trailers";
-    const hpack::Header headers[] = {{{":method", 7}, {kPost, 4}},
-                                     {{":scheme", 7}, {kHttp, 4}},
-                                     {{":authority", 10}, {authority, authority_len}},
-                                     {{":path", 5}, {kPath, sizeof(kPath) - 1}},
-                                     {{"content-type", 12}, {kContentType, 16}},
-                                     {{"te", 2}, {kTrailers, 8}}};
+    const hpack::Header headers[] = {
+        {{":method", 7}, {kPost, 4}},
+        {{":scheme", 7}, {target.tls.enabled ? kHttps : kHttp, target.tls.enabled ? 5u : 4u}},
+        {{":authority", 10}, {authority, authority_len}},
+        {{":path", 5}, {kPath, sizeof(kPath) - 1}},
+        {{"content-type", 12}, {kContentType, 16}},
+        {{"te", 2}, {kTrailers, 8}}};
     u32 header_len = http2_write_headers(buf.write_ptr(),
                                          buf.write_avail(),
                                          1,
@@ -323,6 +344,37 @@ void free_probe_conn(Loop* loop, Connection& conn) {
     // start_health_probe (which calls free_conn directly) — clears it inline.
     set_probe_in_flight(conn.upstream_idx, conn.upstream_backend_idx, false);
     loop->free_health_probe(conn);
+}
+
+template <typename Loop>
+inline bool submit_probe_send(Loop* loop, Connection& conn, const u8* data, u32 len) {
+    return conn.tls_active ? loop->submit_send(conn, data, len)
+                           : loop->submit_send_upstream(conn, data, len);
+}
+
+template <typename Loop>
+inline bool submit_probe_recv(Loop* loop, Connection& conn) {
+    return conn.tls_active ? loop->submit_recv(conn) : loop->submit_recv_upstream(conn);
+}
+
+template <typename Loop>
+inline void set_probe_send_slot(Connection& conn, ConnectionBase::Callback cb) {
+    if (conn.tls_active)
+        conn.set_slots(nullptr, cb, nullptr, nullptr);
+    else
+        conn.set_slots(nullptr, nullptr, nullptr, cb);
+}
+
+template <typename Loop>
+inline void set_probe_recv_slot(Connection& conn, ConnectionBase::Callback cb) {
+    if (conn.tls_active)
+        conn.set_slots(cb, nullptr, nullptr, nullptr);
+    else
+        conn.set_slots(nullptr, nullptr, cb, nullptr);
+}
+
+inline Buffer& probe_response_buffer(Connection& conn) {
+    return conn.tls_active ? conn.recv_buf : conn.upstream_recv_buf;
 }
 
 // Record an active-probe outcome, but only if the config that LAUNCHED the probe
@@ -617,10 +669,6 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
 
     conn.reset_request_receive_buffer();
     if (target.http2) {
-        if (target.tls.enabled) {
-            free_probe_conn(loop, conn);
-            return false;
-        }
         bool h2_allocated = false;
         if constexpr (requires { loop->alloc_h2(conn); }) h2_allocated = loop->alloc_h2(conn);
         if (!h2_allocated || !build_grpc_health_probe_request(conn, target, backend_idx)) {
@@ -670,9 +718,61 @@ void on_probe_connected(void* lp, Connection& conn, IoEvent ev) {
         free_probe_conn(loop, conn);
         return;
     }
-    conn.set_slots(nullptr, nullptr, nullptr, &on_probe_sent<Loop>);
+    // A health probe does not hold the request epoch. Hot reload may therefore
+    // reclaim its launch config while connect is pending; compare pointer values
+    // before dereferencing the non-owning snapshot.
+    const RouteConfig* active_config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    if (conn.request_config == nullptr || conn.request_config != active_config) {
+        free_probe_conn(loop, conn);
+        return;
+    }
+    if (conn.upstream_idx >= conn.request_config->upstream_count) {
+        free_probe_conn(loop, conn);
+        return;
+    }
+    {
+        const auto& target = conn.request_config->upstreams[conn.upstream_idx];
+        if (target.tls.enabled) {
+            if (!target.http2 || conn.h2 == nullptr) {
+                free_probe_conn(loop, conn);
+                return;
+            }
+            i32 fd = -1;
+            if constexpr (requires { loop->backend.detach_upstream(conn, &fd); }) {
+                if (!loop->backend.detach_upstream(conn, &fd)) {
+                    free_probe_conn(loop, conn);
+                    return;
+                }
+            } else {
+                free_probe_conn(loop, conn);
+                return;
+            }
+            conn.fd = fd;
+            // Once detached, the socket is dispatched as a downstream fd. Map
+            // it before the initial SSL_write so handshake HUP/ERR is routed.
+            loop->backend.downstream_fd_map[conn.id] = fd;
+            auto& context = conn.h2->grpc.client_tls;
+            if (!init_tls_client_context(context, target.tls)) {
+                free_probe_conn(loop, conn);
+                return;
+            }
+            auto ssl = create_tls_client_ssl(context, fd, target.tls.server_name);
+            if (!ssl) {
+                free_probe_conn(loop, conn);
+                return;
+            }
+            conn.tls = ssl.value();
+            conn.tls_active = true;
+            conn.tls_handshake_complete = false;
+            conn.h2->grpc.upstream = true;
+        }
+    }
+    if (conn.tls_active)
+        set_probe_send_slot<Loop>(conn, &on_probe_sent<Loop>);
+    else
+        conn.set_slots(nullptr, nullptr, nullptr, &on_probe_sent<Loop>);
     // submit failure is local (kernel submission), not a backend signal — skip.
-    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), conn.recv_buf.len())) {
+    if (!submit_probe_send(loop, conn, conn.recv_buf.data(), conn.recv_buf.len())) {
         free_probe_conn(loop, conn);
     }
 }
@@ -692,6 +792,14 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
         free_probe_conn(loop, conn);
         return;
     }
+    if (conn.tls_active && !conn.tls_handshake_complete) {
+        if (!tls_handshake_finished(conn.tls) || !tls_client_peer_valid(conn.tls)) {
+            record_probe_if_current(loop, conn, false, monotonic_us());
+            free_probe_conn(loop, conn);
+            return;
+        }
+        conn.tls_handshake_complete = true;
+    }
     if (conn.h2 != nullptr) {
         const u32 request_len = conn.recv_buf.len();
         const u32 result = static_cast<u32>(ev.result);
@@ -703,9 +811,10 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.send_progress += result;
         if (conn.send_progress < request_len) {
-            if (!loop->submit_send_upstream(conn,
-                                            conn.recv_buf.data() + conn.send_progress,
-                                            request_len - conn.send_progress))
+            if (!submit_probe_send(loop,
+                                   conn,
+                                   conn.recv_buf.data() + conn.send_progress,
+                                   request_len - conn.send_progress))
                 free_probe_conn(loop, conn);
             return;
         }
@@ -720,16 +829,20 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
             stream->state = Http2StreamState::HalfClosedLocal;
         }
         conn.reset_request_receive_buffer();
-        conn.set_slots(nullptr, nullptr, &on_probe_h2_response<Loop>, nullptr);
-        if (conn.upstream_recv_buf.len() > 0) {
+        set_probe_recv_slot<Loop>(conn, &on_probe_h2_response<Loop>);
+        Buffer& response = probe_response_buffer(conn);
+        if (response.len() > 0) {
             IoEvent synth{conn.id, 1, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
             on_probe_h2_response<Loop>(lp, conn, synth);
-        } else if (!loop->submit_recv_upstream(conn)) {
+        } else if (!submit_probe_recv(loop, conn)) {
             free_probe_conn(loop, conn);
         }
         return;
     }
-    conn.set_slots(nullptr, nullptr, &on_probe_response<Loop>, nullptr);
+    if (conn.tls_active)
+        set_probe_recv_slot<Loop>(conn, &on_probe_response<Loop>);
+    else
+        conn.set_slots(nullptr, nullptr, &on_probe_response<Loop>, nullptr);
     if (conn.upstream_recv_buf.len() > 0) {
         IoEvent synth = {conn.id,
                          static_cast<i32>(conn.upstream_recv_buf.len()),
@@ -743,7 +856,7 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     // submit failure is local (kernel submission), not a backend signal — skip.
-    if (!loop->submit_recv_upstream(conn)) {
+    if (!submit_probe_recv(loop, conn)) {
         free_probe_conn(loop, conn);
     }
 }
@@ -800,6 +913,7 @@ template <typename Loop>
 void on_probe_h2_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     Http2Conn* h2 = conn.h2;
+    Buffer& response = probe_response_buffer(conn);
     if (h2 == nullptr) {
         free_probe_conn(loop, conn);
         return;
@@ -809,18 +923,18 @@ void on_probe_h2_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     const bool eof = ev.result == 0;
-    if (ev.result < 0 || (eof && conn.upstream_recv_buf.len() == 0)) {
+    if (ev.result < 0 || (eof && response.len() == 0)) {
         record_probe_if_current(loop, conn, false, monotonic_us());
         free_probe_conn(loop, conn);
         return;
     }
     u32 control_len = 0;
-    Http2Result result = h2->process(conn.upstream_recv_buf.data(),
-                                     conn.upstream_recv_buf.len(),
+    Http2Result result = h2->process(response.data(),
+                                     response.len(),
                                      conn.send_buf.write_ptr(),
                                      conn.send_buf.write_avail(),
                                      &control_len);
-    if (result.consumed != 0) conn.upstream_recv_buf.consume(result.consumed);
+    if (result.consumed != 0) response.consume(result.consumed);
     if (result.close || (h2->peer_goaway && h2->peer_last_stream < 1) ||
         h2->health_probe_malformed) {
         record_probe_if_current(loop, conn, false, monotonic_us());
@@ -835,8 +949,8 @@ void on_probe_h2_response(void* lp, Connection& conn, IoEvent ev) {
     if (control_len != 0) {
         conn.send_buf.commit(control_len);
         conn.send_progress = 0;
-        conn.set_slots(nullptr, nullptr, nullptr, &on_probe_h2_control_sent<Loop>);
-        if (!loop->submit_send_upstream(conn, conn.send_buf.data(), conn.send_buf.len()))
+        set_probe_send_slot<Loop>(conn, &on_probe_h2_control_sent<Loop>);
+        if (!submit_probe_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()))
             free_probe_conn(loop, conn);
         return;
     }
@@ -845,12 +959,13 @@ void on_probe_h2_response(void* lp, Connection& conn, IoEvent ev) {
         free_probe_conn(loop, conn);
         return;
     }
-    if (conn.upstream_recv_buf.write_avail() == 0) {
+    if (response.write_avail() == 0) {
         record_probe_if_current(loop, conn, false, monotonic_us());
         free_probe_conn(loop, conn);
         return;
     }
-    if (!loop->submit_recv_upstream(conn)) free_probe_conn(loop, conn);
+    set_probe_recv_slot<Loop>(conn, &on_probe_h2_response<Loop>);
+    if (!submit_probe_recv(loop, conn)) free_probe_conn(loop, conn);
 }
 
 template <typename Loop>
@@ -869,8 +984,10 @@ void on_probe_h2_control_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.send_progress += static_cast<u32>(ev.result);
     if (conn.send_progress < send_len) {
-        if (!loop->submit_send_upstream(
-                conn, conn.send_buf.data() + conn.send_progress, send_len - conn.send_progress))
+        if (!submit_probe_send(loop,
+                               conn,
+                               conn.send_buf.data() + conn.send_progress,
+                               send_len - conn.send_progress))
             free_probe_conn(loop, conn);
         return;
     }

@@ -1663,9 +1663,10 @@ RPCs. The source live-log writer retains its configured bytes-only output.
 Header-only route handlers can forward gRPC. Body-dependent handlers,
 HTTP/1-specific forwarding policies and JSON transcoding remain outside this
 path. HTTP/2 upstreams support active unary gRPC Health `Check` probes over
-plaintext HTTP/2; TLS probes and `Watch` are unsupported. HTTP/1 upstreams keep
-their existing path/status health-check form. Active probes run on epoll and
-kqueue readiness loops; io_uring does not issue probes. See
+plaintext or TLS on epoll/kqueue readiness loops. TLS validates the configured
+server name and requires h2 ALPN. `Watch` is unsupported, and io_uring does not
+issue active probes. HTTP/1 upstreams keep their existing path/status
+health-check form. See
 [examples/grpc.rut](examples/grpc.rut) and the language card for the current
 configuration and response criteria.
 

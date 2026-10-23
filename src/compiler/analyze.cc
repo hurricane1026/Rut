@@ -16794,12 +16794,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         // Health-check fields are protocol-specific. HTTP/1 keeps its existing
         // path/status form. HTTP/2 uses the standard gRPC Health Check RPC, whose
-        // method is fixed and whose service name is optional. TLS probes are
-        // explicitly rejected until the probe path can perform TLS.
+        // method is fixed and whose service name is optional. Readiness
+        // backends support this probe over upstream TLS as well.
         if (item.upstream.hc_enabled) {
             if (item.upstream.http2) {
-                if (item.upstream.hc_path_set || item.upstream.hc_status_set ||
-                    item.upstream.tls.enabled)
+                if (item.upstream.hc_path_set || item.upstream.hc_status_set)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           item.upstream.addr_span,
                                           {"HTTP/2 health_check accepts service only", 40});

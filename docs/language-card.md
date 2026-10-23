@@ -535,8 +535,10 @@ standard unary `/grpc.health.v1.Health/Check` probe. `service` is optional,
 accepts at most 128 valid UTF-8 bytes, and defaults to the empty string, which
 asks the server for overall health. A probe marks the backend healthy only for
 HTTP 200, a gRPC content type, `grpc-status:
-0`, and a valid `HealthCheckResponse` with status `SERVING`. Probes use plaintext
-HTTP/2; TLS probes, `Watch`, and active probes from the io_uring backend are not
+0`, and a valid `HealthCheckResponse` with status `SERVING`. Probes use HTTP/2
+over plaintext or TLS on readiness backends (epoll/kqueue). TLS uses the
+configured server name for SNI, certificate validation, and `:authority`, and
+requires h2 ALPN. `Watch` and active probes from the io_uring backend are not
 supported. HTTP/1 health checks retain the `path` and optional `status` form.
 
 Binary and base64-text gRPC-Web can use the same `.http2` upstream through
