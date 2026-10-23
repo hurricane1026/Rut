@@ -7346,34 +7346,35 @@ Latency histogram uses log-scale buckets:
 
 ### 13.6 Access Log
 
-High-performance access log — separate from application logging:
+Access logging is a process-start sink, separate from application logging.
+The legacy CLI flusher remains unchanged. A main-source `accessLog` declaration
+selects the reliable per-record SourceLive publisher:
 
-```
-Architecture:
-  Each shard writes to a per-shard ring buffer (64KB)
-  Background thread (not on any shard) batch-flushes to file/stdout
-  Zero allocation, zero syscall on the request path
-
-Format: one JSON line per request
-  {
-    "ts": "2026-03-20T15:30:00.123Z",
-    "method": "GET",
-    "path": "/users/123",
-    "status": 200,
-    "duration_us": 1234,
-    "req_size": 256,
-    "resp_size": 1024,
-    "addr": "10.0.0.5",
-    "upstream": "users",
-    "upstream_duration_us": 1100,
-    "request_id": "abc-123",
-    "shard": 3
-  }
+```rut
+accessLog { path: "/var/log/rut/host.log", format: downstreamHost, publication: live }
 ```
 
-Access logging is automatic — the runtime logs every request. Format and output
-are controlled by runtime flags (`--access-log-format`, `--access-log-output`),
-not in .rut source files.
+The existing `downstreamRequestBytes` profile retains its exact decimal line
+and bytes. The bounded `downstreamHost` profile emits one versioned ASCII line
+per completed strict HTTP/1 request:
+
+```text
+host1 request_bytes=<u32> status=<u16> host_state=<state> host_length=<u32> host_hex=<lowercase-hex-or-dash> upstream_history=unavailable\n
+```
+
+Host is an owned observation of the downstream request's semantic value after
+optional whitespace trimming. The explicit states are `unavailable`,
+`complete`, `empty`, `absent`, `duplicate`, `over_limit`, and `invalid`; only a
+complete value carries bytes. Hex encoding keeps arbitrary bytes on one line.
+This profile does not validate authority, alter routing, or claim upstream
+attempt history. H2 stream publication and upstream endpoint/status history
+remain outside this bounded capability. Source declarations are accepted only
+in the main file and use `publication: live`.
+
+The reliable SourceLive path uses one SPSC ring per shard and a process-owned
+writer thread. Publication remains bounded and allocates no memory on request
+completion. The legacy CLI flusher and its existing text format remain a
+separate compatibility mode.
 
 ### 13.7 Internal Endpoints
 

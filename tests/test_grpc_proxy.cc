@@ -3379,6 +3379,46 @@ TEST(grpc_proxy, live_log_keeps_bytes_only_output) {
     CHECK_EQ(metrics.grpc_active, 0u);
 }
 
+TEST(grpc_proxy, live_host_log_skips_http2_publication) {
+    LiveAccessLogRing ring;
+    ring.init();
+    SourceLiveAccessLogLeaseSlot lease{nullptr};
+    SourceLiveAccessLogHostRing hosts;
+    hosts.init(&ring, &lease);
+    SourceLiveAccessLogHostRingBinding binding{&ring, &hosts, &lease};
+    i32 fds[2];
+    REQUIRE(rut::test::nonblocking_pipe(fds) == 0);
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start_host(SourceAccessLogFd(fds[1]), &binding, 1));
+    SourceLiveAccessLogProducer producer;
+    REQUIRE(producer.init_host(&ring, &hosts, &session, 0, &lease));
+
+    ShardMetrics metrics;
+    metrics.init();
+    metrics.on_grpc_start();
+    struct Loop {
+        ShardMetrics* metrics;
+        AccessLogRing* access_log;
+        SourceLiveAccessLogProducer* live_access_log;
+    } loop{&metrics, nullptr, &producer};
+    auto exchange = std::make_unique<GrpcExchange>();
+    exchange->init();
+    exchange->observed = true;
+    exchange->started_us = monotonic_us();
+    exchange->response_end_sent = true;
+    exchange->response_status = 0;
+    grpc_observe(&loop, *exchange);
+
+    CHECK_FALSE(exchange->observed);
+    CHECK_EQ(metrics.grpc_completed[0], 1u);
+    CHECK_EQ(metrics.grpc_active, 0u);
+    CHECK(session.fatal().kind == SourceLiveAccessLogFatalKind::None);
+    CHECK_EQ(ring.published_pos.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(session.finish().status, SourceLiveAccessLogFinishStatus::Success);
+    producer.reset();
+    close(fds[0]);
+}
+
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
     return rut::test::run_all(argc, argv);

@@ -338,6 +338,149 @@ TEST(access_log_live_lease, raw_attach_rejects_and_conflicting_start_unwinds_exa
     CHECK(occupied_lease.load(std::memory_order_acquire) == nullptr);
 }
 
+TEST(access_log_live_host, owned_sidecar_publish_survives_wrap_and_input_reuse) {
+    LiveAccessLogRing ring;
+    ring.init_quiescent_empty(UINT64_MAX);
+    SourceLiveAccessLogLeaseSlot lease{nullptr};
+    SourceLiveAccessLogHostRing hosts;
+    hosts.init(&ring, &lease);
+    SourceLiveAccessLogHostRingBinding binding{&ring, &hosts, &lease};
+    Pipe output;
+    REQUIRE(output.open_nonblocking());
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start_host(output.take_writer(), &binding, 1));
+    SourceLiveAccessLogProducer producer;
+    REQUIRE(producer.init_host(&ring, &hosts, &session, 0, &lease));
+    CHECK(producer.captures_downstream_host());
+    AccessLogDownstreamHostRecord host{};
+    host.record_schema = kAccessLogDownstreamHostRecordSchema;
+    host.state = AccessLogDownstreamHostState::Complete;
+    host.observed_length = 1;
+    host.value[0] = 'A';
+    auto entry = entry_with_size(102);
+    entry.status = 200;
+    const auto first = producer.publish_host(entry, host);
+    REQUIRE(first.status == SourceLiveAccessLogPublishStatus::Published);
+    CHECK(first.ticket.valid);
+    CHECK_EQ(first.ticket.end_position, 0u);
+    host.value[0] = 'B';
+    const auto second = producer.publish_host(entry, host);
+    REQUIRE(second.status == SourceLiveAccessLogPublishStatus::Published);
+    host.value[0] = 'Z';
+    REQUIRE(session.finish().status == SourceLiveAccessLogFinishStatus::Success);
+    CHECK(ring.acknowledged(first.ticket));
+    CHECK(ring.acknowledged(second.ticket));
+    CHECK(lease.load(std::memory_order_acquire) == nullptr);
+    CHECK_EQ(read_available(output.read_fd),
+             "host1 request_bytes=102 status=200 host_state=complete host_length=1 "
+             "host_hex=41 upstream_history=unavailable\n"
+             "host1 request_bytes=102 status=200 host_state=complete host_length=1 "
+             "host_hex=42 upstream_history=unavailable\n");
+    producer.reset();
+}
+
+TEST(access_log_live_host, invalid_descriptors_reject_before_borrowing_or_publication) {
+    for (u32 poison = 0; poison < 4; ++poison) {
+        LiveAccessLogRing ring;
+        ring.init();
+        SourceLiveAccessLogLeaseSlot lease{nullptr};
+        SourceLiveAccessLogHostRing hosts;
+        hosts.init(&ring, &lease);
+        switch (poison) {
+            case 0:
+                hosts.schema++;
+                break;
+            case 1:
+                hosts.record_size++;
+                break;
+            case 2:
+                hosts.capacity--;
+                break;
+            case 3:
+                hosts.owner_ring = nullptr;
+                break;
+        }
+        SourceLiveAccessLogHostRingBinding binding{&ring, &hosts, &lease};
+        Pipe output;
+        REQUIRE(output.open_nonblocking());
+        SourceLiveAccessLogSession session;
+        const auto started = session.start_host(output.take_writer(), &binding, 1);
+        CHECK_FALSE(started.has_value());
+        CHECK(lease.load(std::memory_order_acquire) == nullptr);
+        CHECK_EQ(ring.published_pos.load(std::memory_order_acquire), 0u);
+        CHECK(read_available(output.read_fd).empty());
+    }
+}
+
+TEST(access_log_live_host, noncanonical_record_is_fatal_without_enqueue) {
+    LiveAccessLogRing ring;
+    ring.init();
+    SourceLiveAccessLogLeaseSlot lease{nullptr};
+    SourceLiveAccessLogHostRing hosts;
+    hosts.init(&ring, &lease);
+    SourceLiveAccessLogHostRingBinding binding{&ring, &hosts, &lease};
+    Pipe output;
+    REQUIRE(output.open_nonblocking());
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start_host(output.take_writer(), &binding, 1));
+    SourceLiveAccessLogProducer producer;
+    REQUIRE(producer.init_host(&ring, &hosts, &session, 0, &lease));
+    AccessLogDownstreamHostRecord invalid{};  // zero schema must not be published
+    const auto result = producer.publish_host(entry_with_size(102), invalid);
+    CHECK(result.status == SourceLiveAccessLogPublishStatus::Fatal);
+    CHECK_EQ(ring.published_pos.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(hosts.slots[0].record.record_schema, 0u);
+    CHECK(session.finish().status == SourceLiveAccessLogFinishStatus::Fatal);
+    CHECK(read_available(output.read_fd).empty());
+    producer.reset();
+}
+
+TEST(access_log_live_host, stale_sidecar_cursor_is_fatal_without_prefix_output) {
+    LiveAccessLogRing ring;
+    ring.init();
+    SourceLiveAccessLogLeaseSlot lease{nullptr};
+    SourceLiveAccessLogHostRing hosts;
+    hosts.init(&ring, &lease);
+    hosts.slots[0].start_position = 1;  // wrong start cursor for base position zero
+    hosts.slots[0].record.record_schema = kAccessLogDownstreamHostRecordSchema;
+    hosts.slots[0].record.state = AccessLogDownstreamHostState::Absent;
+    REQUIRE(ring.try_publish(entry_with_size(102)).status == LiveAccessLogPublishStatus::Published);
+    SourceLiveAccessLogHostRingBinding binding{&ring, &hosts, &lease};
+    Pipe output;
+    REQUIRE(output.open_nonblocking());
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start_host(output.take_writer(), &binding, 1));
+    CHECK(session.finish().status == SourceLiveAccessLogFinishStatus::Fatal);
+    CHECK_EQ(ring.committed_pos.load(std::memory_order_acquire), 0u);
+    CHECK(read_available(output.read_fd).empty());
+}
+
+TEST(access_log_live_host, shard_retains_typed_sidecar_until_writer_releases_lease) {
+    Shard<RealLoop> shard;
+    REQUIRE(shard.init(0, -1));
+    const auto ring_result = shard.init_live_access_log_ring();
+    REQUIRE(ring_result);
+    const auto hosts_result = shard.init_live_access_log_host_ring();
+    REQUIRE(hosts_result);
+    auto* hosts = hosts_result.value();
+    const auto binding = shard.live_access_log_host_binding();
+    Pipe output;
+    REQUIRE(output.open_nonblocking());
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start_host(output.take_writer(), &binding, 1));
+    REQUIRE(shard.attach_live_access_log_host(&session, 0));
+    shard.shutdown();
+    CHECK_EQ(shard.live_log_host_ring, hosts);
+    CHECK_EQ(shard.live_log_ring, ring_result.value());
+    const auto held = shard.release_live_access_log();
+    CHECK_FALSE(held.has_value());
+    CHECK(held.error() == ShardLiveAccessLogError::LeaseHeld);
+    REQUIRE(session.finish().status == SourceLiveAccessLogFinishStatus::Success);
+    REQUIRE(shard.release_live_access_log());
+    CHECK(shard.live_log_host_ring == nullptr);
+    CHECK(shard.live_log_ring == nullptr);
+}
+
 int main() {
     return test::run_all();
 }

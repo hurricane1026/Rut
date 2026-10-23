@@ -72,11 +72,31 @@ core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::
     return start_impl(static_cast<SourceAccessLogFd&&>(output), bindings, ring_count, false);
 }
 
+core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::start_host(
+    SourceAccessLogFd&& output,
+    const SourceLiveAccessLogHostRingBinding* bindings,
+    u32 ring_count) {
+    SourceLiveAccessLogRingBinding base_bindings[kMaxRings]{};
+    SourceLiveAccessLogHostRing* host_rings[kMaxRings]{};
+    if (bindings != nullptr && ring_count <= kMaxRings) {
+        for (u32 i = 0; i < ring_count; i++) {
+            base_bindings[i] = {bindings[i].ring, bindings[i].lease};
+            host_rings[i] = bindings[i].host_ring;
+        }
+    }
+    return start_impl(static_cast<SourceAccessLogFd&&>(output),
+                      bindings != nullptr ? base_bindings : nullptr,
+                      ring_count,
+                      false,
+                      bindings != nullptr ? host_rings : nullptr);
+}
+
 core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::start_impl(
     SourceAccessLogFd&& output,
     const SourceLiveAccessLogRingBinding* bindings,
     u32 ring_count,
-    bool allow_unleased) {
+    bool allow_unleased,
+    SourceLiveAccessLogHostRing* const* host_rings) {
     if (state_.load(std::memory_order_acquire) != State::New)
         return core::make_unexpected(SourceLiveAccessLogStartError{
             SourceLiveAccessLogStartErrorKind::InvalidLifecycle, kSourceLiveAccessLogNoRing, 0});
@@ -106,6 +126,19 @@ core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::
                         SourceLiveAccessLogStartErrorKind::DuplicateLease, static_cast<u8>(i), 0});
             }
         }
+        if (host_rings != nullptr) {
+            if (host_rings[i] == nullptr ||
+                !host_rings[i]->binding_valid(bindings[i].ring, bindings[i].lease))
+                return core::make_unexpected(SourceLiveAccessLogStartError{
+                    SourceLiveAccessLogStartErrorKind::InvalidRingState, static_cast<u8>(i), 0});
+            for (u32 j = 0; j < i; j++) {
+                if (host_rings[i] == host_rings[j])
+                    return core::make_unexpected(SourceLiveAccessLogStartError{
+                        SourceLiveAccessLogStartErrorKind::InvalidRingState,
+                        static_cast<u8>(i),
+                        0});
+            }
+        }
         const u64 published = bindings[i].ring->published_pos.load(std::memory_order_acquire);
         const u64 committed = bindings[i].ring->committed_pos.load(std::memory_order_acquire);
         if (published - committed > LiveAccessLogRing::kCapacity)
@@ -116,6 +149,7 @@ core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::
     ring_count_ = ring_count;
     for (u32 i = 0; i < ring_count_; i++) {
         rings_[i] = bindings[i].ring;
+        host_rings_[i] = host_rings != nullptr ? host_rings[i] : nullptr;
         if (bindings[i].lease == nullptr) continue;
         SourceLiveAccessLogSession* expected = nullptr;
         if (!bindings[i].lease->compare_exchange_strong(
@@ -228,6 +262,19 @@ bool SourceLiveAccessLogSession::producer_binding_valid(
     const SourceLiveAccessLogLeaseSlot* lease) const {
     return state_.load(std::memory_order_acquire) == State::Running && ring != nullptr &&
            ring_index < ring_count_ && rings_[ring_index] == ring && leases_[ring_index] == lease &&
+           host_rings_[ring_index] == nullptr &&
+           (lease == nullptr || lease->load(std::memory_order_acquire) == this);
+}
+
+bool SourceLiveAccessLogSession::producer_host_binding_valid(
+    const LiveAccessLogRing* ring,
+    const SourceLiveAccessLogHostRing* host_ring,
+    u32 ring_index,
+    const SourceLiveAccessLogLeaseSlot* lease) const {
+    return state_.load(std::memory_order_acquire) == State::Running && ring != nullptr &&
+           host_ring != nullptr && ring_index < ring_count_ && rings_[ring_index] == ring &&
+           host_rings_[ring_index] == host_ring && leases_[ring_index] == lease &&
+           host_ring->binding_valid(ring, lease) &&
            (lease == nullptr || lease->load(std::memory_order_acquire) == this);
 }
 
@@ -301,10 +348,30 @@ bool SourceLiveAccessLogSession::service_round() {
                 SourceLiveAccessLogFatalKind::Protocol, static_cast<u8>(ring_index), 0);
             return progressed;
         }
-        char line[kAccessLogDownstreamRequestBytesLineCapacity];
-        const u32 line_length =
-            format_access_log_downstream_request_bytes_line(*peek.entry, line, sizeof(line));
         const u64 position = peek.position;
+        const AccessLogEntry entry = *peek.entry;
+        char host_line[kAccessLogDownstreamHostLineCapacity];
+        char request_bytes_line[kAccessLogDownstreamRequestBytesLineCapacity];
+        u32 line_length = 0u;
+        const char* line = nullptr;
+        if (host_rings_[ring_index] != nullptr) {
+            const SourceLiveAccessLogHostSlot& slot =
+                host_rings_[ring_index]->slots[position & SourceLiveAccessLogHostRing::kMask];
+            if (slot.start_position != position ||
+                slot.record.record_schema != kAccessLogDownstreamHostRecordSchema) {
+                publish_writer_fatal(
+                    SourceLiveAccessLogFatalKind::Protocol, static_cast<u8>(ring_index), 0);
+                return progressed;
+            }
+            const AccessLogDownstreamHostRecord host_record = slot.record;
+            line_length = format_access_log_downstream_host_line(
+                entry, host_record, host_line, sizeof(host_line));
+            line = host_line;
+        } else {
+            line_length = format_access_log_downstream_request_bytes_line(
+                entry, request_bytes_line, sizeof(request_bytes_line));
+            line = request_bytes_line;
+        }
         // Drop the only borrowed slot pointer before any commit can make the
         // slot reusable by its producer.
         peek = {};
@@ -324,8 +391,10 @@ bool SourceLiveAccessLogSession::write_record(u32 ring_index,
                                               u64 position,
                                               const char* line,
                                               u32 line_length) {
-    if (line == nullptr || line_length == 0u ||
-        line_length > kAccessLogDownstreamRequestBytesLineCapacity) {
+    const u32 line_capacity = host_rings_[ring_index] != nullptr
+                                  ? kAccessLogDownstreamHostLineCapacity
+                                  : kAccessLogDownstreamRequestBytesLineCapacity;
+    if (line == nullptr || line_length == 0u || line_length > line_capacity) {
         publish_writer_fatal(
             SourceLiveAccessLogFatalKind::Protocol, static_cast<u8>(ring_index), 0);
         return false;
@@ -449,6 +518,7 @@ void SourceLiveAccessLogSession::release_ring_borrows() {
         }
         leases_[i] = nullptr;
         rings_[i] = nullptr;
+        host_rings_[i] = nullptr;
     }
     ring_count_ = 0u;
 }

@@ -30383,6 +30383,68 @@ TEST(access_log_live_callback,
     producer.reset();
 }
 
+TEST(access_log_live_callback,
+     downstream_host_profile_publishes_owned_observation_with_base_start_ticket) {
+    static constexpr char kRequest[] =
+        "GET /ledger HTTP/1.1\r\n"
+        "hOsT: \tEXample.test:80 \t\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr u32 kRequestLen = sizeof(kRequest) - 1u;
+
+    SmallLoop loop;
+    loop.setup();
+    LiveAccessLogRing ring;
+    ring.init();
+    SourceLiveAccessLogLeaseSlot lease{nullptr};
+    SourceLiveAccessLogHostRing host_ring;
+    host_ring.init(&ring, &lease);
+    SourceLiveNetworkPipe output;
+    REQUIRE(output.open_nonblocking());
+    const SourceLiveAccessLogHostRingBinding binding{&ring, &host_ring, &lease};
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start_host(output.take_writer(), &binding, 1u));
+    SourceLiveAccessLogProducer producer;
+    REQUIRE(producer.init_host(&ring, &host_ring, &session, 0u, &lease));
+    loop.live_access_log = &producer;
+
+    RouteConfig config{};
+    REQUIRE(config.add_static("/ledger", 0, 204));
+    Connection* conn = dispatch_unmatched_request(loop, config, kRequest);
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    REQUIRE_EQ(conn->downstream_req_size, kRequestLen);
+    REQUIRE_EQ(conn->access_log_downstream_host_snapshot.record.state,
+               AccessLogDownstreamHostState::Complete);
+    CHECK_EQ(conn->access_log_downstream_host_snapshot.record.observed_length, 15u);
+    CHECK_EQ(std::string(conn->access_log_downstream_host_snapshot.record.value, 15u),
+             "EXample.test:80");
+
+    const u32 response_wire_length = conn->send_buf.len();
+    REQUIRE_NE(response_wire_length, 0u);
+    loop.inject_and_dispatch(
+        make_ev(id, IoEventType::Send, static_cast<i32>(response_wire_length)));
+    CHECK_EQ(loop.conns[id].access_log_downstream_host_snapshot.episode, 0u);
+    CHECK_EQ(host_ring.slots[0].start_position, 0u);
+    CHECK_EQ(host_ring.slots[0].record.record_schema, kAccessLogDownstreamHostRecordSchema);
+    CHECK_EQ(host_ring.slots[0].record.state, AccessLogDownstreamHostState::Complete);
+
+    for (u32 attempt = 0u;
+         attempt < 100000u && ring.committed_pos.load(std::memory_order_acquire) != 1u;
+         attempt++)
+        sched_yield();
+    REQUIRE_EQ(ring.published_pos.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(ring.committed_pos.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(read_source_live_network_output(output.read_fd),
+             "host1 request_bytes=" + std::to_string(kRequestLen) +
+                 " status=204 host_state=complete host_length=15 "
+                 "host_hex=4558616d706c652e746573743a3830 upstream_history=unavailable\n");
+    const auto finished = session.finish();
+    REQUIRE(finished.status == SourceLiveAccessLogFinishStatus::Success);
+    CHECK_EQ(lease.load(std::memory_order_acquire), nullptr);
+    loop.live_access_log = nullptr;
+    producer.reset();
+}
+
 TEST(access_log_live_callback, dual_mode_fails_protocol_without_capture_or_publication) {
     SmallLoop loop;
     loop.setup();

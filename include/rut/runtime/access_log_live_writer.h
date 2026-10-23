@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log_live.h"
+#include "rut/runtime/access_log_live_host.h"
 #include "rut/runtime/access_log_startup.h"
 #include <atomic>
 
@@ -10,11 +11,14 @@
 
 namespace rut {
 
-class SourceLiveAccessLogSession;
-using SourceLiveAccessLogLeaseSlot = std::atomic<SourceLiveAccessLogSession*>;
-
 struct SourceLiveAccessLogRingBinding {
     LiveAccessLogRing* ring = nullptr;
+    SourceLiveAccessLogLeaseSlot* lease = nullptr;
+};
+
+struct SourceLiveAccessLogHostRingBinding {
+    LiveAccessLogRing* ring = nullptr;
+    SourceLiveAccessLogHostRing* host_ring = nullptr;
     SourceLiveAccessLogLeaseSlot* lease = nullptr;
 };
 
@@ -109,6 +113,10 @@ public:
     // caller-owned sessions and cannot be attached to a leased Shard ring.
     core::Expected<void, SourceLiveAccessLogStartError> start(
         SourceAccessLogFd&& output, const SourceLiveAccessLogRingBinding* bindings, u32 ring_count);
+    core::Expected<void, SourceLiveAccessLogStartError> start_host(
+        SourceAccessLogFd&& output,
+        const SourceLiveAccessLogHostRingBinding* bindings,
+        u32 ring_count);
 
     // Called only after a successful try_publish() on ring_index. EINTR is
     // retried; eventfd saturation is a coalesced success. Other errors publish
@@ -133,6 +141,10 @@ public:
     bool producer_binding_valid(const LiveAccessLogRing* ring,
                                 u32 ring_index,
                                 const SourceLiveAccessLogLeaseSlot* lease) const;
+    bool producer_host_binding_valid(const LiveAccessLogRing* ring,
+                                     const SourceLiveAccessLogHostRing* host_ring,
+                                     u32 ring_index,
+                                     const SourceLiveAccessLogLeaseSlot* lease) const;
     bool running() const;
     void report_producer_fatal(SourceLiveAccessLogFatalKind kind, u32 ring_index, i32 system_error);
 
@@ -157,7 +169,8 @@ private:
         SourceAccessLogFd&& output,
         const SourceLiveAccessLogRingBinding* bindings,
         u32 ring_count,
-        bool allow_unleased);
+        bool allow_unleased,
+        SourceLiveAccessLogHostRing* const* host_rings = nullptr);
     void release_ring_borrows();
     void close_owned();
 
@@ -173,6 +186,7 @@ private:
     pthread_t writer_{};
     bool writer_started_ = false;
     LiveAccessLogRing* rings_[kMaxRings]{};
+    SourceLiveAccessLogHostRing* host_rings_[kMaxRings]{};
     SourceLiveAccessLogLeaseSlot* leases_[kMaxRings]{};
     u32 ring_count_ = 0u;
     u32 next_ring_ = 0u;

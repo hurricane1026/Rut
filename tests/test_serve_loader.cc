@@ -790,6 +790,17 @@ TEST(serve_loader, source_access_log_metadata_is_owned_and_reuses_without_stale_
     CHECK(access_log_sink_spec_valid(program.access_log));
     program.destroy();
 
+    write_file(dir,
+               "app.rut",
+               "accessLog { path: \"/var/log/rut/host.log\", format: downstreamHost, "
+               "publication: live }\nroute GET \"/\" { return 204 }\n");
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE(program.access_log.present);
+    CHECK(program.access_log.format == AccessLogFormatProfile::DownstreamHost);
+    CHECK(program.access_log.publication == AccessLogPublicationProfile::LiveEachRecord);
+    CHECK(access_log_sink_spec_valid(program.access_log));
+    program.destroy();
+
     // Absence on the same owner must replace, not retain, either prior declaration.
     write_file(dir, "app.rut", "route GET \"/\" { return 204 }\n");
     REQUIRE(load_rut_program(path.c_str(), program, err));

@@ -9,6 +9,7 @@
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/access_log_host.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/buffered_send_vector.h"
 #include "rut/runtime/chunked_parser.h"
@@ -1392,6 +1393,9 @@ struct ConnectionBase {
     // populated only when access logging is enabled and remains valid after the
     // borrowed recv_buf witness is cleared by rewrite/consume/reset paths.
     AccessLogTargetSnapshot access_log_target_snapshot;
+    // Opt-in SourceLive Host profile snapshot. Its original header bound and
+    // episode survive request rewrites; the borrowed ParsedRequest views do not.
+    AccessLogDownstreamHostSnapshot access_log_downstream_host_snapshot;
 
     void clear_access_log_target_snapshot() {
         access_log_target_snapshot.episode = 0;
@@ -1411,6 +1415,7 @@ struct ConnectionBase {
         if (req_metadata_episode == 0) req_metadata_episode = 1;
         clear_raw_request_target_witness();
         clear_access_log_target_snapshot();
+        clear_access_log_downstream_host_snapshot(access_log_downstream_host_snapshot);
     }
 
     // Reset/compaction paths must use this instead of resetting recv_buf
@@ -2093,6 +2098,7 @@ struct ConnectionBase {
         req_target_form_unsupported = false;
         req_target_form_reject_before_pre_route = false;
         clear_access_log_target_snapshot();
+        clear_access_log_downstream_host_snapshot(access_log_downstream_host_snapshot);
         req_keep_alive = false;
         req_client_keep_alive = false;
         req_client_connection_close = false;

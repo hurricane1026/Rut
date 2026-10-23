@@ -2144,15 +2144,25 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
             entry.upstream[i] = conn.upstream_name[i];
             if (conn.upstream_name[i] == '\0') break;
         }
-        if (live_access_log_enabled)
-            (void)loop->live_access_log->publish(entry);
-        else
+        if (live_access_log_enabled) {
+            if (loop->live_access_log->captures_downstream_host()) {
+                AccessLogDownstreamHostRecord host_record{};
+                canonicalize_access_log_downstream_host_record(
+                    conn.access_log_downstream_host_snapshot,
+                    conn.req_metadata_episode,
+                    host_record);
+                (void)loop->live_access_log->publish_host(entry, host_record);
+            } else {
+                (void)loop->live_access_log->publish(entry);
+            }
+        } else
             loop->access_log->push(entry);
     }
     // Every completion consumes the episode-owned snapshot, including when logging was disabled
     // after request-start capture or the ring is full. A later duplicate completion can therefore
     // publish only an explicit Invalid record, never the old target.
     conn.clear_access_log_target_snapshot();
+    clear_access_log_downstream_host_snapshot(conn.access_log_downstream_host_snapshot);
 
     if (loop->capture_ring && conn.capture_buf && conn.capture_header_len > 0) {
         CaptureEntry* cap_entry = nullptr;
@@ -2366,6 +2376,15 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     capture_request_metadata(conn);
     if ((loop->access_log != nullptr) != (loop->live_access_log != nullptr))
         conn.capture_access_log_target_snapshot();
+    if (loop->live_access_log != nullptr && loop->live_access_log->captures_downstream_host()) {
+        capture_access_log_downstream_host_snapshot(conn.access_log_downstream_host_snapshot,
+                                                    conn.req_metadata_episode,
+                                                    pre_req,
+                                                    conn.recv_buf.data(),
+                                                    conn.recv_buf.len(),
+                                                    pre_parser.header_end,
+                                                    pre_status == ParseStatus::Complete);
+    }
 
     // Tag the request with a fresh generation so the yield-heap stale
     // filter can reliably reject entries left by a close+reuse even if

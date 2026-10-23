@@ -15790,7 +15790,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   decl.span,
                                   lit_str("only one accessLog declaration is supported"));
-        if (decl.format != AccessLogFormatProfile::DownstreamRequestBytesLine)
+        if (decl.format != AccessLogFormatProfile::DownstreamRequestBytesLine &&
+            decl.format != AccessLogFormatProfile::DownstreamHost)
             return frontend_error(FrontendError::UnsupportedSyntax, decl.format_value_span);
         if (decl.publication != AccessLogPublicationProfile::LiveEachRecord)
             return frontend_error(FrontendError::UnsupportedSyntax, decl.publication_value_span);

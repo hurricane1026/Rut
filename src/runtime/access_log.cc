@@ -1,5 +1,6 @@
 #include "rut/runtime/access_log.h"
 
+#include "rut/runtime/access_log_host.h"
 #include <atomic>
 
 #include <errno.h>
@@ -267,6 +268,89 @@ u32 format_access_log_downstream_request_bytes_line(const AccessLogEntry& entry,
     u32 w = write_u64_dec(line, entry.req_size);
     line[w++] = '\n';
     if (buf == nullptr || buf_size < w) return 0;
+    for (u32 i = 0; i < w; i++) buf[i] = line[i];
+    return w;
+}
+
+u32 format_access_log_downstream_host_line(const AccessLogEntry& entry,
+                                           const AccessLogDownstreamHostRecord& host,
+                                           char* buf,
+                                           u32 buf_size) {
+    if (buf == nullptr || host.record_schema != kAccessLogDownstreamHostRecordSchema ||
+        host.reserved[0] != 0u || host.reserved[1] != 0u)
+        return 0u;
+
+    const char* state_name = nullptr;
+    switch (host.state) {
+        case AccessLogDownstreamHostState::Unavailable:
+            if (host.observed_length != 0u) return 0u;
+            state_name = "unavailable";
+            break;
+        case AccessLogDownstreamHostState::Complete:
+            if (host.observed_length == 0u || host.observed_length > kAccessLogDownstreamHostMax)
+                return 0u;
+            state_name = "complete";
+            break;
+        case AccessLogDownstreamHostState::Empty:
+            if (host.observed_length != 0u) return 0u;
+            state_name = "empty";
+            break;
+        case AccessLogDownstreamHostState::Absent:
+            if (host.observed_length != 0u) return 0u;
+            state_name = "absent";
+            break;
+        case AccessLogDownstreamHostState::Duplicate:
+            if (host.observed_length != 0u) return 0u;
+            state_name = "duplicate";
+            break;
+        case AccessLogDownstreamHostState::OverLimit:
+            if (host.observed_length <= kAccessLogDownstreamHostMax) return 0u;
+            state_name = "over_limit";
+            break;
+        case AccessLogDownstreamHostState::Invalid:
+            if (host.observed_length != 0u) return 0u;
+            state_name = "invalid";
+            break;
+        default:
+            return 0u;
+    }
+    if (host.state != AccessLogDownstreamHostState::Complete) {
+        for (char byte : host.value)
+            if (byte != '\0') return 0u;
+    } else {
+        for (u32 i = host.observed_length; i < kAccessLogDownstreamHostMax; i++)
+            if (host.value[i] != '\0') return 0u;
+    }
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    static_assert(sizeof("host1 request_bytes=") - 1u + 10u + sizeof(" status=") - 1u + 5u +
+                      sizeof(" host_state=") - 1u + sizeof("unavailable") - 1u +
+                      sizeof(" host_length=") - 1u + 10u + sizeof(" host_hex=") - 1u +
+                      static_cast<u64>(2u) * kAccessLogDownstreamHostMax +
+                      sizeof(" upstream_history=unavailable\n") - 1u <=
+                  kAccessLogDownstreamHostLineCapacity);
+    char line[kAccessLogDownstreamHostLineCapacity];
+    u32 w = 0u;
+    w += copy_str(line + w, "host1 request_bytes=");
+    w += write_u64_dec(line + w, entry.req_size);
+    w += copy_str(line + w, " status=");
+    w += write_u64_dec(line + w, entry.status);
+    w += copy_str(line + w, " host_state=");
+    w += copy_str(line + w, state_name);
+    w += copy_str(line + w, " host_length=");
+    w += write_u64_dec(line + w, host.observed_length);
+    w += copy_str(line + w, " host_hex=");
+    if (host.state == AccessLogDownstreamHostState::Complete) {
+        for (u32 i = 0; i < host.observed_length; i++) {
+            const u8 byte = static_cast<u8>(host.value[i]);
+            line[w++] = kHex[byte >> 4u];
+            line[w++] = kHex[byte & 0x0fu];
+        }
+    } else {
+        line[w++] = '-';
+    }
+    w += copy_str(line + w, " upstream_history=unavailable\n");
+    if (w > sizeof(line) || buf_size < w) return 0u;
     for (u32 i = 0; i < w; i++) buf[i] = line[i];
     return w;
 }
