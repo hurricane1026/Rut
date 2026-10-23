@@ -7,6 +7,7 @@
 #include "test_helpers.h"
 
 #include <nghttp2/nghttp2.h>
+#include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #if RUT_GRPC_JIT
@@ -23,6 +24,17 @@
 using namespace rut;
 
 namespace {
+template <typename Call>
+inline bool grpc_web_test_ssl_call(SSL* ssl,
+                                   int fd,
+                                   u64 deadline_us,
+                                   int* result,
+                                   int* error_number,
+                                   int* ssl_error,
+                                   unsigned long* openssl_error,
+                                   std::atomic<u32>* retry_count,
+                                   Call&& call);
+
 volatile sig_atomic_t grpc_test_signal_count = 0;
 void grpc_test_signal_handler(int) {
     grpc_test_signal_count = grpc_test_signal_count + 1;
@@ -226,6 +238,13 @@ struct EchoServer {
                                       nv("content-type", "application/grpc"),
                                       nv("grpc-status", "7"),
                                       nv("grpc-message", "denied")};
+                return nghttp2_submit_response(session, s->id, error, 4, nullptr);
+            }
+            if (mode == 13) {
+                nghttp2_nv error[] = {nv(":status", "200"),
+                                      nv("content-type", "application/grpc"),
+                                      nv("grpc-status", "7"),
+                                      nv("content-length", "1")};
                 return nghttp2_submit_response(session, s->id, error, 4, nullptr);
             }
             if (mode == 10)
@@ -441,6 +460,7 @@ struct EchoServer {
 struct Client {
     SSL_CTX* tls_context = nullptr;
     SSL* ssl = nullptr;
+    std::atomic<u32> tls_connect_retries{0};
     struct Rpc {
         static constexpr u32 kWebBufferCap = 262144;
         u32 sent = 0, received = 0, size = 0;
@@ -565,21 +585,61 @@ struct Client {
         static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].closed = true;
         return 0;
     }
-    bool init(u16 port, bool tls = false) {
+    bool init(u16 port, bool tls = false, const char* client_name = "client") {
+        auto report_init_failure = [&](const char* stage, int result, int tls_error = 0) {
+            const int saved_errno = errno;
+            const unsigned long openssl_error = ERR_get_error();
+            char openssl_message[256]{};
+            if (openssl_error != 0)
+                ERR_error_string_n(openssl_error, openssl_message, sizeof(openssl_message));
+            fprintf(stderr,
+                    "grpc test client %s init failed at %s: port=%u fd=%d result=%d "
+                    "tls_error=%d errno=%d retries=%u openssl_error=%s\n",
+                    client_name,
+                    stage,
+                    port,
+                    fd,
+                    result,
+                    tls_error,
+                    saved_errno,
+                    tls_connect_retries.load(std::memory_order_relaxed),
+                    openssl_message[0] ? openssl_message : "none");
+            return false;
+        };
+        ERR_clear_error();
         fd = connect_to(port);
-        if (fd < 0) return false;
+        if (fd < 0) return report_init_failure("connect", fd);
         set_socket_timeouts(fd, 5);
         if (tls) {
             tls_context = SSL_CTX_new(TLS_client_method());
-            if (!tls_context) return false;
+            if (!tls_context) return report_init_failure("SSL_CTX_new", 0);
             ssl = SSL_new(tls_context);
             const u8 alpn[] = {2, 'h', '2'};
-            if (!ssl || !SSL_set_fd(ssl, fd) || SSL_set_alpn_protos(ssl, alpn, sizeof(alpn)) != 0 ||
-                SSL_connect(ssl) != 1)
-                return false;
+            if (!ssl) return report_init_failure("SSL_new", 0);
+            if (!SSL_set_fd(ssl, fd)) return report_init_failure("SSL_set_fd", 0);
+            const int alpn_rc = SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
+            if (alpn_rc != 0) return report_init_failure("SSL_set_alpn_protos", alpn_rc);
+            const u64 tls_deadline = monotonic_us() + 5000000;
+            int connect_rc = 0, connect_errno = 0, tls_error = 0;
+            unsigned long openssl_error = 0;
+            if (!grpc_web_test_ssl_call(ssl,
+                                        fd,
+                                        tls_deadline,
+                                        &connect_rc,
+                                        &connect_errno,
+                                        &tls_error,
+                                        &openssl_error,
+                                        &tls_connect_retries,
+                                        [&] { return SSL_connect(ssl); })) {
+                errno = connect_errno;
+                return report_init_failure("SSL_connect", connect_rc, tls_error);
+            }
+            set_socket_timeouts(fd, 5);
         }
         nghttp2_session_callbacks* cb;
-        nghttp2_session_callbacks_new(&cb);
+        const int callbacks_rc = nghttp2_session_callbacks_new(&cb);
+        if (callbacks_rc != 0 || !cb)
+            return report_init_failure("nghttp2_session_callbacks_new", callbacks_rc);
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, &receive);
         nghttp2_session_callbacks_set_on_header_callback(cb, &header);
         nghttp2_session_callbacks_set_on_stream_close_callback(cb, &closed);
@@ -587,8 +647,9 @@ struct Client {
         nghttp2_session_callbacks_set_on_frame_send_callback(cb, &frame_send);
         const int rc = nghttp2_session_client_new(&session, cb, this);
         nghttp2_session_callbacks_del(cb);
+        if (rc != 0 || !session) return report_init_failure("nghttp2_session_client_new", rc);
         nghttp2_submit_settings(session, 0, nullptr, 0);
-        return rc == 0;
+        return true;
     }
     int request(u32 index,
                 u32 bytes,
@@ -816,7 +877,7 @@ void streaming_case(rut::test::TestCase* _tc,
     // No REQUIRE after spawning: always stop/join before destroying config.
     {
         Client a, b;
-        const bool connected = a.init(get_port(lfd), tls) && b.init(get_port(lfd), tls);
+        const bool connected = a.init(get_port(lfd), tls, "a") && b.init(get_port(lfd), tls, "b");
         CHECK(connected);
         if (connected) {
             CHECK_EQ(a.request(0, large_first ? 200000 : 128, false), 1);
@@ -2605,6 +2666,73 @@ TEST(grpc_proxy, c5_exhaustion_retries_only_complete_logical_exchanges) {
     incomplete.replay_body.release();
 }
 
+void rejected_retry_deadline_case(rut::test::TestCase* _tc, bool connect_exhausted) {
+    for (u32 mode = 0; mode < 5; mode++) {
+        RetryCloseGrpcDriveFixture loop;
+        Connection upstream;
+        upstream.reset();
+        u8 recv_storage[64]{};
+        upstream.bind_request_receive_buffer(recv_storage, sizeof(recv_storage));
+        Http2Conn up_h2;
+        up_h2.init_client();
+        up_h2.preface_seen = up_h2.our_settings_sent = up_h2.peer_settings_seen = true;
+        up_h2.grpc.upstream = true;
+        up_h2.grpc.connecting = up_h2.grpc.c5_exhausted = connect_exhausted;
+        up_h2.grpc.preface_sent = !connect_exhausted;
+        upstream.h2 = &up_h2;
+        loop.grpc_upstreams = &upstream;
+        Connection downstream;
+        downstream.reset();
+        downstream.on_send = &pending_send;
+        Http2Conn down_h2;
+        down_h2.init_client();
+        downstream.h2 = &down_h2;
+        REQUIRE(up_h2.open_stream(1) != nullptr);
+        REQUIRE(down_h2.open_stream(1) != nullptr);
+        auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+        REQUIRE(x != nullptr);
+        x->init();
+        x->upstream = &upstream;
+        x->downstream = &downstream;
+        x->upstream_stream = x->downstream_stream = 1;
+        x->slot_held = true;
+        x->retry_enabled = mode != 0;
+        // Transport rejection retries do not depend on the status mask.
+        x->retry_policy = {2, 16, 1u << 7, 500};
+        x->replay_body.replayable = x->replay_body.sealed = true;
+        x->replay_headers.valid = x->replay_trailers.valid = true;
+        const u64 now = monotonic_us();
+        x->deadline_us = mode == 3   ? 0
+                         : mode == 4 ? now - 1
+                                     : now + (mode == 2 ? 60000000u : 50000u);
+        REQUIRE(grpc_attach(up_h2, x));
+        REQUIRE(grpc_attach(down_h2, x));
+        if (connect_exhausted) {
+            grpc_connection_closed<RetryCloseGrpcDriveFixture>(&loop, upstream);
+        } else {
+            const u32 len = write_goaway(recv_storage, 0, Http2Error::NoError);
+            upstream.recv_buf.commit(len);
+            grpc_on_upstream_data<RetryCloseGrpcDriveFixture>(
+                &loop, upstream, {upstream.id, static_cast<i32>(len), 0, 0, IoEventType::Recv, 0});
+        }
+        const bool pending = mode == 2 || mode == 3;
+        CHECK_EQ(x->retry_pending, pending);
+        CHECK_EQ(x->response_end, !pending);
+        CHECK_EQ(x->failure, pending ? 0u : mode == 0 ? 14u : 4u);
+        CHECK_EQ(x->slot_held, pending);
+        CHECK_EQ(loop.released, pending ? 0u : 1u);
+        CHECK(x->upstream == nullptr);
+        CHECK_EQ(up_h2.grpc.active, 0u);
+        CHECK_EQ(down_h2.grpc.active, 1u);
+    }
+}
+TEST(grpc_proxy, c5_exhaustion_retry_respects_original_deadline) {
+    rejected_retry_deadline_case(_tc, true);
+}
+TEST(grpc_proxy, encoded_goaway_retry_respects_original_deadline) {
+    rejected_retry_deadline_case(_tc, false);
+}
+
 TEST(grpc_proxy, c5_exhaustion_carries_tried_backends_into_logical_retry) {
     GrpcBackendHealthReset health_reset{};
     RetryCloseSelectionFixture loop;
@@ -3222,7 +3350,7 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
     (void)_tc;
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
-    server->reply_mode = 1;  // First request gets trailers-only UNAUTHENTICATED.
+    server->reply_mode = mode == 5 ? 13 : 1;  // Mode 5 declares a missing response body.
     auto shard = std::make_unique<Shard<Loop>>();
     const int lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
@@ -3276,7 +3404,7 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
             const bool retried = mode == 1;
             CHECK_EQ(server->requests.load(), retried ? 2u : 1u);
             if (!web) {
-                CHECK_EQ(rpc.status, retried ? 0u : 7u);
+                CHECK_EQ(rpc.status, retried ? 0u : mode == 5 ? 13u : 7u);
                 CHECK_EQ(rpc.ok, retried);
             } else if (retried) {
                 u8 decoded[256];
@@ -3320,7 +3448,8 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
     CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
     CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
     CHECK_EQ(shard->shard_metrics.grpc_completed[0], mode == 1 ? 1u : 0u);
-    CHECK_EQ(shard->shard_metrics.grpc_completed[7], mode == 1 ? 0u : 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[7], mode == 1 || mode == 5 ? 0u : 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[13], mode == 5 ? 1u : 0u);
     CHECK_EQ(shard->shard_metrics.grpc_latency.count, 1u);
     shard->loop->force_close_all();
     if (shard->loop->listen_fd >= 0) {
@@ -3346,6 +3475,12 @@ TEST(grpc_proxy, grpc_retry_nonlisted_status_epoll) {
 }
 TEST(grpc_proxy, grpc_retry_nonlisted_status_iouring) {
     grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 2);
+}
+TEST(grpc_proxy, grpc_retry_rejects_trailers_only_length_mismatch_epoll) {
+    grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 5);
+}
+TEST(grpc_proxy, grpc_retry_rejects_trailers_only_length_mismatch_iouring) {
+    grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 5);
 }
 TEST(grpc_proxy, grpc_retry_malformed_native_is_transparent) {
     grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 3);
@@ -4863,11 +4998,12 @@ TEST(grpc_proxy, grpc_retry_does_not_replay_after_downstream_response_commit) {
     shard->shutdown();
 }
 
-void grpc_retry_suppressed_deadline_case(rut::test::TestCase* _tc, bool web) {
+template <typename Loop>
+void grpc_retry_suppressed_deadline_case(rut::test::TestCase* _tc, bool web, bool refused = false) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
-    server->reply_mode = 1;
-    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    server->reply_mode = refused ? 10 : 1;
+    auto shard = std::make_unique<Shard<Loop>>();
     const int lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     if (!shard->init(0, lfd)) {
@@ -4877,7 +5013,7 @@ void grpc_retry_suppressed_deadline_case(rut::test::TestCase* _tc, bool web) {
     RouteConfig cfg;
     REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
     cfg.upstreams[0].http2 = true;
-    cfg.upstreams[0].grpc_retry = {2, 1024, 1u << 7, 500};
+    cfg.upstreams[0].grpc_retry = {2, 1024, refused ? (1u << 14) : (1u << 7), 500};
     REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
     shard->route_config = &cfg;
     REQUIRE(shard->spawn(-1));
@@ -4927,10 +5063,122 @@ void grpc_retry_suppressed_deadline_case(rut::test::TestCase* _tc, bool web) {
     shard->shutdown();
 }
 TEST(grpc_proxy, grpc_retry_is_suppressed_when_backoff_exceeds_deadline) {
-    grpc_retry_suppressed_deadline_case(_tc, false);
+    grpc_retry_suppressed_deadline_case<EpollEventLoop>(_tc, false);
 }
 TEST(grpc_proxy, grpc_web_retry_is_suppressed_when_backoff_exceeds_deadline) {
-    grpc_retry_suppressed_deadline_case(_tc, true);
+    grpc_retry_suppressed_deadline_case<EpollEventLoop>(_tc, true);
+}
+
+TEST(grpc_proxy, refused_retry_backoff_exceeds_deadline_epoll) {
+    grpc_retry_suppressed_deadline_case<EpollEventLoop>(_tc, false, true);
+}
+TEST(grpc_proxy, refused_retry_backoff_exceeds_deadline_iouring) {
+    grpc_retry_suppressed_deadline_case<IoUringEventLoop>(_tc, false, true);
+}
+TEST(grpc_proxy, web_refused_retry_backoff_exceeds_deadline_epoll) {
+    grpc_retry_suppressed_deadline_case<EpollEventLoop>(_tc, true, true);
+}
+TEST(grpc_proxy, web_refused_retry_backoff_exceeds_deadline_iouring) {
+    grpc_retry_suppressed_deadline_case<IoUringEventLoop>(_tc, true, true);
+}
+
+TEST(grpc_proxy, grpc_retry_unknown_requires_valid_backend_and_mutated_status) {
+    const Str values[] = {
+        {"2", 1}, {"17", 2}, {"", 0}, {"unknown", 7}, {"-2", 2}, {"4294967298", 10}};
+    for (const Str value : values) {
+        for (u32 mutation = 0; mutation < 3; mutation++) {
+            GrpcDriveFixture loop;
+            Connection upstream;
+            upstream.reset();
+            Connection downstream;
+            downstream.reset();
+            Http2Conn h;
+            h.init_client();
+            upstream.h2 = &h;
+            REQUIRE(h.open_stream(1) != nullptr);
+            GrpcExchange x;
+            x.init();
+            x.upstream = &upstream;
+            x.downstream = &downstream;
+            x.upstream_stream = x.downstream_stream = 1;
+            x.retry_enabled = true;
+            x.retry_policy = {2, 1024, 1u << 2, 0};
+            x.replay_body.replayable = true;
+            x.replay_body.sealed = true;
+            x.replay_headers.valid = true;
+            x.replay_trailers.valid = true;
+            if (mutation) {
+                downstream.resp_header_mutations[0] = {
+                    {"grpc-status", 11},
+                    mutation == 1 ? Str{"invalid", 7} : Str{"2", 1},
+                    Connection::RespHeaderMutationMode::Set};
+                downstream.resp_header_mutation_count = 1;
+                REQUIRE(grpc_snapshot_response_mutations(downstream, x));
+            }
+            REQUIRE(grpc_attach(h, &x));
+            GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+            const hpack::Header response[] = {
+                {{":status", 7}, {"200", 3}},
+                {{"content-type", 12}, {"application/grpc", 16}},
+                {{"grpc-status", 11}, value},
+            };
+            grpc_response_headers<GrpcDriveFixture>(&dispatch, h, 1, response, 3, true);
+            const bool should_retry = value.eq({"2", 1}) && mutation != 1;
+            CHECK_EQ(x.retry_pending, should_retry);
+            CHECK_EQ(x.response_end, !should_retry);
+            CHECK_EQ(x.response_headers_len == 0, should_retry);
+        }
+    }
+}
+
+TEST(grpc_proxy, terminal_response_length_checked_before_retry_and_output) {
+    for (u32 mode = 0; mode < 5; mode++) {
+        for (u32 length = 0; length < 2; length++) {
+            GrpcDriveFixture loop;
+            Connection upstream;
+            upstream.reset();
+            Connection downstream;
+            downstream.reset();
+            Http2Conn h;
+            h.init_client();
+            upstream.h2 = &h;
+            h.grpc.upstream = true;
+            REQUIRE(h.open_stream(1) != nullptr);
+            GrpcExchange x;
+            x.init();
+            x.upstream = &upstream;
+            x.downstream = &downstream;
+            x.upstream_stream = x.downstream_stream = 1;
+            x.slot_held = true;
+            x.web_mode = mode == 0  ? GrpcWebContentType::Native
+                         : mode % 2 ? GrpcWebContentType::Binary
+                                    : GrpcWebContentType::Text;
+            x.web_h1 = mode > 2;
+            x.retry_enabled = true;
+            x.retry_policy = {2, 1024, 1u << 7, 0};
+            x.replay_body.replayable = true;
+            x.replay_body.sealed = true;
+            x.replay_headers.valid = true;
+            x.replay_trailers.valid = true;
+            REQUIRE(grpc_attach(h, &x));
+            GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+            const hpack::Header response[] = {
+                {{":status", 7}, {"200", 3}},
+                {{"content-type", 12}, {"application/grpc", 16}},
+                {{"grpc-status", 11}, {"7", 1}},
+                {{"content-length", 14}, length ? Str{"1", 1} : Str{"0", 1}},
+            };
+            grpc_response_headers<GrpcDriveFixture>(&dispatch, h, 1, response, 4, true);
+            CHECK_EQ(x.retry_pending, length == 0);
+            CHECK_EQ(x.response_end, length != 0);
+            CHECK_EQ(x.failure, length ? 13u : 0u);
+            CHECK_EQ(x.response_headers_len, 0u);
+            CHECK_EQ(x.response_trailers_len, 0u);
+            CHECK_EQ(x.slot_held, length == 0);
+            CHECK_EQ(loop.released, length);
+            CHECK_EQ(grpc_find(h, 1) == nullptr, length != 0);
+        }
+    }
 }
 
 TEST(grpc_proxy, grpc_retry_requires_uncommitted_downstream_response) {
@@ -8853,6 +9101,61 @@ TEST(grpc_proxy, message_limits_snapshot_iouring) {
 }
 
 #include "grpc_web_h1_cases.h"
+
+TEST(grpc_proxy, tls_client_init_retries_handshake_eintr) {
+    GrpcWebTlsGateServer server;
+    server.pause_handshake = true;
+    REQUIRE(server.start());
+
+    Client client;
+    struct ClientCall {
+        u16 port;
+        Client* client;
+        bool initialized = false;
+    } call{server.port, &client};
+    auto run_client = +[](void* ptr) -> void* {
+        auto* call = static_cast<ClientCall*>(ptr);
+        call->initialized = call->client->init(call->port, true, "signal-test");
+        return nullptr;
+    };
+
+    struct sigaction action{}, old_action{};
+    action.sa_handler = grpc_test_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    grpc_test_signal_count = 0;
+    REQUIRE(sigaction(SIGUSR1, &action, &old_action) == 0);
+
+    pthread_t client_thread{};
+    const int thread_result = pthread_create(&client_thread, nullptr, run_client, &call);
+    if (thread_result != 0) {
+        sigaction(SIGUSR1, &old_action, nullptr);
+        CHECK_EQ(thread_result, 0);
+        return;
+    }
+
+    const u64 hello_deadline = monotonic_us() + 3000000;
+    while (!server.client_hello_waiting.load(std::memory_order_acquire) &&
+           monotonic_us() < hello_deadline)
+        sched_yield();
+    const bool hello_arrived = server.client_hello_waiting.load(std::memory_order_acquire);
+    CHECK(hello_arrived);
+
+    const u64 signal_deadline = monotonic_us() + 2000000;
+    while (hello_arrived && client.tls_connect_retries.load(std::memory_order_relaxed) == 0 &&
+           monotonic_us() < signal_deadline) {
+        CHECK_EQ(pthread_kill(client_thread, SIGUSR1), 0);
+        sched_yield();
+    }
+    CHECK_GT(client.tls_connect_retries.load(std::memory_order_relaxed), 0u);
+
+    const u8 release = 1;
+    CHECK_EQ(write(server.gate[1], &release, 1), 1);
+    pthread_join(client_thread, nullptr);
+    CHECK_GT(grpc_test_signal_count, 0);
+    CHECK(call.initialized);
+    sigaction(SIGUSR1, &old_action, nullptr);
+}
 
 #if RUT_GRPC_JIT
 #include "protobuf/enum_oracle.inc"

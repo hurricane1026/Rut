@@ -645,7 +645,17 @@ a nonempty list of distinct gRPC codes 1 through 16 (OK is not retryable), and
 `backoff_ms` is 0 through 60,000. Omission disables retries. Replay requires the
 complete request body to fit the configured byte limit, a separately retained
 metadata snapshot, no committed response, and enough time for the backoff
-before the original deadline.
+before the original deadline. A status-based retry requires exactly one valid
+backend `grpc-status` (0–16), preserved as a valid matching status after
+response middleware. Malformed metadata remains UNKNOWN in telemetry and
+does not authorize replay, even when status 2 is configured for retry.
+Trailers-only responses must also satisfy their declared Content-Length before
+any retry or response staging; a mismatch ends the RPC with INTERNAL (status 13)
+without replay.
+When an otherwise eligible retry cannot fit its backoff before the original
+deadline, retryable responses, REFUSED_STREAM, GOAWAY rejection and exhausted
+connection attempts end with DEADLINE_EXCEEDED (status 4). Ineligible transport
+failures remain UNAVAILABLE.
 See [the complete example](../examples/grpc.rut).
 
 Optional per-message wire limits are configured on an HTTP/2 upstream:

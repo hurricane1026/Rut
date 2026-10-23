@@ -279,6 +279,7 @@ void grpc_connection_closed(void* lp, Connection& conn) {
                 continue;
             }
             if (g.c5_exhausted && !g.preface_sent) x->retry_tried_mask |= g.connect_tried_mask;
+            bool retry_deadline_exceeded = false;
             if (g.c5_exhausted && !g.preface_sent && grpc_retry_can_schedule(*x, 14, false)) {
                 const u64 now = monotonic_us();
                 const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
@@ -291,9 +292,10 @@ void grpc_connection_closed(void* lp, Connection& conn) {
                     if (down && down->h2) grpc_refresh_timer(loop, *down);
                     continue;
                 }
+                retry_deadline_exceeded = true;
             }
             x->upstream = nullptr;
-            if (!x->response_end) x->failure = 14;
+            if (!x->response_end) x->failure = retry_deadline_exceeded ? 4 : 14;
             x->response_end = true;
             Connection* down = x->downstream;
             if (x->slot_held) {
@@ -406,24 +408,30 @@ inline bool grpc_has_status(const hpack::Header* hs, u32 n) {
 }
 // Invalid or duplicate status metadata is reported as UNKNOWN in telemetry;
 // forwarding remains opaque and does not rewrite backend trailers.
-inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
+inline bool grpc_parse_status(const hpack::Header* hs, u32 n, u8* out) {
     bool seen = false;
     u8 status = 2;
     for (u32 i = 0; i < n; i++) {
         if (!hs[i].name.eq({"grpc-status", 11})) continue;
-        if (seen) return 2;
+        if (seen) return false;
         seen = true;
         const Str kValue = hs[i].value;
-        if (!kValue.len) return 2;
+        if (!kValue.len) return false;
         u32 parsed = 0;
         for (u32 j = 0; j < kValue.len; j++) {
-            if (kValue.ptr[j] < '0' || kValue.ptr[j] > '9') return 2;
+            if (kValue.ptr[j] < '0' || kValue.ptr[j] > '9') return false;
             parsed = parsed * 10 + static_cast<u32>(kValue.ptr[j] - '0');
-            if (parsed > 16) return 2;
+            if (parsed > 16) return false;
         }
         status = static_cast<u8>(parsed);
     }
-    return status;
+    if (!seen) return false;
+    *out = status;
+    return true;
+}
+inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
+    u8 status = 2;
+    return grpc_parse_status(hs, n, &status) ? status : 2;
 }
 inline bool grpc_web_trailer_metadata(const hpack::Header& h) {
     return !h.name.eq({":status", 7}) && !h.name.eq({"content-type", 12}) &&
@@ -729,6 +737,10 @@ void grpc_response_headers(
             }
         }
     }
+    // END_STREAM makes the body length final, including trailers-only replies.
+    // Reject mismatches before retry decisions or downstream output staging.
+    if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
+        invalid_content_length = true;
     if (web_response && content_type_count != 1) content_type = false;
     if (!status || !content_type || invalid_content_length) {
         switch (http_status) {
@@ -776,9 +788,15 @@ void grpc_response_headers(
         response_mode == GrpcWebContentType::Binary || response_mode == GrpcWebContentType::Text;
     const bool filtered_has_status = grpc_has_status(filtered, filtered_n);
     const u8 observed_status = end ? grpc_observed_status(filtered, filtered_n) : 2;
+    // UNKNOWN telemetry also covers malformed metadata. Only a valid backend
+    // status, preserved by response mutations, can authorize request replay.
+    u8 backend_status = 2;
+    u8 filtered_status = 2;
+    const bool retry_status_valid = grpc_parse_status(hs, n, &backend_status) &&
+                                    grpc_parse_status(filtered, filtered_n, &filtered_status);
     // Decide before Web trailer encoding or any downstream output staging.
-    if (end && raw_status_count == 1 && content_type_count == 1 && filtered_has_status &&
-        grpc_observed_status(hs, n) == observed_status &&
+    if (retry_status_valid && end && raw_status_count == 1 && content_type_count == 1 &&
+        filtered_has_status && backend_status == filtered_status &&
         grpc_retry_can_schedule(*x, observed_status)) {
         const u64 now = monotonic_us();
         const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
@@ -842,8 +860,6 @@ void grpc_response_headers(
     if (end) x->response_status = observed_status;
     if (end && (!grpc_has_status(hs, n) || !filtered_has_status)) x->failure = 2;
     if (web && end && !backend_terminal && !x->failure) x->failure = 2;
-    if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
-        x->failure = 13;
     if (x->response_end && !x->failure && x->upstream && grpc_has_status(hs, n))
         grpc_record_rpc_success(dispatch->loop, *x->upstream, monotonic_us());
     if (x->response_end) grpc_release_slot(dispatch->loop, *x);
@@ -963,6 +979,7 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
 template <typename Loop>
 void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
     if (auto* x = grpc_find(h, sid); x && !x->response_end) {
+        bool retry_deadline_exceeded = false;
         if (error == Http2Error::RefusedStream && grpc_retry_can_schedule(*x, 14, false)) {
             const u64 now = monotonic_us();
             const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
@@ -972,13 +989,16 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
                 x->retry_reason = 14;
                 return;
             }
+            retry_deadline_exceeded = true;
         }
         switch (static_cast<u32>(error)) {
             case static_cast<u32>(Http2Error::Cancel):
                 x->failure = 1;
                 break;
             case static_cast<u32>(Http2Error::RefusedStream):
-                x->failure = 14;
+                // Match trailers-only retries when backoff cannot fit before
+                // the original deadline; other refusals remain UNAVAILABLE.
+                x->failure = retry_deadline_exceeded ? 4 : 14;
                 break;
             case static_cast<u32>(Http2Error::EnhanceYourCalm):
                 x->failure = 8;
@@ -1377,13 +1397,13 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
         if (!x || x->retry_pending || !grpc_rejected_by_goaway(h, *x)) continue;
         const u64 now = monotonic_us();
         const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
-        if (grpc_retry_can_schedule(*x, 14, false) &&
-            (!x->deadline_us || retry_at < x->deadline_us)) {
+        const bool retry_allowed = grpc_retry_can_schedule(*x, 14, false);
+        if (retry_allowed && (!x->deadline_us || retry_at < x->deadline_us)) {
             x->retry_pending = true;
             x->retry_at_us = retry_at > now ? retry_at : now + 1;
             x->retry_reason = 14;
         } else {
-            x->failure = 14;
+            x->failure = retry_allowed ? 4 : 14;
             x->response_end = true;
             grpc_detach_upstream_exchange(loop, h, *x);
         }

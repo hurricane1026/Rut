@@ -1582,10 +1582,12 @@ when that block is actually sent, including after connection setup or retry.
 Requests without the field remain without it. If the deadline has expired
 before send, the proxy returns DEADLINE_EXCEEDED (status 4) without sending the
 upstream request headers. Timers retain millisecond resolution. If a retryable
-response arrives but its configured backoff cannot fit strictly before the
-original deadline, the RPC ends with DEADLINE_EXCEEDED (status 4), without
-binding another endpoint or forwarding the backend status. Completion and
-status metrics are recorded once. Upstream connection failures map to
+response, REFUSED_STREAM, GOAWAY rejection, or exhausted connection attempt
+cannot fit its configured backoff strictly before the original deadline, the
+RPC ends with DEADLINE_EXCEEDED (status 4), without binding another endpoint
+or forwarding the backend status. This applies only when the exchange is
+otherwise eligible for retry; ineligible transport failures remain UNAVAILABLE.
+Completion and status metrics are recorded once. Upstream connection failures map to
 UNAVAILABLE; expired deadlines map to DEADLINE_EXCEEDED. Configuration epochs
 remain pinned by active/pooled sessions until teardown.
 
@@ -1618,7 +1620,13 @@ a nonempty list of distinct gRPC status codes 1 through 16, and `backoff_ms` is
 0 through 60,000. Omission disables retries. Replay requires the complete
 request body to fit the configured byte limit, a separately retained metadata
 snapshot, no committed response, and enough time for the backoff before the
-original deadline.
+original deadline. A status-based retry requires exactly one valid backend
+`grpc-status` (0–16), preserved as a valid matching status after response
+middleware. Malformed metadata remains UNKNOWN in telemetry and cannot
+authorize replay, even when status 2 is configured for retry.
+Trailers-only responses must also satisfy their declared Content-Length before
+any retry or response staging; a mismatch ends the RPC with INTERNAL (status 13)
+without replay.
 
 Optional `max_request_message_bytes` and `max_response_message_bytes` upstream
 fields bound the wire payload of each message independently. They are positive
