@@ -29,7 +29,8 @@ bool cleanup_case(ControlExit mode,
                   sig_atomic_t clock_failures = 0,
                   sig_atomic_t proc_open_failures = 0,
                   sig_atomic_t scan_failures = 0,
-                  int expected_status_override = -1) {
+                  int expected_status_override = -1,
+                  sig_atomic_t fail_reopen_after_preflight = 0) {
     rut::test::ScopedChildSubreaper subreaper;
     if (!subreaper.enable()) return false;
     int channel[2];
@@ -53,6 +54,7 @@ bool cleanup_case(ControlExit mode,
     rut::test::control_clock_failures = clock_failures;
     rut::test::control_proc_open_failures = proc_open_failures;
     rut::test::control_scan_failures = scan_failures;
+    rut::test::control_fail_reopen_after_preflight = fail_reopen_after_preflight;
     const pid_t kControl = fork();
     if (kControl == 0) {
         _exit(rut::test::supervise_forked_control(
@@ -82,6 +84,7 @@ bool cleanup_case(ControlExit mode,
     rut::test::control_clock_failures = 0;
     rut::test::control_proc_open_failures = 0;
     rut::test::control_scan_failures = 0;
+    rut::test::control_fail_reopen_after_preflight = 0;
     close(channel[1]);
     close(kHeld);
     if (kControl < 0) {
@@ -197,43 +200,42 @@ TEST(forked_control, restores_subreaper_state) {
     CHECK_EQ(after, before);
 }
 
-TEST(forked_control, fallback_cleanup_reaps_known_descendant) {
-    rut::test::ScopedChildSubreaper subreaper;
-    REQUIRE(subreaper.enable());
-    int channel[2];
-    REQUIRE_EQ(pipe(channel), 0);
-    const pid_t worker = fork();
-    REQUIRE(worker >= 0);
-    if (worker == 0) {
-        close(channel[0]);
-        const pid_t sentinel = fork();
-        if (sentinel < 0) _exit(41);
-        if (sentinel == 0) {
-            close(channel[1]);
-            for (;;) pause();
-        }
-        (void)write(channel[1], &sentinel, sizeof(sentinel));
-        close(channel[1]);
-        for (;;) pause();
-    }
-    close(channel[1]);
-    pid_t sentinel = -1;
-    REQUIRE_EQ(read(channel[0], &sentinel, sizeof(sentinel)), sizeof(sentinel));
-    close(channel[0]);
-    rut::test::fallback_control_cleanup(worker, false, false);
-    errno = 0;
-    CHECK(kill(sentinel, 0) == -1 && errno == ESRCH);
-    int status = 0;
-    errno = 0;
-    CHECK(waitpid(worker, &status, WNOHANG) == -1 && errno == ECHILD);
-}
-
-TEST(forked_control, procfs_open_failure_falls_back_and_reaps_tree) {
-    CHECK(cleanup_case(ControlExit::UnexpectedStatus, 0, 1, 0, 125));
-}
-
 TEST(forked_control, procfs_scan_failure_falls_back_and_reaps_tree) {
     CHECK(cleanup_case(ControlExit::UnexpectedStatus, 0, 0, 1, 125));
+}
+
+TEST(forked_control, procfs_open_failure_before_worker_is_fail_closed) {
+    rut::test::control_proc_open_failures = INT_MAX;
+    int marker[2];
+    REQUIRE_EQ(pipe(marker), 0);
+    const pid_t child = fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        close(marker[0]);
+        struct Context {
+            int fd;
+        } context{marker[1]};
+        _exit(rut::test::supervise_forked_control(
+            [](void* opaque) -> int {
+                const auto& context = *static_cast<Context*>(opaque);
+                (void)write(context.fd, "x", 1);
+                return 86;
+            },
+            &context));
+    }
+    close(marker[1]);
+    rut::test::control_proc_open_failures = 0;
+    int status = 0;
+    CHECK(wait_terminal(child, status));
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), 125);
+    char marker_byte = 0;
+    CHECK_EQ(read(marker[0], &marker_byte, 1), 0);
+    close(marker[0]);
+}
+
+TEST(forked_control, retained_children_fd_survives_reopen_failure) {
+    CHECK(cleanup_case(ControlExit::UnexpectedStatus, 0, 0, 0, 87, 1));
 }
 
 TEST(forked_control, clock_failure_falls_back_and_reaps_tree) {
