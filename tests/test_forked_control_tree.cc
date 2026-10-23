@@ -25,7 +25,11 @@ bool wait_terminal(pid_t pid, int& status) {
 
 enum class ControlExit : unsigned char { Stall, UnexpectedStatus, Signal, ExpectedStatus };
 
-bool cleanup_case(ControlExit mode) {
+bool cleanup_case(ControlExit mode,
+                  sig_atomic_t clock_failures = 0,
+                  sig_atomic_t proc_open_failures = 0,
+                  sig_atomic_t scan_failures = 0,
+                  int expected_status_override = -1) {
     rut::test::ScopedChildSubreaper subreaper;
     if (!subreaper.enable()) return false;
     int channel[2];
@@ -46,6 +50,9 @@ bool cleanup_case(ControlExit mode) {
         int* channel;
         ControlExit mode;
     } context{channel, mode};
+    rut::test::control_clock_failures = clock_failures;
+    rut::test::control_proc_open_failures = proc_open_failures;
+    rut::test::control_scan_failures = scan_failures;
     const pid_t kControl = fork();
     if (kControl == 0) {
         _exit(rut::test::supervise_forked_control(
@@ -72,6 +79,9 @@ bool cleanup_case(ControlExit mode) {
             },
             &context));
     }
+    rut::test::control_clock_failures = 0;
+    rut::test::control_proc_open_failures = 0;
+    rut::test::control_scan_failures = 0;
     close(channel[1]);
     close(kHeld);
     if (kControl < 0) {
@@ -98,17 +108,34 @@ bool cleanup_case(ControlExit mode) {
     // A success-shaped worker result with leftover children is rejected too.
     if (mode == ControlExit::Signal)
         ok = ok && WIFSIGNALED(control_status) && WTERMSIG(control_status) == SIGKILL;
-    else
-        ok = ok && WIFEXITED(control_status) &&
-             WEXITSTATUS(control_status) == (mode == ControlExit::Stall              ? 124
-                                             : mode == ControlExit::UnexpectedStatus ? 87
-                                                                                     : 125);
+    else {
+        const int expected_status = expected_status_override >= 0
+                                        ? expected_status_override
+                                        : (mode == ControlExit::Stall              ? 124
+                                           : mode == ControlExit::UnexpectedStatus ? 87
+                                                                                   : 125);
+        ok = ok && WIFEXITED(control_status) && WEXITSTATUS(control_status) == expected_status;
+    }
     if (sentinel > 0) {
         errno = 0;
-        if (kill(sentinel, 0) != -1 || errno != ESRCH) ok = false;
+        const bool sentinel_gone = kill(sentinel, 0) == -1 && errno == ESRCH;
+        if (!sentinel_gone) {
+            ok = false;
+        }
         errno = 0;
         int status = 0;
-        if (waitpid(sentinel, &status, WNOHANG) != -1 || errno != ECHILD) ok = false;
+        const pid_t reaped = waitpid(sentinel, &status, WNOHANG);
+        if (reaped == 0) {
+            ok = false;
+            (void)kill(sentinel, SIGKILL);
+            int cleanup_status = 0;
+            (void)wait_terminal(sentinel, cleanup_status);
+        } else if (reaped == sentinel) {
+            // It is already reaped; never signal a potentially reused PID.
+            ok = false;
+        } else if (reaped != -1 || errno != ECHILD) {
+            ok = false;
+        }
     }
     if (kUnrelated > 0) {
         int status = 0;
@@ -168,6 +195,49 @@ TEST(forked_control, restores_subreaper_state) {
     int after = -1;
     CHECK_EQ(prctl(PR_GET_CHILD_SUBREAPER, &after), 0);
     CHECK_EQ(after, before);
+}
+
+TEST(forked_control, fallback_cleanup_reaps_known_descendant) {
+    rut::test::ScopedChildSubreaper subreaper;
+    REQUIRE(subreaper.enable());
+    int channel[2];
+    REQUIRE_EQ(pipe(channel), 0);
+    const pid_t worker = fork();
+    REQUIRE(worker >= 0);
+    if (worker == 0) {
+        close(channel[0]);
+        const pid_t sentinel = fork();
+        if (sentinel < 0) _exit(41);
+        if (sentinel == 0) {
+            close(channel[1]);
+            for (;;) pause();
+        }
+        (void)write(channel[1], &sentinel, sizeof(sentinel));
+        close(channel[1]);
+        for (;;) pause();
+    }
+    close(channel[1]);
+    pid_t sentinel = -1;
+    REQUIRE_EQ(read(channel[0], &sentinel, sizeof(sentinel)), sizeof(sentinel));
+    close(channel[0]);
+    rut::test::fallback_control_cleanup(worker, false, false);
+    errno = 0;
+    CHECK(kill(sentinel, 0) == -1 && errno == ESRCH);
+    int status = 0;
+    errno = 0;
+    CHECK(waitpid(worker, &status, WNOHANG) == -1 && errno == ECHILD);
+}
+
+TEST(forked_control, procfs_open_failure_falls_back_and_reaps_tree) {
+    CHECK(cleanup_case(ControlExit::UnexpectedStatus, 0, 1, 0, 125));
+}
+
+TEST(forked_control, procfs_scan_failure_falls_back_and_reaps_tree) {
+    CHECK(cleanup_case(ControlExit::UnexpectedStatus, 0, 0, 1, 125));
+}
+
+TEST(forked_control, clock_failure_falls_back_and_reaps_tree) {
+    CHECK(cleanup_case(ControlExit::UnexpectedStatus, 1, 0, 0, 125));
 }
 
 int main(int argc, char** argv) {

@@ -34,14 +34,61 @@ public:
 };
 
 inline volatile sig_atomic_t control_stop_requested = 0;
+inline volatile sig_atomic_t control_clock_failures = 0;
+inline volatile sig_atomic_t control_proc_open_failures = 0;
+inline volatile sig_atomic_t control_scan_failures = 0;
 inline void request_control_stop(int) {
     control_stop_requested = 1;
 }
 
 inline long long control_now_ms() {
+    if (control_clock_failures > 0) {
+        control_clock_failures = control_clock_failures - 1;
+        return -1;
+    }
     timespec now{};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
     return static_cast<long long>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+}
+
+inline void fallback_control_cleanup(pid_t worker, bool worker_reaped, bool worker_group_owned) {
+    if (!worker_reaped) {
+        (void)kill(worker, SIGKILL);
+        if (worker_group_owned) (void)kill(-worker, SIGKILL);
+    }
+    // Keep retrying enumeration for a fixed number of passes. A broken clock
+    // must not turn cleanup into an unbounded wait, and a broken procfs must
+    // never cause a broad kill of unrelated processes.
+    for (unsigned pass = 0; pass < 400; ++pass) {
+        int status = 0;
+        for (;;) {
+            const pid_t result = waitpid(-1, &status, WNOHANG);
+            if (result < 0 && (errno == ECHILD || errno == EINTR)) break;
+            if (result <= 0) break;
+        }
+        char path[96];
+        snprintf(path, sizeof(path), "/proc/self/task/%ld/children", static_cast<long>(getpid()));
+        FILE* children = control_proc_open_failures > 0 ? nullptr : fopen(path, "r");
+        if (control_proc_open_failures > 0)
+            control_proc_open_failures = control_proc_open_failures - 1;
+        if (children != nullptr) {
+            char token[32];
+            const bool scan_failed = control_scan_failures > 0;
+            if (scan_failed) control_scan_failures = control_scan_failures - 1;
+            while (!scan_failed && fscanf(children, "%31s", token) == 1) {
+                errno = 0;
+                char* end = nullptr;
+                const long child = strtol(token, &end, 10);
+                if (errno != 0 || end == token || *end != '\0' || child <= 0 || child > INT_MAX ||
+                    child == getpid())
+                    break;
+                if (child != worker || !worker_reaped)
+                    (void)kill(static_cast<pid_t>(child), SIGKILL);
+            }
+            fclose(children);
+        }
+        (void)poll(nullptr, 0, 5);
+    }
 }
 
 // Called only in the newly forked supervisor, before it creates any children.
@@ -64,6 +111,7 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
         (void)sigaction(SIGTERM, &action, nullptr);
         _exit(run(context));
     }
+    const bool worker_group_owned = setpgid(worker, worker) == 0;
     int status = 0;
     bool reaped = false;
     while (!control_stop_requested) {
@@ -78,7 +126,10 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
     const bool stopped = control_stop_requested != 0;
     bool leftovers = false;
     const long long started = control_now_ms();
-    if (started < 0) return 125;
+    if (started < 0) {
+        fallback_control_cleanup(worker, reaped, worker_group_owned);
+        return 125;
+    }
     const long long deadline = started + 2000;
     for (;;) {
         int descendant_status = 0;
@@ -115,16 +166,26 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
             return 125;
         }
         const long long now = control_now_ms();
-        if (now < 0 || now >= deadline) return 125;
+        if (now < 0 || now >= deadline) {
+            fallback_control_cleanup(worker, reaped, worker_group_owned);
+            return 125;
+        }
         // Do not reap during this scan: each PID remains reserved by a child
         // until the next wait, so signals cannot hit an unrelated reused PID.
         char path[96];
         snprintf(path, sizeof(path), "/proc/self/task/%ld/children", static_cast<long>(getpid()));
-        FILE* children = fopen(path, "r");
-        if (children == nullptr) return 125;
+        FILE* children = control_proc_open_failures > 0 ? nullptr : fopen(path, "r");
+        if (control_proc_open_failures > 0)
+            control_proc_open_failures = control_proc_open_failures - 1;
+        if (children == nullptr) {
+            fallback_control_cleanup(worker, reaped, worker_group_owned);
+            return 125;
+        }
         char token[32];
         bool ok = true;
-        while (fscanf(children, "%31s", token) == 1) {
+        const bool scan_failed = control_scan_failures > 0;
+        if (scan_failed) control_scan_failures = control_scan_failures - 1;
+        while (!scan_failed && fscanf(children, "%31s", token) == 1) {
             errno = 0;
             char* end = nullptr;
             const long child = strtol(token, &end, 10);
@@ -144,9 +205,13 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
             if (child != worker) leftovers = true;
             if (kill(static_cast<pid_t>(child), SIGKILL) != 0 && errno != ESRCH) ok = false;
         }
+        if (scan_failed) ok = false;
         if (ferror(children)) ok = false;
         fclose(children);
-        if (!ok) return 125;
+        if (!ok) {
+            fallback_control_cleanup(worker, reaped, worker_group_owned);
+            return 125;
+        }
         (void)poll(nullptr, 0, 5);
     }
 }
