@@ -519,6 +519,72 @@ TEST(envoy_parser, accepts_camel_case_spellings_and_optional_fields) {
     CHECK_EQ(result.value().clusters[0].endpoint.address.port, 9000u);
 }
 
+TEST(envoy_parser, explicit_tcp_and_round_robin_defaults) {
+    const char* tcp_values[] = {"\"TCP\"", "0"};
+    const char* lb_values[] = {"\"ROUND_ROBIN\"", "0"};
+    for (const char* tcp : tcp_values) {
+        for (const char* lb : lb_values) {
+            for (const char* lb_key : {"lb_policy", "lbPolicy"}) {
+                Bootstrap b;
+                const std::string socket =
+                    std::string("\"socket_address\": {\"protocol\": ") + tcp + ", ";
+                REQUIRE(replace(&b.listeners, "\"socket_address\": {", socket));
+                REQUIRE(replace(&b.clusters, "\"socket_address\": {", socket));
+                REQUIRE(
+                    replace(&b.clusters,
+                            "\"name\": \"backend\",",
+                            std::string("\"name\": \"backend\", \"") + lb_key + "\": " + lb + ","));
+                const std::string text = b.render();
+                static envoy::JsonDocument doc;
+                auto result = envoy::parse_bootstrap_json(str(text), doc);
+                REQUIRE(result);
+                CHECK_EQ(result.value().listener.address.port, 8080u);
+                CHECK_EQ(result.value().clusters[0].endpoint.address.port, 9000u);
+            }
+        }
+    }
+}
+
+TEST(envoy_parser, rejects_nondefault_socket_protocol_and_lb_policy) {
+    const char* unsupported_values[] = {"\"UDP\"", "\"LEAST_REQUEST\"", "\"UNKNOWN\"", "1", "99"};
+    const char* malformed_values[] = {"true", "null", "{}", "[]", "-1", "0.0", "\"0\""};
+    for (u32 location = 0; location < 3; location++) {
+        for (u32 malformed = 0; malformed < 2; malformed++) {
+            const auto* values = malformed ? malformed_values : unsupported_values;
+            const u32 count = malformed ? 7u : 5u;
+            for (u32 i = 0; i < count; i++) {
+                Bootstrap b;
+                const bool socket = location < 2;
+                const std::string field = std::string("\"") + (socket ? "protocol" : "lb_policy") +
+                                          "\": " + values[i] + ", ";
+                if (location == 0) {
+                    REQUIRE(replace(
+                        &b.listeners, "\"socket_address\": {", "\"socket_address\": {" + field));
+                } else if (location == 1) {
+                    REQUIRE(replace(
+                        &b.clusters, "\"socket_address\": {", "\"socket_address\": {" + field));
+                } else {
+                    REQUIRE(replace(
+                        &b.clusters, "\"name\": \"backend\",", "\"name\": \"backend\", " + field));
+                }
+                const std::string text = b.render();
+                const auto code = malformed && i != 6 ? FrontendError::UnexpectedToken
+                                                      : FrontendError::UnsupportedSyntax;
+                const Span span = expect_reject(text, code, socket ? "protocol" : "lb_policy");
+                CHECK_EQ(text.substr(span.start, span.end - span.start), values[i]);
+            }
+        }
+    }
+}
+
+TEST(envoy_parser, rejects_both_lb_policy_spellings) {
+    Bootstrap b;
+    REQUIRE(replace(&b.clusters,
+                    "\"name\": \"backend\",",
+                    "\"name\": \"backend\", \"lb_policy\": \"ROUND_ROBIN\", \"lbPolicy\": 0,"));
+    expect_reject(b.render(), FrontendError::UnexpectedToken, "both snake_case and camelCase");
+}
+
 TEST(envoy_parser, rejects_both_spellings_of_one_field) {
     Bootstrap b;
     REQUIRE(replace(&b.clusters,
@@ -544,7 +610,6 @@ TEST(envoy_parser, rejects_unknown_fields_at_their_key) {
         {"\"listeners\": ", "\"secrets\": [], \"listeners\": "},
         {"\"name\": \"ingress\",", "\"name\": \"ingress\", \"listener_filters\": [],"},
         {"\"name\": \"ingress\",", "\"name\": \"ingress\", \"additional_addresses\": [],"},
-        {"\"port_value\": 8080", "\"port_value\": 8080, \"protocol\": \"TCP\""},
         {"\"filter_chains\": [{", "\"filter_chains\": [{\"filter_chain_match\": {},"},
         {"\"filter_chains\": [{", "\"filter_chains\": [{\"transport_socket\": {},"},
         {"\"stat_prefix\": \"ingress\",", "\"stat_prefix\": \"ingress\", \"access_log\": [],"},
@@ -558,7 +623,6 @@ TEST(envoy_parser, rejects_unknown_fields_at_their_key) {
          "\"route\": {\"cluster\": \"backend\", \"prefix_rewrite\": \"/\"}"},
         {"\"route\": {\"cluster\": \"backend\"}",
          "\"route\": {\"cluster\": \"backend\", \"retry_policy\": {}}"},
-        {"\"name\": \"backend\",", "\"name\": \"backend\", \"lb_policy\": \"ROUND_ROBIN\","},
         {"\"name\": \"backend\",", "\"name\": \"backend\", \"health_checks\": [],"},
         {"\"name\": \"backend\",", "\"name\": \"backend\", \"circuit_breakers\": {},"},
         {"\"name\": \"backend\",", "\"name\": \"backend\", \"transport_socket\": {},"},
