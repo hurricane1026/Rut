@@ -56,6 +56,14 @@ def main():
         assert response.status == 204
         assert response.getheader("Access-Control-Allow-Origin") == ORIGIN
         assert "POST" in response.getheader("Access-Control-Allow-Methods", "")
+        allow_headers = {
+            header.strip().lower()
+            for header in response.getheader("Access-Control-Allow-Headers", "").split(",")
+            if header.strip()
+        }
+        assert {"content-type", "x-grpc-web"} <= allow_headers, allow_headers
+        reused_socket = connection.sock
+        assert reused_socket is not None
         for text in (args.mode == "text",):
             mode = "application/grpc-web-text" if text else "application/grpc-web"
             for suffix in ("", "+proto"):
@@ -66,6 +74,8 @@ def main():
                     (b"\x80", "3"),
                     (b"", "0"),  # Success after errors on the same connection.
                 ):
+                    request_socket = connection.sock
+                    assert request_socket is reused_socket
                     body = b"\x00" + len(payload).to_bytes(4, "big") + payload
                     if text:
                         body = base64.b64encode(body)
@@ -74,6 +84,8 @@ def main():
                     })
                     response = connection.getresponse()
                     result = response.read()
+                    assert not response.will_close
+                    assert connection.sock is request_socket
                     assert response.status == 200, (response.status, result)
                     assert response.getheader("Content-Type") in (mode, mode + "+proto"), (response.getheaders(), result)
                     assert response.getheader("Access-Control-Allow-Origin") == ORIGIN

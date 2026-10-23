@@ -248,5 +248,9 @@ not covered by this example check.
 CORS permits the fixed demo origin `http://127.0.0.1:8080`, POST/OPTIONS, and
 the content-type/x-grpc-web/grpc-timeout/x-user-agent headers. It does not reflect
 arbitrary origins or enable credentials. Change the fixed origin for your
-browser deployment. The CORS headers are included in error responses too.
+browser deployment. Handler-generated gRPC errors include the CORS headers.
+Runtime admission and deadline failures can be generated before the route handler
+runs, such as malformed framing, invalid or duplicate `grpc-timeout` headers, or
+an expired allowed timeout; those generic responses are outside this handler-level
+CORS guarantee.
 These examples do not add streaming Health Watch or dynamic service readiness.
