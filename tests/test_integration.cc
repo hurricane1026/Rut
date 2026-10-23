@@ -21092,11 +21092,14 @@ TEST(route, dsl_response_205_large_body_real_socket) {
 }
 
 // End-to-end: a `body: b"..."` exact-byte literal must reach the wire with
-// its decoded bytes (newline and backslash here) and a matching Content-Length.
+// its decoded bytes (including NUL and non-ASCII) and a matching Content-Length.
 TEST(route, dsl_response_byte_body_real_socket) {
     using namespace rut;
 
-    const char* src = "route GET \"/x\" { return response(200, body: b\"a\\nb\\\\c\") }\n";
+    const char* src =
+        "route GET \"/x\" { return response(200, body: b\"A\\nB\\rC\\tD\\\\E\\\"F\\x00\\xff\") }\n";
+    static constexpr char kBody[] = "A\nB\rC\tD\\E\"F\0\xff";
+    static_assert(sizeof(kBody) - 1 == 13);
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -21142,26 +21145,37 @@ TEST(route, dsl_response_byte_body_real_socket) {
 
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    const char kReq[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    const char kReq[] = "GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[2048];
     u32 n = 0;
-    // Accumulate through the header terminator and the 5-byte body; a single
-    // recv may return only part of the response.
+    bool eof = false;
     while (n < sizeof(buf)) {
         const i32 r = recv_timeout(c, buf + n, static_cast<i32>(sizeof(buf) - n), 1000);
-        if (r <= 0) break;
+        if (r == 0) {
+            eof = true;
+            break;
+        }
+        if (r < 0) break;
         n += static_cast<u32>(r);
-        if (buf_contains(buf, n, "\r\n\r\na\nb\\c", sizeof("\r\n\r\na\nb\\c") - 1)) break;
     }
-    REQUIRE_GT(n, 0u);
+    CHECK(eof);
     auto has = [&](const char* needle, u32 nlen) { return buf_contains(buf, n, needle, nlen); };
     CHECK(has("200 OK", 6));
-    CHECK(has("Content-Length: 5\r\n", 19));
-    // Decoded body is exactly `a\nb\\c`.
-    CHECK(has("\r\n\r\na\nb\\c", sizeof("\r\n\r\na\nb\\c") - 1));
-    REQUIRE_GE(n, 5u);
-    CHECK_EQ(memcmp(buf + n - 5, "a\nb\\c", 5), 0);
+    CHECK(has("Content-Length: 13\r\n", 20));
+    u32 body_offset = 0;
+    for (u32 i = 3; i < n; ++i) {
+        if (memcmp(buf + i - 3, "\r\n\r\n", 4) == 0) {
+            body_offset = i + 1;
+            break;
+        }
+    }
+    CHECK_GT(body_offset, 0u);
+    if (body_offset != 0) {
+        CHECK_EQ(n - body_offset, sizeof(kBody) - 1);
+        if (n - body_offset == sizeof(kBody) - 1)
+            CHECK_EQ(memcmp(buf + body_offset, kBody, sizeof(kBody) - 1), 0);
+    }
 
     close(c);
     lt.stop();
