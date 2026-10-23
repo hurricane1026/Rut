@@ -2901,8 +2901,8 @@ TEST(active_health_e2e, grpc_tls_check_validates_peer_and_alpn_before_request) {
 
     loop->upstream_timeout = 1;
     REQUIRE(start_stalled_probe_until_io());
-    loop->dispatch(IoEvent{0, 1, 0, 0, IoEventType::Timeout, 0, 0});
-    loop->dispatch(IoEvent{0, 1, 0, 0, IoEventType::Timeout, 0, 0});
+    loop->dispatch(
+        IoEvent{0, static_cast<i32>(loop->upstream_timeout) + 1, 0, 0, IoEventType::Timeout, 0, 0});
     CHECK_EQ(loop->active_count(), 0u);
     CHECK_EQ(loop->free_conn_slots(), free_slots_before);
     CHECK_EQ(loop->backend.pending_count, 0u);

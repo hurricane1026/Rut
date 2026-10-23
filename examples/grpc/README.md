@@ -191,3 +191,32 @@ It checks a successful echo, INTERNAL for malformed protobuf, and a subsequent
 successful call on the same channel. For io_uring use `--backend io_uring` on a
 supported Linux host. This example supports one uncompressed message up to 8 KiB;
 it does not implement local deadline scheduling or streaming message handlers.
+
+## Local standard health Check
+
+[grpc-health.rut](../grpc-health.rut) serves the standard unary
+`/grpc.health.v1.Health/Check` method directly in Rut. It decodes the standard
+request with the built-in protobuf compiler and encodes a typed response; no
+Python backend, generated bindings, or additional runtime dependency is needed.
+The empty service and `grpc.health.v1.Health` return `SERVING`. The legacy
+`example.BatchEcho` name and other unknown services return gRPC `NOT_FOUND` (5);
+malformed protobuf returns `INVALID_ARGUMENT` (3).
+This is a static readiness example: replace its policy with your application's
+readiness decision before deploying it. It does not implement streaming `Watch`
+or a dynamic service registry.
+
+From the repository root, start a listener and use the existing optional SDK:
+
+```bash
+build/src/rut 50052 examples/grpc-health.rut --backend epoll --shards 1 --no-pin --h2
+examples/grpc/.venv/bin/python examples/grpc/health_client.py
+```
+
+The client checks the empty and advertised service names, rejects the legacy
+`example.BatchEcho` name and other unknown or malformed requests, and makes a
+successful call after failures on the same channel. For TLS,
+use the listener certificate/key arguments from above and run the client with
+`--target localhost:50052 --ca tests/fixtures/localhost_cert.pem`.
+The source schema includes the unary subset of the standard health protocol;
+ordinary generated Health `Check` stubs interoperate with the same wire format.
+This local service is separate from upstream `health_check` probing.
