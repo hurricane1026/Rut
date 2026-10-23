@@ -326,8 +326,8 @@ u32 format_access_log_downstream_host_line(const AccessLogEntry& entry,
     static_assert(sizeof("host1 request_bytes=") - 1u + 10u + sizeof(" status=") - 1u + 5u +
                       sizeof(" host_state=") - 1u + sizeof("unavailable") - 1u +
                       sizeof(" host_length=") - 1u + 10u + sizeof(" host_hex=") - 1u +
-                      2u * kAccessLogDownstreamHostMax + sizeof(" upstream_history=unavailable\n") -
-                      1u <=
+                      static_cast<u64>(2u) * kAccessLogDownstreamHostMax +
+                      sizeof(" upstream_history=unavailable\n") - 1u <=
                   kAccessLogDownstreamHostLineCapacity);
     char line[kAccessLogDownstreamHostLineCapacity];
     u32 w = 0u;
