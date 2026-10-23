@@ -4933,6 +4933,55 @@ TEST(grpc_proxy, grpc_web_retry_is_suppressed_when_backoff_exceeds_deadline) {
     grpc_retry_suppressed_deadline_case(_tc, true);
 }
 
+TEST(grpc_proxy, grpc_retry_unknown_requires_valid_backend_and_mutated_status) {
+    const Str values[] = {
+        {"2", 1}, {"17", 2}, {"", 0}, {"unknown", 7}, {"-2", 2}, {"4294967298", 10}};
+    for (const Str value : values) {
+        for (u32 mutation = 0; mutation < 3; mutation++) {
+            GrpcDriveFixture loop;
+            Connection upstream;
+            upstream.reset();
+            Connection downstream;
+            downstream.reset();
+            Http2Conn h;
+            h.init_client();
+            upstream.h2 = &h;
+            REQUIRE(h.open_stream(1) != nullptr);
+            GrpcExchange x;
+            x.init();
+            x.upstream = &upstream;
+            x.downstream = &downstream;
+            x.upstream_stream = x.downstream_stream = 1;
+            x.retry_enabled = true;
+            x.retry_policy = {2, 1024, 1u << 2, 0};
+            x.replay_body.replayable = true;
+            x.replay_body.sealed = true;
+            x.replay_headers.valid = true;
+            x.replay_trailers.valid = true;
+            if (mutation) {
+                downstream.resp_header_mutations[0] = {
+                    {"grpc-status", 11},
+                    mutation == 1 ? Str{"invalid", 7} : Str{"2", 1},
+                    Connection::RespHeaderMutationMode::Set};
+                downstream.resp_header_mutation_count = 1;
+                REQUIRE(grpc_snapshot_response_mutations(downstream, x));
+            }
+            REQUIRE(grpc_attach(h, &x));
+            GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+            const hpack::Header response[] = {
+                {{":status", 7}, {"200", 3}},
+                {{"content-type", 12}, {"application/grpc", 16}},
+                {{"grpc-status", 11}, value},
+            };
+            grpc_response_headers<GrpcDriveFixture>(&dispatch, h, 1, response, 3, true);
+            const bool should_retry = value.eq({"2", 1}) && mutation != 1;
+            CHECK_EQ(x.retry_pending, should_retry);
+            CHECK_EQ(x.response_end, !should_retry);
+            CHECK_EQ(x.response_headers_len == 0, should_retry);
+        }
+    }
+}
+
 TEST(grpc_proxy, grpc_retry_requires_uncommitted_downstream_response) {
     GrpcExchange exchange;
     exchange.init();

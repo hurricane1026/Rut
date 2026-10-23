@@ -406,24 +406,30 @@ inline bool grpc_has_status(const hpack::Header* hs, u32 n) {
 }
 // Invalid or duplicate status metadata is reported as UNKNOWN in telemetry;
 // forwarding remains opaque and does not rewrite backend trailers.
-inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
+inline bool grpc_parse_status(const hpack::Header* hs, u32 n, u8* out) {
     bool seen = false;
     u8 status = 2;
     for (u32 i = 0; i < n; i++) {
         if (!hs[i].name.eq({"grpc-status", 11})) continue;
-        if (seen) return 2;
+        if (seen) return false;
         seen = true;
         const Str kValue = hs[i].value;
-        if (!kValue.len) return 2;
+        if (!kValue.len) return false;
         u32 parsed = 0;
         for (u32 j = 0; j < kValue.len; j++) {
-            if (kValue.ptr[j] < '0' || kValue.ptr[j] > '9') return 2;
+            if (kValue.ptr[j] < '0' || kValue.ptr[j] > '9') return false;
             parsed = parsed * 10 + static_cast<u32>(kValue.ptr[j] - '0');
-            if (parsed > 16) return 2;
+            if (parsed > 16) return false;
         }
         status = static_cast<u8>(parsed);
     }
-    return status;
+    if (!seen) return false;
+    *out = status;
+    return true;
+}
+inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
+    u8 status = 2;
+    return grpc_parse_status(hs, n, &status) ? status : 2;
 }
 inline bool grpc_web_trailer_metadata(const hpack::Header& h) {
     return !h.name.eq({":status", 7}) && !h.name.eq({"content-type", 12}) &&
@@ -776,9 +782,15 @@ void grpc_response_headers(
         response_mode == GrpcWebContentType::Binary || response_mode == GrpcWebContentType::Text;
     const bool filtered_has_status = grpc_has_status(filtered, filtered_n);
     const u8 observed_status = end ? grpc_observed_status(filtered, filtered_n) : 2;
+    // UNKNOWN telemetry also covers malformed metadata. Only a valid backend
+    // status, preserved by response mutations, can authorize request replay.
+    u8 backend_status = 2;
+    u8 filtered_status = 2;
+    const bool retry_status_valid = grpc_parse_status(hs, n, &backend_status) &&
+                                    grpc_parse_status(filtered, filtered_n, &filtered_status);
     // Decide before Web trailer encoding or any downstream output staging.
-    if (end && raw_status_count == 1 && content_type_count == 1 && filtered_has_status &&
-        grpc_observed_status(hs, n) == observed_status &&
+    if (retry_status_valid && end && raw_status_count == 1 && content_type_count == 1 &&
+        filtered_has_status && backend_status == filtered_status &&
         grpc_retry_can_schedule(*x, observed_status)) {
         const u64 now = monotonic_us();
         const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;

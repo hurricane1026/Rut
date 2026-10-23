@@ -645,7 +645,10 @@ a nonempty list of distinct gRPC codes 1 through 16 (OK is not retryable), and
 `backoff_ms` is 0 through 60,000. Omission disables retries. Replay requires the
 complete request body to fit the configured byte limit, a separately retained
 metadata snapshot, no committed response, and enough time for the backoff
-before the original deadline.
+before the original deadline. A status-based retry requires exactly one valid
+backend `grpc-status` (0–16), preserved as a valid matching status after
+response middleware. Malformed metadata remains UNKNOWN in telemetry and
+does not authorize replay, even when status 2 is configured for retry.
 See [the complete example](../examples/grpc.rut).
 
 Optional per-message wire limits are configured on an HTTP/2 upstream:
