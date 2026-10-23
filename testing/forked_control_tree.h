@@ -14,6 +14,12 @@
 
 namespace rut::test {
 
+inline constexpr int kControlCleanupDeadlineMs = 2000;
+inline constexpr int kControlFallbackPasses = 400;
+inline constexpr int kControlFallbackPollMs = 5;
+inline constexpr int kControlReapBudgetMs =
+    kControlCleanupDeadlineMs + kControlFallbackPasses * kControlFallbackPollMs + 2000;
+
 inline volatile sig_atomic_t control_seek_failures = 0;
 
 enum class ControlProcfsCapability : unsigned char {
@@ -79,6 +85,7 @@ inline volatile sig_atomic_t control_clock_failures = 0;
 inline volatile sig_atomic_t control_proc_open_failures = 0;
 inline volatile sig_atomic_t control_read_failures = 0;
 inline volatile sig_atomic_t control_persistent_read_after_preflight = 0;
+inline volatile sig_atomic_t control_defer_cleanup_until_deadline = 0;
 inline volatile sig_atomic_t control_fail_reopen_after_preflight = 0;
 inline volatile sig_atomic_t control_scan_failures = 0;
 inline void request_control_stop(int) {
@@ -197,7 +204,7 @@ inline void fallback_control_cleanup(FILE* children,
     // Keep retrying enumeration for a fixed number of passes. A broken clock
     // must not turn cleanup into an unbounded wait, and a broken procfs must
     // never cause a broad kill of unrelated processes.
-    for (unsigned pass = 0; pass < 400; ++pass) {
+    for (unsigned pass = 0; pass < kControlFallbackPasses; ++pass) {
         int status = 0;
         for (;;) {
             const pid_t result = waitpid(-1, &status, WNOHANG);
@@ -215,7 +222,7 @@ inline void fallback_control_cleanup(FILE* children,
                 (void)control_signal_children(
                     children, getpid(), worker, worker_reaped, ignored_leftovers);
         }
-        (void)poll(nullptr, 0, 5);
+        (void)poll(nullptr, 0, kControlFallbackPollMs);
     }
 }
 
@@ -279,7 +286,7 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
         fallback_control_cleanup(children, worker, reaped, worker_group_owned);
         return 125;
     }
-    const long long deadline = started + 2000;
+    const long long deadline = started + kControlCleanupDeadlineMs;
     for (;;) {
         int descendant_status = 0;
         const pid_t result = waitpid(-1, &descendant_status, WNOHANG);
@@ -320,6 +327,10 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
             fallback_control_cleanup(children, worker, reaped, worker_group_owned);
             return 125;
         }
+        if (control_defer_cleanup_until_deadline) {
+            (void)poll(nullptr, 0, kControlFallbackPollMs);
+            continue;
+        }
         // Do not reap during this scan: each PID remains reserved by a child
         // until the next wait, so signals cannot hit an unrelated reused PID.
         bool ok = true;
@@ -337,7 +348,7 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
             // before the failure cannot be discovered; this path is deliberately failure-only.
             return 125;
         }
-        (void)poll(nullptr, 0, 5);
+        (void)poll(nullptr, 0, kControlFallbackPollMs);
     }
 }
 

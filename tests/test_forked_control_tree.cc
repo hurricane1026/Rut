@@ -394,6 +394,99 @@ TEST(forked_control, persistent_postlaunch_read_failure_is_bounded) {
     CHECK_EQ(WEXITSTATUS(sibling_status), 73);
 }
 
+TEST(forked_control, deadline_fallback_reaps_escaped_group_without_hardkill) {
+    rut::test::ScopedChildSubreaper subreaper;
+    REQUIRE(subreaper.enable());
+    rut::test::control_defer_cleanup_until_deadline = 1;
+    int channel[2];
+    REQUIRE_EQ(pipe(channel), 0);
+    const pid_t control = fork();
+    REQUIRE(control >= 0);
+    if (control == 0) {
+        close(channel[0]);
+        struct Context {
+            int fd;
+        } context{channel[1]};
+        _exit(rut::test::supervise_forked_control(
+            [](void* opaque) -> int {
+                const auto& context = *static_cast<Context*>(opaque);
+                const pid_t sentinel = fork();
+                if (sentinel < 0) return 41;
+                if (sentinel == 0) {
+                    close(context.fd);
+                    if (setpgid(0, 0) != 0) _exit(42);
+                    for (;;) pause();
+                }
+                if (setpgid(sentinel, sentinel) != 0) return 43;
+                (void)write(context.fd, &sentinel, sizeof(sentinel));
+                return 87;
+            },
+            &context));
+    }
+    close(channel[1]);
+    rut::test::control_defer_cleanup_until_deadline = 0;
+    pid_t sentinel = -1;
+    auto abort_control = [&]() {
+        (void)kill(control, SIGKILL);
+        int control_status = 0;
+        (void)wait_terminal(control, control_status);
+        (void)fcntl(channel[0], F_SETFL, O_NONBLOCK);
+        if (read(channel[0], &sentinel, sizeof(sentinel)) == sizeof(sentinel) && sentinel > 0) {
+            int sentinel_status = 0;
+            const pid_t observed = waitpid(sentinel, &sentinel_status, WNOHANG);
+            if (observed == 0) {
+                (void)kill(sentinel, SIGKILL);
+                (void)wait_terminal(sentinel, sentinel_status);
+            }
+        }
+        close(channel[0]);
+    };
+    pollfd ready{channel[0], POLLIN, 0};
+    const int ready_result = poll(&ready, 1, 3000);
+    if (ready_result != 1 || (ready.revents & POLLIN) == 0 ||
+        (ready.revents & (POLLERR | POLLNVAL)) != 0) {
+        CHECK(false);
+        abort_control();
+        return;
+    }
+    if (read(channel[0], &sentinel, sizeof(sentinel)) != sizeof(sentinel) || sentinel <= 0) {
+        CHECK(false);
+        abort_control();
+        return;
+    }
+    close(channel[0]);
+    const pid_t sibling = fork();
+    REQUIRE(sibling >= 0);
+    if (sibling == 0) _exit(73);
+    int status = 0;
+    const bool exited = wait_terminal(control, status, rut::test::kControlReapBudgetMs / 5);
+    CHECK(exited);
+    if (!exited) {
+        (void)kill(control, SIGKILL);
+        CHECK(wait_terminal(control, status));
+    }
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), 125);
+    int sentinel_status = 0;
+    const pid_t observed = waitpid(sentinel, &sentinel_status, WNOHANG);
+    CHECK_NE(observed, 0);
+    if (observed == 0) {
+        CHECK_EQ(kill(sentinel, SIGKILL), 0);
+        CHECK(wait_terminal(sentinel, sentinel_status));
+    } else if (observed == sentinel) {
+        CHECK(WIFSIGNALED(sentinel_status));
+    } else {
+        CHECK(observed < 0 && errno == ECHILD);
+        errno = 0;
+        CHECK_EQ(kill(sentinel, 0), -1);
+        CHECK_EQ(errno, ESRCH);
+    }
+    int sibling_status = 0;
+    CHECK(wait_terminal(sibling, sibling_status));
+    CHECK(WIFEXITED(sibling_status));
+    CHECK_EQ(WEXITSTATUS(sibling_status), 73);
+}
+
 TEST(forked_control, retained_children_fd_survives_reopen_failure) {
     CHECK(cleanup_case(ControlExit::UnexpectedStatus, 0, 0, 0, 87, 1));
 }

@@ -1843,9 +1843,11 @@ static bool reap_forked_control_tree(Child& child, const std::string& container_
         // The dedicated supervisor adopts and reaps the entire tree, including
         // native compiler children that changed their process group.
         if (!child.reaped && kill(child.pid, SIGTERM) != 0 && errno != ESRCH) ok = false;
-        if (!wait_child(child, 3000)) {
+        constexpr int kFallbackBudgetMs =
+            rut::test::kControlFallbackPasses * rut::test::kControlFallbackPollMs;
+        if (!wait_child(child, rut::test::kControlReapBudgetMs)) {
             (void)kill(child.pid, SIGKILL);
-            (void)wait_child(child, 2000);
+            (void)wait_child(child, kFallbackBudgetMs + 1000);
             ok = false;
         }
         if (child.reaped) {
