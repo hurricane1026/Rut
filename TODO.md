@@ -123,6 +123,10 @@ without presenting lossy or per-shard state as exact shared state.
   missing, before spending earlier shard-rule budget. Disabled rules and normal
   startup wiring retain their behavior; shared enforcement has focused tests.
 
+- [x] Reject rate-limit key names longer than 32 bytes in the parser and native
+  key-spec builder instead of silently truncating them. Boundary tests cover
+  header/query/cookie/param names and preservation through RIR lowering.
+
 - [x] Kong/APISIX plan #819, M1 security primitive: `constantTimeEqual(str, str)`
   exposes bounded OpenSSL content comparison to Rut without a new keyword or
   dependency. Public lengths, 16 KiB failure limit, empty/binary semantics and

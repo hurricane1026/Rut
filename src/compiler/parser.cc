@@ -4922,6 +4922,10 @@ struct Parser {
         if (!arg) return core::make_unexpected(arg.error());
         if (!expect(TokenType::RParen))
             return frontend_error(FrontendError::UnexpectedToken, deco_span, kName);
+        if (arg.value()->text.len > RateLimitKeyComponent::kMaxName)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(*arg.value()),
+                                  lit_str("rate-limit key names must be at most 32 bytes"));
         if (!spec.add(kind, arg.value()->text.ptr, arg.value()->text.len))
             return frontend_error(FrontendError::UnsupportedSyntax, deco_span, kName);
         return true;

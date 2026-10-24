@@ -6780,6 +6780,11 @@ Missing shared state is a fail-closed configuration failure: HTTP/1 and HTTP/2
 return 429 without spending other rules' budget. It must not weaken enforcement
 by falling back to shard scope; disabled rules need no shared instance.
 
+Names in rate-limit `by: header/query/cookie/param("name")` components are
+limited to 32 bytes. A longer name is a compile-time error at the name literal,
+not a truncated lookup. The native key-spec builder also rejects it without
+appending a component.
+
 Source (`@rateLimit` is top-level route metadata, not a user helper):
 ```swift
 @rateLimit(limit: 100, window: 1m)
