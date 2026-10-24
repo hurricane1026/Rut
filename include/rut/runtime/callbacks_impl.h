@@ -2111,19 +2111,9 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (fd < 0) return false;
     conn.upstream_fd = fd;
     conn.upstream_start_us = monotonic_us();
-    if (conn.forward_load_balance.policy != LoadBalancePolicy::None)
-        conn.upstream_backend_idx =
-            static_cast<u8>(select_forward_backend(cfg,
-                                                   conn.shard_id,
-                                                   conn.forward_load_balance,
-                                                   conn.upstream_idx,
-                                                   target.addr_count,
-                                                   conn.upstream_start_us,
-                                                   conn.upstream_attempted_backends));
-    if (conn.upstream_backend_idx >= target.addr_count) {
-        (void)detach_upstream_close(loop, conn);
-        return false;
-    }
+    // This is recovery from a dead pooled transport, not endpoint failover:
+    // reconnect to the endpoint whose idle socket died. Keep its attempted bit
+    // so a failure of this fresh connect advances past it via the normal retry.
     conn.upstream_attempted_backends |= static_cast<u8>(1u << conn.upstream_backend_idx);
     hold_backend_active(conn);
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);

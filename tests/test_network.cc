@@ -17384,6 +17384,96 @@ TEST(upstream_reuse, fallback_retries_idempotent_method) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+TEST(upstream_reuse, explicit_policy_reconnects_single_stale_pooled_endpoint) {
+    for (const LoadBalancePolicy policy :
+         {LoadBalancePolicy::RoundRobin, LoadBalancePolicy::LeastRequests}) {
+        SmallLoop loop;
+        loop.setup();
+        auto* c = loop.alloc_conn();
+        REQUIRE(c != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*c));
+        RouteConfig cfg{};
+        auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+        REQUIRE(uid.has_value());
+        c->request_config = &cfg;
+        c->upstream_idx = static_cast<u16>(uid.value());
+        c->upstream_backend_idx = 0;
+        c->upstream_attempted_backends = 1u;
+        c->forward_load_balance = {1, policy};
+        c->upstream_attempts = 1;
+        c->req_method = static_cast<u8>(LogHttpMethod::Get);
+        c->req_body_mode = BodyMode::None;
+        c->upstream_reused = true;
+        static constexpr char kGet[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        c->recv_buf.write(reinterpret_cast<const u8*>(kGet), sizeof(kGet) - 1);
+        c->req_initial_send_len = sizeof(kGet) - 1;
+        c->upstream_fd = dup(2);
+        REQUIRE(c->upstream_fd >= 0);
+        hold_backend_active(*c, &cfg);
+        loop.backend.clear_ops();
+
+        CHECK(rut::retry_reused_upstream(&loop, *c));
+
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+        CHECK_EQ(c->upstream_backend_idx, 0u);
+        CHECK_EQ(c->upstream_attempted_backends, 1u);
+        CHECK_EQ(cfg.backend_selection[0].active[uid.value()][0], 1u);
+        CHECK(!c->upstream_reused);
+        close(c->upstream_fd);
+        c->upstream_fd = -1;
+        c->release_backend_active();
+        loop.free_conn(*c);
+    }
+}
+
+TEST(upstream_reuse, explicit_policy_stale_reconnect_then_connect_failure_fails_over) {
+    for (const LoadBalancePolicy policy :
+         {LoadBalancePolicy::RoundRobin, LoadBalancePolicy::LeastRequests}) {
+        SmallLoop loop;
+        loop.setup();
+        auto* c = loop.alloc_conn();
+        REQUIRE(c != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*c));
+        RouteConfig cfg{};
+        auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+        REQUIRE(uid.has_value());
+        REQUIRE(cfg.add_upstream_backend(static_cast<u16>(uid.value()), 0x7F000001, 8081));
+        c->request_config = &cfg;
+        c->upstream_idx = static_cast<u16>(uid.value());
+        c->upstream_backend_idx = 0;
+        c->upstream_attempted_backends = 1u;
+        c->forward_load_balance = {1, policy};
+        c->upstream_attempts = 1;
+        c->req_method = static_cast<u8>(LogHttpMethod::Get);
+        c->req_body_mode = BodyMode::None;
+        c->upstream_reused = true;
+        static constexpr char kGet[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        c->recv_buf.write(reinterpret_cast<const u8*>(kGet), sizeof(kGet) - 1);
+        c->req_initial_send_len = sizeof(kGet) - 1;
+        c->upstream_fd = dup(2);
+        REQUIRE(c->upstream_fd >= 0);
+        hold_backend_active(*c, &cfg);
+        loop.backend.clear_ops();
+
+        REQUIRE(rut::retry_reused_upstream(&loop, *c));
+        CHECK_EQ(c->upstream_backend_idx, 0u);
+        CHECK_EQ(cfg.backend_selection[0].active[uid.value()][0], 1u);
+        CHECK_EQ(c->upstream_attempted_backends, 1u);
+
+        REQUIRE(try_connect_next_backend<SmallLoop>(&loop, *c));
+        CHECK_EQ(c->upstream_backend_idx, 1u);
+        CHECK_EQ(c->upstream_attempted_backends, 3u);
+        CHECK_EQ(cfg.backend_selection[0].active[uid.value()][0], 0u);
+        CHECK_EQ(cfg.backend_selection[0].active[uid.value()][1], 1u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 2u);
+
+        close(c->upstream_fd);
+        c->upstream_fd = -1;
+        c->release_backend_active();
+        loop.free_conn(*c);
+    }
+}
+
 // A reused idempotent request whose body already began streaming upstream must NOT
 // retry: recv_buf was reset + refilled with body chunks, so the original request is
 // gone and a replay would send a truncated/garbage request. (Finding 1 regression —
