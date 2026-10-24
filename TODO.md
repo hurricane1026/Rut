@@ -101,6 +101,10 @@ without presenting lossy or per-shard state as exact shared state.
 - [x] Lower `Cache.set` at its branch position instead of only in the route-entry
   prelude. This enables a Rut limiter to commit the successor only on its
   accepted branch; the shipped example now demonstrates that policy.
+- [x] Built-in shard limiter rejects collisions with active buckets instead of
+  replacing their state and allowing alternating keys to refill burst credit.
+  Slots become reusable after full recovery; capacity can still cause conservative
+  rejection, and global slots still alias colliding keys.
 - Design the strict, visible-failure `Hash` table and an owner-shard atomic
   update primitive before offering exact cross-shard rate limiting or state
   whose absence would be incorrect.

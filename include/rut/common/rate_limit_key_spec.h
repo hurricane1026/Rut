@@ -56,8 +56,8 @@ struct RateLimitKeySpec {
 // Where a rule applies. Shard (default): each per-core shard enforces the rule
 // independently — fast, no coordination, but a client spread across shards gets
 // up to limit × shard_count (SO_REUSEPORT hashes connections by 4-tuple, so a
-// client's connections fan out). Global: an exact cluster-wide cap via the shared
-// GlobalRateLimiter (all shards advance one bucket).
+// client's connections fan out). Global: a process-shared budget via
+// GlobalRateLimiter (all shards advance the same slot; colliding keys share it).
 enum class RateLimitScope : u8 {
     Shard = 0,
     Global,

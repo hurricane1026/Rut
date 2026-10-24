@@ -19,9 +19,10 @@
 // requests back-to-back (the burst). Versus the old fixed window this removes the
 // boundary 2× burst and gives a tunable burst.
 //
-// Bounded memory: a fixed direct-mapped slot table. On hash collision the new key
-// takes the slot (the evicted key restarts) — the standard approximation for
-// high-cardinality limiting.
+// Bounded memory: a fixed direct-mapped slot table. A different key may reuse a
+// slot only once its previous bucket has fully recovered (tat <= now). Active
+// collisions fail closed instead of resetting another key's budget. Capacity
+// pressure can therefore reject otherwise-conforming keys.
 namespace rut {
 
 // Per-shard limiter (one thread per shard → no atomics). Value-initialized to all
@@ -48,7 +49,10 @@ struct RateLimiter {
         u64 h = key * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
         Slot& s = slots[h % kSlots];
-        if (s.key != key) {  // collision / first use → empty bucket for this key
+        if (s.key != key) {
+            // Replacing active state would let alternating colliding keys refill
+            // their buckets without waiting. Only a fully idle slot is reusable.
+            if (s.tat > now_us) return false;
             s.key = key;
             s.tat = 0;
         }
@@ -60,14 +64,15 @@ struct RateLimiter {
 };
 
 // Cross-shard limiter for @rateLimit(scope: global). One instance shared by every
-// shard; the bucket is truly cluster-wide (all shards advance the same `tat`), so
-// the configured limit is the exact process-wide cap — no divide-by-shard-count.
+// shard in one process; all shards advance the same `tat` for a slot, without
+// dividing the configured rate by shard count. Different keys that collide share
+// that budget, so this is not an exact per-key table or a cross-node limiter.
 // Each slot is a single atomic<u64> `tat`, so a grant is one CAS (no field
 // packing) and the throttle path is a *read only* (load + compare, no RMW): a
 // flood on a hot key keeps the slot's cache line Shared across cores and never
 // writes it; grants are inherently bounded by the rate, so the RMW/barrier rate is
-// capped by the limit, not by traffic. relaxed ordering — `tat` is the only shared
-// datum. Collisions share a slot (rare, bounded), minus the per-key eviction.
+// capped by the slot budget, not by traffic. relaxed ordering — `tat` is the only shared
+// datum. Collisions share a slot and can cause conservative throttling.
 struct GlobalRateLimiter {
     static constexpr u32 kSlots = 8192;  // 64 KB shared (atomic<u64> per slot)
     std::atomic<u64> slots[kSlots];
