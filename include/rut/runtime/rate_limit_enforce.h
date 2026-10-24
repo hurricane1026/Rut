@@ -26,6 +26,7 @@ inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
             if (rule.scope == RateLimitScope::Global && rule.emit_interval_us != 0) return true;
         }
     }
+    bool exceeded = false;
     for (u32 ri = 0; ri < rules.count; ri++) {
         const RateLimitRule& rule = rules.rules[ri];
         if (rule.emit_interval_us == 0) continue;
@@ -35,14 +36,19 @@ inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
             (rule.scope == RateLimitScope::Global)
                 ? global_rate_limiter->allow_key(kKey, rule.emit_interval_us, rule.tau_us, now_us)
                 : rate_limiter.allow_key(kKey, rule.emit_interval_us, rule.tau_us, now_us);
-        if (!kOk) return true;
+        // Every active rule meters the attempt, even after another rejects it.
+        if (!kOk) exceeded = true;
     }
-    return false;
+    return exceeded;
 }
 
 // Returns true if the request exceeds any of the route's stacked rate-limit
 // rules (the caller answers 429). A route may stack several rules; the request
-// must pass every one, each metered by its own key tuple. The limiter is
+// must pass every one, each metered by its own key tuple. All active rules are
+// evaluated: conforming rules consume budget even if another rule rejects the
+// request. Rejected GCRA rules do not advance their own timestamp; no rule is
+// refunded. Missing required shared state is a preflight failure, not a metered
+// request attempt. The limiter is
 // per-shard (one thread each), so a thread_local table needs no atomics. Both
 // dispatch paths run on the same shard thread with the same Loop type, so they
 // resolve to one shared limiter instance. Global-scope rules go to the
