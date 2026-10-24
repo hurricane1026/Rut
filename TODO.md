@@ -119,6 +119,10 @@ without presenting lossy or per-shard state as exact shared state.
   that decorator, instead of silently omitting the rule. Boundary regression
   tests cover all four rules and independent per-route capacity.
 
+- [x] Active global rate-limit rules fail closed when their shared limiter is
+  missing, before spending earlier shard-rule budget. Disabled rules and normal
+  startup wiring retain their behavior; shared enforcement has focused tests.
+
 - [x] Kong/APISIX plan #819, M1 security primitive: `constantTimeEqual(str, str)`
   exposes bounded OpenSSL content comparison to Rut without a new keyword or
   dependency. Public lengths, 16 KiB failure limit, empty/binary semantics and

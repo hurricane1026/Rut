@@ -6775,6 +6775,11 @@ Each route supports at most four stacked `@rateLimit` rules. Exceeding this
 capacity is a compile-time error at the first excess decorator; the compiler
 must not discard a configured rule. Other routes have independent capacity.
 
+An active `scope: global` rate-limit rule requires the process-shared limiter.
+Missing shared state is a fail-closed configuration failure: HTTP/1 and HTTP/2
+return 429 without spending other rules' budget. It must not weaken enforcement
+by falling back to shard scope; disabled rules need no shared instance.
+
 Source (`@rateLimit` is top-level route metadata, not a user helper):
 ```swift
 @rateLimit(limit: 100, window: 1m)

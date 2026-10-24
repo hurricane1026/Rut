@@ -869,6 +869,11 @@ A route supports at most four stacked `@rateLimit` decorators. A fifth is a
 compile-time error reported at that decorator; rules are never silently omitted.
 The limit is per route, not per file.
 
+An active `@rateLimit(..., scope: global)` rule requires the process-shared
+limiter. If a runtime caller omits it, enforcement fails closed with 429 before
+spending any other rule's budget; it never falls back to per-shard enforcement.
+Disabled rules do not require shared state. Normal `rut` startup supplies it.
+
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)
 
