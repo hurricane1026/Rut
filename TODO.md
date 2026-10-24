@@ -114,6 +114,10 @@ without presenting lossy or per-shard state as exact shared state.
 **Acceptance**:
 - A rate-limit test demonstrates both meter-every-attempt and meter-on-accept
   policies without special C++ rate-limit logic.
+- [x] Built-in stacked rules meter all active rules on each valid attempt,
+  including rules after the first rejection. Conforming rules spend one token,
+  rejected rules keep their GCRA timestamp, and there is no cross-rule refund.
+  This does not change Rut Cache policy examples or global preflight failure.
 - Any exact shared-state surface specifies capacity failure, update atomicity,
   shard ownership, and read freshness before parser/runtime implementation.
 
