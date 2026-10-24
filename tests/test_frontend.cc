@@ -3160,6 +3160,59 @@ TEST(frontend, cache_bare_set_allowed_on_ratelimit_throttle_routes) {
     REQUIRE(hir);
 }
 
+TEST(frontend, rate_limit_rejects_fifth_rule_at_decorator) {
+    const char* source =
+        "@rateLimit(limit: 10, window: 1m)\n"
+        "@rateLimit(limit: 20, window: 1m)\n"
+        "@rateLimit(limit: 30, window: 1m)\n"
+        "@rateLimit(limit: 40, window: 1m)\n"
+        "@rateLimit(limit: 50, window: 1m)\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::TooManyItems);
+    CHECK_EQ(hir.error().span.line, 5u);
+    CHECK_EQ(hir.error().span.col, 1u);
+    CHECK(hir.error().detail.eq(lit("a route supports at most 4 @rateLimit rules")));
+}
+
+TEST(frontend, rate_limit_preserves_four_rules_per_route) {
+    const char* source =
+        "@rateLimit(limit: 10, window: 1m, by: ip)\n"
+        "@rateLimit(limit: 20, window: 1m, by: header(\"X-Key\"), scope: global)\n"
+        "@rateLimit(limit: 30, window: 1m, by: query(\"key\"))\n"
+        "@rateLimit(limit: 40, window: 1m, by: cookie(\"key\"), burst: 2)\n"
+        "route GET \"/x\" { return 200 }\n"
+        "@rateLimit(limit: 50, window: 1m)\n"
+        "route GET \"/y\" { return 200 }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir.value().routes.len, 2u);
+    const auto& rules = hir.value().routes[0].rate_limit;
+    REQUIRE_EQ(rules.count, 4u);
+    for (u32 i = 0; i < rules.count; ++i) {
+        CHECK_EQ(rules.rules[i].max, (i + 1) * 10u);
+        CHECK_EQ(rules.rules[i].window_sec, 60u);
+        CHECK_EQ(rules.rules[i].key.count, 1u);
+    }
+    CHECK_EQ(rules.rules[0].key.comps[0].kind, RateLimitKeyKind::Ip);
+    CHECK_EQ(rules.rules[1].key.comps[0].kind, RateLimitKeyKind::Header);
+    CHECK_EQ(rules.rules[1].scope, RateLimitScope::Global);
+    CHECK_EQ(rules.rules[2].key.comps[0].kind, RateLimitKeyKind::Query);
+    CHECK_EQ(rules.rules[3].key.comps[0].kind, RateLimitKeyKind::Cookie);
+    CHECK_EQ(rules.rules[3].burst, 2u);
+    CHECK_EQ(hir.value().routes[1].rate_limit.count, 1u);
+    CHECK_EQ(hir.value().routes[1].rate_limit.rules[0].max, 50u);
+}
+
 TEST(frontend, cache_decl_rejects_overlong_name) {
     // The runtime descriptor truncates names at 31 bytes and the reload
     // identity hashes the stored name — overlong names are rejected.

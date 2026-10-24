@@ -865,6 +865,10 @@ shutdown { ... }     // per-shard, after drain
 
 ## Rate limiting in Rut (the blessed algorithms — examples/ratelimit.rut)
 
+A route supports at most four stacked `@rateLimit` decorators. A fifth is a
+compile-time error reported at that decorator; rules are never silently omitted.
+The limit is per route, not per file.
+
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)
 

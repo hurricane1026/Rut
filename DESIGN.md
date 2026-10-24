@@ -6771,6 +6771,10 @@ RIR instruction set:
 
 #### 11.2.3 Example: auth function after inlining into a route
 
+Each route supports at most four stacked `@rateLimit` rules. Exceeding this
+capacity is a compile-time error at the first excess decorator; the compiler
+must not discard a configured rule. Other routes have independent capacity.
+
 Source (`@rateLimit` is top-level route metadata, not a user helper):
 ```swift
 @rateLimit(limit: 100, window: 1m)
