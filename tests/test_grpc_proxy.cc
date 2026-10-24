@@ -103,6 +103,7 @@ struct EchoServer {
         u32 len;
         bool end;
         bool trailer;
+        bool discard;
         u8 data[65535];
     } streams[64]{};
     int listen_fd = -1;
@@ -143,6 +144,8 @@ struct EchoServer {
         memcpy(buf, s->data, n);
         s->len -= n;
         memmove(s->data, s->data + n, s->len);
+        // Release upload credit only after response flow control lets us echo.
+        if (n && nghttp2_session_consume(session, id, n) != 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
         if (!s->len && s->end) {
             *flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
             nghttp2_nv trailers[] = {nv("grpc-status", "0"), nv("x-trailer", "present")};
@@ -162,6 +165,7 @@ struct EchoServer {
             const u32 mode = self->reply_mode.exchange(0);
             if (mode == 2) return NGHTTP2_ERR_CALLBACK_FAILURE;
             if (mode == 1) {
+                s->discard = true;
                 nghttp2_nv error[] = {nv(":status", "200"),
                                       nv("content-type", "application/grpc"),
                                       nv("grpc-status", "7"),
@@ -169,6 +173,7 @@ struct EchoServer {
                 return nghttp2_submit_response(session, s->id, error, 4, nullptr);
             }
             if (mode == 3) {
+                s->discard = true;
                 static char large_value[12000];
                 static bool initialized = false;
                 if (!initialized) {
@@ -228,11 +233,60 @@ struct EchoServer {
                     size_t len,
                     void* user) {
         auto* s = static_cast<EchoServer*>(user)->get(id);
-        if (!s || len > sizeof(s->data) - s->len) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (s && s->discard)
+            return nghttp2_session_consume(session, id, len) == 0 ? 0
+                                                                  : NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (!s || len > sizeof(s->data) - s->len) {
+            fprintf(stderr,
+                    "echo buffer exhausted: stream=%d buffered=%u incoming=%zu\n",
+                    id,
+                    s ? s->len : 0,
+                    len);
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
         memcpy(s->data + s->len, data, len);
         s->len += static_cast<u32>(len);
         nghttp2_session_resume_data(session, id);
         return 0;
+    }
+    static int closed(nghttp2_session* session, int32_t id, uint32_t, void* user) {
+        // A reset may abandon buffered data before read_data can consume it.
+        for (auto& stream : static_cast<EchoServer*>(user)->streams) {
+            if (stream.id == id && stream.len != 0) {
+                const u32 pending = stream.len;
+                stream.len = 0;
+                return nghttp2_session_consume_connection(session, pending) == 0
+                           ? 0
+                           : NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
+        }
+        return 0;
+    }
+    nghttp2_session* create_session() {
+        nghttp2_session_callbacks* cb = nullptr;
+        if (nghttp2_session_callbacks_new(&cb) != 0) return nullptr;
+        nghttp2_session_callbacks_set_on_frame_recv_callback(cb, &frame);
+        nghttp2_session_callbacks_set_on_header_callback(cb, &header);
+        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, &data);
+        nghttp2_session_callbacks_set_on_stream_close_callback(cb, &closed);
+        nghttp2_option* option = nullptr;
+        if (nghttp2_option_new(&option) != 0) {
+            nghttp2_session_callbacks_del(cb);
+            return nullptr;
+        }
+        // Auto WINDOW_UPDATE would acknowledge data still occupying our bounded
+        // echo buffer. Couple request credit to actual consumption instead.
+        nghttp2_option_set_no_auto_window_update(option, 1);
+        nghttp2_session* session = nullptr;
+        const int rc = nghttp2_session_server_new2(&session, cb, this, option);
+        nghttp2_option_del(option);
+        nghttp2_session_callbacks_del(cb);
+        if (rc != 0) return nullptr;
+        if (nghttp2_submit_settings(session, 0, nullptr, 0) != 0) {
+            nghttp2_session_del(session);
+            return nullptr;
+        }
+        return session;
     }
     static void* run(void* ptr) {
         auto* self = static_cast<EchoServer*>(ptr);
@@ -261,15 +315,13 @@ struct EchoServer {
                 self->saw_client_cert = peer != nullptr;
                 if (peer) X509_free(peer);
             }
-            nghttp2_session_callbacks* cb;
-            nghttp2_session_callbacks_new(&cb);
-            nghttp2_session_callbacks_set_on_frame_recv_callback(cb, &frame);
-            nghttp2_session_callbacks_set_on_header_callback(cb, &header);
-            nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, &data);
-            nghttp2_session* session;
-            nghttp2_session_server_new(&session, cb, self);
-            nghttp2_session_callbacks_del(cb);
-            nghttp2_submit_settings(session, 0, nullptr, 0);
+            nghttp2_session* session = self->create_session();
+            if (!session) {
+                if (ssl) SSL_free(ssl);
+                close(self->fd);
+                self->fd = -1;
+                continue;
+            }
             flush_session(session, self->fd, ssl);
             while (!self->stop.load()) {
                 pollfd r{self->fd, POLLIN, 0};
@@ -406,16 +458,18 @@ struct Client {
                 SSL_connect(ssl) != 1)
                 return false;
         }
-        nghttp2_session_callbacks* cb;
-        nghttp2_session_callbacks_new(&cb);
+        return init_session();
+    }
+    bool init_session() {
+        nghttp2_session_callbacks* cb = nullptr;
+        if (nghttp2_session_callbacks_new(&cb) != 0) return false;
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, &receive);
         nghttp2_session_callbacks_set_on_header_callback(cb, &header);
         nghttp2_session_callbacks_set_on_stream_close_callback(cb, &closed);
         nghttp2_session_callbacks_set_on_frame_recv_callback(cb, &frame);
         const int rc = nghttp2_session_client_new(&session, cb, this);
         nghttp2_session_callbacks_del(cb);
-        nghttp2_submit_settings(session, 0, nullptr, 0);
-        return rc == 0;
+        return rc == 0 && nghttp2_submit_settings(session, 0, nullptr, 0) == 0;
     }
     int request(u32 index,
                 u32 bytes,
@@ -760,6 +814,81 @@ void streaming_case(rut::test::TestCase* _tc,
     }
     shard->shutdown();
     if (tls_server) destroy_tls_server_context(tls_server);
+}
+
+TEST(grpc_proxy, echo_reference_backpressures_upload_until_response_window_opens) {
+    auto server = std::make_unique<EchoServer>();
+    std::unique_ptr<nghttp2_session, decltype(&nghttp2_session_del)> upstream(
+        server->create_session(), &nghttp2_session_del);
+    REQUIRE(upstream != nullptr);
+    Client client;
+    REQUIRE(client.init_session());
+    nghttp2_settings_entry blocked_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 0};
+    REQUIRE_EQ(nghttp2_submit_settings(client.session, 0, &blocked_window, 1), 0);
+    REQUIRE_EQ(client.request(0, 200000, true), 1);
+
+    auto transfer = [](nghttp2_session* from, nghttp2_session* to, bool& progress) {
+        const u8* bytes = nullptr;
+        ssize_t n;
+        while ((n = nghttp2_session_mem_send(from, &bytes)) > 0) {
+            const ssize_t received = nghttp2_session_mem_recv(to, bytes, n);
+            if (received != n) return false;
+            progress = true;
+        }
+        return n == 0;
+    };
+    auto pump = [&]() {
+        for (u32 round = 0; round < 128; ++round) {
+            bool progress = false;
+            if (!transfer(client.session, upstream.get(), progress) ||
+                !transfer(upstream.get(), client.session, progress))
+                return false;
+            if (!progress) return true;
+        }
+        return false;
+    };
+    REQUIRE(pump());
+    CHECK_EQ(client.rpcs[0].sent, 65535u);
+    CHECK_EQ(client.rpcs[0].received, 0u);
+    CHECK(!client.rpcs[0].closed);
+    const auto* buffered = server->get(1);
+    REQUIRE(buffered != nullptr);
+    CHECK_EQ(buffered->len, 65535u);
+
+    // Reopen the response window: draining echoes must release upload credit.
+    nghttp2_settings_entry open_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535};
+    REQUIRE_EQ(nghttp2_submit_settings(client.session, 0, &open_window, 1), 0);
+    REQUIRE(pump());
+    CHECK_EQ(client.rpcs[0].sent, 200000u);
+    CHECK_EQ(client.rpcs[0].received, 200000u);
+    CHECK(client.rpcs[0].response_end);
+    CHECK(client.rpcs[0].ok && client.rpcs[0].meta && client.rpcs[0].trailer);
+    CHECK_EQ(buffered->len, 0u);
+
+    // Cancelling a blocked echo must release connection credit for the next RPC.
+    REQUIRE_EQ(nghttp2_submit_settings(client.session, 0, &blocked_window, 1), 0);
+    REQUIRE_EQ(client.request(1, 200000, true), 3);
+    REQUIRE(pump());
+    REQUIRE_GT(client.rpcs[1].sent, 0u);
+    CHECK_EQ(client.rpcs[1].received, 0u);
+    REQUIRE_EQ(nghttp2_submit_rst_stream(client.session, 0, 3, NGHTTP2_CANCEL), 0);
+    REQUIRE(pump());
+    REQUIRE_EQ(nghttp2_submit_settings(client.session, 0, &open_window, 1), 0);
+    REQUIRE_EQ(client.request(2, 200000, true), 5);
+    REQUIRE(pump());
+    CHECK_EQ(client.rpcs[2].received, 200000u);
+    CHECK(client.rpcs[2].response_end && client.rpcs[2].ok && client.rpcs[2].trailer);
+
+    // Early trailers-only replies discard uploads rather than retaining credit.
+    server->reply_mode = 1;
+    REQUIRE_EQ(client.request(3, 200000, true), 7);
+    REQUIRE(pump());
+    CHECK_EQ(client.rpcs[3].status, 7u);
+    CHECK(client.rpcs[3].response_end);
+    REQUIRE_EQ(client.request(4, 200000, true), 9);
+    REQUIRE(pump());
+    CHECK_EQ(client.rpcs[4].received, 200000u);
+    CHECK(client.rpcs[4].response_end && client.rpcs[4].ok && client.rpcs[4].trailer);
 }
 
 struct GrpcDriveFixture {

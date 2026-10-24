@@ -20826,15 +20826,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
             const auto& ast_deco = route_decl.decorators[di];
             // Official built-in decorators are recognized here and lowered to
             // route metadata, not resolved to user functions. @rateLimit sets
-            // the per-route fixed-window limit (enforced in the runtime).
+            // the per-route GCRA limits (enforced in the runtime).
             if (ast_deco.name.eq({"rateLimit", 9})) {
-                // Each @rateLimit stacks one rule (caps are silently dropped past
-                // the rule-set capacity).
+                // Every configured rule must fit; dropping one weakens the policy.
                 const i32 kRuleIdx = route.rate_limit.add_rule(ast_deco.rate_limit_max,
                                                                ast_deco.rate_limit_window_sec,
                                                                ast_deco.rate_limit_burst,
                                                                ast_deco.rate_limit_scope);
-                if (kRuleIdx >= 0) route.rate_limit.rules[kRuleIdx].key = ast_deco.rate_limit_key;
+                if (kRuleIdx < 0)
+                    return frontend_error(FrontendError::TooManyItems,
+                                          ast_deco.span,
+                                          lit_str("a route supports at most 4 @rateLimit rules"));
+                route.rate_limit.rules[kRuleIdx].key = ast_deco.rate_limit_key;
                 continue;
             }
             if (ast_deco.name.eq({"throttle", 8})) {
