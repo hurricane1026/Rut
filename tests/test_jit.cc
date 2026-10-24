@@ -17,6 +17,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/rate_limit_key.h"
 #include "rut/runtime/uuid.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
@@ -7792,6 +7793,98 @@ TEST(helpers, req_query_from_request_bytes) {
         reinterpret_cast<const u8*>(req), sizeof(req) - 1, "missing", 7, &has, &ptr, &len);
     CHECK(has == 0);
     CHECK(len == 0u);
+}
+
+TEST(helpers, rate_limit_key_matches_request_extractor_identity) {
+    static const char req[] =
+        "GET /search?=rotating&UID=rotating&uid=fixed HTTP/1.1\r\n"
+        "X-Key: fixed \t\r\n"
+        "Cookie: =rotating\r\n"
+        "Cookie: SID=rotating\r\n"
+        "Cookie: sid=fixed \t\r\n"
+        "\r\n";
+    u8 has = 0;
+    const char* ptr = nullptr;
+    u32 len = 0;
+
+    rut_helper_req_header(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "X-Key", 5, &has, &ptr, &len);
+    REQUIRE(has == 1);
+    REQUIRE_EQ(len, 5u);
+    CHECK((Str{ptr, len}.eq(Str{"fixed", 5})));
+    rut_helper_req_query(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "uid", 3, &has, &ptr, &len);
+    REQUIRE(has == 1);
+    REQUIRE_EQ(len, 5u);
+    CHECK((Str{ptr, len}.eq(Str{"fixed", 5})));
+    has = 1;
+    rut_helper_req_query(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "", 0, &has, &ptr, &len);
+    CHECK(has == 0);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+    rut_helper_req_cookie(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "sid", 3, &has, &ptr, &len);
+    REQUIRE(has == 1);
+    REQUIRE_EQ(len, 5u);
+    CHECK((Str{ptr, len}.eq(Str{"fixed", 5})));
+    has = 1;
+    rut_helper_req_cookie(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "", 0, &has, &ptr, &len);
+    CHECK(has == 0);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+
+    static const char malformed[] =
+        "GET /search?uid=rotating HTTP/1.1\r\n"
+        "Bad Header\r\n"
+        "\r\n";
+    has = 1;
+    ptr = reinterpret_cast<const char*>(0x1);
+    len = 99;
+    rut_helper_req_query(
+        reinterpret_cast<const u8*>(malformed), sizeof(malformed) - 1, "uid", 3, &has, &ptr, &len);
+    CHECK(has == 0);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+
+    TestHandlerCtxFrame frame{};
+    static const char upper_name[] = "ID";
+    static const char lower_name[] = "id";
+    static const char rotating[] = "rotating";
+    static const char fixed[] = "fixed";
+    frame.ctx.route_param_count = 2;
+    frame.ctx.route_params[0] = {upper_name, 2, rotating, 8};
+    frame.ctx.route_params[1] = {lower_name, 2, fixed, 5};
+    rut_helper_req_param(&frame.ctx, "id", 2, &ptr, &len);
+    REQUIRE_EQ(len, 5u);
+    CHECK((Str{ptr, len}.eq(Str{"fixed", 5})));
+
+    RateLimitKeyInput input{};
+    input.req_buf = reinterpret_cast<const u8*>(req);
+    input.req_header_end = sizeof(req) - 1;
+    input.params = frame.ctx.route_params;
+    input.param_count = frame.ctx.route_param_count;
+    RateLimitKeyComponent components[4]{};
+    components[0].kind = RateLimitKeyKind::Header;
+    components[0].set_name("X-Key", 5);
+    components[1].kind = RateLimitKeyKind::Query;
+    components[1].set_name("uid", 3);
+    components[2].kind = RateLimitKeyKind::Cookie;
+    components[2].set_name("sid", 3);
+    components[3].kind = RateLimitKeyKind::Param;
+    components[3].set_name("id", 2);
+    const u64 key = rate_limit_key(0, components, 4, input);
+
+    static const char canonical[] =
+        "GET /search?uid=fixed HTTP/1.1\r\n"
+        "X-Key: fixed\r\n"
+        "Cookie: sid=fixed\r\n"
+        "\r\n";
+    RateLimitKeyInput canonical_input = input;
+    canonical_input.req_buf = reinterpret_cast<const u8*>(canonical);
+    canonical_input.req_header_end = sizeof(canonical) - 1;
+    CHECK_EQ(key, rate_limit_key(0, components, 4, canonical_input));
 }
 
 TEST(helpers, req_query_ignores_fragment_suffix) {

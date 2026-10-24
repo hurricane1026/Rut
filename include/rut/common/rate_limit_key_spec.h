@@ -121,9 +121,9 @@ struct RateLimitRuleSet {
 // an HTTP/2 request whose HTTP/1 synthesis overflowed its scratch buffer — must
 // reject rather than meter with an empty buffer, which would extract every such
 // component as empty and collapse distinct callers into one shared bucket.
-// IP and route-param keys don't read the buffer; query keys fall back to the
-// separately-supplied request path (RateLimitKeyInput::path) — so none of those
-// force a reject.
+// IP and route-param keys don't read the buffer; query keys may fall back to a
+// separately-supplied request path (RateLimitKeyInput::path) only when its
+// producer marks that path trusted (for example a validated HTTP/2 :path).
 inline bool rate_limit_needs_req_buf(const RateLimitRuleSet& rs) {
     for (u8 i = 0; i < rs.count; i++) {
         const RateLimitKeySpec& k = rs.rules[i].key;

@@ -2,6 +2,7 @@
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
 #include "fault_injection.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/http2_conn.h"
@@ -16123,6 +16124,141 @@ TEST(rate_limit_key, query_uses_full_target_not_capped_path) {
     no_buf.req_buf = nullptr;
     no_buf.req_header_end = 0;
     CHECK(query_value(no_buf, "uid", 3).empty());
+}
+
+TEST(rate_limit_key, extractor_normalization_matches_h1_and_h2) {
+    using namespace rut;
+    using namespace rut::rl_detail;
+
+    const char* raw =
+        "GET /p?=rotating&UID=rotating&uid=fixed HTTP/1.1\r\n"
+        "X-Key: fixed \t\r\n"
+        "Cookie: =rotating\r\n"
+        "Cookie: SID=rotating\r\n"
+        "Cookie: sid=fixed \t\r\n"
+        "\r\n";
+    const char* canonical =
+        "GET /p?uid=fixed HTTP/1.1\r\n"
+        "X-Key: fixed\r\n"
+        "Cookie: sid=fixed\r\n"
+        "\r\n";
+    RateLimitKeyInput in = make_key_input(raw, "/p?uid=fixed", nullptr, 0);
+    RateLimitKeyInput expected = make_key_input(canonical, "/p?uid=fixed", nullptr, 0);
+    RouteParam params[] = {{"ID", 2, "rotating", 8}, {"id", 2, "fixed", 5}};
+    in.params = params;
+    in.param_count = 2;
+    expected.params = params + 1;
+    expected.param_count = 1;
+
+    RateLimitKeyComponent query{};
+    query.kind = RateLimitKeyKind::Query;
+    query.set_name("uid", 3);
+    RateLimitKeyComponent cookie{};
+    cookie.kind = RateLimitKeyKind::Cookie;
+    cookie.set_name("sid", 3);
+    RateLimitKeyComponent header{};
+    header.kind = RateLimitKeyKind::Header;
+    header.set_name("X-Key", 5);
+    RateLimitKeyComponent param{};
+    param.kind = RateLimitKeyKind::Param;
+    param.set_name("id", 2);
+    RateLimitKeyComponent empty_query{};
+    empty_query.kind = RateLimitKeyKind::Query;
+    empty_query.set_name("", 0);
+    RateLimitKeyComponent empty_cookie{};
+    empty_cookie.kind = RateLimitKeyKind::Cookie;
+    empty_cookie.set_name("", 0);
+
+    HttpParser parser;
+    ParsedRequest parsed{};
+    REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(raw), in.req_header_end, &parsed),
+               ParseStatus::Complete);
+    REQUIRE_EQ(parsed.header_count, 4u);
+    CHECK(parsed.headers[0].value.eq(Str{"fixed", 5}));
+
+    // Case-distinct query/cookie decoys do not steer the exact-name key, and
+    // trailing header/cookie OWS does not create a second bucket.
+    CHECK(query_value(in, "uid", 3).eq(Str{"fixed", 5}));
+    CHECK(cookie_value(in, "sid", 3).eq(Str{"fixed", 5}));
+    CHECK(header_value(in, "x-key", 5).eq(Str{"fixed", 5}));
+    CHECK(param_value(in, "id", 2).eq(Str{"fixed", 5}));
+    CHECK(query_value(in, "", 0).empty());
+    CHECK(cookie_value(in, "", 0).empty());
+    CHECK_EQ(rate_limit_key(0, &query, 1, in), rate_limit_key(0, &query, 1, expected));
+    CHECK_EQ(rate_limit_key(0, &cookie, 1, in), rate_limit_key(0, &cookie, 1, expected));
+    CHECK_EQ(rate_limit_key(0, &header, 1, in), rate_limit_key(0, &header, 1, expected));
+    CHECK_EQ(rate_limit_key(0, &param, 1, in), rate_limit_key(0, &param, 1, expected));
+
+    const char* missing = "GET /p HTTP/1.1\r\n\r\n";
+    const char* empty = "GET /p HTTP/1.1\r\nX-Key:\r\n\r\n";
+    RateLimitKeyInput missing_in = make_key_input(missing, "/p", nullptr, 0);
+    RateLimitKeyInput empty_in = make_key_input(empty, "/p", nullptr, 0);
+    CHECK_EQ(rate_limit_key(0, &header, 1, missing_in), rate_limit_key(0, &header, 1, empty_in));
+    CHECK_EQ(rate_limit_key(0, &empty_query, 1, in),
+             rate_limit_key(0, &empty_query, 1, missing_in));
+    CHECK_EQ(rate_limit_key(0, &empty_cookie, 1, in),
+             rate_limit_key(0, &empty_cookie, 1, missing_in));
+
+    // HTTP/2's multiple Cookie fields are synthesized into one HTTP/1 field;
+    // exercise that view as well as the direct HTTP/1 request above.
+    const hpack::Header h2_headers[] = {{{":method", 7}, {"GET", 3}},
+                                        {{":path", 5}, {"/p?=rotating&UID=rotating&uid=fixed", 35}},
+                                        {{"x-key", 5}, {"fixed \t", 7}},
+                                        {{"cookie", 6}, {"SID=rotating", 12}},
+                                        {{"cookie", 6}, {"sid=fixed \t", 11}}};
+    u8 synth[512]{};
+    const u32 synth_len = h2_synth_h1_request(h2_headers, 5, synth, sizeof synth - 1);
+    REQUIRE(synth_len > 0);
+    synth[synth_len] = 0;
+    RateLimitKeyInput h2 = make_key_input(
+        reinterpret_cast<const char*>(synth), "/p?UID=rotating&uid=fixed", nullptr, 0);
+    CHECK(header_value(h2, "x-key", 5).eq(Str{"fixed", 5}));
+    CHECK(cookie_value(h2, "sid", 3).eq(Str{"fixed", 5}));
+    CHECK_EQ(rate_limit_key(0, &query, 1, h2), rate_limit_key(0, &query, 1, expected));
+    CHECK_EQ(rate_limit_key(0, &cookie, 1, h2), rate_limit_key(0, &cookie, 1, expected));
+    CHECK_EQ(rate_limit_key(0, &header, 1, h2), rate_limit_key(0, &header, 1, expected));
+}
+
+TEST(rate_limit_key, malformed_h1_recovered_path_is_untrusted) {
+    using namespace rut;
+    using namespace rut::rl_detail;
+
+    Connection conn{};
+    conn.reset();
+    u8 storage[256]{};
+    conn.bind_request_receive_buffer(storage, sizeof(storage));
+    static constexpr char malformed[] =
+        "GET /p?uid=A HTTP/1.1\r\n"
+        "Bad Header\r\n"
+        "\r\n";
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(malformed), sizeof(malformed) - 1u),
+               sizeof(malformed) - 1u);
+    capture_request_metadata(conn);
+    REQUIRE_EQ(conn.req_header_end, 0u);
+
+    u32 path_len = 0;
+    while (path_len < Connection::kMaxReqPathLen && conn.req_path[path_len] != '\0') path_len++;
+    RateLimitKeyInput recovered{};
+    recovered.req_buf = conn.recv_buf.data();
+    recovered.req_header_end = conn.req_header_end;
+    recovered.path = conn.req_path;
+    recovered.path_len = path_len;
+    recovered.path_is_trusted = false;
+    CHECK(query_value(recovered, "uid", 3).empty());
+
+    RateLimitKeyComponent query{};
+    query.kind = RateLimitKeyKind::Query;
+    query.set_name("uid", 3);
+    const u64 recovered_key = rate_limit_key(0, &query, 1, recovered);
+
+    static constexpr char canonical[] = "GET /p?uid=A HTTP/1.1\r\n\r\n";
+    const RateLimitKeyInput valid = make_key_input(canonical, "/p?uid=A", nullptr, 0);
+    CHECK(recovered_key != rate_limit_key(0, &query, 1, valid));
+
+    RateLimitKeyInput trusted = recovered;
+    trusted.path_is_trusted = true;
+    CHECK(query_value(trusted, "uid", 3).eq(Str{"A", 1}));
+    CHECK_EQ(rate_limit_key(0, &query, 1, trusted), rate_limit_key(0, &query, 1, valid));
 }
 
 TEST(rate_limit_key, composition) {

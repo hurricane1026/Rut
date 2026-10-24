@@ -388,6 +388,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         key_input.req_header_end = request_header_end(scenario.request_data, scenario.request_len);
         key_input.path = connection.connection.req_path;
         key_input.path_len = routing_path.len;
+        key_input.path_is_trusted = false;
         key_input.params = route_params;
         key_input.param_count = route_param_count;
         rate_limited = rate_limit_exceeded_with_limiters(*rate_limiter,

@@ -1287,6 +1287,44 @@ TEST(harness_scenario, rate_limit_state_obeys_group_and_run_isolation) {
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, query_key_without_raw_request_does_not_use_scenario_path) {
+    TempSource source;
+    REQUIRE(
+        source.write("@rateLimit(limit: 1, window: 1m, by: query(\"uid\"))\n"
+                     "route GET \"/limited\" { return 204 }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    harness::ScenarioState state{};
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.method = kRouteMethodGet;
+    scenario.peer_addr = 0x0a00002au;
+    scenario.now_us = 100;
+    scenario.state_isolation = harness::StateIsolation::Group;
+    scenario.state_group = 1;
+    scenario.state = &state;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+
+    static constexpr char first_path[] = "/limited?uid=A";
+    scenario.path = {first_path, sizeof(first_path) - 1u};
+    const auto first = harness::drive_scenario(scenario, spec);
+    static constexpr char second_path[] = "/limited?uid=B";
+    scenario.path = {second_path, sizeof(second_path) - 1u};
+    const auto second = harness::drive_scenario(scenario, spec);
+    REQUIRE(first.has_terminal);
+    REQUIRE(second.has_terminal);
+    CHECK_EQ(first.terminal.status_code, 204);
+    CHECK_EQ(second.terminal.status_code, 429);
+    state.reset();
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, reprepare_changes_shared_state_generation) {
     TempSource source;
     REQUIRE(

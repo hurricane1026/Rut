@@ -1711,6 +1711,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         key_in.req_header_end = kRlLen;
         key_in.path = req.path.ptr;  // :path fallback for query keys on overflow
         key_in.path_len = req.path.len;
+        key_in.path_is_trusted = true;  // decoded and validated HTTP/2 :path
         key_in.params = params;
         key_in.param_count = param_count;
         if (rate_limit_exceeded(

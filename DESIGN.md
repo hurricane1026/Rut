@@ -6785,6 +6785,19 @@ limited to 32 bytes. A longer name is a compile-time error at the name literal,
 not a truncated lookup. The native key-spec builder also rejects it without
 appending a component.
 
+Key extraction follows the corresponding request accessors: header names are
+case-insensitive and optional whitespace around values is ignored; query,
+cookie, and route-parameter names are exact byte matches. Query and cookie
+lookups use the first matching field in request order (including all Cookie
+fields), and cookie names/values ignore optional whitespace around their tokens.
+Missing and explicitly empty values intentionally share the documented
+unattributed bucket.
+Query extraction uses the validated raw request target when available; a
+separately supplied path is used only when its producer explicitly marks it
+trusted (for example, a validated HTTP/2 `:path`). Recovered paths from
+malformed HTTP/1 metadata and synthetic harness routing fields are not trusted
+fallbacks.
+
 The built-in shard limiter has 8192 direct-mapped slots. A colliding new key
 is rejected until the previous bucket fully recovers (`tat <= now`); it cannot
 reset active state to obtain fresh burst credit. This is conservative capacity
