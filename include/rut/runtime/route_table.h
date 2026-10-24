@@ -1401,7 +1401,7 @@ public:
     // (IP / header / query / cookie / param). With no components a rule meters
     // per client IP; each appended component adds a dimension, so it counts per
     // unique tuple. `name` is ignored for Ip. Returns false on a bad index, when
-    // the route has no rule yet, or when that rule's key is already full.
+    // the route has no rule yet, the key is full, or a name exceeds 32 bytes.
     bool add_route_rate_limit_key(u32 idx, RateLimitKeyKind kind, const char* name, u32 name_len) {
         if (idx >= route_count) return false;
         RateLimitRuleSet& rs = routes[idx].rate_limit;

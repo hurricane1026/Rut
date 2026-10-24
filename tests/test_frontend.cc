@@ -3213,6 +3213,66 @@ TEST(frontend, rate_limit_preserves_four_rules_per_route) {
     CHECK_EQ(hir.value().routes[1].rate_limit.rules[0].max, 50u);
 }
 
+TEST(frontend, rate_limit_key_rejects_overlong_names) {
+    const char* sources[] = {"header", "query", "cookie", "param"};
+    for (const char* kind : sources) {
+        const std::string source = std::string("@rateLimit(limit: 1, window: 1m, by: ") + kind +
+                                   R"rut(("abcdefghijklmnopqrstuvwxyz1234567"))
+route GET "/x" { return 200 }
+)rut";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK(!ast);
+        if (!ast) {
+            CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+            CHECK_EQ(ast.error().span.line, 1u);
+            CHECK(ast.error().detail.eq(lit("rate-limit key names must be at most 32 bytes")));
+        }
+    }
+}
+
+TEST(frontend, rate_limit_key_preserves_boundary_names_through_lowering) {
+    const char* sources[] = {"header", "query", "cookie", "param"};
+    const Str name = lit("abcdefghijklmnopqrstuvwxyz123456");
+    for (const char* kind : sources) {
+        const std::string source = std::string("@rateLimit(limit: 1, window: 1m, by: ") + kind +
+                                   R"rut(("abcdefghijklmnopqrstuvwxyz123456"))
+route GET "/x" { return 200 }
+)rut";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE_EQ(rir.module.func_count, 1u);
+        const auto& spec = rir.module.functions[0].rate_limit.rules[0].key;
+        REQUIRE_EQ(spec.count, 1u);
+        CHECK((Str{spec.comps[0].name, spec.comps[0].name_len}.eq(name)));
+        rir.destroy();
+    }
+}
+
+TEST(frontend, rate_limit_key_spec_does_not_truncate_failed_add) {
+    RateLimitKeySpec spec{};
+    const char* name = "abcdefghijklmnopqrstuvwxyz1234567";
+    CHECK(!spec.add(RateLimitKeyKind::Header, name, 33));
+    CHECK_EQ(spec.count, 0u);
+    REQUIRE(spec.add(RateLimitKeyKind::Header, name, 32));
+    CHECK_EQ(spec.count, 1u);
+    CHECK_EQ(spec.comps[0].name_len, 32u);
+    CHECK(!spec.add(RateLimitKeyKind::Query, nullptr, 1));
+    CHECK_EQ(spec.count, 1u);
+    CHECK(!spec.comps[0].set_name(name, 33));
+    CHECK_EQ(spec.comps[0].name_len, 32u);
+    CHECK((Str{spec.comps[0].name, spec.comps[0].name_len}.eq({name, 32})));
+}
+
 TEST(frontend, cache_decl_rejects_overlong_name) {
     // The runtime descriptor truncates names at 31 bytes and the reload
     // identity hashes the stored name — overlong names are rejected.

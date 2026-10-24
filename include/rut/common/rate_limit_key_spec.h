@@ -26,10 +26,11 @@ struct RateLimitKeyComponent {
     u8 name_len = 0;
     char name[kMaxName] = {};
 
-    void set_name(const char* s, u32 n) {
-        if (n > kMaxName) n = kMaxName;
+    bool set_name(const char* s, u32 n) {
+        if (n > kMaxName || (n != 0 && s == nullptr)) return false;
         name_len = static_cast<u8>(n);
         for (u32 i = 0; i < n; i++) name[i] = s[i];
+        return true;
     }
 };
 
@@ -44,10 +45,10 @@ struct RateLimitKeySpec {
 
     bool add(RateLimitKeyKind kind, const char* name, u32 name_len) {
         if (count >= kMaxRateLimitKeyComponents) return false;
-        comps[count].kind = kind;
-        comps[count].name_len = 0;
-        if (kind != RateLimitKeyKind::Ip && name) comps[count].set_name(name, name_len);
-        count++;
+        RateLimitKeyComponent component{};
+        component.kind = kind;
+        if (kind != RateLimitKeyKind::Ip && !component.set_name(name, name_len)) return false;
+        comps[count++] = component;
         return true;
     }
 };

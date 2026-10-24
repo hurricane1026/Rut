@@ -874,6 +874,11 @@ limiter. If a runtime caller omits it, enforcement fails closed with 429 before
 spending any other rule's budget; it never falls back to per-shard enforcement.
 Disabled rules do not require shared state. Normal `rut` startup supplies it.
 
+Names in rate-limit `by: header/query/cookie/param("name")` components are
+limited to 32 bytes. A longer name is a compile-time error at the name literal,
+not a truncated lookup. The native key-spec builder also rejects it without
+appending a component.
+
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)
 
