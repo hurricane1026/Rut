@@ -48,6 +48,8 @@ constexpr Field kName = RUT_FIELD("name");
 constexpr Field kAddress = RUT_FIELD("address");
 constexpr Field kFilterChains = RUT_FIELD2("filter_chains", "filterChains");
 constexpr Field kSocketAddress = RUT_FIELD2("socket_address", "socketAddress");
+constexpr Field kProtocol = RUT_FIELD("protocol");
+constexpr Field kLbPolicy = RUT_FIELD2("lb_policy", "lbPolicy");
 constexpr Field kPortValue = RUT_FIELD2("port_value", "portValue");
 constexpr Field kFilters = RUT_FIELD("filters");
 constexpr Field kTypedConfig = RUT_FIELD2("typed_config", "typedConfig");
@@ -242,6 +244,25 @@ private:
 
     // ── Leaf value parsers ───────────────────────────────────────────
 
+    // These fields have a single supported effective value. Preserve the
+    // omitted-field behavior while accepting its explicit ProtoJSON enum form.
+    FrontendResult<bool> default_enum(u32 object, Field field, Str name, Str detail) {
+        auto value = optional(object, field);
+        if (!value) return core::make_unexpected(value.error());
+        if (value.value() == kJsonNoNode) return true;
+        const JsonNode& node = doc_.at(value.value());
+        if (node.kind == JsonKind::String) {
+            auto text = plain_string(value.value(), detail);
+            if (!text) return core::make_unexpected(text.error());
+            if (text.value().eq(name)) return true;
+            return unsupported(node.span, detail);
+        }
+        u32 number = 0;
+        if (!json_u32(node, &number)) return invalid(node.span, detail);
+        if (number == 0u) return true;
+        return unsupported(node.span, detail);
+    }
+
     FrontendResult<bool> parse_socket_address(u32 address_node, SocketAddress* out) {
         auto ok = expect_object(address_node, lit_str("address must be an object"));
         if (!ok) return ok;
@@ -252,8 +273,14 @@ private:
         if (!socket) return core::make_unexpected(socket.error());
         ok = expect_object(socket.value(), lit_str("socket_address must be an object"));
         if (!ok) return ok;
-        const Field allowed_socket[] = {kAddress, kPortValue};
-        if (auto r = reject_unknown(socket.value(), allowed_socket, 2u); !r) return r;
+        const Field allowed_socket[] = {kAddress, kPortValue, kProtocol};
+        if (auto r = reject_unknown(socket.value(), allowed_socket, 3u); !r) return r;
+        if (auto r = default_enum(socket.value(),
+                                  kProtocol,
+                                  lit_str("TCP"),
+                                  lit_str("socket_address.protocol must be TCP or integer 0"));
+            !r)
+            return r;
 
         auto address =
             required(socket.value(), kAddress, lit_str("socket_address.address is required"));
@@ -956,8 +983,14 @@ private:
     FrontendResult<bool> parse_cluster(u32 node, Cluster* out) {
         auto ok = expect_object(node, lit_str("cluster must be an object"));
         if (!ok) return ok;
-        const Field allowed[] = {kName, kType, kConnectTimeout, kLoadAssignment};
-        if (auto r = reject_unknown(node, allowed, 4u); !r) return r;
+        const Field allowed[] = {kName, kType, kConnectTimeout, kLoadAssignment, kLbPolicy};
+        if (auto r = reject_unknown(node, allowed, 5u); !r) return r;
+        if (auto r = default_enum(node,
+                                  kLbPolicy,
+                                  lit_str("ROUND_ROBIN"),
+                                  lit_str("lb_policy must be ROUND_ROBIN or integer 0"));
+            !r)
+            return r;
         out->span = doc_.at(node).span;
 
         auto name = required(node, kName, lit_str("cluster name is required"));

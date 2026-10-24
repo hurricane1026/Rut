@@ -24,6 +24,7 @@ static constexpr u32 kMaxEnvoyClusters = 8;
 // Every proto3 JSON field is accepted in both its lowerCamelCase and its
 // snake_case spelling. Both spellings present at once is a duplicate-field
 // diagnostic.
+// Effective transport is always TCP: protocol may be omitted, "TCP", or integer 0.
 struct SocketAddress {
     // Host byte order; 0 is the IPv4 wildcard.
     u32 ipv4_host = 0;
@@ -275,6 +276,8 @@ struct Endpoint {
     Span span{};
 };
 
+// Effective load balancing is always ROUND_ROBIN: lb_policy/lbPolicy may be
+// omitted, "ROUND_ROBIN", or integer 0. Other policies are rejected while parsing.
 struct Cluster {
     Str name{};
     Span name_span{};

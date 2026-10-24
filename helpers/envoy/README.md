@@ -24,3 +24,8 @@ build the binary is `build/helpers/envoy/rut-envoy-convert`.
 Run the emitted program separately with `build/src/rut gateway.rut`.
 See [conversion scope](../../docs/envoy-converter.md) and the
 [compatibility matrix](../../docs/envoy-compatibility.md) for remaining limits.
+
+The supported IPv4 TCP addresses accept `protocol: "TCP"` or `protocol: 0`
+explicitly, and clusters accept `lb_policy: "ROUND_ROBIN"` (also `lbPolicy`)
+or integer `0`. These spell the existing defaults and emit the same Rut source
+as omission. Other transports and load-balancing policies remain rejected.

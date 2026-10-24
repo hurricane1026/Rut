@@ -1423,6 +1423,42 @@ TEST(envoy_convert, cli_milestone_s_converts) {
     CHECK_EQ(result.out, std::string(kEnvoyMilestoneSGolden));
 }
 
+TEST(envoy_convert, explicit_tcp_and_round_robin_keep_golden_output) {
+    const TempDir directory;
+    REQUIRE(directory.ok());
+    const std::string path = directory.path() + "/explicit-defaults.json";
+    for (const char* protocol : {"\"TCP\"", "0"}) {
+        for (const char* policy : {"\"ROUND_ROBIN\"", "0"}) {
+            for (const char* key : {"lb_policy", "lbPolicy"}) {
+                std::string text = milestone_s_json();
+                const std::string socket =
+                    std::string("\"socket_address\": {\"protocol\": ") + protocol + ", ";
+                REQUIRE(replace_first(&text, "\"socket_address\": {", socket));
+                // Skip the listener occurrence already rewritten above.
+                const size_t endpoint =
+                    text.find("\"socket_address\": {", text.find(socket) + socket.size());
+                REQUIRE(endpoint != std::string::npos);
+                text.replace(endpoint, std::string("\"socket_address\": {").size(), socket);
+                REQUIRE(replace_first(
+                    &text,
+                    "\"name\": \"backend\",",
+                    std::string("\"name\": \"backend\", \"") + key + "\": " + policy + ","));
+                static envoy::JsonDocument doc;
+                auto parsed = envoy::parse_bootstrap_json(str(text), doc);
+                REQUIRE(parsed);
+                auto lowered = lower_heap(parsed.value());
+                REQUIRE(*lowered);
+                CHECK(lowered->value().view().eq(lit_str(kEnvoyMilestoneSGolden)));
+                REQUIRE(write_file(path, text));
+                const RunResult result = run_converter(g_executable, path);
+                REQUIRE(WIFEXITED(result.status));
+                CHECK_EQ(WEXITSTATUS(result.status), 0);
+                CHECK_EQ(result.out, std::string(kEnvoyMilestoneSGolden));
+            }
+        }
+    }
+}
+
 // ── API-level capability gating ───────────────────────────────────────
 
 TEST(envoy_convert, blocked_without_suppress_envoy_headers) {

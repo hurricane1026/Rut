@@ -248,8 +248,9 @@ not at the enclosing object.
 
 The first parser increment represents, but does not yet lower:
 
-- exactly one listener with one `socket_address`, IPv4 literal, TCP, no
-  `additional_addresses`, no `listener_filters`, no `transport_socket`;
+- exactly one listener with one `socket_address`, IPv4 literal, TCP (`protocol`
+  omitted, `"TCP"`, or integer `0`), no `additional_addresses`, no
+  `listener_filters`, no `transport_socket`;
 - exactly one filter chain with no `filter_chain_match`, containing exactly one
   network filter, which must be the HTTP connection manager;
 - HCM: `stat_prefix`, inline `route_config`, `generate_request_id: false`,
@@ -267,11 +268,19 @@ The first parser increment represents, but does not yet lower:
   `load_assignment.cluster_name` required and equal to the cluster `name`
   (Envoy's v3 `ClusterLoadAssignment.cluster_name` has `min_len: 1`, so an
   omitted value is a validation error, not the empty string), one locality
-  with one `lb_endpoints` entry with an IPv4 `socket_address`, no `lb_policy`
-  field at all (only omission is supported; Envoy's default for an omitted
-  `lb_policy` is `ROUND_ROBIN`), no `health_checks`, no
-  `circuit_breakers`, no `outlier_detection`, no `transport_socket`, no
+  with one `lb_endpoints` entry with an IPv4 `socket_address` whose `protocol`
+  is omitted, `"TCP"`, or integer `0`. `lb_policy`/`lbPolicy` may be omitted,
+  `"ROUND_ROBIN"`, or integer `0`; other policies remain unsupported. No
+  `health_checks`, no `circuit_breakers`, no `outlier_detection`, no `transport_socket`, no
   `typed_extension_protocol_options`.
+
+Explicit default protocol and load-balancing values produce byte-identical Rut
+source to omission. This accepts existing Envoy TCP/round-robin configuration;
+it does not add UDP, weighted balancing, or multiple endpoints. Unsupported enum
+names/numbers and malformed enum JSON fail at the value span; duplicate
+`lb_policy`/`lbPolicy` aliases remain errors. The defaults follow the pinned
+[v1.39.1 SocketAddress](https://www.envoyproxy.io/docs/envoy/v1.39.1/api-v3/config/core/v3/address.proto.html)
+and [Cluster API](https://www.envoyproxy.io/docs/envoy/v1.39.1/api-v3/config/cluster/v3/cluster.proto.html).
 
 Every unknown field, duplicate key, unknown `@type`, unsupported enum value,
 `Any` without `@type`, and every field outside this list produces a
