@@ -6780,6 +6780,14 @@ Missing shared state is a fail-closed configuration failure: HTTP/1 and HTTP/2
 return 429 without spending other rules' budget. It must not weaken enforcement
 by falling back to shard scope; disabled rules need no shared instance.
 
+Stacked built-in rules meter each request attempt independently. Enforcement
+checks every active rule even if an earlier rule rejects: each conforming rule
+consumes one token, with no rollback when the final response is 429. A rule
+already over limit does not advance its own GCRA timestamp or accumulate debt.
+The request passes only when every rule passes. Disabled rules consume nothing;
+a missing required global limiter fails preflight without spending any budget.
+This does not change the policy chosen by Rut code over Cache.
+
 Source (`@rateLimit` is top-level route metadata, not a user helper):
 ```swift
 @rateLimit(limit: 100, window: 1m)
