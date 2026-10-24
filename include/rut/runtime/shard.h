@@ -386,7 +386,8 @@ struct Shard {
             return core::make_unexpected(Error::make(EEXIST, Error::Source::Thread));
         // Validate before seeding so a rejected config is never left installed.
         const RouteConfig* seed = active_config ? active_config : route_config;
-        if (seed != nullptr && !seed->forward_policy_tables_valid())
+        if (seed != nullptr &&
+            (!seed->rate_limit_ids_valid() || !seed->forward_policy_tables_valid()))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
         active_config = seed;
 
@@ -466,9 +467,11 @@ struct Shard {
     }
 
     // Skips only the timer-shard check. A config whose forward policy tables
-    // fail full validation is still refused (returns false, nothing installed).
+    // or rate-limit namespaces fail full validation is still refused (returns
+    // false, nothing installed).
     bool reload_config_unchecked(const RouteConfig* cfg) {
-        if (cfg != nullptr && !cfg->forward_policy_tables_valid()) return false;
+        if (cfg != nullptr && (!cfg->rate_limit_ids_valid() || !cfg->forward_policy_tables_valid()))
+            return false;
         if (!thread_spawned) {
             // No thread — direct apply. The running path's poll_command() drains
             // the idle pool on every config adopt; this not-running path must do

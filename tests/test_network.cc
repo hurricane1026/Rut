@@ -15980,6 +15980,7 @@ TEST(rate_limit, exceeded_helper_meters_and_isolates) {
     struct NoGlobalLoop {
         RateLimiter rate_limiter{};
     } loop;  // no global_rl member → shard-only limiter
+    const u64 ids[kMaxRateLimitRules] = {1, 2, 3, 4};
     RateLimitRuleSet rules;
     rules.count = 1;
     rules.rules[0].emit_interval_us = 10;
@@ -15991,17 +15992,18 @@ TEST(rate_limit, exceeded_helper_meters_and_isolates) {
 
     // No rules → never exceeded.
     RateLimitRuleSet none;
-    CHECK(!rate_limit_exceeded(&loop, none, 0, in, 1000));
+    CHECK(!rate_limit_exceeded(&loop, none, ids, in, 1000));
 
     // Fresh bucket admits a burst of 3 at the same instant, then trips. This is
     // the shared logic the HTTP/1 and HTTP/2 dispatch paths both call.
-    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
-    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
-    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
-    CHECK(rate_limit_exceeded(&loop, rules, 0, in, 1000));  // 4th → over the burst
+    CHECK(!rate_limit_exceeded(&loop, rules, ids, in, 1000));
+    CHECK(!rate_limit_exceeded(&loop, rules, ids, in, 1000));
+    CHECK(!rate_limit_exceeded(&loop, rules, ids, in, 1000));
+    CHECK(rate_limit_exceeded(&loop, rules, ids, in, 1000));  // 4th → over the burst
 
-    // A different route index folds into a separate bucket scope.
-    CHECK(!rate_limit_exceeded(&loop, rules, 1, in, 1000));
+    // A different semantic route namespace gets a separate bucket scope.
+    const u64 other_ids[kMaxRateLimitRules] = {11, 12, 13, 14};
+    CHECK(!rate_limit_exceeded(&loop, rules, other_ids, in, 1000));
 }
 
 TEST(global_rate_limit, token_bucket_shared) {
@@ -16158,6 +16160,8 @@ TEST(rate_limit_key, composition) {
 
     // Different route → different key (route folded in).
     CHECK(rate_limit_key(0, hdr, 1, a) != rate_limit_key(1, hdr, 1, a));
+    // The semantic namespace is u64; high bits must not be truncated.
+    CHECK(rate_limit_key(1ull, hdr, 1, a) != rate_limit_key(1ull | (1ull << 32), hdr, 1, a));
 }
 
 TEST(route, add_route_rate_limit_key) {

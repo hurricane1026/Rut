@@ -2809,8 +2809,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         key_in.path_len = path_len;
         key_in.params = route_params;
         key_in.param_count = route_param_count;
-        const u32 kRouteIdx = static_cast<u32>(route - config->routes);
-        if (rate_limit_exceeded(loop, route->rate_limit, kRouteIdx, key_in, monotonic_us())) {
+        if (rate_limit_exceeded(
+                loop, route->rate_limit, route->rate_limit_ids, key_in, monotonic_us())) {
             conn.resp_status = 429;
             format_static_response(conn,
                                    429,

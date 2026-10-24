@@ -165,17 +165,18 @@ inline Str param_value(const RateLimitKeyInput& in, const char* name, u32 name_l
 
 }  // namespace rl_detail
 
-// Compute the u64 metering key for a request: route_idx folded with each
-// component's extracted value. With no components, keys by client IP (the
-// historical default). A 1-byte separator per component keeps ("ab","c") and
-// ("a","bc") distinct. Never returns 0 (the RateLimiter's empty-slot sentinel).
-inline u64 rate_limit_key(u32 route_idx,
+// Compute the u64 metering key for a request: the full semantic rate-limit
+// namespace folded with each component's extracted value. With no components,
+// keys by client IP (the historical default). A 1-byte separator per component
+// keeps ("ab","c") and ("a","bc") distinct. Never returns 0 (the
+// RateLimiter's empty-slot sentinel).
+inline u64 rate_limit_key(u64 rate_limit_id,
                           const RateLimitKeyComponent* comps,
                           u32 comp_count,
                           const RateLimitKeyInput& in) {
     using namespace rl_detail;
     u64 h = 14695981039346656037ull;  // FNV-1a/64 offset basis
-    h = mix(h, &route_idx, sizeof route_idx);
+    h = mix(h, &rate_limit_id, sizeof rate_limit_id);
     if (comp_count == 0) {
         h = mix(h, &in.peer_addr, sizeof in.peer_addr);
     } else {

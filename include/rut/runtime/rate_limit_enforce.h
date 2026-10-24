@@ -15,10 +15,13 @@ namespace rut {
 inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
                                               GlobalRateLimiter* global_rate_limiter,
                                               const RateLimitRuleSet& rules,
-                                              u32 route_idx,
+                                              const u64* rate_limit_ids,
                                               const RateLimitKeyInput& key_in,
                                               u64 now_us) {
     if (rules.count == 0) return false;
+    if (rate_limit_ids == nullptr) return true;
+    for (u32 ri = 0; ri < rules.count; ++ri)
+        if (rules.rules[ri].emit_interval_us != 0 && rate_limit_ids[ri] == 0) return true;
     // Validate shared state before spending any earlier shard-rule budget.
     if (global_rate_limiter == nullptr) {
         for (u32 ri = 0; ri < rules.count; ++ri) {
@@ -30,8 +33,7 @@ inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
     for (u32 ri = 0; ri < rules.count; ri++) {
         const RateLimitRule& rule = rules.rules[ri];
         if (rule.emit_interval_us == 0) continue;
-        const u32 kScope = route_idx * kMaxRateLimitRules + ri;
-        const u64 kKey = rate_limit_key(kScope, rule.key.comps, rule.key.count, key_in);
+        const u64 kKey = rate_limit_key(rate_limit_ids[ri], rule.key.comps, rule.key.count, key_in);
         const bool kOk =
             (rule.scope == RateLimitScope::Global)
                 ? global_rate_limiter->allow_key(kKey, rule.emit_interval_us, rule.tau_us, now_us)
@@ -49,22 +51,22 @@ inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
 // request. Rejected GCRA rules do not advance their own timestamp; no rule is
 // refunded. Missing required shared state is a preflight failure, not a metered
 // request attempt. The limiter is
-// per-shard (one thread each), so a thread_local table needs no atomics. Both
-// dispatch paths run on the same shard thread with the same Loop type, so they
-// resolve to one shared limiter instance. Global-scope rules go to the
+// per-shard (one thread each), so the loop-owned table needs no atomics. Both
+// dispatch paths run on the same shard thread and use the same Loop-owned
+// limiter instance. Global-scope rules go to the
 // process-shared GlobalRateLimiter. An active global rule without that shared
 // instance fails closed (429) before any rule consumes budget. Disabled global
 // rules need no instance.
 template <typename Loop>
 bool rate_limit_exceeded(Loop* loop,
                          const RateLimitRuleSet& rules,
-                         u32 route_idx,
+                         const u64* rate_limit_ids,
                          const RateLimitKeyInput& key_in,
                          u64 now_us) {
     GlobalRateLimiter* grl = nullptr;
     if constexpr (requires { loop->global_rl; }) grl = loop->global_rl;
     return rate_limit_exceeded_with_limiters(
-        loop->rate_limiter, grl, rules, route_idx, key_in, now_us);
+        loop->rate_limiter, grl, rules, rate_limit_ids, key_in, now_us);
 }
 
 }  // namespace rut
