@@ -24090,7 +24090,7 @@ static bool validate_wildcard_service_no_uri_four_way(
             error = "#357 generated source did not contain unique dynamic endpoints";
             return false;
         }
-        if (canonical.size() != 3189u || canonical != canonical_source) {
+        if (canonical.size() != 3216u || canonical != canonical_source) {
             error = "#357 generated declaration orders did not canonicalize to the genuine " +
                     std::to_string(canonical_source.size()) + "-byte source (candidate " +
                     std::to_string(canonical.size()) + ")";
@@ -24210,7 +24210,7 @@ static bool run_wildcard_service_no_uri_four_way_self_checks(std::string& error)
     };
     std::string canonical;
     std::string sources[2];
-    if (!lower(8080u, 9000u, true, canonical) || canonical.size() != 3189u ||
+    if (!lower(8080u, 9000u, true, canonical) || canonical.size() != 3216u ||
         !lower(kPorts[4], kPorts[5], true, sources[0]) ||
         !lower(kPorts[6], kPorts[7], false, sources[1])) {
         error = "#357 self-check could not construct genuine canonical generated sources";
@@ -24800,8 +24800,8 @@ static bool run_converter_wildcard_service_no_uri_differential(
         rut::nginx::parse({canonical_fragment.data(), static_cast<u32>(canonical_fragment.size())});
     if (!parsed) return false;
     const auto lowered = rut::nginx::lower_to_rut(parsed.value());
-    if (!lowered || lowered.value().len != 3189u) {
-        error = "#357 genuine representative source did not have canonical size 3247";
+    if (!lowered || lowered.value().len != 3216u) {
+        error = "#357 genuine representative source did not have canonical size 3216";
         return false;
     }
     const std::string canonical_source(lowered.value().data, lowered.value().len);
@@ -49319,7 +49319,7 @@ static bool run_exact_max_proxy_prefix_self_checks(
         maximum_ipv4_lowered.value().len != profile.maximum_exact_size ||
         profile.maximum_exact_size >= rut::nginx::RutSource::kCapacity ||
         rut::nginx::RutSource::kCapacity - profile.maximum_exact_size !=
-            (profile.uses_target_transform ? 9255u : 9411u) ||
+            (profile.uses_target_transform ? 9336u : 9492u) ||
         maximum_ipv4_lowered.value().data[maximum_ipv4_lowered.value().len] != '\0') {
         error = std::string(profile.issue) +
                 " P63 genuine maximum lowering lost its canonical size/capacity/NUL boundary";
@@ -86926,7 +86926,7 @@ int main(int argc, char** argv) {
                "with zero extra upstream. Generated source ownership, zero target transforms "
                "through public RIR/config, scoped access and clean lifecycle passed. Runtime "
                "source size was derived from actual port widths; genuine maximum ports/IP is "
-               "3368 bytes with 9411 bytes capacity delta and 9352 bytes payload headroom "
+               "3395 bytes with 9492 bytes capacity delta and 9491 bytes payload headroom "
                "before NUL (#356 boundary "
                "only; representative both-order behavior is separately proven; wildcard "
                "no-URI, configured URI/query, normalization-sensitive/absolute-form targets, "
@@ -87600,7 +87600,7 @@ int main(int argc, char** argv) {
             << "PASS: #357 representative port-only wildcard listen <port> plus clean "
                "/service/ true no-URI proxy_pass traversed genuine nginx parsing/provenance "
                "and independent lowering in both declaration orders to the canonical "
-               "3189-byte ordinary RUT program. Two pinned nginx 1.29.7 sides and two "
+               "3216-byte ordinary RUT program. Two pinned nginx 1.29.7 sides and two "
                "public-CLI/JIT/io_uring generated-RUT sides used eight unique ports/resources "
                "and matched five exact Date-normalized wires/EOF, three unchanged /service/, "
                "/service/x and /service/x?y=1 upstream targets with rebuilt Host, omitted "
