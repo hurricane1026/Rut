@@ -1385,7 +1385,7 @@ public:
     }
 
     // Append an additional rate-limit rule to a route (stacking): a request must
-    // pass every rule. `scope` selects per-shard (default) or exact global; `burst`
+    // pass every rule. `scope` selects per-shard (default) or process-shared global; `burst`
     // is the bucket capacity (0 → defaults to `max`). Returns false on a bad index
     // or when the rule set is full.
     bool add_route_rate_limit_rule(u32 idx,

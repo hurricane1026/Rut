@@ -6785,6 +6785,14 @@ limited to 32 bytes. A longer name is a compile-time error at the name literal,
 not a truncated lookup. The native key-spec builder also rejects it without
 appending a component.
 
+The built-in shard limiter has 8192 direct-mapped slots. A colliding new key
+is rejected until the previous bucket fully recovers (`tat <= now`); it cannot
+reset active state to obtain fresh burst credit. This is conservative capacity
+failure, not an exact per-key table. The global limiter shares atomic slots
+within one process; colliding keys share budget and may throttle one another.
+Neither mechanism supplies cross-node or strict lossless state. Rut `Cache`
+examples remain a separate, deliberately lossy state mechanism.
+
 Source (`@rateLimit` is top-level route metadata, not a user helper):
 ```swift
 @rateLimit(limit: 100, window: 1m)

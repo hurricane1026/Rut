@@ -778,6 +778,14 @@ target_include_directories(test_types PRIVATE
 add_test(NAME test_types COMMAND test_types)
 set_tests_properties(test_types PROPERTIES LABELS "unit")
 
+add_executable(test_rate_limit_table test_rate_limit_table.cc)
+target_include_directories(test_rate_limit_table PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_rate_limit_table COMMAND test_rate_limit_table)
+set_tests_properties(test_rate_limit_table PROPERTIES LABELS "unit;runtime")
+
 add_executable(test_route_trie test_route_trie.cc)
 target_link_libraries(test_route_trie rut_runtime)
 target_include_directories(test_route_trie PRIVATE
