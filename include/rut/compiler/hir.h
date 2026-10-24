@@ -5,6 +5,7 @@
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/listener_address.h"
+#include "rut/common/load_balance.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/response_policy.h"
@@ -44,7 +45,7 @@ struct HirUpstream {
     u32 ip = 0;
     u16 port = 0;
     // Extra load-balancing endpoints beyond the primary (ip, port), from
-    // `{ backends: [...] }`. Primary + extras are round-robined at runtime.
+    // `{ backends: [...] }`. Each forward site selects its explicit policy.
     // ips in host byte order, matching RouteConfig::add_upstream_backend.
     static constexpr u32 kMaxExtraBackends = 7;  // AstUpstreamDecl::kMaxBackends - 1
     u32 extra_count = 0;
@@ -841,6 +842,7 @@ struct HirTerminator {
     u16 forward_request_policy_id = 0;
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
+    ForwardLoadBalance forward_load_balance{};
     u16 forward_timeout_failure_policy_id = 0;
     u8 forward_response_read_timeout_seconds = 0;
     ForwardResponseBufferingMode forward_response_buffering = ForwardResponseBufferingMode::None;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/load_balance.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/tls.h"
@@ -41,6 +42,7 @@ struct GrpcExchange {
     bool response_headers_sent;
     bool response_end_sent;
     u8 failure;
+    u32* backend_active;
     bool slot_held;
     u16 upstream_id;
     u32 upload_len;
@@ -76,6 +78,7 @@ struct GrpcExchange {
         has_request_length = request_end = request_headers_sent = request_end_sent = false;
         response_end = response_headers_sent = response_end_sent = false;
         failure = 0;
+        backend_active = nullptr;
         slot_held = false;
         upstream_id = 0;
         upload_len = download_len = response_bytes = expected_response_bytes = 0;

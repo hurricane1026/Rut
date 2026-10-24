@@ -14,7 +14,7 @@ unmatched { return local_response({
   head_mode: .suppressBody, body: b""
 }) }
 route HEAD "/" {
-    return forward(envoy_cluster_0, request_policy: {
+    return forward(envoy_cluster_0, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,
@@ -52,7 +52,7 @@ route HEAD "/" {
     )
 }
 route "/" {
-    return forward(envoy_cluster_0, request_policy: {
+    return forward(envoy_cluster_0, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,

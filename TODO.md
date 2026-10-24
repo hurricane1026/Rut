@@ -587,6 +587,10 @@ canonical spelling for common gateway tasks.
 
 ### M3：状态、限流与高可用（清单 2、5、7）
 
+- [x] 转发点显式负载均衡：`forward(api, load_balance: .roundRobin)` /
+  `.leastRequests`；参数必填，单后端无例外，无默认/继承；轮询游标按转发点和 shard
+  隔离，计数在共享 upstream 的路由间共享；迁移 helper、示例和测试。
+
 - [ ] 用 Rut 实现固定/滑动窗口、GCRA/漏桶、突发、并发配额、响应计量与服务整体额度。
 - [ ] 明确每次尝试/仅接收/实际消耗的扣费时机，取消时并发计数只释放一次。
 - [ ] 先交付精确单节点 owner-shard 语义，再实现跨节点协议与一致性策略；

@@ -646,8 +646,8 @@ def main() -> int:
         p.error(str(error))
     output.mkdir(parents=True, exist_ok=True)
     config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "proxy-rps.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, hint: .rps, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')
-    (config_dir / "proxy-throughput.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, hint: .throughput, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')
+    (config_dir / "proxy-rps.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, load_balance: .roundRobin, hint: .rps, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')
+    (config_dir / "proxy-throughput.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, load_balance: .roundRobin, hint: .throughput, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')
 
     payloads = {}
     try:

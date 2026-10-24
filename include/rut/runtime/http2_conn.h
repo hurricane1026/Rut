@@ -144,6 +144,7 @@ struct Http2Conn {
     const RouteEntry* pending_route;
     RouteAction pending_route_action;
     u16 pending_static_status;
+    ForwardLoadBalance pending_load_balance;
     u16 pending_forward_upstream_id;
     jit::HandlerFn pending_jit_fn;
     // Route param VALUES the matcher produced point into hdr_scratch, which the
@@ -216,6 +217,7 @@ struct Http2Conn {
     // Proxy suspension only: selected upstream and the running count of upstream
     // h1 response bytes accumulated back into pending_synth (reused as the
     // response buffer once the request is sent).
+    ForwardLoadBalance async_load_balance;
     u16 async_upstream_id;
     u32 async_resp_len;
 

@@ -86,7 +86,7 @@ to end today are **returning a status** and **forwarding to an upstream**.
 ```rut
 // app.rut
 
-// Declare upstreams with an address. forward(name) proxies to it.
+// Declare upstreams with an address. forward(name, load_balance: .roundRobin) proxies to it.
 upstream origin at "127.0.0.1:9090"
 
 route GET "/" {
@@ -98,7 +98,7 @@ route GET "/health" {
 }
 
 route GET "/proxy" {
-    return forward(origin)          // zero-copy proxy to `origin`
+    return forward(origin, load_balance: .roundRobin)          // zero-copy proxy to `origin`
 }
 ```
 

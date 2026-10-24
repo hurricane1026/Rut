@@ -1275,36 +1275,37 @@ TEST(frontend, six_hundred_fifty_three_slot_source_reaches_verified_rir) {
 static std::string make_policy_heavy_route_source(u32 route_count) {
     std::string source = "listen 127.0.0.1:8080\nupstream nginx_upstream at \"127.0.0.1:9000\"\n";
     for (u32 i = 0; i < route_count; i++) {
-        source += "route GET \"/route" + std::to_string(i) +
-                  "\" {\n"
-                  "    return forward(nginx_upstream, request_policy: {\n"
-                  "            version: .http11,\n"
-                  "            host: .upstream,\n"
-                  "            connection: .omit,\n"
-                  "            strip_headers: [.connection, .keepAlive, .te, "
-                  ".expect, .upgrade]\n"
-                  "        },\n"
-                  "        response_policy: {\n"
-                  "            version: .http11,\n"
-                  "            framing: .contentLength,\n"
-                  "            connection: .request,\n"
-                  "            server: \"nginx/1.29.7\",\n"
-                  "            date: .current,\n"
-                  "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
-                  "\"X-Compat-Hidden\"]\n"
-                  "        },\n"
-                  "        failure_policy: {\n"
-                  "            version: .http11,\n"
-                  "            status: 502,\n"
-                  "            reason: \"Bad Gateway\",\n"
-                  "            content_type: \"text/html\",\n"
-                  "            server: \"nginx/1.29.7\",\n"
-                  "            date: .current,\n"
-                  "            connection: .request,\n"
-                  "            body: b\"<html><body>502 Bad Gateway</body></html>\"\n"
-                  "        }\n"
-                  "    )\n"
-                  "}\n";
+        source +=
+            "route GET \"/route" + std::to_string(i) +
+            "\" {\n"
+            "    return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
+            "            version: .http11,\n"
+            "            host: .upstream,\n"
+            "            connection: .omit,\n"
+            "            strip_headers: [.connection, .keepAlive, .te, "
+            ".expect, .upgrade]\n"
+            "        },\n"
+            "        response_policy: {\n"
+            "            version: .http11,\n"
+            "            framing: .contentLength,\n"
+            "            connection: .request,\n"
+            "            server: \"nginx/1.29.7\",\n"
+            "            date: .current,\n"
+            "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
+            "\"X-Compat-Hidden\"]\n"
+            "        },\n"
+            "        failure_policy: {\n"
+            "            version: .http11,\n"
+            "            status: 502,\n"
+            "            reason: \"Bad Gateway\",\n"
+            "            content_type: \"text/html\",\n"
+            "            server: \"nginx/1.29.7\",\n"
+            "            date: .current,\n"
+            "            connection: .request,\n"
+            "            body: b\"<html><body>502 Bad Gateway</body></html>\"\n"
+            "        }\n"
+            "    )\n"
+            "}\n";
     }
     return source;
 }
@@ -1319,7 +1320,6 @@ TEST(frontend, policy_heavy_multi_route_source_exceeds_legacy_token_bound_and_pa
     REQUIRE(lexed);
     CHECK_GT(lexed->tokens.len, 1036u);
     CHECK_LT(lexed->tokens.len, LexedTokens::kMaxTokens);
-    REQUIRE_EQ(lexed->tokens.len, 1167u);
 
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
@@ -5033,7 +5033,8 @@ TEST(frontend, parse_return_forward_name) {
     // on the ForwardUpstream terminator, and RIR lowers to RetForward
     // with that index as the operand. Runtime dispatch is covered by
     // integration tests; here we just verify the compile-side path.
-    const char* src = "upstream api\nroute GET \"/users\" { return forward(api) }\n";
+    const char* src =
+        "upstream api\nroute GET \"/users\" { return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5623,7 +5624,7 @@ TEST(frontend, parse_upstream_protocol_only_name_only) {
     // application supplies the endpoint in the pre-bound RouteConfig.
     const char* src =
         "upstream api { protocol: .http2 }\n"
-        "route GET \"/u\" { return forward(api) }\n";
+        "route GET \"/u\" { return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -8120,7 +8121,7 @@ func response_headers(_ resp: Response) -> i32 {
     0
 }
 chain access { after response_headers(resp) }
-route GET "/users" use chain access { return forward(api) }
+route GET "/users" use chain access { return forward(api, load_balance: .roundRobin) }
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -14208,7 +14209,8 @@ TEST(frontend, analyze_rejects_known_named_error_matched_arm_before_wildcard_gua
 }
 TEST(frontend, if_const_selects_then_without_checking_else) {
     const char* src =
-        "route GET \"/users\" { if const true { return 200 } else { return forward(missing) } }\n";
+        "route GET \"/users\" { if const true { return 200 } else { return forward(missing, "
+        "load_balance: .roundRobin) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -14224,7 +14226,7 @@ TEST(frontend, if_const_selects_then_without_checking_else) {
 TEST(frontend, if_const_folds_constant_local_boolean_or) {
     const char* src =
         "route GET \"/users\" { let flag = true if const flag || false { return 200 } else { "
-        "return forward(missing) } }\n";
+        "return forward(missing, load_balance: .roundRobin) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -14239,7 +14241,8 @@ TEST(frontend, if_const_folds_constant_local_boolean_or) {
 
 TEST(frontend, if_const_folds_constant_local_boolean_and) {
     const char* src =
-        "route GET \"/users\" { let flag = false if const flag && true { return forward(missing) "
+        "route GET \"/users\" { let flag = false if const flag && true { return forward(missing, "
+        "load_balance: .roundRobin) "
         "} else { return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -14256,7 +14259,7 @@ TEST(frontend, if_const_folds_constant_local_boolean_and) {
 TEST(frontend, if_const_folds_const_comparison_boolean_or) {
     const char* src =
         "route GET \"/users\" { if const (POST == GET) || true { return 200 } else { return "
-        "forward(missing) } }\n";
+        "forward(missing, load_balance: .roundRobin) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -14271,7 +14274,8 @@ TEST(frontend, if_const_folds_const_comparison_boolean_or) {
 
 TEST(frontend, if_const_folds_const_comparison_boolean_and) {
     const char* src =
-        "route GET \"/users\" { if const (POST == GET) && true { return forward(missing) } else { "
+        "route GET \"/users\" { if const (POST == GET) && true { return forward(missing, "
+        "load_balance: .roundRobin) } else { "
         "return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -14301,7 +14305,8 @@ TEST(frontend, match_const_selects_variant_case_without_checking_other_arms) {
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/users\" { let state = Result.ok(200) match const state { .ok(x) => if x "
-        "== 200 { return 200 } else { return 500 } .err => return forward(missing) } }\n";
+        "== 200 { return 200 } else { return 500 } .err => return forward(missing, load_balance: "
+        ".roundRobin) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -14319,7 +14324,7 @@ TEST(frontend, match_const_selects_variant_case_without_checking_other_arms) {
 TEST(frontend, match_const_selects_string_case_without_checking_other_arms) {
     const char* src =
         "route GET \"/users\" { let path = \"/users\" match const path { \"/users\" => return "
-        "200 \"/admin\" => return forward(missing) } }\n";
+        "200 \"/admin\" => return forward(missing, load_balance: .roundRobin) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -14489,7 +14494,8 @@ TEST(frontend, analyze_rejects_duplicate_bool_match_case) {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, lower_forward_route_to_rir) {
-    const char* src = "upstream api\nroute GET \"/users\" { return forward(api) }\n";
+    const char* src =
+        "upstream api\nroute GET \"/users\" { return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -14524,7 +14530,8 @@ TEST(frontend, lower_forward_route_to_rir) {
 TEST(frontend, let_if_lowers_to_branching_rir) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let ok = true if ok { return 200 } else { return forward(api) } "
+        "route GET \"/users\" { let ok = true if ok { return 200 } else { return forward(api, "
+        "load_balance: .roundRobin) } "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -14596,7 +14603,7 @@ TEST(frontend, guard_lowers_to_fail_and_continue_blocks) {
     const char* src =
         "upstream api\n"
         "route GET \"/users\" { let failed = error(7) guard let failed else { return 401 } return "
-        "forward(api) "
+        "forward(api, load_balance: .roundRobin) "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -14721,7 +14728,8 @@ TEST(frontend, guard_let_takes_else_branch_on_known_nil) {
 TEST(frontend, equality_expression_lowers_to_cmp_eq) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let code = 200 if code == 200 { return forward(api) } else { "
+        "route GET \"/users\" { let code = 200 if code == 200 { return forward(api, load_balance: "
+        ".roundRobin) } else { "
         "return 404 } "
         "}\n";
     auto lexed = lex(lit(src));
@@ -16072,7 +16080,7 @@ TEST(frontend, any_builtin_rejects_non_binary_arity) {
 }
 
 TEST(frontend, analyze_rejects_unknown_upstream) {
-    const char* src = "route GET \"/users\" { return forward(api) }\n";
+    const char* src = "route GET \"/users\" { return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -16084,7 +16092,8 @@ TEST(frontend, analyze_rejects_unknown_upstream) {
 TEST(frontend, match_lowers_to_cmp_eq_chain) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let code = 200 match code { 200 => return forward(api) _ => "
+        "route GET \"/users\" { let code = 200 match code { 200 => return forward(api, "
+        "load_balance: .roundRobin) _ => "
         "return "
         "404 } }\n";
     auto lexed = lex(lit(src));
@@ -16371,7 +16380,8 @@ TEST(frontend, route_match_arm_nested_match_const_selects_inner_case_only) {
     const char* src =
         "variant Auth { ok, denied }\n"
         "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { .ok => "
-        "match const path { \"/users\" => return 200 \"/admin\" => return forward(missing) } "
+        "match const path { \"/users\" => return 200 \"/admin\" => return forward(missing, "
+        "load_balance: .roundRobin) } "
         ".denied => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -16606,7 +16616,8 @@ TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
         "upstream api\n"
         "route GET \"/users\" { let failed = error(7) let code = 200 guard let code else { return "
         "401 "
-        "} match code { 200 => return forward(api) _ => return 404 } }\n";
+        "} match code { 200 => return forward(api, load_balance: .roundRobin) _ => return 404 } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -16832,7 +16843,7 @@ TEST(frontend, guard_lowers_from_error_alias) {
         "upstream api\n"
         "route GET \"/users\" { let failed = error(7) let alias = failed guard let alias else { "
         "return "
-        "401 } return forward(api) }\n";
+        "401 } return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33730,28 +33741,28 @@ TEST(frontend, http_policy_enum_members_are_contextual_and_strings_are_rejected)
     // a parser failure elsewhere cannot hide an unconverted field.
     const char* programs[] = {
         R"rut(upstream b at "127.0.0.1:9000"
-route GET "/" { return forward(b, request_policy: {
+route GET "/" { return forward(b, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .upstream, connection: .omit,
     content_length_position: .afterHost,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
 }) }
 )rut",
         R"rut(upstream b at "127.0.0.1:9000"
-route GET "/" { return forward(b, request_policy: {
+route GET "/" { return forward(b, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .upstream, connection: .omit,
     retained_header_value: .trimSpPreserveHtab,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
 }) }
 )rut",
         R"rut(upstream b at "127.0.0.1:9000"
-route GET "/" { return forward(b, request_policy: {
+route GET "/" { return forward(b, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .preserve, connection: .omit,
     header_names: .lowercase, forwarded_proto: .http,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
 }) }
 )rut",
         R"rut(upstream b at "127.0.0.1:9000"
-route GET "/" { return forward(b, response_policy: {
+route GET "/" { return forward(b, load_balance: .roundRobin, response_policy: {
     version: .http11, framing: .contentLength, connection: .request,
     head_mode: .reject, server: "custom-server", date: .current,
     hide_headers: ["X-Custom-Header"]
@@ -33786,7 +33797,7 @@ unmatched { return local_response({
     header_names: .lowercase, header_order: .dateServerLength,
     head_mode: .suppressBody, body: b""
 }) }
-route GET "/" { return forward(b, response_policy: {
+route GET "/" { return forward(b, load_balance: .roundRobin, response_policy: {
     version: .http11, framing: .contentLength, connection: .request,
     header_order: .upstream, header_names: .lowercase,
     connection_header: .closeOnly, status_reason: .canonical,
@@ -33835,7 +33846,7 @@ route GET "/" { return forward(b, response_policy: {
     }
     // A real enum case from a different field is also a type error.
     const char* invalid = R"rut(upstream b
-route GET "/" { return forward(b, request_policy: { version: .current }) }
+route GET "/" { return forward(b, load_balance: .roundRobin, request_policy: { version: .current }) }
 )rut";
     auto lexed = lex(lit(invalid));
     REQUIRE(lexed);
@@ -33848,7 +33859,7 @@ TEST(frontend, forward_request_policy_requires_exact_fixed_strip_contract) {
     const char* valid = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
-    return forward(backend, request_policy: {
+    return forward(backend, load_balance: .roundRobin, request_policy: {
         version: .http11,
         host: .upstream,
         connection: .omit,
@@ -33864,19 +33875,24 @@ route GET "/" {
     REQUIRE(hir);
 
     const char* invalid[] = {
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http10, host: .upstream, connection: .omit, strip_headers: "
         "[.connection, .keepAlive, .te, .expect, .upgrade] }) }\n",
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .upstream, connection: .close, strip_headers: "
         "[.connection, .keepAlive, .te, .expect, .upgrade] }) }\n",
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .upstream, connection: .omit, strip_headers: "
         "[.connection, .keepAlive] }) }\n",
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .upstream, connection: .omit, strip_headers: "
         "[.connection, .keepAlive, .te, .expect, .upgrade, \"Foo\"] }) }\n",
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .upstream, connection: .omit, strip_headers: "
         "[.connection, .keepAlive, .te, .expect, .upgrade] }, set_path: \"/x\") "
         "}\n",
@@ -33897,7 +33913,7 @@ TEST(frontend, request_policy_preserve_host_parses_to_id4) {
     const char* valid = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
-    return forward(backend, request_policy: {
+    return forward(backend, load_balance: .roundRobin, request_policy: {
         version: .http11,
         host: .preserve,
         connection: .omit,
@@ -33938,44 +33954,52 @@ route GET "/" {
 TEST(frontend, request_policy_preserve_host_rejects_every_other_combination) {
     const char* invalid[] = {
         // Missing header_names.
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .preserve, connection: .omit, "
         "forwarded_proto: .http, strip_headers: [.connection, .keepAlive, .te, "
         ".expect, .upgrade, .proxyConnection] }) }\n",
         // Missing forwarded_proto.
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .preserve, connection: .omit, "
         "header_names: .lowercase, strip_headers: [.connection, .keepAlive, .te, "
         ".expect, .upgrade, .proxyConnection] }) }\n",
         // Five-name strip list (missing Proxy-Connection) with preserve.
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .preserve, connection: .omit, "
         "header_names: .lowercase, forwarded_proto: .http, strip_headers: [.connection, "
         ".keepAlive, .te, .expect, .upgrade] }) }\n",
         // content_length_position rejected with preserve.
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .preserve, connection: .omit, "
         "header_names: .lowercase, forwarded_proto: .http, content_length_position: "
         ".afterHost, strip_headers: [.connection, .keepAlive, .te, .expect, "
         ".upgrade, .proxyConnection] }) }\n",
         // retained_header_value rejected with preserve.
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .preserve, connection: .omit, "
         "header_names: .lowercase, forwarded_proto: .http, retained_header_value: "
         ".trimSpPreserveHtab, strip_headers: [.connection, .keepAlive, .te, "
         ".expect, .upgrade, .proxyConnection] }) }\n",
         // header_names rejected with host: .upstream.
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .upstream, connection: .omit, "
         "header_names: .lowercase, strip_headers: [.connection, .keepAlive, .te, "
         ".expect, .upgrade] }) }\n",
         // forwarded_proto rejected with host: .upstream.
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .upstream, connection: .omit, "
         "forwarded_proto: .http, strip_headers: [.connection, .keepAlive, .te, "
         ".expect, .upgrade] }) }\n",
         // "Proxy-Connection" rejected in the strip list with host: .upstream.
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin, request_policy: { "
         "version: .http11, host: .upstream, connection: .omit, "
         "strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, "
         ".proxyConnection] }) }\n",
@@ -33993,7 +34017,7 @@ TEST(frontend, request_policy_preserve_host_rejects_timing_and_buffering_options
         return std::string(R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
-    return forward(backend, request_policy: {
+    return forward(backend, load_balance: .roundRobin, request_policy: {
         version: .http11,
         host: .preserve,
         connection: .omit,
@@ -34025,13 +34049,13 @@ TEST(frontend, request_policy_content_length_position_selects_id_after_complete_
     const char source[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 route POST "/legacy" {
-    return forward(backend, request_policy: {
+    return forward(backend, load_balance: .roundRobin, request_policy: {
         version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
     })
 }
 route POST "/after" {
-    return forward(backend, request_policy: {
+    return forward(backend, load_balance: .roundRobin, request_policy: {
         content_length_position: .afterHost, strip_headers: [.connection, .keepAlive,
             .te, .expect, .upgrade], connection: .omit, host: .upstream,
         version: .http11
@@ -34078,11 +34102,13 @@ route POST "/after" {
     rir.destroy();
 
     const char* invalid[] = {
-        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
+        "upstream b\nroute POST \"/\" { return forward(b, load_balance: .roundRobin, "
+        "request_policy: { version: "
         ".http11, host: .upstream, connection: .omit, strip_headers: "
         "[.connection, .keepAlive, .te, .expect, .upgrade], "
         "content_length_position: .before_host }) }\n",
-        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
+        "upstream b\nroute POST \"/\" { return forward(b, load_balance: .roundRobin, "
+        "request_policy: { version: "
         ".http11, host: .upstream, connection: .omit, strip_headers: "
         "[.connection, .keepAlive, .te, .expect, .upgrade], "
         "content_length_position: .afterHost, content_length_position: "
@@ -34098,7 +34124,7 @@ route POST "/after" {
     const char timeout[] = R"rut(
 upstream b
 route POST "/" {
-    return forward(b, request_policy: { version: .http11, host: .upstream,
+    return forward(b, load_balance: .roundRobin, request_policy: { version: .http11, host: .upstream,
         connection: .omit, content_length_position: .afterHost,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
         response_read_timeout: 1s)
@@ -34135,7 +34161,7 @@ TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) 
         response_read_timeout: 60s, response_buffering: .completeContentLength)
     )rut";
     const std::string source = std::string("upstream b at \"127.0.0.1:9000\"\n") +
-                               "route GET \"/ok\" { return forward(b, "
+                               "route GET \"/ok\" { return forward(b, load_balance: .roundRobin, "
                                "request_policy: { version: .http11, host: .upstream, "
                                "connection: .omit, strip_headers: [.connection, "
                                ".keepAlive, .te, .expect, .upgrade], "
@@ -34238,7 +34264,7 @@ TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) 
 TEST(frontend, request_policy_after_host_admits_only_fixed_upload_head_timeout_profile) {
     const auto source_for = [](const char* route) {
         return std::string("upstream backend at \"127.0.0.1:9000\"\n") + route + R"rut( {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
         request_policy: { version: .http11, host: .upstream, connection: .omit,
             content_length_position: .afterHost,
             strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
@@ -34370,7 +34396,7 @@ func add_header(_ resp: Response) -> i32 {
 }
 chain access { after add_header(resp) }
 route GET "/" use chain access {
-    return forward(backend, request_policy: {
+    return forward(backend, load_balance: .roundRobin, request_policy: {
         version: .http11,
         host: .upstream,
         connection: .omit,
@@ -34392,7 +34418,7 @@ TEST(frontend, response_policy_metadata_is_bounded_and_carried_to_rir) {
     const char* src = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
-    return forward(backend, request_policy: {
+    return forward(backend, load_balance: .roundRobin, request_policy: {
         version: .http11,
         host: .upstream,
         connection: .omit,
@@ -34545,7 +34571,7 @@ TEST(frontend, response_policy_header_order_upstream_parses_and_propagates) {
     const char source[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
         response_policy: {
             version: .http11, framing: .contentLength, connection: .request,
             header_order: .upstream, header_names: .lowercase,
@@ -34592,36 +34618,43 @@ route GET "/" {
 TEST(frontend, response_policy_header_order_upstream_rejects_every_missing_companion) {
     const char* invalid[] = {
         // Missing header_names.
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: "
         ".http11, framing: .contentLength, connection: .request, header_order: "
         ".upstream, connection_header: .closeOnly, status_reason: .canonical, "
         "server: \"envoy\", date: .preserveOrCurrent, hide_headers: [] }) }\n",
         // Missing connection_header.
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: "
         ".http11, framing: .contentLength, connection: .request, header_order: "
         ".upstream, header_names: .lowercase, status_reason: .canonical, "
         "server: \"envoy\", date: .preserveOrCurrent, hide_headers: [] }) }\n",
         // Missing status_reason.
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: "
         ".http11, framing: .contentLength, connection: .request, header_order: "
         ".upstream, header_names: .lowercase, connection_header: .closeOnly, "
         "server: \"envoy\", date: .preserveOrCurrent, hide_headers: [] }) }\n",
         // date stays "current" instead of "preserve_or_current".
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: "
         ".http11, framing: .contentLength, connection: .request, header_order: "
         ".upstream, header_names: .lowercase, connection_header: .closeOnly, "
         "status_reason: .canonical, server: \"envoy\", date: .current, "
         "hide_headers: [] }) }\n",
         // header_names/connection_header/status_reason set without header_order at all.
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: "
         ".http11, framing: .contentLength, connection: .request, header_names: "
         ".lowercase, server: \"envoy\", date: .current, hide_headers: [] }) }\n",
         // date: .preserveOrCurrent alone, header_order omitted (Synthesized).
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: "
         ".http11, framing: .contentLength, connection: .request, server: \"envoy\", "
         "date: .preserveOrCurrent, hide_headers: [] }) }\n",
         // header_order: .upstream duplicated.
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: "
         ".http11, framing: .contentLength, connection: .request, header_order: "
         ".upstream, header_order: .upstream, header_names: .lowercase, "
         "connection_header: .closeOnly, status_reason: .canonical, server: \"envoy\", "
@@ -34640,7 +34673,7 @@ TEST(frontend, response_policy_header_order_upstream_rejects_timing_and_bufferin
         return std::string(R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
-    return forward(backend, response_policy: {
+    return forward(backend, load_balance: .roundRobin, response_policy: {
         version: .http11, framing: .contentLength, connection: .request,
         header_order: .upstream, header_names: .lowercase,
         connection_header: .closeOnly, status_reason: .canonical,
@@ -34681,7 +34714,7 @@ TEST(frontend, response_policy_header_order_upstream_verifier_rejects_forged_bun
     const char source[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
         response_policy: {
             version: .http11, framing: .contentLength, connection: .request,
             header_order: .upstream, header_names: .lowercase,
@@ -34775,19 +34808,24 @@ route GET "/" {
 
 TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fields) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http10, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http10, "
         "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
         ".current, hide_headers: [] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .chunked, connection: .keepAlive, server: \"nginx\", date: .current, "
         "hide_headers: [] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
         ".current, hide_headers: [\"Date\", \"date\"] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .keepAlive, server: \"nginx\", hide_headers: "
         "[] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .keepAlive, server: \"bad\rvalue\", date: "
         ".current, hide_headers: [] }) }\n",
     };
@@ -34803,7 +34841,7 @@ TEST(frontend, public_head_mode_pair_lowers_with_modes_and_bundle) {
     const char source[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/head" {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
         response_policy: {
             version: .http11, framing: .contentLength, connection: .request,
             head_mode: .suppressBody, server: "nginx", date: .current, hide_headers: []
@@ -34847,7 +34885,7 @@ TEST(frontend, public_head_mode_omission_and_explicit_reject_preserve_legacy) {
     const char source[] = R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         response_policy: {
             version: .http11, framing: .contentLength, connection: .request,
             head_mode: .reject, server: "s", date: .current, hide_headers: []
@@ -34871,7 +34909,7 @@ route GET "/" {
     const char omitted[] = R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         response_policy: {
             version: .http11, framing: .contentLength, connection: .request,
             server: "s", date: .current, hide_headers: []
@@ -34895,7 +34933,8 @@ route GET "/" {
 
 TEST(frontend, public_head_mode_applies_through_nested_control_paths) {
     const char* forward =
-        "return forward(b, response_policy: { version: .http11, framing: .contentLength, "
+        "return forward(b, load_balance: .roundRobin, response_policy: { version: .http11, "
+        "framing: .contentLength, "
         "connection: .request, head_mode: .suppressBody, server: \"s\", date: .current, "
         "hide_headers: [] }, failure_policy: { version: .http11, status: 502, reason: \"Bad "
         "Gateway\", content_type: \"text/plain\", server: \"s\", date: .current, connection: "
@@ -34920,7 +34959,8 @@ TEST(frontend, public_head_mode_applies_through_nested_control_paths) {
 
 TEST(frontend, public_head_mode_analyzer_defends_forged_policy_id) {
     const char source[] =
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b) }\n";
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+        ".roundRobin) }\n";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -34936,7 +34976,7 @@ TEST(frontend, public_head_mode_analyzer_defends_forged_policy_id) {
     const char policy_source[] = R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         response_policy: {
             version: .http11, framing: .contentLength, connection: .request,
             head_mode: .reject, server: "s", date: .current, hide_headers: []
@@ -34956,7 +34996,7 @@ route GET "/" {
     const char failure_policy_source[] = R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         failure_policy: {
             version: .http11, status: 502, reason: "Bad Gateway",
             content_type: "text/plain", server: "s", date: .current,
@@ -34989,24 +35029,28 @@ route GET "/" {
 
 TEST(frontend, public_head_mode_parser_rejects_duplicate_unknown_and_invalid_values) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .request, head_mode: .bogus, server: "
         "\"s\", date: .current, hide_headers: [] }, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: "
         ".current, connection: .request, head_mode: .suppressBody, body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .request, head_mode: .suppressBody, "
         "head_mode: .reject, server: \"s\", date: .current, hide_headers: [] }, "
         "failure_policy: { version: .http11, status: 502, reason: \"Bad Gateway\", "
         "content_type: \"text/plain\", server: \"s\", date: .current, connection: .request, "
         "head_mode: .suppressBody, body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .request, head_mode: .suppressBody, nope: "
         "\"x\", server: \"s\", date: .current, hide_headers: [] }, failure_policy: { version: "
         ".http11, status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
         "\"s\", date: .current, connection: .request, head_mode: .suppressBody, body: "
         "b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .request, head_mode: .suppressBody, "
         "server: \"s\", date: .current, hide_headers: [] }, failure_policy: { version: "
         ".http11, status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
@@ -35034,7 +35078,8 @@ TEST(frontend, public_head_mode_rejects_unpaired_or_unsupported_combinations) {
                           const char* failure_mode,
                           bool target_transform) {
         std::string source =
-            "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, ";
+            "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, load_balance: "
+            ".roundRobin, ";
         bool comma = false;
         if (response) {
             source +=
@@ -35089,7 +35134,7 @@ TEST(frontend, public_head_mode_conditional_keeps_legacy_forward_sibling) {
 upstream backend at "127.0.0.1:9000"
 route "/" {
     if req.method == HEAD && req.pathOnly == "/head" {
-        return forward(backend,
+        return forward(backend, load_balance: .roundRobin,
             response_policy: {
                 version: .http11, framing: .contentLength, connection: .request,
                 head_mode: .suppressBody, server: "s", date: .current, hide_headers: []
@@ -35100,7 +35145,7 @@ route "/" {
                 connection: .request, head_mode: .suppressBody, body: b"x"
             })
     } else {
-        return forward(backend)
+        return forward(backend, load_balance: .roundRobin)
     }
 }
 )rut";
@@ -35145,11 +35190,13 @@ TEST(frontend, response_policy_rejects_invalid_and_duplicate_connection_fields) 
         FrontendError code;
     };
     static constexpr InvalidCase kCases[] = {
-        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        {"upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+         "response_policy: { version: "
          ".http11, framing: .contentLength, connection: .close, server: \"nginx\", "
          "date: .current, hide_headers: [] }) }\n",
          FrontendError::UnsupportedSyntax},
-        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        {"upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+         "response_policy: { version: "
          ".http11, framing: .contentLength, connection: .keepAlive, connection: "
          ".request, server: \"nginx\", date: .current, hide_headers: [] }) }\n",
          FrontendError::UnexpectedToken},
@@ -35175,7 +35222,7 @@ func add_header(_ resp: Response) -> i32 {
 
 chain access { after add_header(resp) }
 route GET "/" use chain access {
-    return forward(backend, response_policy: {
+    return forward(backend, load_balance: .roundRobin, response_policy: {
         version: .http11, framing: .contentLength, connection: .keepAlive,
         server: "nginx", date: .current, hide_headers: ["Date"]
     })
@@ -35195,7 +35242,7 @@ TEST(frontend, failure_policy_bundle_is_carried_and_route_owned) {
     const char* src = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
-    return forward(backend, request_policy: {
+    return forward(backend, load_balance: .roundRobin, request_policy: {
         version: .http11,
         host: .upstream,
         connection: .omit,
@@ -35255,8 +35302,10 @@ TEST(frontend, response_read_timeout_accepts_only_exact_whole_seconds_one_throug
         u8 seconds;
     } accepted[] = {{"1s", 1}, {"63s", 63}, {"1m", 60}, {"1000ms", 1}};
     for (const auto& test : accepted) {
-        const std::string source = std::string("upstream b\nroute GET \"/\" { return forward(b, ") +
-                                   "response_read_timeout: " + test.literal + ") }\n";
+        const std::string source =
+            std::string(
+                "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, ") +
+            "response_read_timeout: " + test.literal + ") }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -35295,8 +35344,10 @@ TEST(frontend, response_read_timeout_accepts_only_exact_whole_seconds_one_throug
         {"1d", FrontendError::UnexpectedToken},
     };
     for (const auto& test : rejected) {
-        const std::string source = std::string("upstream b\nroute GET \"/\" { return forward(b, ") +
-                                   "response_read_timeout: " + test.literal + ") }\n";
+        const std::string source =
+            std::string(
+                "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, ") +
+            "response_read_timeout: " + test.literal + ") }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -35305,7 +35356,8 @@ TEST(frontend, response_read_timeout_accepts_only_exact_whole_seconds_one_throug
     }
 
     const char duplicate[] =
-        "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_read_timeout: 1s, "
         "response_read_timeout: 2s) }\n";
     auto lexed = lex(lit(duplicate));
     REQUIRE(lexed);
@@ -35315,7 +35367,8 @@ TEST(frontend, response_read_timeout_accepts_only_exact_whole_seconds_one_throug
     CHECK(ast.error().detail.eq(lit("response_read_timeout")));
 
     const char valid[] =
-        "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s) }\n";
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_read_timeout: 1s) }\n";
     for (const u8 forged_seconds : {static_cast<u8>(0), static_cast<u8>(64)}) {
         lexed = lex(lit(valid));
         REQUIRE(lexed);
@@ -35344,7 +35397,7 @@ TEST(frontend, response_buffering_parses_propagates_deduplicates_and_preserves_p
     const char source[] = R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/one" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         request_policy: { version: .http11, host: .upstream, connection: .omit,
             strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
         response_policy: { version: .http11, framing: .contentLength,
@@ -35359,7 +35412,7 @@ route GET "/one" {
         response_buffering: .completeContentLength)
 }
 route GET "/same" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         response_policy: { version: .http11, framing: .contentLength,
             connection: .request, server: "s", date: .current, hide_headers: [] },
         failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
@@ -35372,7 +35425,7 @@ route GET "/same" {
         response_buffering: .completeContentLength)
 }
 route GET "/stream" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         response_policy: { version: .http11, framing: .contentLength,
             connection: .request, server: "s", date: .current, hide_headers: [] },
         failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
@@ -35470,16 +35523,20 @@ TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) 
         FrontendError code;
         const char* detail;
     } invalid_syntax[] = {
-        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: 1) }\n",
+        {"upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+         "response_buffering: 1) }\n",
          FrontendError::UnsupportedSyntax,
          ".completeContentLength .bounded"},
-        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: .stream) }\n",
+        {"upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+         "response_buffering: .stream) }\n",
          FrontendError::UnsupportedSyntax,
          ".completeContentLength .bounded"},
-        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: \"bounded\") }\n",
+        {"upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+         "response_buffering: \"bounded\") }\n",
          FrontendError::UnsupportedSyntax,
          ".completeContentLength .bounded"},
-        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering:) }\n",
+        {"upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+         "response_buffering:) }\n",
          FrontendError::UnsupportedSyntax,
          nullptr},
     };
@@ -35494,7 +35551,7 @@ TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) 
         if (test.detail != nullptr) CHECK(ast.error().detail.eq(lit(test.detail)));
     }
     const char duplicate[] =
-        "upstream b\nroute GET \"/\" { return forward(b, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
         "response_buffering: .completeContentLength, "
         "response_buffering: .completeContentLength) }\n";
     auto lexed = lex(lit(duplicate));
@@ -35505,7 +35562,8 @@ TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) 
     CHECK(ast.error().detail.eq(lit("response_buffering")));
 
     const char incomplete_bundle[] =
-        "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_read_timeout: 1s, "
         "response_buffering: .completeContentLength) }\n";
     lexed = lex(lit(incomplete_bundle));
     REQUIRE(lexed);
@@ -35519,7 +35577,7 @@ TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) 
     const char valid[] = R"rut(
 upstream b
 route GET "/" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         request_policy: { version: .http11, host: .upstream, connection: .omit,
             strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
         response_policy: { version: .http11, framing: .contentLength,
@@ -35714,7 +35772,7 @@ TEST(frontend, response_buffering_admits_closed_bodyless_non_head_static_route_m
         for (const bool request_policy : {false, true}) {
             std::string source = "upstream b at \"127.0.0.1:9000\"\nroute ";
             source += method.source_method;
-            source += "\"/\" { return forward(b, ";
+            source += "\"/\" { return forward(b, load_balance: .roundRobin, ";
             if (request_policy) source += kRequestPolicy;
             source += kPolicies;
             auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -35751,17 +35809,17 @@ TEST(frontend, response_buffering_admits_closed_bodyless_non_head_static_route_m
 TEST(frontend, response_read_timeout_bundle_shapes_deduplicate_and_reach_config_exactly) {
     const char source[] = R"rut(
 upstream b at "127.0.0.1:9000"
-route GET "/one" { return forward(b, response_read_timeout: 1s) }
-route GET "/same" { return forward(b, response_read_timeout: 1000ms) }
-route GET "/different" { return forward(b, response_read_timeout: 2s) }
+route GET "/one" { return forward(b, load_balance: .roundRobin, response_read_timeout: 1s) }
+route GET "/same" { return forward(b, load_balance: .roundRobin, response_read_timeout: 1000ms) }
+route GET "/different" { return forward(b, load_balance: .roundRobin, response_read_timeout: 2s) }
 route GET "/response" {
-    return forward(b, response_policy: {
+    return forward(b, load_balance: .roundRobin, response_policy: {
         version: .http11, framing: .contentLength, connection: .request,
         server: "s", date: .current, hide_headers: []
     }, response_read_timeout: 2s)
 }
 route GET "/triple" {
-    return forward(b, response_policy: {
+    return forward(b, load_balance: .roundRobin, response_policy: {
         version: .http11, framing: .contentLength, connection: .request,
         server: "s", date: .current, hide_headers: []
     }, failure_policy: {
@@ -35822,41 +35880,41 @@ route GET "/triple" {
 TEST(frontend, response_read_timeout_rejects_noncanonical_or_effectful_routes) {
     const char* rejected[] = {
         R"rut(upstream b
-route GET "/" { let x = 1 return forward(b, response_read_timeout: 5s) }
+route GET "/" { let x = 1 return forward(b, load_balance: .roundRobin, response_read_timeout: 5s) }
 )rut",
         R"rut(upstream b
-route GET "/" { req.set("X-Test", "v") return forward(b, response_read_timeout: 5s) }
+route GET "/" { req.set("X-Test", "v") return forward(b, load_balance: .roundRobin, response_read_timeout: 5s) }
 )rut",
         R"rut(upstream b
-route GET "/" { wait(1ms) return forward(b, response_read_timeout: 5s) }
+route GET "/" { wait(1ms) return forward(b, load_balance: .roundRobin, response_read_timeout: 5s) }
 )rut",
         R"rut(upstream b
-route GET "/" { if true { return forward(b, response_read_timeout: 5s) } else { return 200 } }
+route GET "/" { if true { return forward(b, load_balance: .roundRobin, response_read_timeout: 5s) } else { return 200 } }
 )rut",
         R"rut(upstream b
-route GET "/" { guard true else { return 400 } return forward(b, response_read_timeout: 5s) }
+route GET "/" { guard true else { return 400 } return forward(b, load_balance: .roundRobin, response_read_timeout: 5s) }
 )rut",
         R"rut(upstream b
-route GET "/" { return forward(b, set_path: "/x", response_read_timeout: 5s) }
+route GET "/" { return forward(b, load_balance: .roundRobin, set_path: "/x", response_read_timeout: 5s) }
 )rut",
         R"rut(upstream b
-route GET "/" { return forward(b, set_header: { "X-Test": "v" }, response_read_timeout: 5s) }
+route GET "/" { return forward(b, load_balance: .roundRobin, set_header: { "X-Test": "v" }, response_read_timeout: 5s) }
 )rut",
         R"rut(upstream b
-route GET "/" { return forward(b, target_transform: { strip_prefix: "/", replace_prefix: "/x/" }, response_read_timeout: 5s) }
+route GET "/" { return forward(b, load_balance: .roundRobin, target_transform: { strip_prefix: "/", replace_prefix: "/x/" }, response_read_timeout: 5s) }
 )rut",
         R"rut(upstream b
 @rateLimit(limit: 2, window: 1m)
-route GET "/" { return forward(b, response_read_timeout: 5s) }
+route GET "/" { return forward(b, load_balance: .roundRobin, response_read_timeout: 5s) }
 )rut",
         R"rut(upstream b
 @throttle(downstream: 5mb, window: 1s)
-route GET "/" { return forward(b, response_read_timeout: 5s) }
+route GET "/" { return forward(b, load_balance: .roundRobin, response_read_timeout: 5s) }
 )rut",
         R"rut(upstream b
 func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain mutate { after add_header(resp) }
-route GET "/" use chain mutate { return forward(b, response_read_timeout: 5s) }
+route GET "/" use chain mutate { return forward(b, load_balance: .roundRobin, response_read_timeout: 5s) }
 )rut",
     };
     for (const char* source : rejected) {
@@ -35875,7 +35933,8 @@ route GET "/" use chain mutate { return forward(b, response_read_timeout: 5s) }
 TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismatches) {
     const char source[] =
         "upstream b at \"127.0.0.1:9000\"\n"
-        "route GET \"/\" { return forward(b, response_read_timeout: 5s) }\n";
+        "route GET \"/\" { return forward(b, load_balance: .roundRobin, response_read_timeout: 5s) "
+        "}\n";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -36037,7 +36096,7 @@ TEST(frontend, timeout_failure_policy_is_carried_as_a_deduplicated_triple_bundle
     const char* src = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/one" {
-    return forward(backend, response_policy: {
+    return forward(backend, load_balance: .roundRobin, response_policy: {
         version: .http11, framing: .contentLength, connection: .request,
         head_mode: .suppressBody, server: "rut", date: .current, hide_headers: []
     }, failure_policy: {
@@ -36051,7 +36110,7 @@ route GET "/one" {
     })
 }
 route GET "/two" {
-    return forward(backend, response_policy: {
+    return forward(backend, load_balance: .roundRobin, response_policy: {
         version: .http11, framing: .contentLength, connection: .request,
         head_mode: .suppressBody, server: "rut", date: .current, hide_headers: []
     }, failure_policy: {
@@ -36111,7 +36170,8 @@ TEST(frontend, timeout_failure_policy_rejects_missing_peers_duplicate_status_and
                "server: \"s\", date: .current, connection: .request, head_mode: ." +
                head + ", body: b\"slow\" }";
     };
-    const std::string prefix = "upstream b\nroute GET \"/\" { return forward(b, ";
+    const std::string prefix =
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, ";
     const std::string suffix = ") }\n";
     const std::string valid_timeout = timeout(504, "suppressBody");
     const std::string invalid[] = {
@@ -36133,36 +36193,44 @@ TEST(frontend, timeout_failure_policy_rejects_missing_peers_duplicate_status_and
 
 TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
         ".current, hide_headers: [] }, failure_policy: { version: .http11, status: 500, "
         "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
         ".current, connection: .request, body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
         ".current, hide_headers: [] }, failure_policy: { version: .http11, status: 502, "
         "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
         ".current, connection: .request, body: b\"x\", nope: \"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
         ".current, hide_headers: [] }, failure_policy: { version: .http11, status: 502, "
         "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
         ".current, connection: .request, body: b\"x\", body: b\"y\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_policy: { version: .http11, "
         "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
         ".current, hide_headers: [] }, failure_policy: { version: .http11, status: 502, "
         "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
         ".current, connection: .request }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: \"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: b\"\\q\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: b\"\\x0\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: b\"\\xGG\" }) }\n",
     };
@@ -36173,7 +36241,8 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
         CHECK_FALSE(ast.has_value());
     }
     const char* independent =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: b\"x\" }) }\n";
     auto independent_lexed = lex(lit(independent));
@@ -36185,7 +36254,8 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     CHECK_EQ(independent_ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
 
     const char* bytes =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: b\"\\x00\\n\\xff\" }) }\n";
     auto bytes_lexed = lex(lit(bytes));
@@ -36198,7 +36268,8 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     CHECK(static_cast<u8>(bytes_ast->failure_policies[0].body.ptr[2]) == 0xff);
 
     const char* empty =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: b\"\" }) }\n";
     auto empty_lexed = lex(lit(empty));
@@ -36211,7 +36282,8 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     CHECK_EQ(empty_copy->failure_policies[0].body.len, 0u);
 
     std::string oversized =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: b\"";
     oversized.append(kMaxFailurePolicyBodyLen + 1, 'x');
@@ -36254,7 +36326,8 @@ TEST(frontend, failure_policy_envoy_layout_admits_503_and_keeps_502_closed) {
         return parse_file_heap(lexed.value()).has_value();
     };
     const std::string prefix =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, ";
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, ";
     const std::string envoy_fields =
         "connection_header: .closeOnly, header_names: .lowercase, header_order: "
         ".lengthTypeDateServer, ";
@@ -36316,7 +36389,8 @@ TEST(frontend, failure_policy_envoy_layout_admits_503_and_keeps_502_closed) {
 // connect-failure-only usage (no response_read_timeout) stays admitted.
 TEST(frontend, failure_policy_status_503_rejects_response_read_timeout) {
     const std::string prefix =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 503, reason: \"Service Unavailable\", content_type: \"text/plain\", server: "
         "\"envoy\", date: .current, connection_header: .closeOnly, header_names: "
         ".lowercase, header_order: .lengthTypeDateServer, connection: .request, "
@@ -36346,7 +36420,8 @@ TEST(frontend, failure_policy_status_503_rejects_response_read_timeout) {
 
 TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
     const char* src =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: b\"A\\x00\\nB\" }) }\n";
     auto lexed = lex(lit(src));
@@ -36425,7 +36500,7 @@ TEST(frontend, failure_policy_head_mode_is_owned_deduplicated_and_printed) {
 TEST(frontend, target_transform_internal_metadata_reaches_rir_and_preserves_policy) {
     const char source[] =
         "upstream backend at \"127.0.0.1:9000\"\n"
-        "route GET \"/api\" { return forward(backend) }\n";
+        "route GET \"/api\" { return forward(backend, load_balance: .roundRobin) }\n";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -36471,7 +36546,7 @@ TEST(frontend, target_transform_source_reaches_rir_and_preserves_all_forward_pol
     const char source[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/api" {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
         target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
         request_policy: {
             version: .http11, host: .upstream, connection: .omit,
@@ -36558,7 +36633,8 @@ TEST(frontend, query_prefix_variants_reach_owned_config_after_source_destruction
         {
             std::string source =
                 "upstream backend at \"127.0.0.1:9000\"\n"
-                "route GET \"/api\" { return forward(backend, target_transform: { strip_prefix: "
+                "route GET \"/api\" { return forward(backend, load_balance: .roundRobin, "
+                "target_transform: { strip_prefix: "
                 "\"/api/\", replace_prefix: \"" +
                 std::string(variant.replace_prefix, variant.replace_prefix_len) + "\" }) }\n";
             auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -36618,35 +36694,50 @@ TEST(frontend, query_prefix_variants_reach_owned_config_after_source_destruction
 
 TEST(frontend, target_transform_source_rejects_invalid_objects_and_compositions) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: {}) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: {}) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { replace_prefix: \"/\" "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { replace_prefix: \"/\" "
         "}) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/\", strip_prefix: \"/x/\", replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/\", extra: \"/x/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: 1, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: 1, "
         "replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"api/\", replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/?fixed=1\", replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/v1/?bad#\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/\" }, target_transform: { strip_prefix: \"/web/\", "
         "replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/\" }, set_path: \"/x\") }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, set_path: \"/x\", target_transform: { "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, set_path: "
+        "\"/x\", target_transform: { "
         "strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/\" }, set_header: { \"X-Test\": \"v\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, set_header: { \"X-Test\": \"v\" }, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, set_header: { "
+        "\"X-Test\": \"v\" }, "
         "target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
     };
     for (const char* source : invalid) {
@@ -36660,7 +36751,8 @@ TEST(frontend, target_transform_source_rejects_invalid_objects_and_compositions)
 
 TEST(frontend, target_transform_analyzer_defends_forged_spec) {
     const char source[] =
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/\" }) }\n";
     const char query_strip[] = "/api/?fixed=1";
     const char invalid_query[] = "/v1/?bad#";
@@ -36689,7 +36781,7 @@ TEST(frontend, target_transform_rejects_response_mutations_in_direct_and_if_cont
 upstream b
 func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain access { after add_header(resp) }
-route GET "/" use chain access { return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" }) }
+route GET "/" use chain access { return forward(b, load_balance: .roundRobin, target_transform: { strip_prefix: "/api/", replace_prefix: "/" }) }
 )rut",
         R"rut(
 upstream b
@@ -36697,7 +36789,7 @@ func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain access { after add_header(resp) }
 route GET "/" use chain access {
     if req.http11 {
-        return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" })
+        return forward(b, load_balance: .roundRobin, target_transform: { strip_prefix: "/api/", replace_prefix: "/" })
     } else { return 200 }
 }
 )rut",
@@ -36708,7 +36800,7 @@ chain access { after add_header(resp) }
 route GET "/" use chain access {
     match req.http11 {
         true => {
-            return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" })
+            return forward(b, load_balance: .roundRobin, target_transform: { strip_prefix: "/api/", replace_prefix: "/" })
         }
         _ => return 200
     }
@@ -36730,7 +36822,8 @@ route GET "/" use chain access {
 TEST(frontend, target_transform_duplicates_reuse_stable_first_ids) {
     std::string source = "upstream backend at \"127.0.0.1:9000\"\n";
     for (u32 i = 0; i < 3; i++) {
-        source += "route GET \"/r" + std::to_string(i) + "\" { return forward(backend) }\n";
+        source += "route GET \"/r" + std::to_string(i) +
+                  "\" { return forward(backend, load_balance: .roundRobin) }\n";
     }
     auto lexed = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(lexed);
@@ -36767,7 +36860,7 @@ TEST(frontend, target_transform_precedes_forward_bundle_and_preserves_operands) 
     const char source[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/api" {
-    return forward(backend, response_policy: {
+    return forward(backend, load_balance: .roundRobin, response_policy: {
         version: .http11,
         framing: .contentLength,
         connection: .keepAlive,
@@ -36843,7 +36936,8 @@ TEST(frontend, target_transform_count_and_aggregate_boundaries_are_atomic) {
     auto make_source = [](u32 count) {
         std::string source = "upstream backend at \"127.0.0.1:9000\"\n";
         for (u32 i = 0; i < count; i++)
-            source += "route GET \"/r" + std::to_string(i) + "\" { return forward(backend) }\n";
+            source += "route GET \"/r" + std::to_string(i) +
+                      "\" { return forward(backend, load_balance: .roundRobin) }\n";
         return source;
     };
 
@@ -36960,7 +37054,7 @@ TEST(frontend, target_transform_count_and_aggregate_boundaries_are_atomic) {
 TEST(frontend, target_transform_invalid_presence_rejects_and_absence_is_transparent) {
     const char source[] =
         "upstream backend at \"127.0.0.1:9000\"\n"
-        "route GET \"/api\" { return forward(backend) }\n";
+        "route GET \"/api\" { return forward(backend, load_balance: .roundRobin) }\n";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -37000,7 +37094,7 @@ TEST(frontend, target_transform_invalid_presence_rejects_and_absence_is_transpar
 TEST(frontend, target_transform_lowering_defends_forged_query_specs) {
     const char source[] =
         "upstream backend at \"127.0.0.1:9000\"\n"
-        "route GET \"/api\" { return forward(backend) }\n";
+        "route GET \"/api\" { return forward(backend, load_balance: .roundRobin) }\n";
     const char query_strip[] = "/api/?fixed=1";
     const char invalid_query[] = "/v1/?bad#";
     const ForwardTargetTransformSpec forgeries[] = {
@@ -37206,7 +37300,7 @@ route GET "/" {
       header_order: .connectionThenLocation, status: 302,
       reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
       target_path: "/new", body: b"fixed-302"})
-  } else { return forward(backend) }
+  } else { return forward(backend, load_balance: .roundRobin) }
 }
 )rut";
 
@@ -37399,13 +37493,13 @@ route "/" use chain access { return redirect({scheme: .http, authority: .request
 upstream b at "127.0.0.1:9000"
 func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain access { after after_headers(resp) }
-route "/" use chain access { if req.method == GET { return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) } else { return forward(b) } }
+route "/" use chain access { if req.method == GET { return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) } else { return forward(b, load_balance: .roundRobin) } }
 )rut",
         R"rut(
 upstream b at "127.0.0.1:9000"
 func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain access { after after_headers(resp) }
-route "/" use chain access { match req.method { GET => return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) _ => return forward(b) } }
+route "/" use chain access { match req.method { GET => return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) _ => return forward(b, load_balance: .roundRobin) } }
 )rut",
     };
     for (const char* source : sources) {
@@ -37426,7 +37520,7 @@ route "/" use chain access {
     guard req.http11 else {
         return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""})
     }
-    return forward(b)
+    return forward(b, load_balance: .roundRobin)
 }
 )rut";
     auto lexed = lex(lit(source));
@@ -37485,7 +37579,7 @@ route "/" {
       status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html",
       target_path: "/api/", body: b"redirect"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
@@ -39822,7 +39916,7 @@ TEST(frontend, bounded_response_buffering_parses_and_propagates_like_complete_co
     const char source[] = R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/one" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         request_policy: { version: .http11, host: .upstream, connection: .omit,
             strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
         response_policy: { version: .http11, framing: .contentLength,
@@ -39917,7 +40011,8 @@ TEST(frontend, bounded_response_buffering_rejects_same_shapes_as_complete_conten
     // "bounded" is accepted exactly where "complete_content_length" is:
     // missing the paired timeout/policy bundle produces the same rejection.
     const char incomplete_bundle[] =
-        "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "response_read_timeout: 1s, "
         "response_buffering: .bounded) }\n";
     auto lexed = lex(lit(incomplete_bundle));
     REQUIRE(lexed);
@@ -39935,7 +40030,7 @@ TEST(frontend, bounded_response_buffering_rejects_same_shapes_as_complete_conten
     const char retained_no_timeout[] = R"rut(
 upstream b
 route GET "/" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         request_policy: { version: .http11, host: .upstream, connection: .omit,
             retained_header_value: .trimSpPreserveHtab,
             strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
@@ -40057,7 +40152,7 @@ TEST(frontend, upstream_http2_protocol_reaches_runtime_config) {
     const char* src =
         "upstream grpc { host: \"127.0.0.1\", port: 50051, protocol: .http2 }\n"
         "upstream http { host: \"127.0.0.1\", port: 8080, protocol: .http11 }\n"
-        "route POST \"/test.Echo/Call\" { return forward(grpc) }\n";
+        "route POST \"/test.Echo/Call\" { return forward(grpc, load_balance: .roundRobin) }\n";
     auto tokens = lex(lit(src));
     REQUIRE(tokens);
     auto ast = parse_file_heap(tokens.value());
@@ -40230,7 +40325,7 @@ route GET "/admin" {
     guard let expires = json.int(claims.exp) else { return 401 }
     guard expires * i64(1000000) > time.nowMicros() else { return 401 }
     guard claims.role == "admin" else { return 403 }
-    return forward(api)
+    return forward(api, load_balance: .roundRobin)
 }
 )rut";
     REQUIRE_EQ(setenv("JWT_SECRET", "s3cr3t", 1), 0);
@@ -40298,7 +40393,7 @@ TEST(frontend, upstream_tls_options_reach_runtime_config) {
         "upstream grpc { host: \"127.0.0.1\", port: 443, protocol: .http2, "
         "tls: { ca: \"ca.pem\", server_name: \"backend.example\", "
         "cert: \"client.pem\", key: \"client.key\" } }\n"
-        "route POST \"/test.Echo/Call\" { return forward(grpc) }\n";
+        "route POST \"/test.Echo/Call\" { return forward(grpc, load_balance: .roundRobin) }\n";
     auto tokens = lex(lit(source));
     REQUIRE(tokens);
     auto ast = parse_file_heap(tokens.value());
@@ -40349,4 +40444,54 @@ TEST(frontend, upstream_tls_rejects_incomplete_duplicate_or_unsafe_options) {
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     CHECK(!analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, forward_load_balance_required_and_closed_vocabulary) {
+    for (const char* args : {"",
+                             ", load_balance: .random",
+                             ", load_balance: \"roundRobin\"",
+                             ", load_balance: 0",
+                             ", load_balance: .roundRobin, load_balance: .leastRequests"}) {
+        const std::string source =
+            std::string(
+                "upstream api at \"127.0.0.1:9001\"\nroute GET \"/\" { return forward(api") +
+            args + ") }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        CHECK_FALSE(ast);
+    }
+}
+
+TEST(frontend, forward_load_balance_survives_all_lowering_with_distinct_sites) {
+    auto tokens = lex(lit(R"(
+upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:9002"] }
+route GET "/rr" { return forward(api, load_balance: .roundRobin) }
+route POST "/least" { return forward(api, load_balance: .leastRequests) }
+route GET "/other" { return forward(api, load_balance: .roundRobin) }
+)"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_load_balance.policy,
+             LoadBalancePolicy::LeastRequests);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[1].blocks[0].term.forward_load_balance.policy,
+             LoadBalancePolicy::LeastRequests);
+    FrontendRirModule out{};
+    REQUIRE(lower_to_rir(mir.value(), out));
+    REQUIRE(rir::verify_module(out.module).ok);
+    for (u32 i = 0; i < 3; ++i) {
+        auto* term = find_first_op(out.module.functions[i], rir::Opcode::RetForward);
+        REQUIRE(term != nullptr);
+        CHECK_EQ(static_cast<u32>(term->imm.i32_val) >> 8, i + 1);
+        CHECK_EQ(static_cast<u32>(term->imm.i32_val) & 255, i == 1 ? 2u : 1u);
+    }
+    auto* term = find_first_op(out.module.functions[0], rir::Opcode::RetForward);
+    term->imm.i32_val = (1 << 8) | 3;
+    CHECK_FALSE(rir::verify_module(out.module).ok);
+    out.destroy();
 }

@@ -444,7 +444,7 @@ def main():
                     program.write_text(f'listen 127.0.0.1:{front_port}\n'
                                        f'upstream origin at "127.0.0.1:{origin_port}"\n'
                                        'route GET "/ws" { return websocket(origin) }\n'
-                                       'route GET "/stream" { return forward(origin) }\n')
+                                       'route GET "/stream" { return forward(origin, load_balance: .roundRobin) }\n')
                     nginx = directory / 'nginx.conf'
                     nginx.write_text('worker_processes 1; error_log /dev/stderr warn; pid /tmp/nginx.pid;\n'
                                      'events { worker_connections 8192; }\nhttp { access_log off; keepalive_requests 1000000; '

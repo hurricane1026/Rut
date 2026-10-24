@@ -57,6 +57,7 @@ void Http2Conn::init() {
     pending_route = nullptr;
     pending_route_action = RouteAction::Static;
     pending_static_status = 200;
+    pending_load_balance = {};
     pending_forward_upstream_id = 0;
     pending_jit_fn = nullptr;
     pending_route_param_count = 0;
@@ -87,6 +88,7 @@ void Http2Conn::init() {
     async_timer_ms = 0;
     async_fn = nullptr;
     async_state = 0;
+    async_load_balance = {};
     async_upstream_id = 0;
     async_resp_len = 0;
     outbound_stream = 0;
@@ -698,6 +700,7 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     c.pending_route = nullptr;
     c.pending_route_action = RouteAction::Static;
     c.pending_static_status = 200;
+    c.pending_load_balance = {};
     c.pending_forward_upstream_id = 0;
     c.pending_jit_fn = nullptr;
     c.pending_route_param_count = 0;

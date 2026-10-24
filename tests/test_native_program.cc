@@ -3,6 +3,7 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_program.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/connection_base.h"
 #include "rut/runtime/ebpf_plan.h"
 #include "rut/runtime/slice_pool.h"
 #include "test.h"
@@ -72,11 +73,11 @@ bool load(Source& source, NativeProgram& p, u8 opt = 2) {
 
 TEST(native_program, upstream_tls_configuration_is_owned_after_compiler_exit) {
     Source source;
-    REQUIRE(
-        source.append("upstream secure { host: \"127.0.0.1\", port: 443, protocol: .http2, "
-                      "tls: { ca: \"ca.pem\", server_name: \"backend.example\", "
-                      "cert: \"client.pem\", key: \"client.key\" } }\n"
-                      "route POST \"/test.Echo/Call\" { return forward(secure) }\n"));
+    REQUIRE(source.append(
+        "upstream secure { host: \"127.0.0.1\", port: 443, protocol: .http2, "
+        "tls: { ca: \"ca.pem\", server_name: \"backend.example\", "
+        "cert: \"client.pem\", key: \"client.key\" } }\n"
+        "route POST \"/test.Echo/Call\" { return forward(secure, load_balance: .roundRobin) }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
@@ -364,8 +365,9 @@ TEST(native_program, ebpf_body_plan_survives_compiler_exit_and_is_validated) {
     Source source;
     REQUIRE(source.append(
         "upstream b at \"127.0.0.1:9999\"\n"
-        "route GET \"/plain\" { return forward(b) }\n"
-        "route GET \"/headers\" { return forward(b, request_policy: { version: .http11, "
+        "route GET \"/plain\" { return forward(b, load_balance: .roundRobin) }\n"
+        "route GET \"/headers\" { return forward(b, load_balance: .roundRobin, request_policy: { "
+        "version: .http11, "
         "host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, "
         ".expect, .upgrade] }) }\n"
         "route GET \"/static\" { return 200 }\n"));
@@ -466,4 +468,31 @@ TEST(native_program, uuid_is_available_after_compiler_exit_with_request_arena) {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(native_program, forward_load_balance_survives_relocation_without_live_gauges) {
+    Source source;
+    REQUIRE(source.append(
+        "upstream api at \"127.0.0.1:9001\"\n"
+        "route GET \"/rr\" { return forward(api, load_balance: .roundRobin) }\n"
+        "route GET \"/least\" { return forward(api, load_balance: .leastRequests) }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    ConnectionBase conn;
+    conn.reset();
+    jit::HandlerCtx ctx{};
+    auto& cfg = owner.p->config;
+    REQUIRE_EQ(cfg.route_count, 2u);
+    for (u32 i = 0; i < 2; ++i) {
+        const auto result =
+            jit::HandlerResult::unpack(cfg.routes[i].fn(&conn, &ctx, nullptr, 0, nullptr));
+        CHECK_EQ(result.action, jit::HandlerAction::Forward);
+        CHECK_EQ(conn.forward_load_balance.site, i + 1);
+        CHECK_EQ(conn.forward_load_balance.policy,
+                 i == 0 ? LoadBalancePolicy::RoundRobin : LoadBalancePolicy::LeastRequests);
+        CHECK_EQ(cfg.backend_selection[0].active[0][0], 0u);
+        CHECK_EQ(cfg.backend_selection[0].cursor[i], 0u);
+    }
 }

@@ -735,7 +735,8 @@ TEST(simulate_engine, nested_wait_any_expression_is_rejected) {
 TEST(simulate_engine, wait_any_prefers_terminal_mismatch_over_failed_candidate) {
     const char* src =
         "upstream api\n"
-        "route GET \"/x\" { wait any { downstream.recv() => { return forward(api) } timer(50) => "
+        "route GET \"/x\" { wait any { downstream.recv() => { return forward(api, load_balance: "
+        ".roundRobin) } timer(50) => "
         "{ return 408 } } }\n";
     FrontendRirModule rir{};
     REQUIRE(compile_to_rir(src, rir));
@@ -818,7 +819,8 @@ TEST(simulate_engine, forward_upstream_match) {
 
 TEST(simulate_engine, forward_bundle_is_explicitly_unsupported) {
     const char* src =
-        "upstream backend\nroute GET \"/api\" { return forward(backend, failure_policy: { version: "
+        "upstream backend\nroute GET \"/api\" { return forward(backend, load_balance: .roundRobin, "
+        "failure_policy: { version: "
         ".http11, status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
         "\"nginx\", date: .current, connection: .request, body: b\"unavailable\" }) }\n";
     FrontendRirModule rir{};
@@ -855,7 +857,9 @@ TEST(simulate_engine, redirect_action_is_explicitly_unsupported) {
 }
 
 TEST(simulate_engine, recorded_target_transform_is_unsupported_before_forward) {
-    const char* src = "upstream backend\nroute GET \"/api\" { return forward(backend) }\n";
+    const char* src =
+        "upstream backend\nroute GET \"/api\" { return forward(backend, load_balance: .roundRobin) "
+        "}\n";
     FrontendRirModule rir{};
     REQUIRE(compile_to_rir(src, rir));
     REQUIRE(rir.module.func_count == 1);

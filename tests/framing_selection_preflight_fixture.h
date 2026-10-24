@@ -7,7 +7,7 @@ inline constexpr char kFramingSelectionPreflightSource[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 route HEAD "/one" {
   if req.hasContentLength {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: {version: .http11, host: .upstream, connection: .omit,
         content_length_position: .afterHost,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]},
@@ -22,7 +22,7 @@ route HEAD "/one" {
         date: .current, connection: .request, head_mode: .suppressBody, body: b"slow"},
       response_read_timeout: 1s)
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: {version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]},
       response_policy: {version: .http11, framing: .contentLength,
@@ -43,7 +43,7 @@ inline constexpr char kCompleteContentLengthFramingSelectionSource[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/one" {
   if req.hasContentLength {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: {version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]},
       response_policy: {version: .http11, framing: .contentLength,
@@ -57,7 +57,7 @@ route GET "/one" {
       response_read_timeout: 60s,
       response_buffering: .completeContentLength)
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: {version: .http11, host: .upstream, connection: .omit,
         retained_header_value: .trimSpPreserveHtab,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]},
@@ -82,7 +82,7 @@ inline constexpr char kBoundedFramingSelectionSource[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/one" {
   if req.hasContentLength {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: {version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]},
       response_policy: {version: .http11, framing: .contentLength,
@@ -96,7 +96,7 @@ route GET "/one" {
       response_read_timeout: 60s,
       response_buffering: .bounded)
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: {version: .http11, host: .upstream, connection: .omit,
         retained_header_value: .trimSpPreserveHtab,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]},

@@ -22,21 +22,21 @@ func require_path(_ req: i32) -> i32 {
     0
 }
 chain gate { before require_path(req) }
-route GET "/plain" { return forward(b) }
-route GET "/h2" { return forward(h2) }
+route GET "/plain" { return forward(b, load_balance: .roundRobin) }
+route GET "/h2" { return forward(h2, load_balance: .roundRobin) }
 route GET "/headers" {
-    return forward(b, request_policy: { version: .http11, host: .upstream,
+    return forward(b, load_balance: .roundRobin, request_policy: { version: .http11, host: .upstream,
         connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] })
 }
 route GET "/static" { return 200 }
-route POST "/body" { guard req.body == "ok" else { return 400 } return forward(b) }
-route GET "/regex" { guard req.path.matches(re"/regex") else { return 403 } return forward(b) }
+route POST "/body" { guard req.body == "ok" else { return 400 } return forward(b, load_balance: .roundRobin) }
+route GET "/regex" { guard req.path.matches(re"/regex") else { return 403 } return forward(b, load_balance: .roundRobin) }
 @rateLimit(limit: 2, window: 1m)
-route GET "/limited" { return forward(b) }
-route GET "/state" { counts.set(req.remoteAddr, 1) return forward(b) }
-route GET "/chain" use chain gate { return forward(b) }
+route GET "/limited" { return forward(b, load_balance: .roundRobin) }
+route GET "/state" { counts.set(req.remoteAddr, 1) return forward(b, load_balance: .roundRobin) }
+route GET "/chain" use chain gate { return forward(b, load_balance: .roundRobin) }
 route GET "/buffered" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
       response_policy: {version: .http11, framing: .contentLength,
         connection: .request, server: "rut", date: .current, hide_headers: []},
       failure_policy: {version: .http11, status: 502, reason: "Bad Gateway",
@@ -151,7 +151,7 @@ def main():
         assert not Path(str(partial) + ".handoff-commit.bpf").exists()
         assert Path(str(partial) + ".json").read_text() == "existing"
         # The consumer must reject malformed plans received over the real compiler pipe.
-        source.write_text('upstream b at "127.0.0.1:9000"\nroute GET "/" { return forward(b) }\n')
+        source.write_text('upstream b at "127.0.0.1:9000"\nroute GET "/" { return forward(b, load_balance: .roundRobin) }\n')
         compiler = server.parent / "rut-compile"
         with_plan = subprocess.run([str(compiler), str(source), "2", "--ebpf-plan"],
                                    capture_output=True, check=True, timeout=30).stdout

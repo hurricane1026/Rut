@@ -3,6 +3,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/load_balance.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
@@ -295,6 +296,7 @@ struct MirTerminator {
     u16 forward_request_policy_id = 0;
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
+    ForwardLoadBalance forward_load_balance{};
     u16 forward_timeout_failure_policy_id = 0;
     u8 forward_response_read_timeout_seconds = 0;
     ForwardResponseBufferingMode forward_response_buffering = ForwardResponseBufferingMode::None;

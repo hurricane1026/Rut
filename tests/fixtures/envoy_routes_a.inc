@@ -32,7 +32,7 @@ unmatched { return local_response({
 }) }
 route HEAD "/api" {
     if req.pathOnly != "/api" {
-    return forward(envoy_cluster_1, request_policy: {
+    return forward(envoy_cluster_1, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,
@@ -69,7 +69,7 @@ route HEAD "/api" {
         }
     )
     } else {
-    return forward(envoy_cluster_0, request_policy: {
+    return forward(envoy_cluster_0, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,
@@ -109,7 +109,7 @@ route HEAD "/api" {
 }
 route "/api" {
     if req.pathOnly != "/api" {
-    return forward(envoy_cluster_1, request_policy: {
+    return forward(envoy_cluster_1, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,
@@ -144,7 +144,7 @@ route "/api" {
         }
     )
     } else {
-    return forward(envoy_cluster_0, request_policy: {
+    return forward(envoy_cluster_0, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,
@@ -181,7 +181,7 @@ route "/api" {
     }
 }
 route HEAD "/" {
-    return forward(envoy_cluster_0, request_policy: {
+    return forward(envoy_cluster_0, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,
@@ -219,7 +219,7 @@ route HEAD "/" {
     )
 }
 route "/" {
-    return forward(envoy_cluster_0, request_policy: {
+    return forward(envoy_cluster_0, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,

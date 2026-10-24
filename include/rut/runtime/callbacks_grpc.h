@@ -10,6 +10,13 @@
 
 namespace rut {
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us);
+inline u32 select_forward_backend(const RouteConfig*, u32, ForwardLoadBalance, u16, u32, u64);
+inline void grpc_release_backend_active(GrpcExchange& x) {
+    if (x.backend_active) {
+        --*x.backend_active;
+        x.backend_active = nullptr;
+    }
+}
 inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success, u64 now_us);
 
 template <typename Loop>
@@ -180,6 +187,7 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
         grpc_detach(h, x);
     }
     if (x->slot_held) loop->upstream_release(x->upstream_id);
+    grpc_release_backend_active(*x);
     loop->pool.free(reinterpret_cast<u8*>(x));
     if (up && up->h2 && !up->h2->grpc.busy) grpc_drive_upstream(loop, *up);
 }
@@ -215,6 +223,7 @@ void grpc_connection_closed(void* lp, Connection& conn) {
             if (!x->response_end) x->failure = 14;
             x->response_end = true;
             Connection* down = x->downstream;
+            grpc_release_backend_active(*x);
             if (x->slot_held) {
                 loop->upstream_release(x->upstream_id);
                 x->slot_held = false;
@@ -346,6 +355,7 @@ inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
 }
 template <typename Loop>
 inline void grpc_release_slot(Loop* loop, GrpcExchange& x) {
+    grpc_release_backend_active(x);
     if (!x.slot_held) return;
     loop->upstream_release(x.upstream_id);
     x.slot_held = false;
@@ -936,7 +946,9 @@ bool grpc_start_impl(Loop* loop,
         req.method != HttpMethod::POST || !grpc_request(req) || down.h2->grpc.active >= 64)
         return false;
     const auto& target = cfg->upstreams[uid];
-    if (!target.addr_count) return false;
+    if (!target.addr_count || down.shard_id >= kMaxShards ||
+        !forward_load_balance_valid(down.forward_load_balance))
+        return false;
     const u64 now = monotonic_us();
     u64 deadline_base = now;
     if (down.h2 && down.h2->async_stream == sid && down.h2->async_headers_received_us)
@@ -950,7 +962,8 @@ bool grpc_start_impl(Loop* loop,
         if (deadline || !grpc_timeout(hs[i].value, &timeout)) return false;
         deadline = deadline_base + timeout;
     }
-    const u32 backend = select_backend(uid, target.addr_count, now);
+    const u32 backend = select_forward_backend(
+        cfg, down.shard_id, down.forward_load_balance, uid, target.addr_count, now);
     Connection* up = nullptr;
     for (auto* c = loop->grpc_upstreams; c; c = c->h2->grpc.pool_next) {
         if (grpc_upstream_reusable(*c, cfg, uid, backend)) {
@@ -963,6 +976,7 @@ bool grpc_start_impl(Loop* loop,
     static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize);
     x->init();
     if (!grpc_snapshot_response_mutations(down, *x)) {
+        grpc_release_backend_active(*x);
         loop->pool.free(reinterpret_cast<u8*>(x));
         return false;
     }
@@ -971,12 +985,14 @@ bool grpc_start_impl(Loop* loop,
     if (!up) {
         up = loop->alloc_conn();
         if (!up) {
+            grpc_release_backend_active(*x);
             loop->pool.free(reinterpret_cast<u8*>(x));
             return false;
         }
         up->set_metrics_client(false);
         if (!loop->alloc_h2(*up) || !grpc_grow_recv(loop, *up)) {
             loop->close_conn(*up);
+            grpc_release_backend_active(*x);
             loop->pool.free(reinterpret_cast<u8*>(x));
             return false;
         }
@@ -1000,6 +1016,7 @@ bool grpc_start_impl(Loop* loop,
     auto* stream = up->h2->open_stream(usid);
     auto* down_stream = down.h2->find_stream(sid);
     if (!stream || !down_stream) {
+        grpc_release_backend_active(*x);
         loop->pool.free(reinterpret_cast<u8*>(x));
         if (fresh) loop->close_conn(*up);
         return false;
@@ -1018,6 +1035,7 @@ bool grpc_start_impl(Loop* loop,
         x->request_headers, sizeof(x->request_headers), usid, filtered, filtered_n, false);
     if (!x->request_headers_len) {
         stream->state = Http2StreamState::Closed;
+        grpc_release_backend_active(*x);
         loop->pool.free(reinterpret_cast<u8*>(x));
         if (fresh) loop->close_conn(*up);
         return false;
@@ -1034,12 +1052,15 @@ bool grpc_start_impl(Loop* loop,
     if (target.max_inflight) {
         if (!loop->upstream_acquire(uid, target.max_inflight)) {
             stream->state = Http2StreamState::Closed;
+            grpc_release_backend_active(*x);
             loop->pool.free(reinterpret_cast<u8*>(x));
             if (fresh) loop->close_conn(*up);
             return false;
         }
         x->slot_held = true;
     }
+    x->backend_active = &cfg->backend_selection[down.shard_id].active[uid][backend];
+    ++*x->backend_active;
     x->started_us = now;
     x->observed = true;
     if (loop->metrics) loop->metrics->on_grpc_start();
@@ -1294,6 +1315,7 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
             }
             grpc_detach(uh, x);
             x->upstream = nullptr;
+            grpc_release_backend_active(*x);
             if (x->slot_held) {
                 loop->upstream_release(x->upstream_id);
                 x->slot_held = false;
@@ -1348,6 +1370,7 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
         }
         grpc_detach(uh, x);
         x->upstream = nullptr;
+        grpc_release_backend_active(*x);
         if (x->slot_held) {
             loop->upstream_release(x->upstream_id);
             x->slot_held = false;

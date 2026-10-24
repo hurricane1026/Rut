@@ -51,7 +51,7 @@ examples/grpc/.venv/bin/python examples/grpc/client.py
 All four calls should print `OK`. To compare with the backend directly, use
 `--target 127.0.0.1:50051`. Stop the gateway and backend with Ctrl-C.
 
-`protocol: .http2` selects a prior-knowledge h2c upstream by default. `forward(echo)` routes
+`protocol: .http2` selects a prior-knowledge h2c upstream by default. `forward(echo, load_balance: .roundRobin)` routes
 by the ordinary `/package.Service/Method` path; Rut neither loads the proto nor
 decodes messages. Streaming and compressed payloads stay opaque. HTTP/2
 multiplexing and pooling do not require TLS.

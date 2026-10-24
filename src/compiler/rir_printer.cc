@@ -891,6 +891,12 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::RetForwardBundle:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
+            if (inst.imm.i32_val != 0) {
+                const u32 encoded = static_cast<u32>(inst.imm.i32_val);
+                buf.put_cstr((encoded & 255) == 1 ? ", load_balance: .roundRobin, site#"
+                                                  : ", load_balance: .leastRequests, site#");
+                buf.put_u32(encoded >> 8);
+            }
             break;
         case Opcode::RetRedirect:
             buf.put(' ');

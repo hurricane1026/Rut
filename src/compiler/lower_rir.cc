@@ -3223,6 +3223,13 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         return {};
     }
     if (term.kind == MirTerminatorKind::ForwardUpstream) {
+        u32 load_balance = 0;
+        if (term.forward_load_balance.policy != LoadBalancePolicy::None) {
+            if (b.mod->forward_site_count >= kMaxForwardSites)
+                return frontend_error(FrontendError::TooManyItems, term.span);
+            const u32 site = ++b.mod->forward_site_count;
+            load_balance = (site << 8) | static_cast<u8>(term.forward_load_balance.policy);
+        }
         if (term.forward_response_read_timeout_seconds != 0 &&
             !response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
@@ -3347,8 +3354,11 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
                 fn->preflight_forward_policy_bundle_id = bundle_id;
             }
-            if (!b.emit_ret_forward_bundle(
-                    upstream.value(), policy, bundle.value(), {term.span.line, term.span.col}))
+            if (!b.emit_ret_forward_bundle(upstream.value(),
+                                           policy,
+                                           bundle.value(),
+                                           {term.span.line, term.span.col},
+                                           load_balance))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             return {};
         }
@@ -3377,8 +3387,11 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         if (target_transform_id != 0 &&
             !b.emit_req_set_target_transform(target_transform_id, {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
-        if (!b.emit_ret_forward(
-                upstream.value(), policy, response_policy, {term.span.line, term.span.col}))
+        if (!b.emit_ret_forward(upstream.value(),
+                                policy,
+                                response_policy,
+                                {term.span.line, term.span.col},
+                                load_balance))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }

@@ -111,7 +111,7 @@ def config(out, body_size, origin, port, workers):
             raise ValueError('invalid origin port')
         (out / 'proxy.rut').write_text(
             f'listen 0.0.0.0:{port}\nupstream backend at "{origin}"\n'
-            'route GET "/proxy" { return forward(backend) }\n')
+            'route GET "/proxy" { return forward(backend, load_balance: .roundRobin) }\n')
         (out / 'proxy.conf').write_text(common +
             f'upstream backend {{ server {origin}; keepalive 4096; '
             'keepalive_timeout 60s; keepalive_requests 1000000000; }\n'

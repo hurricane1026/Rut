@@ -798,7 +798,7 @@ get /users/:id {
     let key = "/users/\(req.params.id)"
     // miss + in-flight → auto wait for first request
     if let cached = cache.get(key) { return 200, cached }
-    let resp = forward(userService, buffered: true)
+    let resp = forward(userService, load_balance: .roundRobin, buffered: true)
     cache.set(key, resp.body)        // stores result + wakes all waiting connections
     return resp
 }
@@ -916,7 +916,7 @@ get /api/*path {
     // Compiler generates: hash(remoteAddr) → owner shard → SPSC send → yield → receive
     let tat = ownerBuckets.get(req.remoteAddr).or(0)
     // ... GCRA over tat (see examples/ratelimit.rut)
-    return forward(userService)
+    return forward(userService, load_balance: .roundRobin)
 }
 ```
 
@@ -1166,7 +1166,7 @@ get /api/data {
         msg = "\(msg) sql_injection"
     }
     guard score <= 10 else { return 403, msg }
-    return forward(userService)
+    return forward(userService, load_balance: .roundRobin)
 }
 
 // ❌ top-level var — compile error
@@ -1202,7 +1202,7 @@ get /api/data {
 
     guard req.authorization != nil else { return 401 }   // defer still runs
     guard req.contentLength <= 1mb else { return 413 } // defer still runs
-    return forward(userService)                        // defer still runs
+    return forward(userService, load_balance: .roundRobin)                        // defer still runs
 }
 ```
 
@@ -1320,7 +1320,7 @@ images or streaming responses), use `compress: .off` in the response:
 
 ```swift
 get /files/:id {
-    forward(storageService, compress: .off)          // skip compression for this proxy
+    forward(storageService, load_balance: .roundRobin, compress: .off)          // skip compression for this proxy
 }
 
 get /images/*path {
@@ -1334,7 +1334,6 @@ get /images/*path {
 let users = upstream {
     "10.0.0.1:8080", weight: 3
     "10.0.0.2:8080"
-    balance: .leastConn
     health: .active(get: "/ping", every: 5s)              // active — timer probes
     health: .passive(failures: 5, recover: 30s)            // passive — mark unhealthy after consecutive errors
     breaker: .consecutive(failures: 5, recover: 30s)
@@ -1356,7 +1355,7 @@ let orders = upstream { "10.0.1.1:8080" }
 
 **Implemented native gRPC gateway path:** the current frontend accepts
 `upstream greeter { host: "127.0.0.1", port: 50051, protocol: .http2 }` and
-`route POST "/package.Service/Method" { return forward(greeter) }`.
+`route POST "/package.Service/Method" { return forward(greeter, load_balance: .roundRobin) }`.
 `protocol` is an upstream configuration field, not a new keyword. Its closed
 selectors are `.http11` (default) and `.http2`. HTTP/2 uses prior-knowledge
 h2c by default; the implemented `tls: { ca: "...", server_name: "..." }`
@@ -1443,25 +1442,86 @@ health checks remain outside this path. The frontend rejects
 `.http2` combined with the HTTP/1 health-check configuration. See
 [examples/grpc.rut](examples/grpc.rut) and the language card.
 
-**Load balancing algorithms:**
+**Forward-site load balancing**
 
-All standard algorithms are built-in. The runtime tracks per-target state
-(connection count, latency, weight) per shard.
+Backend membership and connection configuration belong to `upstream`. Backend
+selection belongs to each `forward` call. A shared backend set can therefore
+serve routes with different selection policies:
 
-| Algorithm | Declaration | Description |
-|-----------|-------------|-------------|
-| Round Robin | `balance: .roundRobin` | Sequential rotation (default) |
-| Weighted Round Robin | `balance: .weightedRoundRobin` | Distribute proportional to `weight:` |
-| Least Connections | `balance: .leastConn` | Target with fewest active connections |
-| Random | `balance: .random` | Uniform random selection |
-| Power of Two (P2C) | `balance: .powerOfTwo` | Random 2 targets, pick the one with fewer connections |
-| IP Hash | `balance: .ipHash` | Consistent hash on client IP (session affinity) |
-| Consistent Hash | `balance: .hash(expr)` | Consistent hash on arbitrary field (e.g., `req.header("X-User-ID")`) |
-| EWMA | `balance: .ewma` | Lowest exponential weighted moving average latency |
+```swift
+upstream api {
+    backends: ["127.0.0.1:9001", "127.0.0.1:9002"]
+}
 
-**Custom load balancing:**
+route GET "/catalog" {
+    return forward(api, load_balance: .roundRobin)
+}
 
-Users can implement custom algorithms in Rutlang. Instead of `forward(upstream)`,
+route POST "/jobs" {
+    return forward(api, load_balance: .leastRequests)
+}
+```
+
+`load_balance` is an ordinary named argument, not a new keyword. Its value has
+a closed policy type; the initial policy vocabulary is `.roundRobin` and
+`.leastRequests`. The compiler requires this argument at every `forward` call; legacy
+`forward(api)` is rejected, including for single-backend upstreams.
+
+The compiler contract is:
+
+- Every `forward` call must supply exactly one `load_balance` argument, even
+  when its upstream has one backend or is supplied by the host application.
+- There is no inherited or default selection policy. `defaults`, `upstream`,
+  route annotations, and an enclosing handler cannot fill an omitted argument.
+- Only the canonical enum selectors are accepted. Strings, numeric IDs,
+  aliases, duplicate arguments, and unimplemented selectors are compile errors.
+- Selection must be preserved through AST/HIR/MIR/RIR, static route lowering,
+  JIT yields/resumption, native-program serialization/loading, and HTTP/1 and
+  native gRPC forwarding. An optimization must not silently erase the policy
+  or revert to the old implicit selector.
+- Existing upstream declaration forms, including `upstream api at "ip:port"`,
+  remain independent of selection. Migration changes the `forward` call;
+  moving the policy to `upstream` is not a supported migration.
+- Existing hand-written programs, generated programs, fixtures, and examples
+  must supply the mandatory argument explicitly.
+  Importers must translate the source configuration's selection semantics into
+  an explicit argument, or reject an unsupported mapping.
+
+Selection state follows the same ownership boundary:
+
+- A round-robin cursor belongs to one compiled forward site on one shard.
+  Different routes, branches, and expanded helper calls cannot advance each
+  other's cursor merely because they share the same upstream.
+- Least-request accounting is shared by all routes using the same upstream
+  backend set within a shard. It measures in-flight requests/RPCs rather than
+  TCP connections; a streaming gRPC RPC counts once over its active lifetime.
+- Backend accounting must be released exactly once on completion, failure,
+  cancellation, reset, and close. Pooling and HTTP/2 multiplexing must not
+  distort the count. Retry accounting and selection must preserve the logical
+  forward site's policy rather than introduce an implicit fallback algorithm.
+- Configuration hot reload must not bind an old request's selection state to
+  a different forward site or backend solely because a numeric ID was reused.
+  State remains shard-owned and configuration lifetimes follow existing RCU.
+
+Both algorithms skip actively or passively ejected endpoints when at least one
+healthy endpoint exists. When all endpoints are ejected, they consider the full
+set, preserving the runtime's existing fail-open behavior. Empty backend sets
+are rejected by configuration admission. Least-request ties rotate using that
+forward site's cursor. One attempt is counted from upstream dispatch through
+completion or failure, including connect time; a failed attempt releases its
+count before retry selection. A completed RPC releases its count even if the
+downstream is still draining a response. No `max_inflight` setting is needed
+for counting. Additional algorithms have no accepted selector spelling yet.
+
+Selection is terminal metadata in RIR, independent of request/response policy
+bundles. JIT/native code records it on the connection before returning the
+existing forward ABI. Config-owned sidecars contain disjoint rows for each
+shard; RCU pins keep old gauges alive through request teardown. Native artifacts
+serialize configuration and generated code, never live counters or cursors.
+
+**⏳ Custom load balancing (design only):**
+
+Users can implement custom algorithms in Rutlang. Instead of `forward(upstream, load_balance: .roundRobin)`,
 select a target manually using `upstream.servers` and `forward` to a specific address:
 
 ```swift
@@ -1477,7 +1537,7 @@ func selectByHeader(_ req: Request, up: Upstream) -> Server {
 
 get /custom {
     let target = selectByHeader(req, up: users)
-    return forward(target)
+    return forward(target, load_balance: .roundRobin)
 }
 ```
 
@@ -1576,7 +1636,6 @@ let backend = upstream {
 let userService = upstream {
     "10.0.0.1:8080", weight: 3, zone: "us-east-1a"
     "10.0.0.2:8080", weight: 1, zone: "us-east-1b"
-    balance: .ewma
     health: .active(get: "/ping", every: 5s)
     health: .passive(failures: 5, recover: 30s)
     outlier: .successRate(threshold: 0.9, interval: 30s, minRequests: 100)
@@ -1786,9 +1845,9 @@ route {
     @requestId *
 
     @maxBody(limit: 100mb)                  // only this route
-    post /files/upload => forward(storageService, streaming: true)
+    post /files/upload => forward(storageService, load_balance: .roundRobin, streaming: true)
 
-    get /users/:id => forward(userService)  // gets @requestId from binding
+    get /users/:id => forward(userService, load_balance: .roundRobin)  // gets @requestId from binding
 }
 ```
 
@@ -1817,7 +1876,7 @@ route {
     @requestId *                // Request → pre
     @addSecurityHeaders *       // Response → post
 
-    get /users/:id => forward(userService)
+    get /users/:id => forward(userService, load_balance: .roundRobin)
 }
 
 // Expands to:
@@ -1832,8 +1891,8 @@ buffered mode and emits a warning:
 
 ```
 ⚠ warning: post-middleware @addSecurityHeaders forces buffered mode for
-            'get /users/:id => forward(userService)'. Zero-copy disabled.
-            To silence: use forward(userService, buffered: true) explicitly.
+            'get /users/:id => forward(userService, load_balance: .roundRobin)'. Zero-copy disabled.
+            To silence: use forward(userService, load_balance: .roundRobin, buffered: true) explicitly.
 ```
 
 **Conditional decorators: `@if`**
@@ -1853,7 +1912,7 @@ route {
     @addSecurityHeaders *
 
     api.example.com {
-        get /users/:id => forward(userService)
+        get /users/:id => forward(userService, load_balance: .roundRobin)
     }
 }
 ```
@@ -1868,7 +1927,7 @@ route {
 //   *rest          — captures remaining path segments as string (must be last)
 
 get /users/:id(i64) {         // req.params.id is i64, returns 404 if not numeric
-    return forward(userService)
+    return forward(userService, load_balance: .roundRobin)
 }
 
 get /files/*rest {            // req.params.rest captures "docs/2024/readme.md"
@@ -1885,10 +1944,10 @@ Groups can nest.
 route {
     api.example.com {
         /v1 {
-            get /users/:id => forward(usersV1)
+            get /users/:id => forward(usersV1, load_balance: .roundRobin)
         }
         /v2 {
-            get /users/:id => forward(usersV2)
+            get /users/:id => forward(usersV2, load_balance: .roundRobin)
         }
     }
 
@@ -1925,14 +1984,14 @@ route {
     get /health => 200
 
     api.example.com {
-        get /users/:id(i64) => forward(userService)
+        get /users/:id(i64) => forward(userService, load_balance: .roundRobin)
 
         post /orders {
             guard let order = req.body(Order) else { return 400 }
             for item in order.items {
                 guard item.qty > 0 else { return 400, "invalid quantity" }
             }
-            return forward(orderService)
+            return forward(orderService, load_balance: .roundRobin)
         }
     }
 
@@ -2036,18 +2095,18 @@ same path for different methods.
 
 `forward` has two modes:
 
-- **Zero-copy** — `return forward(upstream)`. Data spliced directly between sockets,
+- **Zero-copy** — `return forward(upstream, load_balance: .roundRobin)`. Data spliced directly between sockets,
   never enters userspace. No response modification possible.
-- **Buffered** — `forward(upstream, buffered: true)`. Response read into memory,
+- **Buffered** — `forward(upstream, load_balance: .roundRobin, buffered: true)`. Response read into memory,
   returned as `Response` object. Full modification, then explicit `return`.
 
 ```swift
 // Zero-copy — no modification, maximum performance
-get /users/:id => forward(userService)
+get /users/:id => forward(userService, load_balance: .roundRobin)
 
 // Buffered — modify headers
 get /users/:id {
-    let resp = forward(userService, buffered: true)
+    let resp = forward(userService, load_balance: .roundRobin, buffered: true)
     resp.remove("Server")
     resp.set("X-Request-ID", req.header("X-Request-ID").or(""))
     return resp
@@ -2055,7 +2114,7 @@ get /users/:id {
 
 // Buffered — modify body, log errors
 get /users/:id {
-    let resp = forward(userService, buffered: true)
+    let resp = forward(userService, load_balance: .roundRobin, buffered: true)
     if resp.status >= 500 {
         log.error("upstream error", status: resp.status, path: req.path)
     }
@@ -2068,15 +2127,15 @@ get /users/:id {
 ```
 
 The compiler detects which mode to use:
-- `return forward(x)` or `=> forward(x)` → zero-copy
-- `let resp = forward(x, buffered: true)` → buffered, `resp` is a regular variable
+- `return forward(x, load_balance: .roundRobin)` or `=> forward(x, load_balance: .roundRobin)` → zero-copy
+- `let resp = forward(x, load_balance: .roundRobin, buffered: true)` → buffered, `resp` is a regular variable
 
 **Bandwidth limiting** — see §3.4.10 Throttle.
 
 **Response object members (buffered mode):**
 
 ```swift
-let resp = forward(userService, buffered: true)
+let resp = forward(userService, load_balance: .roundRobin, buffered: true)
 resp.status                   // StatusCode — read/write
 resp.body                     // string — read/write
 resp.header("Server")         // string? — header read
@@ -2117,7 +2176,7 @@ Changing selector syntax does not widen policy combinations or runtime
 protocol support, and generated nginx/Envoy RUT uses exactly the same syntax
 as hand-written RUT.
 
-`forward(upstream, request_policy: { ... })` requests a fixed, closed
+`forward(upstream, load_balance: .roundRobin, request_policy: { ... })` requests a fixed, closed
 byte-for-byte serialization of the upstream request instead of the
 transparent zero-copy default; every field is a literal, validated at parse
 time, and unsupported combinations are a compile error rather than a runtime
@@ -2129,7 +2188,7 @@ fallback. The compiler selects one of four closed source profiles
 // ID1 (Http11FixedStrip) -- the base upstream-authority profile: rewrites
 // Host to the upstream endpoint and strips the fixed five-name hop-by-hop
 // set unconditionally (no Connection-token nomination, no TE exception).
-return forward(users, request_policy: {
+return forward(users, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .upstream, connection: .omit,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
 })
@@ -2141,7 +2200,7 @@ return forward(users, request_policy: {
 // A request with no framing header at all (no Content-Length) is admitted
 // unchanged -- there is nothing to reposition, so it forwards like ID1. Only
 // an explicit `Content-Length: 0` is rejected.
-return forward(users, request_policy: {
+return forward(users, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .upstream, connection: .omit,
     content_length_position: .afterHost,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
@@ -2154,7 +2213,7 @@ return forward(users, request_policy: {
 // Mutually exclusive with `content_length_position`. Bounded to the single
 // bodyless-GET profile: any Content-Length (including zero), chunked
 // framing, or a non-GET method is rejected.
-return forward(users, request_policy: {
+return forward(users, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .upstream, connection: .omit,
     retained_header_value: .trimSpPreserveHtab,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
@@ -2167,7 +2226,7 @@ return forward(users, request_policy: {
 // header name, and requires forwarded_proto and the six-name strip list
 // (including Proxy-Connection) together. Mutually exclusive with
 // `content_length_position` and `retained_header_value`.
-return forward(users, request_policy: {
+return forward(users, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .preserve, connection: .omit,
     header_names: .lowercase, forwarded_proto: .http,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
@@ -2299,7 +2358,7 @@ or OWS-only `Expect` field is admitted like a request with no `Expect`
 header at all, matching the same nonempty-trimmed-value condition described
 above. `host: .preserve` (ID4) is additionally ordinary-forward-only: a
 route pairing it with a response read timeout, response buffering, or a
-`target_transform` (`forward(upstream, set_path: "...")`) request-target
+`target_transform` (`forward(upstream, load_balance: .roundRobin, set_path: "...")`) request-target
 rewrite fails at compile time with a dedicated diagnostic (`analyze_term`,
 `src/compiler/analyze.cc`) rather than the generic response-read-timeout/
 buffering diagnostics, since none of the three has a proven interaction with
@@ -2312,7 +2371,7 @@ verified against.
 
 **Response rewrite policy (`response_policy`)**
 
-`forward(upstream, response_policy: { ... })` is `request_policy`'s
+`forward(upstream, load_balance: .roundRobin, response_policy: { ... })` is `request_policy`'s
 response-side counterpart: a fixed, closed byte-for-byte serialization of the
 upstream response instead of the transparent zero-copy default. Admission is
 bounded to a cleartext HTTP/1.1, origin-form, bodyless non-HEAD request and
@@ -2333,14 +2392,14 @@ idle upstream socket (see `request_policy_body_response_admitted` in
 ```swift
 // Fixed-order profile (nginx-compatible default): synthesizes the response
 // in a fixed field order, replacing Server/Date and applying hide_headers.
-return forward(users, response_policy: {
+return forward(users, load_balance: .roundRobin, response_policy: {
     version: .http11, framing: .contentLength, connection: .request,
     server: "nginx/1.29.7", date: .current, hide_headers: ["Date", "Server", "X-Pad"]
 })
 
 // Envoy-compatible H1 profile (`header_order: .upstream`): preserves the
 // upstream's header order instead of the fixed layout above.
-return forward(users, response_policy: {
+return forward(users, load_balance: .roundRobin, response_policy: {
     version: .http11, framing: .contentLength, connection: .request,
     header_order: .upstream, header_names: .lowercase,
     connection_header: .closeOnly, status_reason: .canonical,
@@ -2448,7 +2507,7 @@ get /users/:id {
     if let cached = responseCache.get(key) {
         return 200, cached
     }
-    let resp = forward(userService, buffered: true)
+    let resp = forward(userService, load_balance: .roundRobin, buffered: true)
     responseCache.set(key, resp.body)
     return resp
 }
@@ -2471,7 +2530,7 @@ func mirror(_ req: Request, to: string) {
 post /api/orders {
     auth(req, role: "user")
     mirror(req, to: "staging-gateway:8080")   // fire-and-forget
-    forward(orderService)               // actual request
+    forward(orderService, load_balance: .roundRobin)               // actual request
 }
 ```
 
@@ -2599,11 +2658,11 @@ For large bodies (file uploads, downloads), stream without buffering:
 post /upload {
     auth(req, role: "user")
     guard req.contentLength <= 100mb else { return 413 }
-    forward(storageService, streaming: true)    // body streams through, not buffered
+    forward(storageService, load_balance: .roundRobin, streaming: true)    // body streams through, not buffered
 }
 
 get /download/:fileId {
-    forward(storageService, streaming: true)    // response streams to client
+    forward(storageService, load_balance: .roundRobin, streaming: true)    // response streams to client
 }
 ```
 
@@ -2630,26 +2689,26 @@ evaluated at compile time.
 // File download — limit per-user download speed
 get /files/:id {
     throttle(downstream: 100kb per 1s)
-    return forward(storageService)
+    return forward(storageService, load_balance: .roundRobin)
 }
 
 // Video streaming — pace to match playback rate
 get /video/:id {
     throttle(downstream: 5mb per 1s)
-    return forward(cdnService, streaming: true)
+    return forward(cdnService, load_balance: .roundRobin, streaming: true)
 }
 
 // Upload protection — don't overwhelm slow upstream
 post /upload {
     throttle(upstream: 500kb per 1s)
-    return forward(legacyService, streaming: true)
+    return forward(legacyService, load_balance: .roundRobin, streaming: true)
 }
 
 // Anti-scraping — slow down data extraction
 @auth(role: "user")
 get /api/products/:id {
     throttle(downstream: 50kb per 1s)
-    return forward(productService, buffered: true)
+    return forward(productService, load_balance: .roundRobin, buffered: true)
 }
 
 // Tiered service — different speeds per plan
@@ -2659,13 +2718,13 @@ get /data/*path {
         "pro" => throttle(downstream: 1mb per 1s)
         _ => throttle(downstream: 100kb per 1s)
     }
-    return forward(storageService)
+    return forward(storageService, load_balance: .roundRobin)
 }
 
 // Both directions
 post /sync {
     throttle(downstream: 1mb per 1s, upstream: 500kb per 1s)
-    return forward(syncService, streaming: true)
+    return forward(syncService, load_balance: .roundRobin, streaming: true)
 }
 ```
 
@@ -2843,7 +2902,7 @@ reports an error if it finds code after a terminal statement.
 | Statement | Effect |
 |-----------|--------|
 | `return N` | (handler) Send HTTP response with status code N |
-| `return forward(upstream)` | (handler) Forward request to upstream (zero-copy) |
+| `return forward(upstream, load_balance: .roundRobin)` | (handler) Forward request to upstream (zero-copy) |
 | `return read(root:)` | (handler) Serve static file/pipe (zero-copy) |
 | `return websocket(upstream)` | (handler) Upgrade to WebSocket and proxy |
 | `respond N` / `respond N, body` / `respond resp` | (middleware) Short-circuit the request with a response |
@@ -2855,7 +2914,7 @@ operations.
 
 ```swift
 get /users/:id {
-    return forward(userService)
+    return forward(userService, load_balance: .roundRobin)
     log.info("done")   // compile error: unreachable code after return
 }
 ```
@@ -2878,15 +2937,15 @@ get /api/users/:id {
         "v2" => usersV2
         _    => usersV1
     }
-    return forward(target)
+    return forward(target, load_balance: .roundRobin)
 }
 
 // Canary release: percentage-based — a two-way bool branch uses if, not match
 get /api/** {
     if fnv32(req.remoteAddr) % 100 < 10 {
-        return forward(canary)
+        return forward(canary, load_balance: .roundRobin)
     }
-    return forward(stable)
+    return forward(stable, load_balance: .roundRobin)
 }
 
 // Blue-green via environment variable
@@ -2895,7 +2954,7 @@ get /api/** {
         "blue" => blueUpstream
         _      => greenUpstream
     }
-    return forward(target)
+    return forward(target, load_balance: .roundRobin)
 }
 ```
 
@@ -2949,9 +3008,9 @@ let clean = req.path.replace(re"/+", "/")
 
 // In match expressions
 match req.userAgent {
-    re"(?i)mobile|android|iphone" { forward(mobileBackend) }
+    re"(?i)mobile|android|iphone" { forward(mobileBackend, load_balance: .roundRobin) }
     re"(?i)bot|spider"            { return 403 }
-    _                              { forward(desktopBackend) }
+    _                              { forward(desktopBackend, load_balance: .roundRobin) }
 }
 ```
 
@@ -3275,7 +3334,7 @@ let h = submit get http://slow-service/data
 guard let result = any(wait(h, 5s)) else { return 504, "timeout" }
 
 // Custom timeout on any I/O (alternative to per-call timeout: parameter)
-let h1 = submit forward(userService, buffered: true)
+let h1 = submit forward(userService, load_balance: .roundRobin, buffered: true)
 guard let resp = any(wait(h1, 30s)) else { return 504 }
 return resp
 ```
@@ -3415,7 +3474,7 @@ Most handlers need nothing. If custom attributes are needed:
 get /users/:id {
     auth(req, role: "user")
     req.span.set("userId", req.ctx.userId)    // add attribute to current span
-    return forward(userService)
+    return forward(userService, load_balance: .roundRobin)
 }
 ```
 
@@ -3429,8 +3488,8 @@ Everything a gateway needs, with zero external dependencies:
 // --- I/O ---
 get/post/put/delete url { }   // HTTP calls to external services
 fire post url { }             // fire-and-forget HTTP (traffic mirroring, async logging)
-forward(upstream)                // forward to upstream (zero-copy when returned)
-forward(upstream, streaming:)   // streaming proxy (large body, no buffering)
+forward(upstream, load_balance: .roundRobin)                // forward to upstream (zero-copy when returned)
+forward(upstream, load_balance: .roundRobin, streaming:)   // streaming proxy (large body, no buffering)
 websocket(upstream)           // WebSocket transparent proxy
 read(root:, fallback:)        // file/pipe I/O: zero-copy (return) or buffered (let)
 tcp(addr) -> TcpConn          // TCP connection (Redis, custom protocols)
@@ -3651,7 +3710,7 @@ bitwise.shiftRight(a, n)      // a >> n
 | Consistent cost | `Cache<IP, i64>(..., consistent: true)` | warning: "cross-shard round-trip on every op, suppress with // rut:allow(consistent)" |
 | Consistent read-only | `Set<IP>(..., consistent: true)` with only `.contains()` | warning: "reads are local, consistent only affects writes, use notify all for rare writes" |
 | Broadcast in handler | `notify` inside a route handler | warning: "executes on every request, did you mean to put this in an admin endpoint?" |
-| Post-middleware + zero-copy | `@addSecurityHeaders *` bound to `=> forward(x)` | warning: "post-middleware forces buffered mode, zero-copy disabled" |
+| Post-middleware + zero-copy | `@addSecurityHeaders *` bound to `=> forward(x, load_balance: .roundRobin)` | warning: "post-middleware forces buffered mode, zero-copy disabled" |
 | State key type | `Cache<Order, i64>` | "Cache key must be scalar type" |
 | State no capacity | `Cache<IP, i64>()` | "capacity is required" |
 | Persist layout change | hot reload + struct field changed | "persistent state 'sessions': layout changed" |
@@ -3709,7 +3768,7 @@ removed from the language instead of documented as a variation.
 | Named fallback | `req.authorization.or("")` | Core optional fallback surface; `??` / `?.` / postfix `!` remain reserved (rejected with fix-its) |
 | `let` / `var` | `let x = ...` (immutable), `var x = ...` (mutable) | `var` only inside func/handler, not at top level |
 | String interpolation | `"\(req.method)\n\(req.path)"` | Cleaner than concatenation |
-| `.enumCase` | `balance: .leastConn` | Concise enum values |
+| `.enumCase` | `forward(api, load_balance: .leastRequests)` | Concise enum values |
 | Trailing block | `websocket(x) { frame in ... }` | Swift trailing-closure surface; compiled to a state machine, not a closure |
 | No commas in blocks | Multi-line blocks don't need commas | Cleaner, less noise |
 
@@ -3744,7 +3803,6 @@ defaults {
 let userService = upstream {
     "10.0.0.1:8080", weight: 3
     "10.0.0.2:8080"
-    balance: .ewma
     health: .active(get: "/ping", every: 5s)
     health: .passive(failures: 5, recover: 30s)
     breaker: .consecutive(failures: 5, recover: 30s)
@@ -3859,7 +3917,7 @@ route {
                 return 200, cached
             }
 
-            let resp = forward(userService, buffered: true)
+            let resp = forward(userService, load_balance: .roundRobin, buffered: true)
             resp.set("X-Request-ID", req.header("X-Request-ID").or(""))
             resp.remove("X-Powered-By")
             userCache.set("/users/\(req.params.id)", resp.body)
@@ -3871,15 +3929,15 @@ route {
             for item in order.items {
                 guard item.qty > 0 else { return 400, "invalid quantity" }
             }
-            return forward(orderService)
+            return forward(orderService, load_balance: .roundRobin)
         }
 
         post /files/upload {
             guard req.contentLength <= 100mb else { return 413 }
-            return forward(storageService, streaming: true)
+            return forward(storageService, load_balance: .roundRobin, streaming: true)
         }
 
-        get /files/:fileId => forward(storageService, streaming: true)
+        get /files/:fileId => forward(storageService, load_balance: .roundRobin, streaming: true)
 
         get /ws/chat {
             guard req.upgrade == .websocket else { return 400 }
@@ -3940,8 +3998,8 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | Request size limiting | `req.contentLength` comparison |
 | Header add/remove/modify | `req.Header = val` / `= nil` |
 | URL rewriting | `req.path` assignment |
-| Response header rewrite | `let resp = forward(x, buffered: true); resp.Header = val` |
-| Response body rewrite | `let resp = forward(x, buffered: true); resp.body = ...` |
+| Response header rewrite | `let resp = forward(x, load_balance: .roundRobin, buffered: true); resp.Header = val` |
+| Response body rewrite | `let resp = forward(x, load_balance: .roundRobin, buffered: true); resp.body = ...` |
 | Request termination (maintenance) | `return 503` |
 | Canary release / A/B testing | conditional routing + `fnv32` hash |
 | Blue-green deployment | `env()` + conditional proxy |
@@ -3951,7 +4009,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | Response caching | runtime auto (RFC 7234) + `LRU` state type for custom logic |
 | Stale-while-revalidate | runtime auto (Cache-Control headers) |
 | Cache purge | `LRU.delete(key)` or runtime API |
-| Streaming proxy | `forward(upstream, streaming: true)` |
+| Streaming proxy | `forward(upstream, load_balance: .roundRobin, streaming: true)` |
 | WebSocket proxy | `websocket(upstream)` |
 | Access logging | automatic — runtime always logs every request |
 | Prometheus metrics | `metrics()` built-in |
@@ -6719,7 +6777,7 @@ Source (`@rateLimit` is top-level route metadata, not a user helper):
 route GET "/users/:id" {
     let user = auth(req, role: "user")
     req.set("X-User-ID", req.params.id)
-    return forward(userService)
+    return forward(userService, load_balance: .roundRobin)
 }
 ```
 
@@ -7096,7 +7154,7 @@ let users = upstream {
 }
 
 // Request-level timeout via any(wait()):
-let h = submit forward(userService, buffered: true)
+let h = submit forward(userService, load_balance: .roundRobin, buffered: true)
 // 5s deadline, cancel if exceeded
 guard let resp = any(wait(h, 5s)) else { return 504 }
 ```
@@ -7167,7 +7225,6 @@ let users = upstream { "user-service.default.svc:8080" }
 // Phase 2: DNS SRV records
 let users = upstream {
     discover: .dnsSrv("_http._tcp.user-service")
-    balance: .roundRobin
 }
 // SRV records provide port + weight + priority
 
@@ -7267,7 +7324,7 @@ func processOrder(_ req: Request) {
         guard res.status == 200 else { respond 503 }
     }
 
-    forward(orders)
+    forward(orders, load_balance: .roundRobin)
 }
 ```
 

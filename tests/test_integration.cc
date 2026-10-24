@@ -1344,7 +1344,8 @@ TEST(timer_dsl, rejects_guard_match_forward_in_body) {
     const char* src =
         "upstream api at \"10.0.0.1:8080\"\n"
         "timer t, every: 1s { let failed = error(.timeout) guard match failed else { "
-        ".timeout => return forward(api) _ => return 500 } return 200 }\n";
+        ".timeout => return forward(api, load_balance: .roundRobin) _ => return 500 } return 200 "
+        "}\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -17145,19 +17146,19 @@ static void start_deferred_return_rig(rut::test::TestCase* _tc, DeferredReturnRi
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(rig.backend.port) + "\"\n";
     source_text += R"rut(
 route GET "/plain" {
-  return forward(backend)
+  return forward(backend, load_balance: .roundRobin)
 }
 route POST "/post" {
-  return forward(backend)
+  return forward(backend, load_balance: .roundRobin)
 }
 route POST "/big" {
-  return forward(backend)
+  return forward(backend, load_balance: .roundRobin)
 }
 route GET "/withbody" {
-  return forward(backend)
+  return forward(backend, load_balance: .roundRobin)
 }
 route GET "/direct" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -17181,7 +17182,7 @@ route GET "/guarded" {
       reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
       header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
       response_policy: { version: .http11, framing: .contentLength,
@@ -17204,7 +17205,7 @@ route GET "/gr" {
       reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
       header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
       response_policy: { version: .http11, framing: .contentLength,
@@ -21539,7 +21540,9 @@ TEST(route, ordinary_head_pipelined_get_iouring_exact_wire_and_eof) {
 TEST(route, dsl_return_forward_enters_proxy_state) {
     using namespace rut;
 
-    const char* src = "upstream backend\nroute GET \"/api\" { return forward(backend) }\n";
+    const char* src =
+        "upstream backend\nroute GET \"/api\" { return forward(backend, load_balance: .roundRobin) "
+        "}\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -21702,14 +21705,18 @@ TEST(route, dsl_return_websocket_enters_proxy_state) {
 // a keyword broke this (and `.websocket` variant literals). Frontend-only — no JIT.
 TEST(route, websocket_is_not_a_reserved_identifier) {
     using namespace rut;
-    const char* src = "upstream websocket\nroute GET \"/x\" { return forward(websocket) }\n";
+    const char* src =
+        "upstream websocket\nroute GET \"/x\" { return forward(websocket, load_balance: "
+        ".roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
-    REQUIRE(ast);  // parses: `upstream websocket` + `forward(websocket)` use it as an ident
+    REQUIRE(ast);  // parses: `upstream websocket` + `forward(websocket, load_balance: .roundRobin)`
+                   // use it as an ident
     std::unique_ptr<AstFile> ast_owned(ast.value());
     auto hir = analyze_file(*ast_owned);
-    REQUIRE(hir);  // analyzes: forward(websocket) resolves the upstream named "websocket"
+    REQUIRE(hir);  // analyzes: forward(websocket, load_balance: .roundRobin) resolves the upstream
+                   // named "websocket"
     delete hir.value();
 }
 
@@ -21752,17 +21759,21 @@ TEST(route, populate_route_config_rejects_partial_cfg) {
     using namespace rut;
     FrontendRirModule rir{};
     REQUIRE(rir.init(1, 8));
-    RouteConfig cfg_with_route{};
+    auto cfg_with_route_owner = std::make_unique<RouteConfig>();
+    auto& cfg_with_route = *cfg_with_route_owner;
     REQUIRE(cfg_with_route.add_static("/x", 0, 200));
     CHECK(!populate_route_config(cfg_with_route, rir.module));
     // upstream_count == 1 but module has 0 → mismatch, reject.
-    RouteConfig cfg_upstream_mismatch{};
+    auto cfg_upstream_mismatch_owner = std::make_unique<RouteConfig>();
+    auto& cfg_upstream_mismatch = *cfg_upstream_mismatch_owner;
     REQUIRE(cfg_upstream_mismatch.add_upstream("x", 0x7F000001, 1).has_value());
     CHECK(!populate_route_config(cfg_upstream_mismatch, rir.module));
-    RouteConfig cfg_with_body{};
+    auto cfg_with_body_owner = std::make_unique<RouteConfig>();
+    auto& cfg_with_body = *cfg_with_body_owner;
     REQUIRE_EQ(cfg_with_body.add_response_body("hi", 2), 1u);
     CHECK(!populate_route_config(cfg_with_body, rir.module));
-    RouteConfig cfg_with_headers{};
+    auto cfg_with_headers_owner = std::make_unique<RouteConfig>();
+    auto& cfg_with_headers = *cfg_with_headers_owner;
     const char* keys[1] = {"X-Foo"};
     u32 klens[1] = {5};
     const char* vals[1] = {"v"};
@@ -21816,7 +21827,7 @@ TEST(route, populate_route_config_accepts_pre_bound_upstreams) {
     using namespace rut;
     const char* src =
         "upstream backend\n"
-        "route GET \"/api\" { return forward(backend) }\n";
+        "route GET \"/api\" { return forward(backend, load_balance: .roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -21904,7 +21915,7 @@ TEST(route, upstream_backends_list_compiles) {
     using namespace rut;
     const char* src =
         "upstream pool { backends: [\"127.0.0.1:8081\", \"127.0.0.2:8082\", \"127.0.0.3:8083\"] }\n"
-        "route GET \"/api\" { return forward(pool) }\n";
+        "route GET \"/api\" { return forward(pool, load_balance: .roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -21948,7 +21959,7 @@ TEST(route, upstream_health_check_compiles) {
         "  backends: [\"127.0.0.1:8081\"]\n"
         "  health_check: { path: \"/healthz\", interval: 5s, status: 200 }\n"
         "}\n"
-        "route GET \"/api\" { return forward(api) }\n";
+        "route GET \"/api\" { return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -21989,7 +22000,7 @@ TEST(route, upstream_health_check_status_defaults_to_200) {
         "  backends: [\"127.0.0.1:8081\"]\n"
         "  health_check: { path: \"/up\", interval: 10s }\n"
         "}\n"
-        "route GET \"/api\" { return forward(api) }\n";
+        "route GET \"/api\" { return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -22018,7 +22029,7 @@ TEST(route, upstream_health_check_missing_path_rejected) {
         "  backends: [\"127.0.0.1:8081\"]\n"
         "  health_check: { interval: 5s }\n"
         "}\n"
-        "route GET \"/api\" { return forward(api) }\n";
+        "route GET \"/api\" { return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -22033,7 +22044,7 @@ TEST(route, upstream_health_check_missing_interval_rejected) {
         "  backends: [\"127.0.0.1:8081\"]\n"
         "  health_check: { path: \"/healthz\" }\n"
         "}\n"
-        "route GET \"/api\" { return forward(api) }\n";
+        "route GET \"/api\" { return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -22045,7 +22056,7 @@ TEST(route, upstream_backends_mixed_with_host_rejected) {
     using namespace rut;
     const char* src =
         "upstream pool { host: \"127.0.0.1\", backends: [\"127.0.0.2:8082\"] }\n"
-        "route GET \"/api\" { return forward(pool) }\n";
+        "route GET \"/api\" { return forward(pool, load_balance: .roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -22060,7 +22071,7 @@ TEST(route, populate_route_config_rejects_pre_bound_name_mismatch) {
     using namespace rut;
     const char* src =
         "upstream backend\n"
-        "route GET \"/api\" { return forward(backend) }\n";
+        "route GET \"/api\" { return forward(backend, load_balance: .roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -22098,7 +22109,8 @@ TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
     const char* src =
         "upstream "
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"  // 32 'a's
-        "route GET \"/api\" { return forward(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) }\n";
+        "route GET \"/api\" { return forward(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, load_balance: "
+        ".roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -23709,12 +23721,12 @@ TEST(route, forward_set_path_rewrites_upstream_request) {
     REQUIRE(echo.setup());
 
     char src_buf[256];
-    const int src_len =
-        snprintf(src_buf,
-                 sizeof(src_buf),
-                 "upstream backend at \"127.0.0.1:%u\"\n"
-                 "route GET \"/api\" { return forward(backend, set_path: \"/rewritten\") }\n",
-                 echo.port);
+    const int src_len = snprintf(src_buf,
+                                 sizeof(src_buf),
+                                 "upstream backend at \"127.0.0.1:%u\"\n"
+                                 "route GET \"/api\" { return forward(backend, load_balance: "
+                                 ".roundRobin, set_path: \"/rewritten\") }\n",
+                                 echo.port);
     REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
     auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
     REQUIRE(lexed);
@@ -23786,8 +23798,9 @@ TEST(route, set_path_does_not_leak_across_keepalive) {
         snprintf(src_buf,
                  sizeof(src_buf),
                  "upstream backend at \"127.0.0.1:%u\"\n"
-                 "route GET \"/rewrite\" { return forward(backend, set_path: \"/rewritten\") }\n"
-                 "route GET \"/plain\" { return forward(backend) }\n",
+                 "route GET \"/rewrite\" { return forward(backend, load_balance: .roundRobin, "
+                 "set_path: \"/rewritten\") }\n"
+                 "route GET \"/plain\" { return forward(backend, load_balance: .roundRobin) }\n",
                  echo.port);
     REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
     auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
@@ -23857,12 +23870,13 @@ TEST(route, target_transform_effect_does_not_leak_across_keepalive) {
     REQUIRE(echo.setup());
 
     char src_buf[384];
-    const int src_len = snprintf(src_buf,
-                                 sizeof(src_buf),
-                                 "upstream backend at \"127.0.0.1:%u\"\n"
-                                 "route GET \"/local\" { return 200 }\n"
-                                 "route GET \"/plain\" { return forward(backend) }\n",
-                                 echo.port);
+    const int src_len =
+        snprintf(src_buf,
+                 sizeof(src_buf),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route GET \"/local\" { return 200 }\n"
+                 "route GET \"/plain\" { return forward(backend, load_balance: .roundRobin) }\n",
+                 echo.port);
     REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
     auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
     REQUIRE(lexed);
@@ -24076,12 +24090,12 @@ TEST(route, forward_set_path_streaming_post_body) {
     REQUIRE(echo.setup());
 
     char src_buf[256];
-    const int src_len =
-        snprintf(src_buf,
-                 sizeof(src_buf),
-                 "upstream backend at \"127.0.0.1:%u\"\n"
-                 "route POST \"/api\" { return forward(backend, set_path: \"/rewritten\") }\n",
-                 echo.port);
+    const int src_len = snprintf(src_buf,
+                                 sizeof(src_buf),
+                                 "upstream backend at \"127.0.0.1:%u\"\n"
+                                 "route POST \"/api\" { return forward(backend, load_balance: "
+                                 ".roundRobin, set_path: \"/rewritten\") }\n",
+                                 echo.port);
     REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
     auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
     REQUIRE(lexed);
@@ -24982,10 +24996,10 @@ func response_headers(_ req: i32, _ resp: Response) -> i32 {
 }
 chain access { after response_headers(req, resp) }
 route POST "/post" {
-  return forward(origin)
+  return forward(origin, load_balance: .roundRobin)
 }
 route POST "/mpost" use chain access {
-  return forward(origin)
+  return forward(origin, load_balance: .roundRobin)
 }
 )rut";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -25271,14 +25285,15 @@ TEST(route, forward_invalid_kwargs_rejected) {
     using namespace rut;
     const char* bogus =
         "upstream b at \"127.0.0.1:80\"\n"
-        "route GET \"/a\" { return forward(b, bogus: \"x\") }\n";
+        "route GET \"/a\" { return forward(b, load_balance: .roundRobin, bogus: \"x\") }\n";
     auto l1 = lex(Str{bogus, static_cast<u32>(strlen(bogus))});
     REQUIRE(l1);
     CHECK(!parse_file(l1.value()));
 
     const char* dup =
         "upstream b at \"127.0.0.1:80\"\n"
-        "route GET \"/a\" { return forward(b, set_path: \"/x\", set_path: \"/y\") }\n";
+        "route GET \"/a\" { return forward(b, load_balance: .roundRobin, set_path: \"/x\", "
+        "set_path: \"/y\") }\n";
     auto l2 = lex(Str{dup, static_cast<u32>(strlen(dup))});
     REQUIRE(l2);
     CHECK(!parse_file(l2.value()));
@@ -25286,7 +25301,8 @@ TEST(route, forward_invalid_kwargs_rejected) {
     // set_header: reserved framing name (Content-Length) is rejected.
     const char* reserved =
         "upstream b at \"127.0.0.1:80\"\n"
-        "route GET \"/a\" { return forward(b, set_header: { \"Content-Length\": \"9\" }) }\n";
+        "route GET \"/a\" { return forward(b, load_balance: .roundRobin, set_header: { "
+        "\"Content-Length\": \"9\" }) }\n";
     auto l3 = lex(Str{reserved, static_cast<u32>(strlen(reserved))});
     REQUIRE(l3);
     CHECK(!parse_file(l3.value()));
@@ -25294,7 +25310,7 @@ TEST(route, forward_invalid_kwargs_rejected) {
     // set_header: empty dict is rejected (omit the kwarg instead).
     const char* empty =
         "upstream b at \"127.0.0.1:80\"\n"
-        "route GET \"/a\" { return forward(b, set_header: {}) }\n";
+        "route GET \"/a\" { return forward(b, load_balance: .roundRobin, set_header: {}) }\n";
     auto l4 = lex(Str{empty, static_cast<u32>(strlen(empty))});
     REQUIRE(l4);
     CHECK(!parse_file(l4.value()));
@@ -25302,7 +25318,8 @@ TEST(route, forward_invalid_kwargs_rejected) {
     // set_header: duplicate (case-insensitive) keys are rejected.
     const char* dupkey =
         "upstream b at \"127.0.0.1:80\"\n"
-        "route GET \"/a\" { return forward(b, set_header: { \"X-A\": \"1\", \"x-a\": \"2\" }) }\n";
+        "route GET \"/a\" { return forward(b, load_balance: .roundRobin, set_header: { \"X-A\": "
+        "\"1\", \"x-a\": \"2\" }) }\n";
     auto l5 = lex(Str{dupkey, static_cast<u32>(strlen(dupkey))});
     REQUIRE(l5);
     CHECK(!parse_file(l5.value()));
@@ -25959,7 +25976,7 @@ struct PublicPairedHeadSourceResources {
         source += R"rut(
 route "/" {
   if req.method == HEAD && req.pathOnly == "/head" {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
       response_policy: { version: .http11, framing: .contentLength, connection: .request,
@@ -25975,7 +25992,7 @@ route "/" {
         head_mode: .suppressBody,
         body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" })
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
       response_policy: { version: .http11, framing: .contentLength, connection: .request,
@@ -26077,7 +26094,7 @@ struct PublicResponseReadDeadlineSourceResources {
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route HEAD "/deadline" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -26245,7 +26262,7 @@ struct PublicDistinctResponseReadDeadlineSourceResources
             "\"\n";
         source += R"rut(
 route HEAD "/short-deadline" {
-  return forward(short_backend,
+  return forward(short_backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -26261,7 +26278,7 @@ route HEAD "/short-deadline" {
     response_read_timeout: 1s)
 }
 route HEAD "/long-deadline" {
-  return forward(long_backend,
+  return forward(long_backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -26310,7 +26327,7 @@ struct PublicGetCl0ResponseReadDeadlineSourceResources : PublicResponseReadDeadl
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += nginx_shaped_timeout ? R"rut(
 route GET "/deadline" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -26331,7 +26348,7 @@ route GET "/deadline" {
 )rut"
                                        : R"rut(
 route GET "/deadline" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -26487,7 +26504,7 @@ struct PublicPlainAndDeadlineForwardSourceResources : PublicResponseReadDeadline
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route GET "/plain" {
-  return forward(backend)
+  return forward(backend, load_balance: .roundRobin)
 }
 route GET "/deadline" {
   if req.pathOnly == "/old" {
@@ -26497,7 +26514,7 @@ route GET "/deadline" {
       reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
       header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
       response_policy: { version: .http11, framing: .contentLength,
@@ -26571,7 +26588,7 @@ struct PublicGetCompleteContentLengthBufferingSourceResources
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route GET "/buffered" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     response_policy: { version: .http11, framing: .contentLength,
       connection: .request, head_mode: .reject, server: "buffered-test",
       date: .current, hide_headers: ["Date", "Server"] },
@@ -26633,7 +26650,7 @@ struct PublicGetCompleteContentLengthBufferingFixedRequestPolicySourceResources
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route GET "/buffered" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -26682,7 +26699,7 @@ struct PublicPutCompleteContentLengthBufferingFixedRequestPolicySourceResources
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route PUT "/buffered" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -26731,7 +26748,7 @@ struct PublicPatchCompleteContentLengthBufferingFixedRequestPolicySourceResource
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route PATCH "/buffered" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -26782,7 +26799,7 @@ struct PublicValidatedFailureLateSuccessorSourceResources
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route GET "/buffered" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -26835,7 +26852,7 @@ struct PublicExactStrictCoalescedSuccessorSourceResources
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route GET "/buffered" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -27119,7 +27136,7 @@ struct PublicPostCompleteContentLengthBufferingFixedRequestPolicySourceResources
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route POST "/buffered" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -27174,7 +27191,7 @@ struct PublicAnyCompleteContentLengthBufferingFixedRequestPolicySourceResources
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route "/buffered" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -27223,7 +27240,7 @@ struct PublicPostCl0ResponseReadDeadlineSourceResources
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route POST "/deadline" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -27270,7 +27287,7 @@ struct PublicAnyCl0ResponseReadDeadlineSourceResources : PublicResponseReadDeadl
             "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route "/deadline" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -27503,7 +27520,7 @@ static void run_public_source_transfer_encoding_rejection(rut::test::TestCase* _
     std::string source_text =
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(upstream_port) + "\"\n";
     source_text += R"rut(
-route POST "/" { return forward(backend) }
+route POST "/" { return forward(backend, load_balance: .roundRobin) }
 )rut";
 
     struct TempSource {
@@ -27791,7 +27808,7 @@ unmatched OPTIONS { return local_response({
   date: .current, content_type: "text/html", connection: .request,
   head_mode: .reject, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
-route "/" { return forward(backend) }
+route "/" { return forward(backend, load_balance: .roundRobin) }
 )rut";
 
     auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -27993,7 +28010,7 @@ unmatched CONNECT { return local_response({
   date: .current, content_type: "text/html", connection: .request,
   head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
-route "/" { return forward(backend) }
+route "/" { return forward(backend, load_balance: .roundRobin) }
 )rut";
 
     const auto check_connect_policy = [&](const auto& policy) {
@@ -28581,7 +28598,7 @@ TEST(route, public_ordinary_source_exact_strict_local_response_and_prefix_fallba
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source_text += R"rut(
 route "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -28878,7 +28895,7 @@ TEST(route, public_ordinary_source_exact_strict_local_response_single_cl0_post_i
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source_text += R"rut(
 route "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -29202,7 +29219,7 @@ TEST(route, public_ordinary_source_exact_strict_local_response_fresh_delete_iour
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source_text += R"rut(
 route "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -29528,7 +29545,7 @@ TEST(route, public_ordinary_source_exact_strict_local_response_fresh_put_iouring
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source_text += R"rut(
 route "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -29852,7 +29869,7 @@ TEST(route, public_ordinary_source_exact_strict_local_response_fresh_patch_iouri
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source_text += R"rut(
 route "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -30242,7 +30259,7 @@ route exact "/static" { return local_response({
   head_mode: .suppressBody, body: b"successor-static"
 }) }
 route "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -30789,7 +30806,7 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
         snprintf(source,
                  sizeof(source),
                  "upstream backend at \"127.0.0.1:%u\"\n"
-                 "route GET \"/api\" { return forward(backend, "
+                 "route GET \"/api\" { return forward(backend, load_balance: .roundRobin, "
                  "target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, "
                  "request_policy: { version: .http11, host: .upstream, "
                  "connection: .omit, strip_headers: [.connection, .keepAlive, "
@@ -31202,7 +31219,7 @@ TEST(route, empty_query_target_transform_public_source_reaches_iouring_backend_a
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source_text += R"rut(
 route GET "/api" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     target_transform: { strip_prefix: "/api/", replace_prefix: "/v1/?" },
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
@@ -31211,7 +31228,7 @@ route GET "/api" {
       hide_headers: ["Date", "Server"] })
 }
 route GET "/fixed" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     target_transform: { strip_prefix: "/fixed/", replace_prefix: "/v1/?fixed=1" },
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
@@ -31906,14 +31923,14 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
     RecordingUpstream upstream;
     REQUIRE(upstream.setup());
     char source[1024];
-    const int source_len =
-        snprintf(source,
-                 sizeof(source),
-                 "upstream backend at \"127.0.0.1:%u\"\n"
-                 "route GET \"/api\" { return forward(backend, request_policy: { "
-                 "version: .http11, host: .upstream, connection: .omit, "
-                 "strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n",
-                 upstream.port);
+    const int source_len = snprintf(
+        source,
+        sizeof(source),
+        "upstream backend at \"127.0.0.1:%u\"\n"
+        "route GET \"/api\" { return forward(backend, load_balance: .roundRobin, request_policy: { "
+        "version: .http11, host: .upstream, connection: .omit, "
+        "strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n",
+        upstream.port);
     REQUIRE_GT(source_len, 0);
     REQUIRE_LT(source_len, static_cast<int>(sizeof(source)));
     auto lexed = lex(Str{source, static_cast<u32>(source_len)});
@@ -32046,7 +32063,7 @@ TEST(route, forward_request_policy_preserve_host_lowercase_h11_wire) {
     auto route_block = [](const char* path) {
         return std::string("route \"") + path +
                "\" {\n"
-               "    return forward(backend, request_policy: {\n"
+               "    return forward(backend, load_balance: .roundRobin, request_policy: {\n"
                "        version: .http11, host: .preserve, connection: .omit,\n"
                "        header_names: .lowercase, forwarded_proto: .http,\n"
                "        strip_headers: [.connection, .keepAlive, .te, .expect, "
@@ -32201,7 +32218,7 @@ TEST(route, forward_request_policy_preserve_host_lowercase_strips_client_envoy_i
     std::string source(upstream_line);
     source +=
         "route \"/smoke\" {\n"
-        "    return forward(backend, request_policy: {\n"
+        "    return forward(backend, load_balance: .roundRobin, request_policy: {\n"
         "        version: .http11, host: .preserve, connection: .omit,\n"
         "        header_names: .lowercase, forwarded_proto: .http,\n"
         "        strip_headers: [.connection, .keepAlive, .te, .expect, "
@@ -32303,7 +32320,7 @@ TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_with_respo
                  sizeof(source),
                  "upstream backend at \"127.0.0.1:%u\"\n"
                  "route POST \"/upload\" {\n"
-                 "    return forward(backend, request_policy: {\n"
+                 "    return forward(backend, load_balance: .roundRobin, request_policy: {\n"
                  "        version: .http11, host: .preserve, connection: .omit,\n"
                  "        header_names: .lowercase, forwarded_proto: .http,\n"
                  "        strip_headers: [.connection, .keepAlive, .te, .expect, "
@@ -32408,9 +32425,9 @@ TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_never_reus
         snprintf(source,
                  sizeof(source),
                  "upstream backend at \"127.0.0.1:%u\"\n"
-                 "route GET \"/warm\" { return forward(backend) }\n"
+                 "route GET \"/warm\" { return forward(backend, load_balance: .roundRobin) }\n"
                  "route POST \"/upload\" {\n"
-                 "    return forward(backend, request_policy: {\n"
+                 "    return forward(backend, load_balance: .roundRobin, request_policy: {\n"
                  "        version: .http11, host: .preserve, connection: .omit,\n"
                  "        header_names: .lowercase, forwarded_proto: .http,\n"
                  "        strip_headers: [.connection, .keepAlive, .te, .expect, "
@@ -32551,7 +32568,7 @@ TEST(route, forward_response_policy_upstream_order_wire) {
         [](const char* method, const char* path, const char* upstream_name, bool suppress_body) {
             return std::string("route ") + method + " \"" + path + "\" {\n" +
                    "    return forward(" + upstream_name +
-                   ", request_policy: {\n"
+                   ", load_balance: .roundRobin, request_policy: {\n"
                    "        version: .http11, host: .preserve, connection: .omit,\n"
                    "        header_names: .lowercase, forwarded_proto: .http,\n"
                    "        strip_headers: [.connection, .keepAlive, .te, .expect, "
@@ -35056,7 +35073,8 @@ static bool run_set_header_case(const char* echo_header,
     const int src_len = snprintf(src_buf,
                                  sizeof(src_buf),
                                  "upstream backend at \"127.0.0.1:%u\"\n"
-                                 "route GET \"/api\" { return forward(backend, set_header: %s) }\n",
+                                 "route GET \"/api\" { return forward(backend, load_balance: "
+                                 ".roundRobin, set_header: %s) }\n",
                                  echo.port,
                                  set_header_dict);
     if (src_len <= 0 || src_len >= static_cast<int>(sizeof(src_buf))) return false;
@@ -35229,11 +35247,12 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     const u16 upstream_port = __builtin_bswap16(got.sin_port);
 
     char src_buf[256];
-    const int src_len = snprintf(src_buf,
-                                 sizeof(src_buf),
-                                 "upstream backend at \"127.0.0.1:%u\"\n"
-                                 "route GET \"/api\" { return forward(backend) }\n",
-                                 upstream_port);
+    const int src_len =
+        snprintf(src_buf,
+                 sizeof(src_buf),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route GET \"/api\" { return forward(backend, load_balance: .roundRobin) }\n",
+                 upstream_port);
     REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
     auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
     REQUIRE(lexed);
@@ -35660,7 +35679,7 @@ route "/api" {
       status: 301, reason: "Moved Permanently", server: "nginx/1.29.7",
       content_type: "text/html", target_path: "/api/", body: b"<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n<center><h1>301 Moved Permanently</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
@@ -35967,7 +35986,7 @@ route GET "/" {
       content_type: "text/html", target_path: "/new",
       body: b"<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n<center><h1>301 Moved Permanently</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
       response_policy: { version: .http11, framing: .contentLength,
@@ -36439,7 +36458,7 @@ route GET "/" {
       content_type: "text/html", target_path: "/new",
       body: b"<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n<center><h1>302 Found</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: {version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]},
       response_policy: {version: .http11, framing: .contentLength,
@@ -36766,7 +36785,7 @@ route GET "/" {
       reason: "Moved Permanently", server: "conditional-test",
       content_type: "text/plain", target_path: "/new", body: b"moved\n"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
       response_policy: { version: .http11, framing: .contentLength,
@@ -42516,7 +42535,7 @@ TEST(route, public_ordinary_source_deadline_complete_buffering_preserves_bounded
         "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source_text += R"rut(
 route GET "/buffered" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -49137,10 +49156,10 @@ func add_trace(_ req: i32, _ resp: Response) -> i32 {
 }
 chain observability { after add_trace(req, resp) }
 route GET "/plain" {
-  return forward(backend)
+  return forward(backend, load_balance: .roundRobin)
 }
 route GET "/mutated" use chain observability {
-  return forward(backend)
+  return forward(backend, load_balance: .roundRobin)
 }
 route GET "/old" {
   if req.pathOnly == "/old" {
@@ -49150,7 +49169,7 @@ route GET "/old" {
       reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
       header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: { version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
       response_policy: { version: .http11, framing: .contentLength,

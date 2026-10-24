@@ -4,6 +4,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/load_balance.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
@@ -395,6 +396,14 @@ struct ConnectionBase {
 
     // Upstream (only when proxying)
     i32 upstream_fd;
+    ForwardLoadBalance forward_load_balance{};
+    u32* backend_active = nullptr;
+    void release_backend_active() {
+        if (backend_active) {
+            --*backend_active;
+            backend_active = nullptr;
+        }
+    }
     u16 upstream_idx;
     u8 upstream_attempts;     // connect attempts so far (initial + retries) this request
     u8 upstream_backend_idx;  // which backend endpoint the current connect targets
@@ -1944,6 +1953,8 @@ struct ConnectionBase {
         timer_node.init();
         idle_node.init();
         upstream_fd = -1;
+        forward_load_balance = {};
+        backend_active = nullptr;
         upstream_idx = 0;
         upstream_attempts = 0;
         upstream_backend_idx = 0;

@@ -617,6 +617,7 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_route = nullptr;
     h2.pending_route_action = RouteAction::Static;
     h2.pending_static_status = 200;
+    h2.pending_load_balance = {};
     h2.pending_forward_upstream_id = 0;
     h2.pending_jit_fn = nullptr;
     h2.pending_route_param_count = 0;
@@ -790,6 +791,7 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     h2->pending_route = route;
     h2->pending_route_action = action;
     h2->pending_static_status = static_status;
+    h2->pending_load_balance = {};
     h2->pending_forward_upstream_id = 0;
     h2->pending_jit_fn = route ? route->fn : nullptr;
     // Snapshot route params for the deferred handler. Only JIT handlers consume
@@ -866,6 +868,7 @@ bool h2_defer_prepared_forward(H2Dispatch<Loop>& d,
     h2->pending_route = nullptr;
     h2->pending_route_action = RouteAction::JitHandler;
     h2->pending_static_status = 200;
+    h2->pending_load_balance = d.conn->forward_load_balance;
     h2->pending_forward_upstream_id = upstream_id;
     h2->pending_jit_fn = nullptr;
     h2->pending_route_param_count = 0;
@@ -1051,6 +1054,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_timer_ms = 0;
     h2.async_fn = nullptr;
     h2.async_state = 0;
+    h2.async_load_balance = {};
     h2.async_upstream_id = 0;
     h2.async_resp_len = 0;
 }
@@ -1149,6 +1153,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     h2->async_is_head = false;
     h2->async_kind = H2AsyncKind::Proxy;
     h2->async_cfg = cfg;
+    h2->async_load_balance = d.conn->forward_load_balance;
     h2->async_upstream_id = upstream_id;
     h2->async_resp_len = 0;
     return true;
@@ -1185,6 +1190,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         d.overflow = false;
         return;
     }
+    d.conn->forward_load_balance = {};
     d.conn->json_arena.destroy();
     d.conn->jit_response_body = {};
     d.conn->jit_response_body_valid = false;
@@ -1410,6 +1416,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const u32 kBodyLen = h2->pending_body_len;
         const u32 kSynthLen = h2->pending_synth_len;
         const RouteConfig* cfg = h2->pending_route_config;
+        d.conn->forward_load_balance = h2->pending_load_balance;
         const u16 kUpstreamId = h2->pending_forward_upstream_id;
         const u8* synth = h2->pending_synth;
         h2_clear_pending(*h2);
@@ -1783,6 +1790,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         }
         case RouteAction::Proxy:
         default:
+            d.conn->forward_load_balance = {};
             if (route->upstream_id < config->upstream_count &&
                 config->upstreams[route->upstream_id].http2) {
                 if (!h2_proxy_request_forwardable(headers, nheaders)) {
@@ -2324,6 +2332,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
             if (!*retain) h2_release_completed_jit_json(*conn);
         }
     } json_lifetime{&conn, &retain_json};
+    conn.forward_load_balance = {};
     JitDispatchOutcome kOutcome = invoke_jit_handler(conn.pending_handler_fn,
                                                      static_cast<void*>(&conn),
                                                      *ctx,
@@ -2523,6 +2532,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
             h2->async_synth_sent = 0;
             h2->async_is_head = false;
             h2->async_kind = H2AsyncKind::Proxy;
+            h2->async_load_balance = conn.forward_load_balance;
             h2->async_upstream_id = static_cast<u16>(kOutcome.upstream_id);
             h2->async_resp_len = 0;
             h2->async_timer_ms = 0;

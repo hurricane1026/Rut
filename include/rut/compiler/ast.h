@@ -4,6 +4,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/listener_address.h"
+#include "rut/common/load_balance.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
@@ -309,6 +310,7 @@ struct AstStatement {
     bool has_forward_response_policy = false;
     u16 forward_failure_policy_id = 0;
     bool has_forward_failure_policy = false;
+    ForwardLoadBalance forward_load_balance{};
     u16 forward_timeout_failure_policy_id = 0;
     bool has_forward_timeout_failure_policy = false;
     u8 forward_response_read_timeout_seconds = 0;

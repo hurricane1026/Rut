@@ -24,7 +24,7 @@ unmatched { return local_response({
 }) }
 route HEAD "/" {
     if req.hasContentLength {
-        return forward(nginx_upstream, request_policy: {
+        return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .upstream,
             connection: .omit,
@@ -65,7 +65,7 @@ route HEAD "/" {
         response_read_timeout: 1s
     )
     } else {
-        return forward(nginx_upstream, request_policy: {
+        return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .upstream,
             connection: .omit,
@@ -107,7 +107,7 @@ route HEAD "/" {
     }
 }
 route GET "/" {
-    return forward(nginx_upstream, request_policy: {
+    return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .upstream,
             connection: .omit,
@@ -146,7 +146,7 @@ route GET "/" {
     )
 }
 route "/" {
-    return forward(nginx_upstream, request_policy: {
+    return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .upstream,
             connection: .omit,

@@ -4,6 +4,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/load_balance.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/response_policy.h"
@@ -494,6 +495,7 @@ struct Module {
     u32 failure_policy_count = 0;
     ForwardPolicyBundle policy_bundles[kMaxForwardFailurePolicies]{};
     u32 policy_bundle_count = 0;
+    u32 forward_site_count = 0;
 
     // Program-scoped strict local responses for route misses. IDs are 1-based;
     // zero in a canonical method slot means no configured action.

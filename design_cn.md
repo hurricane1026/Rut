@@ -463,7 +463,7 @@ get /users/:id {
     let key = "/users/\(req.id)"
     let cached = cache.get(key)      // miss + 有 in-flight 请求 → 自动等待首个请求
     if cached? { return 200, cached }
-    let resp = forward(userService, buffered: true)
+    let resp = forward(userService, load_balance: .roundRobin, buffered: true)
     cache.set(key, resp.body)        // 存入结果并唤醒所有等待连接
     return resp
 }
@@ -581,7 +581,7 @@ get /api/*path {
     // 编译器生成：hash(remoteAddr) → owner shard → SPSC send → yield → receive
     exactLimits.incr(req.remoteAddr)
     guard exactLimits.get(req.remoteAddr) <= 1000 else { return 429 }
-    return forward(userService)
+    return forward(userService, load_balance: .roundRobin)
 }
 ```
 
@@ -706,7 +706,7 @@ guard let user else {
 | `req.body(T)` | `Result<T>` | `guard let x else { return 400 }` |
 | `get/post http://...` | `Result<Response>` | `guard let res else { return 502 }` |
 | `jwtDecode(token, secret:)` | `Result<Claims>` | `guard let claims else { return 401 }` |
-| `forward(upstream)` | 内建，失败时返回 502 | 不需要 guard |
+| `forward(upstream, load_balance: .roundRobin)` | 内建，失败时返回 502 | 不需要 guard |
 | `req.authorization` | `string?`（Optional） | `guard let x else { return 401 }` |
 | `req.query("key")` | `string?`（Optional） | `guard let x else { return 400 }` |
 
@@ -714,7 +714,7 @@ guard let user else {
 
 ```swift
 let user = req.body(User)
-forward(users)
+forward(users, load_balance: .roundRobin)
 // ERROR: Result<User> must be unwrapped with 'guard let user else { return ... }'
 ```
 
@@ -761,7 +761,7 @@ get /api/data {
         msg = "\(msg) sql_injection"
     }
     guard score <= 10 else { return 403, msg }
-    return forward(userService)
+    return forward(userService, load_balance: .roundRobin)
 }
 
 // ❌ 顶层 var —— 编译错误
@@ -795,7 +795,7 @@ get /api/data {
 
     guard req.authorization? else { return 401 }      // defer 仍然执行
     guard req.contentLength <= 1mb else { return 413 } // defer 仍然执行
-    return forward(userService)                        // defer 仍然执行
+    return forward(userService, load_balance: .roundRobin)                        // defer 仍然执行
 }
 ```
 
@@ -898,7 +898,7 @@ route {
 
 ```swift
 get /files/:id {
-    forward(storageService, compress: .off)          // 对这个 proxy 禁用压缩
+    forward(storageService, load_balance: .roundRobin, compress: .off)          // 对这个 proxy 禁用压缩
 }
 
 get /images/*path {
@@ -912,7 +912,6 @@ get /images/*path {
 let users = upstream {
     "10.0.0.1:8080", weight: 3
     "10.0.0.2:8080"
-    balance: .leastConn
     health: .active(get: "/ping", every: 5s)              // 主动健康检查 —— timer probe
     health: .passive(failures: 5, recover: 30s)            // 被动健康检查 —— 连续错误后标记不健康
     breaker: .consecutive(failures: 5, recover: 30s)
@@ -932,24 +931,33 @@ let internalService = upstream {
 let orders = upstream { "10.0.1.1:8080" }
 ```
 
-**负载均衡算法：**
+**按转发点显式选择负载均衡策略：**
 
-所有标准算法都属于内建能力。运行时在每个 shard 上维护每个 target 的状态（连接数、延迟、权重等）。
+`upstream` 只声明后端集合和连接配置。每个 `forward` 必须填写 `load_balance`，
+单后端和宿主绑定的 upstream 也不能省略；不提供默认值、继承或别名。
+当前只接受 `.roundRobin` 与 `.leastRequests`，其他算法尚未实现。
 
-| 算法 | 声明方式 | 描述 |
-|-----------|-------------|-------------|
-| Round Robin | `balance: .roundRobin` | 顺序轮转（默认） |
-| Weighted Round Robin | `balance: .weightedRoundRobin` | 按 `weight:` 比例分配 |
-| Least Connections | `balance: .leastConn` | 选择当前活动连接最少的 target |
-| Random | `balance: .random` | 均匀随机 |
-| Power of Two (P2C) | `balance: .powerOfTwo` | 随机抽两个 target，选连接数更少者 |
-| IP Hash | `balance: .ipHash` | 基于客户端 IP 做一致性 hash（会话亲和） |
-| Consistent Hash | `balance: .hash(expr)` | 对任意字段做一致性 hash（例如 `req.X-User-ID`） |
-| EWMA | `balance: .ewma` | 选择指数滑动平均延迟最低的 target |
+```swift
+upstream api {
+    backends: ["127.0.0.1:9001", "127.0.0.1:9002"]
+}
+route GET "/catalog" {
+    return forward(api, load_balance: .roundRobin)
+}
+route POST "/jobs" {
+    return forward(api, load_balance: .leastRequests)
+}
+```
 
-**自定义负载均衡：**
+轮询游标按转发点与 shard 隔离；最少请求策略统计该 shard 上同一 upstream 的
+在途请求/RPC，跨路由共享，流式 gRPC 按 RPC 计数。请求数相同时按该转发点轮换。
+完成、失败、取消、重置或关闭时只释放一次计数；重试先释放失败尝试，再按原策略选择。
+健康后端存在时跳过被剔除的端点；全部被剔除时保留现有继续尝试的行为。
+完整契约见 [语言卡](docs/language-card.md#explicit-load-balancing-at-each-forward-call)。
 
-用户也可以用 Rutlang 自己实现算法。不是 `forward(upstream)`，而是先遍历 `upstream.servers` 选一个 target，再对具体地址 `forward`：
+**⏳ 自定义负载均衡（仅设计，尚未实现）：**
+
+用户也可以用 Rutlang 自己实现算法。不是 `forward(upstream, load_balance: .roundRobin)`，而是先遍历 `upstream.servers` 选一个 target，再对具体地址 `forward`：
 
 ```swift
 // 自定义：按 header 指定的目标名路由
@@ -964,7 +972,7 @@ func selectByHeader(_ req: Request, up: Upstream) -> Server {
 
 get /custom {
     let target = selectByHeader(req, up: users)
-    return forward(target)
+    return forward(target, load_balance: .roundRobin)
 }
 ```
 
@@ -1054,7 +1062,6 @@ let backend = upstream {
 let userService = upstream {
     "10.0.0.1:8080", weight: 3, zone: "us-east-1a"
     "10.0.0.2:8080", weight: 1, zone: "us-east-1b"
-    balance: .ewma
     health: .active(get: "/ping", every: 5s)
     health: .passive(failures: 5, recover: 30s)
     outlier: .successRate(threshold: 0.9, interval: 30s, minRequests: 100)
@@ -1245,9 +1252,9 @@ route {
     @requestId *
 
     @maxBody(limit: 100mb)                  // 仅这条路由
-    post /files/upload => forward(storageService, streaming: true)
+    post /files/upload => forward(storageService, load_balance: .roundRobin, streaming: true)
 
-    get /users/:id => forward(userService)  // 会继承上面的 @requestId 绑定
+    get /users/:id => forward(userService, load_balance: .roundRobin)  // 会继承上面的 @requestId 绑定
 }
 ```
 
@@ -1272,7 +1279,7 @@ route {
     @requestId *                // Request → pre
     @addSecurityHeaders *       // Response → post
 
-    get /users/:id => forward(userService)
+    get /users/:id => forward(userService, load_balance: .roundRobin)
 }
 
 // 展开后等价于：
@@ -1285,8 +1292,8 @@ route {
 
 ```
 ⚠ warning: post-middleware @addSecurityHeaders forces buffered mode for
-            'get /users/:id => forward(userService)'. Zero-copy disabled.
-            To silence: use forward(userService, buffered: true) explicitly.
+            'get /users/:id => forward(userService, load_balance: .roundRobin)'. Zero-copy disabled.
+            To silence: use forward(userService, load_balance: .roundRobin, buffered: true) explicitly.
 ```
 
 **条件装饰器：`@if`**
@@ -1304,7 +1311,7 @@ route {
     @addSecurityHeaders *
 
     api.example.com {
-        get /users/:id => forward(userService)
+        get /users/:id => forward(userService, load_balance: .roundRobin)
     }
 }
 ```

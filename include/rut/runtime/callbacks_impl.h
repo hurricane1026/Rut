@@ -177,6 +177,41 @@ inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
     return idx;
 }
 
+// Selection uses only the owning shard's sidecar in the pinned configuration.
+// Ties rotate at this forward site. Health eligibility matches existing fail-open
+// behavior: when every endpoint is ejected, consider the complete backend set.
+inline u32 select_forward_backend(
+    const RouteConfig* cfg, u32 shard, ForwardLoadBalance spec, u16 uid, u32 count, u64 now) {
+    if (!cfg || shard >= kMaxShards || uid >= RouteConfig::kMaxUpstreams || count == 0) return 0;
+    if (spec.policy == LoadBalancePolicy::None) return select_backend(uid, count, now);
+    if (!forward_load_balance_valid(spec)) return count;
+    auto& state = cfg->backend_selection[shard];
+    auto& cursor = state.cursor[spec.site - 1];
+    bool any_healthy = false;
+    for (u32 i = 0; i < count; ++i) any_healthy |= !backend_ejected(uid, i, now);
+    u32 best = count;
+    for (u32 step = 0; step < count; ++step) {
+        const u32 i = (cursor + step) % count;
+        if (any_healthy && backend_ejected(uid, i, now)) continue;
+        if (best == count || (spec.policy == LoadBalancePolicy::LeastRequests &&
+                              state.active[uid][i] < state.active[uid][best]))
+            best = i;
+        if (spec.policy == LoadBalancePolicy::RoundRobin) break;
+    }
+    cursor = static_cast<u16>((best + 1) % count);
+    return best;
+}
+inline void hold_backend_active(Connection& conn, const RouteConfig* cfg = nullptr) {
+    conn.release_backend_active();
+    if (!cfg) cfg = conn.request_config;
+    if (!cfg || conn.shard_id >= kMaxShards || conn.upstream_idx >= RouteConfig::kMaxUpstreams ||
+        conn.upstream_backend_idx >= UpstreamTarget::kMaxBackends)
+        return;
+    conn.backend_active =
+        &cfg->backend_selection[conn.shard_id].active[conn.upstream_idx][conn.upstream_backend_idx];
+    ++*conn.backend_active;
+}
+
 // --- Active health-check probes (Phase 5 slice 2) — EPOLL ONLY ---
 //
 // A probe is a Connection with fd == -1 (no downstream client) whose upstream_fd
@@ -1528,7 +1563,8 @@ inline bool deferred_canonical_selection_state_is_neutral(const Connection& conn
            conn.resp_body_mode == BodyMode::None && conn.resp_body_remaining == 0 &&
            conn.resp_body_sent == 0 && conn.send_buf.len() == 0 && conn.send_progress == 0 &&
            !conn.send_armed && conn.on_send == nullptr && conn.upstream_attempts == 0 &&
-           conn.upstream_start_us == 0 && !conn.upstream_slot_held && !conn.upstream_send_armed &&
+           conn.upstream_start_us == 0 && !conn.upstream_slot_held &&
+           conn.backend_active == nullptr && !conn.upstream_send_armed &&
            !conn.upstream_recv_armed && !conn.request_body_fully_buffered &&
            !conn.request_upload_complete;
 }
@@ -1871,6 +1907,7 @@ void throttle_resume(Loop* loop, Connection& conn) {
 // non-keep-alive completion) — the held flag makes the second call a no-op.
 template <typename Loop>
 void release_upstream_slot(Loop* loop, Connection& conn) {
+    conn.release_backend_active();
     if (!conn.upstream_slot_held) return;
     conn.upstream_slot_held = false;
     if constexpr (requires { loop->upstream_release(conn.upstream_slot_uid); }) {
@@ -1921,6 +1958,7 @@ bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
 // their existing close/accounting behavior through the fallback below.
 template <typename Loop>
 bool detach_upstream_close(Loop* loop, Connection& conn) {
+    conn.release_backend_active();
     if constexpr (requires { loop->detach_upstream_close(conn); }) {
         return loop->detach_upstream_close(conn);
     } else {
@@ -1941,6 +1979,7 @@ bool detach_upstream_close(Loop* loop, Connection& conn) {
 // retain the fd/armed state until their normal close/cancel accounting drains.
 template <typename Loop>
 bool detach_upstream_close_only(Loop* loop, Connection& conn) {
+    conn.release_backend_active();
     if constexpr (requires { loop->detach_upstream_close(conn); }) {
         return loop->detach_upstream_close(conn);
     } else {
@@ -2065,6 +2104,15 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (fd < 0) return false;
     conn.upstream_fd = fd;
     conn.upstream_start_us = monotonic_us();
+    if (conn.forward_load_balance.policy != LoadBalancePolicy::None)
+        conn.upstream_backend_idx =
+            static_cast<u8>(select_forward_backend(cfg,
+                                                   conn.shard_id,
+                                                   conn.forward_load_balance,
+                                                   conn.upstream_idx,
+                                                   target.addr_count,
+                                                   conn.upstream_start_us));
+    hold_backend_active(conn);
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
     if (!loop->submit_connect(conn,
                               &target.addrs[conn.upstream_backend_idx],
@@ -2411,6 +2459,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                conn.req_strict_h1_complete && !conn.req_malformed) {
         conn.http1_pipeline_request_generation = conn.handler_gen;
     }
+    conn.forward_load_balance = {};
     conn.req_start_us = monotonic_us();
     conn.json_arena.destroy();
     conn.jit_response_body = {};
@@ -2837,9 +2886,14 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // (terminate-mode config is set unconditionally above, for every request)
         conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
-        const u32 kBackend =
-            select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
+        const u32 kBackend = select_forward_backend(conn.request_config,
+                                                    conn.shard_id,
+                                                    conn.forward_load_balance,
+                                                    route->upstream_id,
+                                                    target.addr_count,
+                                                    conn.upstream_start_us);
         conn.upstream_backend_idx = static_cast<u8>(kBackend);
+        hold_backend_active(conn);
 
         // Idle reuse: borrow a live keep-alive socket to this endpoint from the
         // per-shard pool and skip the TCP connect, driving the post-connect path
@@ -2875,6 +2929,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 
         const i32 kUpstreamFd = UpstreamPool::create_socket();
         if (kUpstreamFd < 0) {
+            conn.release_backend_active();
             conn.resp_status = kStatusBadGateway;
             format_static_response(conn, 502, false, http1_request_is_head(conn));
             conn.keep_alive = false;
@@ -4002,6 +4057,7 @@ void handle_jit_outcome(Loop* loop,
                 }
                 const i32 kUpstreamFd = UpstreamPool::create_socket();
                 if (kUpstreamFd < 0) {
+                    conn.release_backend_active();
                     send_bad_gateway();
                     return;
                 }
@@ -4107,6 +4163,10 @@ void handle_jit_outcome(Loop* loop,
             return;
         }
         case JitDispatchOutcome::Kind::Forward: {
+            if (!forward_load_balance_valid(conn.forward_load_balance)) {
+                loop->close_conn(conn);
+                return;
+            }
             conn.pending_handler_fn = nullptr;
             // Resolve upstream by id against the config pinned at
             // on_header_received. Reading loop->config_ptr here would
@@ -4704,8 +4764,6 @@ void handle_jit_outcome(Loop* loop,
                 reject_request_policy(loop, conn);
                 return;
             }
-            const u32 kBackend = select_backend(
-                static_cast<u16>(outcome.upstream_id), target.addr_count, monotonic_us());
             bool request_policy_prepared = false;
             if (outcome.request_policy_id != 0) {
                 const RequestPolicyBodyState body_state =
@@ -4730,6 +4788,14 @@ void handle_jit_outcome(Loop* loop,
                     if (!loop->submit_recv(conn)) loop->close_conn(conn);
                     return;
                 }
+            }
+            const u32 kBackend = select_forward_backend(config,
+                                                        conn.shard_id,
+                                                        conn.forward_load_balance,
+                                                        static_cast<u16>(outcome.upstream_id),
+                                                        target.addr_count,
+                                                        monotonic_us());
+            if (outcome.request_policy_id != 0) {
                 if (!apply_request_policy(
                         conn, target.addrs[kBackend], outcome.request_policy_id)) {
                     if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated)
@@ -4969,6 +5035,7 @@ void handle_jit_outcome(Loop* loop,
             conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
             conn.upstream_start_us = monotonic_us();
             conn.upstream_backend_idx = static_cast<u8>(kBackend);
+            hold_backend_active(conn);
 
             conn.request_policy_id = outcome.request_policy_id;
             if (conn.request_policy_id != 0 && !request_policy_prepared) {
@@ -5056,6 +5123,7 @@ void handle_jit_outcome(Loop* loop,
 
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
+                conn.release_backend_active();
                 if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated) {
                     respond_validated_preconnect_failure(
                         loop, conn, ValidatedPreconnectFailureSite::SocketCreate);
@@ -5219,11 +5287,17 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     if (kFd < 0) return false;
     conn.upstream_fd = kFd;
     conn.upstream_attempts++;
+    conn.release_backend_active();
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-    const u32 kBackend =
-        select_backend(conn.upstream_idx, target.addr_count, conn.upstream_start_us);
+    const u32 kBackend = select_forward_backend(config,
+                                                conn.shard_id,
+                                                conn.forward_load_balance,
+                                                conn.upstream_idx,
+                                                target.addr_count,
+                                                conn.upstream_start_us);
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
+    hold_backend_active(conn);
     if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
         return true;
     (void)detach_upstream_close(loop, conn);
@@ -9028,7 +9102,8 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
     const RouteConfig* cfg = h2->async_cfg;
     const u16 upstream_id = h2->async_upstream_id;
-    if (cfg == nullptr || upstream_id >= cfg->upstream_count) {
+    if (cfg == nullptr || upstream_id >= cfg->upstream_count ||
+        !forward_load_balance_valid(h2->async_load_balance)) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }
@@ -9076,8 +9151,14 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     conn.upstream_attempts = 1;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
-    const u32 kBackend = select_backend(upstream_id, target.addr_count, conn.upstream_start_us);
+    const u32 kBackend = select_forward_backend(cfg,
+                                                conn.shard_id,
+                                                h2->async_load_balance,
+                                                upstream_id,
+                                                target.addr_count,
+                                                conn.upstream_start_us);
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
+    hold_backend_active(conn, cfg);
     if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
         h2_proxy_fail(loop, conn, 502);  // h2_proxy_fail closes the fd we just opened
     }

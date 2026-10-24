@@ -19,7 +19,7 @@ unmatched { return local_response({
 }) }
 route HEAD "/" {
     if req.pathOnly == "/healthz" {
-    return forward(envoy_cluster_1, request_policy: {
+    return forward(envoy_cluster_1, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,
@@ -56,7 +56,7 @@ route HEAD "/" {
         }
     )
     } else {
-    return forward(envoy_cluster_0, request_policy: {
+    return forward(envoy_cluster_0, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,
@@ -96,7 +96,7 @@ route HEAD "/" {
 }
 route "/" {
     if req.pathOnly == "/healthz" {
-    return forward(envoy_cluster_1, request_policy: {
+    return forward(envoy_cluster_1, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,
@@ -131,7 +131,7 @@ route "/" {
         }
     )
     } else {
-    return forward(envoy_cluster_0, request_policy: {
+    return forward(envoy_cluster_0, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .preserve,
             connection: .omit,

@@ -22,5 +22,5 @@ route GET "/admin" {
     guard let claims = json.decode(Claims, document) else { return 401 }
     guard claims.role == "admin" else { return 403 }
 
-    return forward(api)
+    return forward(api, load_balance: .roundRobin)
 }
