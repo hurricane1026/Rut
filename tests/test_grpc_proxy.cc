@@ -3447,6 +3447,12 @@ TEST(load_balance, sites_shards_shared_load_and_config_lifetimes) {
     conn.shard_id = 0;
     hold_backend_active(conn);
     CHECK_EQ(select_forward_backend(cfg.get(), 0, least, 0, 2, 0), 1u);
+    // A failed connect can release its active count before retry selection. Keep
+    // that endpoint out of this request's retry candidates even when it now
+    // appears to have the fewest active requests.
+    auto retry_cfg = std::make_unique<RouteConfig>();
+    retry_cfg->backend_selection[0].active[0][1] = 1;
+    CHECK_EQ(select_forward_backend(retry_cfg.get(), 0, least, 0, 2, 0, 1u), 1u);
     CHECK_EQ(select_forward_backend(cfg.get(), 1, least, 0, 2, 0), 0u);
     CHECK_EQ(select_forward_backend(next.get(), 0, least, 0, 2, 0), 0u);
     // An old request retains its old config's gauge even after publication.
@@ -3460,6 +3466,8 @@ TEST(load_balance, sites_shards_shared_load_and_config_lifetimes) {
     CHECK_EQ(select_forward_backend(cfg.get(), 0, a, 0, 2, 0), 0u);
     backend_health(0, 0)->active_down = true;
     CHECK_LT(select_forward_backend(cfg.get(), 0, least, 0, 2, 0), 2u);
+    CHECK_EQ(select_forward_backend(retry_cfg.get(), 0, least, 0, 2, 0, 1u), 1u);
+    CHECK_EQ(select_forward_backend(retry_cfg.get(), 0, least, 0, 2, 0, 3u), 2u);
 }
 
 TEST(load_balance, grpc_rpc_count_is_independent_of_connection_and_optional_cap) {

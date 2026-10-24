@@ -10,7 +10,8 @@
 
 namespace rut {
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us);
-inline u32 select_forward_backend(const RouteConfig*, u32, ForwardLoadBalance, u16, u32, u64);
+inline u32 select_forward_backend(
+    const RouteConfig*, u32, ForwardLoadBalance, u16, u32, u64, u8 = 0);
 inline void grpc_release_backend_active(GrpcExchange& x) {
     if (x.backend_active) {
         --*x.backend_active;

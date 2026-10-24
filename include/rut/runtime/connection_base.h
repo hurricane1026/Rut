@@ -405,10 +405,11 @@ struct ConnectionBase {
         }
     }
     u16 upstream_idx;
-    u8 upstream_attempts;     // connect attempts so far (initial + retries) this request
-    u8 upstream_backend_idx;  // which backend endpoint the current connect targets
-    bool proxy_resp_started;  // true once upstream response bytes were sent to the client
-    bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
+    u8 upstream_attempts;            // connect attempts so far (initial + retries) this request
+    u8 upstream_backend_idx;         // which backend endpoint the current connect targets
+    u8 upstream_attempted_backends;  // endpoints already tried by this request
+    bool proxy_resp_started;         // true once upstream response bytes were sent to the client
+    bool upstream_abandoned;         // gave up on the upstream (timeout); ignore late upstream CQEs
     // io_uring: a request-body CQE overflowed recv_buf and the client was refused with
     // 413 (respond_request_body_overflow); later recv errors must not cut that response.
     bool req_body_overflow_rejected;
@@ -1958,6 +1959,7 @@ struct ConnectionBase {
         upstream_idx = 0;
         upstream_attempts = 0;
         upstream_backend_idx = 0;
+        upstream_attempted_backends = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
         req_body_overflow_rejected = false;

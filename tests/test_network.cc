@@ -80962,6 +80962,41 @@ TEST(state_invariant, backend_retry_connect_submit_failure_closes_retry_fd) {
     close(retry_fds[1]);
 }
 
+TEST(state_invariant, backend_retry_least_requests_skips_failed_endpoint) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    REQUIRE(cfg.add_upstream_backend(static_cast<u16>(upstream.value()), 0x7F000001, 9001));
+    SmallLoop loop;
+    loop.setup();
+
+    i32 old_fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, old_fds) == 0);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(upstream.value());
+    c->upstream_fd = old_fds[1];
+    c->upstream_attempts = 1;
+    c->upstream_backend_idx = 0;
+    c->forward_load_balance = {1, LoadBalancePolicy::LeastRequests};
+    cfg.backend_selection[0].active[upstream.value()][1] = 1;
+    hold_backend_active(*c, &cfg);
+    CHECK_EQ(cfg.backend_selection[0].active[upstream.value()][0], 1u);
+    CHECK_EQ(cfg.backend_selection[0].active[upstream.value()][1], 1u);
+
+    REQUIRE(try_connect_next_backend<SmallLoop>(&loop, *c));
+
+    CHECK_EQ(c->upstream_backend_idx, 1u);
+    CHECK_EQ(c->upstream_attempted_backends, 3u);
+    CHECK_EQ(cfg.backend_selection[0].active[upstream.value()][0], 0u);
+    CHECK_EQ(cfg.backend_selection[0].active[upstream.value()][1], 2u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    loop.free_conn(*c);
+    close(old_fds[0]);
+}
+
 // State 1: Accept → ReadingHeader {on_recv=header, rest=null}
 TEST(state_transition, accept_to_reading_header) {
     SmallLoop loop;

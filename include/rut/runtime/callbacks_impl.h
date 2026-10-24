@@ -179,19 +179,26 @@ inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
 
 // Selection uses only the owning shard's sidecar in the pinned configuration.
 // Ties rotate at this forward site. Health eligibility matches existing fail-open
-// behavior: when every endpoint is ejected, consider the complete backend set.
-inline u32 select_forward_backend(
-    const RouteConfig* cfg, u32 shard, ForwardLoadBalance spec, u16 uid, u32 count, u64 now) {
+// behavior: if every unattempted endpoint is ejected, consider that remaining set.
+inline u32 select_forward_backend(const RouteConfig* cfg,
+                                  u32 shard,
+                                  ForwardLoadBalance spec,
+                                  u16 uid,
+                                  u32 count,
+                                  u64 now,
+                                  u8 excluded_backends) {
     if (!cfg || shard >= kMaxShards || uid >= RouteConfig::kMaxUpstreams || count == 0) return 0;
     if (spec.policy == LoadBalancePolicy::None) return select_backend(uid, count, now);
     if (!forward_load_balance_valid(spec)) return count;
     auto& state = cfg->backend_selection[shard];
     auto& cursor = state.cursor[spec.site - 1];
     bool any_healthy = false;
-    for (u32 i = 0; i < count; ++i) any_healthy |= !backend_ejected(uid, i, now);
+    for (u32 i = 0; i < count; ++i)
+        if ((excluded_backends & (1u << i)) == 0) any_healthy |= !backend_ejected(uid, i, now);
     u32 best = count;
     for (u32 step = 0; step < count; ++step) {
         const u32 i = (cursor + step) % count;
+        if ((excluded_backends & (1u << i)) != 0) continue;
         if (any_healthy && backend_ejected(uid, i, now)) continue;
         if (best == count || (spec.policy == LoadBalancePolicy::LeastRequests &&
                               state.active[uid][i] < state.active[uid][best]))
@@ -2111,7 +2118,13 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
                                                    conn.forward_load_balance,
                                                    conn.upstream_idx,
                                                    target.addr_count,
-                                                   conn.upstream_start_us));
+                                                   conn.upstream_start_us,
+                                                   conn.upstream_attempted_backends));
+    if (conn.upstream_backend_idx >= target.addr_count) {
+        (void)detach_upstream_close(loop, conn);
+        return false;
+    }
+    conn.upstream_attempted_backends |= static_cast<u8>(1u << conn.upstream_backend_idx);
     hold_backend_active(conn);
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
     if (!loop->submit_connect(conn,
@@ -2460,6 +2473,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.http1_pipeline_request_generation = conn.handler_gen;
     }
     conn.forward_load_balance = {};
+    conn.upstream_attempted_backends = 0;
     conn.req_start_us = monotonic_us();
     conn.json_arena.destroy();
     conn.jit_response_body = {};
@@ -2893,6 +2907,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                                     target.addr_count,
                                                     conn.upstream_start_us);
         conn.upstream_backend_idx = static_cast<u8>(kBackend);
+        conn.upstream_attempted_backends = static_cast<u8>(1u << kBackend);
         hold_backend_active(conn);
 
         // Idle reuse: borrow a live keep-alive socket to this endpoint from the
@@ -4795,6 +4810,7 @@ void handle_jit_outcome(Loop* loop,
                                                         static_cast<u16>(outcome.upstream_id),
                                                         target.addr_count,
                                                         monotonic_us());
+            conn.upstream_attempted_backends |= static_cast<u8>(1u << kBackend);
             if (outcome.request_policy_id != 0) {
                 if (!apply_request_policy(
                         conn, target.addrs[kBackend], outcome.request_policy_id)) {
@@ -5281,6 +5297,8 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     const u32 kBudget =
         target.addr_count < kMaxConnectAttempts ? target.addr_count : kMaxConnectAttempts;
     if (conn.upstream_attempts >= kBudget) return false;  // budget exhausted
+    if (conn.upstream_backend_idx < target.addr_count)
+        conn.upstream_attempted_backends |= static_cast<u8>(1u << conn.upstream_backend_idx);
 
     (void)detach_upstream_close(loop, conn);
     const i32 kFd = UpstreamPool::create_socket();
@@ -5295,8 +5313,14 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
                                                 conn.forward_load_balance,
                                                 conn.upstream_idx,
                                                 target.addr_count,
-                                                conn.upstream_start_us);
+                                                conn.upstream_start_us,
+                                                conn.upstream_attempted_backends);
+    if (kBackend >= target.addr_count) {
+        (void)detach_upstream_close(loop, conn);
+        return false;
+    }
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
+    conn.upstream_attempted_backends |= static_cast<u8>(1u << kBackend);
     hold_backend_active(conn);
     if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
         return true;
@@ -9158,6 +9182,7 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
                                                 target.addr_count,
                                                 conn.upstream_start_us);
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
+    conn.upstream_attempted_backends = static_cast<u8>(1u << kBackend);
     hold_backend_active(conn, cfg);
     if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
         h2_proxy_fail(loop, conn, 502);  // h2_proxy_fail closes the fd we just opened
