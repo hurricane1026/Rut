@@ -81,6 +81,22 @@ struct RateLimitRule {
     RateLimitKeySpec key{};
 };
 
+// Rate-limit GCRA arithmetic is precomputed during configuration. Keep the
+// interval exact (ceil rather than floor) so a configured window is never
+// shortened, and reject a burst whose tolerance cannot be represented in u64.
+inline u64 rate_limit_emit_interval_us(u32 max, u32 window_sec) {
+    if (max == 0 || window_sec == 0) return 0;
+    const u64 numerator = static_cast<u64>(window_sec) * 1000000ull;
+    return (numerator + static_cast<u64>(max) - 1ull) / max;
+}
+
+inline bool rate_limit_params_representable(u32 max, u32 window_sec, u32 burst) {
+    if (max == 0 || window_sec == 0) return true;  // disabled rule
+    if (burst == 0) burst = max;
+    const u64 emit = rate_limit_emit_interval_us(max, window_sec);
+    return static_cast<u64>(burst - 1u) <= 0xffffffffffffffffull / emit;
+}
+
 static constexpr u32 kMaxRateLimitRules = 4;
 
 // The ordered rule list for a route + its length. POD (inline arrays) → one-line
@@ -91,12 +107,13 @@ struct RateLimitRuleSet {
 
     // Append a rule; returns its index, or -1 if full. `burst == 0` defaults the
     // bucket capacity to `max`. Precomputes the GCRA params so the hot path is
-    // division-free: emit = window/max (µs per token), tau = (burst-1)·emit.
+    // division-free: emit = ceil(window/max) (µs per token), tau = (burst-1)·emit.
     i32 add_rule(u32 max,
                  u32 window_sec,
                  u32 burst = 0,
                  RateLimitScope scope = RateLimitScope::Shard) {
         if (count >= kMaxRateLimitRules) return -1;
+        if (!rate_limit_params_representable(max, window_sec, burst)) return -1;
         RateLimitRule& r = rules[count];
         r.max = max;
         r.window_sec = window_sec;
@@ -104,8 +121,7 @@ struct RateLimitRuleSet {
         r.scope = scope;
         r.key = RateLimitKeySpec{};
         if (max > 0 && window_sec > 0) {
-            u64 emit = static_cast<u64>(window_sec) * 1000000ull / max;
-            if (emit == 0) emit = 1;  // clamp: extremely high rate → ~1 token/µs
+            const u64 emit = rate_limit_emit_interval_us(max, window_sec);
             r.emit_interval_us = emit;
             r.tau_us = (r.burst > 0 ? static_cast<u64>(r.burst - 1) : 0) * emit;
         } else {

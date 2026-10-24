@@ -195,6 +195,67 @@ TEST(rate_limit_enforce, missing_semantic_id_fails_closed_without_spending) {
     CHECK(rate_limit_exceeded_with_limiters(shard, &global, rules, missing_ids, input, 1000));
 }
 
+TEST(rate_limit_arithmetic, rejects_unrepresentable_tau_atomically) {
+    RateLimitRuleSet rules{};
+    REQUIRE_EQ(rules.add_rule(7, 1, 3), 0);
+    const RateLimitRule saved = rules.rules[0];
+    CHECK_EQ(rules.add_rule(1, 4293934841u, 4297u), -1);
+    CHECK_EQ(rules.count, 1u);
+    CHECK_EQ(rules.rules[0].max, saved.max);
+    CHECK_EQ(rules.rules[0].emit_interval_us, saved.emit_interval_us);
+    CHECK_EQ(rules.rules[0].tau_us, saved.tau_us);
+}
+
+TEST(rate_limit_arithmetic, disabled_interval_is_safe) {
+    CHECK_EQ(rate_limit_emit_interval_us(0, 60), 0ull);
+    CHECK_EQ(rate_limit_emit_interval_us(10, 0), 0ull);
+    RateLimitRuleSet disabled{};
+    REQUIRE_EQ(disabled.add_rule(0, 60, 4), 0);
+    CHECK_EQ(disabled.rules[0].emit_interval_us, 0ull);
+    CHECK_EQ(disabled.rules[0].tau_us, 0ull);
+}
+
+TEST(rate_limit_arithmetic, emission_interval_uses_ceil) {
+    RateLimitRuleSet rules{};
+    REQUIRE_EQ(rules.add_rule(3, 1, 1), 0);
+    CHECK_EQ(rules.rules[0].emit_interval_us, 333334ull);
+    RateLimiter limiter{};
+    const u64 key = 0x1234;
+    CHECK(limiter.allow_key(key, rules.rules[0].emit_interval_us, rules.rules[0].tau_us, 1000));
+    CHECK(!limiter.allow_key(key, rules.rules[0].emit_interval_us, rules.rules[0].tau_us, 333333));
+    CHECK(limiter.allow_key(key, rules.rules[0].emit_interval_us, rules.rules[0].tau_us, 334334));
+}
+
+TEST(rate_limit_arithmetic, configured_burst_sets_capacity_and_tolerance) {
+    RateLimitRuleSet rules{};
+    REQUIRE_EQ(rules.add_rule(3, 1, 2), 0);
+    const RateLimitRule& rule = rules.rules[0];
+    CHECK_EQ(rule.burst, 2u);
+    CHECK_EQ(rule.emit_interval_us, 333334ull);
+    CHECK_EQ(rule.tau_us, 333334ull);
+
+    RateLimiter limiter{};
+    const u64 key = 0x2345;
+    CHECK(limiter.allow_key(key, rule.emit_interval_us, rule.tau_us, 1000));
+    CHECK(limiter.allow_key(key, rule.emit_interval_us, rule.tau_us, 1000));
+    CHECK(!limiter.allow_key(key, rule.emit_interval_us, rule.tau_us, 1000));
+    CHECK(limiter.allow_key(key, rule.emit_interval_us, rule.tau_us, 334334));
+}
+
+TEST(rate_limit_arithmetic, conformance_and_state_update_are_overflow_safe) {
+    constexpr u64 kMax = 0xffffffffffffffffull;
+    constexpr u64 kKey = 0x5678;
+    RateLimiter shard{};
+    GlobalRateLimiter global{};
+    global.reset();
+    CHECK(shard.allow_key(kKey, 1, 0, kMax - 6));
+    CHECK(shard.allow_key(kKey, 1, kMax - 20, kMax - 10));
+    CHECK(global.allow_key(kKey, 1, 0, kMax - 6));
+    CHECK(global.allow_key(kKey, 1, kMax - 20, kMax - 10));
+    CHECK(!shard.allow_key(0x9abc, 10, 0, kMax - 5));
+    CHECK(!global.allow_key(0x9abc, 10, 0, kMax - 5));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

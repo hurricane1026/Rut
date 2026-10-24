@@ -1100,7 +1100,7 @@ TEST(rate_limit_e2e, global_scope_shared_limiter) {
 TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
     using namespace rut;
     const char* src =
-        "@rateLimit(limit: 3, window: 1m)\n"
+        "@rateLimit(limit: 3, window: 1001ms)\n"
         "route GET \"/api\" { return 200 }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -1119,9 +1119,111 @@ TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
     REQUIRE_EQ(rir.module.func_count, 1u);
     REQUIRE_EQ(rir.module.functions[0].rate_limit.count, 1u);
     CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].max, 3u);
-    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].window_sec, 60u);  // 1m
-    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].key.count, 0u);    // default per-IP
+    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].window_sec, 2u);  // ceil(1001ms)
+    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].key.count, 0u);   // default per-IP
     rir.destroy();
+}
+
+TEST(rate_limit_dsl, rejects_unrepresentable_window_duration) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 1, window: 4294967295h)\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK_FALSE(ast);
+}
+
+TEST(rate_limit_dsl, accepts_exact_u32_second_window_boundary) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 1, window: 4294967295s)\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].window_sec, 0xffffffffu);
+    rir.destroy();
+}
+
+TEST(rate_limit_dsl, rejects_one_millisecond_past_u32_second_window_boundary) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 1, window: 4294967295001ms)\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK_FALSE(ast);
+}
+
+TEST(rate_limit_dsl, rejects_unrepresentable_burst_tau) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 1, window: 4293934841s, burst: 4297)\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK_FALSE(ast);
+}
+
+TEST(rate_limit_dsl, preserves_representable_large_tau) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 1, window: 4293934840s, burst: 4297)\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    const auto& rule = rir.module.functions[0].rate_limit.rules[0];
+    CHECK_EQ(rule.emit_interval_us, 4293934840000000ull);
+    CHECK_EQ(rule.tau_us, 18446744072640000000ull);
+    rir.destroy();
+}
+
+TEST(rate_limit_native, setter_failure_preserves_existing_rules) {
+    using namespace rut;
+    RouteConfig config{};
+    REQUIRE(config.add_static("/limited", 'G', 200));
+    REQUIRE(config.set_route_rate_limit(0, 7, 1));
+    const RateLimitRule saved = config.routes[0].rate_limit.rules[0];
+    const u64 saved_id = config.routes[0].rate_limit_ids[0];
+    CHECK(config.rate_limit_ids_valid());
+
+    CHECK_FALSE(config.set_route_rate_limit(0, 1, 4293934841u, 4297u));
+    CHECK_EQ(config.routes[0].rate_limit.count, 1u);
+    CHECK_EQ(config.routes[0].rate_limit.rules[0].max, saved.max);
+    CHECK_EQ(config.routes[0].rate_limit.rules[0].emit_interval_us, saved.emit_interval_us);
+    CHECK_EQ(config.routes[0].rate_limit.rules[0].tau_us, saved.tau_us);
+    CHECK_EQ(config.routes[0].rate_limit_ids[0], saved_id);
+    CHECK(config.rate_limit_ids_valid());
+
+    REQUIRE(config.set_route_rate_limit(0, 3, 1, 2));
+    CHECK_EQ(config.routes[0].rate_limit.rules[0].burst, 2u);
+    CHECK_NE(config.routes[0].rate_limit_ids[0], saved_id);
+    CHECK(config.rate_limit_ids_valid());
 }
 
 // A `timer name, every: D { }` declaration compiles through the IR to a timer

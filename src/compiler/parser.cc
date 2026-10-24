@@ -4858,6 +4858,38 @@ struct Parser {
         return secs > 0xffffffffull ? 0xffffffffu : static_cast<u32>(secs);
     }
 
+    // Rate-limit windows are stored exactly as u32 seconds. Unlike throttle's
+    // legacy conversion, never saturate an out-of-range duration: silently
+    // shortening a request-rate window changes its policy.
+    static bool dur_lit_to_rate_limit_seconds(Str t, u32* out) {
+        if (out == nullptr) return false;
+        u64 digits = 0;
+        u32 i = 0;
+        for (; i < t.len && t.ptr[i] >= '0' && t.ptr[i] <= '9'; i++) {
+            const u64 digit = static_cast<u64>(t.ptr[i] - '0');
+            if (digits > (0xffffffffffffffffull - digit) / 10ull) return false;
+            digits = digits * 10ull + digit;
+        }
+        const Str unit{t.ptr + i, t.len - i};
+        u64 seconds = 0;
+        if (unit.eq({"ms", 2})) {
+            seconds = digits / 1000ull + (digits % 1000ull != 0 ? 1ull : 0ull);
+        } else if (unit.eq({"s", 1})) {
+            seconds = digits;
+        } else if (unit.eq({"m", 1})) {
+            if (digits > 0xffffffffffffffffull / 60ull) return false;
+            seconds = digits * 60ull;
+        } else if (unit.eq({"h", 1})) {
+            if (digits > 0xffffffffffffffffull / 3600ull) return false;
+            seconds = digits * 3600ull;
+        } else {
+            return false;
+        }
+        if (seconds == 0 || seconds > 0xffffffffull) return false;
+        *out = static_cast<u32>(seconds);
+        return true;
+    }
+
     // Convert a duration literal to the exact whole-second representation used
     // by response_read_timeout. This intentionally does not share the rounded
     // decorator conversion above and never clamps or saturates.
@@ -4968,8 +5000,8 @@ struct Parser {
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto dur = expect(TokenType::DurLit);
             if (!dur) return core::make_unexpected(dur.error());
-            const u32 kWin = dur_lit_to_seconds(dur.value()->text);
-            if (kWin == 0 || maxv == 0)
+            u32 kWin = 0;
+            if (!dur_lit_to_rate_limit_seconds(dur.value()->text, &kWin) || maxv == 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, deco.span, dur.value()->text);
             // Optional trailing named args, in any order:
@@ -5027,6 +5059,12 @@ struct Parser {
             }
             if (!expect(TokenType::RParen))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            const u32 burst =
+                deco.rate_limit_burst == 0 ? static_cast<u32>(maxv) : deco.rate_limit_burst;
+            if (!rate_limit_params_representable(static_cast<u32>(maxv), kWin, burst))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      deco.span,
+                                      lit_str("rate-limit burst/window exceeds u64 GCRA range"));
             deco.rate_limit_max = static_cast<u32>(maxv);
             deco.rate_limit_window_sec = kWin;
             return deco;
