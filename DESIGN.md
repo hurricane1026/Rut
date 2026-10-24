@@ -6792,6 +6792,9 @@ failure, not an exact per-key table. The global limiter shares atomic slots
 within one process; colliding keys share budget and may throttle one another.
 Neither mechanism supplies cross-node or strict lossless state. Rut `Cache`
 examples remain a separate, deliberately lossy state mechanism.
+The shard limiter table belongs to its event-loop instance: HTTP/1 and HTTP/2
+dispatch on that loop share the table, while separate loop instances remain
+isolated even when they run on the same thread.
 
 Stacked built-in rules meter each request attempt independently. Enforcement
 checks every active rule even if an earlier rule rejects: each conforming rule
