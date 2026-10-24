@@ -19,12 +19,20 @@ inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
                                               const RateLimitKeyInput& key_in,
                                               u64 now_us) {
     if (rules.count == 0) return false;
+    // Validate shared state before spending any earlier shard-rule budget.
+    if (global_rate_limiter == nullptr) {
+        for (u32 ri = 0; ri < rules.count; ++ri) {
+            const auto& rule = rules.rules[ri];
+            if (rule.scope == RateLimitScope::Global && rule.emit_interval_us != 0) return true;
+        }
+    }
     for (u32 ri = 0; ri < rules.count; ri++) {
         const RateLimitRule& rule = rules.rules[ri];
+        if (rule.emit_interval_us == 0) continue;
         const u32 kScope = route_idx * kMaxRateLimitRules + ri;
         const u64 kKey = rate_limit_key(kScope, rule.key.comps, rule.key.count, key_in);
         const bool kOk =
-            (rule.scope == RateLimitScope::Global && global_rate_limiter != nullptr)
+            (rule.scope == RateLimitScope::Global)
                 ? global_rate_limiter->allow_key(kKey, rule.emit_interval_us, rule.tau_us, now_us)
                 : rate_limiter.allow_key(kKey, rule.emit_interval_us, rule.tau_us, now_us);
         if (!kOk) return true;
@@ -38,8 +46,9 @@ inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
 // per-shard (one thread each), so a thread_local table needs no atomics. Both
 // dispatch paths run on the same shard thread with the same Loop type, so they
 // resolve to one shared limiter instance. Global-scope rules go to the
-// process-shared GlobalRateLimiter when the loop exposes one; otherwise a global
-// rule degrades to per-shard.
+// process-shared GlobalRateLimiter. An active global rule without that shared
+// instance fails closed (429) before any rule consumes budget. Disabled global
+// rules need no instance.
 template <typename Loop>
 bool rate_limit_exceeded(Loop* loop,
                          const RateLimitRuleSet& rules,

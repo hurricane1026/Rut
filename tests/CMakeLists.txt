@@ -754,6 +754,14 @@ target_include_directories(test_buffer PRIVATE
 add_test(NAME test_buffer COMMAND test_buffer)
 set_tests_properties(test_buffer PROPERTIES LABELS "unit")
 
+add_executable(test_rate_limit test_rate_limit.cc)
+target_include_directories(test_rate_limit PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_rate_limit COMMAND test_rate_limit)
+set_tests_properties(test_rate_limit PROPERTIES LABELS "unit;runtime")
+
 add_executable(test_cache_table test_cache_table.cc)
 target_include_directories(test_cache_table PRIVATE
     ${PROJECT_SOURCE_DIR}/include
