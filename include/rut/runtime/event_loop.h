@@ -69,6 +69,7 @@ public:
         return self().submit_connect_impl(c, addr, addr_len);
     }
     void close_conn(Connection& c) {
+        c.release_backend_active();
         if (c.on_close) {
             auto cleanup = c.on_close;
             c.on_close = nullptr;

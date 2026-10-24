@@ -547,15 +547,16 @@ void streaming_case(rut::test::TestCase* _tc,
                               "/localhost_key.pem\""
                             : "");
         }
-        const int len =
-            snprintf(source,
-                     sizeof(source),
-                     "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2%s }\n"
-                     "route POST \"/test.Echo/Call\" { return forward(grpc) }\n"
-                     "route POST \"/jit.Echo/Call\" { return forward(grpc) }\n"
-                     "route POST \"/jitwait.Echo/Call\" { wait(100) return forward(grpc) }\n",
-                     get_port(server->listen_fd),
-                     tls_fields);
+        const int len = snprintf(
+            source,
+            sizeof(source),
+            "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2%s }\n"
+            "route POST \"/test.Echo/Call\" { return forward(grpc, load_balance: .roundRobin) }\n"
+            "route POST \"/jit.Echo/Call\" { return forward(grpc, load_balance: .roundRobin) }\n"
+            "route POST \"/jitwait.Echo/Call\" { wait(100) return forward(grpc, load_balance: "
+            ".roundRobin) }\n",
+            get_port(server->listen_fd),
+            tls_fields);
         const bool written = write(file, source, len) == len;
         close(file);
         LoadError error;
@@ -872,6 +873,8 @@ TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
     x.upstream_stream = 1;
     x.request_headers_sent = true;
     x.deadline_us = monotonic_us() - 1;
+    u32 active = 1;
+    x.backend_active = &active;
     x.slot_held = true;
     x.upstream_id = 7;
     down_h2.grpc.streams[0] = &x;
@@ -880,6 +883,7 @@ TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
     up_h2.grpc.active = 1;
     grpc_deadline_fired(&loop, downstream);
     CHECK_EQ(x.failure, 4u);
+    CHECK_EQ(active, 0u);
     CHECK(x.upstream == nullptr);
     CHECK_FALSE(x.slot_held);
     CHECK_EQ(loop.released, 1u);
@@ -3422,4 +3426,132 @@ TEST(grpc_proxy, live_host_log_skips_http2_publication) {
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
     return rut::test::run_all(argc, argv);
+}
+
+TEST(load_balance, sites_shards_shared_load_and_config_lifetimes) {
+    auto cfg = std::make_unique<RouteConfig>();
+    auto next = std::make_unique<RouteConfig>();
+    GrpcBackendHealthReset reset;
+    const ForwardLoadBalance a{1, LoadBalancePolicy::RoundRobin};
+    const ForwardLoadBalance b{2, LoadBalancePolicy::RoundRobin};
+    const ForwardLoadBalance least{3, LoadBalancePolicy::LeastRequests};
+    CHECK_EQ(select_forward_backend(cfg.get(), 0, a, 0, 2, 0), 0u);
+    CHECK_EQ(select_forward_backend(cfg.get(), 0, a, 0, 2, 0), 1u);
+    CHECK_EQ(select_forward_backend(cfg.get(), 0, b, 0, 2, 0), 0u);
+    CHECK_EQ(select_forward_backend(cfg.get(), 1, b, 0, 2, 0), 0u);
+    Connection conn;
+    conn.reset();
+    conn.request_config = cfg.get();
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    conn.shard_id = 0;
+    hold_backend_active(conn);
+    CHECK_EQ(select_forward_backend(cfg.get(), 0, least, 0, 2, 0), 1u);
+    // A failed connect can release its active count before retry selection. Keep
+    // that endpoint out of this request's retry candidates even when it now
+    // appears to have the fewest active requests.
+    auto retry_cfg = std::make_unique<RouteConfig>();
+    retry_cfg->backend_selection[0].active[0][1] = 1;
+    CHECK_EQ(select_forward_backend(retry_cfg.get(), 0, least, 0, 2, 0, 1u), 1u);
+    CHECK_EQ(select_forward_backend(cfg.get(), 1, least, 0, 2, 0), 0u);
+    CHECK_EQ(select_forward_backend(next.get(), 0, least, 0, 2, 0), 0u);
+    // An old request retains its old config's gauge even after publication.
+    conn.request_config = next.get();
+    conn.release_backend_active();
+    conn.release_backend_active();
+    CHECK_EQ(cfg->backend_selection[0].active[0][0], 0u);
+    CHECK_EQ(next->backend_selection[0].active[0][0], 0u);
+    // Health filtering takes precedence; the all-ejected case is explicitly fail-open.
+    backend_health(0, 1)->active_down = true;
+    CHECK_EQ(select_forward_backend(cfg.get(), 0, a, 0, 2, 0), 0u);
+    backend_health(0, 0)->active_down = true;
+    CHECK_LT(select_forward_backend(cfg.get(), 0, least, 0, 2, 0), 2u);
+    CHECK_EQ(select_forward_backend(retry_cfg.get(), 0, least, 0, 2, 0, 1u), 1u);
+    CHECK_EQ(select_forward_backend(retry_cfg.get(), 0, least, 0, 2, 0, 3u), 2u);
+}
+
+TEST(load_balance, grpc_rpc_count_is_independent_of_connection_and_optional_cap) {
+    GrpcDriveFixture loop;
+    u32 active = 2;
+    auto x = std::make_unique<GrpcExchange>();
+    auto y = std::make_unique<GrpcExchange>();
+    x->init();
+    y->init();
+    x->backend_active = y->backend_active = &active;
+    // Neither RPC acquired a max_inflight slot, but both own a selection gauge.
+    grpc_release_slot(&loop, *x);
+    CHECK_EQ(active, 1u);
+    grpc_release_slot(&loop, *x);
+    CHECK_EQ(active, 1u);
+    grpc_release_slot(&loop, *y);
+    CHECK_EQ(active, 0u);
+    CHECK_EQ(loop.released, 0u);
+}
+
+TEST(load_balance, grpc_dispatch_balances_independent_rpcs_and_releases_on_close) {
+    struct PendingConnectLoop : EpollEventLoop {
+        bool submit_connect(Connection&, const void*, u32) { return true; }
+    } loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    auto cfg = std::make_unique<RouteConfig>();
+    REQUIRE(cfg->add_upstream("grpc", 0x7f000001, 9001).has_value());
+    REQUIRE(cfg->upstreams[0].add_addr(0x7f000001, 9002));
+    cfg->upstreams[0].http2 = true;
+    GrpcBackendHealthReset health_reset;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init_client();
+    down->request_config = cfg.get();
+    ParsedRequest req;
+    req.reset();
+    req.method = HttpMethod::POST;
+    req.headers[0] = {Str{"content-type", 12}, Str{"application/grpc", 16}};
+    req.header_count = 1;
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/Echo", 5}},
+                                {{":authority", 10}, {"x", 1}},
+                                {{"content-type", 12}, {"application/grpc", 16}}};
+    for (u16 i = 0; i < 3; ++i) {
+        const u32 sid = 2u * i + 1u;
+        REQUIRE(down->h2->open_stream(sid) != nullptr);
+        down->forward_load_balance = {
+            static_cast<u16>(i + 1),
+            i == 2 ? LoadBalancePolicy::RoundRobin : LoadBalancePolicy::LeastRequests};
+        REQUIRE(grpc_start_impl(&loop, *down, sid, cfg.get(), 0, hs, 5, req, false));
+        auto* rpc = grpc_find(*down->h2, sid);
+        REQUIRE(rpc != nullptr);
+        REQUIRE(rpc->upstream != nullptr);
+        CHECK_EQ(rpc->upstream->upstream_backend_idx, i == 1 ? 1u : 0u);
+    }
+    CHECK_EQ(cfg->backend_selection[0].active[0][0], 2u);
+    CHECK_EQ(cfg->backend_selection[0].active[0][1], 1u);
+    auto* first = grpc_find(*down->h2, 1);
+    REQUIRE(first != nullptr);
+    grpc_release_slot(&loop, *first);
+    CHECK_EQ(cfg->backend_selection[0].active[0][0], 1u);
+    loop.force_close_all();
+    CHECK_EQ(cfg->backend_selection[0].active[0][0], 0u);
+    CHECK_EQ(cfg->backend_selection[0].active[0][1], 0u);
+    loop.shutdown();
+}
+
+TEST(load_balance, failed_http_attempt_releases_before_downstream_drain) {
+    struct Loop {
+        void clear_upstream_fd(u32) {}
+    } loop;
+    Connection conn;
+    conn.reset();
+    u32 active = 1;
+    conn.backend_active = &active;
+    REQUIRE(detach_upstream_close(&loop, conn));
+    CHECK_EQ(active, 0u);
+    CHECK(conn.backend_active == nullptr);
+    REQUIRE(detach_upstream_close(&loop, conn));
+    CHECK_EQ(active, 0u);
+    active = 1;
+    conn.backend_active = &active;
+    REQUIRE(detach_upstream_close_only(&loop, conn));
+    CHECK_EQ(active, 0u);
 }

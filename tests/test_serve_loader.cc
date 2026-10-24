@@ -546,7 +546,7 @@ TEST(serve_loader, forward_preflight_mode_reaches_owned_routes_and_deferred_publ
     static constexpr char kSource[] = R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/buffered" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         response_policy: { version: .http11, framing: .contentLength,
             connection: .request, server: "s", date: .current, hide_headers: [] },
         failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
@@ -1533,7 +1533,7 @@ TEST(serve_loader, nginx_exact_loopback_fixed_302_output_is_owned_and_reuses_cle
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5797u);
+        REQUIRE_EQ(lowered.value().len, 5878u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
     }
@@ -1738,8 +1738,8 @@ TEST(serve_loader, issue351_exact_5945_byte_redirect_output_is_owned_and_reuses_
     REQUIRE(parsed);
     auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    REQUIRE_EQ(lowered.value().len, 5829u);
-    REQUIRE_EQ(lowered.value().len, 5829u);
+    REQUIRE_EQ(lowered.value().len, 5910u);
+    REQUIRE_EQ(lowered.value().len, 5910u);
     REQUIRE_EQ(lowered.value().data[lowered.value().len], '\0');
     std::string generated(lowered.value().data, lowered.value().len);
     REQUIRE_EQ(generated.rfind("listen 127.0.0.1:65535\n", 0u), 0u);
@@ -1747,7 +1747,7 @@ TEST(serve_loader, issue351_exact_5945_byte_redirect_output_is_owned_and_reuses_
 
     const std::string dir = "/tmp/rut_serve_loader_issue351_exact_301";
     const std::string path = write_file(dir, "app.rut", generated.c_str());
-    REQUIRE_EQ(std::filesystem::file_size(path), 5829u);
+    REQUIRE_EQ(std::filesystem::file_size(path), 5910u);
     std::fill(generated.begin(), generated.end(), 'y');
     memset(lowered.value().data, 'z', lowered.value().len);
     lowered.value().len = 0u;
@@ -1910,7 +1910,7 @@ TEST(serve_loader,
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3300u);
+        REQUIRE_EQ(lowered.value().len, 3327u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
     }
@@ -2125,7 +2125,7 @@ TEST(serve_loader, nginx_exact_loopback_fixed_replacement_output_is_owned_and_re
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3287u);
+        REQUIRE_EQ(lowered.value().len, 3314u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
     }
@@ -2438,7 +2438,7 @@ TEST(serve_loader, issue372_root_empty_query_transform_is_owned_and_reload_clear
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3285u);
+        REQUIRE_EQ(lowered.value().len, 3312u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'x', sizeof(source) - 1u);
     }
@@ -2550,7 +2550,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5260u);
+        REQUIRE_EQ(lowered.value().len, 5341u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'x', sizeof(source) - 1u);
     }
@@ -2686,7 +2686,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 6834u);
+        REQUIRE_EQ(lowered.value().len, 6942u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'z', sizeof(source) - 1u);
     }
@@ -2722,7 +2722,7 @@ TEST(serve_loader, nginx_exact_loopback_api_no_uri_output_is_owned_and_reuses_cl
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3186u);
+        REQUIRE_EQ(lowered.value().len, 3213u);
         generated.assign(lowered.value().data, lowered.value().len);
         CHECK(generated.find("target_transform") == std::string::npos);
         CHECK(generated.find("strip_prefix") == std::string::npos);
@@ -3298,7 +3298,7 @@ TEST(serve_loader, nginx_issue356_p63_no_uri_output_is_owned_and_reuses_cleanly)
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3367u);
+        REQUIRE_EQ(lowered.value().len, 3394u);
         generated.assign(lowered.value().data, lowered.value().len);
         CHECK(generated.find("target_transform") == std::string::npos);
         CHECK(generated.find("strip_prefix") == std::string::npos);
@@ -3824,9 +3824,9 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
         CHECK_FALSE(parsed.value().location.proxy_pass.has_uri);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3359u);
+        REQUIRE_EQ(lowered.value().len, 3386u);
         CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
-        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 9420u);
+        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 9501u);
         generated.assign(lowered.value().data, lowered.value().len);
         REQUIRE_EQ(generated.rfind("listen :65535\n", 0u), 0u);
         CHECK(generated.find("target_transform") == std::string::npos);
@@ -5210,7 +5210,7 @@ route exact "/static" { return local_response({
   date: .current, content_type: "text/plain", connection: .request,
   head_mode: .suppressBody, body: b"successor-static"
 }) }
-route "/" { return forward(backend) }
+route "/" { return forward(backend, load_balance: .roundRobin) }
 unmatched TRACE { return local_response({
   version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
   date: .current, content_type: "text/html", connection: .request,
@@ -5805,7 +5805,7 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
             content_length_after_host ? "content_length_position: .afterHost, " : "";
         const std::string source =
             "upstream backend at \"127.0.0.1:9000\"\n" + route + R"rut( {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
         request_policy: { version: .http11, host: .upstream, connection: .omit,
             )rut" +
             content_length_position +

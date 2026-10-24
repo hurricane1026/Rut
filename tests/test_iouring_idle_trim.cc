@@ -1154,11 +1154,9 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // RelayOwner and BufferedSendVector are part of the hot connection slot.
     // Keep the slot-size assertion explicit so future owner fields cannot grow
     // the layout unnoticed.
-    // tls_recv_overflow_prefix_len and the gRPC proxy state were added after
-    // the original 3824-byte budget assertion; keep checking the current
-    // hot-slot layout explicitly. The owned downstream Host snapshot adds
-    // 144 bytes without changing the access ring entry ABI.
-    CHECK_EQ(sizeof(Connection), 4024u);
+    // Keep checking the current hot-slot layout explicitly. The per-request
+    // attempted-backend mask increases the aligned Connection slot by 16 bytes.
+    CHECK_EQ(sizeof(Connection), 4040u);
 }
 
 TEST(iouring_idle_trim,

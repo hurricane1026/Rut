@@ -49,9 +49,9 @@ def server(directory, origin_port, tls):
         f'accessLog {{ path: "{access_log}", format: downstreamRequestBytes, publication: live }}\n'
         'route GET "/" { return 200 }\n'
         'route GET "/wait" { wait(40)\n return 201 }\n'
-        'route GET "/proxy" { return forward(api) }\n'
-        'route GET "/large" { return forward(api) }\n'
-        'route POST "/proxy" { return forward(api) }\n'
+        'route GET "/proxy" { return forward(api, load_balance: .roundRobin) }\n'
+        'route GET "/large" { return forward(api, load_balance: .roundRobin) }\n'
+        'route POST "/proxy" { return forward(api, load_balance: .roundRobin) }\n'
     )
     args = [str(BINARY), "0", str(source), "--drain", "1"]
     if tls:

@@ -319,6 +319,17 @@ struct Ctx {
         return fn_req_set_path;
     }
 
+    // void rut_helper_req_set_load_balance(ptr conn, i32 id)
+    LLVMValueRef fn_req_set_load_balance = nullptr;
+    LLVMValueRef get_req_set_load_balance() {
+        if (!fn_req_set_load_balance) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 2, 0);
+            fn_req_set_load_balance =
+                LLVMAddFunction(llvm_mod, "rut_helper_req_set_load_balance", ft);
+        }
+        return fn_req_set_load_balance;
+    }
     // void rut_helper_req_set_target_transform(ptr conn, i32 id)
     LLVMValueRef fn_req_set_target_transform = nullptr;
     LLVMValueRef get_req_set_target_transform() {
@@ -1973,6 +1984,16 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::RetForward:
         case rir::Opcode::RetForwardBundle: {
+            // Backend selection is terminal metadata; recording it here preserves
+            // the existing request/response policy ABI and preflight proof shape.
+            LLVMValueRef lb_args[] = {
+                c.param_conn, LLVMConstInt(c.i32_ty, static_cast<u32>(inst.imm.i32_val), 0)};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_set_load_balance()),
+                           c.get_req_set_load_balance(),
+                           lb_args,
+                           2,
+                           "");
             // Pack: action=Forward, upstream_id from operand. For the explicit
             // request-policy slice, operand 1 carries the compact policy id in
             // the otherwise-unused status slot.

@@ -19,7 +19,8 @@ struct RutSource {
     // add at most 4093 - 64 bytes over that prior bound, so this conservative
     // capacity includes that growth and the terminal NUL. Writer completion
     // remains strict (`len < kCapacity`).
-    static constexpr u32 kCapacity = 12779;
+    // At most four forward sites each add the 27-byte mandatory selector.
+    static constexpr u32 kCapacity = 12887;
     char data[kCapacity]{};
     u32 len = 0;
 
@@ -29,12 +30,12 @@ struct RutSource {
 // Owned output for the bounded request-length http profile. The accessLog
 // declaration contributes at most 329 bytes (19-byte prefix, 255-byte path,
 // 55-byte suffix), so the conservative output capacity is
-// RutSource::kCapacity + 329 == 13108 bytes. The earlier 9078-byte
+// RutSource::kCapacity + 329 == 13216 bytes. The earlier 9078-byte
 // terminal-Server payload estimate does not prove this wrapper's capacity;
 // writers still reserve the final NUL.
 struct HttpProfileRutSource {
     static constexpr u32 kMaxAccessLogDeclarationLen = 329u;
-    static constexpr u32 kCapacity = 13108u;
+    static constexpr u32 kCapacity = 13216u;
     char data[kCapacity]{};
     u32 len = 0;
 

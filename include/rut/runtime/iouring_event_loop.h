@@ -2111,6 +2111,7 @@ public:
         c.on_upstream_send = nullptr;
         ::close(c.upstream_fd);
         c.upstream_fd = -1;
+        c.release_backend_active();
         if (c.upstream_slot_held) {
             upstream_release(c.upstream_slot_uid);
             c.upstream_slot_held = false;
@@ -6141,6 +6142,7 @@ public:
         c.upstream_keep_alive = false;
         c.upstream_start_us = 0;
         release_retired_bounded_origin(c, reusable_origin);
+        c.release_backend_active();
         if (c.upstream_slot_held) {
             upstream_release(c.upstream_slot_uid);
             c.upstream_slot_held = false;
@@ -6292,6 +6294,7 @@ public:
         c.upstream_keep_alive = false;
         c.upstream_start_us = 0;
         release_retired_bounded_origin(c, reusable_origin);
+        c.release_backend_active();
         if (c.upstream_slot_held) {
             upstream_release(c.upstream_slot_uid);
             c.upstream_slot_held = false;
@@ -6372,6 +6375,7 @@ public:
             if (!begin_strict_upstream_retirement(c)) return false;
             ::close(c.upstream_fd);
             c.upstream_fd = -1;
+            c.release_backend_active();
             if (c.upstream_slot_held) {
                 upstream_release(c.upstream_slot_uid);
                 c.upstream_slot_held = false;
@@ -7055,6 +7059,7 @@ public:
             // close_conn then disarms the deadline and invalidates the fd. A duplicate
             // expiry therefore cannot complete the request or leave the epoch twice.
             c.clear_slots();
+            c.release_backend_active();
             if (c.upstream_slot_held) {
                 upstream_release(c.upstream_slot_uid);
                 c.upstream_slot_held = false;
@@ -7427,6 +7432,7 @@ public:
         c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all; held flag makes a
         // prior release at completion a no-op).
+        c.release_backend_active();
         if (c.upstream_slot_held) {
             upstream_release(c.upstream_slot_uid);
             c.upstream_slot_held = false;

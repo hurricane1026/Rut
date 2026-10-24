@@ -23,7 +23,7 @@ unmatched { return local_response({
   head_mode: .suppressBody, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
 }) }
 route HEAD "/" {
-    return forward(nginx_upstream, request_policy: {
+    return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .upstream,
             connection: .omit,
@@ -53,7 +53,7 @@ route HEAD "/" {
 }
 route GET "/" {
     if req.hasContentLength {
-        return forward(nginx_upstream, request_policy: {
+        return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .upstream,
             connection: .omit,
@@ -91,7 +91,7 @@ route GET "/" {
         response_buffering: .completeContentLength
     )
     } else {
-        return forward(nginx_upstream, request_policy: {
+        return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .upstream,
             connection: .omit,
@@ -132,7 +132,7 @@ route GET "/" {
     }
 }
 route "/" {
-    return forward(nginx_upstream, request_policy: {
+    return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {
             version: .http11,
             host: .upstream,
             connection: .omit,

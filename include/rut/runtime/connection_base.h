@@ -4,6 +4,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/load_balance.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
@@ -395,11 +396,20 @@ struct ConnectionBase {
 
     // Upstream (only when proxying)
     i32 upstream_fd;
+    ForwardLoadBalance forward_load_balance{};
+    u32* backend_active = nullptr;
+    void release_backend_active() {
+        if (backend_active) {
+            --*backend_active;
+            backend_active = nullptr;
+        }
+    }
     u16 upstream_idx;
-    u8 upstream_attempts;     // connect attempts so far (initial + retries) this request
-    u8 upstream_backend_idx;  // which backend endpoint the current connect targets
-    bool proxy_resp_started;  // true once upstream response bytes were sent to the client
-    bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
+    u8 upstream_attempts;            // connect attempts so far (initial + retries) this request
+    u8 upstream_backend_idx;         // which backend endpoint the current connect targets
+    u8 upstream_attempted_backends;  // endpoints already tried by this request
+    bool proxy_resp_started;         // true once upstream response bytes were sent to the client
+    bool upstream_abandoned;         // gave up on the upstream (timeout); ignore late upstream CQEs
     // io_uring: a request-body CQE overflowed recv_buf and the client was refused with
     // 413 (respond_request_body_overflow); later recv errors must not cut that response.
     bool req_body_overflow_rejected;
@@ -1944,9 +1954,12 @@ struct ConnectionBase {
         timer_node.init();
         idle_node.init();
         upstream_fd = -1;
+        forward_load_balance = {};
+        backend_active = nullptr;
         upstream_idx = 0;
         upstream_attempts = 0;
         upstream_backend_idx = 0;
+        upstream_attempted_backends = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
         req_body_overflow_rejected = false;

@@ -337,7 +337,7 @@ def main():
                 self.args.rut = options.baseline_rut.resolve()
             active_rut = self.args.rut
             if source_text is not None:
-                source_file.write_text(source_text + f'\nroute GET "{options.mixed_small_path}" {{ return forward(backend) }}\n')
+                source_file.write_text(source_text + f'\nroute GET "{options.mixed_small_path}" {{ return forward(backend, load_balance: .roundRobin) }}\n')
             if engine == "nginx":
                 size = options.nginx_buffer_kib
                 header = size if options.nginx_buffering == "off" else 16

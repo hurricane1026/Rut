@@ -179,6 +179,7 @@ void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
 
 // Foundation-only target-transform effect. Records one bounded 1-based ID;
 // malformed or duplicate effects are retained as a fail-closed sentinel.
+void rut_helper_req_set_load_balance(void* conn, rut::u32 encoded);
 void rut_helper_req_set_target_transform(void* conn, rut::u32 transform_id);
 
 // Record a forward(set_header:) override. `name`/`val` must point at stable

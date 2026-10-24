@@ -365,7 +365,7 @@ class Harness:
             if native_streaming:
                 native = (f'listen 127.0.0.1:{a.front_port}\n'
                           f'upstream backend at "127.0.0.1:{a.origin_port}"\n'
-                          'route GET "/proxy" { return forward(backend) }\n')
+                          'route GET "/proxy" { return forward(backend, load_balance: .roundRobin) }\n')
                 (self.out / (work + ".source.rut")).write_text(native)
                 runnable = native
                 if self.tls_context:

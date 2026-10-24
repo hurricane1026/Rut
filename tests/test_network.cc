@@ -17384,6 +17384,96 @@ TEST(upstream_reuse, fallback_retries_idempotent_method) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+TEST(upstream_reuse, explicit_policy_reconnects_single_stale_pooled_endpoint) {
+    for (const LoadBalancePolicy policy :
+         {LoadBalancePolicy::RoundRobin, LoadBalancePolicy::LeastRequests}) {
+        SmallLoop loop;
+        loop.setup();
+        auto* c = loop.alloc_conn();
+        REQUIRE(c != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*c));
+        RouteConfig cfg{};
+        auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+        REQUIRE(uid.has_value());
+        c->request_config = &cfg;
+        c->upstream_idx = static_cast<u16>(uid.value());
+        c->upstream_backend_idx = 0;
+        c->upstream_attempted_backends = 1u;
+        c->forward_load_balance = {1, policy};
+        c->upstream_attempts = 1;
+        c->req_method = static_cast<u8>(LogHttpMethod::Get);
+        c->req_body_mode = BodyMode::None;
+        c->upstream_reused = true;
+        static constexpr char kGet[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        c->recv_buf.write(reinterpret_cast<const u8*>(kGet), sizeof(kGet) - 1);
+        c->req_initial_send_len = sizeof(kGet) - 1;
+        c->upstream_fd = dup(2);
+        REQUIRE(c->upstream_fd >= 0);
+        hold_backend_active(*c, &cfg);
+        loop.backend.clear_ops();
+
+        CHECK(rut::retry_reused_upstream(&loop, *c));
+
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+        CHECK_EQ(c->upstream_backend_idx, 0u);
+        CHECK_EQ(c->upstream_attempted_backends, 1u);
+        CHECK_EQ(cfg.backend_selection[0].active[uid.value()][0], 1u);
+        CHECK(!c->upstream_reused);
+        close(c->upstream_fd);
+        c->upstream_fd = -1;
+        c->release_backend_active();
+        loop.free_conn(*c);
+    }
+}
+
+TEST(upstream_reuse, explicit_policy_stale_reconnect_then_connect_failure_fails_over) {
+    for (const LoadBalancePolicy policy :
+         {LoadBalancePolicy::RoundRobin, LoadBalancePolicy::LeastRequests}) {
+        SmallLoop loop;
+        loop.setup();
+        auto* c = loop.alloc_conn();
+        REQUIRE(c != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*c));
+        RouteConfig cfg{};
+        auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+        REQUIRE(uid.has_value());
+        REQUIRE(cfg.add_upstream_backend(static_cast<u16>(uid.value()), 0x7F000001, 8081));
+        c->request_config = &cfg;
+        c->upstream_idx = static_cast<u16>(uid.value());
+        c->upstream_backend_idx = 0;
+        c->upstream_attempted_backends = 1u;
+        c->forward_load_balance = {1, policy};
+        c->upstream_attempts = 1;
+        c->req_method = static_cast<u8>(LogHttpMethod::Get);
+        c->req_body_mode = BodyMode::None;
+        c->upstream_reused = true;
+        static constexpr char kGet[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        c->recv_buf.write(reinterpret_cast<const u8*>(kGet), sizeof(kGet) - 1);
+        c->req_initial_send_len = sizeof(kGet) - 1;
+        c->upstream_fd = dup(2);
+        REQUIRE(c->upstream_fd >= 0);
+        hold_backend_active(*c, &cfg);
+        loop.backend.clear_ops();
+
+        REQUIRE(rut::retry_reused_upstream(&loop, *c));
+        CHECK_EQ(c->upstream_backend_idx, 0u);
+        CHECK_EQ(cfg.backend_selection[0].active[uid.value()][0], 1u);
+        CHECK_EQ(c->upstream_attempted_backends, 1u);
+
+        REQUIRE(try_connect_next_backend<SmallLoop>(&loop, *c));
+        CHECK_EQ(c->upstream_backend_idx, 1u);
+        CHECK_EQ(c->upstream_attempted_backends, 3u);
+        CHECK_EQ(cfg.backend_selection[0].active[uid.value()][0], 0u);
+        CHECK_EQ(cfg.backend_selection[0].active[uid.value()][1], 1u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 2u);
+
+        close(c->upstream_fd);
+        c->upstream_fd = -1;
+        c->release_backend_active();
+        loop.free_conn(*c);
+    }
+}
+
 // A reused idempotent request whose body already began streaming upstream must NOT
 // retry: recv_buf was reset + refilled with body chunks, so the original request is
 // gone and a replay would send a truncated/garbage request. (Finding 1 regression —
@@ -22260,7 +22350,8 @@ TEST(request_admission, absolute_target_unmatched_and_exact_inventory_precedence
     SmallLoop loop;
     loop.setup();
     const char* request = "GET http://example.test/ HTTP/1.1\r\nHost: x\r\n\r\n";
-    RouteConfig fallback{};
+    auto fallback_owner = std::make_unique<RouteConfig>();
+    auto& fallback = *fallback_owner;
     auto* unmatched = dispatch_unmatched_request(loop, fallback, request);
     REQUIRE(unmatched != nullptr);
     CHECK_EQ(unmatched->resp_status, 400u);
@@ -22270,7 +22361,8 @@ TEST(request_admission, absolute_target_unmatched_and_exact_inventory_precedence
     u16 unmatched_ids[kStrictLocalResponseMethodSlots]{};
     ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
     exact[0] = make_exact_local_binding("/", kRouteMethodAny, 1);
-    RouteConfig strict{};
+    auto strict_owner = std::make_unique<RouteConfig>();
+    auto& strict = *strict_owner;
     REQUIRE(strict.install_strict_local_response_table(&policy, 1, unmatched_ids, exact, 1));
     loop.backend.clear_ops();
     auto* closed = dispatch_unmatched_request(loop, strict, request);
@@ -22280,7 +22372,8 @@ TEST(request_admission, absolute_target_unmatched_and_exact_inventory_precedence
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
 
     StrictLocalResponsePolicySpec pre_route = make_representation200_policy();
-    RouteConfig pre_route_config{};
+    auto pre_route_config_owner = std::make_unique<RouteConfig>();
+    auto& pre_route_config = *pre_route_config_owner;
     REQUIRE_EQ(pre_route_config.add_strict_local_response_policy(pre_route), 1u);
     REQUIRE(pre_route_config.set_pre_route_policy_id(kRouteMethodGet, 1));
     loop.backend.clear_ops();
@@ -22291,7 +22384,8 @@ TEST(request_admission, absolute_target_unmatched_and_exact_inventory_precedence
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     loop.close_conn(*pre_route_rejected);
 
-    RouteConfig connect_pre_route{};
+    auto connect_pre_route_owner = std::make_unique<RouteConfig>();
+    auto& connect_pre_route = *connect_pre_route_owner;
     REQUIRE_EQ(connect_pre_route.add_strict_local_response_policy(pre_route), 1u);
     REQUIRE(connect_pre_route.set_pre_route_policy_id(kRouteMethodConnect, 1));
     const char* connect_origin = "CONNECT / HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -35370,7 +35464,8 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
     }
     {
         auto loop = make_loop();
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         REQUIRE(config.add_static("/local", kRouteMethodGet, 204));
         Connection* conn = dispatch(*loop,
                                     &config,
@@ -35385,7 +35480,8 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
     }
     {
         auto loop = make_loop();
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         REQUIRE(config.add_static("/local", kRouteMethodHead, 200));
         Connection* conn = dispatch(*loop, &config, "HEAD /local HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(conn != nullptr);
@@ -35396,7 +35492,8 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
     }
     {
         auto loop = make_loop();
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         REQUIRE(config.add_jit_handler(
             "/local", kRouteMethodGet, &response_read_timeout_later_handler, false));
         Connection* conn = dispatch(*loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -35410,7 +35507,8 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
     }
     {
         auto loop = make_loop();
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         REQUIRE(config.add_jit_handler(
             "/local", kRouteMethodGet, &response_read_timeout_later_handler, false));
         Connection* conn = dispatch(*loop,
@@ -35472,7 +35570,8 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
     }
     {
         auto loop = make_loop();
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         REQUIRE(config.add_static("/local", kRouteMethodGet, 204));
         loop->draining = true;
         Connection* conn = dispatch(*loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -60143,7 +60242,8 @@ TEST(response_read_deadline_fixed_upload_head_policy_id2,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(
             loop, config, kRouteMethodHead, &fixture, static_cast<u16>(kPolicy)));
@@ -60202,7 +60302,8 @@ TEST(response_read_deadline_fixed_upload_head_policy_id2,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(
             loop, config, kRouteMethodAny, &fixture, static_cast<u16>(kPolicy)));
@@ -60219,7 +60320,8 @@ TEST(response_read_deadline_fixed_upload_head_policy_id2,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(
             loop, config, kRouteMethodHead, &fixture, static_cast<u16>(kPolicy)));
@@ -60234,7 +60336,8 @@ TEST(response_read_deadline_fixed_upload_head_policy_id2,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(
             loop, config, kRouteMethodAny, &fixture, static_cast<u16>(kPolicy)));
@@ -60422,7 +60525,15 @@ TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
 
     loop->timer.remove(&conn);
     conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+    // Precise io_uring retirement bypasses the ordinary release helper. The
+    // selection gauge must still retire before a keep-alive successor arrives,
+    // even when max_inflight is disabled.
+    conn.release_backend_active();
+    u32 active = 1;
+    conn.backend_active = &active;
     REQUIRE(try_prebuilt_strict_read_timeout(loop, conn));
+    CHECK_EQ(active, 0u);
+    CHECK(conn.backend_active == nullptr);
     CHECK_EQ(conn.resp_status, 504u);
     CHECK_EQ(conn.http1_prebuilt_body_len, 7u);
     CHECK_EQ(backend_health(0, 0)->fails, 0u);
@@ -62057,7 +62168,8 @@ TEST(response_read_deadline_fixed_upload,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
             config, 5, ForwardResponseBufferingMode::CompleteContentLength));
@@ -62121,7 +62233,8 @@ TEST(response_read_deadline_fixed_upload,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
             config, 5, ForwardResponseBufferingMode::CompleteContentLength));
@@ -62155,7 +62268,8 @@ TEST(response_read_deadline_fixed_upload,
             ScopedIoUringLoopForRetirement guard;
             if (!guard.init()) SKIP("io_uring unavailable");
             auto* loop = guard.loop;
-            RouteConfig config{};
+            auto config_owner = std::make_unique<RouteConfig>();
+            auto& config = *config_owner;
             REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
             REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
                 config, 5, ForwardResponseBufferingMode::CompleteContentLength));
@@ -62217,7 +62331,8 @@ TEST(response_read_deadline_fixed_upload,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
             config, 5, ForwardResponseBufferingMode::None));
@@ -76148,7 +76263,8 @@ TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         const RouteConfig* active = &config;
         loop->config_ptr = &active;
         ShardEpoch epoch{};
@@ -76190,7 +76306,8 @@ TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         const RouteConfig* active = &config;
         loop->config_ptr = &active;
         ShardEpoch epoch{};
@@ -76230,7 +76347,8 @@ TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         const RouteConfig* active = &config;
         loop->config_ptr = &active;
         ShardEpoch epoch{};
@@ -76277,7 +76395,8 @@ TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         const RouteConfig* active = &config;
         loop->config_ptr = &active;
         ShardEpoch epoch{};
@@ -80931,6 +81050,41 @@ TEST(state_invariant, backend_retry_connect_submit_failure_closes_retry_fd) {
 
     close(old_fds[0]);
     close(retry_fds[1]);
+}
+
+TEST(state_invariant, backend_retry_least_requests_skips_failed_endpoint) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    REQUIRE(cfg.add_upstream_backend(static_cast<u16>(upstream.value()), 0x7F000001, 9001));
+    SmallLoop loop;
+    loop.setup();
+
+    i32 old_fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, old_fds) == 0);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(upstream.value());
+    c->upstream_fd = old_fds[1];
+    c->upstream_attempts = 1;
+    c->upstream_backend_idx = 0;
+    c->forward_load_balance = {1, LoadBalancePolicy::LeastRequests};
+    cfg.backend_selection[0].active[upstream.value()][1] = 1;
+    hold_backend_active(*c, &cfg);
+    CHECK_EQ(cfg.backend_selection[0].active[upstream.value()][0], 1u);
+    CHECK_EQ(cfg.backend_selection[0].active[upstream.value()][1], 1u);
+
+    REQUIRE(try_connect_next_backend<SmallLoop>(&loop, *c));
+
+    CHECK_EQ(c->upstream_backend_idx, 1u);
+    CHECK_EQ(c->upstream_attempted_backends, 3u);
+    CHECK_EQ(cfg.backend_selection[0].active[upstream.value()][0], 0u);
+    CHECK_EQ(cfg.backend_selection[0].active[upstream.value()][1], 2u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    loop.free_conn(*c);
+    close(old_fds[0]);
 }
 
 // State 1: Accept → ReadingHeader {on_recv=header, rest=null}
@@ -86031,7 +86185,8 @@ TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachabl
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -86076,7 +86231,8 @@ TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachabl
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -86106,7 +86262,8 @@ TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachabl
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -86158,7 +86315,8 @@ TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachabl
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -86332,7 +86490,8 @@ TEST(response_read_deadline_fixed_upload_head_batch,
                     ScopedIoUringLoopForRetirement guard;
                     if (!guard.init()) SKIP("io_uring unavailable");
                     auto* loop = guard.loop;
-                    RouteConfig config{};
+                    auto config_owner = std::make_unique<RouteConfig>();
+                    auto& config = *config_owner;
                     PrebuiltD2Fixture fixture{};
                     REQUIRE(stage_unreachable_fixed_upload_head_wait(
                         loop, config, route_method, &fixture));
@@ -86481,7 +86640,8 @@ TEST(response_read_deadline_fixed_upload_head_batch,
             ScopedIoUringLoopForRetirement guard;
             if (!guard.init()) SKIP("io_uring unavailable");
             auto* loop = guard.loop;
-            RouteConfig config{};
+            auto config_owner = std::make_unique<RouteConfig>();
+            auto& config = *config_owner;
             PrebuiltD2Fixture fixture{};
             REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, route_method, &fixture));
             REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -86553,7 +86713,8 @@ TEST(response_read_deadline_fixed_upload_head_batch,
                 ScopedIoUringLoopForRetirement guard;
                 if (!guard.init()) SKIP("io_uring unavailable");
                 auto* loop = guard.loop;
-                RouteConfig config{};
+                auto config_owner = std::make_unique<RouteConfig>();
+                auto& config = *config_owner;
                 PrebuiltD2Fixture fixture{};
                 REQUIRE(
                     stage_unreachable_fixed_upload_head_wait(loop, config, route_method, &fixture));
@@ -86601,7 +86762,8 @@ TEST(response_read_deadline_fixed_upload_head_batch,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        auto config_owner = std::make_unique<RouteConfig>();
+        auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, route_method, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));

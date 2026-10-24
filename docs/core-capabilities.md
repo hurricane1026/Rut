@@ -13,7 +13,7 @@ route automaton:
 - `let` and handler-local `var`,
 - `guard`, `if`, and `match`,
 - terminal `return`,
-- terminal `return forward(upstream)`,
+- terminal `return forward(upstream, load_balance: .roundRobin)`,
 - explicit `wait(...)` and `wait any { ... }`,
 - route `chain` before handler steps,
 - bounded per-shard state.
@@ -26,7 +26,7 @@ visible at the source boundary.
 Canonical core forms:
 
 ```rut
-return forward(api)
+return forward(api, load_balance: .roundRobin)
 
 let ev = wait(downstream.recv())
 

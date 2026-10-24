@@ -132,7 +132,7 @@ exceptions, no try/catch. `!` is logical not only.
 ## return vs respond — the one asymmetry to remember
 
 - **Handler** (route entry body): its value IS the response → `return 200`,
-  `return 200, body`, `return resp`, `return forward(x)`.
+  `return 200, body`, `return resp`, `return forward(x, load_balance: .roundRobin)`.
 - **Middleware/helper func**: `return` only produces the function's normal
   value (or passes through); to end the whole request immediately use
   **`respond`**: `respond 401` / `respond 401, "expired"` / `respond 401, b"\x00"` /
@@ -377,7 +377,7 @@ notify(ip) blacklist.add(ip)      // to owner shard by key hash (expr form;
 route GET "/health" { return 200 }
 route "/" { return 404 }                          // all methods (omit METHOD)
 route GET "/users/:id" {                         // capture: req.params.id
-    return forward(userService)
+    return forward(userService, load_balance: .roundRobin)
 }
 
 @rateLimit(limit: 1000, window: 1m)               // official decorator applies
@@ -404,11 +404,46 @@ func add_trace(_ req: i32, _ resp: Response) -> i32 {
     0
 }
 chain observability { after add_trace(req, resp) }
-route GET "/users" use chain observability { return forward(users) }
+route GET "/users" use chain observability { return forward(users, load_balance: .roundRobin) }
 ```
 
 `before` helpers may gate a route; `after` currently supports Response header
 effects only. Full buffered body/status middleware remains ⏳.
+
+## Explicit load balancing at each forward call
+
+Every `forward` requires an explicit `load_balance` named argument. The only
+accepted values are `.roundRobin` and `.leastRequests`. Legacy `forward(api)`
+is a compile error, including for single-backend upstreams.
+
+```swift
+upstream api {
+    backends: ["127.0.0.1:9001", "127.0.0.1:9002"]
+}
+
+route GET "/catalog" {
+    return forward(api, load_balance: .roundRobin)
+}
+route POST "/jobs" {
+    return forward(api, load_balance: .leastRequests)
+}
+```
+
+Every forward site must explicitly name one policy, including single-backend
+and host-bound upstreams. `upstream` contains backend/connection configuration;
+it does not contain or supply a selection policy. The `at "ip:port"` upstream
+form can remain: its callers must supply the argument. There is no default,
+inheritance, string spelling, numeric spelling, or policy alias.
+
+Round-robin cursors are per forward site and shard. Least-request counts are
+shared across routes using the same upstream backend set on that shard and
+count active requests/RPCs, not pooled connections. The policy is part of the
+forward operation, including suspended JIT handlers and native gRPC streams.
+Least-request ties rotate at the forward site. Connecting attempts count as
+active; completion, failure, cancellation, and reset release the count once.
+Retries release the failed attempt before selecting again. Both algorithms
+skip ejected backends when healthy ones exist and retain the existing fail-open
+behavior when all are ejected. Empty backend sets remain invalid. See [DESIGN.md §3.4.1](../DESIGN.md#341-listening-tls-and-upstream).
 
 ## Native gRPC forwarding
 
@@ -423,7 +458,7 @@ upstream greeter {
     port: 50051
     protocol: .http2
 }
-route POST "/helloworld.Greeter/SayHello" { return forward(greeter) }
+route POST "/helloworld.Greeter/SayHello" { return forward(greeter, load_balance: .roundRobin) }
 ```
 
 When the host application pre-binds an upstream endpoint, the declaration may
@@ -540,8 +575,8 @@ do not enable a protocol or policy combination absent from this card.
 
 ```swift
 // Proxy — the transparent forms plus the explicit header-only policy form
-return forward(users)                          // zero-copy, terminal
-return forward(users, request_policy: {
+return forward(users, load_balance: .roundRobin)                          // zero-copy, terminal
+return forward(users, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .upstream, connection: .omit,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
 })                                               // ID1: fixed header-only rebuild
@@ -552,7 +587,7 @@ return forward(users, request_policy: {
 // ID3 adds retained_header_value: .trimSpPreserveHtab (retained values
 // keep leading/trailing HTAB while SP is trimmed; bounded to bodyless GET).
 // The two are mutually exclusive and both require host: .upstream.
-return forward(users, request_policy: {
+return forward(users, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .upstream, connection: .omit,
     content_length_position: .afterHost,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
@@ -611,10 +646,10 @@ return forward(users, request_policy: {
 // `x-forwarded-client-cert`, and `x-envoy-external-address`;
 // docs/envoy-compatibility.md). ID4 is ordinary-forward-only: pairing it with
 // a response read timeout, response buffering, or a target_transform
-// (forward(upstream, set_path: "...")) request-target rewrite fails at
+// (forward(upstream, load_balance: .roundRobin, set_path: "...")) request-target rewrite fails at
 // compile time with a dedicated diagnostic -- none of the three has a
 // proven interaction with this profile.
-return forward(users, request_policy: {
+return forward(users, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .preserve, connection: .omit,
     header_names: .lowercase, forwarded_proto: .http,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
@@ -645,12 +680,12 @@ return forward(users, request_policy: {
 // Live receive/cancel owners, surplus bytes, EOF, truncation and timeout
 // prevent pooling. Fixed uploads and pipelined successors still connect fresh.
 
-return forward(users, response_policy: {
+return forward(users, load_balance: .roundRobin, response_policy: {
     version: .http11, framing: .contentLength, connection: .request,
     server: "nginx/1.29.7", date: .current, hide_headers: ["Date", "Server", "X-Pad"]
 })
 // Public HEAD suppression is an explicit paired source contract:
-return forward(users,
+return forward(users, load_balance: .roundRobin,
     response_policy: {
         version: .http11, framing: .contentLength, connection: .request,
         head_mode: .suppressBody, server: "nginx/1.29.7", date: .current,
@@ -718,7 +753,7 @@ return forward(users,
 // are rejected with it (ordinary-forward-only, like request_policy
 // host: .preserve). The fixed-order layout above (`header_order` omitted)
 // is unchanged.
-return forward(users, request_policy: {
+return forward(users, load_balance: .roundRobin, request_policy: {
     version: .http11, host: .preserve, connection: .omit,
     header_names: .lowercase, forwarded_proto: .http,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
@@ -758,7 +793,7 @@ unmatched { return local_response({
 // it: status 503 is admitted paired with it and a non-empty body (Envoy's
 // connect-failure representation); 502 stays exactly the fixed-order-only
 // contract above. timeout_failure_policy stays fixed-order-only (400..599).
-return forward(users, failure_policy: {
+return forward(users, load_balance: .roundRobin, failure_policy: {
     version: .http11, status: 503, reason: "Service Unavailable",
     content_type: "text/plain", server: "envoy", date: .current,
     connection: .request, connection_header: .closeOnly,
@@ -777,8 +812,8 @@ return redirect({
     status: 301, reason: "Moved Permanently", server: "nginx/1.29.7",
     content_type: "text/html", target_path: "/api/", body: b"<p>moved</p>"
 })
-let resp = forward(users, buffered: true)      // buffered Response, then return resp
-return forward(users, streaming: true)         // ⏳ explicit flag; current transparent forward(users) streams
+let resp = forward(users, load_balance: .roundRobin, buffered: true)      // buffered Response, then return resp
+return forward(users, load_balance: .roundRobin, streaming: true)         // ⏳ explicit flag; current transparent forward(users, load_balance: .roundRobin) streams
 
 // Static files / pipes
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
@@ -976,11 +1011,11 @@ let users = upstream { "10.0.0.1:8080" }          // ⏳ current: upstream users
 route GET "/health" { return 200 }
 
 @rateLimit(limit: 1000, window: 1m)
-route GET "/users/:id" { return forward(users) }
+route GET "/users/:id" { return forward(users, load_balance: .roundRobin) }
 
 route POST "/users" {
     guard let user = req.body(User) else { return 400 }
-    return forward(users)
+    return forward(users, load_balance: .roundRobin)
 }
 
 struct User {

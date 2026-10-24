@@ -13369,7 +13369,7 @@ static bool run_converter_exact_return204_source_validation_self_checks(std::str
     static constexpr char kCanonical[] =
         "listen :54321\n"
         "route exact slash_normalized GET \"/static\" { return local_response({ status: 204 }) }\n"
-        "route GET \"/\" { return forward(nginx_upstream) }\n";
+        "route GET \"/\" { return forward(nginx_upstream, load_balance: .roundRobin) }\n";
     const std::string query_route =
         std::string(kCanonical) + "route exact GET \"/static?x=1\" { return response() }\n";
     const std::string host_predicate =
@@ -14249,7 +14249,7 @@ static bool capture_generated_exact_local_return204_order(
         count_literal("route exact GET \"/static\"") != 0u || count_literal("route exact ") != 1u ||
         count_literal("route HEAD \"/\" {") != 1u || count_literal("route GET \"/\" {") != 1u ||
         count_literal("route \"/\" {") != 1u ||
-        count_literal("return forward(nginx_upstream") != 3u ||
+        count_literal("return forward(nginx_upstream, load_balance: .roundRobin") != 3u ||
         count_literal("upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) +
                       "\"") != 1u ||
         count_literal("listen :" + std::to_string(frontend_port) + "\n") != 1u ||
@@ -14821,7 +14821,7 @@ static bool validate_bounded_no_content_generated_source(const std::string& sour
         count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "route \"/\" {") != 1u ||
-        count_text(source, "return forward(nginx_upstream") != 3u ||
+        count_text(source, "return forward(nginx_upstream, load_balance: .roundRobin") != 3u ||
         count_text(source, backend) != 1u || count_text(source, listener) != 1u ||
         source.find("?x=1") != std::string::npos ||
         source.find("healthz-return204.example") != std::string::npos ||
@@ -18160,7 +18160,7 @@ static bool validate_trailing_slash_no_content_generated_source(const std::strin
         count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "route \"/\" {") != 1u ||
-        count_text(source, "return forward(nginx_upstream") != 3u ||
+        count_text(source, "return forward(nginx_upstream, load_balance: .roundRobin") != 3u ||
         count_text(source, backend) != 1u || count_text(source, listener) != 1u ||
         source.find("?x=1") != std::string::npos || source.find("Host") != std::string::npos ||
         source.find("runtime") != std::string::npos ||
@@ -19083,7 +19083,7 @@ static bool validate_max_boundary_generated_source(const std::string& source,
         count_text(source, other_key) != 0u || count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "route \"/\" {") != 1u ||
-        count_text(source, "return forward(nginx_upstream") != 3u ||
+        count_text(source, "return forward(nginx_upstream, load_balance: .roundRobin") != 3u ||
         count_text(source, backend) != 1u || count_text(source, listener) != 1u ||
         source.find("?x=1") != std::string::npos || source.find("Host") != std::string::npos ||
         source.find("max-boundary.example") != std::string::npos ||
@@ -20477,7 +20477,7 @@ static std::string canonical_generated_bodyful_exact_route(const char* path, con
 
 static constexpr char kCanonicalGeneratedNginxRootGetForward[] =
     "route GET \"/\" {\n"
-    "    return forward(nginx_upstream, request_policy: {\n"
+    "    return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
     "            version: .http11,\n"
     "            host: .upstream,\n"
     "            connection: .omit,\n"
@@ -20543,7 +20543,8 @@ static bool validate_converter_coalesced_source(const std::string& source) {
            source.find("/static?") == std::string::npos &&
            source.find("coalesced-ingress.example") == std::string::npos &&
            source.find("route \"/\"") != std::string::npos &&
-           source.find("return forward(nginx_upstream") != std::string::npos &&
+           source.find("return forward(nginx_upstream, load_balance: .roundRobin") !=
+               std::string::npos &&
            source.find("proxy_pass") == std::string::npos &&
            source.find("nginx.conf") == std::string::npos &&
            source.find("nginx::") == std::string::npos &&
@@ -20555,7 +20556,8 @@ static bool validate_converter_coalesced_source(const std::string& source) {
 static bool run_converter_coalesced_source_self_checks(std::string& error) {
     const std::string exact_route =
         canonical_generated_bodyful_exact_route("/static", "successor-static");
-    const std::string canonical = exact_route + "route \"/\" { return forward(nginx_upstream) }\n";
+    const std::string canonical =
+        exact_route + "route \"/\" { return forward(nginx_upstream, load_balance: .roundRobin) }\n";
     if (!validate_converter_coalesced_source(canonical)) {
         error = "coalesced-source validator rejected its canonical normalized ANY baseline";
         return false;
@@ -20612,7 +20614,8 @@ static bool validate_bodyful_normalized_generated_source(const std::string& sour
         count_source_literal(source, "route HEAD \"/\" {") != 1u ||
         count_source_literal(source, "route GET \"/\" {") != 1u ||
         count_source_literal(source, "route \"/\" {") != 1u ||
-        count_source_literal(source, "return forward(nginx_upstream") != 3u ||
+        count_source_literal(source, "return forward(nginx_upstream, load_balance: .roundRobin") !=
+            3u ||
         count_source_literal(source, listener) != 1u ||
         count_source_literal(source, backend) != 1u ||
         source.find("route exact \"/a/b\"") != std::string::npos ||
@@ -21715,7 +21718,7 @@ static bool capture_generated_exact_local_body_space_order(
     if (count_literal("body: b\"hello world\"") != 1 || count_literal(exact_route) != 1 ||
         count_literal("/static") != 1 || count_literal("route exact ") != 1 ||
         count_literal("route \"/\" {") != 1 ||
-        count_literal("return forward(nginx_upstream") != 3 ||
+        count_literal("return forward(nginx_upstream, load_balance: .roundRobin") != 3 ||
         generated_source.find("route exact \"/static\"") != std::string::npos ||
         generated_source.find("route exact \"/static/") != std::string::npos ||
         generated_source.find("route \"/static") != std::string::npos ||
@@ -22122,7 +22125,7 @@ static bool capture_generated_exact_local_body_multiple_space_order(
     if (count_literal(expected_literal) != 1 || count_literal(exact_route) != 1 ||
         count_literal("/static") != 1 || count_literal("route exact ") != 1 ||
         count_literal("route \"/\" {") != 1 ||
-        count_literal("return forward(nginx_upstream") != 3 ||
+        count_literal("return forward(nginx_upstream, load_balance: .roundRobin") != 3 ||
         generated_source.find("body: b\"" + std::string(other_body) + "\"") != std::string::npos ||
         generated_source.find("route exact \"/static\"") != std::string::npos ||
         generated_source.find("route exact \"/static/") != std::string::npos ||
@@ -22566,7 +22569,7 @@ static bool capture_generated_bounded_exact_local_path_order(
         canonical_generated_bodyful_exact_route("/healthz", "successor-static");
     if (count_literal(exact_route) != 1 || count_literal("route exact ") != 1 ||
         count_literal("/healthz") != 1 || count_literal("route \"/\" {") != 1 ||
-        count_literal("return forward(nginx_upstream") != 3 ||
+        count_literal("return forward(nginx_upstream, load_balance: .roundRobin") != 3 ||
         generated_source.find("successor-static") == std::string::npos ||
         generated_source.find("route exact \"/healthz\"") != std::string::npos ||
         generated_source.find("/healthz?") != std::string::npos ||
@@ -23315,7 +23318,8 @@ static bool run_converter_api_non_root_proxy_uri_differential(
         "            strip_prefix: \"/api/\",\n"
         "            replace_prefix: \"/v1/\"";
     if (count_literal("route \"/api\" {") != 1 || count_literal(kTransform) != 1 ||
-        count_literal("return forward(nginx_upstream, target_transform: {") != 1 ||
+        count_literal(
+            "return forward(nginx_upstream, load_balance: .roundRobin, target_transform: {") != 1 ||
         count_literal("target_path: \"/api/\"") != 1 ||
         rut_source.find("proxy_pass") != std::string::npos ||
         rut_source.find("nginx.conf") != std::string::npos) {
@@ -23420,7 +23424,8 @@ static bool run_converter_service_root_proxy_uri_differential(
         "            strip_prefix: \"/service/\",\n"
         "            replace_prefix: \"/\"";
     if (count_literal("route \"/service\" {") != 1 || count_literal(kTransform) != 1 ||
-        count_literal("return forward(nginx_upstream, target_transform: {") != 1 ||
+        count_literal(
+            "return forward(nginx_upstream, load_balance: .roundRobin, target_transform: {") != 1 ||
         count_literal("target_path: \"/service/\"") != 1 ||
         rut_source.find("proxy_pass") != std::string::npos ||
         rut_source.find("nginx.conf") != std::string::npos) {
@@ -23536,7 +23541,9 @@ static bool validate_wildcard_service_no_uri_generated_source(const std::string&
         count_text(source, "path: .static, query: .preserveRaw") != 1u ||
         count_text(source, "status: 301, reason: \"Moved Permanently\"") != 1u ||
         count_text(source, "target_path: \"/service/\"") != 1u ||
-        count_text(source, "return forward(nginx_upstream, request_policy: {") != 1u ||
+        count_text(source,
+                   "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {") !=
+            1u ||
         count_text(source, "request_policy: {") != 1u ||
         count_text(source, "host: .upstream") != 1u ||
         count_text(source, "connection: .omit") != 1u ||
@@ -24083,7 +24090,7 @@ static bool validate_wildcard_service_no_uri_four_way(
             error = "#357 generated source did not contain unique dynamic endpoints";
             return false;
         }
-        if (canonical.size() != 3189u || canonical != canonical_source) {
+        if (canonical.size() != 3216u || canonical != canonical_source) {
             error = "#357 generated declaration orders did not canonicalize to the genuine " +
                     std::to_string(canonical_source.size()) + "-byte source (candidate " +
                     std::to_string(canonical.size()) + ")";
@@ -24203,7 +24210,7 @@ static bool run_wildcard_service_no_uri_four_way_self_checks(std::string& error)
     };
     std::string canonical;
     std::string sources[2];
-    if (!lower(8080u, 9000u, true, canonical) || canonical.size() != 3189u ||
+    if (!lower(8080u, 9000u, true, canonical) || canonical.size() != 3216u ||
         !lower(kPorts[4], kPorts[5], true, sources[0]) ||
         !lower(kPorts[6], kPorts[7], false, sources[1])) {
         error = "#357 self-check could not construct genuine canonical generated sources";
@@ -24521,11 +24528,13 @@ static bool run_wildcard_service_no_uri_four_way_self_checks(std::string& error)
                         "401,",
                         "unmatched-any")},
         {"transform",
-         replace_unique(sources[0],
-                        "return forward(nginx_upstream, request_policy: {",
-                        "return forward(nginx_upstream, target_transform: { strip_prefix: "
-                        "\"/service/\", replace_prefix: \"/\" }, request_policy: {",
-                        "transform")}};
+         replace_unique(
+             sources[0],
+             "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {",
+             "return forward(nginx_upstream, load_balance: .roundRobin, target_transform: { "
+             "strip_prefix: "
+             "\"/service/\", replace_prefix: \"/\" }, request_policy: {",
+             "transform")}};
     for (const auto& mutation : source_mutations) {
         if (mutation.second.empty() || mutation.second == sources[0]) return false;
         const auto lexed =
@@ -24791,8 +24800,8 @@ static bool run_converter_wildcard_service_no_uri_differential(
         rut::nginx::parse({canonical_fragment.data(), static_cast<u32>(canonical_fragment.size())});
     if (!parsed) return false;
     const auto lowered = rut::nginx::lower_to_rut(parsed.value());
-    if (!lowered || lowered.value().len != 3189u) {
-        error = "#357 genuine representative source did not have canonical size 3247";
+    if (!lowered || lowered.value().len != 3216u) {
+        error = "#357 genuine representative source did not have canonical size 3216";
         return false;
     }
     const std::string canonical_source(lowered.value().data, lowered.value().len);
@@ -24836,13 +24845,13 @@ static constexpr MaxProxyPrefixProfile kMaxProxyPrefixRootProfile = {
     "/",
     true,
     MaxProxyForwardTargets::RootReplacement,
-    3516u,
-    3524u,
+    3543u,
+    3551u,
     false};
 static constexpr MaxProxyPrefixProfile kMaxProxyPrefixNoUriProfile = {
-    "#356", "exact-p63-no-uri", "", false, MaxProxyForwardTargets::Original, 3360u, 3368u, false};
+    "#356", "exact-p63-no-uri", "", false, MaxProxyForwardTargets::Original, 3387u, 3395u, false};
 static constexpr MaxProxyPrefixProfile kWildcardMaxProxyPrefixNoUriProfile = {
-    "#357", "wildcard-p63-no-uri", "", false, MaxProxyForwardTargets::Original, 3351u, 3359u, true};
+    "#357", "wildcard-p63-no-uri", "", false, MaxProxyForwardTargets::Original, 3378u, 3386u, true};
 
 static std::string max_proxy_forward_target(size_t index, const MaxProxyPrefixProfile& profile) {
     static constexpr const char* kRootTargets[] = {"/", "/x", "/x?y=1"};
@@ -24894,8 +24903,8 @@ static std::string make_exact_max_proxy_prefix_fragment(
     return fragment;
 }
 
-static constexpr size_t kExactLoopbackMaxProxyPrefixSourceSize = 3518u;
-static constexpr size_t kMaximumExactMaxProxyPrefixSourceSize = 3524u;
+static constexpr size_t kExactLoopbackMaxProxyPrefixSourceSize = 3545u;
+static constexpr size_t kMaximumExactMaxProxyPrefixSourceSize = 3551u;
 static_assert(kExactLoopbackMaxProxyPrefixSourceSize +
                       (sizeof("255.255.255.255") - sizeof("127.0.0.1")) ==
                   kMaximumExactMaxProxyPrefixSourceSize,
@@ -24964,11 +24973,15 @@ static bool validate_max_proxy_prefix_generated_source(
         profile.uses_target_transform
             ? count_text(source, transform) == 1u && count_text(source, "strip_prefix:") == 1u &&
                   count_text(source, "replace_prefix:") == 1u &&
-                  count_text(source, "return forward(nginx_upstream, target_transform: {") == 1u
+                  count_text(source,
+                             "return forward(nginx_upstream, load_balance: .roundRobin, "
+                             "target_transform: {") == 1u
             : count_text(source, transform) == 0u && count_text(source, "strip_prefix:") == 0u &&
                   count_text(source, "replace_prefix:") == 0u &&
                   count_text(source, "target_transform") == 0u &&
-                  count_text(source, "return forward(nginx_upstream, request_policy: {") == 1u;
+                  count_text(source,
+                             "return forward(nginx_upstream, load_balance: .roundRobin, "
+                             "request_policy: {") == 1u;
     if (count_text(source, listener) != 1u ||
         (exact_listener &&
          (source.rfind(listener, 0u) != 0u || source.find("listen :") != std::string::npos ||
@@ -26304,9 +26317,9 @@ static bool run_max_proxy_prefix_self_checks(std::string& error) {
         return false;
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
-    if (!maximum_lowered || maximum_lowered.value().len != 3515u ||
-        rut::nginx::RutSource::kCapacity != 12779u) {
-        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/12779 bytes";
+    if (!maximum_lowered || maximum_lowered.value().len != 3542u ||
+        rut::nginx::RutSource::kCapacity != 12887u) {
+        if (error.empty()) error = "#335 maximum generated source was not exactly 3542/12887 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -26508,7 +26521,10 @@ static bool validate_max_proxy_replacement_generated_source(const std::string& s
         count_text(source, redirect_condition) != 1u || count_text(source, redirect_target) != 1u ||
         count_text(source, transform) != 1u || count_text(source, "strip_prefix:") != 1u ||
         count_text(source, "replace_prefix:") != 1u || count_text(source, replacement) != 1u ||
-        count_text(source, "return forward(nginx_upstream, target_transform: {") != 1u ||
+        count_text(
+            source,
+            "return forward(nginx_upstream, load_balance: .roundRobin, target_transform: {") !=
+            1u ||
         count_text(source, "query: .preserveRaw") != 1u ||
         source.find("proxy_pass") != std::string::npos ||
         source.find("nginx.conf") != std::string::npos ||
@@ -27379,9 +27395,9 @@ static bool run_max_proxy_replacement_self_checks(std::string& error) {
         return false;
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
-    if (!maximum_lowered || maximum_lowered.value().len != 3410u ||
-        rut::nginx::RutSource::kCapacity != 12779u) {
-        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/12779 bytes";
+    if (!maximum_lowered || maximum_lowered.value().len != 3437u ||
+        rut::nginx::RutSource::kCapacity != 12887u) {
+        if (error.empty()) error = "#336 maximum generated source was not exactly 3437/12887 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -31957,7 +31973,9 @@ static bool build_converter_exact_absolute_redirect_artifacts(u16 frontend_port,
         rut_source.find("header_order: .connectionThenLocation") == std::string::npos ||
         rut_source.find("status: " + status_lexeme + ",") == std::string::npos ||
         rut_source.find("target_path: \"/new\"") == std::string::npos ||
-        rut_source.find("} else {\n        return forward(nginx_upstream") == std::string::npos) {
+        rut_source.find(
+            "} else {\n        return forward(nginx_upstream, load_balance: .roundRobin") ==
+            std::string::npos) {
         error = "converter output lacked the bounded redirect/forward conditional profile";
         return false;
     }
@@ -32581,7 +32599,8 @@ static bool run_converter_root_proxy_trace_differential(u16 frontend_port,
         find_line_prefix("route PATCH TRACE") != std::string::npos ||
         find_line_prefix("route OPTIONS TRACE") != std::string::npos ||
         find_line_prefix("route CONNECT TRACE") != std::string::npos ||
-        rut_source.find("return forward(nginx_upstream") == std::string::npos ||
+        rut_source.find("return forward(nginx_upstream, load_balance: .roundRobin") ==
+            std::string::npos ||
         rut_source.find("route \"/\"") == std::string::npos ||
         rut_source.find("route exact") != std::string::npos ||
         rut_source.find("/api/") != std::string::npos) {
@@ -32896,7 +32915,8 @@ static bool run_converter_api_proxy_trace_differential(u16 frontend_port,
         find_line_prefix("route CONNECT TRACE") != std::string::npos ||
         rut_source.find("route \"/api\" {") == std::string::npos ||
         rut_source.find("target_path: \"/api/\"") == std::string::npos ||
-        rut_source.find("return forward(nginx_upstream") == std::string::npos ||
+        rut_source.find("return forward(nginx_upstream, load_balance: .roundRobin") ==
+            std::string::npos ||
         rut_source.find("strip_prefix: \"/api/\"") == std::string::npos ||
         rut_source.find("replace_prefix: \"/\"") == std::string::npos ||
         rut_source.find("route \"/\"") != std::string::npos ||
@@ -33484,7 +33504,8 @@ static bool run_converter_exact_local_differential(
         rut_source.find("nginx::") != std::string::npos ||
         rut_source.find("nginx_compat") != std::string::npos ||
         rut_source.find("workaround") != std::string::npos ||
-        rut_source.find("return forward(nginx_upstream") == std::string::npos ||
+        rut_source.find("return forward(nginx_upstream, load_balance: .roundRobin") ==
+            std::string::npos ||
         rut_source.find("route \"/\"") == std::string::npos ||
         rut_source.find("return response(") != std::string::npos) {
         error = "converter output lost the exact-ANY strict-local/root-forward source shape";
@@ -34261,7 +34282,7 @@ static bool run_exact_strict_route_differential(
         "listen :" + std::to_string(frontend_port) + "\n" +
         "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n" +
         R"rut(route GET "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -34287,7 +34308,7 @@ route exact "/static" { return local_response({
 )rut";
     if (rut_source.find("route exact \"/static\"") == std::string::npos ||
         rut_source.find("route exact GET \"/static\"") != std::string::npos ||
-        rut_source.find("return forward(backend") == std::string::npos) {
+        rut_source.find("return forward(backend, load_balance: .roundRobin") == std::string::npos) {
         error = "hand-authored ordinary RUT source lost its exact-ANY/root-forward shape";
         return false;
     }
@@ -34627,7 +34648,7 @@ static bool run_no_content204_rut_production(
                                "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) +
                                "\"\n" +
                                R"rut(route GET "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -34644,7 +34665,7 @@ route exact GET "/static" { return local_response({
     if (source.find("route exact GET \"/static\"") == std::string::npos ||
         source.find("route GET \"/ordinary\" { return 204 }") == std::string::npos ||
         source.find("route GET \"/\"") == std::string::npos ||
-        source.find("return forward(backend") == std::string::npos ||
+        source.find("return forward(backend, load_balance: .roundRobin") == std::string::npos ||
         source.find("nginx.conf") != std::string::npos ||
         !write_file(temp.source, source.data(), source.size())) {
         error = "failed to preserve/write ordinary public RUT no-content production source";
@@ -35049,7 +35070,7 @@ static bool run_slash_normalized_exact_rut_production(
         "listen :" + std::to_string(frontend_port) + "\n" +
         "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n" +
         R"rut(route GET "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -35080,8 +35101,9 @@ route exact slash_normalized GET "/health/check/" { return local_response({
     const char* expected_exact_route = generated_source == nullptr
                                            ? "route exact slash_normalized GET \"/health/check/\""
                                            : "route exact slash_normalized \"/health/check/\"";
-    const char* expected_forward =
-        generated_source == nullptr ? "return forward(backend" : "return forward(nginx_upstream";
+    const char* expected_forward = generated_source == nullptr
+                                       ? "return forward(backend, load_balance: .roundRobin"
+                                       : "return forward(nginx_upstream, load_balance: .roundRobin";
     if (source.find(expected_root_route) == std::string::npos ||
         source.find(expected_exact_route) == std::string::npos ||
         source.find(expected_forward) == std::string::npos ||
@@ -35496,7 +35518,7 @@ static bool capture_generated_normalized_exact_trailing_slash_order(
     if (count_literal(exact_route.c_str()) != 1 || count_literal("route exact \"") != 0 ||
         count_literal("route exact ") != 1 || count_literal("/health/check/") != 1 ||
         count_literal("route \"/\" {") != 1 ||
-        count_literal("return forward(nginx_upstream") != 3 ||
+        count_literal("return forward(nginx_upstream, load_balance: .roundRobin") != 3 ||
         generated_source.find("route exact slash_normalized GET \"/health/check/\"") !=
             std::string::npos ||
         generated_source.find("/health/check/?") != std::string::npos ||
@@ -36018,8 +36040,8 @@ static constexpr StaticQueryProxyOracleProfile kRootEmptyQueryProxyOracleProfile
     kRootEmptyQueryProxyClientRequestSizes,
     kRootEmptyQueryProxyUpstreamRequestSizes,
     true,
-    3285u,
-    9493u,
+    3312u,
+    9574u,
     true,
     true,
     true};
@@ -38086,7 +38108,10 @@ static bool validate_static_query_proxy_generated_source(
         count_text(source, std::string("replace_prefix: \"") + profile.configured_uri + "\"") !=
             1u ||
         count_text(source, profile.configured_uri) != 1u ||
-        count_text(source, "return forward(nginx_upstream, target_transform: {") != 1u ||
+        count_text(
+            source,
+            "return forward(nginx_upstream, load_balance: .roundRobin, target_transform: {") !=
+            1u ||
         count_text(source, "query: .preserveRaw") != 1u ||
         (profile.require_exact_generated_policies &&
          (count_text(source, "request_policy: {") != 1u ||
@@ -39214,12 +39239,12 @@ static bool run_empty_query_proxy_differential_self_checks(std::string& error) {
 
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
-        canonical[0] != canonical[1] || canonical[0].size() != 3279u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 9499u ||
+        canonical[0] != canonical[1] || canonical[0].size() != 3306u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 9580u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
         if (error.empty())
-            error = "#360 canonical declaration-order source lost exact 3337/9441 evidence";
+            error = "#360 canonical declaration-order source lost exact 3306/9580 evidence";
         return false;
     }
 
@@ -39407,11 +39432,11 @@ static bool run_root_empty_query_proxy_differential_self_checks(std::string& err
     }
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
-        canonical[0] != canonical[1] || canonical[0].size() != 3285u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 9493u ||
+        canonical[0] != canonical[1] || canonical[0].size() != 3312u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 9574u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
-        if (error.empty()) error = "#372 canonical source lost exact 3285/9493 evidence";
+        if (error.empty()) error = "#372 canonical source lost exact 3312/9574 evidence";
         return false;
     }
 
@@ -42943,7 +42968,7 @@ static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect30
     "301 Moved Permanently",
     kExactLoopbackFixedRedirect301SourceBody,
     kExactLoopbackFixedRedirect301Body,
-    5821u};
+    5902u};
 static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect302Profile{
     302u,
     "#350",
@@ -42955,7 +42980,7 @@ static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect30
     "302 Found",
     kExactLoopbackFixedRedirect302SourceBody,
     kExactLoopbackFixedRedirect302Body,
-    5797u};
+    5878u};
 
 static const ExactLoopbackFixedRedirectProfile* exact_loopback_fixed_redirect_profile(u16 status) {
     if (status == 301u) return &kExactLoopbackFixedRedirect301Profile;
@@ -44098,8 +44123,14 @@ static bool validate_exact_loopback_fixed_redirect_generated_source_structure(
                        "\"") != 1u ||
         count_text(source, "target_path: \"/new\"") != 1u ||
         count_text(source, profile->source_body) != 1u ||
-        count_text(source, "    } else {\n        return forward(nginx_upstream") != 1u ||
-        count_text(source, "return forward(nginx_upstream, request_policy: {\n") != 3u ||
+        count_text(
+            source,
+            "    } else {\n        return forward(nginx_upstream, load_balance: .roundRobin") !=
+            1u ||
+        count_text(
+            source,
+            "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n") !=
+            3u ||
         count_text(source, "            host: .upstream,\n") != 3u ||
         count_text(source, "            connection: .omit,\n") != 3u ||
         count_text(source,
@@ -45152,10 +45183,11 @@ static bool run_exact_loopback_fixed_redirect_four_way_self_checks(std::string& 
                         "<h1>399 Mutated Redirect</h1>",
                         "body")},
         {"root",
-         replace_unique(sources[0],
-                        "    } else {\n        return forward(nginx_upstream",
-                        "    } else {\n        return forwarX(nginx_upstream",
-                        "root")},
+         replace_unique(
+             sources[0],
+             "    } else {\n        return forward(nginx_upstream, load_balance: .roundRobin",
+             "    } else {\n        return forwarX(nginx_upstream",
+             "root")},
         {"hook", sources[0] + "// nginx_compat workaround marker\n"}};
     for (const auto& mutation : source_mutations)
         if (!source_rejects(mutation.first, mutation.second)) return false;
@@ -45482,13 +45514,13 @@ struct ExactLoopbackPrefixOracleProfile {
 };
 
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackPrefixRootProfile = {
-    "#353", "exact_loopback_prefix_root", &kServiceRootProxyUriOracleProfile, 3300u, true};
+    "#353", "exact_loopback_prefix_root", &kServiceRootProxyUriOracleProfile, 3327u, true};
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackApiV1Profile = {
-    "#354", "exact_loopback_api_v1", &kExactApiV1ProxyUriOracleProfile, 3287u, true};
+    "#354", "exact_loopback_api_v1", &kExactApiV1ProxyUriOracleProfile, 3314u, true};
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackApiNoUriProfile = {
-    "#355", "exact_loopback_api_no_uri", &kExactApiNoUriProxyOracleProfile, 3186u, false};
+    "#355", "exact_loopback_api_no_uri", &kExactApiNoUriProxyOracleProfile, 3213u, false};
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackServiceNoUriOracleProfile = {
-    "#356", "exact_loopback_service_no_uri", &kExactServiceNoUriProxyOracleProfile, 3198u, false};
+    "#356", "exact_loopback_service_no_uri", &kExactServiceNoUriProxyOracleProfile, 3225u, false};
 
 static std::string make_exact_loopback_prefix_root_config(
     u16 frontend_port,
@@ -47574,9 +47606,14 @@ static bool validate_exact_loopback_prefix_root_generated_source(
         "replace_prefix: \"" + std::string(profile.semantics->proxy_uri) + "\"";
     const bool forward_shape_is_canonical =
         profile.uses_target_transform
-            ? count_text(source, "return forward(nginx_upstream, target_transform: {") == 1u &&
+            ? count_text(source,
+                         "return forward(nginx_upstream, load_balance: .roundRobin, "
+                         "target_transform: {") == 1u &&
                   count_text(source, strip) == 1u && count_text(source, replace) == 1u
-            : count_text(source, "return forward(nginx_upstream, request_policy: {") == 1u &&
+            : count_text(
+                  source,
+                  "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {") ==
+                      1u &&
                   source.find("target_transform") == std::string::npos &&
                   source.find("strip_prefix") == std::string::npos &&
                   source.find("replace_prefix") == std::string::npos &&
@@ -48929,11 +48966,13 @@ static bool run_exact_loopback_prefix_root_four_way_self_checks(
     } else {
         mutations.push_back(
             {"forbidden-target-transform",
-             replace_unique(sources[0],
-                            "return forward(nginx_upstream, request_policy: {",
-                            "return forward(nginx_upstream, target_transform: { strip_prefix: "
-                            "\"/api/\", replace_prefix: \"/\" }, request_policy: {",
-                            "forbidden-target-transform")});
+             replace_unique(
+                 sources[0],
+                 "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {",
+                 "return forward(nginx_upstream, load_balance: .roundRobin, target_transform: { "
+                 "strip_prefix: "
+                 "\"/api/\", replace_prefix: \"/\" }, request_policy: {",
+                 "forbidden-target-transform")});
         mutations.push_back({"forbidden-set-path", sources[0] + "// set_path no-URI workaround\n"});
     }
     for (const auto& mutation : mutations)
@@ -49228,7 +49267,7 @@ static bool run_exact_max_proxy_prefix_self_checks(
     const size_t expected_source_size =
         max_proxy_expected_source_size(kPorts[2], kPorts[3], profile);
     if (!lowered || lowered.value().len != expected_source_size ||
-        (!profile.uses_target_transform && expected_source_size != 3362u)) {
+        (!profile.uses_target_transform && expected_source_size != 3389u)) {
         error = std::string(profile.issue) +
                 " P63 self-check did not lower to the canonical loopback RUT size";
         return false;
@@ -49280,7 +49319,7 @@ static bool run_exact_max_proxy_prefix_self_checks(
         maximum_ipv4_lowered.value().len != profile.maximum_exact_size ||
         profile.maximum_exact_size >= rut::nginx::RutSource::kCapacity ||
         rut::nginx::RutSource::kCapacity - profile.maximum_exact_size !=
-            (profile.uses_target_transform ? 9255u : 9411u) ||
+            (profile.uses_target_transform ? 9336u : 9492u) ||
         maximum_ipv4_lowered.value().data[maximum_ipv4_lowered.value().len] != '\0') {
         error = std::string(profile.issue) +
                 " P63 genuine maximum lowering lost its canonical size/capacity/NUL boundary";
@@ -49358,9 +49397,10 @@ static bool run_exact_max_proxy_prefix_self_checks(
                                                    "         replace_prefix: \"/v1/\"",
                                                    "replace")});
     } else {
-        const std::string forward = "return forward(nginx_upstream, request_policy: {";
+        const std::string forward =
+            "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {";
         const std::string injected =
-            "return forward(nginx_upstream, target_transform: {\n"
+            "return forward(nginx_upstream, load_balance: .roundRobin, target_transform: {\n"
             "            strip_prefix: \"" +
             prefix +
             "\",\n"
@@ -49723,16 +49763,16 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
     }
     const auto baseline_lowered = rut::nginx::lower_to_rut(baseline_parsed.value());
     std::string canonicalized_runtime = canonical;
-    if (!baseline_lowered || baseline_lowered.value().len != 3351u || canonical.size() != 3353u ||
+    if (!baseline_lowered || baseline_lowered.value().len != 3378u || canonical.size() != 3380u ||
         max_proxy_expected_source_size(8080u, 9000u, kWildcardMaxProxyPrefixNoUriProfile) !=
-            3351u ||
+            3378u ||
         !canonicalize_unique_port(
             canonicalized_runtime, "listen :" + std::to_string(kPorts[2]), "listen :8080") ||
         !canonicalize_unique_port(
             canonicalized_runtime, "127.0.0.1:" + std::to_string(kPorts[3]), "127.0.0.1:9000") ||
         canonicalized_runtime !=
             std::string(baseline_lowered.value().data, baseline_lowered.value().len)) {
-        error = "#357 P63 wildcard canonical size formula lost the 3351-byte baseline";
+        error = "#357 P63 wildcard canonical size formula lost the 3378-byte baseline";
         return false;
     }
 
@@ -49744,10 +49784,10 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
         return false;
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
-    if (!maximum_lowered || maximum_lowered.value().len != 3359u ||
-        rut::nginx::RutSource::kCapacity != 12779u ||
-        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 9420u ||
-        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 9419u ||
+    if (!maximum_lowered || maximum_lowered.value().len != 3386u ||
+        rut::nginx::RutSource::kCapacity != 12887u ||
+        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 9501u ||
+        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 9500u ||
         maximum_lowered.value().data[maximum_lowered.value().len] != '\0' ||
         !validate_max_proxy_prefix_generated_source(
             std::string(maximum_lowered.value().data, maximum_lowered.value().len),
@@ -49758,7 +49798,7 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
             false,
             kWildcardMaxProxyPrefixNoUriProfile)) {
         if (error.empty())
-            error = "#357 genuine maximum wildcard endpoints lost 3417/12779/9362/9361 evidence";
+            error = "#357 genuine maximum wildcard endpoints lost 3386/12887/9501/9500 evidence";
         return false;
     }
 
@@ -49885,10 +49925,12 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
                          "route \"" + route.substr(0u, route.size() - 1u) + "S\" {"),
           replace_unique(
               canonical, "target_path: \"" + prefix + "\"", "target_path: \"" + route + "\""),
-          replace_unique(canonical,
-                         "return forward(nginx_upstream, request_policy: {",
-                         "return forward(nginx_upstream, target_transform: { strip_prefix: \"" +
-                             prefix + "\", replace_prefix: \"/\" }, request_policy: {"),
+          replace_unique(
+              canonical,
+              "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {",
+              "return forward(nginx_upstream, load_balance: .roundRobin, target_transform: { "
+              "strip_prefix: \"" +
+                  prefix + "\", replace_prefix: \"/\" }, request_policy: {"),
           canonical + "// nginx_compat workaround marker\n"}) {
         std::string detail;
         if (mutation.empty() || mutation == canonical ||
@@ -49986,7 +50028,10 @@ static bool validate_exact_loopback_action_generated_source(
         count_text(source, "route HEAD \"/\" {\n") != 1u ||
         count_text(source, "route GET \"/\" {\n") != 1u ||
         count_text(source, "\nroute \"/\" {\n") != 1u ||
-        count_text(source, "return forward(nginx_upstream, request_policy: {\n") != 3u ||
+        count_text(
+            source,
+            "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n") !=
+            3u ||
         count_text(source, "            host: .upstream,\n") != 3u ||
         count_text(source, "            connection: .omit,\n") != 3u ||
         count_text(source,
@@ -50926,7 +50971,7 @@ static bool run_exact_loopback_conditional_get_mutation_self_checks(const std::s
                                                                     std::string& error,
                                                                     const char* issue) {
     static constexpr char kFixed[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -50934,7 +50979,7 @@ static bool run_exact_loopback_conditional_get_mutation_self_checks(const std::s
         ".upgrade]\n"
         "        },\n";
     static constexpr char kRetained[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -51019,7 +51064,9 @@ static bool validate_wildcard_listen_generated_source(
         count_text(source, "route HEAD \"/\" {\n") != 1u ||
         count_text(source, "route GET \"/\" {\n") != 1u ||
         count_text(source, "\nroute \"/\" {\n") != 1u ||
-        count_text(source, "return forward(nginx_upstream, request_policy: {\n") !=
+        count_text(
+            source,
+            "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n") !=
             expected_forward_count ||
         count_text(source, "            host: .upstream,\n") != expected_forward_count ||
         count_text(source, "            connection: .omit,\n") != expected_forward_count ||
@@ -51998,9 +52045,10 @@ static bool run_wildcard_listen_differential_self_checks(
         !rejects_appended_source(
             "# bind_address 0.0.0.0\n", "bind_address 0.0.0.0", "address-marker") ||
         !rejects_appended_source("# listen *:1\n", "listen *:1", "asterisk-address-marker") ||
-        !rejects_appended_source("route \"/extra\" { return forward(nginx_upstream) }\n",
-                                 "route \"/extra\"",
-                                 "extra-route") ||
+        !rejects_appended_source(
+            "route \"/extra\" { return forward(nginx_upstream, load_balance: .roundRobin) }\n",
+            "route \"/extra\"",
+            "extra-route") ||
         !rejects_appended_source("# nginx_compat wildcard workaround\n",
                                  "nginx_compat wildcard workaround",
                                  "workaround"))
@@ -53383,7 +53431,7 @@ static bool validate_rut_exact_ipv4_source(const std::string& source,
         wildcard_listen_source_declarations(source, "upstream") != 1u ||
         count_text(source, "route GET \"/\" {\n") != 1u ||
         wildcard_listen_source_declarations(source, "route") != 1u ||
-        count_text(source, "return forward(exact_backend,") != 1u ||
+        count_text(source, "return forward(exact_backend, load_balance: .roundRobin,") != 1u ||
         source.find("127.0.0.2") != std::string::npos ||
         source.find("0.0.0.0") != std::string::npos || source.find("*:") != std::string::npos ||
         source.find("nginx") != std::string::npos ||
@@ -53445,7 +53493,7 @@ static bool run_rut_exact_ipv4_production_self_checks(std::string& error) {
     const std::string exact =
         "listen 127.0.0.1:54321\n"
         "upstream exact_backend at \"127.0.0.1:54322\"\n"
-        "route GET \"/\" {\n  return forward(exact_backend,\n"
+        "route GET \"/\" {\n  return forward(exact_backend, load_balance: .roundRobin,\n"
         "    request_policy: { version: .http11, host: .upstream, connection: .omit,\n"
         "      strip_headers: [.connection] },\n"
         "    response_policy: { version: .http11, framing: .contentLength,\n"
@@ -53561,7 +53609,7 @@ static bool run_rut_exact_ipv4_listener_production(TempDir& temp,
                std::to_string(frontend_port) + "\n" +
                "upstream exact_backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n" +
                R"rut(route GET "/" {
-  return forward(exact_backend,
+  return forward(exact_backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -55795,7 +55843,7 @@ static bool validate_converter_request_length_source(const std::string& source,
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
     static constexpr char kFixedRequestPolicy[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -55803,7 +55851,7 @@ static bool validate_converter_request_length_source(const std::string& source,
         ".upgrade]\n"
         "        },\n";
     static constexpr char kRetainedRequestPolicy[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -55828,7 +55876,8 @@ static bool validate_converter_request_length_source(const std::string& source,
         count_text(source, kRetainedRequestPolicy) != expected_retained_policy_count ||
         count_text(source, "    if req.hasContentLength {\n") !=
             expected_content_length_branch_count ||
-        count_text(source, "return forward(nginx_upstream,") != expected_forward_count ||
+        count_text(source, "return forward(nginx_upstream, load_balance: .roundRobin,") !=
+            expected_forward_count ||
         count_text(source, "        response_read_timeout: 60s,\n") != expected_timeout_count ||
         count_text(source, "        response_buffering: .completeContentLength\n") !=
             expected_timeout_count ||
@@ -57826,7 +57875,7 @@ static bool validate_converter_request_length_fixed_body_source(const std::strin
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
     static constexpr char kFixedRequestPolicy[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -57834,7 +57883,7 @@ static bool validate_converter_request_length_fixed_body_source(const std::strin
         ".upgrade]\n"
         "        },\n";
     static constexpr char kRetainedRequestPolicy[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -57853,7 +57902,7 @@ static bool validate_converter_request_length_fixed_body_source(const std::strin
         count_text(source, kFixedRequestPolicy) != 3u ||
         count_text(source, kRetainedRequestPolicy) != 1u ||
         count_text(source, "    if req.hasContentLength {\n") != 1u ||
-        count_text(source, "return forward(nginx_upstream,") != 4u ||
+        count_text(source, "return forward(nginx_upstream, load_balance: .roundRobin,") != 4u ||
         count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
         count_text(source, "        response_buffering: .completeContentLength\n") != 2u ||
         count_text(source, "        timeout_failure_policy: {\n") != 2u ||
@@ -58248,7 +58297,7 @@ static std::string make_rut_initial_header_split_source(u16 frontend_port,
            std::to_string(backend_port) +
            "\"\n"
            R"rut(route GET "/" {
-  return forward(issue371_backend,
+  return forward(issue371_backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -58276,7 +58325,7 @@ static bool validate_rut_initial_header_split_source(const std::string& source,
         count_text(source, "listen ") != 1u || count_text(source, upstream) != 1u ||
         count_text(source, "upstream ") != 1u || count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "route ") != 1u ||
-        count_text(source, "return forward(issue371_backend,") != 1u ||
+        count_text(source, "return forward(issue371_backend, load_balance: .roundRobin,") != 1u ||
         count_text(source, "format: downstreamRequestBytes") != 1u ||
         count_text(source, "publication: live") != 1u ||
         count_text(source, "host: .upstream") != 1u ||
@@ -58691,10 +58740,11 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
     const std::string three_headers = "hide_headers: [\"Date\", \"Server\", \"X-Pad\"]";
     const u32 routes =
         (source.rfind("route ", 0u) == 0u ? 1u : 0u) + count_text(source, "\nroute ");
-    const u32 forwards = count_text(source, "return forward(nginx_upstream");
-    if (source.empty() || source.size() != 5260u || source.find('\0') != std::string::npos ||
+    const u32 forwards =
+        count_text(source, "return forward(nginx_upstream, load_balance: .roundRobin");
+    if (source.empty() || source.size() != 5341u || source.find('\0') != std::string::npos ||
         source.size() + 1u > rut::nginx::RutSource::kCapacity ||
-        rut::nginx::RutSource::kCapacity - source.size() - 1u != 7518u ||
+        rut::nginx::RutSource::kCapacity - source.size() - 1u != 7545u ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u || routes != 3u ||
         forwards != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
@@ -58710,7 +58760,7 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
         source.find("nginx_compat") != std::string::npos ||
         source.find("workaround") != std::string::npos ||
         source.find("accessLog") != std::string::npos) {
-        error = "#373 generated source failed exact 5260-byte policy/route/ownership validation";
+        error = "#373 generated source failed exact 5341-byte policy/route/ownership validation";
         return false;
     }
     return true;
@@ -58913,7 +58963,8 @@ static bool run_proxy_hide_header_source_self_checks(std::string& error) {
     redirect_mutation.erase(body_at + strlen("body: b\""),
                             strlen("\nreturn redirect(nginx_upstream)"));
     if (redirect_mutation.size() != evidence[0].source.size() ||
-        count_text(redirect_mutation, "return forward(nginx_upstream") != 3u ||
+        count_text(redirect_mutation, "return forward(nginx_upstream, load_balance: .roundRobin") !=
+            3u ||
         count_text(redirect_mutation, "return redirect(") != 1u ||
         !reject_source(std::move(redirect_mutation), 0u, "equal-length-redirect"))
         return false;
@@ -58966,7 +59017,7 @@ static bool run_proxy_hide_header_source_self_checks(std::string& error) {
             "route HEAD \"/\" {", "route GET \"/\" {", "missing-head-route") ||
         !reject_unique_source_mutation(
             "route GET \"/\" {", "route GET \"/\" {\nroute GET \"/\" {", "duplicate-get-route") ||
-        !reject_unique_source_mutation("return forward(nginx_upstream",
+        !reject_unique_source_mutation("return forward(nginx_upstream, load_balance: .roundRobin",
                                        "return redirect(nginx_upstream",
                                        "unexpected-redirect") ||
         !reject_unique_source_mutation(
@@ -59175,7 +59226,7 @@ static bool capture_proxy_hide_header_generated_side(
 
     // Parse and lower the borrowed fragment, then destroy both borrowed input
     // and lower-buffer ownership before persistence.  Stage 4a's exact source
-    // validator remains the authority for the 5260-byte output.
+    // validator remains the authority for the 5341-byte output.
     {
         std::string borrowed = observation.fragment;
         const auto parsed = rut::nginx::parse({borrowed.data(), static_cast<u32>(borrowed.size())});
@@ -59838,7 +59889,7 @@ static bool validate_proxy_hide_header_generated_pair(const ProxyHideHeaderGener
                 return false;
             }
     if (first.child_pid <= 0 || second.child_pid <= 0 || first.child_pid == second.child_pid ||
-        first.source.size() != 5260u || second.source.size() != 5260u ||
+        first.source.size() != 5341u || second.source.size() != 5341u ||
         first.source.size() != second.source.size() ||
         first.rut_executable != second.rut_executable) {
         error = "#373 generated pair source size or PID identity failed";
@@ -60786,7 +60837,7 @@ static bool validate_positive_get_default_generated_source(const std::string& so
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
     static constexpr char kFixedRequestPolicy[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -60794,7 +60845,7 @@ static bool validate_positive_get_default_generated_source(const std::string& so
         ".upgrade]\n"
         "        },\n";
     static constexpr char kRetainedRequestPolicy[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -60812,7 +60863,7 @@ static bool validate_positive_get_default_generated_source(const std::string& so
         count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "\nroute \"/\" {") != 1u ||
         wildcard_listen_source_declarations(source, "route") != 3u ||
-        count_text(source, "return forward(nginx_upstream,") != 4u ||
+        count_text(source, "return forward(nginx_upstream, load_balance: .roundRobin,") != 4u ||
         count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
         count_text(source, "        response_buffering: .completeContentLength\n") != 2u ||
         count_text(source, "        timeout_failure_policy: {\n") != 2u ||
@@ -60872,7 +60923,7 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
     static constexpr char kFixedRequestPolicy[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -60880,7 +60931,7 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         ".upgrade]\n"
         "        },\n";
     static constexpr char kAfterHostRequestPolicy[] =
-        "return forward(nginx_upstream, request_policy: {\n"
+        "return forward(nginx_upstream, load_balance: .roundRobin, request_policy: {\n"
         "            version: .http11,\n"
         "            host: .upstream,\n"
         "            connection: .omit,\n"
@@ -60900,7 +60951,7 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         count_text(source, "route HEAD \"/\" {\n") != 1u ||
         count_text(source, "route GET \"/\" {\n") != 1u ||
         count_text(source, "\nroute \"/\" {\n") != 1u ||
-        count_text(source, "return forward(nginx_upstream,") != 4u ||
+        count_text(source, "return forward(nginx_upstream, load_balance: .roundRobin,") != 4u ||
         count_text(source, kFixedRequestPolicy) != 3u ||
         count_text(source, kAfterHostRequestPolicy) != 1u ||
         count_text(source, kFramingSelector) != 1u || count_text(source, kFramingElse) != 1u ||
@@ -60966,26 +61017,29 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         const size_t suppress = region.find("head_mode: .suppressBody,", start);
         return start != std::string::npos && end != std::string::npos && suppress < end;
     };
-    if (count_text(head_region, "return forward(nginx_upstream,") != 2u ||
+    if (count_text(head_region, "return forward(nginx_upstream, load_balance: .roundRobin,") !=
+            2u ||
         count_text(head_region, "response_read_timeout: 1s") != 2u ||
         count_text(get_region, "response_read_timeout: 1s") != 1u ||
         count_text(any_region, "response_read_timeout: 1s") != 1u ||
-        count_text(content_length_head_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(content_length_head_region,
+                   "return forward(nginx_upstream, load_balance: .roundRobin,") != 1u ||
         count_text(content_length_head_region, kAfterHostRequestPolicy) != 1u ||
         content_length_head_region.find(kFixedRequestPolicy) != std::string::npos ||
         count_text(content_length_head_region, "response_read_timeout: 1s") != 1u ||
-        count_text(bodyless_head_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(bodyless_head_region,
+                   "return forward(nginx_upstream, load_balance: .roundRobin,") != 1u ||
         count_text(bodyless_head_region, kFixedRequestPolicy) != 1u ||
         bodyless_head_region.find(kAfterHostRequestPolicy) != std::string::npos ||
         bodyless_head_region.find("content_length_position: .afterHost") != std::string::npos ||
         count_text(bodyless_head_region, "response_read_timeout: 1s") != 1u ||
         normalized_content_length_head_region != bodyless_head_region ||
-        count_text(get_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(get_region, "return forward(nginx_upstream, load_balance: .roundRobin,") != 1u ||
         count_text(get_region, kFixedRequestPolicy) != 1u ||
         get_region.find(kFramingSelector) != std::string::npos ||
         get_region.find(kAfterHostRequestPolicy) != std::string::npos ||
         get_region.find("content_length_position: .afterHost") != std::string::npos ||
-        count_text(any_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(any_region, "return forward(nginx_upstream, load_balance: .roundRobin,") != 1u ||
         count_text(any_region, kFixedRequestPolicy) != 1u ||
         any_region.find(kFramingSelector) != std::string::npos ||
         any_region.find(kAfterHostRequestPolicy) != std::string::npos ||
@@ -68177,7 +68231,7 @@ static std::string make_handwritten_explicit_off_capability_source(u16 frontend_
            "\nupstream capability_backend at \"127.0.0.1:" + std::to_string(backend_port) +
            "\"\n"
            R"rut(route GET "/" {
-  return forward(capability_backend,
+  return forward(capability_backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -71939,7 +71993,7 @@ static bool build_issue554_handwritten_source(u16 frontend_port,
     source += "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
     source += "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
     source += R"rut(route GET "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
     response_policy: { version: .http11, framing: .contentLength,
@@ -72292,7 +72346,7 @@ static bool build_issue558_handwritten_source(u16 frontend_port,
     source += "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
     source += "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
     source += R"rut(route GET "/" {
-  return forward(backend,
+  return forward(backend, load_balance: .roundRobin,
     request_policy: { version: .http11, host: .upstream, connection: .omit,
       strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade], )rut";
     if (retained) source += "retained_header_value: .trimSpPreserveHtab, ";
@@ -83971,7 +84025,7 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#373 generated-side live self-check]: " << generated_error << "\n";
             return 1;
         }
-        std::cerr << "PASS: #373 independently parsed/lowered/persisted one exact 5260-byte "
+        std::cerr << "PASS: #373 independently parsed/lowered/persisted one exact 5341-byte "
                      "proxy_hide_header source and proved the generated ordinary-RUT public "
                      "io_uring side's exact 85-byte request, 66-byte rebuilt upstream, 219-byte "
                      "origin response, 176-byte hidden-header-filtered response/EOF, poison "
@@ -83991,7 +84045,7 @@ int main(int argc, char** argv) {
         }
         std::cerr
             << "PASS: #373 independently parsed/lowered/persisted both declaration orders into "
-               "two isolated 5260-byte ordinary-RUT sources and proved exact paired "
+               "two isolated 5341-byte ordinary-RUT sources and proved exact paired "
                "Date-normalized downstream/upstream wires, endpoint/resource/PID isolation, "
                "poison liveness, FIN/EOF/stability, disabled access and clean io_uring lifecycle; "
                "generated-pair witness only (no nginx/four-way equivalence claim)\n";
@@ -86872,7 +86926,7 @@ int main(int argc, char** argv) {
                "with zero extra upstream. Generated source ownership, zero target transforms "
                "through public RIR/config, scoped access and clean lifecycle passed. Runtime "
                "source size was derived from actual port widths; genuine maximum ports/IP is "
-               "3368 bytes with 9411 bytes capacity delta and 9352 bytes payload headroom "
+               "3395 bytes with 9492 bytes capacity delta and 9491 bytes payload headroom "
                "before NUL (#356 boundary "
                "only; representative both-order behavior is separately proven; wildcard "
                "no-URI, configured URI/query, normalization-sensitive/absolute-form targets, "
@@ -87167,7 +87221,7 @@ int main(int argc, char** argv) {
             << "PASS: #351 exact listen 127.0.0.1:<port>, exact /old fixed absolute return "
                "301 and minimal root proxy in exactly listen/exact/root and listen/root/exact "
                "orders traversed the genuine borrowed nginx parser/provenance model and "
-               "converter into canonical 5821-byte ordinary RUT. Two isolated pinned-nginx "
+               "converter into canonical 5902-byte ordinary RUT. Two isolated pinned-nginx "
                "1.29.7 sides and two independently generated public-CLI/JIT/io_uring RUT sides "
                "retained causal same-port non-listening .2 guards and quiet refusal probes. All "
                "four sides matched three exact Date-normalized 366-byte fixed-Location 301/"
@@ -87546,7 +87600,7 @@ int main(int argc, char** argv) {
             << "PASS: #357 representative port-only wildcard listen <port> plus clean "
                "/service/ true no-URI proxy_pass traversed genuine nginx parsing/provenance "
                "and independent lowering in both declaration orders to the canonical "
-               "3189-byte ordinary RUT program. Two pinned nginx 1.29.7 sides and two "
+               "3216-byte ordinary RUT program. Two pinned nginx 1.29.7 sides and two "
                "public-CLI/JIT/io_uring generated-RUT sides used eight unique ports/resources "
                "and matched five exact Date-normalized wires/EOF, three unchanged /service/, "
                "/service/x and /service/x?y=1 upstream targets with rebuilt Host, omitted "
@@ -87897,8 +87951,8 @@ int main(int argc, char** argv) {
                "Host-rebuilt, Connection-omitted upstream episodes preserving both ordered "
                "X-Dupe fields, with no fifth/retry, and six ordered original raw-target access "
                "records under its current runtime-specific schema. The generated orders retain "
-               "exact 3279-byte canonical 8080/9000 source "
-               "with 9499 bytes headroom, one owned /api/ + /v1/? RouteConfig transform after "
+               "exact 3306-byte canonical 8080/9000 source "
+               "with 9580 bytes headroom, one owned /api/ + /v1/? RouteConfig transform after "
                "source/RIR/compiler teardown, post-load source overwrite, disjoint resources "
                "and clean lifecycle (#360 bounded converter equivalence only; excludes /? "
                "profile, exact-listener allowlists, variables, quoted/escaped/repeated-query, "
@@ -87932,7 +87986,7 @@ int main(int argc, char** argv) {
         std::cerr
             << "PASS: #372 exact /api/ with proxy_pass replacement /? in both declaration "
                "orders traversed the genuine borrowed nginx parser/model and independent "
-               "converter lowering into exact 3285-byte ordinary RUT sources with 9435 bytes "
+               "converter lowering into exact 3312-byte ordinary RUT sources with 9574 bytes "
                "NUL headroom and one owned generic transform ID 1. Two isolated pinned nginx "
                "1.29.7 sides and two public-CLI/O2-JIT/io_uring generated-RUT sides used eight "
                "simultaneously held unique endpoints, with all four generated endpoints P4, "

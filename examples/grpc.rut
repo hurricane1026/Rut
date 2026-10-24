@@ -10,17 +10,17 @@ upstream echo {
 
 // The same forward operation supports all four RPC shapes.
 route POST "/example.Echo/Unary" {
-    return forward(echo)
+    return forward(echo, load_balance: .roundRobin)
 }
 
 route POST "/example.Echo/ServerStream" {
-    return forward(echo)
+    return forward(echo, load_balance: .roundRobin)
 }
 
 route POST "/example.Echo/ClientStream" {
-    return forward(echo)
+    return forward(echo, load_balance: .roundRobin)
 }
 
 route POST "/example.Echo/Chat" {
-    return forward(echo)
+    return forward(echo, load_balance: .roundRobin)
 }

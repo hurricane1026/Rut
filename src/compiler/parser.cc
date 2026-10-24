@@ -1,6 +1,7 @@
 #include "rut/compiler/parser.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/load_balance.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_method.h"
@@ -2097,8 +2098,8 @@ struct Parser {
                 if (!name) return core::make_unexpected(name.error());
                 stmt.kind = AstStmtKind::ForwardUpstream;
                 stmt.name = name.value()->text;
-                // Optional kwargs after the upstream name. Currently:
-                //   set_path: "<StringLit>"  — rewrite the outbound request path.
+                // Named arguments after the upstream name; load_balance is required.
+                // Optional set_path: "<StringLit>"  — rewrite the outbound request path.
                 // Each at most once; analyze/lowering emits ReqSetPath.
                 while (take(TokenType::Comma)) {
                     auto kw = expect(TokenType::Ident);
@@ -2106,7 +2107,21 @@ struct Parser {
                     const Str kw_text = kw.value()->text;
                     auto colon = expect(TokenType::Colon);
                     if (!colon) return core::make_unexpected(colon.error());
-                    if (kw_text.eq({"response_read_timeout", 21})) {
+                    if (kw_text.eq({"load_balance", 12})) {
+                        if (stmt.forward_load_balance.policy != LoadBalancePolicy::None)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        auto value = expect_policy_case(lit_str(".roundRobin .leastRequests"));
+                        if (!value) return core::make_unexpected(value.error());
+                        if (value.value()->text.eq({"roundRobin", 10}))
+                            stmt.forward_load_balance.policy = LoadBalancePolicy::RoundRobin;
+                        else if (value.value()->text.eq({"leastRequests", 13}))
+                            stmt.forward_load_balance.policy = LoadBalancePolicy::LeastRequests;
+                        else
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*value.value()),
+                                                  value.value()->text);
+                    } else if (kw_text.eq({"response_read_timeout", 21})) {
                         if (stmt.has_forward_response_read_timeout)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
@@ -2834,6 +2849,11 @@ struct Parser {
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, span_from(*kw.value()), kw_text);
                 }
+                if (stmt.forward_load_balance.policy == LoadBalancePolicy::None)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        span_from(start),
+                        lit_str("forward requires load_balance: .roundRobin or .leastRequests"));
                 if (stmt.has_forward_timeout_failure_policy &&
                     (!stmt.has_forward_response_policy || !stmt.has_forward_failure_policy))
                     return frontend_error(
@@ -3588,7 +3608,7 @@ struct Parser {
                     seen_port = true;
                 } else if (field_name.eq({"backends", 8})) {
                     // `backends: ["host:port", ...]` — a non-empty list of
-                    // string literals for round-robin load balancing. Analyze
+                    // string literals; the forward call chooses the selection policy. Analyze
                     // splits each into (ip, port).
                     if (item.upstream.backend_count > 0)
                         return frontend_error(

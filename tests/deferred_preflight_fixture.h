@@ -13,7 +13,7 @@ route GET "/" {
       reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
       header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       request_policy: {version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]},
       response_policy: {version: .http11, framing: .contentLength,

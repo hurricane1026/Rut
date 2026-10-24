@@ -1848,7 +1848,7 @@ bool put_root_forward(Writer& writer,
            (method_len == 0
                 ? writer.put_cstr("\"/\" {\n")
                 : writer.put_lit(method, method_len) && writer.put_cstr(" \"/\" {\n")) &&
-           writer.put_cstr("    return forward(nginx_upstream, ") &&
+           writer.put_cstr("    return forward(nginx_upstream, load_balance: .roundRobin, ") &&
            put_request_policy(writer, request_policy_placement) &&
            put_response_policy(writer, suppress_body, hide_header_name) &&
            put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
@@ -1871,7 +1871,8 @@ bool put_root_forward_action(Writer& writer,
                              bool timeout_present,
                              u8 timeout_seconds,
                              Str indent) {
-    return writer.put(indent) && writer.put_cstr("return forward(nginx_upstream, ") &&
+    return writer.put(indent) &&
+           writer.put_cstr("return forward(nginx_upstream, load_balance: .roundRobin, ") &&
            put_request_policy(writer, request_policy_placement) &&
            put_response_policy(writer, suppress_body, hide_header_name) &&
            put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
@@ -2473,7 +2474,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         !writer.put(location_path) || !put("\", body: b\"") ||
         !writer.put_lit(kRedirect301Body, static_cast<u32>(__builtin_strlen(kRedirect301Body))) ||
         !put("\"})\n") || !put("    } else {\n") ||
-        !put("        return forward(nginx_upstream,") ||
+        !put("        return forward(nginx_upstream, load_balance: .roundRobin,") ||
         (proxy_location.value() == ProxyLocationProfile::PrefixWithUri &&
          (!put(" target_transform: {\n") || !put("            strip_prefix: \"") ||
           !writer.put(location_path) || !put("\",\n") || !put("            replace_prefix: \"") ||

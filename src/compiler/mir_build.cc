@@ -1440,6 +1440,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             out->response_body_local_index = term.response_body_local_index;
             out->forward_set_path = term.forward_set_path;
             out->forward_request_policy_id = term.forward_request_policy_id;
+            out->forward_load_balance = term.forward_load_balance;
             out->forward_response_policy_id = term.forward_response_policy_id;
             out->forward_failure_policy_id = term.forward_failure_policy_id;
             out->forward_timeout_failure_policy_id = term.forward_timeout_failure_policy_id;

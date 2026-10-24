@@ -2,4 +2,4 @@
 listen 127.0.0.1:8804
 upstream origin at "127.0.0.1:8805"
 route GET "/ws" { return websocket(origin) }
-route GET "/stream" { return forward(origin) }
+route GET "/stream" { return forward(origin, load_balance: .roundRobin) }

@@ -5,8 +5,10 @@
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/load_balance.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/shard_limits.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/common/upstream_tls.h"
@@ -59,8 +61,8 @@ enum class RouteAction : u8 {
 };
 
 // Upstream target — one named backend that may resolve to several
-// address:port endpoints. Multiple endpoints enable per-shard round-robin
-// load balancing; a single-endpoint upstream is just addr_count == 1.
+// address:port endpoints. Each forward site selects its load-balancing policy;
+// a single-endpoint upstream is just addr_count == 1.
 struct UpstreamTarget {
     static constexpr u32 kMaxUpstreamNameLen = 32;
     static constexpr u32 kMaxBackends = 8;  // endpoints per upstream (LB pool)
@@ -214,6 +216,9 @@ struct RouteConfig {
 
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
+    // Runtime sidecars are excluded from native metadata. Each shard exclusively
+    // owns its row; the existing request epoch pins the sidecar with its config.
+    mutable BackendSelectionState backend_selection[kMaxShards]{};
 
     // Phase 2 dispatch — 2-way tagged union.
     //

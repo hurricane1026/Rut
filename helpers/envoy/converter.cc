@@ -186,7 +186,7 @@ bool put_route_exact_404(Writer& w, Str node_text) {
 bool put_forward_call(Writer& w, u32 cluster_index, bool include_head_mode) {
     if (!w.put_cstr("    return forward(envoy_cluster_")) return false;
     if (!w.put_u16(static_cast<u16>(cluster_index))) return false;
-    if (!w.put_cstr(", request_policy: {\n"
+    if (!w.put_cstr(", load_balance: .roundRobin, request_policy: {\n"
                     "            version: .http11,\n"
                     "            host: .preserve,\n"
                     "            connection: .omit,\n"

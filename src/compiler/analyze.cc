@@ -10701,6 +10701,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
     if (!upstream_index) return core::make_unexpected(upstream_index.error());
     term.kind = HirTerminatorKind::ForwardUpstream;
+    term.forward_load_balance = stmt.forward_load_balance;
     term.upstream_index = upstream_index.value();
     if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
     if (stmt.has_forward_request_policy)
@@ -12502,7 +12503,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         if (!is_frame_method) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
 
         if (call.name.eq({"forward", 7})) {
-            if (call.args.len > 1)  // forward() or forward(payload)
+            if (call.args.len > 1)  // forward() or forward(payload, load_balance: .roundRobin)
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
             route->ws_handler.default_verdict = WsVerdict::Forward;
             if (call.args.len == 1) {

@@ -1,6 +1,7 @@
 #include "rut/jit/runtime_helpers.h"
 
 #include "core/placement_new.h"
+#include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
@@ -273,6 +274,21 @@ void rut_helper_req_set_path(void* conn, const char* path, u32 len) {
     auto* c = static_cast<ConnectionBase*>(conn);
     c->req_path_overridden = true;
     c->req_path_override = Str{path, len};
+}
+
+void rut_helper_req_set_load_balance(void* conn, u32 encoded) {
+    if (!conn) return;  // ABI-only callers may inspect a result without dispatching.
+    auto* c = static_cast<ConnectionBase*>(conn);
+    if (encoded == 0) {
+        c->forward_load_balance = {};
+        return;
+    }
+    c->forward_load_balance = {static_cast<u16>(encoded >> 8),
+                               static_cast<LoadBalancePolicy>(encoded & 255)};
+    if ((encoded >> 8) > kMaxForwardSites || (encoded >> 8) == 0 ||
+        !load_balance_policy_valid(c->forward_load_balance.policy) ||
+        c->forward_load_balance.policy == LoadBalancePolicy::None)
+        c->forward_load_balance = {0, LoadBalancePolicy::Invalid};
 }
 
 void rut_helper_req_set_target_transform(void* conn, u32 transform_id) {

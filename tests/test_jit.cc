@@ -8302,7 +8302,8 @@ TEST(jit_dispatch, forward_bundle_keeps_request_and_bundle_ids_independent) {
 
 TEST(jit, compiled_failure_only_forward_bundle_preserves_zero_response_id) {
     const char* src =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
+        "failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
         "date: .current, connection: .request, body: b\"x\" }) }\n";
     auto lexed = lex(lit(src));
@@ -8339,7 +8340,7 @@ TEST(jit, compiled_timeout_failure_policy_preserves_single_packed_bundle_id) {
     const char* src = R"rut(
 upstream b
 route GET "/" {
-    return forward(b, response_policy: {
+    return forward(b, load_balance: .roundRobin, response_policy: {
         version: .http11, framing: .contentLength, connection: .request,
         server: "s", date: .current, hide_headers: []
     }, failure_policy: {
@@ -8388,7 +8389,7 @@ TEST(jit, compiled_response_read_timeout_preserves_single_bundle_and_request_pol
     const char source[] = R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/" {
-    return forward(b, request_policy: {
+    return forward(b, load_balance: .roundRobin, request_policy: {
         version: .http11, host: .upstream, connection: .omit,
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
     }, response_policy: {
@@ -8470,7 +8471,7 @@ TEST(jit, compiled_response_buffering_reaches_config_without_changing_handler_re
     const char source[] = R"rut(
 upstream b at "127.0.0.1:9000"
 route POST "/" {
-    return forward(b,
+    return forward(b, load_balance: .roundRobin,
         request_policy: { version: .http11, host: .upstream, connection: .omit,
             strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
         response_policy: { version: .http11, framing: .contentLength,
@@ -20160,7 +20161,7 @@ route GET "/" {
       reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
       target_path: "/new", body: b"fixed-302"})
   } else {
-    return forward(backend,
+    return forward(backend, load_balance: .roundRobin,
       response_policy: {version: .http11, framing: .contentLength,
         connection: .request, server: "rut", date: .current, hide_headers: []},
       failure_policy: {version: .http11, status: 502, reason: "Bad Gateway",
@@ -22543,4 +22544,50 @@ return 200
     }
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit, forward_load_balance_survives_timer_yield_and_distinct_routes) {
+    const char* source = R"(
+upstream api at "127.0.0.1:9001"
+route GET "/rr" { return forward(api, load_balance: .roundRobin) }
+route GET "/least" { wait(1ms) return forward(api, load_balance: .leastRequests) }
+)";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule out{};
+    REQUIRE(lower_to_rir(mir.value(), out));
+    auto cg = codegen(out.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto rr = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto least = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(rr != nullptr);
+    REQUIRE(least != nullptr);
+    ConnectionBase conn;
+    conn.reset();
+    HandlerCtx ctx{};
+    auto result = HandlerResult::unpack(rr(&conn, &ctx, nullptr, 0, nullptr));
+    CHECK_EQ(result.action, HandlerAction::Forward);
+    CHECK_EQ(conn.forward_load_balance.policy, LoadBalancePolicy::RoundRobin);
+    const u16 first_site = conn.forward_load_balance.site;
+    conn.forward_load_balance = {};
+    result = HandlerResult::unpack(least(&conn, &ctx, nullptr, 0, nullptr));
+    REQUIRE_EQ(result.action, HandlerAction::Yield);
+    CHECK_EQ(conn.forward_load_balance.policy, LoadBalancePolicy::None);
+    ctx.state = result.next_state;
+    ctx.resume_event_kind = static_cast<u32>(YieldKind::Timer);
+    result = HandlerResult::unpack(least(&conn, &ctx, nullptr, 0, nullptr));
+    CHECK_EQ(result.action, HandlerAction::Forward);
+    CHECK_EQ(conn.forward_load_balance.policy, LoadBalancePolicy::LeastRequests);
+    CHECK(conn.forward_load_balance.site != first_site);
+    engine.shutdown();
+    out.destroy();
 }

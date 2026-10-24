@@ -1200,6 +1200,14 @@ inline VerifyResult verify_module_impl(const Module& mod,
             if (block.insts == nullptr) continue;
             for (u32 ii = 0; ii < block.inst_count; ii++) {
                 const Instruction& inst = block.insts[ii];
+                if (inst.op == Opcode::RetForward || inst.op == Opcode::RetForwardBundle) {
+                    const u32 encoded = static_cast<u32>(inst.imm.i32_val);
+                    const ForwardLoadBalance lb{static_cast<u16>(encoded >> 8),
+                                                static_cast<LoadBalancePolicy>(encoded & 255)};
+                    if ((encoded >> 8) > kMaxForwardSites || !forward_load_balance_valid(lb))
+                        return verify_fail(
+                            summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
+                }
                 if (inst.op != Opcode::RetForwardBundle) continue;
                 if (inst.operand_count != 3)
                     return verify_fail(
