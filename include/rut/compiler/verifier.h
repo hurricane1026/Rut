@@ -42,6 +42,7 @@ enum class VerifyIssueCode : u8 {
     TooManyBlocks,
     UnreachableBlock,
     InvalidForwardPreflight,
+    InvalidHttpCachePolicy,
     InvalidPreRoutePolicyId,
 };
 
@@ -1162,6 +1163,9 @@ inline VerifyResult verify_module_impl(const Module& mod,
 
     for (u32 fi = 0; fi < mod.func_count; fi++) {
         const Function& fn = mod.functions[fi];
+        if (fn.http_cache_ttl > 86400 || (fn.http_cache_ttl && (fn.http_method != kRouteMethodGet ||
+                                                                fn.is_timer || fn.yield_count)))
+            return verify_fail(summary, VerifyIssueCode::InvalidHttpCachePolicy, fi);
         const ForwardPreflightMode preflight_mode = fn.forward_preflight_mode;
         const u16 preflight_id = fn.preflight_forward_policy_bundle_id;
         if (!forward_preflight_mode_valid(preflight_mode) ||
@@ -1290,7 +1294,7 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 fn.block_count != 1 || sole_timeout_block != 0 || fn.blocks == nullptr ||
                 fn.blocks[0].inst_count < 4 || fn.yield_count != 0 || fn.state_zero_enters_entry ||
                 fn.has_explicit_resume_blocks || fn.rate_limit.count != 0 ||
-                fn.throttle_down_bps != 0)
+                fn.throttle_down_bps != 0 || fn.http_cache_ttl != 0)
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
             const Block& block = fn.blocks[0];
             for (u32 ii = 0; ii + 1 < block.inst_count; ii++) {
@@ -1309,7 +1313,7 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 fn.block_cap < fn.block_count || fn.value_count != 7 ||
                 fn.value_cap < fn.value_count || fn.yield_count != 0 ||
                 fn.state_zero_enters_entry || fn.has_explicit_resume_blocks ||
-                fn.rate_limit.count != 0 || fn.throttle_down_bps != 0)
+                fn.rate_limit.count != 0 || fn.throttle_down_bps != 0 || fn.http_cache_ttl != 0)
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
             const Block& entry = fn.blocks[0];
             const Block& then_block = fn.blocks[1];
@@ -1412,7 +1416,7 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 fn.block_cap < fn.block_count || fn.value_count != 6 ||
                 fn.value_cap < fn.value_count || fn.yield_count != 0 ||
                 fn.state_zero_enters_entry || fn.has_explicit_resume_blocks ||
-                fn.rate_limit.count != 0 || fn.throttle_down_bps != 0)
+                fn.rate_limit.count != 0 || fn.throttle_down_bps != 0 || fn.http_cache_ttl != 0)
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
             const Block& entry = fn.blocks[0];
             const Block& then_block = fn.blocks[1];
@@ -1554,6 +1558,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidJumpTarget";
         case VerifyIssueCode::InvalidRedirectPolicyId:
             return "InvalidRedirectPolicyId";
+        case VerifyIssueCode::InvalidHttpCachePolicy:
+            return "InvalidHttpCachePolicy";
         case VerifyIssueCode::InvalidPreRoutePolicyId:
             return "InvalidPreRoutePolicyId";
         case VerifyIssueCode::InvalidUnmatchedPolicyId:

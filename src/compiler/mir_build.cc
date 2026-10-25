@@ -111,7 +111,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
     const bool common = function.locals.len == 0 && function.waits.len == 0 &&
                         !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
                         function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&
-                        !function.is_timer;
+                        function.http_cache_ttl == 0 && !function.is_timer;
     if (function.forward_preflight_mode == ForwardPreflightMode::EagerDirect) {
         return common && function.blocks.len == 1 && &function.blocks[0].term == preflight_term &&
                preflight_term->kind == MirTerminatorKind::ForwardUpstream &&
@@ -1366,6 +1366,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         fn.forward_preflight_mode = module.routes[i].forward_preflight_mode;
         fn.rate_limit = module.routes[i].rate_limit;
         fn.throttle_down_bps = module.routes[i].throttle_down_bps;
+        fn.http_cache_ttl = module.routes[i].http_cache_ttl;
         fn.is_timer = module.routes[i].is_timer;
         fn.timer_interval_ms = module.routes[i].timer_interval_ms;
         fn.timer_shard = module.routes[i].timer_shard;

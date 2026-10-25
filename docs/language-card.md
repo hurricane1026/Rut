@@ -1411,3 +1411,42 @@ unsupported configuration to 503 and invalid tokens to a challenged 401.
 expiry and scopes. Signature verification does not replace claims policy.
 This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism;
 asymmetric JWT/JWKS remain separate work.
+
+## Public HTTP response cache (implemented)
+
+```rut
+@cache(ttl: 30s)
+route GET "/assets" {
+    return forward(origin, load_balance: .roundRobin)
+}
+```
+
+`@cache` accepts one `ttl:` argument: a whole-second duration from `1s` to
+`24h` (`s`, `m`, `h`). It requires an explicit GET route without `wait`.
+Handlers, guards and rate limits run before lookup. Only forwarded responses
+are cached; local `return` responses are not cached.
+
+This is a bounded, per-shard, in-memory cache for public anonymous content.
+Requests with `Authorization`, `Proxy-Authorization`, `X-API-Key`, cookies,
+bodies, range/conditional headers, or `no-cache`/`no-store` bypass it. Use it
+only on public routes: custom credentials in query parameters or other header
+names are not recognized automatically. Request `only-if-cached` returns 504
+on a miss. Request `max-age` and `min-fresh` can tighten freshness.
+
+Only complete 200 responses with `Content-Length`, a valid IMF-fixdate `Date`,
+and a wire size at most 16 KiB minus 256 bytes are stored. `private`,
+`no-cache`, `no-store`, `Set-Cookie`, `Vary: *`, chunked, incomplete and
+unsupported responses are forwarded without storage. Origin `s-maxage`,
+`max-age`, `Expires`, `Date` and `Age` affect freshness; `ttl` is the default
+and upper bound. Hits include an updated `Age` header.
+
+Keys include configuration, route, upstream, peer address, transport, exact
+path/query and end-to-end request headers, so header variants remain separate.
+Each shard holds up to 64 entries; capacity pressure may evict entries before
+TTL. Forwarded unsafe requests invalidate that shard's entries for the same host, both
+at dispatch and on successful response headers. Other shards are independent;
+this is not cross-shard write coherence. Configuration reloads start a new
+cache namespace. HTTP/1.1 and HTTP/2 clients work with both I/O backends.
+
+Revalidation (304), stale serving, request coalescing, configurable capacity,
+private caches, persistence and distributed invalidation are not implemented.

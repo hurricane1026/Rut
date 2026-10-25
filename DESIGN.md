@@ -8251,3 +8251,41 @@ unsupported configuration to 503 and invalid tokens to a challenged 401.
 expiry and scopes. Signature verification does not replace claims policy.
 This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism;
 asymmetric JWT/JWKS remain separate work.
+
+### Public HTTP response cache
+
+Implemented `@cache(ttl: Duration)` on explicit GET routes, using the existing
+decorator grammar and route metadata through HIR/MIR/RIR and native artifacts.
+The runtime executes route handlers before cache lookup. Each shard owns a
+bounded 64-entry, four-way cache with fixed key/response storage, generation
+checked fill tokens, and connection-owned copies for asynchronous sends.
+Cancelled or invalidated fills cannot publish into reused entries. Cache
+namespaces change with configuration installation, including native loads.
+
+The initial policy is anonymous public responses only, conservative request
+header variant keys, complete bounded 200/Content-Length responses, and HTTP
+freshness/Age accounting capped by route TTL. Credential-bearing requests and
+private/cookie responses bypass storage. Forwarded unsafe methods invalidate matching
+host entries on the local shard; cross-shard coherence is deliberately absent.
+See [the language card](docs/language-card.md#public-http-response-cache-implemented)
+for policy limits, syntax and deferred capabilities. HTTP/1 and HTTP/2 both
+copy cache hits before scheduling output, and cache routes bypass prebuilt
+response shortcuts in both epoll and io_uring.
+
+Cache storage is separated from HTTP policy. `HttpCachePolicy` builds keys,
+checks request/response eligibility, accounts for freshness, and serializes
+hits. `HttpResponseCache<Store>` coordinates that policy with the compile-time
+store contract in `http_cache_store.h`; `HttpCache` selects
+`MemoryHttpCacheStore` for the existing transport callbacks. Only the memory
+store owns slots, replacement policy, copied keys/values and fill generations.
+Store lookup/reservation failure bypasses caching (or returns 504 for
+`only-if-cached`); failed publication discards that fill. Cancellation preserves
+a previously stored record, while invalidation/discard also remove it.
+
+The current store contract completes inline and forbids blocking I/O. Lookup
+views live until the next store mutation; reserve/publish copy borrowed inputs
+before returning. Cache hits are copied into connection-owned buffers before
+any store mutation. Disk/Redis backends are not implemented: they will require
+an asynchronous submission/completion adapter, owned operation buffers,
+connection cancellation and a shared namespace/invalidation design. This
+refactor adds no language syntax or runtime backend-selection configuration.

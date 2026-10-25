@@ -14,6 +14,7 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/buffered_send_vector.h"
 #include "rut/runtime/chunked_parser.h"
+#include "rut/runtime/http_cache.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/listener_context.h"
@@ -604,6 +605,12 @@ struct ConnectionBase {
     // or close). `upstream_slot_uid` records which backend's gauge to decrement.
     bool upstream_slot_held;
     u16 upstream_slot_uid;
+
+    HttpCache::Token http_cache_token{};
+    u32 http_cache_ttl = 0;
+    u32 http_cache_route = 0;
+    u64 http_cache_config = 0;
+    u64 http_cache_mutation_host = 0;
 
     // @throttle downstream pacing — per-connection token bucket (virtual-time /
     // GCRA) for sends to the client. Set per request from the matched route. The
@@ -1995,6 +2002,12 @@ struct ConnectionBase {
         response_header_buf.bind(nullptr, 0);
         upstream_slot_held = false;
         upstream_slot_uid = 0;
+        if (http_cache_token.generation) local_http_cache().cancel(http_cache_token);
+        http_cache_token = {};
+        http_cache_ttl = 0;
+        http_cache_route = 0;
+        http_cache_config = 0;
+        http_cache_mutation_host = 0;
         throttle_down_bps = 0;
         throttle_tat_ns = 0;
         throttle_paused = false;

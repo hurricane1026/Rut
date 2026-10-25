@@ -17,6 +17,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/grpc_protocol.h"
 #include "rut/runtime/http2_conn.h"
+#include "rut/runtime/http_cache_connection.h"
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/rate_limit_enforce.h"
@@ -624,6 +625,7 @@ inline bool h2_proxy_request_forwardable(const hpack::Header* hs, u32 n) {
 }
 
 inline void h2_clear_pending(Http2Conn& h2) {
+    h2.pending_http_cache_ttl = h2.pending_http_cache_route = 0;
     h2.pending_stream = 0;
     h2.pending_is_head = false;
     h2.pending_body_start = 0;
@@ -1078,6 +1080,8 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_state = 0;
     h2.async_load_balance = {};
     h2.async_upstream_id = 0;
+    h2.async_http_cache_ttl = 0;
+    h2.async_http_cache_route = 0;
     h2.async_resp_len = 0;
 }
 
@@ -1160,7 +1164,9 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
                       const RouteConfig* cfg,
                       u16 upstream_id,
                       const u8* synth,
-                      u32 synth_len) {
+                      u32 synth_len,
+                      u32 cache_ttl = 0,
+                      u32 cache_route = 0) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse while another stream is suspended OR a body-reading request is
     // deferred — both reuse pending_synth (see h2_suspend_timer) — OR while
@@ -1174,6 +1180,8 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     h2->async_stream = stream_id;
     h2->async_is_head = false;
     h2->async_kind = H2AsyncKind::Proxy;
+    h2->async_http_cache_ttl = cache_ttl;
+    h2->async_http_cache_route = cache_route;
     h2->async_cfg = cfg;
     h2->async_load_balance = d.conn->forward_load_balance;
     h2->async_upstream_id = upstream_id;
@@ -1352,7 +1360,19 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                                                    static_cast<u16>(kOutcome.upstream_id),
                                                    forward_synth,
                                                    forward_len);
-        if (!parked) h2_emit_status(d, stream_id, 503);
+        if (!parked)
+            h2_emit_status(d, stream_id, 503);
+        else {
+            const u32 ttl = route ? route->http_cache_ttl : 0;
+            const u32 index = route ? static_cast<u32>(route - cfg->routes) : 0;
+            if (d.conn->h2->pending_stream == stream_id) {
+                d.conn->h2->pending_http_cache_ttl = ttl;
+                d.conn->h2->pending_http_cache_route = index;
+            } else {
+                d.conn->h2->async_http_cache_ttl = ttl;
+                d.conn->h2->async_http_cache_route = index;
+            }
+        }
         return;
     }
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
@@ -1440,13 +1460,16 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const RouteConfig* cfg = h2->pending_route_config;
         d.conn->forward_load_balance = h2->pending_load_balance;
         const u16 kUpstreamId = h2->pending_forward_upstream_id;
+        const u32 kCacheTtl = h2->pending_http_cache_ttl;
+        const u32 kCacheRoute = h2->pending_http_cache_route;
         const u8* synth = h2->pending_synth;
         h2_clear_pending(*h2);
         if (kBodyLen != 0) {
             h2_emit_status(d, stream_id, 503);
             return;
         }
-        if (!h2_suspend_proxy(d, stream_id, cfg, kUpstreamId, synth, kSynthLen))
+        if (!h2_suspend_proxy(
+                d, stream_id, cfg, kUpstreamId, synth, kSynthLen, kCacheTtl, kCacheRoute))
             h2_emit_status(d, stream_id, 503);
         return;
     }
@@ -1872,7 +1895,14 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     h2_emit_status(d, stream_id, 400);
                     return;
                 }
-                if (!h2_suspend_proxy(d, stream_id, config, route->upstream_id, synth, kSynthLen))
+                if (!h2_suspend_proxy(d,
+                                      stream_id,
+                                      config,
+                                      route->upstream_id,
+                                      synth,
+                                      kSynthLen,
+                                      route->http_cache_ttl,
+                                      static_cast<u32>(route - config->routes)))
                     h2_emit_status(d, stream_id, 503);  // a stream is already suspended
             }
             return;

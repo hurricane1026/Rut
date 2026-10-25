@@ -165,6 +165,8 @@ bool load_native_program(const char* source,
         snprintf(error, error_size, "native program destination is already populated");
         return false;
     }
+    out.config.http_cache_identity = http_cache_config_identity();
+    out.config.http_cache_route_count = 0;
     StartupSignalScope startup_signals;
     if (!startup_signals.ready()) return fail("cannot install startup signal handlers");
 #if !RUT_ENABLE_EBPF
@@ -457,6 +459,10 @@ bool load_native_program(const char* source,
     if (h.dispatch == RouteConfig::DispatchKind::SegmentTrie) c.use_segment_trie();
     for (u32 i = 0; i < h.route_count; i++) {
         const auto& r = c.routes[i];
+        if (r.http_cache_ttl) ++c.http_cache_route_count;
+        if (r.http_cache_ttl > HttpCache::kMaxTtl ||
+            (r.http_cache_ttl && r.method != kRouteMethodGet))
+            return fail("invalid native HTTP cache policy");
         if (r.path_len >= RouteEntry::kMaxPathLen || r.path[r.path_len] != '\0' ||
             !RouteConfig::is_routable_path(r.path) || !c.populate_dispatch_state(r))
             return fail("cannot rebuild native route index");

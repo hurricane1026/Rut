@@ -90,6 +90,8 @@ void Http2Conn::init() {
     async_state = 0;
     async_load_balance = {};
     async_upstream_id = 0;
+    pending_http_cache_ttl = pending_http_cache_route = 0;
+    async_http_cache_ttl = async_http_cache_route = 0;
     async_resp_len = 0;
     outbound_stream = 0;
     outbound_config = nullptr;

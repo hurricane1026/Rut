@@ -219,6 +219,10 @@ struct Http2Conn {
     // response buffer once the request is sent).
     ForwardLoadBalance async_load_balance;
     u16 async_upstream_id;
+    u32 pending_http_cache_ttl;
+    u32 pending_http_cache_route;
+    u32 async_http_cache_ttl;
+    u32 async_http_cache_route;
     u32 async_resp_len;
 
     // One response body owner is staged at a time. The body remains a borrowed

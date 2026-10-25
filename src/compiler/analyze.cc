@@ -19682,7 +19682,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         bool has_guarding_decorator = false;
         for (u32 di = 0; di < route_decl.decorators.len; di++) {
             const Str dn = route_decl.decorators[di].name;
-            if (!dn.eq({"rateLimit", 9}) && !dn.eq({"throttle", 8})) {
+            if (!dn.eq({"rateLimit", 9}) && !dn.eq({"throttle", 8}) && !dn.eq(lit_str("cache"))) {
                 has_guarding_decorator = true;
                 break;
             }
@@ -21075,6 +21075,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // Official built-in decorators are recognized here and lowered to
             // route metadata, not resolved to user functions. @rateLimit sets
             // the per-route GCRA limits (enforced in the runtime).
+            if (ast_deco.name.eq(lit_str("cache"))) {
+                if (route.http_cache_ttl != 0 || route.waits.len != 0 || route_decl.method_is_any ||
+                    route.method != kRouteMethodGet)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        ast_deco.span,
+                        lit_str("@cache is supported once on an explicit GET route"));
+                route.http_cache_ttl = ast_deco.http_cache_ttl;
+                continue;
+            }
             if (ast_deco.name.eq({"rateLimit", 9})) {
                 // Every configured rule must fit; dropping one weakens the policy.
                 const i32 kRuleIdx = route.rate_limit.add_rule(ast_deco.rate_limit_max,

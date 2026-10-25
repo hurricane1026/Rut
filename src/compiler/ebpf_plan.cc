@@ -33,7 +33,8 @@ ebpf::RoutePlan classify(const rir::Function& fn, const rir::Module& module, boo
         return plan;
     };
     if (tls) return reject(Reason::Tls);
-    if (fn.rate_limit.count || fn.throttle_down_bps) return reject(Reason::Metering);
+    if (fn.rate_limit.count || fn.throttle_down_bps || fn.http_cache_ttl)
+        return reject(Reason::Metering);
     for (u32 b = 0; b < fn.block_count; ++b) {
         for (u32 i = 0; i < fn.blocks[b].inst_count; ++i) {
             const auto kOp = fn.blocks[b].insts[i].op;

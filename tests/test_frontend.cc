@@ -40981,3 +40981,42 @@ route GET "/" {
     CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqRemoveHeader));
     rir.destroy();
 }
+
+TEST(frontend, public_http_cache_metadata_is_preserved_and_invalid_policies_reject) {
+    const char* source = R"rut(
+upstream origin at "127.0.0.1:8000"
+@cache(ttl: 30s)
+route GET "/" { return forward(origin, load_balance: .roundRobin) }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].http_cache_ttl, 30u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].http_cache_ttl, 30u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.functions[0].http_cache_ttl, 30u);
+    REQUIRE(rir::verify_module(rir.module).ok);
+    rir.module.functions[0].http_cache_ttl = 86401;
+    CHECK(!rir::verify_module(rir.module).ok);
+    rir.destroy();
+    const char* invalid[] = {
+        "@cache(ttl: 0s) route GET \"/\" { return 200 }",
+        "@cache(ttl: 25h) route GET \"/\" { return 200 }",
+        "@cache(ttl: 1ms) route GET \"/\" { return 200 }",
+        "@cache(ttl: 1s) route POST \"/\" { return 200 }",
+        "@cache(ttl: 1s) route \"/\" { return 200 }",
+        "@cache(ttl: 1s) @cache(ttl: 2s) route GET \"/\" { return 200 }",
+    };
+    for (const char* bad : invalid) {
+        auto bad_tokens = lex(lit(bad));
+        REQUIRE(bad_tokens);
+        auto bad_ast = parse_file_heap(bad_tokens.value());
+        if (bad_ast) CHECK(!analyze_file_heap(bad_ast.value()));
+    }
+}
