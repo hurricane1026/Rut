@@ -543,6 +543,7 @@ struct AstDecorator {
     // @throttle(downstream: <ByteSize> per <duration>): client-send byte rate,
     // stored as bytes/second (0 = none).
     u32 throttle_down_bps = 0;
+    u32 http_cache_ttl = 0;
 };
 
 enum class AstChainStepKind : u8 {

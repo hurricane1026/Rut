@@ -106,6 +106,7 @@ add_library(rut_runtime STATIC
     placement_new.cc
     runtime/auth.cc
     runtime/hash.cc
+    runtime/http_cache.cc
     runtime/jwt_claims.cc
     runtime/arena.cc
     runtime/callbacks.cc

@@ -359,6 +359,7 @@ struct MirFunction {
     RateLimitRuleSet rate_limit{};
     // @throttle client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
+    u32 http_cache_ttl = 0;
     // Timer function: a `timer name, every: D {...}` periodic task (path holds the
     // name). Carried to the RIR Function so config registers it into the timer
     // table instead of the route table.
@@ -383,6 +384,7 @@ struct MirFunction {
           forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
+          http_cache_ttl(other.http_cache_ttl),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
           timer_shard(other.timer_shard) {
@@ -407,6 +409,7 @@ struct MirFunction {
         forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        http_cache_ttl = other.http_cache_ttl;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;
@@ -429,6 +432,7 @@ struct MirFunction {
           forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
+          http_cache_ttl(other.http_cache_ttl),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
           timer_shard(other.timer_shard) {
@@ -453,6 +457,7 @@ struct MirFunction {
         forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        http_cache_ttl = other.http_cache_ttl;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;

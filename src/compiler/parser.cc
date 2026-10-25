@@ -4985,6 +4985,23 @@ struct Parser {
         deco.span =
             Span{at.value()->start, name_tok.value()->end, at.value()->line, at.value()->col};
 
+        if (deco.name.eq(lit_str("cache"))) {
+            constexpr Str kDetail = lit_str("@cache requires ttl: a duration from 1s to 24h");
+            if (!expect(TokenType::LParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, kDetail);
+            auto label = expect(TokenType::Ident);
+            if (!label || !label.value()->text.eq(lit_str("ttl")) || !expect(TokenType::Colon))
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, kDetail);
+            auto duration = expect(TokenType::DurLit);
+            if (!duration) return core::make_unexpected(duration.error());
+            const Str text = duration.value()->text;
+            if ((text.len >= 2 && Str{text.ptr + text.len - 2, 2}.eq(lit_str("ms"))) ||
+                !dur_lit_to_rate_limit_seconds(text, &deco.http_cache_ttl) ||
+                deco.http_cache_ttl == 0 || deco.http_cache_ttl > 86400 ||
+                !expect(TokenType::RParen))
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, kDetail);
+            return deco;
+        }
         if (deco.name.eq({"rateLimit", 9})) {
             // @rateLimit(limit: <IntLit>, window: <DurLit>)
             if (!expect(TokenType::LParen))

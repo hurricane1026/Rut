@@ -113,6 +113,8 @@ inline bool rir_function_needs_req_body(const rir::Function& fn) {
 
 inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     if (cfg.route_count != 0) return false;
+    cfg.http_cache_identity = http_cache_config_identity();
+    cfg.http_cache_route_count = 0;
     if (mod.func_count > 0 && mod.functions == nullptr) return false;
 
     // Count only HTTP routes — timer functions are fired on a schedule, not matched
@@ -320,6 +322,8 @@ inline bool register_verified_jit_routes(RouteConfig& cfg,
                     }
                 }
             }
+            if (!target.set_route_http_cache(target.route_count - 1, fn.http_cache_ttl))
+                return false;
             if (fn.throttle_down_bps > 0 &&
                 !target.set_route_throttle(target.route_count - 1, fn.throttle_down_bps))
                 return false;

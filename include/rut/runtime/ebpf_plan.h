@@ -19,7 +19,8 @@ inline bool validate_ebpf_plan(const ebpf::Plan& plan, const RouteConfig& config
             if (route.reason != ebpf::Reason::None || route.upstream_id >= config.upstream_count ||
                 config.upstreams[route.upstream_id].http2 ||
                 entry.action != RouteAction::JitHandler || entry.needs_req_body ||
-                entry.rate_limit.count || entry.throttle_down_bps || entry.ws_terminate ||
+                entry.rate_limit.count || entry.throttle_down_bps || entry.http_cache_ttl ||
+                entry.ws_terminate ||
                 (route.request_policy_id != 0 &&
                  !request_policy_is_supported(route.request_policy_id)) ||
                 (route.response_policy_id != 0 &&

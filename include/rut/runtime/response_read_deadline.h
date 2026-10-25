@@ -571,7 +571,7 @@ inline bool header_only_head_explicit_close_arm_is_stable(
     const RouteEntry& route = config->routes[proof.route_index];
     if (route.action != RouteAction::JitHandler || route.fn != proof.route_fn ||
         route.needs_req_body || route.rate_limit.count != 0 || route.throttle_down_bps != 0 ||
-        route.ws_terminate ||
+        route.http_cache_ttl != 0 || route.ws_terminate ||
         !forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) ||
         route.preflight_forward_policy_bundle_id != bundle_id ||
         !response_read_deadline_route_method_matches(c.req_method, route.method) ||
@@ -854,7 +854,8 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
            (explicit_close || default_keep_alive) && route.action == RouteAction::JitHandler &&
            route.fn == copied_proof.route_fn &&
            route.method == c.http1_prebuilt_deadline_route_method && !route.needs_req_body &&
-           route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
+           route.rate_limit.count == 0 && route.throttle_down_bps == 0 &&
+           route.http_cache_ttl == 0 && !route.ws_terminate &&
            forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
            route.preflight_forward_policy_bundle_id == bundle_id && target.addr_count == 1 &&
            target.addrs[0].sin_family == AF_INET && target.max_inflight == 0 &&
@@ -1034,7 +1035,7 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
     const UpstreamTarget& target = cfg->upstreams[proof.upstream_id];
     return route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
            route.fn != nullptr && !route.needs_req_body && route.rate_limit.count == 0 &&
-           route.throttle_down_bps == 0 && !route.ws_terminate &&
+           route.throttle_down_bps == 0 && route.http_cache_ttl == 0 && !route.ws_terminate &&
            forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
            route.preflight_forward_policy_bundle_id == bundle_id && route.method == route_method &&
            response_read_deadline_route_method_matches(c.req_method, route.method) &&
@@ -1294,7 +1295,7 @@ inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
         (allow_retired_episode && proof.upload_episode == c.upstream_retiring_episode);
     return episode && route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
            !route.needs_req_body && route.rate_limit.count == 0 && route.throttle_down_bps == 0 &&
-           !route.ws_terminate &&
+           route.http_cache_ttl == 0 && !route.ws_terminate &&
            forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
            route.preflight_forward_policy_bundle_id == identity_bundle_id &&
            route.method == kRouteMethodGet && target.addr_count == 1 &&
@@ -1594,7 +1595,7 @@ inline bool http1_pipeline_successor_selected_identity_is_stable(
     const UpstreamTarget& target = cfg->upstreams[proof.upstream_id];
     return route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
            !route.needs_req_body && route.rate_limit.count == 0 && route.throttle_down_bps == 0 &&
-           !route.ws_terminate && route.method == kRouteMethodGet &&
+           route.http_cache_ttl == 0 && !route.ws_terminate && route.method == kRouteMethodGet &&
            cfg->policy_bundle_id_is_valid(c.response_read_deadline_bundle_id) &&
            forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
            route.preflight_forward_policy_bundle_id == c.response_read_deadline_bundle_id &&
@@ -1749,9 +1750,9 @@ inline bool http1_pipeline_request_generation_prebuilt_is_stable(
            route.method == kRouteMethodGet &&
            forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
            route.preflight_forward_policy_bundle_id == copied_bundle_id && !route.needs_req_body &&
-           route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
-           target.addr_count == 1 && target.addrs[0].sin_family == AF_INET &&
-           target.max_inflight == 0;
+           route.rate_limit.count == 0 && route.throttle_down_bps == 0 &&
+           route.http_cache_ttl == 0 && !route.ws_terminate && target.addr_count == 1 &&
+           target.addrs[0].sin_family == AF_INET && target.max_inflight == 0;
 }
 
 // A response can be staged through SSL_write only when no older TLS output or
@@ -2068,7 +2069,8 @@ inline bool header_only_head_keep_alive_arm_is_stable(const Connection& c,
     return c.response_read_deadline_bundle_id == bundle_id &&
            route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
            route.method == c.response_read_deadline_route_method && !route.needs_req_body &&
-           route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
+           route.rate_limit.count == 0 && route.throttle_down_bps == 0 &&
+           route.http_cache_ttl == 0 && !route.ws_terminate &&
            forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
            route.preflight_forward_policy_bundle_id == bundle_id && target.addr_count == 1 &&
            target.addrs[0].sin_family == AF_INET && target.max_inflight == 0 &&
@@ -2128,7 +2130,8 @@ inline bool bodyless_get_keep_alive_precise_arm_is_stable(
     return c.response_read_deadline_bundle_id == bundle_id &&
            route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
            route.method == kRouteMethodGet && !route.needs_req_body &&
-           route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
+           route.rate_limit.count == 0 && route.throttle_down_bps == 0 &&
+           route.http_cache_ttl == 0 && !route.ws_terminate &&
            forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
            route.preflight_forward_policy_bundle_id == bundle_id && target.addr_count == 1 &&
            target.addrs[0].sin_family == AF_INET && target.max_inflight == 0 &&

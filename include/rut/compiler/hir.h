@@ -1189,6 +1189,7 @@ struct HirRoute {
     RateLimitRuleSet rate_limit{};
     // @throttle decorator → client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
+    u32 http_cache_ttl = 0;
     // WebSocket terminate mode: when the route body is `websocket(x){...}`, this
     // route has no HTTP terminator — `ws_handler` carries the frame-handler
     // verdict instead and `control` is unused. (Slice B; lowering rejects it
@@ -1222,6 +1223,7 @@ struct HirRoute {
           forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
+          http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
@@ -1247,6 +1249,7 @@ struct HirRoute {
         forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
@@ -1272,6 +1275,7 @@ struct HirRoute {
           forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
+          http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
@@ -1297,6 +1301,7 @@ struct HirRoute {
         forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;

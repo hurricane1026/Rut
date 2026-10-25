@@ -3508,7 +3508,7 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
     const bool common = function.locals.len == 0 && function.waits.len == 0 &&
                         !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
                         function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&
-                        !function.is_timer;
+                        function.http_cache_ttl == 0 && !function.is_timer;
     if (function.forward_preflight_mode == ForwardPreflightMode::EagerDirect) {
         const bool complete = forward_response_buffering_uses_content_length_machinery(
             timeout_term->forward_response_buffering);
@@ -4351,6 +4351,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         fn.value()->rate_limit = mir.functions[i].rate_limit;
         fn.value()->forward_preflight_mode = mir.functions[i].forward_preflight_mode;
         fn.value()->throttle_down_bps = mir.functions[i].throttle_down_bps;
+        fn.value()->http_cache_ttl = mir.functions[i].http_cache_ttl;
         fn.value()->is_timer = mir.functions[i].is_timer;
         fn.value()->timer_interval_ms = mir.functions[i].timer_interval_ms;
         fn.value()->timer_shard = mir.functions[i].timer_shard;

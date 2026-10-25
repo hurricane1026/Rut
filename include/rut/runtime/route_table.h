@@ -15,6 +15,7 @@
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/http_cache.h"
 #include "rut/runtime/rate_limit_key.h"
 #include "rut/runtime/route_art.h"
 #include "rut/runtime/route_canon.h"   // canonicalize_request
@@ -145,6 +146,7 @@ struct RouteEntry {
     // Per-route client-send byte rate (bytes/sec, 0 = unlimited). The runtime
     // paces the response so it isn't sent faster than this.
     u32 throttle_down_bps = 0;
+    u32 http_cache_ttl = 0;
     // WebSocket TERMINATE mode (Proxy routes only). When `ws_terminate` is set, a 101
     // upgrade enters frame-inspection mode instead of the raw passthrough tunnel: each
     // reassembled message is handed to `ws_frame_handler` (forward/drop/close), bounded by
@@ -346,6 +348,8 @@ struct RouteConfig {
 
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
+    u64 http_cache_identity = http_cache_config_identity();
+    u32 http_cache_route_count = 0;
     // Runtime sidecars are excluded from native metadata. Each shard exclusively
     // owns its row; the existing request epoch pins the sidecar with its config.
     mutable BackendSelectionState backend_selection[kMaxShards]{};
@@ -1606,6 +1610,16 @@ public:
         return true;
     }
 
+    // Attach bounded public GET caching (seconds, 0 disables).
+    bool set_route_http_cache(u32 idx, u32 ttl) {
+        if (idx >= route_count || ttl > HttpCache::kMaxTtl ||
+            (ttl != 0 && routes[idx].method != kRouteMethodGet))
+            return false;
+        if (routes[idx].http_cache_ttl) --http_cache_route_count;
+        routes[idx].http_cache_ttl = ttl;
+        if (ttl) ++http_cache_route_count;
+        return true;
+    }
     // Attach a per-route client-send byte rate (bytes/sec, 0 disables). Set by
     // the @throttle decorator via register_jit_routes. Returns false on a bad
     // index.

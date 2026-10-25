@@ -8251,3 +8251,23 @@ unsupported configuration to 503 and invalid tokens to a challenged 401.
 expiry and scopes. Signature verification does not replace claims policy.
 This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism;
 asymmetric JWT/JWKS remain separate work.
+
+### Public HTTP response cache
+
+Implemented `@cache(ttl: Duration)` on explicit GET routes, using the existing
+decorator grammar and route metadata through HIR/MIR/RIR and native artifacts.
+The runtime executes route handlers before cache lookup. Each shard owns a
+bounded 64-entry, four-way cache with fixed key/response storage, generation
+checked fill tokens, and connection-owned copies for asynchronous sends.
+Cancelled or invalidated fills cannot publish into reused entries. Cache
+namespaces change with configuration installation, including native loads.
+
+The initial policy is anonymous public responses only, conservative request
+header variant keys, complete bounded 200/Content-Length responses, and HTTP
+freshness/Age accounting capped by route TTL. Credential-bearing requests and
+private/cookie responses bypass storage. Forwarded unsafe methods invalidate matching
+host entries on the local shard; cross-shard coherence is deliberately absent.
+See [the language card](docs/language-card.md#public-http-response-cache-implemented)
+for policy limits, syntax and deferred capabilities. HTTP/1 and HTTP/2 both
+copy cache hits before scheduling output, and cache routes bypass prebuilt
+response shortcuts in both epoll and io_uring.

@@ -7,7 +7,7 @@ namespace rut::native {
 // Private, same-build ABI. Artifacts contain executable code and are trusted
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
-constexpr u32 kVersion = 4;
+constexpr u32 kVersion = 5;
 struct StreamHeader {
     u64 magic;
     u32 version;

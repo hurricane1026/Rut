@@ -9,6 +9,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/connection_capacity.h"
+#include "rut/runtime/http_cache_connection.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
@@ -1290,7 +1291,7 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
     const RouteEntry& pinned = config->routes[proof.route_index];
     if (pinned.action != RouteAction::JitHandler || pinned.fn != proof.route_fn ||
         pinned.needs_req_body || pinned.rate_limit.count != 0 || pinned.throttle_down_bps != 0 ||
-        pinned.ws_terminate ||
+        pinned.http_cache_ttl != 0 || pinned.ws_terminate ||
         !forward_preflight_mode_can_own_runtime_deadline(pinned.forward_preflight_mode) ||
         pinned.preflight_forward_policy_bundle_id != conn.response_read_deadline_bundle_id ||
         pinned.method != conn.response_read_deadline_route_method ||
@@ -1360,7 +1361,7 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
         if (config == nullptr || conn.request_config != config ||
             !config->policy_bundle_id_is_valid(id) || route->action != RouteAction::JitHandler ||
             route->fn == nullptr || route->needs_req_body || route->rate_limit.count != 0 ||
-            route->throttle_down_bps != 0 || route->ws_terminate ||
+            route->throttle_down_bps != 0 || route->http_cache_ttl != 0 || route->ws_terminate ||
             conn.response_read_deadline_state != ResponseReadDeadlineState::None) {
             loop->close_conn(conn);
             return false;
@@ -1586,7 +1587,7 @@ inline bool deferred_canonical_selection_route_is_valid(const Connection& conn,
     for (u32 i = 0; i < config->route_count; i++) owned = owned || route == &config->routes[i];
     if (!owned || route->action != RouteAction::JitHandler || route->fn == nullptr ||
         route->fn != fn || route->needs_req_body || route->rate_limit.count != 0 ||
-        route->throttle_down_bps != 0 || route->ws_terminate ||
+        route->throttle_down_bps != 0 || route->http_cache_ttl != 0 || route->ws_terminate ||
         route->forward_preflight_mode != ForwardPreflightMode::AfterCanonicalSelection ||
         route->preflight_forward_policy_bundle_id == 0 || route->method == kRouteMethodAny ||
         !complete_content_length_route_method_is_admitted(route->method) ||
@@ -1606,7 +1607,7 @@ inline bool deferred_request_framing_selection_route_is_valid(const Connection& 
     for (u32 i = 0; i < config->route_count; i++) owned = owned || route == &config->routes[i];
     if (!owned || route->action != RouteAction::JitHandler || route->fn == nullptr ||
         route->fn != fn || route->needs_req_body || route->rate_limit.count != 0 ||
-        route->throttle_down_bps != 0 || route->ws_terminate ||
+        route->throttle_down_bps != 0 || route->http_cache_ttl != 0 || route->ws_terminate ||
         route->forward_preflight_mode != ForwardPreflightMode::AfterRequestFramingSelection ||
         route->preflight_forward_policy_bundle_id == 0 ||
         (route->method != kRouteMethodHead && route->method != kRouteMethodGet) ||
@@ -1907,6 +1908,35 @@ void throttle_resume(Loop* loop, Connection& conn) {
         // guaranteed, so fail closed rather than stall the response until timeout.
         loop->close_conn(conn);
     }
+}
+
+template <typename Loop>
+bool try_http_cache_response(Loop* loop, Connection& conn, u16 upstream) {
+    if (!conn.http_cache_ttl) return false;
+    conn.send_buf.reset();
+    conn.http_cache_route = (conn.http_cache_route << 16) | upstream;
+    const bool keep_alive = conn.keep_alive && conn.req_keep_alive;
+    u32 length = 0;
+    const auto result = http_cache_lookup(conn,
+                                          conn.recv_buf.data(),
+                                          conn.req_header_end,
+                                          keep_alive,
+                                          conn.send_buf.write_ptr(),
+                                          conn.send_buf.write_avail(),
+                                          length);
+    if (result != HttpCache::Result::Hit && result != HttpCache::Result::OnlyCachedMiss)
+        return false;
+    conn.keep_alive = keep_alive;
+    if (result == HttpCache::Result::OnlyCachedMiss) {
+        conn.resp_status = 504;
+        format_static_response(conn, 504, conn.keep_alive);
+    } else {
+        conn.resp_status = 200;
+        conn.send_buf.commit(length);
+    }
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+    return true;
 }
 
 // Release the upstream concurrency slot taken at proxy dispatch, exactly once.
@@ -2858,6 +2888,12 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // goes immediately, then paced). client_send advances tat by len*1e9/bps at
     // full precision (see there) — there is no precomputed ns-per-byte, which
     // would round to 0 and silently disable throttling for rates >= ~1 GB/s.
+    http_cache_prepare(conn,
+                       config,
+                       route ? static_cast<u32>(route - config->routes) : 0,
+                       route ? route->http_cache_ttl : 0,
+                       conn.recv_buf.data(),
+                       conn.req_header_end);
     conn.throttle_down_bps = route ? route->throttle_down_bps : 0;
     conn.throttle_tat_ns = 0;
 #if RUT_ENABLE_WEBSOCKET
@@ -2873,6 +2909,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 #endif
 
     if (route && route->action == RouteAction::Proxy) {
+        if (route->upstream_id < config->upstream_count &&
+            !config->upstreams[route->upstream_id].http2 &&
+            try_http_cache_response(loop, conn, route->upstream_id))
+            return;
         conn.state = ConnState::Proxying;
         auto& target = config->upstreams[route->upstream_id];
         if (target.http2) {
@@ -4648,6 +4688,12 @@ void handle_jit_outcome(Loop* loop,
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
+            if (outcome.request_policy_id == 0 && outcome.policy_bundle_id == 0 &&
+                forward_response_policy_id == 0 && forward_failure_policy_id == 0 &&
+                forward_timeout_failure_policy_id == 0 &&
+                !config->upstreams[outcome.upstream_id].http2 &&
+                try_http_cache_response(loop, conn, static_cast<u16>(outcome.upstream_id)))
+                return;
             if (outcome.policy_bundle_id == 0) {
                 if ((forward_failure_policy_id != 0 &&
                      !config->failure_policy_id_is_valid(forward_failure_policy_id)) ||
@@ -4755,7 +4801,8 @@ void handle_jit_outcome(Loop* loop,
                 }
                 if (selected->action != RouteAction::JitHandler || selected->needs_req_body ||
                     selected->rate_limit.count != 0 || selected->throttle_down_bps != 0 ||
-                    selected->ws_terminate || selected->method != kRouteMethodGet ||
+                    selected->http_cache_ttl != 0 || selected->ws_terminate ||
+                    selected->method != kRouteMethodGet ||
                     !forward_preflight_mode_can_own_runtime_deadline(
                         selected->forward_preflight_mode) ||
                     selected->preflight_forward_policy_bundle_id != outcome.policy_bundle_id ||
@@ -8791,6 +8838,8 @@ void h2_proxy_finish(Loop* loop,
         h2_proxy_fail(loop, conn, 502);
         return;
     }
+    http_cache_observe_status(conn, resp.status_code);
+    if (!is_head) http_cache_complete(conn, conn.upstream_recv_buf.data(), hdr_end + body_len);
     constexpr u32 kMaxForwardHeaders = kMaxHeaders + Connection::kMaxRespHeaderMutations;
     hpack::Header hdrs[kMaxForwardHeaders];
     u32 nhdrs = 0;
@@ -8963,6 +9012,7 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (!loop->submit_recv_upstream(conn)) h2_proxy_fail(loop, conn, 502);
         return;
     }
+    http_cache_observe_status(conn, resp.status_code);
     // Headers complete.
     const u32 kHdrEnd = parser.header_end;
 
@@ -9161,6 +9211,49 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
         !forward_load_balance_valid(h2->async_load_balance)) {
         h2_proxy_fail(loop, conn, 502);
         return;
+    }
+    http_cache_prepare(conn,
+                       cfg,
+                       (h2->async_http_cache_route << 16) | upstream_id,
+                       h2->async_http_cache_ttl,
+                       h2->pending_synth,
+                       h2->async_synth_len);
+    if (conn.http_cache_ttl && !cfg->upstreams[upstream_id].http2) {
+        if (!loop->alloc_upstream_buf(conn)) {
+            h2_proxy_fail(loop, conn, 503);
+            return;
+        }
+        conn.upstream_recv_buf.reset();
+        u32 length = 0;
+        const auto result = http_cache_lookup(conn,
+                                              h2->pending_synth,
+                                              h2->async_synth_len,
+                                              true,
+                                              conn.upstream_recv_buf.write_ptr(),
+                                              conn.upstream_recv_buf.write_avail(),
+                                              length);
+        if (result == HttpCache::Result::OnlyCachedMiss) {
+            h2_proxy_fail(loop, conn, 504);
+            return;
+        }
+        if (result == HttpCache::Result::Hit) {
+            // No upstream request is sent on a hit; retire the synthesized request
+            // before the response serializer reuses its storage for the body.
+            h2->async_synth_sent = h2->async_synth_len;
+            conn.upstream_recv_buf.commit(length);
+            HttpResponseParser parser;
+            ParsedResponse response;
+            parser.reset();
+            response.reset();
+            if (parser.parse(conn.upstream_recv_buf.data(), length, &response) !=
+                ParseStatus::Complete) {
+                h2_proxy_fail(loop, conn, 502);
+                return;
+            }
+            h2_proxy_finish(
+                loop, conn, response, parser.header_end, response.content_length, false);
+            return;
+        }
     }
     // NOTE: upstream_abandoned stays true (set by the prior episode's teardown)
     // through the connect window — cleared only once the fresh upstream connects
@@ -12298,7 +12391,7 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                 conn.response_read_deadline_route_method);
         if (route == nullptr || route->action != RouteAction::JitHandler || route->fn == nullptr ||
             route->needs_req_body || route->rate_limit.count != 0 ||
-            route->throttle_down_bps != 0 || route->ws_terminate ||
+            route->throttle_down_bps != 0 || route->http_cache_ttl != 0 || route->ws_terminate ||
             !forward_preflight_mode_can_own_runtime_deadline(route->forward_preflight_mode) ||
             route->preflight_forward_policy_bundle_id != bundle_id ||
             route->method != conn.response_read_deadline_route_method ||
@@ -14247,6 +14340,29 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
+    }
+
+    http_cache_observe_status(conn, resp.status_code);
+    if (conn.http_cache_token.generation) {
+        u32 total = 0;
+        if (local_http_cache().pending(conn.http_cache_token) &&
+            HttpCache::response_can_buffer(
+                conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), total)) {
+            if (conn.upstream_recv_buf.len() < total) {
+                if (ev.result <= 0) {
+                    local_http_cache().cancel(conn.http_cache_token);
+                    conn.http_cache_token = {};
+                    loop->close_conn(conn);
+                    return;
+                }
+                if (!ev.more && !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
+                return;
+            }
+            http_cache_complete(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len());
+        } else {
+            local_http_cache().cancel(conn.http_cache_token);
+            conn.http_cache_token = {};
+        }
     }
 
     if ((explicit_first_batch || explicit_progress_batch) &&
