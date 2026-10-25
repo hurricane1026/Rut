@@ -378,6 +378,16 @@ struct Ctx {
         return fn_req_add_header;
     }
 
+    LLVMValueRef fn_req_remove_header = nullptr;
+    LLVMValueRef get_req_remove_header() {
+        if (!fn_req_remove_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
+            fn_req_remove_header = LLVMAddFunction(llvm_mod, "rut_helper_req_remove_header", ft);
+        }
+        return fn_req_remove_header;
+    }
+
     LLVMValueRef fn_resp_set_header = nullptr;
     LLVMValueRef fn_resp_add_header = nullptr;
     LLVMValueRef fn_resp_remove_header = nullptr;
@@ -1122,6 +1132,19 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            c.get_req_add_header(),
                            args,
                            5,
+                           "");
+            break;
+        }
+        case rir::Opcode::ReqRemoveHeader: {
+            const Str name = inst.imm.str_val;
+            LLVMValueRef args[] = {c.param_conn,
+                                   c.make_global_str(name, "removeheader.name"),
+                                   LLVMConstInt(c.i32_ty, name.len, 0)};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_remove_header()),
+                           c.get_req_remove_header(),
+                           args,
+                           3,
                            "");
             break;
         }

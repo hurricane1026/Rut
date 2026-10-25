@@ -333,6 +333,8 @@ canonical spelling for common gateway tasks.
 - [x] 同一 Consumer 的 Bearer OR Basic，可禁用单个认证方法，拒绝重复 Authorization，失败携带双 challenge。
 - [x] 基于已验证 Identity 的精确单 Consumer allow/deny；认证 401、授权 403、空策略 503。
 - [x] HIR/MIR 表达式池按需增长、节点地址稳定；LLVM 值/块映射超出栈缓冲区时使用 Arena。
+- [x] 显式上游凭证 Header 剥离：`req.remove("Authorization")` / 自定义 Key Header，
+  删除全部同名字段，保持原始认证读取；HTTP/1 与 H2→H1 转发共用实现。
 
 
 - [ ] API Key、Basic、JWT、HMAC：两者有对应认证插件。

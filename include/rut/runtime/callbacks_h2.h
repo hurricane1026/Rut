@@ -48,6 +48,7 @@ inline void h2_reset_request_mutations(Connection& conn, bool release_json_body 
     conn.target_transform_recorded = false;
     conn.req_header_override_count = 0;
     conn.req_header_append_mask = 0;
+    conn.req_header_remove_mask = 0;
     conn.req_header_override_overflow = false;
     conn.resp_header_mutation_pending_count = 0;
     conn.resp_header_mutation_pending_overflow = false;

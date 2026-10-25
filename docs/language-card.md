@@ -239,6 +239,7 @@ req.header("X-Request-ID")   // str?
 req.uniqueHeader("X-API-Key") // str?; missing or duplicate fields yield nil
 req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only
 req.add("X-Tag", "a")        // ✅ preserve existing fields and append
+req.remove("Authorization")  // ✅ delete every matching field before forwarding
 req.getAll("Accept")         // ⏳ [str]
 
 // Route captures / query / cookies / body
@@ -1220,6 +1221,34 @@ The example resolves secrets with existing compile-time `env()`. Missing variabl
 reject compilation, and compiled artifacts contain these constants. Serve credentials
 through TLS. Dynamic Consumer storage, live revocation, and automatic identity or
 credential forwarding are outside this static helper layer.
+
+## Credential stripping before forwarding (implemented)
+
+This covers the header-credential hiding use case documented by
+[Kong Key Auth](https://docs.konghq.com/hub/kong-inc/key-auth/configuration/)
+and [APISIX key-auth](https://apisix.apache.org/docs/apisix/plugins/key-auth/),
+using explicit Rut request mutations.
+
+`req.remove("Authorization")` and `req.remove("X-API-Key")` delete all fields
+with that name, case-insensitively, from the upstream request. Missing fields
+are a no-op; removal is distinct from setting an empty value. Ordered
+set/add/remove effects share the existing bounded request mutation log. Overflow,
+invalid direct-IR names/modes, aliased views, or unusable request framing fail
+closed before forwarding. Content-Length, Transfer-Encoding and Connection remain
+reserved. The HTTP/1 path and HTTP/2-to-HTTP/1 bridge share the same rewrite.
+
+Place removals in the leading route statements before guards/auth helper calls,
+or in an already-supported selected match arm; names must be literal safe
+HTTP tokens. Like set/add, removal after guards/waits/for remains rejected.
+Authentication reads (`req.authorization`, `req.uniqueHeader`) still observe the
+original request. Therefore declare stripping first, then verify credentials,
+then forward only on success. A rejected authentication response is never
+forwarded. Removal modes reset at each request/HTTP/2 stream boundary.
+
+See [examples/auth-proxy.rut](../examples/auth-proxy.rut). Explicitly remove each
+configured credential source and any client identity fields you do not trust.
+Query/body credentials and dynamically forwarding verified Identity fields are
+separate capabilities; this helper only removes named header fields.
 
 ## JWT resource-server claims profile
 

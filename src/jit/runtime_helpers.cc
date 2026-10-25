@@ -357,6 +357,7 @@ static void record_req_header(
     o.name = Str{name, nlen};
     o.value = Str{val, vlen};
     const u16 bit = static_cast<u16>(1u << index);
+    c->req_header_remove_mask &= static_cast<u16>(~bit);
     if (append)
         c->req_header_append_mask |= bit;
     else
@@ -369,6 +370,14 @@ void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const cha
 
 void rut_helper_req_add_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
     record_req_header(conn, name, nlen, val, vlen, true);
+}
+
+void rut_helper_req_remove_header(void* conn, const char* name, u32 nlen) {
+    auto* c = static_cast<ConnectionBase*>(conn);
+    const u8 index = c->req_header_override_count;
+    record_req_header(conn, name, nlen, "", 0, false);
+    if (index < ConnectionBase::kMaxReqHeaderOverrides)
+        c->req_header_remove_mask |= static_cast<u16>(1u << index);
 }
 
 static bool ascii_header_name_eq(Str h, const char* name, u32 name_len) {

@@ -43,6 +43,7 @@ enum class MirValueKind : u8 {
     ReqHeader,
     ReqSetHeader,
     ReqAddHeader,
+    ReqRemoveHeader,  // Remove all case-insensitive matches before forwarding.
     RespHeader,
     RespSetHeader,
     RespAddHeader,

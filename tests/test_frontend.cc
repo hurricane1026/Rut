@@ -40876,3 +40876,79 @@ route GET "/" { let value = sha256("user") guard value == "user" else { return 5
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
+
+TEST(frontend, req_remove_statement_lowers_to_no_operand_removal_effect) {
+    auto tokens = lex(lit("route GET \"/\" { req.remove(\"Authorization\") return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].init.kind == HirExprKind::ReqRemoveHeader);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK(mir->functions[0].locals[0].init.kind == MirValueKind::ReqRemoveHeader);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqRemoveHeader));
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; ++bi) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 i = 0; i < block.inst_count; ++i) {
+            if (block.insts[i].op != rir::Opcode::ReqRemoveHeader) continue;
+            CHECK(block.insts[i].imm.str_val.eq(lit("Authorization")));
+            CHECK_EQ(block.insts[i].operand_count, 0u);
+        }
+    }
+    rir.destroy();
+}
+
+TEST(frontend, req_remove_rejects_unsafe_names_value_uses_and_unsupported_order) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { req.remove() return 200 })rut",
+        R"rut(route GET "/" { req.remove("X-Key", "extra") return 200 })rut",
+        R"rut(route GET "/" { req.remove(1) return 200 })rut",
+        R"rut(route GET "/" { let name = "X-Key" req.remove(name) return 200 })rut",
+        R"rut(route GET "/" { req.remove("") return 200 })rut",
+        R"rut(route GET "/" { req.remove("Bad Header") return 200 })rut",
+        R"rut(route GET "/" { req.remove("X\r\nInjected") return 200 })rut",
+        R"rut(route GET "/" { req.remove("X\0Key") return 200 })rut",
+        R"rut(route GET "/" { req.remove("Content-Length") return 200 })rut",
+        R"rut(route GET "/" { req.remove("transfer-encoding") return 200 })rut",
+        R"rut(route GET "/" { req.remove("CONNECTION") return 200 })rut",
+        R"rut(route GET "/" { let result = req.remove("X-Key") return 200 })rut",
+        R"rut(route GET "/" { guard req.path == "/" else { return 403 } req.remove("X-Key") return 200 })rut",
+        R"rut(route GET "/" { wait(1ms) req.remove("X-Key") return 200 })rut",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(!hir);
+    }
+}
+
+TEST(frontend, req_remove_selected_match_arm_stays_a_branch_effect) {
+    const char* source = R"rut(
+route GET "/" {
+    match req.path {
+        "/" => { req.remove("Authorization") return 200 }
+        _ => return 403
+    }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqRemoveHeader));
+    rir.destroy();
+}

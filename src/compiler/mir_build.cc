@@ -618,14 +618,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.str_value = expr.str_value;
         return v;
     }
-    if (expr.kind == HirExprKind::ReqSetHeader || expr.kind == HirExprKind::ReqAddHeader) {
+    if (expr.kind == HirExprKind::ReqSetHeader || expr.kind == HirExprKind::ReqAddHeader ||
+        expr.kind == HirExprKind::ReqRemoveHeader) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         auto value = mir_value(*expr.lhs, module, fn, ctx);
         if (!value) return core::make_unexpected(value.error());
         if (!fn->values.push(value.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
-        v.kind = expr.kind == HirExprKind::ReqAddHeader ? MirValueKind::ReqAddHeader
-                                                        : MirValueKind::ReqSetHeader;
+        v.kind = expr.kind == HirExprKind::ReqRemoveHeader ? MirValueKind::ReqRemoveHeader
+                 : expr.kind == HirExprKind::ReqAddHeader  ? MirValueKind::ReqAddHeader
+                                                           : MirValueKind::ReqSetHeader;
         v.type = MirTypeKind::Str;
         v.str_value = expr.str_value;
         v.lhs = &fn->values[fn->values.len - 1];
@@ -1407,6 +1409,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 module.routes[i].locals[li].init.kind != HirExprKind::CacheSet &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
+                module.routes[i].locals[li].init.kind != HirExprKind::ReqRemoveHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::RespSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::RespAddHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::RespRemoveHeader)

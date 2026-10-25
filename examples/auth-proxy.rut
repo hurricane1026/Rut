@@ -1,0 +1,14 @@
+// RUT_API_KEY is read at compilation/loading. Deploy behind TLS.
+import "middleware/auth.rut"
+listen :8080
+upstream backend at "127.0.0.1:8081"
+
+route GET "/private" {
+    // Removal affects only the forwarded request. Verification below reads
+    // the original request; rejected requests return locally with a challenge.
+    req.remove("Authorization")
+    req.remove("X-API-Key")
+    req.remove("X-Consumer-ID")
+    let identity = auth.apiKey(req.authorization.or(""), env("RUT_API_KEY"), "example-app", "primary")
+    if identity.consumerId == "example-app" { return forward(backend, load_balance: .roundRobin) } else { return 403 }
+}

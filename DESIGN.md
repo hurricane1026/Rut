@@ -541,6 +541,7 @@ req.header("X-Timestamp")    // string?
 
 // Setting headers
 req.set("X-User-ID", "123")
+req.remove("Authorization")  // remove all matching fields before upstream forwarding
 // Target only: unwrap uuid() with guard let, then set the ID.
 // Dynamic req.set/add values remain pending; do not emit uuid() directly here.
 
@@ -8096,6 +8097,25 @@ cleansed after comparison. Imported helper challenge strings use the existing
 expression-string decoder and its owned HIR buffers. Request header validation
 runs on decoded bytes before lowering, preventing escaped CR/LF injection.
 Configuration remains static; CLI restart activates rotation/revocation changes.
+
+### Explicit credential header stripping
+
+`req.remove("Name")` extends the existing statement-only request mutation surface
+with a literal safe header name. The compiler emits an explicit removal effect
+through HIR/MIR/RIR/JIT. Its bounded log slot uses a removal mode separate from
+append/set, so empty header values keep their existing meaning. The forwarding
+rewrite deletes all case-insensitive occurrences, updates header/send bounds,
+and preserves bodies and pipelined bytes. HTTP/2 synthesized forwarding uses the
+same implementation. Framing headers stay reserved; invalid/overflowing effects
+fail closed. Every request/stream reset clears removal modes.
+
+Effects are declared before authentication guards in the existing leading route
+region (or in supported selected match arms) and apply only when forwarding.
+Request reads retain the original credentials for verification; authentication
+failure still returns locally. This provides explicit hide-credentials behavior
+without new keywords or dependencies. Dynamic identity header values, query/body
+credential removal, and a general ordered middleware effect model remain separate
+work. See `examples/auth-proxy.rut` and the language card for current syntax.
 
 Compiler expression storage for HIR helpers/routes and MIR functions uses
 Arena-backed node pools. Nodes keep stable addresses across chunk growth; copies

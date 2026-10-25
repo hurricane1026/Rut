@@ -2493,6 +2493,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.target_transform_recorded = false;
     conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
     conn.req_header_append_mask = 0;
+    conn.req_header_remove_mask = 0;
     conn.req_header_override_overflow = false;
     conn.request_policy_id = 0;
     conn.request_policy_body_pending = false;
@@ -6153,12 +6154,15 @@ inline bool apply_request_header_overrides(Connection& conn) {
         const Str name = conn.req_header_overrides[oi].name;
         const Str val = conn.req_header_overrides[oi].value;
         const bool append = (conn.req_header_append_mask & (1u << oi)) != 0;
+        const bool remove = (conn.req_header_remove_mask & (1u << oi)) != 0;
+        if (remove && (append || val.len != 0)) return false;
         // Validate at the choke point before any byte reaches the wire. The DSL
         // parser already validates literals at compile time, but overrides recorded
         // directly through RIR are otherwise unchecked — an empty/non-tchar name, a
         // value carrying CR/LF or other control bytes (header injection), or a
         // reserved framing name (Content-Length/Transfer-Encoding/Connection) must
         // fail the request closed, never be forwarded.
+        if (name.ptr == nullptr || (val.len != 0 && val.ptr == nullptr)) return false;
         if (validate_response_header(name.ptr, name.len, val.ptr, val.len) !=
             HttpHeaderValidation::Ok)
             return false;
@@ -6173,6 +6177,15 @@ inline bool apply_request_header_overrides(Connection& conn) {
 
         const u32 line_len = name.len + 2 + val.len + 2;
         u32 fs = 0, fe = 0, search_from = 0;
+        if (remove) {
+            // Search again at the deletion point after every splice so adjacent
+            // duplicates (including mixed case) cannot survive a removal.
+            while (find_field(name, search_from, &fs, &fe)) {
+                if (!splice(fs, fe - fs, name, val, /*write_line=*/false)) return false;
+                search_from = fs;
+            }
+            continue;
+        }
         if (append) {
             const u32 hbody = conn.req_header_end - 2;
             if (!splice(hbody, 0, name, val, /*write_line=*/true)) return false;
