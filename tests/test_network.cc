@@ -16059,6 +16059,113 @@ TEST(route, set_route_rate_limit) {
     CHECK(!cfg.set_route_rate_limit(99, 1, 1));  // bad index
 }
 
+TEST(route, rate_limit_publication_rejects_forged_arithmetic) {
+    using namespace rut;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/limited", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 1, 60));
+    auto& rule = cfg.routes[0].rate_limit.rules[0];
+    const RateLimitRule canonical = rule;
+    rule.emit_interval_us = 0;
+    rule.tau_us = 0;
+    CHECK(!cfg.refresh_route_rate_limit_ids(0));
+    CHECK(!cfg.rate_limit_ids_valid());
+
+    rule = canonical;
+    CHECK(cfg.refresh_route_rate_limit_ids(0));
+    CHECK(cfg.rate_limit_ids_valid());
+
+    rule.tau_us++;
+    CHECK(!cfg.refresh_route_rate_limit_ids(0));
+    rule = canonical;
+    CHECK(cfg.refresh_route_rate_limit_ids(0));
+
+    rule.burst = 0;
+    CHECK(!cfg.refresh_route_rate_limit_ids(0));
+    CHECK(!cfg.rate_limit_ids_valid());
+    rule = canonical;
+    rule.burst = 0xffffffffu;
+    rule.emit_interval_us = 1;
+    rule.tau_us = 0;
+    CHECK(!cfg.refresh_route_rate_limit_ids(0));
+    CHECK(!cfg.rate_limit_ids_valid());
+
+    rule = canonical;
+    rule.max = 0;
+    rule.emit_interval_us = 1;
+    rule.tau_us = 1;
+    CHECK(!cfg.refresh_route_rate_limit_ids(0));
+    CHECK(!cfg.rate_limit_ids_valid());
+
+    rule.max = 0;
+    rule.window_sec = 60;
+    rule.burst = 4;
+    rule.emit_interval_us = 0;
+    rule.tau_us = 0;
+    CHECK(cfg.refresh_route_rate_limit_ids(0));
+    CHECK(cfg.rate_limit_ids_valid());
+    rule.emit_interval_us = 1;
+    rule.tau_us = 1;
+    CHECK(!cfg.refresh_route_rate_limit_ids(0));
+
+    rule = canonical;
+    rule.max = 1;
+    rule.window_sec = 4293934841u;
+    rule.burst = 4297u;
+    rule.emit_interval_us = 1;
+    rule.tau_us = 0;
+    CHECK_FALSE(rate_limit_params_representable(1, 4293934841u, 4297u));
+    CHECK(!cfg.refresh_route_rate_limit_ids(0));
+    CHECK(!cfg.rate_limit_ids_valid());
+}
+
+TEST(route, rate_limit_native_mutations_are_transactional_and_count_bounded) {
+    using namespace rut;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/limited", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 1, 60));
+    const RateLimitRuleSet canonical_rules = cfg.routes[0].rate_limit;
+    u64 canonical_ids[kMaxRateLimitRules];
+    for (u32 i = 0; i < kMaxRateLimitRules; i++) canonical_ids[i] = cfg.routes[0].rate_limit_ids[i];
+
+    cfg.routes[0].rate_limit.rules[0].emit_interval_us = 0;
+    const RateLimitRuleSet forged_rules = cfg.routes[0].rate_limit;
+    u64 forged_ids[kMaxRateLimitRules];
+    for (u32 i = 0; i < kMaxRateLimitRules; i++) forged_ids[i] = cfg.routes[0].rate_limit_ids[i];
+    CHECK(!cfg.add_route_rate_limit_rule(0, 1, 60));
+    CHECK_EQ(cfg.routes[0].rate_limit.count, forged_rules.count);
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].emit_interval_us,
+             forged_rules.rules[0].emit_interval_us);
+    for (u32 i = 0; i < kMaxRateLimitRules; i++)
+        CHECK_EQ(cfg.routes[0].rate_limit_ids[i], forged_ids[i]);
+    cfg.routes[0].rate_limit = canonical_rules;
+    for (u32 i = 0; i < kMaxRateLimitRules; i++) cfg.routes[0].rate_limit_ids[i] = canonical_ids[i];
+
+    cfg.routes[0].rate_limit.rules[0].emit_interval_us = 0;
+    const RateLimitRuleSet key_forged_rules = cfg.routes[0].rate_limit;
+    for (u32 i = 0; i < kMaxRateLimitRules; i++) forged_ids[i] = cfg.routes[0].rate_limit_ids[i];
+    CHECK(!cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "x", 1));
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].key.count, key_forged_rules.rules[0].key.count);
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].emit_interval_us,
+             key_forged_rules.rules[0].emit_interval_us);
+    for (u32 i = 0; i < kMaxRateLimitRules; i++)
+        CHECK_EQ(cfg.routes[0].rate_limit_ids[i], forged_ids[i]);
+    cfg.routes[0].rate_limit = canonical_rules;
+    for (u32 i = 0; i < kMaxRateLimitRules; i++) cfg.routes[0].rate_limit_ids[i] = canonical_ids[i];
+
+    cfg.routes[0].rate_limit.count = kMaxRateLimitRules + 1;
+    const RateLimitRuleSet count_forged_rules = cfg.routes[0].rate_limit;
+    for (u32 i = 0; i < kMaxRateLimitRules; i++) forged_ids[i] = cfg.routes[0].rate_limit_ids[i];
+    CHECK(!cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Ip, nullptr, 0));
+    CHECK_EQ(cfg.routes[0].rate_limit.count, count_forged_rules.count);
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].key.count, count_forged_rules.rules[0].key.count);
+    for (u32 i = 0; i < kMaxRateLimitRules; i++)
+        CHECK_EQ(cfg.routes[0].rate_limit_ids[i], forged_ids[i]);
+    cfg.routes[0].rate_limit = canonical_rules;
+    for (u32 i = 0; i < kMaxRateLimitRules; i++) cfg.routes[0].rate_limit_ids[i] = canonical_ids[i];
+    CHECK(cfg.rate_limit_ids_valid());
+}
+
 // Build a RateLimitKeyInput over a fixed raw request for extractor tests.
 static rut::RateLimitKeyInput make_key_input(const char* raw,
                                              const char* path,
