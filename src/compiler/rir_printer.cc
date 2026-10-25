@@ -321,6 +321,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::JsonOp:
             buf.put_cstr("json.op");
             break;
+        case Opcode::HashDigest:
+            buf.put_cstr("hash.digest");
+            break;
         case Opcode::Uuid:
             buf.put_cstr("uuid");
             break;
@@ -714,6 +717,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             break;
+        case Opcode::HashDigest:
         case Opcode::JsonOp:
             buf.put(' ');
             buf.put_i64(inst.imm.i32_val);

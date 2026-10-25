@@ -210,6 +210,7 @@ enum class HirExprKind : u8 {
     BearerMatches,
     BasicMatches,
     HmacSha256Matches,
+    HashDigest,
     ConstantTimeEqual,
     Uuid,
     JsonOp,

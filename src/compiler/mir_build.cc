@@ -738,8 +738,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.type = MirTypeKind::ByteSize;
         return v;
     }
-    if (expr.kind == HirExprKind::JsonOp) {
-        v.kind = MirValueKind::JsonOp;
+    if (expr.kind == HirExprKind::JsonOp || expr.kind == HirExprKind::HashDigest) {
+        v.kind =
+            expr.kind == HirExprKind::HashDigest ? MirValueKind::HashDigest : MirValueKind::JsonOp;
         v.int_value = expr.int_value;
         v.type = mir_type_kind(expr.type);
         for (u32 ai = 0; ai < expr.args.len; ++ai) {

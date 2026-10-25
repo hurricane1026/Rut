@@ -23281,3 +23281,250 @@ route POST "/misconfigured" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, digest_and_hmac_builtins_return_owned_hex_for_exact_body_bytes) {
+    const char* source = R"rut(
+func digestInHelper(_ data: str) -> str {
+    guard let value = sha256(data) else { respond 503 }
+    value
+}
+route POST "/md5" {
+    guard let digest = md5(req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/sha1" {
+    guard let digest = sha1(req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/sha224" {
+    guard let digest = sha224(req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/sha256" {
+    guard let digest = sha256(req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/sha384" {
+    guard let digest = sha384(req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/sha512" {
+    guard let digest = sha512(req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/hmacMd5" {
+    guard let digest = hmacMd5("Jefe", req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/hmacSha1" {
+    guard let digest = hmacSha1("Jefe", req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/hmacSha224" {
+    guard let digest = hmacSha224("Jefe", req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/hmacSha256" {
+    guard let digest = hmacSha256("Jefe", req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/hmacSha384" {
+    guard let digest = hmacSha384("Jefe", req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/hmacSha512" {
+    guard let digest = hmacSha512("Jefe", req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/lifetime" {
+    guard let first = sha256(req.body) else { return 503 }
+    guard let second = sha512(req.body) else { return 503 }
+    guard first == req.uniqueHeader("X-Expected").or("") else { return 409 }
+    return response(200, body: first)
+}
+route POST "/helper" {
+    let digest = digestInHelper(req.body)
+    return response(200, body: digest)
+}
+route POST "/nested" {
+    guard let first = sha256(req.body) else { return 503 }
+    guard let nested = sha256(first) else { return 503 }
+    return response(200, body: nested)
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir)
+        std::fprintf(stderr,
+                     "hash analysis %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    auto connection = std::make_unique<Connection>();
+    struct Case {
+        u32 route;
+        const char* body;
+        u32 length;
+        const char* expected;
+    };
+    const Case cases[] = {
+        {0, "", 0, "d41d8cd98f00b204e9800998ecf8427e"},
+        {0, "\x61\x62\x63", 3, "900150983cd24fb0d6963f7d28e17f72"},
+        {0, "\x61\x00\x62\xff", 4, "0dd4df5b5be53b9566c53387ec9a7bac"},
+        {1, "", 0, "da39a3ee5e6b4b0d3255bfef95601890afd80709"},
+        {1, "\x61\x62\x63", 3, "a9993e364706816aba3e25717850c26c9cd0d89d"},
+        {1, "\x61\x00\x62\xff", 4, "63fcb4a9187af3e3e3319584f43e809426e0b000"},
+        {2, "", 0, "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"},
+        {2, "\x61\x62\x63", 3, "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"},
+        {2, "\x61\x00\x62\xff", 4, "6aa2a868a9c3ce5b5410a8873d4d7dac6d755965e4836f79dd30fe47"},
+        {3, "", 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {3, "\x61\x62\x63", 3, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {3,
+         "\x61\x00\x62\xff",
+         4,
+         "a37cc3026aae4d519e0b19c298fa913b4dccfdf0658cbccbb7deaa0226d5acdb"},
+        {4,
+         "",
+         0,
+         "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14"
+         "898b95b"},
+        {4,
+         "\x61\x62\x63",
+         3,
+         "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca13"
+         "4c825a7"},
+        {4,
+         "\x61\x00\x62\xff",
+         4,
+         "47f55ceefdbee8e10c2d3621c27916990d7dc39155a09dffc95096d05b7f920f60218dc4a0e184b24a6a3a68b"
+         "90f5765"},
+        {5,
+         "",
+         0,
+         "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d28"
+         "77eec2f63b931bd47417a81a538327af927da3e"},
+        {5,
+         "\x61\x62\x63",
+         3,
+         "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a"
+         "3feebbd454d4423643ce80e2a9ac94fa54ca49f"},
+        {5,
+         "\x61\x00\x62\xff",
+         4,
+         "1e76645fa15e740d214209146606412765717327c1ec1f3f8ef0bb29af267ff80fbc4a459420a32b19508e175"
+         "20e7ded1cf6a9633186d1f1381aa67dc075ef39"},
+        {6, "", 0, "60b57da4237ed7c91b475eddf0e798d3"},
+        {6, "\x61\x62\x63", 3, "0c23dc19a0f341f59659378f4621bb4b"},
+        {6, "\x61\x00\x62\xff", 4, "2c090028602287ab3f9c34e1c3d62222"},
+        {7, "", 0, "09d9e59d72239e62a8155c583d52743de9b7231a"},
+        {7, "\x61\x62\x63", 3, "1f81e4c0f425d93623df95a0eb5672555612abbb"},
+        {7, "\x61\x00\x62\xff", 4, "b541a7358b164af0df7bdefd9ab230ff2e9393eb"},
+        {8, "", 0, "e10ba93c2f6fae317af180e83500ed3d54e812db29eadb25ccc43d30"},
+        {8, "\x61\x62\x63", 3, "88496a64f06a13e26cea871fe4cfcd58ae7471d86f8d5f3374e02b9e"},
+        {8, "\x61\x00\x62\xff", 4, "3be6ab496af031e07e0bb43d4cd833605c8edb27449099a72f84b26d"},
+        {9, "", 0, "923598ca6d64af2a5dba79dcd021a8a0fe5c5f557519adaaf0ad532d4506dd30"},
+        {9, "\x61\x62\x63", 3, "7cf4ec4f741f51cb0d887013c46251d6f4175643c4f422906a1aaec688cc13e8"},
+        {9,
+         "\x61\x00\x62\xff",
+         4,
+         "5bf498b8d33c6bf3082794b7e7d7d04a35ba35c822c5bf519dfead05b87ca434"},
+        {10,
+         "",
+         0,
+         "99e07b65e0bfdedd41f44a433e51475a027ef03fe6c9bb6ecf67a700d375dae3863d8b5c3ff63c693d942a291"
+         "add2e78"},
+        {10,
+         "\x61\x62\x63",
+         3,
+         "f73621bbae8b012137a65db5ab260ac622fded492b1443aec9f0679cefb908539463ee92a7dc0944fd3cc9373"
+         "8e4eaf5"},
+        {10,
+         "\x61\x00\x62\xff",
+         4,
+         "bd44d3dcc426cfda3f1475a3e5aa055a95003e33ae9340d69289c3c50d8fb7d2365f86479fdc9f8a7a0a80650"
+         "35eb9a5"},
+        {11,
+         "",
+         0,
+         "b9d14c51a6d4dd41604eb06c9c240f1f64f143b5cfdea37129b28bb75d1371d326fc219216171261a84e6c057"
+         "07cd3be0f61e0a973a33f706d190db9acffc68f"},
+        {11,
+         "\x61\x62\x63",
+         3,
+         "b5af0318c3b88834d89dda9fe6461f2e9fecc953e6f94a09c1786509b1819e5baa8225e9e26268763c41fec71"
+         "0d4cf8cbd29f854215da3455bded16172b932bd"},
+        {11,
+         "\x61\x00\x62\xff",
+         4,
+         "9ebec6d25b8bede43592b9635373df98681f31dedd1252735063e1f86762fb97609e35d0020059a9ed6c154d6"
+         "c4fa2810c7076871f4d7b8320d2d509eb0bffd5"},
+        {12, "abc", 3, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {13, "abc", 3, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {14, "abc", 3, "dfe7a23fefeea519e9bbfdd1a6be94c4b2e4529dd6b7cbea83f9959c2621b13c"},
+    };
+    for (const auto& tc : cases) {
+        char symbol[32];
+        snprintf(symbol, sizeof(symbol), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(symbol));
+        REQUIRE(handler);
+        connection->reset();
+        connection->json_arena.backend.pool = &pool;
+        const std::string request =
+            "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: " + std::to_string(tc.length) +
+            "\r\nX-Expected: " + tc.expected + "\r\n\r\n" + std::string(tc.body, tc.length);
+        auto result = HandlerResult::unpack(handler(connection.get(),
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(request.data()),
+                                                    static_cast<u32>(request.size()),
+                                                    nullptr));
+        CHECK_EQ(result.status_code, 200u);
+        REQUIRE(connection->jit_response_body_valid);
+        CHECK(connection->jit_response_body.eq(lit(tc.expected)));
+    }
+    // Missing result storage must produce nil rather than a borrowed stack view.
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    const char request[] = "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n";
+    auto missing = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+    CHECK_EQ(missing.status_code, 503u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, hash_helper_enforces_storage_budget_without_overwriting_prior_results) {
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 has = 99;
+    const char* text = nullptr;
+    u32 length = 99;
+    rut_helper_hash(nullptr, &arena, 3, "abc", 3, nullptr, 0, &has, &text, &length);
+    REQUIRE_EQ(has, 1u);
+    const Str first{text, length};
+    while (arena.space_used() < 256 * 1024) REQUIRE(arena.alloc(128));
+    rut_helper_hash(nullptr, &arena, 5, "abc", 3, nullptr, 0, &has, &text, &length);
+    CHECK_EQ(has, 0u);
+    CHECK(text == nullptr);
+    CHECK_EQ(length, 0u);
+    CHECK(first.eq(lit("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")));
+    rut_helper_hash(nullptr, &arena, 0x200, "abc", 3, nullptr, 0, &has, &text, &length);
+    CHECK_EQ(has, 0u);
+}

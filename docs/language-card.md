@@ -1052,7 +1052,9 @@ The call must directly initialize a top-level route `let`, as above. Calls in `g
 string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
          s.replace/split/slice s.matches(re"") s.match(re"")
          ⏳ s.hasPrefix/hasSuffix/trimPrefix/trimSuffix
-hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
+hash:    md5/sha1/sha224/sha256/sha384/sha512(data) -> str? (lowercase hex)
+         hmacMd5/hmacSha1/hmacSha224/hmacSha256/hmacSha384/hmacSha512(key, data) -> str?
+         ⏳ fnv32 fnv64
 jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
          decode with json.decode/json.get). ⏳ publicKey/RS/ES and jwtEncode
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
@@ -1311,3 +1313,52 @@ This is not the Kong/APISIX canonical HTTP-signature protocol or Standard
 Webhooks: those additionally define signed header lists, timestamp/nonce
 validation, encoding and replay state. Their full profiles remain pending in
 [auth coverage](auth-coverage.md).
+
+## Digest and HMAC builtins (implemented)
+
+The six digest calls `md5(data)`, `sha1(data)`, `sha224(data)`, `sha256(data)`,
+`sha384(data)` and `sha512(data)` each take one unwrapped `str`. Their HMAC
+counterparts `hmacMd5`, `hmacSha1`, `hmacSha224`, `hmacSha256`, `hmacSha384`
+and `hmacSha512` take **key first, data second**. Each returns `str?`, containing
+lowercase hexadecimal on success. The algorithm is fixed by the function name;
+there is no default algorithm or implicit protocol decoding.
+
+```swift
+route POST "/sha256" {
+    guard let digest = sha256(req.body) else { return 503 }
+    return response(200, body: digest)
+}
+route POST "/signed" {
+    let key = env("HMAC_SECRET")
+    guard key != "" else { return 503 }
+    guard let expected = hmacSha256(key, req.body) else { return 503 }
+    guard constantTimeEqual(expected, req.uniqueHeader("X-Signature").or("")) else { return 401 }
+    return 204
+}
+```
+
+This example's custom X-Signature field contains bare lowercase hex. Protocols
+such as GitHub Webhooks need their own header parsing policy. Hash/HMAC calls
+accept no HTTP headers, prefixes or algorithm parameter. Use constant-time
+comparison, rather than ordinary equality, for authentication signatures.
+
+Input strings are exact byte spans: embedded NUL, non-UTF-8 and empty data are
+valid. HMAC also mathematically supports an empty key; authentication modules
+must explicitly reject disabled/empty credentials as above. No Unicode
+normalization, JSON reserialization, base64 conversion or truncation occurs.
+Digest lengths are 32/40/56/64/96/128 hex characters respectively.
+
+Runtime data is limited to 1 MiB per call and HMAC keys to 4096 bytes. Exceeding
+limits, unavailable result storage or exhausting the shared 256 KiB request
+arena budget yields nil. Each result owns separate arena storage until request
+retirement; later calls cannot overwrite it. Scratch hashing is allocation-free
+and secret context/intermediates are cleansed. Request-body ingress limits are
+independent. No new dependency or language keyword is added.
+
+Calls may appear in ordinary request helpers, nested expressions after optional
+unwrapping, and route local bindings. User functions/bindings shadow builtin
+names. Hashing in `const`, timers and routes with `wait` is not implemented;
+these fail at compilation. SHA-3, SHA-512/224, SHA-512/256 and arbitrary digest
+selection are not part of this implemented set. MD5/SHA-1 remain compatibility
+algorithms; authentication modules select their permitted algorithms explicitly.
+See [hashing.rut](../examples/hashing.rut).

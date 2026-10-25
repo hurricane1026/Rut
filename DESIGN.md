@@ -1131,7 +1131,7 @@ would kill the whole shard process.
 embedded directly in the binary. No runtime cost.
 
 ```swift
-const secretHash = sha256(env("STATIC_SECRET"))
+const secretHash = sha256(env("STATIC_SECRET"))  // ⏳ hash const-evaluation
 const jwtPublicKey = env("JWT_PUBLIC_KEY")
 const maxItems = 100
 const apiPrefix = "/api/v1"
@@ -1141,7 +1141,7 @@ const apiPrefix = "/api/v1"
 base64, string operations), and other `const` values. I/O is a compile error:
 
 ```swift
-const x = sha256(env("KEY"))              // ✅ pure function + env
+const x = sha256(env("KEY"))              // ⏳ pure, but hash const-evaluation is not implemented
 const y = get http://config/value         // ❌ compile error: I/O in const
 ```
 
@@ -1737,7 +1737,8 @@ func verifySig(_ req: Request, secret: string) {
     guard now() - time(ts) <= 5m else { respond 401, "expired" }
 
     let payload = "\(req.method)\n\(req.path)\n\(ts)"
-    guard hmacSha256(secret, payload).hex == req.header("X-Signature") else {
+    guard let expected = hmacSha256(secret, payload) else { respond 503 }
+    guard constantTimeEqual(expected, req.uniqueHeader("X-Signature").or("")) else {
         respond 401, "bad signature"
     }
 }
@@ -3558,11 +3559,12 @@ s.match(re"(group)")              // match object on success
 s.replace(re"pat", replacement)   // string
 
 // --- Hash ---
-md5(data)                     // string (hex)
-sha1(data)                    // string (hex)
-sha256(data)                  // string (hex)
-sha384(data)                  // string (hex)
-sha512(data)                  // string (hex)
+md5(data)                     // str? (lowercase hex)
+sha1(data)                    // str? (lowercase hex)
+sha224(data)                  // str? (lowercase hex)
+sha256(data)                  // str? (lowercase hex)
+sha384(data)                  // str? (lowercase hex)
+sha512(data)                  // str? (lowercase hex)
 fnv32(data)                   // u32 (non-crypto, for load balancing)
 fnv64(data)                   // u64 (non-crypto, for hashing/sharding)
 
@@ -3578,9 +3580,12 @@ constantTimeEqual(a, b)       // (str, str) -> bool; direct call or explicit-pla
 // Authentication policies must separately reject absent/empty credentials.
 
 // --- HMAC ---
-hmacSha256(key, data)         // string (hex)
-hmacSha384(key, data)         // string (hex)
-hmacSha512(key, data)         // string (hex)
+hmacMd5(key, data)            // str? (lowercase hex)
+hmacSha1(key, data)           // str? (lowercase hex)
+hmacSha224(key, data)         // str? (lowercase hex)
+hmacSha256(key, data)         // str? (lowercase hex)
+hmacSha384(key, data)         // str? (lowercase hex)
+hmacSha512(key, data)         // str? (lowercase hex)
 
 // --- JWT (HMAC slice implemented; asymmetric forms are roadmap) ---
 jwtDecode(token, secret)                    // Json? — verified HS256/384/512 claims
@@ -8183,3 +8188,26 @@ signature field and sign the original bytes. Integrity verification alone does
 not establish freshness, replay prevention, canonical HTTP request signing or
 any OAuth/SAML/LDAP protocol. Track those independently in
 [auth-coverage.md](docs/auth-coverage.md).
+
+### Implemented generic digest and HMAC calls
+
+The six MD5/SHA-1/SHA-224/SHA-256/SHA-384/SHA-512 calls and their six HMAC
+counterparts now have a dedicated HashDigest HIR/MIR/RIR operation. Function
+spelling fixes the algorithm; HMAC takes key then exact byte data. The result
+is Optional(str), lowercase hexadecimal. No HTTP-specific extraction or prefix
+handling is part of these calls. The full limits, lifetime and supported call
+contexts are in [the language card](docs/language-card.md#digest-and-hmac-builtins-implemented).
+
+The runtime uses the existing pinned static OpenSSL streaming primitives and
+RFC 2104 HMAC construction, with stack contexts and cleansed secret scratch.
+`hash_digest` is shared with the JWT HS256/384/512 verifier, preserving its
+existing algorithm/key rules. `hash_hex` enforces the public data/key limits;
+the existing HMAC-SHA256 verification helper also reuses it. The compiler/JIT
+helper copies each output into the request arena with a shared 256 KiB budget,
+so multiple results stay independent. Missing storage or exceeding limits
+returns nil rather than exposing stack or thread-local views.
+
+Hash const-evaluation, wait-route rematerialization, timer storage and additional
+SHA families remain pending. Existing SHA-256 HMAC verification and JWT identity
+policies do not acquire an algorithm downgrade fallback when weak compatibility
+digests are made available as general-purpose functions.

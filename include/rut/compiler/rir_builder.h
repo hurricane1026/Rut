@@ -2,6 +2,7 @@
 
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/hash.h"
 
 namespace rut {
 namespace rir {
@@ -896,6 +897,25 @@ struct Builder {
         inst->imm.i32_val = static_cast<i32>(op);
         inst->operand_count = count;
         for (u32 i = 0; i < count; ++i) inst->operands[i] = args[i];
+        return vid;
+    }
+
+    Result<ValueId> emit_hash_digest(u32 operation,
+                                     const ValueId* args,
+                                     u32 count,
+                                     SourceLoc loc = {}) {
+        const bool kKeyed = (operation & kHashHmacFlag) != 0;
+        if ((operation & ~kHashHmacFlag) > static_cast<u32>(HashAlgorithm::Sha512) ||
+            count != (kKeyed ? 2u : 1u) || args == nullptr)
+            return err(RirError::InvalidState);
+        for (u32 i = 0; i < count; ++i)
+            if (!val_has_type(args[i], TypeKind::Str)) return err(RirError::InvalidState);
+        auto* str = TRY(make_type(TypeKind::Str));
+        auto* optional = TRY(make_type(TypeKind::Optional, str));
+        auto [inst, vid] = TRY(emit(Opcode::HashDigest, optional, loc));
+        inst->imm.i32_val = static_cast<i32>(operation);
+        auto stored = set_operands(inst, args, count);
+        if (!stored) return err(stored.error());
         return vid;
     }
 

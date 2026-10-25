@@ -5,6 +5,7 @@
 #include "rut/common/types.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
+#include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/ws_terminate.h"  // ws_valid_close_code (shared close-code predicate)
@@ -9595,6 +9596,60 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    // Fixed algorithm per spelling; no protocol format parsing in crypto calls.
+    {
+        struct HashBuiltin {
+            Str name;
+            HashAlgorithm algorithm;
+            bool keyed;
+        };
+        constexpr HashBuiltin kHashes[] = {
+            {lit_str("md5"), HashAlgorithm::Md5, false},
+            {lit_str("sha1"), HashAlgorithm::Sha1, false},
+            {lit_str("sha224"), HashAlgorithm::Sha224, false},
+            {lit_str("sha256"), HashAlgorithm::Sha256, false},
+            {lit_str("sha384"), HashAlgorithm::Sha384, false},
+            {lit_str("sha512"), HashAlgorithm::Sha512, false},
+            {lit_str("hmacMd5"), HashAlgorithm::Md5, true},
+            {lit_str("hmacSha1"), HashAlgorithm::Sha1, true},
+            {lit_str("hmacSha224"), HashAlgorithm::Sha224, true},
+            {lit_str("hmacSha256"), HashAlgorithm::Sha256, true},
+            {lit_str("hmacSha384"), HashAlgorithm::Sha384, true},
+            {lit_str("hmacSha512"), HashAlgorithm::Sha512, true},
+        };
+        for (const auto& builtin : kHashes) {
+            if (!expr.name.eq(builtin.name) ||
+                user_bound_ident_name(mod, locals, local_count, binding, expr.name))
+                continue;
+            constexpr Str kDetail = lit_str(
+                "hash expects one unwrapped str; HMAC expects key, data as two unwrapped str "
+                "values");
+            if (expr.args.len != (builtin.keyed ? 2u : 1u))
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            HirExpr out{};
+            out.kind = HirExprKind::HashDigest;
+            out.type = HirTypeKind::Str;
+            out.may_nil = true;
+            out.span = expr.span;
+            out.int_value =
+                static_cast<u32>(builtin.algorithm) | (builtin.keyed ? kHashHmacFlag : 0u);
+            for (u32 i = 0; i < expr.args.len; ++i) {
+                if (expr.args[i] == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+                auto arg = analyze_builtin_arg(*expr.args[i]);
+                if (!arg) return core::make_unexpected(arg.error());
+                if (arg->type != HirTypeKind::Str || arg->may_nil || arg->may_error)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, expr.args[i]->span, kDetail);
+                if (!route->exprs.push(arg.value()))
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
+                if (!out.args.push(&route->exprs[route->exprs.len - 1]))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+            }
+            return out;
+        }
+    }
+
     if (expr.name.eq(lit_str("hmacSha256Matches")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr Str kDetail = lit_str(
@@ -15430,6 +15485,7 @@ constexpr Str kTimerWaitDetail = lit_str(
 
 static bool hir_expr_uses_request(const HirExpr& e) {
     switch (e.kind) {
+        case HirExprKind::HashDigest:
         case HirExprKind::Uuid:
         case HirExprKind::ReqUniqueHeader:
         case HirExprKind::ReqHeader:
@@ -20548,6 +20604,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // by analyze_match_arm_body(); guard fail-body locals are separate.
         if (route.waits.len > 0) {
             auto blocked_kind = [](const HirExpr& e) -> Str {
+                if (e.kind == HirExprKind::HashDigest)
+                    return lit_str(
+                        "hash results in wait routes are not supported yet; request-owned result "
+                        "storage must survive resume without rematerialization");
                 if (e.kind == HirExprKind::Uuid) return kUuidWaitDetail;
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)

@@ -87,6 +87,7 @@ enum class MirValueKind : u8 {
     BearerMatches,
     BasicMatches,
     HmacSha256Matches,
+    HashDigest,
     ConstantTimeEqual,
     Uuid,
     JsonOp,

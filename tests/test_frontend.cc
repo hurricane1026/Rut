@@ -40842,3 +40842,37 @@ TEST(frontend, hmac_verification_requires_strings_and_optional_prefix) {
         CHECK(!analyze_file_heap(ast.value()));
     }
 }
+
+TEST(frontend, hash_builtins_reject_wrong_types_arity_and_unwrapped_optional_inputs) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { let x = sha256() return 200 })rut",
+        R"rut(route GET "/" { let x = sha256(1) return 200 })rut",
+        R"rut(route GET "/" { let x = sha256(req.authorization) return 200 })rut",
+        R"rut(route GET "/" { let x = hmacSha512("data") return 200 })rut",
+        R"rut(route GET "/" { let x = hmacMd5(1, "data") return 200 })rut",
+        R"rut(route GET "/" { let x = hmacSha1("key", "data", "extra") return 200 })rut",
+        R"rut(route GET "/" { let x = sha256(sha256("data")) return 200 })rut",
+        R"rut(route GET "/" { let x = sha256("data") wait(1s) return 200 })rut",
+        R"rut(timer tick, every: 1s { let x = sha256("data") })rut",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, user_function_shadows_hash_builtin) {
+    const char* source = R"rut(
+func sha256(_ value: str) -> str { value }
+route GET "/" { let value = sha256("user") guard value == "user" else { return 500 } return 200 }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}

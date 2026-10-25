@@ -1648,7 +1648,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
-    if (value.kind == MirValueKind::JsonOp) {
+    if (value.kind == MirValueKind::JsonOp || value.kind == MirValueKind::HashDigest) {
         rir::ValueId args[3]{};
         for (u32 i = 0; i < value.args.len; ++i) {
             auto child = materialize_value(*value.args[i],
@@ -1666,6 +1666,12 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                            span);
             if (!child) return core::make_unexpected(child.error());
             args[i] = child.value();
+        }
+        if (value.kind == MirValueKind::HashDigest) {
+            auto result = b.emit_hash_digest(
+                static_cast<u32>(value.int_value), args, value.args.len, {span.line, span.col});
+            if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+            return result.value();
         }
         const auto type = value.type == MirTypeKind::Bool  ? rir::TypeKind::Bool
                           : value.type == MirTypeKind::I64 ? rir::TypeKind::I64

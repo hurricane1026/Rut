@@ -1,0 +1,16 @@
+listen :8080
+
+route POST "/sha256" {
+    guard let digest = sha256(req.body) else { return 503 }
+    return response(200, body: digest)
+}
+
+// This custom protocol sends the bare lowercase hex HMAC in X-Signature.
+route POST "/signed" {
+    let key = env("HMAC_SECRET")
+    guard key != "" else { return 503 }
+    guard let expected = hmacSha256(key, req.body) else { return 503 }
+    guard constantTimeEqual(expected, req.uniqueHeader("X-Signature").or("")) else { return 401 }
+    return 204
+}
+route "/" { return 404 }
