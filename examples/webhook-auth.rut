@@ -1,0 +1,12 @@
+import "middleware/auth.rut"
+
+listen :8080
+
+// Deploy with a high-entropy GITHUB_WEBHOOK_SECRET. Empty configuration fails 503.
+route POST "/webhooks/github" {
+    let identity = auth.githubWebhook(req.body, req.uniqueHeader("X-Hub-Signature-256").or(""),
+                                      env("GITHUB_WEBHOOK_SECRET"), "github", "github-webhook-v1")
+    // A real receiver must also deduplicate deliveries in durable application state.
+    return 204
+}
+route "/" { return 404 }

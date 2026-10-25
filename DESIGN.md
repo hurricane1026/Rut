@@ -8163,3 +8163,23 @@ separately; an empty required token always returns false.
 Literal `response(..., headers: {...})` values decode string escapes like
 ordinary expressions, including quoted challenge parameters. Decoded values
 are validated again; escaped CR/LF/NUL cannot introduce header fields.
+
+### Implemented HMAC verification surface
+
+The executable `hmacSha256Matches(message, key, signature)` (or four arguments with an explicit
+wire-format prefix) builtin returns a
+nonoptional bool through a dedicated HIR/MIR/RIR instruction and a synchronous
+native helper. Its exact message/key/signature contract, input limits and
+failure behavior are specified in [the language card](docs/language-card.md#hmac-sha256-and-webhook-authentication-implemented).
+It reuses the pinned OpenSSL SHA-256 primitive and the stack-based RFC 2104
+construction already used by the JWT verifier; no request-path context is heap
+allocated. Equal-length digest comparison is constant-time, temporary secret
+buffers and hash state are cleansed, and no borrowed output survives the call.
+
+Authentication and rotation remain ordinary Rut functions in
+`examples/middleware/auth.rut`: hmac, rotatingHmac and githubWebhook. Verified
+identity metadata comes from server configuration; callers must select a unique
+signature field and sign the original bytes. Integrity verification alone does
+not establish freshness, replay prevention, canonical HTTP request signing or
+any OAuth/SAML/LDAP protocol. Track those independently in
+[auth-coverage.md](docs/auth-coverage.md).

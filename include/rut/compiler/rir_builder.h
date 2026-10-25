@@ -703,6 +703,19 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_hmac_sha256_matches(
+        ValueId message, ValueId key, ValueId signature, ValueId prefix, SourceLoc loc = {}) {
+        if (!val_has_type(message, TypeKind::Str) || !val_has_type(key, TypeKind::Str) ||
+            !val_has_type(signature, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::HmacSha256Matches, ty, loc));
+        const ValueId kOperands[] = {message, key, signature, prefix};
+        auto stored = set_operands(inst, kOperands, 4);
+        if (!stored) return err(stored.error());
+        return vid;
+    }
+
     Result<ValueId> emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
             return err(RirError::InvalidState);

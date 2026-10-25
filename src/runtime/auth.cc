@@ -5,6 +5,7 @@
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/sha.h>
 #include <stddef.h>
 
 namespace rut {
@@ -84,6 +85,53 @@ bool basic_matches(Str authorization, Str credentials) {
         encoded, reinterpret_cast<const u8*>(credentials.ptr), static_cast<int>(credentials.len));
     const bool kMatches =
         kWritten == kExpectedLen && CRYPTO_memcmp(kToken.ptr, encoded, kExpectedLen) == 0;
+    OPENSSL_cleanse(encoded, sizeof(encoded));
+    return kMatches;
+}
+
+bool hmac_sha256_matches(Str message, Str key, Str signature, Str prefix) {
+    if ((message.ptr == nullptr && message.len != 0) || message.len > kMaxHmacMessageBytes ||
+        key.ptr == nullptr || key.len == 0 || key.len > kMaxHmacKeyBytes ||
+        signature.ptr == nullptr || prefix.len > 64 || (prefix.ptr == nullptr && prefix.len != 0) ||
+        signature.len != prefix.len + 64)
+        return false;
+    // Prefix is a public wire-format marker chosen by trusted policy.
+    for (u32 i = 0; i < prefix.len; ++i)
+        if (signature.ptr[i] != prefix.ptr[i]) return false;
+    // Same stack-based RFC 2104 construction used by the JWT verifier. Avoid
+    // EVP/HMAC context allocation on the request path.
+    u8 block[64]{};
+    u8 inner[32]{};
+    u8 expected[32]{};
+    SHA256_CTX ctx;
+    if (key.len > sizeof(block)) {
+        SHA256_Init(&ctx);
+        SHA256_Update(&ctx, key.ptr, key.len);
+        SHA256_Final(block, &ctx);
+    } else {
+        for (u32 i = 0; i < key.len; ++i) block[i] = static_cast<u8>(key.ptr[i]);
+    }
+    for (u8& byte : block) byte ^= 0x36;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, block, sizeof(block));
+    if (message.len != 0) SHA256_Update(&ctx, message.ptr, message.len);
+    SHA256_Final(inner, &ctx);
+    for (u8& byte : block) byte ^= 0x36 ^ 0x5c;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, block, sizeof(block));
+    SHA256_Update(&ctx, inner, sizeof(inner));
+    SHA256_Final(expected, &ctx);
+    OPENSSL_cleanse(&ctx, sizeof(ctx));
+    OPENSSL_cleanse(block, sizeof(block));
+    OPENSSL_cleanse(inner, sizeof(inner));
+    char encoded[64]{};
+    constexpr char kHex[] = "0123456789abcdef";
+    for (u32 i = 0; i < 32; ++i) {
+        encoded[static_cast<size_t>(i) * 2] = kHex[expected[i] >> 4];
+        encoded[static_cast<size_t>(i) * 2 + 1] = kHex[expected[i] & 15];
+    }
+    const bool kMatches = CRYPTO_memcmp(encoded, signature.ptr + prefix.len, sizeof(encoded)) == 0;
+    OPENSSL_cleanse(expected, sizeof(expected));
     OPENSSL_cleanse(encoded, sizeof(encoded));
     return kMatches;
 }

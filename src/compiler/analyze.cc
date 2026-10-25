@@ -9595,6 +9595,47 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    if (expr.name.eq(lit_str("hmacSha256Matches")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr Str kDetail = lit_str(
+            "hmacSha256Matches expects message, key, signature and optional prefix as unwrapped "
+            "str values");
+        if (expr.args.len != 3 && expr.args.len != 4)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr* values[4]{};
+        for (u32 i = 0; i < expr.args.len; ++i) {
+            if (expr.args[i] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            auto value = analyze_builtin_arg(*expr.args[i]);
+            if (!value) return core::make_unexpected(value.error());
+            if (value->type != HirTypeKind::Str || value->may_nil || value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, kDetail);
+            if (!route->exprs.push(value.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            values[i] = &route->exprs[route->exprs.len - 1];
+        }
+        if (expr.args.len == 3) {
+            HirExpr prefix{};
+            prefix.kind = HirExprKind::StrLit;
+            prefix.type = HirTypeKind::Str;
+            prefix.str_value = lit_str("");
+            prefix.span = expr.span;
+            if (!route->exprs.push(prefix))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            values[3] = &route->exprs[route->exprs.len - 1];
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::HmacSha256Matches;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        out.lhs = values[0];
+        out.rhs = values[1];
+        if (!out.args.push(values[2]) || !out.args.push(values[3]))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return out;
+    }
+
     if (expr.name.eq(lit_str("jwtHasScope")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)

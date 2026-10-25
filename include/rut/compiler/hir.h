@@ -209,6 +209,7 @@ enum class HirExprKind : u8 {
     TimeNowMicros,
     BearerMatches,
     BasicMatches,
+    HmacSha256Matches,
     ConstantTimeEqual,
     Uuid,
     JsonOp,

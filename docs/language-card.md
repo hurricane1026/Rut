@@ -1277,3 +1277,37 @@ separately; an empty required token always returns false.
 Literal `response(..., headers: {...})` values decode string escapes like
 ordinary expressions, including quoted challenge parameters. Decoded values
 are validated again; escaped CR/LF/NUL cannot introduce header fields.
+
+## HMAC-SHA256 and webhook authentication (implemented)
+
+`hmacSha256Matches(message, key, signature)` returns bool. An optional fourth
+string argument sets an exact wire-format prefix. All arguments are unwrapped
+`str` values. It verifies HMAC-SHA256 over exact message bytes, including NUL
+and non-UTF-8 bytes. The
+signature must be exactly 64 lowercase hex characters, optionally preceded by
+the exact fourth argument (a trusted prefix up to 64 bytes, empty by default). The
+algorithm is fixed; no attacker-selected digest, decoding, normalization or
+truncation is supported. Empty messages are valid; empty keys, invalid spans,
+keys over 4096 bytes and messages over 1 MiB return false. Hashing uses stack
+scratch with the pinned static OpenSSL SHA-256 primitive; equal-length digest
+contents use `CRYPTO_memcmp`, and secret scratch is cleansed before return.
+This builtin adds no grammar or dependency.
+
+`auth.hmac(message, signature, key, consumerId, credentialId)` publishes an
+Identity only after verification. `auth.rotatingHmac(...)` evaluates current
+and previous slots, prefers current on a tie, and supports revocation by
+removing the previous key. Both disabled slots or empty identity metadata
+return 503; verification failure returns 401.
+
+`auth.githubWebhook(body, signature, key, consumerId, credentialId)` requires
+the exact `sha256=` prefix before the digest. Supply raw `req.body` and
+`req.uniqueHeader("X-Hub-Signature-256").or("")`; duplicate headers reject even
+when identical. See [webhook-auth.rut](../examples/webhook-auth.rut). Verify
+before parsing or transforming JSON; payload signatures do not prevent replay.
+Durable delivery deduplication remains the receiving application's duty.
+The 1 MiB primitive bound does not extend the runtime's request-body limit.
+
+This is not the Kong/APISIX canonical HTTP-signature protocol or Standard
+Webhooks: those additionally define signed header lists, timestamp/nonce
+validation, encoding and replay state. Their full profiles remain pending in
+[auth coverage](auth-coverage.md).

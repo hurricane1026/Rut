@@ -806,15 +806,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         return v;
     }
-    if (expr.kind == HirExprKind::BearerMatches || expr.kind == HirExprKind::BasicMatches ||
-        expr.kind == HirExprKind::ConstantTimeEqual || expr.kind == HirExprKind::Eq ||
-        expr.kind == HirExprKind::Lt || expr.kind == HirExprKind::Gt ||
-        expr.kind == HirExprKind::BitAnd || expr.kind == HirExprKind::BitOr ||
-        expr.kind == HirExprKind::BitXor || expr.kind == HirExprKind::BitShl ||
-        expr.kind == HirExprKind::BitShr || expr.kind == HirExprKind::Add ||
-        expr.kind == HirExprKind::Sub || expr.kind == HirExprKind::Mul ||
-        expr.kind == HirExprKind::Div || expr.kind == HirExprKind::Mod ||
-        expr.kind == HirExprKind::MaxInt || expr.kind == HirExprKind::MinInt) {
+    if (expr.kind == HirExprKind::HmacSha256Matches || expr.kind == HirExprKind::BearerMatches ||
+        expr.kind == HirExprKind::BasicMatches || expr.kind == HirExprKind::ConstantTimeEqual ||
+        expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
+        expr.kind == HirExprKind::Gt || expr.kind == HirExprKind::BitAnd ||
+        expr.kind == HirExprKind::BitOr || expr.kind == HirExprKind::BitXor ||
+        expr.kind == HirExprKind::BitShl || expr.kind == HirExprKind::BitShr ||
+        expr.kind == HirExprKind::Add || expr.kind == HirExprKind::Sub ||
+        expr.kind == HirExprKind::Mul || expr.kind == HirExprKind::Div ||
+        expr.kind == HirExprKind::Mod || expr.kind == HirExprKind::MaxInt ||
+        expr.kind == HirExprKind::MinInt) {
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = mir_value(*expr.rhs, module, fn, ctx);
@@ -828,6 +829,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         switch (expr.kind) {
             case HirExprKind::BearerMatches:
                 v.kind = MirValueKind::BearerMatches;
+                break;
+            case HirExprKind::HmacSha256Matches:
+                v.kind = MirValueKind::HmacSha256Matches;
                 break;
             case HirExprKind::BasicMatches:
                 v.kind = MirValueKind::BasicMatches;
@@ -887,6 +891,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.type = is_cmp ? MirTypeKind::Bool : mir_type_kind(expr.type);
         v.lhs = lhs_ptr;
         v.rhs = rhs_ptr;
+        if (expr.kind == HirExprKind::HmacSha256Matches) {
+            for (u32 i = 0; i < 2; ++i) {
+                auto signature = mir_value(*expr.args[i], module, fn, ctx);
+                if (!signature) return core::make_unexpected(signature.error());
+                if (!fn->values.push(signature.value()))
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
+                if (!v.args.push(&fn->values[fn->values.len - 1]))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+            }
+        }
         v.error_variant_index = expr.error_variant_index;
         return v;
     }

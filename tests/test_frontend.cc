@@ -40826,3 +40826,19 @@ TEST(frontend, literal_response_headers_decode_quotes_and_reject_escaped_control
         if (a) CHECK(!analyze_file_heap(a.value()));
     }
 }
+
+TEST(frontend, hmac_verification_requires_strings_and_optional_prefix) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { if hmacSha256Matches("body", "key") { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { if hmacSha256Matches("body", "key", 1) { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { if hmacSha256Matches(req.authorization, "key", "signature") { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { if hmacSha256Matches("body", "key", "sig", 1) { return 200 } else { return 401 } })rut",
+    };
+    for (const char* src : invalid) {
+        auto tokens = lex(lit(src));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}

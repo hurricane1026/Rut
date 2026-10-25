@@ -109,6 +109,7 @@ struct Ctx {
     bool cur_fn_needs_parse = false;
     LLVMValueRef fn_bearer_matches;
     LLVMValueRef fn_basic_matches;
+    LLVMValueRef fn_hmac_sha256_matches;
     LLVMValueRef fn_str_constant_time_equal;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
@@ -531,6 +532,15 @@ struct Ctx {
             fn_bearer_matches = LLVMAddFunction(llvm_mod, "rut_helper_bearer_matches", ft);
         }
         return fn_bearer_matches;
+    }
+    LLVMValueRef get_hmac_sha256_matches() {
+        if (!fn_hmac_sha256_matches) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 8, 0);
+            fn_hmac_sha256_matches =
+                LLVMAddFunction(llvm_mod, "rut_helper_hmac_sha256_matches", ft);
+        }
+        return fn_hmac_sha256_matches;
     }
     LLVMValueRef get_basic_matches() {
         if (!fn_basic_matches) {
@@ -1306,6 +1316,24 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        case rir::Opcode::HmacSha256Matches: {
+            LLVMValueRef args[8];
+            for (u32 i = 0; i < 4; ++i) {
+                LLVMValueRef value = c.get_value(inst.operand(i));
+                args[static_cast<size_t>(i) * 2] =
+                    LLVMBuildExtractValue(c.builder, value, 0, "hmac.ptr");
+                args[static_cast<size_t>(i) * 2 + 1] =
+                    LLVMBuildExtractValue(c.builder, value, 1, "hmac.len");
+            }
+            LLVMValueRef fn = c.get_hmac_sha256_matches();
+            LLVMValueRef result =
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 8, "hmac");
+            c.set_value(
+                inst.result,
+                LLVMBuildICmp(
+                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "hmac.bool"));
+            break;
+        }
         // ── String operations ──
         case rir::Opcode::BearerMatches:
         case rir::Opcode::BasicMatches:
@@ -2437,6 +2465,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_parse_unprime = nullptr;
     c.fn_bearer_matches = nullptr;
     c.fn_basic_matches = nullptr;
+    c.fn_hmac_sha256_matches = nullptr;
     c.fn_str_constant_time_equal = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;

@@ -984,6 +984,18 @@ u8 rut_helper_bearer_matches(const char* authorization,
     return bearer_matches({authorization, authorization_len}, {key, key_len});
 }
 
+u8 rut_helper_hmac_sha256_matches(const char* message,
+                                  u32 message_len,
+                                  const char* key,
+                                  u32 key_len,
+                                  const char* signature,
+                                  u32 signature_len,
+                                  const char* prefix,
+                                  u32 prefix_len) {
+    return hmac_sha256_matches(
+        {message, message_len}, {key, key_len}, {signature, signature_len}, {prefix, prefix_len});
+}
+
 u8 rut_helper_basic_matches(const char* authorization,
                             u32 authorization_len,
                             const char* credentials,

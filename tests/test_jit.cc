@@ -23156,3 +23156,128 @@ TEST(jit, codegen_grows_block_map_beyond_stack_scratch) {
     CHECK(result.status_code == 204);
     engine.shutdown();
 }
+
+TEST(jit, hmac_webhook_authentication_and_rotation) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/webhook-auth.rut";
+    const char* source = R"rut(
+import "middleware/auth.rut"
+route POST "/webhook" {
+    let identity = auth.githubWebhook(req.body, req.uniqueHeader("X-Hub-Signature-256").or(""),
+                                      "It's a Secret to Everybody", "github", "webhook-1")
+    guard identity.consumerId == "github" && identity.method == "hmac" else { return 500 }
+    return 204
+}
+route POST "/rotate" {
+    let identity = auth.rotatingHmac(req.body, req.uniqueHeader("X-Signature").or(""),
+                                     "new-secret", "It's a Secret to Everybody", "github", "new", "old")
+    guard identity.credentialId == "old" else { return 500 }
+    return 202
+}
+route POST "/revoked" {
+    let identity = auth.rotatingHmac(req.body, req.uniqueHeader("X-Signature").or(""),
+                                     "new-secret", "", "github", "new", "old")
+    return 204
+}
+route POST "/misconfigured" {
+    let identity = auth.githubWebhook(req.body, req.uniqueHeader("X-Hub-Signature-256").or(""), "", "github", "webhook-1")
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "hmac analysis %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    // The runtime must buffer the complete framed body before verification.
+    for (u32 i = 0; i < rir.module.func_count; ++i)
+        CHECK(rir_function_needs_req_body(rir.module.functions[i]));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        const char* body;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0,
+         "X-Hub-Signature-256: "
+         "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17\r\n",
+         "Hello, World!",
+         204},
+        {0,
+         "x-hub-signature-256: "
+         "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17\r\nX-Consumer-ID:"
+         " attacker\r\n",
+         "Hello, World!",
+         204},
+        {0,
+         "X-Hub-Signature-256: "
+         "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17\r\n",
+         "Hello, world!",
+         401},
+        {0,
+         "X-Hub-Signature-256: "
+         "757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17\r\n",
+         "Hello, World!",
+         401},
+        {0,
+         "X-Hub-Signature-256: "
+         "sha1=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17\r\n",
+         "Hello, World!",
+         401},
+        {0,
+         "X-Hub-Signature-256: "
+         "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17\r\nx-hub-"
+         "signature-256: "
+         "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17\r\n",
+         "Hello, World!",
+         401},
+        {0, "", "Hello, World!", 401},
+        {0, "X-Hub-Signature-256: sha256=\r\n", "Hello, World!", 401},
+        {1,
+         "X-Signature: 757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17\r\n",
+         "Hello, World!",
+         202},
+        {2,
+         "X-Signature: 757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17\r\n",
+         "Hello, World!",
+         401},
+        {3, "", "Hello, World!", 503},
+    };
+    for (const auto& tc : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        const std::string body(tc.body);
+        const std::string request =
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) +
+            "\r\n" + tc.headers + "\r\n" + body;
+        auto result = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(request.data()),
+                                                    static_cast<u32>(request.size()),
+                                                    nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK(result.status_code == tc.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
