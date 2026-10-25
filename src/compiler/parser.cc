@@ -5013,13 +5013,20 @@ struct Parser {
             auto dur = expect(TokenType::DurLit);
             if (!dur) return core::make_unexpected(dur.error());
             u32 kWin = 0;
-            if (!dur_lit_to_rate_limit_seconds(dur.value()->text, &kWin) || maxv == 0)
+            if (maxv == 0)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*lim.value()),
+                                      lit_str("rate-limit limit must be greater than zero"));
+            if (!dur_lit_to_rate_limit_seconds(dur.value()->text, &kWin))
                 return frontend_error(
-                    FrontendError::UnsupportedSyntax, deco.span, dur.value()->text);
+                    FrontendError::UnsupportedSyntax,
+                    span_from(*dur.value()),
+                    lit_str("rate-limit window must round up to between 1 and 4294967295 seconds"));
             // Optional trailing named args, in any order:
             //   by: <key>     — single source or [list]; `ip` or
             //                    header/query/cookie/param("name"). Default per-IP.
             //   scope: shard|global — enforcement scope. Default shard.
+            Span burst_span = deco.span;
             while (take(TokenType::Comma)) {
                 auto arg = expect(TokenType::Ident);
                 if (!arg) return core::make_unexpected(arg.error());
@@ -5057,6 +5064,7 @@ struct Parser {
                 } else if (arg.value()->text.eq({"burst", 5})) {
                     auto bv = expect(TokenType::IntLit);
                     if (!bv) return core::make_unexpected(bv.error());
+                    burst_span = span_from(*bv.value());
                     u64 b = 0;
                     for (u32 i = 0; i < bv.value()->text.len; i++) {
                         b = b * 10 + static_cast<u64>(bv.value()->text.ptr[i] - '0');
@@ -5076,9 +5084,10 @@ struct Parser {
             const u32 burst =
                 deco.rate_limit_burst == 0 ? static_cast<u32>(maxv) : deco.rate_limit_burst;
             if (!rate_limit_params_representable(static_cast<u32>(maxv), kWin, burst))
-                return frontend_error(FrontendError::UnsupportedSyntax,
-                                      deco.span,
-                                      lit_str("rate-limit burst/window exceeds u64 GCRA range"));
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    burst_span,
+                    lit_str("rate-limit burst is too large for this limit and window"));
             deco.rate_limit_max = static_cast<u32>(maxv);
             deco.rate_limit_window_sec = kWin;
             return deco;
