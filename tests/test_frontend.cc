@@ -40546,8 +40546,6 @@ TEST(frontend, jwt_decode_requires_two_unwrapped_strings) {
 TEST(frontend, jwt_decode_algorithm_policy_is_an_unwrapped_string) {
     const char* valid[] = {
         "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", \"HS256\") return 200 }",
-        "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", req.header(\"X-Alg\").or(\"\")) return "
-        "200 }",
         "func jwtDecode(_ a: i32, _ b: i32, _ c: i32) -> i32 => a + b + c\n"
         "route GET \"/\" { let n = jwtDecode(1, 2, 3) return 200 }",
     };
@@ -40561,6 +40559,7 @@ TEST(frontend, jwt_decode_algorithm_policy_is_an_unwrapped_string) {
     const char* invalid[] = {
         "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", 1) return 200 }",
         "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", req.header(\"X-Alg\")) return 200 }",
+        "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", req.header(\"X-Alg\").or(\"\")) return 200 }",
         "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", \"HS256\", \"HS512\") return 200 }",
     };
     for (const char* source : invalid) {
@@ -40586,7 +40585,7 @@ route GET "/admin" {
     guard let expires = json.int(claims.exp) else { return 401 }
     guard expires * i64(1000000) > time.nowMicros() else { return 401 }
     guard claims.role == "admin" else { return 403 }
-    return forward(api, load_balance: .roundRobin)
+return forward(api, load_balance: .roundRobin)
 }
 )rut";
     REQUIRE_EQ(setenv("JWT_SECRET", "s3cr3t", 1), 0);
@@ -40602,6 +40601,28 @@ route GET "/admin" {
     REQUIRE(lower_to_rir(mir.value(), rir));
     rir.destroy();
     unsetenv("JWT_SECRET");
+}
+
+TEST(frontend, jwt_decode_algorithm_accepts_static_local_and_env_configuration) {
+    REQUIRE_EQ(setenv("RUT_TEST_JWT_ALGORITHM", "HS256", 1), 0);
+    const char* src = R"rut(
+route GET "/local" {
+    let algorithm = "HS256"
+    let document = jwtDecode("token", "secret", algorithm)
+    return 200
+}
+route GET "/env" {
+    let algorithm = env("RUT_TEST_JWT_ALGORITHM")
+    let document = jwtDecode("token", "secret", algorithm)
+    return 200
+}
+)rut";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
+    unsetenv("RUT_TEST_JWT_ALGORITHM");
 }
 
 TEST(frontend, env_is_resolved_at_analysis_time) {

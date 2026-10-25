@@ -8225,8 +8225,9 @@ never a value copied from the token or request. This follows
 
 The two-argument overload retains its existing HS256/384/512 behavior for
 compatibility. Prefer the three-argument overload for new deployments.
-`auth.jwtDocumentWithAlgorithm(authorization, secret, algorithm)` maps empty or
-unsupported configuration to 503 and invalid tokens to a challenged 401.
+`auth.jwtDocumentHs256` / `auth.jwtDocumentHs384` / `auth.jwtDocumentHs512`
+bind the selected algorithm in configuration; empty secrets map to 503 and
+invalid tokens to a challenged 401.
 `examples/jwt-claims-auth.rut` pins HS256 before checking issuer, audience,
 expiry and scopes. Signature verification does not replace claims policy.
 This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism;
