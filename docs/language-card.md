@@ -934,6 +934,16 @@ The request passes only when every rule passes. Disabled rules consume nothing;
 a missing required global limiter fails preflight without spending any budget.
 This does not change the policy chosen by Rut code over Cache.
 
+When a built-in rule rejects with a known finite wait, HTTP/1 and HTTP/2 return
+429 with an integer-second `Retry-After` advisory rounded up from the remaining
+GCRA wait. The wait is the maximum post-charge recovery wait across every active
+stacked rule, including rules that accepted and consumed a token. Missing semantic
+IDs, missing global state, and timestamp overflow omit the header. The value is a
+snapshot and is not a reservation under concurrent traffic. The runtime exposes
+fixed-cardinality per-shard attempt, rejection, and rejection reason counters
+through `/metrics`; reason counters have stable labels and never include routes
+or metering keys.
+
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)
 

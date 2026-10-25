@@ -22298,6 +22298,38 @@ static Connection* dispatch_unmatched_request(SmallLoop& loop,
     return conn;
 }
 
+TEST(rate_limit, http1_dispatch_emits_retry_after_and_metrics) {
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics;
+    metrics.init();
+    loop.metrics = &metrics;
+    RouteConfig config{};
+    REQUIRE(config.add_static("/", kRouteMethodGet, 204));
+    REQUIRE(config.set_route_rate_limit(0, 1, 60, 1));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    Connection* admitted = dispatch_unmatched_request(loop, config, kRequest);
+    REQUIRE(admitted != nullptr);
+    CHECK_EQ(admitted->resp_status, 204u);
+    CHECK_EQ(metrics.rate_limit_attempts_total, 1u);
+    CHECK_EQ(metrics.rate_limit_rejected_total, 0u);
+
+    Connection* rejected = dispatch_unmatched_request(loop, config, kRequest);
+    REQUIRE(rejected != nullptr);
+    CHECK_EQ(rejected->resp_status, 429u);
+    CHECK_FALSE(rejected->keep_alive);
+    CHECK(buf_contains(reinterpret_cast<const char*>(rejected->send_buf.data()),
+                       rejected->send_buf.len(),
+                       "Retry-After: ",
+                       13));
+    CHECK_EQ(metrics.rate_limit_attempts_total, 2u);
+    CHECK_EQ(metrics.rate_limit_rejected_total, 1u);
+    CHECK_EQ(metrics.rate_limit_rejected_by_reason[0], 1u);
+    loop.close_conn(*admitted);
+    loop.close_conn(*rejected);
+}
+
 TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
     SmallLoop loop;
     loop.setup();

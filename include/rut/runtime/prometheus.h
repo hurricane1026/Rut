@@ -95,6 +95,27 @@ inline u32 format_prometheus(const ShardMetrics& m, char* buf, u32 cap) {
                 "Requests currently being processed.",
                 "gauge",
                 m.requests_active);
+    emit_scalar(w,
+                "rut_rate_limit_attempts_total",
+                "Requests evaluated by rate-limit admission.",
+                "counter",
+                m.rate_limit_attempts_total);
+    emit_scalar(w,
+                "rut_rate_limit_rejected_total",
+                "Requests rejected by rate-limit admission.",
+                "counter",
+                m.rate_limit_rejected_total);
+    static constexpr const char* kRateLimitReasons[] = {
+        "budget", "shard_collision", "state_overflow", "missing_global", "missing_id"};
+    w.str("# HELP rut_rate_limit_rejected_reason_total Rate-limit rejections by reason.\n");
+    w.str("# TYPE rut_rate_limit_rejected_reason_total counter\n");
+    for (u32 i = 0; i < ShardMetrics::kRateLimitReasonCount; i++) {
+        w.str("rut_rate_limit_rejected_reason_total{reason=\"");
+        w.str(kRateLimitReasons[i]);
+        w.str("\"} ");
+        w.u64v(m.rate_limit_rejected_by_reason[i]);
+        w.ch('\n');
+    }
     emit_scalar(
         w, "rut_connections_total", "Total accepted connections.", "counter", m.connections_total);
     emit_scalar(

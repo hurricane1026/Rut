@@ -391,12 +391,19 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         key_input.path_is_trusted = false;
         key_input.params = route_params;
         key_input.param_count = route_param_count;
-        rate_limited = rate_limit_exceeded_with_limiters(*rate_limiter,
-                                                         &state->global_rate_limiter,
-                                                         route->rate_limit,
-                                                         route->rate_limit_ids,
-                                                         key_input,
-                                                         scenario.now_us);
+        const RateLimitDecision decision =
+            rate_limit_decision_with_limiters(*rate_limiter,
+                                              &state->global_rate_limiter,
+                                              route->rate_limit,
+                                              route->rate_limit_ids,
+                                              key_input,
+                                              scenario.now_us);
+        rate_limited = !decision.allowed;
+        out.has_retry_after = rate_limited && decision.retry_known;
+        if (out.has_retry_after) {
+            out.retry_after_seconds = decision.next_wait_us / 1'000'000ull;
+            if (decision.next_wait_us % 1'000'000ull != 0) out.retry_after_seconds++;
+        }
     }
 
     if (rate_limited) {

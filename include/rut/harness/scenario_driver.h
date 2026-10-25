@@ -39,6 +39,8 @@ struct ScenarioResult {
     u32 route_index = 0;
     bool route_selected = false;
     u64 connection_invariant_violations = 0;
+    bool has_retry_after = false;
+    u64 retry_after_seconds = 0;
 };
 
 ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& harness);

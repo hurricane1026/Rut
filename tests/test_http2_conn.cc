@@ -1392,6 +1392,84 @@ TEST(http2_conn, write_response_with_body_and_headers) {
     CHECK((df.flags & http2_flag::kEndStream) != 0);
 }
 
+TEST(http2_conn, rate_limit_retry_after_header_is_encoded) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    const hpack::Header hdrs[] = {{{"retry-after", 11}, {"60", 2}}};
+    u8 out[256];
+    const u32 n = http2_write_response(out, sizeof(out), enc, 1, 429, hdrs, 1, nullptr, 0);
+    REQUIRE(n != 0);
+    Http2FrameHeader frame;
+    REQUIRE(parse_frame_header(out, n, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       out + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &decoded_count));
+    bool found = false;
+    for (u32 i = 0; i < decoded_count; i++) {
+        if (decoded[i].name.eq(Str{"retry-after", 11}) && decoded[i].value.eq(Str{"60", 2}))
+            found = true;
+    }
+    CHECK(found);
+}
+
+TEST(h2_serving, rate_limit_retry_after_header_failure_keeps_429) {
+    struct RetryH2Loop {
+        Http2Conn owned_h2;
+    } loop;
+    Connection conn;
+    conn.reset();
+    conn.h2 = &loop.owned_h2;
+    conn.h2->init();
+    RateLimitDecision decision{};
+    decision.allowed = false;
+    decision.next_wait_us = 60'000'000;
+
+    // This deliberately leaves enough room for status-only 429 but not for the
+    // optional Retry-After field. The advisory must not turn into a 500.
+    u8 response[16]{};
+    H2Dispatch<RetryH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+    h2_emit_rate_limit(d, 1, decision);
+    CHECK_FALSE(d.overflow);
+    REQUIRE_GT(d.resp_len, 0u);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[128];
+    u32 decoded_count = 0;
+    Http2FrameHeader frame;
+    REQUIRE(parse_frame_header(response, d.resp_len, &frame) == ParseStatus::Complete);
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &decoded_count));
+    CHECK(decoded[0].name.eq(Str{":status", 7}));
+    CHECK(decoded[0].value.eq(Str{"429", 3}));
+    bool has_retry = false;
+    for (u32 i = 0; i < decoded_count; i++)
+        if (decoded[i].name.eq(Str{"retry-after", 11})) has_retry = true;
+    CHECK_FALSE(has_retry);
+
+    u8 no_room[1]{};
+    H2Dispatch<RetryH2Loop> blocked{&loop, &conn, no_room, sizeof(no_room), 0, false};
+    h2_emit_rate_limit(blocked, 3, decision);
+    CHECK(blocked.overflow);
+    CHECK_EQ(blocked.resp_len, 0u);
+}
+
 TEST(http2_conn, write_head_headers_with_representation_length_is_transactional) {
     const hpack::Header hdrs[] = {{{"x-head-check", 12}, {"enabled", 7}}};
     u8 out[256];

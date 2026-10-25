@@ -1276,6 +1276,8 @@ TEST(harness_scenario, rate_limit_state_obeys_group_and_run_isolation) {
     CHECK_EQ(second.terminal.status_code, 204);
     CHECK_EQ(other_shard.terminal.status_code, 204);
     CHECK_EQ(third.terminal.status_code, 429);
+    CHECK(third.has_retry_after);
+    CHECK_GT(third.retry_after_seconds, 0u);
 
     scenario.state_isolation = harness::StateIsolation::Run;
     scenario.state = nullptr;
