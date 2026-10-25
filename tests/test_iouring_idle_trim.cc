@@ -1154,9 +1154,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // RelayOwner and BufferedSendVector are part of the hot connection slot.
     // Keep the slot-size assertion explicit so future owner fields cannot grow
     // the layout unnoticed.
-    // Keep checking the current hot-slot layout explicitly. The per-request
-    // attempted-backend mask increases the aligned Connection slot by 16 bytes.
-    CHECK_EQ(sizeof(Connection), 4040u);
+    // Keep checking the current hot-slot layout explicitly. The previous
+    // 4040-byte layout already included the per-request attempted-backend mask;
+    // HTTP-cache token/metadata fields add 48 aligned bytes to that layout.
+    CHECK_EQ(sizeof(Connection), 4088u);
 }
 
 TEST(iouring_idle_trim,

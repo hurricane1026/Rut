@@ -759,6 +759,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_http2_conn.profraw ./build/tests/test_http2_conn
           LLVM_PROFILE_FILE=build/test_ws_frame.profraw ./build/tests/test_ws_frame
           LLVM_PROFILE_FILE=build/test_ws_terminate.profraw ./build/tests/test_ws_terminate
+          LLVM_PROFILE_FILE=build/test_http_cache.profraw ./build/tests/test_http_cache
 
       - name: Generate coverage report
         run: |
@@ -800,6 +801,7 @@ jobs:
             build/tests/test_http2_conn \
             build/tests/test_ws_frame \
             build/tests/test_ws_terminate \
+            build/tests/test_http_cache \
             build/tests/test_expected \
             build/tests/test_drain \
             build/tests/test_access_log \
