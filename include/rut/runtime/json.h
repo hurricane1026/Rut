@@ -40,6 +40,7 @@ enum class Op : u8 {
     BearerToken,
     JwtClaimsValid,
     JwtHasScope,
+    JwtDecodePinned,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

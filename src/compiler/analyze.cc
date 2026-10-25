@@ -9176,10 +9176,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   lit_str("use jwtDecode(token, secret) directly"));
-        if (expr.args.len != 2)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  expr.span,
-                                  lit_str("jwtDecode(token, secret) expects two arguments"));
+        if (expr.args.len != 2 && expr.args.len != 3)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("jwtDecode expects token, secret, and optional algorithm"));
         auto token = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
         if (!token) return token;
         auto secret = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
@@ -9190,12 +9191,22 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 FrontendError::UnsupportedSyntax,
                 expr.span,
                 lit_str("jwtDecode requires unwrapped str token and secret values"));
-        return make_json_op(json::Op::JwtDecode,
+        HirExpr algorithm{};
+        if (expr.args.len == 3) {
+            auto analyzed = analyze_expr(*expr.args[2], route, mod, locals, local_count, binding);
+            if (!analyzed) return analyzed;
+            if (analyzed->type != HirTypeKind::Str || analyzed->may_nil || analyzed->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("jwtDecode algorithm requires an unwrapped str"));
+            algorithm = analyzed.value();
+        }
+        return make_json_op(expr.args.len == 3 ? json::Op::JwtDecodePinned : json::Op::JwtDecode,
                             HirTypeKind::Json,
                             true,
                             &token.value(),
                             &secret.value(),
-                            nullptr,
+                            expr.args.len == 3 ? &algorithm : nullptr,
                             expr.span,
                             route);
     }
