@@ -40723,3 +40723,45 @@ TEST(frontend, jwt_claims_policy_requires_unwrapped_json_and_string_configuratio
         CHECK(!analyze_file_heap(ast.value()));
     }
 }
+
+TEST(frontend, jwt_scope_requires_unwrapped_json_and_one_string) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { if jwtHasScope("{}", "read") { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { if jwtHasScope(json.parse("{}"), "read") { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtHasScope(doc, 1) { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtHasScope(doc) { return 200 } else { return 403 } })rut",
+    };
+    for (const char* src : invalid) {
+        auto tokens = lex(lit(src));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, literal_response_headers_decode_quotes_and_reject_escaped_controls) {
+    const char* source = R"rut(route GET "/" {
+        return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})
+    })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir.value().routes[0].control.direct_term.response_headers.len, 1u);
+    CHECK(hir.value().routes[0].control.direct_term.response_headers[0].value.eq(
+        lit_str("Bearer error=\"insufficient_scope\"")));
+    const char* invalid[] = {
+        R"rut(route GET "/" { return response(403, headers: {"X-Test": "ok\u{a}Injected: yes"}) })rut",
+        R"rut(route GET "/" { return response(403, headers: {"X-Test": "ok\u{d}Injected: yes"}) })rut",
+        R"rut(route GET "/" { return response(403, headers: {"X-Test": "ok\u{0}"}) })rut",
+    };
+    for (const char* src : invalid) {
+        auto t = lex(lit(src));
+        REQUIRE(t);
+        auto a = parse_file_heap(t.value());
+        if (a) CHECK(!analyze_file_heap(a.value()));
+    }
+}

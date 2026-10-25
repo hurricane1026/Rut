@@ -8110,3 +8110,30 @@ remains a distinct step from claims policy. Caller-configured credentialId remai
 untrusted kid header. Dynamic JWKS and live token/key revocation remain separate
 work; this profile is not a replacement for signature verification or a complete
 OIDC implementation. Exact behavior and bounds are in the language card.
+
+## JWT scope authorization (implemented)
+
+`jwtHasScope(claims: Json, required: str) -> bool` checks one complete,
+case-sensitive token in the top-level `scope` string. Use it only after
+`jwtDecode` and `jwtClaimsValid` (or `auth.jwtDocument` and `auth.jwtIdentity`).
+It does not authenticate a document. `&&` composes all-required scopes; `||`
+composes alternatives. No implicit scopes or substring matching apply.
+
+The full decoded list must follow [RFC 6749 section 3.3](https://www.rfc-editor.org/rfc/rfc6749#section-3.3):
+nonempty ASCII scope tokens separated by one space. Quotes, backslashes,
+control/non-ASCII bytes, empty tokens, missing/wrong-type claims, duplicate
+JSON keys and invalid required tokens fail closed. Array-valued `scp`/`scope`
+claims are not part of this profile. Parsing reuses bounded JSON scratch;
+there is no allocation or retained view.
+
+The `/orders` example in `examples/jwt-claims-auth.rut` first verifies the
+signature and identity profile, then uses `guard jwtHasScope(...)` with a 403
+response and `WWW-Authenticate: Bearer error="insufficient_scope"`, following
+[RFC 6750 section 3.1](https://www.rfc-editor.org/rfc/rfc6750#section-3.1).
+Invalid authentication remains 401; an authenticated identity lacking the
+required scope is denied with 403. Validate dynamic policy configuration
+separately; an empty required token always returns false.
+
+Literal `response(..., headers: {...})` values decode string escapes like
+ordinary expressions, including quoted challenge parameters. Decoded values
+are validated again; escaped CR/LF/NUL cannot introduce header fields.

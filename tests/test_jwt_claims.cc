@@ -65,6 +65,56 @@ TEST(jwt_claims, audience_arrays_and_exact_decoded_string_comparison) {
     CHECK(!jwt_claims_valid(scratch, {nullptr, 1}, lit_str("issuer"), lit_str("gateway"), 1000));
 }
 
+TEST(jwt_claims, scope_membership_is_exact_and_validates_the_entire_list) {
+    json::Document scratch;
+    const auto has = [&](Str claims, Str required = lit_str("orders:read")) {
+        return jwt_has_scope(scratch, claims, required);
+    };
+    CHECK(has(lit_str(R"({"scope":"orders:read"})")));
+    CHECK(has(lit_str(R"({"scope":"profile orders:read orders:write"})")));
+    CHECK(has(lit_str(R"({"scope":"orders:read orders:read"})")));
+    CHECK(has(lit_str(R"({"sc\u006fpe":"orders:re\u0061d"})")));
+    CHECK(has(lit_str(R"({"scope":"! # [ ] ~"})"), lit_str("~")));
+    const Str denied[] = {
+        lit_str(R"({"scope":"orders:reader"})"),
+        lit_str(R"({"scope":"xorders:read"})"),
+        lit_str(R"({"scope":"Orders:read"})"),
+        lit_str(R"({"scope":" orders:read"})"),
+        lit_str(R"({"scope":"orders:read "})"),
+        lit_str(R"({"scope":"orders:read  profile"})"),
+        lit_str(R"({"scope":"orders:read\tprofile"})"),
+        lit_str(R"({"scope":"orders:read profile\n"})"),
+        lit_str(R"({"scope":"orders:read \u0000"})"),
+        lit_str(R"({"scope":"orders:read \""})"),
+        lit_str(R"({"scope":"orders:read \\"})"),
+        lit_str(R"({"scope":"orders:read \u00e9"})"),
+        lit_str(R"({"scope":""})"),
+        lit_str(R"({"scope":null})"),
+        lit_str(R"({"scope":["orders:read"]})"),
+        lit_str(R"({"scope":true})"),
+        lit_str(R"({"scope":"orders:read","sc\u006fpe":"profile"})"),
+        lit_str(R"({"nested":{"scope":"orders:read"}})"),
+        lit_str("[]"),
+        lit_str("{}"),
+        lit_str("null"),
+        lit_str("broken"),
+    };
+    for (Str claims : denied) CHECK(!has(claims));
+    const Str claims = lit_str(R"({"scope":"orders:read"})");
+    const Str invalid_requirements[] = {
+        lit_str(""),
+        lit_str("orders:read profile"),
+        lit_str("orders:read\t"),
+        lit_str("\\"),
+        lit_str("\""),
+        {nullptr, 1},
+    };
+    for (Str required : invalid_requirements) CHECK(!has(claims, required));
+    CHECK(!has({nullptr, 1}));
+    // Failure must not poison the reusable shard-local scratch document.
+    CHECK(has(claims));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

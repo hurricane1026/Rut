@@ -16,4 +16,8 @@ namespace rut {
 bool jwt_claims_valid(
     json::Document& scratch, Str claims, Str issuer, Str audience, i64 unix_seconds);
 
+// Exact OAuth scope-token membership in a verified JWT scope string. Does not
+// verify signatures or claims policy. Invalid documents/tokens fail closed.
+bool jwt_has_scope(json::Document& scratch, Str claims, Str required);
+
 }  // namespace rut
