@@ -914,6 +914,10 @@ saturated to a shorter window. Sub-second rate-limit durations retain the
 existing round-up-to-one-second behavior. Runtime conformance and state advancement are
 overflow-safe near the maximum monotonic timestamp and fail closed if the next
 timestamp cannot be represented.
+The compiler diagnoses a zero limit, a window whose rounded whole-second value
+falls outside 1..4294967295, and a burst too large for the selected
+limit/window with actionable parameter errors. Sub-second windows such as
+`1ms` remain valid and round up to one second.
 The shard limiter table belongs to its event-loop instance: HTTP/1 and HTTP/2
 dispatch on that loop share the table, while separate loop instances remain
 isolated even when they run on the same thread.

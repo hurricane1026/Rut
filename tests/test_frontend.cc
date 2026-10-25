@@ -3238,6 +3238,67 @@ TEST(frontend, rate_limit_rejects_fifth_rule_at_decorator) {
     CHECK(hir.error().detail.eq(lit("a route supports at most 4 @rateLimit rules")));
 }
 
+TEST(frontend, rate_limit_invalid_limit_and_window_have_actionable_diagnostics) {
+    const char* sources[] = {
+        "@rateLimit(limit: 0, window: 1m)\nroute GET \"/x\" { return 200 }\n",
+        "@rateLimit(limit: 1, window: 0s)\nroute GET \"/x\" { return 200 }\n",
+    };
+    const char* details[] = {
+        "rate-limit limit must be greater than zero",
+        "rate-limit window must round up to between 1 and 4294967295 seconds",
+    };
+    for (u32 i = 0; i < 2; i++) {
+        auto lexed = lex(lit(sources[i]));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(ast.error().span.line, 1u);
+        CHECK_EQ(ast.error().span.col, i == 0 ? 19u : 30u);
+        CHECK_EQ(ast.error().span.end - ast.error().span.start, i == 0 ? 1u : 2u);
+        CHECK(ast.error().detail.eq(lit(details[i])));
+    }
+}
+
+TEST(frontend, rate_limit_unrepresentable_burst_has_actionable_diagnostic) {
+    const char* source =
+        "@rateLimit(limit: 1, window: 4294967295s, burst: 4294967295)\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(ast.error().span.line, 1u);
+    CHECK_EQ(ast.error().span.col, 50u);
+    CHECK_EQ(ast.error().span.end - ast.error().span.start, 10u);
+    CHECK(ast.error().detail.eq(lit("rate-limit burst is too large for this limit and window")));
+}
+
+TEST(frontend, rate_limit_window_rounding_and_range_boundaries) {
+    const char* valid = "@rateLimit(limit: 1, window: 1ms)\nroute GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir.value().routes[0].rate_limit.rules[0].window_sec, 1u);
+
+    const char* invalid =
+        "@rateLimit(limit: 1, window: 4294967296s)\nroute GET \"/x\" { return 200 }\n";
+    lexed = lex(lit(invalid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(ast.error().span.line, 1u);
+    CHECK_EQ(ast.error().span.col, 30u);
+    CHECK_EQ(ast.error().span.end - ast.error().span.start, 11u);
+    CHECK(ast.error().detail.eq(
+        lit("rate-limit window must round up to between 1 and 4294967295 seconds")));
+}
+
 TEST(frontend, rate_limit_preserves_four_rules_per_route) {
     const char* source =
         "@rateLimit(limit: 10, window: 1m, by: ip)\n"
