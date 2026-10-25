@@ -22591,3 +22591,73 @@ route GET "/least" { wait(1ms) return forward(api, load_balance: .leastRequests)
     engine.shutdown();
     out.destroy();
 }
+
+TEST(jit, unique_credential_headers_reject_ambiguity_without_changing_ordinary_reads) {
+    const char* src = R"rut(
+route GET "/custom" {
+    guard let key = req.uniqueHeader("X-API-Key") else { return 401 }
+    guard constantTimeEqual(key, "secret") else { return 401 }
+    return 200
+}
+route GET "/authorization" {
+    guard let key = req.authorization else { return 401 }
+    if key == "Bearer secret" { return 200 } else { return 401 }
+}
+route GET "/ordinary" {
+    guard let tag = req.header("X-Tag") else { return 401 }
+    if tag == "first" { return 200 } else { return 401 }
+}
+)rut";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0, "X-API-Key: secret\r\n", 200},
+        {0, "x-api-key: secret\r\n", 200},
+        {0, "", 401},
+        {0, "X-API-Key: wrong\r\n", 401},
+        {0, "X-API-Key: secret\r\nx-api-key: wrong\r\n", 401},
+        {0, "X-API-Key: wrong\r\nx-api-key: secret\r\n", 401},
+        {0, "X-API-Key: secret\r\nx-api-key: secret\r\n", 401},
+        {1, "Authorization: Bearer secret\r\n", 200},
+        {1, "Authorization: Bearer secret\r\nauthorization: wrong\r\n", 401},
+        {1, "Authorization: Bearer secret\r\nauthorization: Bearer secret\r\n", 401},
+        {2, "X-Tag: first\r\nx-tag: second\r\n", 200},
+        {0, "X-API-Key: secret\r\n", 200},
+        {0, "", 401},
+    };
+    for (const auto& tc : cases) {
+        char name[] = "handler_route_0";
+        name[14] = static_cast<char>('0' + tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: local\r\n") + tc.headers + "\r\n";
+        auto result = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(request.data()),
+                                                    static_cast<u32>(request.size()),
+                                                    nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, tc.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}

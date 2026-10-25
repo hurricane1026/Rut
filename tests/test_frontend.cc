@@ -40608,3 +40608,19 @@ route GET "/other" { return forward(api, load_balance: .roundRobin) }
     CHECK_FALSE(rir::verify_module(out.module).ok);
     out.destroy();
 }
+
+TEST(frontend, unique_header_requires_literal_token_name_and_a_request) {
+    const char* sources[] = {
+        R"rut(route GET "/" { let h = req.uniqueHeader("") return 200 })rut",
+        R"rut(route GET "/" { let h = req.uniqueHeader("X Bad") return 200 })rut",
+        R"rut(route GET "/" { let n = "X-Key" let h = req.uniqueHeader(n) return 200 })rut",
+        R"rut(timer t, every: 1s { let h = req.uniqueHeader("X-Key") })rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}

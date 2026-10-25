@@ -585,6 +585,13 @@ struct Ctx {
 The compiler verifies that fields read in a handler were set by a decorator in
 the chain. Accessing an unset field is a compile error.
 
+**Credential header reads:** `req.uniqueHeader("Name") -> str?` requires a literal,
+nonempty HTTP token name. It returns a value only for exactly one occurrence,
+using case-insensitive field-name matching. Duplicate identical values yield nil.
+Authorization is a singleton for ordinary header reads and its property alias too;
+other ordinary header reads keep first-occurrence semantics. Reads observe the
+original parsed request, independently of forwarding header mutations.
+
 #### 3.3.5 Response Object
 
 ```swift

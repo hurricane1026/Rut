@@ -236,6 +236,7 @@ req.authorization (str?)   req.host  req.userAgent  req.origin (str?)
 
 // Raw headers — function access ONLY (never req.X-Foo property syntax)
 req.header("X-Request-ID")   // str?
+req.uniqueHeader("X-API-Key") // str?; missing or duplicate fields yield nil
 req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only
 req.add("X-Tag", "a")        // ✅ preserve existing fields and append
 req.getAll("Accept")         // ⏳ [str]
@@ -1091,3 +1092,13 @@ bytecode; they add no language syntax. Fixed terminal forwards can be body
 candidates while routing and headers stay in userspace. A candidate does not
 activate kernel forwarding: live socket handoff remains ⏳. `firewall {}`/XDP and
 kTLS integration also remain unimplemented. See [ebpf.md](ebpf.md).
+
+## Unique credential headers
+
+`req.uniqueHeader("Name") -> str?` accepts a literal HTTP token field name and
+returns a value only when exactly one case-insensitive occurrence exists.
+Duplicate identical values are also absent. Use this read for custom API key
+headers; ordinary `req.header` keeps its first-field behavior for other fields.
+Authorization is always a singleton: both `req.authorization` and
+`req.header("Authorization")` return nil for duplicate Authorization fields.
+Request-header mutation does not change these original-request reads.

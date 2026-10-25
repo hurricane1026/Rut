@@ -68,6 +68,15 @@ void rut_helper_req_header(const rut::u8* req_data,
                            const char** out_ptr,
                            rut::u32* out_len);
 
+// Absent unless exactly one field with this name exists (case-insensitive).
+void rut_helper_req_unique_header(const rut::u8* req_data,
+                                  rut::u32 req_len,
+                                  const char* name,
+                                  rut::u32 name_len,
+                                  rut::u8* out_has_value,
+                                  const char** out_ptr,
+                                  rut::u32* out_len);
+
 // Look up a cookie by name from the Cookie request header.
 // Returns Optional(Str): *out_has_value = 1 if found, 0 if not.
 // If found, *out_ptr / *out_len point into req_data.

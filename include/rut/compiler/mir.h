@@ -38,6 +38,7 @@ enum class MirValueKind : u8 {
     IfElse,
     StructInit,
     Field,
+    ReqUniqueHeader,
     ReqHeader,
     ReqSetHeader,
     ReqAddHeader,

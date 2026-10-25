@@ -1,6 +1,7 @@
 #include "rut/jit/runtime_helpers.h"
 
 #include "core/placement_new.h"
+#include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
@@ -228,13 +229,14 @@ u8 rut_helper_req_method(const u8* req_data, u32 req_len) {
     return static_cast<u8>(HttpMethod::Unknown);
 }
 
-void rut_helper_req_header(const u8* req_data,
-                           u32 req_len,
-                           const char* name,
-                           u32 name_len,
-                           u8* out_has_value,
-                           const char** out_ptr,
-                           u32* out_len) {
+static void lookup_req_header(const u8* req_data,
+                              u32 req_len,
+                              const char* name,
+                              u32 name_len,
+                              u8* out_has_value,
+                              const char** out_ptr,
+                              u32* out_len,
+                              bool unique) {
     *out_has_value = 0;
     *out_ptr = nullptr;
     *out_len = 0;
@@ -260,12 +262,45 @@ void rut_helper_req_header(const u8* req_data,
             }
         }
         if (match) {
+            if (*out_has_value != 0) {
+                *out_has_value = 0;
+                *out_ptr = nullptr;
+                *out_len = 0;
+                return;
+            }
             *out_has_value = 1;
             *out_ptr = h.value.ptr;
             *out_len = h.value.len;
-            return;
+            if (!unique) return;
         }
     }
+}
+
+void rut_helper_req_header(const u8* req_data,
+                           u32 req_len,
+                           const char* name,
+                           u32 name_len,
+                           u8* out_has_value,
+                           const char** out_ptr,
+                           u32* out_len) {
+    lookup_req_header(req_data,
+                      req_len,
+                      name,
+                      name_len,
+                      out_has_value,
+                      out_ptr,
+                      out_len,
+                      http_header_name_eq_ci(name, name_len, "Authorization", 13));
+}
+
+void rut_helper_req_unique_header(const u8* req_data,
+                                  u32 req_len,
+                                  const char* name,
+                                  u32 name_len,
+                                  u8* out_has_value,
+                                  const char** out_ptr,
+                                  u32* out_len) {
+    lookup_req_header(req_data, req_len, name, name_len, out_has_value, out_ptr, out_len, true);
 }
 
 // forward(set_path:) — record the path override on the connection. The proxy
