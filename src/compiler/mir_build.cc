@@ -610,8 +610,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.error_variant_index = expr.error_variant_index;
         return v;
     }
-    if (expr.kind == HirExprKind::ReqHeader) {
-        v.kind = MirValueKind::ReqHeader;
+    if (expr.kind == HirExprKind::ReqHeader || expr.kind == HirExprKind::ReqUniqueHeader) {
+        v.kind = expr.kind == HirExprKind::ReqUniqueHeader ? MirValueKind::ReqUniqueHeader
+                                                           : MirValueKind::ReqHeader;
         v.type = MirTypeKind::Str;
         v.may_nil = true;
         v.str_value = expr.str_value;

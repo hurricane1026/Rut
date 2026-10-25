@@ -89,6 +89,7 @@ struct Ctx {
     LLVMValueRef fn_req_http_version;
     LLVMValueRef fn_req_flag;
     LLVMValueRef fn_req_method;
+    LLVMValueRef fn_req_unique_header;
     LLVMValueRef fn_req_header;
     LLVMValueRef fn_req_cookie;
     LLVMValueRef fn_req_query;
@@ -306,6 +307,16 @@ struct Ctx {
             fn_req_header = LLVMAddFunction(llvm_mod, "rut_helper_req_header", ft);
         }
         return fn_req_header;
+    }
+
+    // void rut_helper_req_unique_header(ptr, i32, ptr, i32, ptr, ptr, ptr)
+    LLVMValueRef get_req_unique_header() {
+        if (!fn_req_unique_header) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 7, 0);
+            fn_req_unique_header = LLVMAddFunction(llvm_mod, "rut_helper_req_unique_header", ft);
+        }
+        return fn_req_unique_header;
     }
 
     // void rut_helper_req_set_path(ptr conn, ptr path, i32 len)
@@ -997,6 +1008,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, v);
             break;
         }
+        case rir::Opcode::ReqUniqueHeader:
         case rir::Opcode::ReqHeader: {
             Str name = inst.imm.str_val;
             LLVMValueRef name_ptr = c.make_global_str(name, "hdr.name");
@@ -1006,12 +1018,9 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "hdr.len");
             LLVMValueRef args[] = {
                 c.param_req_data, c.param_req_len, name_ptr, name_len, out_has, out_ptr, out_len};
-            LLVMBuildCall2(c.builder,
-                           LLVMGlobalGetValueType(c.get_req_header()),
-                           c.get_req_header(),
-                           args,
-                           7,
-                           "");
+            LLVMValueRef fn = inst.op == rir::Opcode::ReqUniqueHeader ? c.get_req_unique_header()
+                                                                      : c.get_req_header();
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 7, "");
             LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "h");
             LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "p");
             LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "l");
@@ -2163,6 +2172,7 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
         if (!blk.insts) continue;
         for (u32 ii = 0; ii < blk.inst_count; ii++) {
             switch (blk.insts[ii].op) {
+                case rir::Opcode::ReqUniqueHeader:
                 case rir::Opcode::ReqHeader:
                 case rir::Opcode::ReqQuery:
                 case rir::Opcode::ReqQueryString:
@@ -2389,6 +2399,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_http_version = nullptr;
     c.fn_req_flag = nullptr;
     c.fn_req_method = nullptr;
+    c.fn_req_unique_header = nullptr;
     c.fn_req_header = nullptr;
     c.fn_req_cookie = nullptr;
     c.fn_req_query = nullptr;

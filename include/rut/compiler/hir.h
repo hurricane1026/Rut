@@ -142,6 +142,7 @@ enum class HirExprKind : u8 {
     Call,
     StructInit,
     Field,
+    ReqUniqueHeader,
     ReqHeader,
     // `req.set("Name", value)` statement effect. `str_value` is the validated
     // literal header name; `lhs` is the plain string value. The expression

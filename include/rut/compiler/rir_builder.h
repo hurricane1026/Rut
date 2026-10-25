@@ -466,6 +466,14 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_req_unique_header(Str name, SourceLoc loc = {}) {
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto [inst, vid] = TRY(emit(Opcode::ReqUniqueHeader, ty, loc));
+        inst->imm.str_val = name;
+        return vid;
+    }
+
     Result<ValueId> emit_req_param(Str name, SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
         auto [inst, vid] = TRY(emit(Opcode::ReqParam, ty, loc));

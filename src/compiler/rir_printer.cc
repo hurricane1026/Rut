@@ -141,6 +141,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ConstStatus:
             buf.put_cstr("const.status");
             break;
+        case Opcode::ReqUniqueHeader:
+            buf.put_cstr("req.unique_header");
+            break;
         case Opcode::ReqHeader:
             buf.put_cstr("req.header");
             break;
@@ -680,6 +683,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             buf.put_u32(inst.imm.method_val);
             break;
+        case Opcode::ReqUniqueHeader:
         case Opcode::ReqHeader:
         case Opcode::ReqParam:
         case Opcode::ReqQuery:

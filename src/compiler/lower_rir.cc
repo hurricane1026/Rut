@@ -1571,8 +1571,10 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!field) return frontend_error(FrontendError::OutOfMemory, span);
         return field.value();
     }
-    if (value.kind == MirValueKind::ReqHeader) {
-        auto v = b.emit_req_header(value.str_value, {span.line, span.col});
+    if (value.kind == MirValueKind::ReqHeader || value.kind == MirValueKind::ReqUniqueHeader) {
+        auto v = value.kind == MirValueKind::ReqUniqueHeader
+                     ? b.emit_req_unique_header(value.str_value, {span.line, span.col})
+                     : b.emit_req_header(value.str_value, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
