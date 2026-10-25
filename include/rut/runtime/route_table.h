@@ -1476,13 +1476,24 @@ public:
     // Set a route's rate limit to a single token-bucket rule (`max` per
     // `window_sec`, burst capacity defaulting to `max`, per-client-IP key),
     // replacing any existing rules. 0/0 leaves the route unlimited. Returns false
-    // on a bad index. For stacked rules use add_route_rate_limit_rule; refine the
-    // key with add_route_rate_limit_key.
-    bool set_route_rate_limit(u32 idx, u32 max, u32 window_sec) {
+    // on a bad index or unrepresentable policy. For stacked rules use
+    // add_route_rate_limit_rule; refine the key with add_route_rate_limit_key.
+    bool set_route_rate_limit(u32 idx, u32 max, u32 window_sec, u32 burst = 0) {
         if (idx >= route_count) return false;
-        routes[idx].rate_limit = RateLimitRuleSet{};
-        if (max > 0 && window_sec > 0) routes[idx].rate_limit.add_rule(max, window_sec);
-        return refresh_route_rate_limit_ids(idx);
+        RateLimitRuleSet replacement{};
+        if (max > 0 && window_sec > 0 && replacement.add_rule(max, window_sec, burst) < 0)
+            return false;
+
+        RouteEntry& route = routes[idx];
+        const RateLimitRuleSet previous_rules = route.rate_limit;
+        u64 previous_ids[kMaxRateLimitRules];
+        for (u32 i = 0; i < kMaxRateLimitRules; i++) previous_ids[i] = route.rate_limit_ids[i];
+        route.rate_limit = replacement;
+        if (refresh_route_rate_limit_ids(idx)) return true;
+
+        route.rate_limit = previous_rules;
+        for (u32 i = 0; i < kMaxRateLimitRules; i++) route.rate_limit_ids[i] = previous_ids[i];
+        return false;
     }
 
     // Append an additional rate-limit rule to a route (stacking): a request must

@@ -6813,6 +6813,14 @@ failure, not an exact per-key table. The global limiter shares atomic slots
 within one process; colliding keys share budget and may throttle one another.
 Neither mechanism supplies cross-node or strict lossless state. Rut `Cache`
 examples remain a separate, deliberately lossy state mechanism.
+Rate-limit emission intervals use the exact ceiling of `window / limit` in
+microseconds, so a non-divisible window is never shortened. Configuration is
+rejected when `(burst - 1) * emit_interval` cannot fit in the runtime's u64
+GCRA state; oversized rate-limit duration literals are rejected rather than
+saturated to a shorter window. Sub-second rate-limit durations retain the
+existing round-up-to-one-second behavior. Runtime conformance and state advancement are
+overflow-safe near the maximum monotonic timestamp and fail closed if the next
+timestamp cannot be represented.
 The shard limiter table belongs to its event-loop instance: HTTP/1 and HTTP/2
 dispatch on that loop share the table, while separate loop instances remain
 isolated even when they run on the same thread.

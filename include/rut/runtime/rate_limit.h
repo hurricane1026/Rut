@@ -56,8 +56,11 @@ struct RateLimiter {
             s.key = key;
             s.tat = 0;
         }
-        if (now_us + tau_us < s.tat) return false;  // too early → throttle (429)
+        // Avoid now+tau overflow: a future TAT conforms iff its distance from
+        // now fits within the burst tolerance.
+        if (s.tat > now_us && s.tat - now_us > tau_us) return false;
         const u64 kBase = (now_us > s.tat) ? now_us : s.tat;
+        if (kBase > 0xffffffffffffffffull - emit_us) return false;
         s.tat = kBase + emit_us;
         return true;
     }
@@ -88,8 +91,9 @@ struct GlobalRateLimiter {
         std::atomic<u64>& slot = slots[h % kSlots];
         u64 tat = slot.load(std::memory_order_relaxed);
         for (;;) {
-            if (now_us + tau_us < tat) return false;  // throttle — read-only, no RMW
+            if (tat > now_us && tat - now_us > tau_us) return false;  // throttle — read-only
             const u64 kBase = (now_us > tat) ? now_us : tat;
+            if (kBase > 0xffffffffffffffffull - emit_us) return false;
             const u64 kNext = kBase + emit_us;
             if (slot.compare_exchange_weak(
                     tat, kNext, std::memory_order_relaxed, std::memory_order_relaxed))
