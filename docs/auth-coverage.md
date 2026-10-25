@@ -70,3 +70,22 @@ ambiguous fields, configuration errors and previous-key revocation. Verification
 alone intentionally makes no delivery replay guarantee. A duplicate delivery can
 still verify successfully; receiving applications must deduplicate durable side
 effects until a complete gateway replay policy is implemented.
+
+## Asymmetric key ownership foundation
+
+The internal `RsaPublicKey` owner loads one canonical SubjectPublicKeyInfo DER
+object during configuration preparation. It bounds input to 8192 bytes and
+accepts ordinary RSA public keys with 2048–4096-bit odd moduli and exponent
+65537. Wrong key types, RSA-PSS-restricted keys, trailing data, noncanonical
+encodings and unsupported parameters fail before publication. Input storage
+may be released after loading; crypto resources remain with the owner.
+
+An owner cannot be copied or overwritten while loaded. Build a new owner for a
+replacement configuration generation; retain the old generation until its last
+reader drains, then destroy it. Parsing and destruction are configuration work,
+never request-path operations. Failure does not leave a partially published key
+or pollute the caller's crypto error queue.
+
+This foundation has native lifecycle and negative parsing tests. It does not
+yet expose a Rut key type, verify RS256 signatures, select JWKs, refresh JWKS or
+claim asymmetric JWT support. Those remain explicit acceptance work in the table.

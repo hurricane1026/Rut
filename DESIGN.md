@@ -8289,3 +8289,15 @@ any store mutation. Disk/Redis backends are not implemented: they will require
 an asynchronous submission/completion adapter, owned operation buffers,
 connection cancellation and a shared namespace/invalidation design. This
 refactor adds no language syntax or runtime backend-selection configuration.
+
+### Configuration-owned asymmetric public keys
+
+`RsaPublicKey` in `rut_runtime` is a noncopyable configuration resource. It parses
+bounded canonical SPKI DER before activation and owns the crypto key independently
+of the input view. Its initial RSA profile accepts 2048–4096-bit odd moduli and
+exponent 65537; key type, full consumption and canonical encoding are checked.
+Loaded owners reject replacement; configuration reload creates a successor and
+keeps the predecessor alive until its readers drain. `reset` and destruction
+release the resource; parse failure publishes nothing and restores crypto errors.
+There is no request-path parsing or language surface in this foundation. RS/ES
+verification contexts, static key integration and JWKS activation remain pending.
