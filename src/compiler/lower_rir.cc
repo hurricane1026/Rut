@@ -3631,6 +3631,8 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
 static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
                                               FrontendRirModule& out,
                                               bool internal_strict_local_response_propagation) {
+    for (u32 i = 0; i < mir.functions.len; ++i)
+        if (!mir.functions[i].values.ok()) return frontend_error(FrontendError::OutOfMemory);
     if (!out.init(mir.functions.len == 0 ? 1 : mir.functions.len,
                   mir.variants.len * 2 + mir.structs.len + 8))
         return frontend_error(FrontendError::OutOfMemory);

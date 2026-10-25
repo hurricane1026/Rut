@@ -8092,6 +8092,29 @@ expression-string decoder and its owned HIR buffers. Request header validation
 runs on decoded bytes before lowering, preventing escaped CR/LF injection.
 Configuration remains static; CLI restart activates rotation/revocation changes.
 
+Compiler expression storage for HIR helpers/routes and MIR functions uses
+Arena-backed node pools. Nodes keep stable addresses across chunk growth; copies
+own their storage and rebase node references. Allocation/copy failure invalidates
+the pool and is reported as OutOfMemory before lowering. This removes the former
+fixed expression/value ceilings without enlarging every route's inline storage.
+LLVM codegen also grows its value/block maps beyond its small stack scratch buffers.
+Other independent language and IR limits remain in effect.
+
+`apiKeyOrBasic` is explicit OR composition of Bearer and Basic for one configured
+consumer. Empty credentials disable a method; both disabled or any empty identity
+ID returns 503. Each method verifies its own scheme and returns its own credential
+ID and method. Rejection emits two ordered `WWW-Authenticate` fields, Bearer then
+Basic. Duplicate Authorization rejects the entire request; there is no alternate
+source or anonymous fallback. Existing verifiers supply all secret comparison.
+
+`requireConsumer` and `denyConsumer` apply exact, case-sensitive single-consumer
+allow/deny rules to an already verified Identity. They return the original identity,
+403 on policy rejection, or 503 for an empty policy ID. Multiple deny checks can
+be chained; multiple allow checks are intersections. Authentication must run first,
+so missing/invalid credentials remain 401. Identity is a constructible ordinary
+struct, not a compiler-enforced proof of authentication. These helpers do not
+implement groups, roles, scopes, or a dynamic Consumer registry.
+
 ### JWT claims policy over existing signature verification
 
 `jwtDecode` continues to return signature-verified Json without silently imposing

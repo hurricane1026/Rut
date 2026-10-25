@@ -2260,17 +2260,20 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.value_map_cap = fn.value_cap;
     c.block_map_cap = fn.block_cap;
 
-    // Allocate maps (use alloca-style stack allocation for small functions,
-    // mmap for large ones). For Phase 1, stack is fine.
-    LLVMValueRef value_buf[512];
-    LLVMBasicBlockRef block_buf[64];
-
-    if (fn.value_cap > 512 || fn.block_cap > 64) return false;  // too large for Phase 1
-
-    for (u32 i = 0; i < fn.value_cap; i++) value_buf[i] = nullptr;
-    for (u32 i = 0; i < fn.block_cap; i++) block_buf[i] = nullptr;
-    c.value_map = value_buf;
-    c.block_map = block_buf;
+    // Small functions use stack scratch space; larger RIR functions allocate
+    // maps from the existing compiler arena instead of hitting a Phase 1 cap.
+    LLVMValueRef small_values[512]{};
+    LLVMBasicBlockRef small_blocks[64]{};
+    struct MapStorage {
+        MmapArena arena;
+        ~MapStorage() { arena.destroy(); }
+    } maps;
+    if ((fn.value_cap > 512 || fn.block_cap > 64) && !maps.arena.init(4096)) return false;
+    c.value_map =
+        fn.value_cap <= 512 ? small_values : maps.arena.alloc_array<LLVMValueRef>(fn.value_cap);
+    c.block_map =
+        fn.block_cap <= 64 ? small_blocks : maps.arena.alloc_array<LLVMBasicBlockRef>(fn.block_cap);
+    if (!c.value_map || !c.block_map) return false;
 
     // Create all basic blocks upfront (forward references from Br/Jmp).
     for (u32 i = 0; i < fn.block_count; i++) {

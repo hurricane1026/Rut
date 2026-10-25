@@ -776,6 +776,12 @@ target_include_directories(test_jwt_claims PRIVATE ${PROJECT_SOURCE_DIR}/testing
 add_test(NAME test_jwt_claims COMMAND test_jwt_claims)
 set_tests_properties(test_jwt_claims PROPERTIES LABELS "unit")
 
+add_executable(test_compiler_node_pool test_compiler_node_pool.cc)
+target_link_libraries(test_compiler_node_pool rut_test_fault rut_compiler rut_runtime)
+target_include_directories(test_compiler_node_pool PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_compiler_node_pool COMMAND test_compiler_node_pool)
+set_tests_properties(test_compiler_node_pool PROPERTIES LABELS "unit")
+
 add_executable(test_auth test_auth.cc)
 target_link_libraries(test_auth rut_runtime)
 target_include_directories(test_auth PRIVATE ${PROJECT_SOURCE_DIR}/testing)
@@ -3753,6 +3759,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_buffer>
         COMMAND $<TARGET_FILE:test_cache_table>
         COMMAND $<TARGET_FILE:test_jwt_claims>
+        COMMAND $<TARGET_FILE:test_compiler_node_pool>
         COMMAND $<TARGET_FILE:test_auth>
         COMMAND $<TARGET_FILE:test_types>
         COMMAND $<TARGET_FILE:test_rir>
@@ -3784,7 +3791,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_auth test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_compiler_node_pool test_auth test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
         COMMENT "Running all tests..."
     )
 else()
@@ -3810,6 +3817,7 @@ else()
         COMMAND $<TARGET_FILE:test_buffer>
         COMMAND $<TARGET_FILE:test_cache_table>
         COMMAND $<TARGET_FILE:test_jwt_claims>
+        COMMAND $<TARGET_FILE:test_compiler_node_pool>
         COMMAND $<TARGET_FILE:test_auth>
         COMMAND $<TARGET_FILE:test_types>
         COMMAND $<TARGET_FILE:test_rir>
@@ -3837,7 +3845,7 @@ else()
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_auth test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_compiler_node_pool test_auth test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
         COMMENT "Running non-JIT tests..."
     )
 endif()

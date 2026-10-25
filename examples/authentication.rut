@@ -36,3 +36,21 @@ route GET "/header-key" {
     let identity = auth.headerKey(req.uniqueHeader("X-API-Key").or(""), key, "example-app", "header-1")
     if identity.consumerId == "example-app" { return 200 } else { return 403 }
 }
+
+// Accept either method for the same consumer, then apply an explicit allow rule.
+route GET "/multi-auth" {
+    let key = env("RUT_API_KEY")
+    let credentials = env("RUT_BASIC_CREDENTIALS")
+    let identity = auth.apiKeyOrBasic(req.authorization.or(""), key, credentials,
+                                     "example-app", "key-1", "password-1")
+    let permitted = auth.requireConsumer(identity, "example-app")
+    if permitted.consumerId == "example-app" { return 200 } else { return 403 }
+}
+
+// A verified but excluded consumer receives 403, rather than an auth challenge.
+route GET "/consumer-policy" {
+    let key = env("RUT_API_KEY")
+    let identity = auth.apiKey(req.authorization.or(""), key, "example-app", "primary")
+    let permitted = auth.denyConsumer(identity, "suspended-app")
+    if permitted.consumerId == "example-app" { return 200 } else { return 403 }
+}

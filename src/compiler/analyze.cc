@@ -3601,7 +3601,7 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
         slot.span = arg.span;
         slot.int_value = static_cast<i32>(slot_index);
         if (!route->exprs.push(*pipe_lhs))
-            return frontend_error(FrontendError::TooManyItems, arg.span);
+            return frontend_error(FrontendError::OutOfMemory, arg.span);
         slot.lhs = &route->exprs[route->exprs.len - 1];
         return slot;
     };
@@ -3691,9 +3691,9 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
     out.type = lhs->type;
     out.span = expr.span;
     if (!route->exprs.push(lhs.value()))
-        return frontend_error(FrontendError::TooManyItems, expr.span);
+        return frontend_error(FrontendError::OutOfMemory, expr.span);
     out.lhs = &route->exprs[route->exprs.len - 1];
-    if (!route->exprs.push(rhs_expr)) return frontend_error(FrontendError::TooManyItems, expr.span);
+    if (!route->exprs.push(rhs_expr)) return frontend_error(FrontendError::OutOfMemory, expr.span);
     out.rhs = &route->exprs[route->exprs.len - 1];
     return out;
 }
@@ -3822,10 +3822,10 @@ static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
     out.type = lhs->type;
     out.span = expr.span;
     if (!route->exprs.push(lhs.value()))
-        return frontend_error(FrontendError::TooManyItems, expr.span);
+        return frontend_error(FrontendError::OutOfMemory, expr.span);
     out.lhs = &route->exprs[route->exprs.len - 1];
     if (!route->exprs.push(rhs.value()))
-        return frontend_error(FrontendError::TooManyItems, expr.span);
+        return frontend_error(FrontendError::OutOfMemory, expr.span);
     out.rhs = &route->exprs[route->exprs.len - 1];
     return out;
 }
@@ -3849,7 +3849,7 @@ static FrontendResult<HirExpr> make_json_op(json::Op op,
     const HirExpr* values[] = {a, b, c};
     for (const HirExpr* value : values) {
         if (value == nullptr) continue;
-        if (!route->exprs.push(*value)) return frontend_error(FrontendError::TooManyItems, span);
+        if (!route->exprs.push(*value)) return frontend_error(FrontendError::OutOfMemory, span);
         if (!out.args.push(&route->exprs[route->exprs.len - 1]))
             return frontend_error(FrontendError::TooManyItems, span);
     }
@@ -3935,7 +3935,7 @@ static FrontendResult<HirExpr> analyze_json_hir_value(const HirExpr& value,
                 projected.tuple_struct_indices[ti] = field.tuple_struct_indices[ti];
             }
             if (!route->exprs.push(base))
-                return frontend_error(FrontendError::TooManyItems, value.span);
+                return frontend_error(FrontendError::OutOfMemory, value.span);
             projected.lhs = &route->exprs[route->exprs.len - 1];
             auto child = analyze_json_hir_value(projected, route, mod, depth + 1);
             if (!child) return child;
@@ -4092,8 +4092,7 @@ static FrontendResult<HirExpr> analyze_json_decode(const HirExpr& source,
                                span,
                                route);
     if (!object) return object;
-    if (!route->exprs.push(object.value()))
-        return frontend_error(FrontendError::TooManyItems, span);
+    if (!route->exprs.push(object.value())) return frontend_error(FrontendError::OutOfMemory, span);
     result.lhs = &route->exprs[route->exprs.len - 1];
     for (u32 i = 0; i < decl.fields.len; ++i) {
         const auto& field = decl.fields[i];
@@ -4145,7 +4144,7 @@ static FrontendResult<HirExpr> analyze_json_decode(const HirExpr& source,
         }
         if (!decoded) return decoded;
         if (!route->exprs.push(decoded.value()))
-            return frontend_error(FrontendError::TooManyItems, span);
+            return frontend_error(FrontendError::OutOfMemory, span);
         if (!result.field_inits.push({field.name, &route->exprs[route->exprs.len - 1]}))
             return frontend_error(FrontendError::TooManyItems, span);
     }
@@ -4402,7 +4401,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                 out.span = expr.span;
                 out.cache_index = cache_index;
                 if (!route->exprs.push(key.value()))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 out.lhs = &route->exprs[route->exprs.len - 1];
                 return out;
             }
@@ -4425,10 +4424,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             out.span = expr.span;
             out.cache_index = cache_index;
             if (!route->exprs.push(key.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
             if (!route->exprs.push(value.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.rhs = &route->exprs[route->exprs.len - 1];
             return out;
         }
@@ -4477,7 +4476,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             return frontend_error(
                 FrontendError::UnsupportedSyntax, expr.args[0]->span, kReqHeaderMutationDetail);
         if (!route->exprs.push(value.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr out{};
         out.kind = is_add ? HirExprKind::ReqAddHeader : HirExprKind::ReqSetHeader;
         out.type = HirTypeKind::Str;
@@ -4534,7 +4533,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                 fallback_value.span = expr.span;
             }
             if (!route->exprs.push(fallback_value))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr out{};
             out.kind = HirExprKind::RespHeader;
             out.type = HirTypeKind::Str;
@@ -4689,10 +4688,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         out.type = HirTypeKind::Bool;
         out.span = expr.span;
         if (!route->exprs.push(lhs_expr))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
         if (!route->exprs.push(rhs_expr))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.rhs = &route->exprs[route->exprs.len - 1];
         return out;
     };
@@ -4721,7 +4720,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             out.type = expr.name.eq({"code", 4}) || expr.name.eq({"line", 4}) ? HirTypeKind::I32
                                                                               : HirTypeKind::Str;
             if (!route->exprs.push(recv))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
             out.str_value = expr.name;
             return out;
@@ -4746,7 +4745,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         out.type = HirTypeKind::Bool;
         out.span = expr.span;
         out.str_value = expr.args[0]->str_value;
-        if (!route->exprs.push(recv)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(recv)) return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
         return out;
     }
@@ -4895,7 +4894,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             out.protocol_index = matched_protocol_index;
             out.str_value = expr.name;
             if (!route->exprs.push(recv))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
             auto bind_req_self_associated = [&](HirExpr* expected) {
                 if (expected->type == HirTypeKind::Associated &&
@@ -4935,7 +4934,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                 if (!same_hir_type_shape(mod, arg.value(), expected))
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
                 if (!route->exprs.push(arg.value()))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 if (!out.args.push(&route->exprs[route->exprs.len - 1]))
                     return frontend_error(FrontendError::TooManyItems, expr.span);
             }
@@ -5075,7 +5074,7 @@ static FrontendResult<HirExpr> make_guard_bound_init(HirRoute* route,
     // its Optional<inner> value. Only a plain (never-missing) bound passes
     // through untouched.
     if (!bound.may_error && !bound.may_nil) return bound;
-    if (!route->exprs.push(bound)) return frontend_error(FrontendError::TooManyItems, span);
+    if (!route->exprs.push(bound)) return frontend_error(FrontendError::OutOfMemory, span);
     HirExpr init{};
     init.kind = HirExprKind::ValueOf;
     init.type = bound.type;
@@ -5559,7 +5558,7 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         }
         HirExpr out_slot = expr;
         if (!route->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out_slot.lhs = &route->exprs[route->exprs.len - 1];
         out_slot.span = expr.span;
         return out_slot;
@@ -5581,10 +5580,10 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         if (!rhs) return core::make_unexpected(rhs.error());
         HirExpr out_or = expr;
         if (!route->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out_or.lhs = &route->exprs[route->exprs.len - 1];
         if (!route->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out_or.rhs = &route->exprs[route->exprs.len - 1];
         out_or.may_nil = false;
         out_or.may_error = false;
@@ -5599,7 +5598,7 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!route->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
@@ -5607,7 +5606,7 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             *expr.rhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!route->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.rhs = &route->exprs[route->exprs.len - 1];
     }
     for (u32 i = 0; i < expr.field_inits.len; i++) {
@@ -5620,7 +5619,7 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                              generic_binding_count);
         if (!val) return core::make_unexpected(val.error());
         if (!route->exprs.push(val.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr::FieldInit init{};
         init.name = expr.field_inits[i].name;
         init.value = &route->exprs[route->exprs.len - 1];
@@ -5632,7 +5631,7 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             *expr.args[i], route, mod, args, arg_count, generic_bindings, generic_binding_count);
         if (!arg) return core::make_unexpected(arg.error());
         if (!route->exprs.push(arg.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         if (!out.args.push(&route->exprs[route->exprs.len - 1]))
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
@@ -5718,7 +5717,7 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
             return out_elem;
         }
         if (!fn->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &fn->exprs[fn->exprs.len - 1];
         out.span = expr.span;
         return out;
@@ -5728,14 +5727,14 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
         auto lhs = normalize_function_expr(*expr.lhs, fn, locals, local_count, param_count);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &fn->exprs[fn->exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
         auto rhs = normalize_function_expr(*expr.rhs, fn, locals, local_count, param_count);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!fn->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.rhs = &fn->exprs[fn->exprs.len - 1];
     }
     for (u32 i = 0; i < expr.field_inits.len; i++) {
@@ -5743,7 +5742,7 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
             *expr.field_inits[i].value, fn, locals, local_count, param_count);
         if (!val) return core::make_unexpected(val.error());
         if (!fn->exprs.push(val.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr::FieldInit init{};
         init.name = expr.field_inits[i].name;
         init.value = &fn->exprs[fn->exprs.len - 1];
@@ -5754,7 +5753,7 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
         auto arg = normalize_function_expr(*expr.args[i], fn, locals, local_count, param_count);
         if (!arg) return core::make_unexpected(arg.error());
         if (!fn->exprs.push(arg.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         if (!out.args.push(&fn->exprs[fn->exprs.len - 1]))
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
@@ -5762,11 +5761,11 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
     return out;
 }
 
-static bool collect_function_response_effects(HirFunction* fn,
-                                              const HirRoute& scratch,
-                                              const HirLocal* all_locals,
-                                              u32 all_local_count,
-                                              u32 param_count) {
+static FrontendResult<void> collect_function_response_effects(HirFunction* fn,
+                                                              const HirRoute& scratch,
+                                                              const HirLocal* all_locals,
+                                                              u32 all_local_count,
+                                                              u32 param_count) {
     fn->has_non_response_statement_effect = false;
     for (u32 li = 0; li < scratch.locals.len; li++) {
         const auto kind = scratch.locals[li].init.kind;
@@ -5780,9 +5779,11 @@ static bool collect_function_response_effects(HirFunction* fn,
             continue;
         auto normalized = normalize_function_expr(
             scratch.locals[li].init, fn, all_locals, all_local_count, param_count);
-        if (!normalized || !fn->exprs.push(normalized.value())) return false;
+        if (!normalized) return core::make_unexpected(normalized.error());
+        if (!fn->exprs.push(normalized.value()))
+            return frontend_error(FrontendError::OutOfMemory, scratch.span);
     }
-    return true;
+    return {};
 }
 
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
@@ -5932,7 +5933,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             code_field.span = arm.span;
             code_field.str_value = Str{"code", 4};
             if (!scratch->exprs.push(subject))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
+                return frontend_error(FrontendError::OutOfMemory, arm.span);
             code_field.lhs = &scratch->exprs[scratch->exprs.len - 1];
 
             HirExpr pattern_code{};
@@ -5946,10 +5947,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             cond.type = HirTypeKind::Bool;
             cond.span = arm.span;
             if (!scratch->exprs.push(code_field))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
+                return frontend_error(FrontendError::OutOfMemory, arm.span);
             cond.lhs = &scratch->exprs[scratch->exprs.len - 1];
             if (!scratch->exprs.push(pattern_code))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
+                return frontend_error(FrontendError::OutOfMemory, arm.span);
             cond.rhs = &scratch->exprs[scratch->exprs.len - 1];
 
             HirExpr out{};
@@ -5978,13 +5979,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             out.error_variant_index = merged_shape.error_variant_index;
             out.span = stmt.span;
             if (!scratch->exprs.push(cond))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
+                return frontend_error(FrontendError::OutOfMemory, arm.span);
             out.lhs = &scratch->exprs[scratch->exprs.len - 1];
             if (!scratch->exprs.push(body.value()))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
+                return frontend_error(FrontendError::OutOfMemory, arm.span);
             out.rhs = &scratch->exprs[scratch->exprs.len - 1];
             if (!scratch->exprs.push(result))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
+                return frontend_error(FrontendError::OutOfMemory, arm.span);
             if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
                 return frontend_error(FrontendError::TooManyItems, arm.span);
             result = out;
@@ -6145,13 +6146,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         out.error_variant_index = merged_shape.error_variant_index;
         out.span = stmt.span;
         if (!scratch->exprs.push(cond_expr))
-            return frontend_error(FrontendError::TooManyItems, stmt.span);
+            return frontend_error(FrontendError::OutOfMemory, stmt.span);
         out.lhs = &scratch->exprs[scratch->exprs.len - 1];
         if (!scratch->exprs.push(then_expr.value()))
-            return frontend_error(FrontendError::TooManyItems, stmt.span);
+            return frontend_error(FrontendError::OutOfMemory, stmt.span);
         out.rhs = &scratch->exprs[scratch->exprs.len - 1];
         if (!scratch->exprs.push(else_expr.value()))
-            return frontend_error(FrontendError::TooManyItems, stmt.span);
+            return frontend_error(FrontendError::OutOfMemory, stmt.span);
         if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
             return frontend_error(FrontendError::TooManyItems, stmt.span);
         return out;
@@ -6168,7 +6169,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
 
         if (!scratch->exprs.push(subject.value()))
-            return frontend_error(FrontendError::TooManyItems, stmt.span);
+            return frontend_error(FrontendError::OutOfMemory, stmt.span);
         const HirExpr* subject_ptr = &scratch->exprs[scratch->exprs.len - 1];
 
         const AstStatement::MatchArm* wildcard_arm = nullptr;
@@ -6240,7 +6241,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
 
         if (!scratch->exprs.push(subject.value()))
-            return frontend_error(FrontendError::TooManyItems, stmt.span);
+            return frontend_error(FrontendError::OutOfMemory, stmt.span);
         const HirExpr* subject_ptr = &scratch->exprs[scratch->exprs.len - 1];
 
         bool seen_wildcard = false;
@@ -6283,14 +6284,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             out.error_variant_index = merged_shape.error_variant_index;
             out.shape_index = merged_shape.shape_index;
             out.span = span;
-            if (!scratch->exprs.push(cond))
-                return frontend_error(FrontendError::TooManyItems, span);
+            if (!scratch->exprs.push(cond)) return frontend_error(FrontendError::OutOfMemory, span);
             out.lhs = &scratch->exprs[scratch->exprs.len - 1];
             if (!scratch->exprs.push(then_expr))
-                return frontend_error(FrontendError::TooManyItems, span);
+                return frontend_error(FrontendError::OutOfMemory, span);
             out.rhs = &scratch->exprs[scratch->exprs.len - 1];
             if (!scratch->exprs.push(else_expr))
-                return frontend_error(FrontendError::TooManyItems, span);
+                return frontend_error(FrontendError::OutOfMemory, span);
             if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
                 return frontend_error(FrontendError::TooManyItems, span);
             return out;
@@ -6309,7 +6309,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 tag.span = span;
                 tag.variant_index = pattern_expr.variant_index;
                 if (!scratch->exprs.push(subject_expr))
-                    return frontend_error(FrontendError::TooManyItems, span);
+                    return frontend_error(FrontendError::OutOfMemory, span);
                 tag.lhs = &scratch->exprs[scratch->exprs.len - 1];
 
                 HirExpr case_index{};
@@ -6318,18 +6318,18 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 case_index.span = span;
                 case_index.int_value = pattern_expr.int_value;
                 if (!scratch->exprs.push(tag))
-                    return frontend_error(FrontendError::TooManyItems, span);
+                    return frontend_error(FrontendError::OutOfMemory, span);
                 cond.lhs = &scratch->exprs[scratch->exprs.len - 1];
                 if (!scratch->exprs.push(case_index))
-                    return frontend_error(FrontendError::TooManyItems, span);
+                    return frontend_error(FrontendError::OutOfMemory, span);
                 cond.rhs = &scratch->exprs[scratch->exprs.len - 1];
                 return cond;
             }
             if (!scratch->exprs.push(subject_expr))
-                return frontend_error(FrontendError::TooManyItems, span);
+                return frontend_error(FrontendError::OutOfMemory, span);
             cond.lhs = &scratch->exprs[scratch->exprs.len - 1];
             if (!scratch->exprs.push(pattern_expr))
-                return frontend_error(FrontendError::TooManyItems, span);
+                return frontend_error(FrontendError::OutOfMemory, span);
             cond.rhs = &scratch->exprs[scratch->exprs.len - 1];
             return cond;
         };
@@ -6620,7 +6620,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         effect.str_value = name;
                         if (!is_remove) {
                             if (!scratch->exprs.push(value))
-                                return frontend_error(FrontendError::TooManyItems, inner.span);
+                                return frontend_error(FrontendError::OutOfMemory, inner.span);
                             effect.lhs = &scratch->exprs[scratch->exprs.len - 1];
                         }
                         HirLocal carrier{};
@@ -6664,7 +6664,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         literal.span = inner.expr.args[1]->span;
                         literal.str_value = value.str_value;
                         if (!scratch->exprs.push(literal))
-                            return frontend_error(FrontendError::TooManyItems, inner.span);
+                            return frontend_error(FrontendError::OutOfMemory, inner.span);
                         if (!fields.push({name, &scratch->exprs[scratch->exprs.len - 1]}))
                             return frontend_error(FrontendError::TooManyItems, inner.span);
                     }
@@ -6828,13 +6828,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 out.error_variant_index = merged_shape.error_variant_index;
                 out.span = inner.span;
                 if (!scratch->exprs.push(cond.value()))
-                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                    return frontend_error(FrontendError::OutOfMemory, inner.span);
                 out.lhs = &scratch->exprs[scratch->exprs.len - 1];
                 if (!scratch->exprs.push(then_expr.value()))
-                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                    return frontend_error(FrontendError::OutOfMemory, inner.span);
                 out.rhs = &scratch->exprs[scratch->exprs.len - 1];
                 if (!scratch->exprs.push(else_expr.value()))
-                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                    return frontend_error(FrontendError::OutOfMemory, inner.span);
                 if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 return out;
@@ -7498,7 +7498,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.field_inits[fi].value->span);
             if (!route->exprs.push(field_value.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr::FieldInit field_init{};
             field_init.name = expr.field_inits[fi].name;
             field_init.value = &route->exprs[route->exprs.len - 1];
@@ -7694,7 +7694,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             }
             if (!route->exprs.push(base.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
             return out;
         }
@@ -7730,7 +7730,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.tuple_struct_indices[i] = field->tuple_struct_indices[i];
             }
             if (!route->exprs.push(base.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
             out.str_value = expr.name;
             return out;
@@ -7745,7 +7745,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.type = expr.name.eq({"code", 4}) || expr.name.eq({"line", 4}) ? HirTypeKind::I32
                                                                               : HirTypeKind::Str;
             if (!route->exprs.push(base.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
             out.str_value = expr.name;
             return out;
@@ -7757,7 +7757,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.type = expr.name.eq({"code", 4}) || expr.name.eq({"line", 4}) ? HirTypeKind::I32
                                                                               : HirTypeKind::Str;
             if (!route->exprs.push(base.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
             out.str_value = expr.name;
             return out;
@@ -7789,7 +7789,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.tuple_struct_indices[i] = field->tuple_struct_indices[i];
         }
         if (!route->exprs.push(base.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
         out.str_value = expr.name;
         out.error_struct_index = base->error_struct_index;
@@ -7935,7 +7935,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (!same_hir_type_shape(mod, payload.value(), expected))
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
             if (!route->exprs.push(payload.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
         } else if (expr.lhs != nullptr) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -7997,7 +7997,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 first_elem_shape_index = elem->shape_index;
             }
             if (!route->exprs.push(elem.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             if (!out.args.push(&route->exprs[route->exprs.len - 1]))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
         }
@@ -8052,7 +8052,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     ? elem->struct_index
                     : (elem->type == HirTypeKind::Generic ? elem->generic_index : 0xffffffffu);
             if (!route->exprs.push(elem.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             if (!out.args.push(&route->exprs[route->exprs.len - 1]))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
         }
@@ -8177,7 +8177,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           expr.field_inits[fi].value->span);
                 if (!route->exprs.push(field_value.value()))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr::FieldInit field_init{};
                 field_init.name = expr.field_inits[fi].name;
                 field_init.value = &route->exprs[route->exprs.len - 1];
@@ -8284,7 +8284,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return folded;
             }
             if (!route->exprs.push(lhs.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr true_expr{};
@@ -8306,11 +8306,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             true_expr.error_variant_index = rhs->error_variant_index;
             true_expr.span = expr.span;
             if (!route->exprs.push(true_expr))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* true_ptr = &route->exprs[route->exprs.len - 1];
 
             if (!route->exprs.push(rhs.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr out{};
@@ -8375,10 +8375,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return folded;
         }
         if (!route->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
         if (!route->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
         HirExpr false_expr{};
         false_expr.kind = HirExprKind::BoolLit;
@@ -8399,7 +8399,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         false_expr.error_variant_index = rhs->error_variant_index;
         false_expr.span = expr.span;
         if (!route->exprs.push(false_expr))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* false_ptr = &route->exprs[route->exprs.len - 1];
 
         HirExpr out{};
@@ -8593,7 +8593,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             }
             if (lhs_state == KnownValueState::Unknown && (lhs->may_nil || lhs->may_error)) {
                 if (!route->exprs.push(lhs.value()))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
 
                 HirExpr unwrapped{};
@@ -8616,7 +8616,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                           lit_str("pipe method stage cannot combine different "
                                                   "propagated error variants"));
                 if (!route->exprs.push(then_expr.value()))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr* then_ptr = &route->exprs[route->exprs.len - 1];
 
                 HirExpr cond{};
@@ -8625,7 +8625,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 cond.span = expr.span;
                 cond.lhs = lhs_ptr;
                 if (!route->exprs.push(cond))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr* cond_ptr = &route->exprs[route->exprs.len - 1];
 
                 HirExpr missing{};
@@ -8640,7 +8640,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                                    : lhs->error_variant_index;
                 missing.lhs = lhs_ptr;
                 if (!route->exprs.push(missing))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr* else_ptr = &route->exprs[route->exprs.len - 1];
 
                 HirExpr out{};
@@ -8719,19 +8719,19 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return out;
         }
         if (!route->exprs.push(carrier.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr has{};
         has.kind = HirExprKind::HasValue;
         has.type = HirTypeKind::Bool;
         has.span = expr.span;
         has.lhs = &route->exprs[route->exprs.len - 1];
-        if (!route->exprs.push(has)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(has)) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr false_lit{};
         false_lit.kind = HirExprKind::BoolLit;
         false_lit.type = HirTypeKind::Bool;
         false_lit.span = expr.span;
         if (!route->exprs.push(false_lit))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.kind = HirExprKind::Eq;
         out.lhs = &route->exprs[route->exprs.len - 2];
         out.rhs = &route->exprs[route->exprs.len - 1];
@@ -8789,7 +8789,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             auto make_operand = [&](const HirExpr& analyzed,
                                     bool maybe_missing) -> FrontendResult<CmpOperand> {
                 if (!route->exprs.push(analyzed))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr* base_ptr = &route->exprs[route->exprs.len - 1];
                 if (!maybe_missing) return CmpOperand{base_ptr, base_ptr, nullptr};
 
@@ -8799,7 +8799,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 cond.span = expr.span;
                 cond.lhs = base_ptr;
                 if (!route->exprs.push(cond))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr* cond_ptr = &route->exprs[route->exprs.len - 1];
 
                 HirExpr value{};
@@ -8810,7 +8810,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 value.may_error = false;
                 value.span = expr.span;
                 if (!route->exprs.push(value))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr* value_ptr = &route->exprs[route->exprs.len - 1];
                 return CmpOperand{base_ptr, value_ptr, cond_ptr};
             };
@@ -8831,7 +8831,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     false_expr.bool_value = false;
                     false_expr.span = expr.span;
                     if (!route->exprs.push(false_expr))
-                        return frontend_error(FrontendError::TooManyItems, expr.span);
+                        return frontend_error(FrontendError::OutOfMemory, expr.span);
                     HirExpr* false_ptr = &route->exprs[route->exprs.len - 1];
 
                     HirExpr both{};
@@ -8843,7 +8843,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     if (!both.args.push(false_ptr))
                         return frontend_error(FrontendError::TooManyItems, expr.span);
                     if (!route->exprs.push(both))
-                        return frontend_error(FrontendError::TooManyItems, expr.span);
+                        return frontend_error(FrontendError::OutOfMemory, expr.span);
                     availability = &route->exprs[route->exprs.len - 1];
                 }
             }
@@ -8855,7 +8855,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             cmp.rhs = rhs_operand->value;
             cmp.span = expr.span;
             if (!route->exprs.push(cmp))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* cmp_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr false_expr{};
@@ -8864,7 +8864,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             false_expr.bool_value = false;
             false_expr.span = expr.span;
             if (!route->exprs.push(false_expr))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* false_ptr = &route->exprs[route->exprs.len - 1];
 
             out.kind = HirExprKind::IfElse;
@@ -8875,7 +8875,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             out.span = expr.span;
             if (!route->exprs.push(out))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* result_ptr = &route->exprs[route->exprs.len - 1];
 
             auto wrap_error_propagation = [&](HirExpr* current,
@@ -8886,7 +8886,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 no_error.span = expr.span;
                 no_error.lhs = source;
                 if (!route->exprs.push(no_error))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr* no_error_ptr = &route->exprs[route->exprs.len - 1];
 
                 HirExpr missing{};
@@ -8910,7 +8910,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 missing.error_variant_index = source->error_variant_index;
                 missing.lhs = source;
                 if (!route->exprs.push(missing))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 HirExpr* missing_ptr = &route->exprs[route->exprs.len - 1];
 
                 HirExpr wrapped{};
@@ -8926,7 +8926,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 wrapped.error_struct_index = source->error_struct_index;
                 wrapped.error_variant_index = source->error_variant_index;
                 if (!route->exprs.push(wrapped))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 return &route->exprs[route->exprs.len - 1];
             };
 
@@ -8952,10 +8952,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return out;
         }
         if (!route->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
         if (!route->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
         out.kind = expr.kind == AstExprKind::Eq
                        ? HirExprKind::Eq
@@ -9041,7 +9041,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.tuple_struct_indices[ti] = binding->tuple_struct_indices[ti];
         }
         if (!route->exprs.push(*binding->subject))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
         return out;
     }
@@ -9230,7 +9230,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                   arg.span,
                                   lit_str("placeholder slot out of range"));
         if (!route->exprs.push(*pipe_lhs))
-            return frontend_error(FrontendError::TooManyItems, arg.span);
+            return frontend_error(FrontendError::OutOfMemory, arg.span);
         HirExpr* source = &route->exprs[route->exprs.len - 1];
         if ((source->may_nil || source->may_error) && arg.int_value != 1)
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -9365,12 +9365,12 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             return folded;
         }
 
-        if (!route->exprs.push(*lhs)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(*lhs)) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
 
         if (!rhs->may_error) {
             if (!route->exprs.push(*rhs))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr out{};
@@ -9396,11 +9396,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             true_expr.bool_value = true;
             true_expr.span = expr.span;
             if (!route->exprs.push(true_expr))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* true_ptr = &route->exprs[route->exprs.len - 1];
 
             if (!route->exprs.push(*rhs))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr out{};
@@ -9427,10 +9427,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         cond.type = HirTypeKind::Bool;
         cond.span = expr.span;
         cond.lhs = lhs_ptr;
-        if (!route->exprs.push(cond)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(cond)) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* cond_ptr = &route->exprs[route->exprs.len - 1];
 
-        if (!route->exprs.push(*rhs)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(*rhs)) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
         HirExpr then_expr{};
@@ -9443,7 +9443,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         then_expr.error_variant_index = lhs->error_variant_index;
         then_expr.span = expr.span;
         if (!route->exprs.push(then_expr))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* then_ptr = &route->exprs[route->exprs.len - 1];
 
         HirExpr out{};
@@ -9508,7 +9508,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             return folded;
         }
 
-        if (!route->exprs.push(*lhs)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(*lhs)) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
 
         if (!lhs->may_nil && !lhs->may_error) {
@@ -9518,11 +9518,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             true_expr.bool_value = true;
             true_expr.span = expr.span;
             if (!route->exprs.push(true_expr))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* true_ptr = &route->exprs[route->exprs.len - 1];
 
             if (!route->exprs.push(*rhs))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr out{};
@@ -9551,10 +9551,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         cond.type = HirTypeKind::Bool;
         cond.span = expr.span;
         cond.lhs = lhs_ptr;
-        if (!route->exprs.push(cond)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(cond)) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* cond_ptr = &route->exprs[route->exprs.len - 1];
 
-        if (!route->exprs.push(*rhs)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(*rhs)) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
         HirExpr fallback{};
@@ -9569,7 +9569,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         fallback.error_variant_index = lhs->error_variant_index;
         fallback.lhs = lhs_ptr;
         if (!route->exprs.push(fallback))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* fallback_ptr = &route->exprs[route->exprs.len - 1];
 
         HirExpr out{};
@@ -9682,10 +9682,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.type = HirTypeKind::Bool;
         out.span = expr.span;
         if (!route->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
         if (!route->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.rhs = &route->exprs[route->exprs.len - 1];
         return out;
     }
@@ -9739,10 +9739,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.type = lhs->type;
             out.span = expr.span;
             if (!route->exprs.push(lhs.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
             if (!route->exprs.push(rhs.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.rhs = &route->exprs[route->exprs.len - 1];
             return out;
         }
@@ -9774,7 +9774,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.type = HirTypeKind::I64;
         out.span = expr.span;
         if (!route->exprs.push(arg.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
         return out;
     }
@@ -10108,7 +10108,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 }
             }
             if (!route->exprs.push(*pipe_lhs))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr unwrapped{};
@@ -10190,7 +10190,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                  pipe_lhs->error_variant_index != then_expr->error_variant_index))
                 return fail_call(expr.span, "pipe error variant mismatch", nullptr);
             if (!route->exprs.push(then_expr.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* then_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr cond{};
@@ -10199,7 +10199,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             cond.span = expr.span;
             cond.lhs = lhs_ptr;
             if (!route->exprs.push(cond))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* cond_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr missing{};
@@ -10231,7 +10231,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                                : pipe_lhs->error_variant_index;
             missing.lhs = lhs_ptr;
             if (!route->exprs.push(missing))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             HirExpr* else_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr out{};
@@ -10287,7 +10287,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             placeholder_count++;
             if (placeholder_source == pipe_lhs) {
                 if (!route->exprs.push(*pipe_lhs))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                    return frontend_error(FrontendError::OutOfMemory, expr.span);
                 placeholder_source = &route->exprs[route->exprs.len - 1];
             }
             auto slot_expr = placeholder_slot_expr(
@@ -11188,7 +11188,7 @@ static FrontendResult<HirExpr> build_guard_cond_from_analyzed(const HirExpr& ana
         // payload} struct, the pure-optional one is an Optional<inner> value
         // (req.query/req.header, a func returning `nil` in a branch) tested
         // with opt_is_nil. Known-nil inits folded above.
-        if (!route->exprs.push(analyzed)) return frontend_error(FrontendError::TooManyItems, span);
+        if (!route->exprs.push(analyzed)) return frontend_error(FrontendError::OutOfMemory, span);
         cond.kind = HirExprKind::HasValue;
         cond.lhs = &route->exprs[route->exprs.len - 1];
         cond.variant_index = analyzed.variant_index;
@@ -11203,7 +11203,7 @@ static FrontendResult<HirExpr> build_guard_cond_from_analyzed(const HirExpr& ana
         // implicit truthiness, no implicit narrowing (DESIGN.md §3.3.7).
         if (analyzed.type != HirTypeKind::Bool || analyzed.may_nil || analyzed.may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, span, bool_detail);
-        if (!route->exprs.push(analyzed)) return frontend_error(FrontendError::TooManyItems, span);
+        if (!route->exprs.push(analyzed)) return frontend_error(FrontendError::OutOfMemory, span);
         return route->exprs[route->exprs.len - 1];
     }
 
@@ -11223,7 +11223,7 @@ static FrontendResult<HirExpr> build_guard_cond_from_analyzed(const HirExpr& ana
         return cond;
     }
 
-    if (!route->exprs.push(analyzed)) return frontend_error(FrontendError::TooManyItems, span);
+    if (!route->exprs.push(analyzed)) return frontend_error(FrontendError::OutOfMemory, span);
     cond.kind = HirExprKind::NoError;
     cond.lhs = &route->exprs[route->exprs.len - 1];
     return cond;
@@ -11266,7 +11266,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
         if (!const_eval_expr(subject.value(), locals, local_count, &subject_value, 0))
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
         if (!route->exprs.push(subject.value()))
-            return frontend_error(FrontendError::TooManyItems, stmt.span);
+            return frontend_error(FrontendError::OutOfMemory, stmt.span);
         const HirExpr* subject_ptr = &route->exprs[route->exprs.len - 1];
 
         const AstStatement::MatchArm* wildcard_arm = nullptr;
@@ -11524,7 +11524,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, inner.span, kCacheStmtDetail);
                 if (!route->exprs.push(value.value()))
-                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                    return frontend_error(FrontendError::OutOfMemory, inner.span);
                 if (!arm->effect_expr_indices.push(route->exprs.len - 1))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 continue;
@@ -11743,7 +11743,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         if (!const_eval_expr(subject.value(), locals, local_count, &subject_value, 0))
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
         if (!route->exprs.push(subject.value()))
-            return frontend_error(FrontendError::TooManyItems, stmt.span);
+            return frontend_error(FrontendError::OutOfMemory, stmt.span);
         const HirExpr* subject_ptr = &route->exprs[route->exprs.len - 1];
 
         const AstStatement::MatchArm* wildcard_arm = nullptr;
@@ -12291,7 +12291,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                             tag.span = inner_arm.span;
                             tag.variant_index = inner_pattern->variant_index;
                             if (!route->exprs.push(inner_subject.value()))
-                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                                return frontend_error(FrontendError::OutOfMemory, inner_arm.span);
                             tag.lhs = &route->exprs[route->exprs.len - 1];
 
                             HirExpr case_index{};
@@ -12300,17 +12300,17 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                             case_index.span = inner_arm.span;
                             case_index.int_value = inner_pattern->int_value;
                             if (!route->exprs.push(tag))
-                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                                return frontend_error(FrontendError::OutOfMemory, inner_arm.span);
                             cond.lhs = &route->exprs[route->exprs.len - 1];
                             if (!route->exprs.push(case_index))
-                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                                return frontend_error(FrontendError::OutOfMemory, inner_arm.span);
                             cond.rhs = &route->exprs[route->exprs.len - 1];
                         } else {
                             if (!route->exprs.push(inner_subject.value()))
-                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                                return frontend_error(FrontendError::OutOfMemory, inner_arm.span);
                             cond.lhs = &route->exprs[route->exprs.len - 1];
                             if (!route->exprs.push(inner_pattern.value()))
-                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                                return frontend_error(FrontendError::OutOfMemory, inner_arm.span);
                             cond.rhs = &route->exprs[route->exprs.len - 1];
                         }
                         hir_arm.has_arm_guard = true;
@@ -12605,7 +12605,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 if (payload->type != HirTypeKind::Str || payload->may_nil || payload->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
                 if (!route->exprs.push(payload.value()))
-                    return frontend_error(FrontendError::TooManyItems, call.span);
+                    return frontend_error(FrontendError::OutOfMemory, call.span);
                 route->ws_handler.has_forward_payload = true;
                 route->ws_handler.forward_payload_expr = route->exprs.len - 1;
             }
@@ -12945,12 +12945,16 @@ static FrontendResult<void> merge_imported_functions(
                                           lit_str("duplicate imported generated function"));
                 if (!mod->functions.push(fn))
                     return frontend_error(FrontendError::TooManyItems, imported.span);
+                if (!mod->functions[mod->functions.len - 1].exprs.ok())
+                    return frontend_error(FrontendError::OutOfMemory);
                 continue;
             }
             if (!imported.selective && !imported.has_namespace_alias) {
                 if (find_function_index(*mod, fn.name) != mod->functions.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, imported.span, fn.name);
                 HirFunction imported_fn = fn;
+                if (!imported_fn.exprs.ok())
+                    return frontend_error(FrontendError::OutOfMemory, imported.span);
                 auto refreshed =
                     refresh_imported_function_signature_shapes(&imported_fn, imported.span);
                 if (!refreshed) return core::make_unexpected(refreshed.error());
@@ -12958,10 +12962,14 @@ static FrontendResult<void> merge_imported_functions(
                 if (!refreshed) return core::make_unexpected(refreshed.error());
                 if (!mod->functions.push(imported_fn))
                     return frontend_error(FrontendError::TooManyItems, imported.span);
+                if (!mod->functions[mod->functions.len - 1].exprs.ok())
+                    return frontend_error(FrontendError::OutOfMemory);
                 continue;
             }
             if (imported.has_namespace_alias) {
                 HirFunction imported_fn = fn;
+                if (!imported_fn.exprs.ok())
+                    return frontend_error(FrontendError::OutOfMemory, imported.span);
                 imported_fn.name = import_visible_name(imported, fn.name);
                 auto refreshed =
                     refresh_imported_function_signature_shapes(&imported_fn, imported.span);
@@ -12973,12 +12981,16 @@ static FrontendResult<void> merge_imported_functions(
                         FrontendError::UnsupportedSyntax, imported.span, imported_fn.name);
                 if (!mod->functions.push(imported_fn))
                     return frontend_error(FrontendError::TooManyItems, imported.span);
+                if (!mod->functions[mod->functions.len - 1].exprs.ok())
+                    return frontend_error(FrontendError::OutOfMemory);
                 continue;
             }
             for (u32 si = 0; si < imported.selected_names.len; si++) {
                 const auto& selected = imported.selected_names[si];
                 if (!selected.name.eq(fn.name)) continue;
                 HirFunction imported_fn = fn;
+                if (!imported_fn.exprs.ok())
+                    return frontend_error(FrontendError::OutOfMemory, imported.span);
                 if (selected.has_alias) imported_fn.name = selected.alias;
                 auto refreshed =
                     refresh_imported_function_signature_shapes(&imported_fn, imported.span);
@@ -12990,6 +13002,8 @@ static FrontendResult<void> merge_imported_functions(
                         FrontendError::UnsupportedSyntax, imported.span, imported_fn.name);
                 if (!mod->functions.push(imported_fn))
                     return frontend_error(FrontendError::TooManyItems, imported.span);
+                if (!mod->functions[mod->functions.len - 1].exprs.ok())
+                    return frontend_error(FrontendError::OutOfMemory);
             }
         }
     }
@@ -14007,7 +14021,7 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     base.wait_payload = timer_ms;
     base.wait_arm_mask = wait.arm_mask;
     base.wait_index = wait_index;
-    if (!route.exprs.push(base)) return frontend_error(FrontendError::TooManyItems, stmt.span);
+    if (!route.exprs.push(base)) return frontend_error(FrontendError::OutOfMemory, stmt.span);
 
     auto simple_arm = [](const AstStatement::MatchArm* arm) {
         return !arm->bind_value && is_ast_hir_terminator(*arm->stmt);
@@ -14487,7 +14501,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax, bstmt.expr.span, kMatchI64Detail);
             body_match.match_expr = subject.value();
             if (!route->exprs.push(subject.value()))
-                return frontend_error(FrontendError::TooManyItems, bstmt.expr.span);
+                return frontend_error(FrontendError::OutOfMemory, bstmt.expr.span);
             const HirExpr* subject_ptr = &route->exprs[route->exprs.len - 1];
             bool seen_wildcard = false;
             bool has_wildcard = false;
@@ -14594,7 +14608,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                               nested_match_stmt->expr.span,
                                               kMatchI64Detail);
                     if (!route->exprs.push(inner_subject.value()))
-                        return frontend_error(FrontendError::TooManyItems,
+                        return frontend_error(FrontendError::OutOfMemory,
                                               nested_match_stmt->expr.span);
                     HirExpr* inner_subject_ptr = &route->exprs[route->exprs.len - 1];
                     bool inner_seen_wildcard = false;
@@ -14678,17 +14692,17 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 case_index.span = inner_arm.span;
                                 case_index.int_value = inner_pattern->int_value;
                                 if (!route->exprs.push(tag))
-                                    return frontend_error(FrontendError::TooManyItems,
+                                    return frontend_error(FrontendError::OutOfMemory,
                                                           inner_arm.span);
                                 cond.lhs = &route->exprs[route->exprs.len - 1];
                                 if (!route->exprs.push(case_index))
-                                    return frontend_error(FrontendError::TooManyItems,
+                                    return frontend_error(FrontendError::OutOfMemory,
                                                           inner_arm.span);
                                 cond.rhs = &route->exprs[route->exprs.len - 1];
                             } else {
                                 cond.lhs = inner_subject_ptr;
                                 if (!route->exprs.push(inner_pattern.value()))
-                                    return frontend_error(FrontendError::TooManyItems,
+                                    return frontend_error(FrontendError::OutOfMemory,
                                                           inner_arm.span);
                                 cond.rhs = &route->exprs[route->exprs.len - 1];
                             }
@@ -15078,7 +15092,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, arm_stmt->expr.span, kMatchI64Detail);
                     if (!route->exprs.push(inner_subject.value()))
-                        return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
+                        return frontend_error(FrontendError::OutOfMemory, arm_stmt->expr.span);
                     HirExpr* inner_subject_ptr = &route->exprs[route->exprs.len - 1];
                     bool inner_seen_wildcard = false;
                     bool inner_seen_bool_true = false;
@@ -15121,15 +15135,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             fallback.bool_value = false;
 
                             if (!route->exprs.push(arm.arm_guard))
-                                return frontend_error(FrontendError::TooManyItems,
+                                return frontend_error(FrontendError::OutOfMemory,
                                                       inner_ast_arm.span);
                             combined.lhs = &route->exprs[route->exprs.len - 1];
                             if (!route->exprs.push(inner_cond))
-                                return frontend_error(FrontendError::TooManyItems,
+                                return frontend_error(FrontendError::OutOfMemory,
                                                       inner_ast_arm.span);
                             combined.rhs = &route->exprs[route->exprs.len - 1];
                             if (!route->exprs.push(fallback))
-                                return frontend_error(FrontendError::TooManyItems,
+                                return frontend_error(FrontendError::OutOfMemory,
                                                       inner_ast_arm.span);
                             if (!combined.args.push(&route->exprs[route->exprs.len - 1]))
                                 return frontend_error(FrontendError::TooManyItems,
@@ -15201,17 +15215,17 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 case_index.span = inner_ast_arm.span;
                                 case_index.int_value = inner_pattern->int_value;
                                 if (!route->exprs.push(tag))
-                                    return frontend_error(FrontendError::TooManyItems,
+                                    return frontend_error(FrontendError::OutOfMemory,
                                                           inner_ast_arm.span);
                                 cond.lhs = &route->exprs[route->exprs.len - 1];
                                 if (!route->exprs.push(case_index))
-                                    return frontend_error(FrontendError::TooManyItems,
+                                    return frontend_error(FrontendError::OutOfMemory,
                                                           inner_ast_arm.span);
                                 cond.rhs = &route->exprs[route->exprs.len - 1];
                             } else {
                                 cond.lhs = inner_subject_ptr;
                                 if (!route->exprs.push(inner_pattern.value()))
-                                    return frontend_error(FrontendError::TooManyItems,
+                                    return frontend_error(FrontendError::OutOfMemory,
                                                           inner_ast_arm.span);
                                 cond.rhs = &route->exprs[route->exprs.len - 1];
                             }
@@ -18294,6 +18308,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (!mod.functions.push(fn))
             return frontend_error(FrontendError::TooManyItems, item.func.span);
+        if (!mod.functions[mod.functions.len - 1].exprs.ok())
+            return frontend_error(FrontendError::OutOfMemory);
     }
 
     for (u32 i = 0; i < file.items.len; i++) {
@@ -18360,6 +18376,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!fn) return core::make_unexpected(fn.error());
             if (!mod.functions.push(fn.value()))
                 return frontend_error(FrontendError::TooManyItems, item.protocol.span);
+            if (!mod.functions[mod.functions.len - 1].exprs.ok())
+                return frontend_error(FrontendError::OutOfMemory);
             method->function_index = mod.functions.len - 1;
         }
     }
@@ -18890,6 +18908,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             if (!mod.functions.push(fn.value()))
                 return frontend_error(FrontendError::TooManyItems, method_ast.span);
+            if (!mod.functions[mod.functions.len - 1].exprs.ok())
+                return frontend_error(FrontendError::OutOfMemory);
             HirImplMethod impl_method{};
             impl_method.name = method_ast.name;
             impl_method.function_index = mod.functions.len - 1;
@@ -19165,9 +19185,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!fn.respond_guards.push(respond_guard))
                 return frontend_error(FrontendError::TooManyItems, guard.fail_term.span);
         }
-        if (!collect_function_response_effects(
-                &fn, scratch, all_locals, all_local_count, fn.params.len))
-            return frontend_error(FrontendError::TooManyItems, item.func.body->span);
+        auto effects = collect_function_response_effects(
+            &fn, scratch, all_locals, all_local_count, fn.params.len);
+        if (!effects) return core::make_unexpected(effects.error());
         auto normalized =
             normalize_function_expr(body.value(), &fn, all_locals, all_local_count, fn.params.len);
         if (!normalized) return core::make_unexpected(normalized.error());
@@ -19654,7 +19674,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             effect.str_value = name;
                             if (!is_remove) {
                                 if (!route.exprs.push(value))
-                                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                                    return frontend_error(FrontendError::OutOfMemory, stmt.span);
                                 effect.lhs = &route.exprs[route.exprs.len - 1];
                             }
                             HirLocal carrier{};
@@ -19690,7 +19710,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             literal.span = value.span;
                             literal.str_value = value.str_value;
                             if (!route.exprs.push(literal))
-                                return frontend_error(FrontendError::TooManyItems, stmt.span);
+                                return frontend_error(FrontendError::OutOfMemory, stmt.span);
                             if (!fields.push({name, &route.exprs[route.exprs.len - 1]}))
                                 return frontend_error(FrontendError::TooManyItems, stmt.span);
                         }
@@ -20990,11 +21010,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
             deco_guard.cond.span = ast_deco.span;
             // Allocate Eq operands from route's expression pool so they survive HirRoute
             // copy/move (which rebases pointers via rebase_expr).
-            if (route.exprs.len + 2 > HirRoute::kMaxExprs)
-                return frontend_error(FrontendError::TooManyItems, ast_deco.span);
-            route.exprs.push(lhs_local);
+            if (!route.exprs.push(lhs_local))
+                return frontend_error(FrontendError::OutOfMemory, ast_deco.span);
             deco_guard.cond.lhs = &route.exprs[route.exprs.len - 1];
-            route.exprs.push(rhs_zero);
+            if (!route.exprs.push(rhs_zero))
+                return frontend_error(FrontendError::OutOfMemory, ast_deco.span);
             deco_guard.cond.rhs = &route.exprs[route.exprs.len - 1];
             // fail_term: ReturnStatus reading from the synthetic local at runtime.
             deco_guard.fail_kind = HirGuard::FailKind::Term;

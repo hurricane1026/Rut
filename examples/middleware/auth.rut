@@ -75,3 +75,36 @@ func jwtIdentity(_ document: Json, _ issuer: str, _ audience: str, _ credentialI
     guard let subject = json.decode(JwtSubject, document) else { respond denied }
     Identity(consumerId: subject.sub, credentialId: credentialId, method: "jwt")
 }
+
+// OR composition for one consumer during a migration between Bearer and Basic.
+// Empty credentials disable that method; both disabled is a configuration error.
+// Use one unique Authorization field, never retry another source after rejection.
+func apiKeyOrBasic(_ authorization: str, _ key: str, _ credentials: str,
+                   _ consumerId: str, _ keyId: str, _ passwordId: str) -> Identity {
+    let denied = response(401)
+    denied.add("WWW-Authenticate", "Bearer")
+    denied.add("WWW-Authenticate", "Basic realm=\"rut\"")
+    guard consumerId != "" && keyId != "" && passwordId != "" && (key != "" || credentials != "") else { respond 503 }
+    let keyMatches = bearerMatches(authorization, key)
+    let passwordMatches = basicMatches(authorization, credentials)
+    guard keyMatches || passwordMatches else { respond denied }
+    match keyMatches {
+        true => Identity(consumerId: consumerId, credentialId: keyId, method: "apiKey")
+        _ => Identity(consumerId: consumerId, credentialId: passwordId, method: "basic")
+    }
+}
+
+// Authorization runs AFTER authentication. Identity must come from a verifier.
+// Exact, case-sensitive IDs: no substring, wildcard, or client-header matching.
+func requireConsumer(_ identity: Identity, _ allowedConsumerId: str) -> Identity {
+    guard allowedConsumerId != "" else { respond 503 }
+    guard identity.consumerId == allowedConsumerId else { respond 403 }
+    identity
+}
+
+// Chain deny checks for multiple excluded consumers; denial terminates the route.
+func denyConsumer(_ identity: Identity, _ deniedConsumerId: str) -> Identity {
+    guard deniedConsumerId != "" else { respond 503 }
+    guard identity.consumerId != deniedConsumerId else { respond 403 }
+    identity
+}

@@ -329,6 +329,12 @@ canonical spelling for common gateway tasks.
 
 ### 3. 身份认证与授权
 
+已实现的静态组合（不代表下列插件家族全部完成）：
+- [x] 同一 Consumer 的 Bearer OR Basic，可禁用单个认证方法，拒绝重复 Authorization，失败携带双 challenge。
+- [x] 基于已验证 Identity 的精确单 Consumer allow/deny；认证 401、授权 403、空策略 503。
+- [x] HIR/MIR 表达式池按需增长、节点地址稳定；LLVM 值/块映射超出栈缓冲区时使用 Arena。
+
+
 - [ ] API Key、Basic、JWT、HMAC：两者有对应认证插件。
 - [ ] LDAP 企业目录：Kong LDAP/企业版高级插件；APISIX LDAP 及版本相关高级插件。
 - [ ] OIDC 单点登录、OAuth2 Token 内省：Kong 对应企业版插件；APISIX `openid-connect`。

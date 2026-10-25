@@ -14,6 +14,7 @@
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
+#include "rut/compiler/node_pool.h"
 
 namespace rut {
 
@@ -339,9 +340,8 @@ struct MirFunction {
     static constexpr u32 kMaxBlocks = 16;
     // Nested JSON decoding and subsequent struct field checks need bounded
     // temporaries for each pointer operation and decoded field.
-    static constexpr u32 kMaxValues = 256;
     static constexpr u32 kMaxWaits = kMaxRouteWaits;
-    FixedVec<MirValue, kMaxValues> values;
+    NodePool<MirValue> values;
     FixedVec<MirLocal, kMaxLocals> locals;
     FixedVec<MirBlock, kMaxBlocks> blocks;
     FixedVec<Wait, kMaxWaits> waits;
@@ -460,11 +460,9 @@ struct MirFunction {
 private:
     void rebase_value_ptr(const MirFunction& other, MirValue*& ptr) {
         if (ptr == nullptr) return;
-        const auto begin = &other.values.data[0];
-        const auto end = begin + other.values.len;
-        if (ptr < begin || ptr >= end) return;
-        const u32 index = static_cast<u32>(ptr - begin);
-        ptr = &values.data[index];
+        const u32 index = other.values.index_of(ptr);
+        if (index == 0xffffffffu) return;
+        ptr = index < values.len ? &values[index] : nullptr;
     }
 
     void rebase_value(MirValue& value, const MirFunction& other) {
