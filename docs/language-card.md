@@ -1178,6 +1178,20 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   supports two credential slots. Empty keys disable slots; both IDs must be nonempty.
   Current wins if both keys match. Clear the old key and activate new configuration
   to revoke it; the current CLI requires restart.
+- `auth.apiKeyOrBasic(authorization, key, credentials, consumerId, keyId, passwordId)`
+  accepts either Bearer or Basic for the same configured consumer. Empty credentials
+  disable that method; both IDs are required even for a disabled method. Both
+  methods disabled returns 503. Rejection returns 401 with two ordered
+  `WWW-Authenticate` fields (Bearer, then Basic). Read only the unique
+  `req.authorization` field: duplicates reject the whole request, with no fallback
+  to another header, query parameter, or anonymous identity.
+- `auth.requireConsumer(identity, allowedConsumerId)` permits one exact,
+  case-sensitive consumer ID; `auth.denyConsumer(identity, deniedConsumerId)`
+  excludes one exact ID. Both return the unchanged verified identity on success,
+  403 on policy rejection, and 503 for an empty policy ID. Chain deny checks for
+  multiple exclusions. Chain allow checks mean AND, not an allow-list union.
+  Authenticate first: these ordinary helpers trust the supplied Identity and do
+  not prove its origin. They do not implement a Consumer/group registry or RBAC.
 
 Use `req.authorization.or("")` for authorization arguments. Invalid credentials
 return 401 with a Bearer, Basic (realm `rut`), or ApiKey challenge. Empty credentials,

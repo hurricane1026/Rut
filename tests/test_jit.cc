@@ -22907,3 +22907,252 @@ route GET "/bearer-token" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, multi_authentication_and_consumer_authorization) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    const char* src = R"rut(
+import "middleware/auth.rut"
+route GET "/both" {
+    let identity = auth.apiKeyOrBasic(req.authorization.or(""), "secret", "user:pass", "customer-a", "key-1", "password-1")
+    let permitted = auth.requireConsumer(identity, "customer-a")
+    if permitted.consumerId == "customer-a" && permitted.method == "apiKey" && permitted.credentialId == "key-1" {
+        return 201
+    } else {
+        if permitted.method == "basic" && permitted.credentialId == "password-1" { return 202 } else { return 500 }
+    }
+}
+route GET "/key-only" {
+    let identity = auth.apiKeyOrBasic(req.authorization.or(""), "secret", "", "customer-a", "key-1", "password-1")
+    return 200
+}
+route GET "/basic-only" {
+    let identity = auth.apiKeyOrBasic(req.authorization.or(""), "", "user:pass", "customer-a", "key-1", "password-1")
+    return 200
+}
+route GET "/disabled" {
+    let identity = auth.apiKeyOrBasic(req.authorization.or(""), "", "", "customer-a", "key-1", "password-1")
+    return 200
+}
+route GET "/missing-id" {
+    let identity = auth.apiKeyOrBasic(req.authorization.or(""), "secret", "", "customer-a", "key-1", "")
+    return 200
+}
+route GET "/allow-mismatch" {
+    let identity = auth.apiKey(req.authorization.or(""), "secret", "customer-a", "key-1")
+    let permitted = auth.requireConsumer(identity, "customer")
+    return 200
+}
+route GET "/deny-match" {
+    let identity = auth.apiKey(req.authorization.or(""), "secret", "customer-a", "key-1")
+    let permitted = auth.denyConsumer(identity, "customer-a")
+    return 200
+}
+route GET "/deny-mismatch" {
+    let identity = auth.apiKey(req.authorization.or(""), "secret", "customer-a", "key-1")
+    let first = auth.denyConsumer(identity, "customer")
+    let permitted = auth.denyConsumer(first, "Customer-a")
+    if permitted.credentialId == "key-1" { return 200 } else { return 500 }
+}
+route GET "/empty-allow" {
+    let identity = auth.apiKey(req.authorization.or(""), "secret", "customer-a", "key-1")
+    let permitted = auth.requireConsumer(identity, "")
+    return 200
+}
+route GET "/empty-deny" {
+    let identity = auth.apiKey(req.authorization.or(""), "secret", "customer-a", "key-1")
+    let permitted = auth.denyConsumer(identity, "")
+    return 200
+}
+route GET "/deny-before-allow" {
+    let identity = auth.apiKey(req.authorization.or(""), "secret", "customer-a", "key-1")
+    let first = auth.denyConsumer(identity, "customer-a")
+    let permitted = auth.requireConsumer(first, "customer-a")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "multi-auth: code=%d %.*s at %u:%u\n",
+                     static_cast<int>(hir.error().code),
+                     static_cast<int>(hir.error().detail.len),
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    if (!mir)
+        std::fprintf(stderr,
+                     "multi-auth MIR: code=%d %.*s at %u:%u\n",
+                     static_cast<int>(mir.error().code),
+                     static_cast<int>(mir.error().detail.len),
+                     mir.error().detail.ptr,
+                     mir.error().span.line,
+                     mir.error().span.col);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0, "Authorization: Bearer secret\r\n", 201},
+        {0, "Authorization: Basic dXNlcjpwYXNz\r\n", 202},
+        {0, "Authorization: bAsIc   dXNlcjpwYXNz\r\n", 202},
+        {0, "", 401},
+        {0, "Authorization: Bearer wrong\r\n", 401},
+        {0, "Authorization: Basic wrong\r\n", 401},
+        {0, "Authorization: Digest secret\r\n", 401},
+        {0, "Authorization: Basic secret\r\n", 401},
+        {0, "Authorization: Bearer dXNlcjpwYXNz\r\n", 401},
+        {0, "Authorization: Bearer secret, Basic dXNlcjpwYXNz\r\n", 401},
+        {0, "Authorization: Bearer secret\r\nauthorization: Basic dXNlcjpwYXNz\r\n", 401},
+        {0, "Authorization: Basic dXNlcjpwYXNz\r\nauthorization: Bearer secret\r\n", 401},
+        {0, "Authorization: Bearer secret\r\nAuthorization: Bearer secret\r\n", 401},
+        {0, "X-Consumer-ID: customer-a\r\nX-API-Key: secret\r\n", 401},
+        {0, "Authorization: Bearer secret\r\nX-Consumer-ID: attacker\r\n", 201},
+        {0, "Authorization: Basic dXNlcjpwYXNz\r\n", 202},
+        {1, "Authorization: Bearer secret\r\n", 200},
+        {1, "Authorization: Basic dXNlcjpwYXNz\r\n", 401},
+        {2, "Authorization: Basic dXNlcjpwYXNz\r\n", 200},
+        {2, "Authorization: Bearer secret\r\n", 401},
+        {3, "Authorization: Bearer secret\r\n", 503},
+        {4, "Authorization: Bearer secret\r\n", 503},
+        {5, "Authorization: Bearer secret\r\nX-Consumer-ID: customer\r\n", 403},
+        {5, "", 401},
+        {6, "Authorization: Bearer secret\r\n", 403},
+        {6, "", 401},
+        {7, "Authorization: Bearer secret\r\n", 200},
+        {8, "Authorization: Bearer secret\r\n", 503},
+        {9, "Authorization: Bearer secret\r\n", 503},
+        {10, "Authorization: Bearer secret\r\n", 403},
+    };
+    for (const auto& tc : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + tc.headers + "\r\n";
+        auto result = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(request.data()),
+                                                    static_cast<u32>(request.size()),
+                                                    nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != tc.status)
+            std::fprintf(stderr,
+                         "multi-auth route %u: got %u expected %u\n",
+                         tc.route,
+                         result.status_code,
+                         tc.status);
+        CHECK(result.status_code == tc.status);
+        if (tc.status == 401) {
+            REQUIRE(result.next_state != 0);
+            REQUIRE(result.next_state <= rir.module.header_set_count);
+            const auto& headers = rir.module.header_sets[result.next_state - 1];
+            CHECK(headers.count == (tc.route <= 4 ? 2 : 1));
+            CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+            CHECK(rir.module.header_values[headers.offset].eq(lit("Bearer")));
+            if (tc.route <= 4) {
+                CHECK(rir.module.header_keys[headers.offset + 1].eq(lit("WWW-Authenticate")));
+                CHECK(rir.module.header_values[headers.offset + 1].eq(lit("Basic realm=\"rut\"")));
+            }
+        } else {
+            // Neither authorization failures nor config failures carry a challenge.
+            CHECK(result.next_state == 0);
+        }
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, large_inlined_auth_policy_grows_expression_pools) {
+    // A balanced tree exercises thousands of nodes without making source nesting
+    // depth or the number of locals/guards the limiting factor.
+    auto choices = [](auto&& self, u32 begin, u32 end) -> std::string {
+        if (end - begin == 1) return "value == \"consumer-" + std::to_string(begin) + "\"";
+        const u32 middle = begin + (end - begin) / 2;
+        return "(" + self(self, begin, middle) + " || " + self(self, middle, end) + ")";
+    };
+    const std::string source =
+        "func allowed(_ value: str) -> bool => " + choices(choices, 0, 256) +
+        "\nroute GET \"/\" { let ok = allowed(req.uniqueHeader(\"X-Consumer\").or(\"\")) "
+        "if ok { return 200 } else { return 403 } }";
+    auto lexed = lex(lit(source.c_str()));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->functions[0].exprs.len > 128);
+    CHECK(hir->routes[0].exprs.len > 128);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK(mir->functions[0].values.len > 128);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    for (const char* value : {"consumer-0", "consumer-127", "consumer-255", "consumer-256", ""}) {
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\nX-Consumer: ") + value + "\r\n\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK(result.status_code ==
+              (value[0] != '\0' && !lit(value).eq(lit("consumer-256")) ? 200 : 403));
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, codegen_grows_block_map_beyond_stack_scratch) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("many_blocks"), lit("/"), 'G'));
+    rir::BlockId blocks[96];
+    for (auto& block : blocks) block = V(b.create_block(fn, lit("step")));
+    for (u32 i = 0; i < 96; ++i) {
+        b.set_insert_point(fn, blocks[i]);
+        if (i + 1 == 96) {
+            VOK(b.emit_ret_status(204));
+        } else {
+            VOK(b.emit_jmp(blocks[i + 1]));
+        }
+    }
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_many_blocks"));
+    REQUIRE(handler != nullptr);
+    const auto result = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK(result.status_code == 204);
+    engine.shutdown();
+}

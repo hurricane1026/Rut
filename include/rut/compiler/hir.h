@@ -15,6 +15,7 @@
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
+#include "rut/compiler/node_pool.h"
 #include "rut/runtime/arena.h"
 #include <deque>
 #include <string>
@@ -578,10 +579,9 @@ struct HirFunction {
     u32 return_tuple_struct_indices[kMaxTupleSlots]{};
     u32 return_shape_index = 0xffffffffu;
     static constexpr u32 kMaxParams = 8;
-    static constexpr u32 kMaxExprs = 64;
     FixedVec<TypeParamDecl, kMaxTypeParams> type_params;
     FixedVec<ParamDecl, kMaxParams> params;
-    FixedVec<HirExpr, kMaxExprs> exprs;
+    NodePool<HirExpr> exprs;
     // Chain-after currently replays only Response header mutations. Remember
     // whether the source helper also contained another statement effect so a
     // call site cannot silently drop it during expansion.
@@ -727,11 +727,9 @@ struct HirFunction {
 private:
     void rebase_expr_ptr(const HirFunction& other, HirExpr*& ptr) {
         if (ptr == nullptr) return;
-        const auto begin = &other.exprs.data[0];
-        const auto end = begin + other.exprs.len;
-        if (ptr < begin || ptr >= end) return;
-        const u32 index = static_cast<u32>(ptr - begin);
-        ptr = &exprs.data[index];
+        const u32 index = other.exprs.index_of(ptr);
+        if (index == 0xffffffffu) return;
+        ptr = index < exprs.len ? &exprs[index] : nullptr;
     }
 
     void rebase_expr(HirExpr& expr, const HirFunction& other) {
@@ -1163,7 +1161,6 @@ struct HirRoute {
     static constexpr u32 kMaxGuards = 8;
     // JSON struct decoding materializes bounded pointer operations for each
     // field; keep enough room for nested shapes and the route's final guards.
-    static constexpr u32 kMaxExprs = 128;
     static constexpr u32 kMaxDecorators = 8;
     static constexpr u32 kMaxWaits = kMaxRouteWaits;
     // 2 for-loops per route covers realistic DSL patterns (one allowlist
@@ -1171,7 +1168,7 @@ struct HirRoute {
     // stack budget. Each HirForLoop is ~10 KB even at kMaxGuards=2; a
     // larger cap would push HirRoute past the recursive-analyze budget.
     static constexpr u32 kMaxForLoops = 2;
-    FixedVec<HirExpr, kMaxExprs> exprs;
+    NodePool<HirExpr> exprs;
     FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxGuards> guards;
     FixedVec<DecoratorRef, kMaxDecorators> decorators;
@@ -1309,11 +1306,9 @@ struct HirRoute {
 private:
     void rebase_expr_ptr(const HirRoute& other, HirExpr*& ptr) {
         if (ptr == nullptr) return;
-        const auto begin = &other.exprs.data[0];
-        const auto end = begin + other.exprs.len;
-        if (ptr < begin || ptr >= end) return;
-        const u32 index = static_cast<u32>(ptr - begin);
-        ptr = &exprs.data[index];
+        const u32 index = other.exprs.index_of(ptr);
+        if (index == 0xffffffffu) return;
+        ptr = index < exprs.len ? &exprs[index] : nullptr;
     }
 
     void rebase_expr(HirExpr& expr, const HirRoute& other) {

@@ -495,7 +495,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::RegexMatch;
         v.type = MirTypeKind::Bool;
         v.str_value = expr.str_value;
@@ -524,7 +524,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             auto elem = mir_value(*expr.args[i], module, fn, ctx);
             if (!elem) return core::make_unexpected(elem.error());
             if (!fn->values.push(elem.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             if (!v.args.push(&fn->values[fn->values.len - 1]))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
         }
@@ -537,7 +537,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             auto object = mir_value(*expr.lhs, module, fn, ctx);
             if (!object) return core::make_unexpected(object.error());
             if (!fn->values.push(object.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             v.lhs = &fn->values[fn->values.len - 1];
         }
         v.type = MirTypeKind::Struct;
@@ -548,7 +548,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             auto field_value = mir_value(*expr.field_inits[i].value, module, fn, ctx);
             if (!field_value) return core::make_unexpected(field_value.error());
             if (!fn->values.push(field_value.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             MirValue::FieldInit field_init{};
             field_init.name = expr.field_inits[i].name;
             field_init.value = &fn->values[fn->values.len - 1];
@@ -561,7 +561,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::TupleSlot;
         v.type = mir_type_kind(expr.type);
         v.variant_index = expr.variant_index;
@@ -584,7 +584,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             auto payload = mir_value(*expr.lhs, module, fn, ctx);
             if (!payload) return core::make_unexpected(payload.error());
             if (!fn->values.push(payload.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             v.lhs = &fn->values[fn->values.len - 1];
         }
         return v;
@@ -593,7 +593,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::Field;
         v.type = mir_type_kind(expr.type);
         v.str_value = expr.str_value;
@@ -623,7 +623,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto value = mir_value(*expr.lhs, module, fn, ctx);
         if (!value) return core::make_unexpected(value.error());
         if (!fn->values.push(value.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = expr.kind == HirExprKind::ReqAddHeader ? MirValueKind::ReqAddHeader
                                                         : MirValueKind::ReqSetHeader;
         v.type = MirTypeKind::Str;
@@ -636,7 +636,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto fallback = mir_value(*expr.lhs, module, fn, ctx);
         if (!fallback) return core::make_unexpected(fallback.error());
         if (!fn->values.push(fallback.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::RespHeader;
         v.type = MirTypeKind::Str;
         v.may_nil = true;
@@ -657,7 +657,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             auto value = mir_value(*expr.lhs, module, fn, ctx);
             if (!value) return core::make_unexpected(value.error());
             if (!fn->values.push(value.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             v.lhs = &fn->values[fn->values.len - 1];
         }
         return v;
@@ -747,7 +747,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             auto child = mir_value(*arg, module, fn, ctx);
             if (!child) return core::make_unexpected(child.error());
             if (!fn->values.push(child.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             if (!v.args.push(&fn->values[fn->values.len - 1]))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
         }
@@ -797,7 +797,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             auto field_value = mir_value(*expr.field_inits[i].value, module, fn, ctx);
             if (!field_value) return core::make_unexpected(field_value.error());
             if (!fn->values.push(field_value.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
             MirValue::FieldInit field_init{};
             field_init.name = expr.field_inits[i].name;
             field_init.value = &fn->values[fn->values.len - 1];
@@ -820,10 +820,10 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto rhs = mir_value(*expr.rhs, module, fn, ctx);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* lhs_ptr = &fn->values[fn->values.len - 1];
         if (!fn->values.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* rhs_ptr = &fn->values[fn->values.len - 1];
         switch (expr.kind) {
             case HirExprKind::BearerMatches:
@@ -894,7 +894,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto operand = mir_value(*expr.lhs, module, fn, ctx);
         if (!operand) return core::make_unexpected(operand.error());
         if (!fn->values.push(operand.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::WidenI64;
         v.type = MirTypeKind::I64;
         v.lhs = &fn->values[fn->values.len - 1];
@@ -904,7 +904,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto key = mir_value(*expr.lhs, module, fn, ctx);
         if (!key) return core::make_unexpected(key.error());
         if (!fn->values.push(key.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::CacheGet;
         v.type = MirTypeKind::I64;
         v.may_nil = true;
@@ -918,10 +918,10 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto value = mir_value(*expr.rhs, module, fn, ctx);
         if (!value) return core::make_unexpected(value.error());
         if (!fn->values.push(key.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* key_ptr = &fn->values[fn->values.len - 1];
         if (!fn->values.push(value.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::CacheSet;
         v.type = MirTypeKind::I64;
         v.cache_index = expr.cache_index;
@@ -937,13 +937,13 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto else_v = mir_value(*expr.args[0], module, fn, ctx);
         if (!else_v) return core::make_unexpected(else_v.error());
         if (!fn->values.push(cond.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* cond_ptr = &fn->values[fn->values.len - 1];
         if (!fn->values.push(then_v.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* then_ptr = &fn->values[fn->values.len - 1];
         if (!fn->values.push(else_v.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* else_ptr = &fn->values[fn->values.len - 1];
         v.kind = MirValueKind::IfElse;
         v.type = mir_type_kind(expr.type);
@@ -965,10 +965,10 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto rhs = mir_value(*expr.rhs, module, fn, ctx);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* lhs_ptr = &fn->values[fn->values.len - 1];
         if (!fn->values.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* rhs_ptr = &fn->values[fn->values.len - 1];
         v.kind = MirValueKind::Or;
         v.type = mir_type_kind(expr.type);
@@ -985,7 +985,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::NoError;
         v.type = MirTypeKind::Bool;
         v.lhs = &fn->values[fn->values.len - 1];
@@ -996,7 +996,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::HasValue;
         v.type = MirTypeKind::Bool;
         v.lhs = &fn->values[fn->values.len - 1];
@@ -1010,7 +1010,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::ValueOf;
         v.type = mir_type_kind(expr.type);
         v.variant_index = expr.variant_index;
@@ -1025,7 +1025,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::MissingOf;
         v.type = mir_type_kind(expr.type);
         v.may_nil = expr.may_nil;
@@ -1042,7 +1042,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::MatchPayload;
         v.type = mir_type_kind(expr.type);
         v.variant_index = expr.variant_index;
@@ -1057,7 +1057,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::VariantTag;
         v.type = MirTypeKind::I32;
         v.variant_index = expr.variant_index;
@@ -1101,7 +1101,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.kind = MirValueKind::WaitField;
         v.type = mir_type_kind(expr.type);
         v.str_value = expr.str_value;
@@ -1116,6 +1116,10 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
 
 static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                                                  bool internal_strict_local_response_propagation) {
+    for (u32 i = 0; i < module.functions.len; ++i)
+        if (!module.functions[i].exprs.ok()) return frontend_error(FrontendError::OutOfMemory);
+    for (u32 i = 0; i < module.routes.len; ++i)
+        if (!module.routes[i].exprs.ok()) return frontend_error(FrontendError::OutOfMemory);
     const bool strict_table_valid =
         internal_strict_local_response_propagation
             ? strict_local_response_source_table_valid_for_internal_propagation(
@@ -1490,7 +1494,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 auto effect = mir_value(module.routes[i].exprs[expr_index], module, &fn);
                 if (!effect) return core::make_unexpected(effect.error());
                 if (!fn.values.push(effect.value()))
-                    return frontend_error(FrontendError::TooManyItems, arm.span);
+                    return frontend_error(FrontendError::OutOfMemory, arm.span);
                 if (!out->effects.push(
                         {fn.values.len - 1, module.routes[i].exprs[expr_index].span}))
                     return frontend_error(FrontendError::TooManyItems, arm.span);
@@ -1532,7 +1536,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                         auto local_value = mir_value(local.init, module, &fn, body_ctx);
                         if (!local_value) return core::make_unexpected(local_value.error());
                         if (!fn.values.push(local_value.value()))
-                            return frontend_error(FrontendError::TooManyItems, local.span);
+                            return frontend_error(FrontendError::OutOfMemory, local.span);
                         ForLoopCtx::LocalBinding binding{};
                         binding.ref_index = local.ref_index;
                         binding.value = &fn.values[fn.values.len - 1];
@@ -2016,6 +2020,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             }
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
+            if (!mir->functions[mir->functions.len - 1].values.ok())
+                return frontend_error(FrontendError::OutOfMemory);
             continue;
         }
 
@@ -2089,8 +2095,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                                         u32 ref_index,
                                         MirValue value,
                                         Span span) -> FrontendResult<void> {
-                if (!fn.values.push(value))
-                    return frontend_error(FrontendError::TooManyItems, span);
+                if (!fn.values.push(value)) return frontend_error(FrontendError::OutOfMemory, span);
                 ForLoopCtx::LocalBinding binding{};
                 binding.ref_index = ref_index;
                 binding.value = &fn.values[fn.values.len - 1];
@@ -2903,6 +2908,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             }
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
+            if (!mir->functions[mir->functions.len - 1].values.ok())
+                return frontend_error(FrontendError::OutOfMemory);
             continue;
         }
 
@@ -2967,6 +2974,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             }
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
+            if (!mir->functions[mir->functions.len - 1].values.ok())
+                return frontend_error(FrontendError::OutOfMemory);
             continue;
         }
 
@@ -3498,6 +3507,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
         }
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
+        if (!mir->functions[mir->functions.len - 1].values.ok())
+            return frontend_error(FrontendError::OutOfMemory);
     }
 
     if (invalid_redirect_policy) return frontend_error(FrontendError::UnsupportedSyntax);
