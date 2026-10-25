@@ -38,6 +38,7 @@ enum class Op : u8 {
     // optional-Json carrier and arena lifetime apply unchanged.
     JwtDecode,
     BearerToken,
+    JwtClaimsValid,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

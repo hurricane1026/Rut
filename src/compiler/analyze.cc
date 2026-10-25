@@ -9595,6 +9595,31 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    if (expr.name.eq(lit_str("jwtClaimsValid")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 3 || expr.args[0] == nullptr || expr.args[1] == nullptr ||
+            expr.args[2] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        HirExpr values[3]{};
+        for (u32 i = 0; i < 3; ++i) {
+            auto value = analyze_builtin_arg(*expr.args[i]);
+            if (!value) return core::make_unexpected(value.error());
+            const auto expected = i == 0 ? HirTypeKind::Json : HirTypeKind::Str;
+            if (value->type != expected || value->may_nil || value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, expr.name);
+            values[i] = value.value();
+        }
+        return make_json_op(json::Op::JwtClaimsValid,
+                            HirTypeKind::Bool,
+                            false,
+                            &values[0],
+                            &values[1],
+                            &values[2],
+                            expr.span,
+                            route);
+    }
+
     if (expr.name.eq(lit_str("bearerToken")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 1 || expr.args[0] == nullptr)
