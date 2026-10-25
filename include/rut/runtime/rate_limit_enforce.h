@@ -56,7 +56,6 @@ inline u32 rate_limit_reason_index(RateLimitRejectReason reason) {
             return 2;
         case RateLimitRejectReason::MissingGlobal:
         case RateLimitRejectReason::MissingSemanticId:
-            return 0;
         case RateLimitRejectReason::None:
             return 0;
     }
