@@ -228,6 +228,17 @@ inline bool rate_limit_route_shape_valid(const RouteEntry& route) {
         const auto& rule = route.rate_limit.rules[i];
         if (rule.scope != RateLimitScope::Shard && rule.scope != RateLimitScope::Global)
             return false;
+        if (rule.max == 0 || rule.window_sec == 0) {
+            if (rule.emit_interval_us != 0 || rule.tau_us != 0) return false;
+        } else {
+            if (rule.burst == 0) return false;
+            if (!rate_limit_params_representable(rule.max, rule.window_sec, rule.burst))
+                return false;
+            const u64 emit = rate_limit_emit_interval_us(rule.max, rule.window_sec);
+            const u32 burst = rule.burst;
+            if (rule.emit_interval_us != emit || rule.tau_us != static_cast<u64>(burst - 1u) * emit)
+                return false;
+        }
         if (rule.key.count > kMaxRateLimitKeyComponents) return false;
         for (u32 j = 0; j < rule.key.count; j++) {
             const auto& component = rule.key.comps[j];
@@ -1499,28 +1510,44 @@ public:
     // Append an additional rate-limit rule to a route (stacking): a request must
     // pass every rule. `scope` selects per-shard (default) or process-shared global; `burst`
     // is the bucket capacity (0 → defaults to `max`). Returns false on a bad index
-    // or when the rule set is full.
+    // or when the rule set is full. Failed mutations leave existing metadata intact.
     bool add_route_rate_limit_rule(u32 idx,
                                    u32 max,
                                    u32 window_sec,
                                    RateLimitScope scope = RateLimitScope::Shard,
                                    u32 burst = 0) {
         if (idx >= route_count) return false;
-        if (routes[idx].rate_limit.add_rule(max, window_sec, burst, scope) < 0) return false;
-        return refresh_route_rate_limit_ids(idx);
+        RouteEntry& route = routes[idx];
+        const RateLimitRuleSet previous_rules = route.rate_limit;
+        u64 previous_ids[kMaxRateLimitRules];
+        for (u32 i = 0; i < kMaxRateLimitRules; i++) previous_ids[i] = route.rate_limit_ids[i];
+        if (route.rate_limit.add_rule(max, window_sec, burst, scope) < 0) return false;
+        if (refresh_route_rate_limit_ids(idx)) return true;
+        route.rate_limit = previous_rules;
+        for (u32 i = 0; i < kMaxRateLimitRules; i++) route.rate_limit_ids[i] = previous_ids[i];
+        return false;
     }
 
     // Append one metering-key component to a route's *most recently added* rule
     // (IP / header / query / cookie / param). With no components a rule meters
     // per client IP; each appended component adds a dimension, so it counts per
     // unique tuple. `name` is ignored for Ip. Returns false on a bad index, when
-    // the route has no rule yet, the key is full, or a name exceeds 32 bytes.
+    // the route has no rule yet, the key is full, a name exceeds 32 bytes, or
+    // existing metadata fails validation. Failed mutations leave metadata intact.
     bool add_route_rate_limit_key(u32 idx, RateLimitKeyKind kind, const char* name, u32 name_len) {
         if (idx >= route_count) return false;
         RateLimitRuleSet& rs = routes[idx].rate_limit;
-        if (rs.count == 0) return false;
+        if (rs.count == 0 || rs.count > kMaxRateLimitRules) return false;
+        const RateLimitRuleSet previous_rules = rs;
+        u64 previous_ids[kMaxRateLimitRules];
+        for (u32 i = 0; i < kMaxRateLimitRules; i++)
+            previous_ids[i] = routes[idx].rate_limit_ids[i];
         if (!rs.rules[rs.count - 1].key.add(kind, name, name_len)) return false;
-        return refresh_route_rate_limit_ids(idx);
+        if (refresh_route_rate_limit_ids(idx)) return true;
+        rs = previous_rules;
+        for (u32 i = 0; i < kMaxRateLimitRules; i++)
+            routes[idx].rate_limit_ids[i] = previous_ids[i];
+        return false;
     }
 
     // Recompute all immutable rate-limit namespaces after direct hand-built

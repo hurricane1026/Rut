@@ -74,7 +74,7 @@ enum class RateLimitScope : u8 {
 struct RateLimitRule {
     u32 max = 0;         // tokens per window (steady rate = max / window_sec)
     u32 window_sec = 0;  // refill window
-    u32 burst = 0;       // bucket capacity; 0 in the spec means "default to max"
+    u32 burst = 0;       // bucket capacity; add_rule's 0 input is stored canonically as max
     RateLimitScope scope = RateLimitScope::Shard;
     u64 emit_interval_us = 0;  // µs between tokens (0 = rule disabled)
     u64 tau_us = 0;            // burst tolerance, in µs
