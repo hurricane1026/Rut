@@ -1837,6 +1837,7 @@ TEST(h2_serving, inject_content_length_rejects_overflow) {
 
 namespace {
 struct FakeH2Loop {
+    RateLimiter rate_limiter{};
     SlicePool pool;
     Http2Conn owned_h2;
     u8 response_headers[4096]{};
