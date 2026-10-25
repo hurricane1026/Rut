@@ -23,6 +23,10 @@ struct RateLimitKeyInput {
     u32 req_header_end = 0;       // offset past the final CRLFCRLF
     const char* path = nullptr;   // raw request path (may contain ?query)
     u32 path_len = 0;
+    // A supplied path is usable without req_buf only when its producer has
+    // independently validated it (for example HTTP/2 :path). HTTP/1 fallback
+    // recovery and harness metadata do not establish that trust.
+    bool path_is_trusted = false;
     const RouteParam* params = nullptr;
     u32 param_count = 0;
 };
@@ -52,7 +56,7 @@ inline u64 mix(u64 h, const void* p, u32 n) {
 }
 
 // Find a request header by (case-insensitive) name; returns its value
-// {ptr,len}, trimmed of leading spaces, or {nullptr,0} if absent. Scans the
+// {ptr,len}, trimmed of optional whitespace, or {nullptr,0} if absent. Scans the
 // header block in req_buf[0..header_end), skipping the request line.
 inline Str header_value(const RateLimitKeyInput& in, const char* name, u32 name_len) {
     if (!in.req_buf || in.req_header_end == 0) return {nullptr, 0};
@@ -75,7 +79,9 @@ inline Str header_value(const RateLimitKeyInput& in, const char* name, u32 name_
             if (ci_eq(p + line_start, nlen, name, name_len)) {
                 u32 vs = colon + 1;
                 while (vs < line_end && (p[vs] == ' ' || p[vs] == '\t')) vs++;
-                return {p + vs, line_end - vs};
+                u32 ve = line_end;
+                while (ve > vs && (p[ve - 1] == ' ' || p[ve - 1] == '\t')) ve--;
+                return {p + vs, ve - vs};
             }
         }
         i = line_end + 2;
@@ -87,21 +93,25 @@ inline Str header_value(const RateLimitKeyInput& in, const char* name, u32 name_
 // The full request target (path?query) read from the request line in req_buf.
 // Unlike in.path it is not capped at Connection::kMaxReqPathLen, so query values
 // past that cutoff still isolate into distinct buckets. Falls back to in.path
-// when req_buf is unavailable (e.g. unit callers that only set path).
+// only when req_buf is unavailable and its producer marked that path trusted.
 inline Str request_target(const RateLimitKeyInput& in) {
-    if (!in.req_buf || in.req_header_end == 0) return {in.path, in.path_len};
+    if (!in.req_buf || in.req_header_end == 0)
+        return in.path_is_trusted ? Str{in.path, in.path_len} : Str{nullptr, 0};
     const char* p = reinterpret_cast<const char*>(in.req_buf);
     u32 end = in.req_header_end;
     u32 i = 0;
     while (i < end && p[i] != ' ' && p[i] != '\r' && p[i] != '\n') i++;  // method
-    if (i >= end || p[i] != ' ') return {in.path, in.path_len};
+    if (i >= end || p[i] != ' ')
+        return in.path_is_trusted ? Str{in.path, in.path_len} : Str{nullptr, 0};
     u32 ts = ++i;
     while (i < end && p[i] != ' ' && p[i] != '\r' && p[i] != '\n') i++;  // request-target
-    if (i >= end || p[i] != ' ') return {in.path, in.path_len};
+    if (i >= end || p[i] != ' ')
+        return in.path_is_trusted ? Str{in.path, in.path_len} : Str{nullptr, 0};
     return {p + ts, i - ts};
 }
 
 inline Str query_value(const RateLimitKeyInput& in, const char* name, u32 name_len) {
+    if (!name || name_len == 0) return {nullptr, 0};
     const Str kTarget = request_target(in);
     const char* p = kTarget.ptr;
     u32 plen = kTarget.len;
@@ -123,33 +133,63 @@ inline Str query_value(const RateLimitKeyInput& in, const char* name, u32 name_l
             vp = p + vs;
             vlen = i - vs;
         }
-        if (ci_eq(p + ks, klen, name, name_len)) return {vp ? vp : p + ks, vp ? vlen : 0};
+        if (Str{p + ks, klen}.eq(Str{name, name_len})) return {vp ? vp : p + ks, vp ? vlen : 0};
         if (i < plen && p[i] == '&') i++;
     }
     return {nullptr, 0};
 }
 
-// Find a cookie value: the Cookie header is "n1=v1; n2=v2".
+// Find a cookie value across all Cookie headers. Cookie fields are joined by
+// the HTTP/2 synthesizer, but HTTP/1 may carry multiple Cookie lines. Match and
+// trimming follow rut_helper_req_cookie so key extraction agrees with handlers.
 inline Str cookie_value(const RateLimitKeyInput& in, const char* name, u32 name_len) {
-    Str ck = header_value(in, "Cookie", 6);
-    if (ck.empty()) return {nullptr, 0};
-    const char* p = ck.ptr;
-    u32 i = 0;
-    while (i < ck.len) {
-        while (i < ck.len && (p[i] == ' ' || p[i] == ';')) i++;
-        u32 ks = i;
-        while (i < ck.len && p[i] != '=' && p[i] != ';') i++;
-        u32 klen = i - ks;
-        const char* vp = nullptr;
-        u32 vlen = 0;
-        if (i < ck.len && p[i] == '=') {
-            i++;
-            u32 vs = i;
-            while (i < ck.len && p[i] != ';') i++;
-            vp = p + vs;
-            vlen = i - vs;
+    if (!name || name_len == 0) return {nullptr, 0};
+    if (!in.req_buf || in.req_header_end == 0) return {nullptr, 0};
+    const char* p = reinterpret_cast<const char*>(in.req_buf);
+    const u32 end = in.req_header_end;
+    u32 line = 0;
+    while (line + 1 < end && (p[line] != '\r' || p[line + 1] != '\n')) line++;
+    line += 2;
+    while (line < end) {
+        if (line + 1 < end && p[line] == '\r' && p[line + 1] == '\n') break;
+        const u32 line_start = line;
+        u32 colon = line_start;
+        while (colon < end && p[colon] != ':' && p[colon] != '\r') colon++;
+        u32 line_end = colon;
+        while (line_end + 1 < end && (p[line_end] != '\r' || p[line_end + 1] != '\n')) line_end++;
+        if (colon < end && p[colon] == ':' &&
+            ci_eq(p + line_start, colon - line_start, "Cookie", 6)) {
+            u32 value_start = colon + 1;
+            while (value_start < line_end && (p[value_start] == ' ' || p[value_start] == '\t'))
+                value_start++;
+            u32 value_end = line_end;
+            while (value_end > value_start && (p[value_end - 1] == ' ' || p[value_end - 1] == '\t'))
+                value_end--;
+            u32 i = value_start;
+            while (i < value_end) {
+                while (i < value_end && (p[i] == ' ' || p[i] == '\t' || p[i] == ';')) i++;
+                const u32 key_start = i;
+                while (i < value_end && p[i] != '=' && p[i] != ';') i++;
+                u32 key_end = i;
+                while (key_end > key_start && (p[key_end - 1] == ' ' || p[key_end - 1] == '\t'))
+                    key_end--;
+                if (i >= value_end || p[i] != '=') {
+                    while (i < value_end && p[i] != ';') i++;
+                    continue;
+                }
+                i++;
+                const u32 value_start = i;
+                while (i < value_end && p[i] != ';') i++;
+                u32 cookie_value_end = i;
+                while (cookie_value_end > value_start &&
+                       (p[cookie_value_end - 1] == ' ' || p[cookie_value_end - 1] == '\t'))
+                    cookie_value_end--;
+                const u32 key_len = key_end - key_start;
+                if (Str{p + key_start, key_len}.eq(Str{name, name_len}))
+                    return {p + value_start, cookie_value_end - value_start};
+            }
         }
-        if (ci_eq(p + ks, klen, name, name_len)) return {vp ? vp : p + ks, vp ? vlen : 0};
+        line = line_end + 2;
     }
     return {nullptr, 0};
 }
@@ -158,7 +198,7 @@ inline Str cookie_value(const RateLimitKeyInput& in, const char* name, u32 name_
 inline Str param_value(const RateLimitKeyInput& in, const char* name, u32 name_len) {
     for (u32 i = 0; i < in.param_count; i++) {
         const RouteParam& rp = in.params[i];
-        if (ci_eq(rp.name, rp.name_len, name, name_len)) return {rp.value, rp.value_len};
+        if (Str{rp.name, rp.name_len}.eq(Str{name, name_len})) return {rp.value, rp.value_len};
     }
     return {nullptr, 0};
 }
