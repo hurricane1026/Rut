@@ -22754,3 +22754,140 @@ route GET "/ordinary" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, basic_authentication_and_key_rotation_identity_matrix) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    const char* src = R"rut(
+import "middleware/auth.rut"
+route GET "/basic" {
+    let identity = auth.basic(req.authorization.or(""), "Aladdin:open sesame", "customer-a", "password-1")
+    if identity.method == "basic" && identity.consumerId == "customer-a" && identity.credentialId == "password-1" {
+        return 200
+    } else { return 500 }
+}
+route GET "/rotation" {
+    let identity = auth.rotatingApiKey(req.authorization.or(""), "new-key", "old-key", "customer-a", "new", "old")
+    if identity.credentialId == "new" { return 201 } else { return 202 }
+}
+route GET "/revoked" {
+    let identity = auth.rotatingApiKey(req.authorization.or(""), "new-key", "", "customer-a", "new", "old")
+    return 201
+}
+route GET "/disabled" {
+    let identity = auth.rotatingApiKey(req.authorization.or(""), "", "", "customer-a", "new", "old")
+    return 201
+}
+route GET "/duplicate-key" {
+    let identity = auth.rotatingApiKey(req.authorization.or(""), "same-key", "same-key", "customer-a", "new", "old")
+    if identity.credentialId == "new" { return 201 } else { return 500 }
+}
+route GET "/empty-basic" {
+    let identity = auth.basic(req.authorization.or(""), "", "customer-a", "password-1")
+    return 200
+}
+route GET "/previous-only" {
+    let identity = auth.rotatingApiKey(req.authorization.or(""), "", "old-key", "customer-a", "new", "old")
+    if identity.credentialId == "old" { return 202 } else { return 500 }
+}
+route GET "/header-key" {
+    let identity = auth.headerKey(req.uniqueHeader("X-API-Key").or(""), "opaque:secret", "customer-b", "header-1")
+    if identity.consumerId == "customer-b" && identity.credentialId == "header-1" && identity.method == "apiKey" {
+        return 203
+    } else { return 500 }
+}
+route GET "/empty-header-key" {
+    let identity = auth.headerKey(req.uniqueHeader("X-API-Key").or(""), "", "customer-b", "header-1")
+    return 203
+}
+route GET "/bearer-token" {
+    guard let token = bearerToken(req.authorization.or("")) else { return 401 }
+    if constantTimeEqual(token, "new-key") { return 200 } else { return 401 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "auth matrix: %d %.*s at %u:%u\n",
+                     static_cast<int>(hir.error().code),
+                     static_cast<int>(hir.error().detail.len),
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0, "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\n", 200},
+        {0, "Authorization: bAsIc   QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\n", 200},
+        {0,
+         "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\nX-Consumer-ID: attacker\r\n",
+         200},
+        {0, "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZR==\r\n", 401},
+        {0, "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ\r\n", 401},
+        {0, "Authorization: Bearer QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\n", 401},
+        {0,
+         "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\nauthorization: Basic wrong\r\n",
+         401},
+        {0, "X-Consumer-ID: customer-a\r\n", 401},
+        {1, "Authorization: Bearer new-key\r\n", 201},
+        {1, "Authorization: bearer   old-key\r\n", 202},
+        {1, "Authorization: Bearer invalid\r\n", 401},
+        {1, "", 401},
+        {2, "Authorization: Bearer old-key\r\n", 401},
+        {2, "Authorization: Bearer new-key\r\n", 201},
+        {3, "Authorization: Bearer new-key\r\n", 503},
+        {4, "Authorization: Bearer same-key\r\n", 201},
+        {5, "", 503},
+        {6, "Authorization: Bearer old-key\r\n", 202},
+        {6, "Authorization: Bearer new-key\r\n", 401},
+        {7, "X-API-Key: opaque:secret\r\n", 203},
+        {7, "x-api-key: opaque:secret\r\nX-Consumer-ID: attacker\r\n", 203},
+        {7, "", 401},
+        {7, "X-API-Key: \r\n", 401},
+        {7, "X-API-Key: wrong\r\n", 401},
+        {7, "X-API-Key: opaque:secret\r\nx-api-key: wrong\r\n", 401},
+        {7, "X-API-Key: wrong\r\nx-api-key: opaque:secret\r\n", 401},
+        {7, "X-API-Key: opaque:secret\r\nx-api-key: opaque:secret\r\n", 401},
+        {7, "Authorization: Bearer opaque:secret\r\n", 401},
+        {7, "X-API-Key: opaque:secret\r\n", 203},
+        {8, "", 503},
+        {9, "Authorization: bEaReR   new-key\r\n", 200},
+        {9, "Authorization: Bearer new-key,other\r\n", 401},
+        {9, "Authorization: Basic new-key\r\n", 401},
+        {9, "", 401},
+    };
+    for (const auto& tc : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + tc.headers + "\r\n";
+        auto result = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(request.data()),
+                                                    static_cast<u32>(request.size()),
+                                                    nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK(result.status_code == tc.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}

@@ -806,7 +806,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         return v;
     }
-    if (expr.kind == HirExprKind::ConstantTimeEqual || expr.kind == HirExprKind::Eq ||
+    if (expr.kind == HirExprKind::BearerMatches || expr.kind == HirExprKind::BasicMatches ||
+        expr.kind == HirExprKind::ConstantTimeEqual || expr.kind == HirExprKind::Eq ||
         expr.kind == HirExprKind::Lt || expr.kind == HirExprKind::Gt ||
         expr.kind == HirExprKind::BitAnd || expr.kind == HirExprKind::BitOr ||
         expr.kind == HirExprKind::BitXor || expr.kind == HirExprKind::BitShl ||
@@ -825,6 +826,12 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* rhs_ptr = &fn->values[fn->values.len - 1];
         switch (expr.kind) {
+            case HirExprKind::BearerMatches:
+                v.kind = MirValueKind::BearerMatches;
+                break;
+            case HirExprKind::BasicMatches:
+                v.kind = MirValueKind::BasicMatches;
+                break;
             case HirExprKind::ConstantTimeEqual:
                 v.kind = MirValueKind::ConstantTimeEqual;
                 break;

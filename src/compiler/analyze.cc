@@ -4468,14 +4468,14 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             return frontend_error(
                 FrontendError::UnsupportedSyntax, expr.span, kReqHeaderMutationDetail);
         const Str header_name = expr.args[0]->str_value;
-        const Str header_value = expr.args[1]->str_value;
+        auto value = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (!value) return core::make_unexpected(value.error());
+        const Str header_value = value->str_value;
         if (validate_response_header(
                 header_name.ptr, header_name.len, header_value.ptr, header_value.len) !=
             HttpHeaderValidation::Ok)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, expr.args[0]->span, kReqHeaderMutationDetail);
-        auto value = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
-        if (!value) return core::make_unexpected(value.error());
         if (!route->exprs.push(value.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr out{};
@@ -9595,7 +9595,26 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
-    if (expr.name.eq(lit_str("constantTimeEqual")) &&
+    if (expr.name.eq(lit_str("bearerToken")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 1 || expr.args[0] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        auto source = analyze_builtin_arg(*expr.args[0]);
+        if (!source) return core::make_unexpected(source.error());
+        if (source->type != HirTypeKind::Str || source->may_nil || source->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        return make_json_op(json::Op::BearerToken,
+                            HirTypeKind::Str,
+                            true,
+                            &source.value(),
+                            nullptr,
+                            nullptr,
+                            expr.span,
+                            route);
+    }
+
+    if ((expr.name.eq({"constantTimeEqual", 17}) || expr.name.eq({"bearerMatches", 13}) ||
+         expr.name.eq({"basicMatches", 12})) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr Str kDetail = lit_str("constantTimeEqual expects two unwrapped str values");
         if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
@@ -9608,7 +9627,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             lhs->may_error || rhs->may_nil || rhs->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
         HirExpr out{};
-        out.kind = HirExprKind::ConstantTimeEqual;
+        out.kind = expr.name.eq({"bearerMatches", 13})  ? HirExprKind::BearerMatches
+                   : expr.name.eq({"basicMatches", 12}) ? HirExprKind::BasicMatches
+                                                        : HirExprKind::ConstantTimeEqual;
         out.type = HirTypeKind::Bool;
         out.span = expr.span;
         if (!route->exprs.push(lhs.value()))

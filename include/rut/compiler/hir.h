@@ -206,6 +206,8 @@ enum class HirExprKind : u8 {
     WidenI64,
     // `time.nowMicros()` — monotonic microseconds, type I64, nullary.
     TimeNowMicros,
+    BearerMatches,
+    BasicMatches,
     ConstantTimeEqual,
     Uuid,
     JsonOp,

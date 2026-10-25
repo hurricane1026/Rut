@@ -107,6 +107,8 @@ struct Ctx {
     // True while emitting a handler that reads the request (and therefore
     // primed the parse cache). Gates the parse-unprime calls at exits.
     bool cur_fn_needs_parse = false;
+    LLVMValueRef fn_bearer_matches;
+    LLVMValueRef fn_basic_matches;
     LLVMValueRef fn_str_constant_time_equal;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
@@ -521,6 +523,22 @@ struct Ctx {
                 LLVMAddFunction(llvm_mod, "rut_helper_str_constant_time_equal", ft);
         }
         return fn_str_constant_time_equal;
+    }
+    LLVMValueRef get_bearer_matches() {
+        if (!fn_bearer_matches) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 4, 0);
+            fn_bearer_matches = LLVMAddFunction(llvm_mod, "rut_helper_bearer_matches", ft);
+        }
+        return fn_bearer_matches;
+    }
+    LLVMValueRef get_basic_matches() {
+        if (!fn_basic_matches) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 4, 0);
+            fn_basic_matches = LLVMAddFunction(llvm_mod, "rut_helper_basic_matches", ft);
+        }
+        return fn_basic_matches;
     }
 
     // u8 rut_helper_str_has_prefix(ptr, i32, ptr, i32)
@@ -1289,6 +1307,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
 
         // ── String operations ──
+        case rir::Opcode::BearerMatches:
+        case rir::Opcode::BasicMatches:
         case rir::Opcode::StrConstantTimeEqual: {
             LLVMValueRef s = c.get_value(inst.operands[0]);
             LLVMValueRef rhs = c.get_value(inst.operands[1]);
@@ -1297,12 +1317,12 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef p_ptr = LLVMBuildExtractValue(c.builder, rhs, 0, "p.ptr");
             LLVMValueRef p_len = LLVMBuildExtractValue(c.builder, rhs, 1, "p.len");
             LLVMValueRef args[] = {s_ptr, s_len, p_ptr, p_len};
-            LLVMValueRef r = LLVMBuildCall2(c.builder,
-                                            LLVMGlobalGetValueType(c.get_str_constant_time_equal()),
-                                            c.get_str_constant_time_equal(),
-                                            args,
-                                            4,
-                                            "cte");
+            LLVMValueRef fn = inst.op == rir::Opcode::BearerMatches ? c.get_bearer_matches()
+                              : inst.op == rir::Opcode::BasicMatches
+                                  ? c.get_basic_matches()
+                                  : c.get_str_constant_time_equal();
+            LLVMValueRef r =
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 4, "cte");
             // Convert u8 result to i1 for branch usage
             LLVMValueRef b =
                 LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "cte.bool");
@@ -2412,6 +2432,8 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_time_now_micros = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;
+    c.fn_bearer_matches = nullptr;
+    c.fn_basic_matches = nullptr;
     c.fn_str_constant_time_equal = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;

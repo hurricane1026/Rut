@@ -1129,3 +1129,46 @@ headers; ordinary `req.header` keeps its first-field behavior for other fields.
 Authorization is always a singleton: both `req.authorization` and
 `req.header("Authorization")` return nil for duplicate Authorization fields.
 Request-header mutation does not change these original-request reads.
+
+## Static authentication helpers
+
+See [examples/authentication.rut](../examples/authentication.rut) and
+[examples/middleware/auth.rut](../examples/middleware/auth.rut). These are ordinary
+Rut functions returning `Identity { consumerId, credentialId, method }`:
+
+- `auth.apiKey(authorization, key, consumerId, credentialId)` verifies an opaque
+  Bearer key. Scheme spelling is case-insensitive and accepts 1*SP.
+- `auth.headerKey(req.uniqueHeader("X-API-Key").or(""), key, consumerId, credentialId)`
+  verifies a custom header key. Do not replace uniqueHeader with first-field reads.
+- `auth.basic(authorization, credentials, consumerId, credentialId)` takes configured
+  `user:password` bytes; password may contain colons or be explicitly empty.
+- `auth.rotatingApiKey(authorization, currentKey, previousKey, consumerId, currentId, previousId)`
+  supports two credential slots. Empty keys disable slots; both IDs must be nonempty.
+  Current wins if both keys match. Clear the old key and activate new configuration
+  to revoke it; the current CLI requires restart.
+
+Use `req.authorization.or("")` for authorization arguments. Invalid credentials
+return 401 with a Bearer, Basic (realm `rut`), or ApiKey challenge. Empty credentials,
+consumer/credential IDs, or two disabled rotation slots return 503. Other malformed
+configured credentials never authenticate. Identity comes from verified configuration,
+not client identity headers, and never includes a secret.
+
+`bearerMatches(authorization, key)` and `basicMatches(authorization, credentials)`
+accept two unwrapped strings and return bool. Bearer keys use RFC 6750 b64token
+syntax and are limited to 4096 bytes. Basic credentials require a nonempty user-id,
+a colon, no control bytes, and at most 1024 bytes. Encoding is byte-exact without
+normalization. Comparing canonical Base64 rejects malformed encoding, nonzero pad
+bits and missing/extra padding, without decoding attacker bytes. Encoded temporary
+credentials are cleansed; equal-length comparisons use the existing crypto primitive.
+Both operations allocate no memory and preserve no references.
+
+`bearerToken(authorization) -> str?` extracts a borrowed, validated Bearer token
+(up to 24 KiB) for the existing `jwtDecode`. Missing/malformed input returns nil;
+use guard-let or `.or("")`. Its lifetime is that of the input string. The builtin
+reuses the optional-string helper ABI and can compose with existing JSON/JWT calls.
+All three builtins can be shadowed by user functions. No keyword or library is added.
+
+The example resolves secrets with existing compile-time `env()`. Missing variables
+reject compilation, and compiled artifacts contain these constants. Serve credentials
+through TLS. Dynamic Consumer storage, live revocation, and automatic identity or
+credential forwarding are outside this static helper layer.
