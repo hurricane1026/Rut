@@ -66,6 +66,10 @@ inline Str header_value(const RateLimitKeyInput& in, const char* name, u32 name_
     // Skip the request line (up to and past the first CRLF).
     while (i + 1 < end && (p[i] != '\r' || p[i + 1] != '\n')) i++;
     i += 2;
+    // Authorization follows req.header's unique-header rule: duplicate fields
+    // are ambiguous and therefore map to the missing-value bucket.
+    const bool unique = ci_eq(name, name_len, "Authorization", 13);
+    Str first{nullptr, 0};
     while (i < end) {
         if (i + 1 < end && p[i] == '\r' && p[i + 1] == '\n') break;  // end of headers
         u32 line_start = i;
@@ -81,12 +85,14 @@ inline Str header_value(const RateLimitKeyInput& in, const char* name, u32 name_
                 while (vs < line_end && (p[vs] == ' ' || p[vs] == '\t')) vs++;
                 u32 ve = line_end;
                 while (ve > vs && (p[ve - 1] == ' ' || p[ve - 1] == '\t')) ve--;
-                return {p + vs, ve - vs};
+                if (!unique) return {p + vs, ve - vs};
+                if (first.ptr != nullptr) return {nullptr, 0};
+                first = {p + vs, ve - vs};
             }
         }
         i = line_end + 2;
     }
-    return {nullptr, 0};
+    return first;
 }
 
 // Find a query-string parameter value in the raw path ("...?k=v&k2=v2#frag").

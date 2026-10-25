@@ -173,6 +173,10 @@ inline u64 rate_limit_id_mix_u32(u64 hash, u32 value) {
     return rate_limit_id_mix(hash, &value, sizeof(value));
 }
 
+inline u8 rate_limit_header_name_lower(u8 c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<u8>(c + ('a' - 'A')) : c;
+}
+
 inline bool rate_limit_rule_identity_equal(const RateLimitRule& lhs, const RateLimitRule& rhs) {
     if (lhs.max != rhs.max || lhs.window_sec != rhs.window_sec || lhs.burst != rhs.burst ||
         lhs.scope != rhs.scope || lhs.emit_interval_us != rhs.emit_interval_us ||
@@ -182,8 +186,15 @@ inline bool rate_limit_rule_identity_equal(const RateLimitRule& lhs, const RateL
         const auto& a = lhs.key.comps[i];
         const auto& b = rhs.key.comps[i];
         if (a.kind != b.kind || a.name_len != b.name_len) return false;
-        for (u32 j = 0; j < a.name_len; j++)
-            if (a.name[j] != b.name[j]) return false;
+        for (u32 j = 0; j < a.name_len; j++) {
+            const u8 lhs = a.kind == RateLimitKeyKind::Header
+                               ? rate_limit_header_name_lower(static_cast<u8>(a.name[j]))
+                               : static_cast<u8>(a.name[j]);
+            const u8 rhs = b.kind == RateLimitKeyKind::Header
+                               ? rate_limit_header_name_lower(static_cast<u8>(b.name[j]))
+                               : static_cast<u8>(b.name[j]);
+            if (lhs != rhs) return false;
+        }
     }
     return true;
 }
@@ -215,7 +226,14 @@ inline u64 rate_limit_rule_id(u64 route_id, const RateLimitRule& rule, u32 dupli
         const u8 kind = static_cast<u8>(component.kind);
         hash = rate_limit_id_mix(hash, &kind, sizeof(kind));
         hash = rate_limit_id_mix(hash, &component.name_len, sizeof(component.name_len));
-        hash = rate_limit_id_mix(hash, component.name, component.name_len);
+        if (component.kind == RateLimitKeyKind::Header) {
+            for (u32 j = 0; j < component.name_len; j++) {
+                const u8 c = rate_limit_header_name_lower(static_cast<u8>(component.name[j]));
+                hash = rate_limit_id_mix(hash, &c, sizeof(c));
+            }
+        } else {
+            hash = rate_limit_id_mix(hash, component.name, component.name_len);
+        }
     }
     hash = rate_limit_id_mix_u32(hash, duplicate_rank);
     return hash == 0 ? 1 : hash;
