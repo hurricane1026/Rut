@@ -10,6 +10,7 @@
 #include "rut/runtime/auth.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/hash.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/uuid.h"
@@ -22,7 +23,6 @@
 #include <hs.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/sha.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -937,6 +937,48 @@ void rut_helper_cache_reset_local_state() {
     for (auto& shard : state->shards) shard.reset();
 }
 
+extern "C" void rut_helper_hash(void* conn,
+                                void* arena,
+                                u32 operation,
+                                const char* a,
+                                u32 a_len,
+                                const char* b,
+                                u32 b_len,
+                                u8* has_value,
+                                const char** out_ptr,
+                                u32* out_len) {
+    *has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    const bool kKeyed = (operation & kHashHmacFlag) != 0;
+    const u32 kAlgorithm = operation & ~kHashHmacFlag;
+    if (kAlgorithm > static_cast<u32>(HashAlgorithm::Sha512)) return;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (storage == nullptr && conn != nullptr)
+        storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    if (storage == nullptr || storage->backend.pool == nullptr) return;
+    char text[kMaxHashHexBytes];
+    u32 length = 0;
+    if (!hash_hex(static_cast<HashAlgorithm>(kAlgorithm),
+                  kKeyed ? Str{b, b_len} : Str{a, a_len},
+                  kKeyed ? Str{a, a_len} : Str{},
+                  kKeyed,
+                  text,
+                  length))
+        return;
+    if (storage->space_used() <= kHashRequestBudget - length &&
+        (storage->current != nullptr || storage->init(storage->backend.pool))) {
+        auto* result = static_cast<char*>(storage->alloc(length));
+        if (result != nullptr) {
+            __builtin_memcpy(result, text, length);
+            *out_ptr = result;
+            *out_len = length;
+            *has_value = 1;
+        }
+    }
+    OPENSSL_cleanse(text, sizeof(text));
+}
+
 extern "C" void rut_helper_uuid(
     void* conn, void* arena, u8* has_value, const char** out_ptr, u32* out_len) {
     *has_value = 0;
@@ -982,6 +1024,18 @@ u8 rut_helper_bearer_matches(const char* authorization,
                              const char* key,
                              u32 key_len) {
     return bearer_matches({authorization, authorization_len}, {key, key_len});
+}
+
+u8 rut_helper_hmac_sha256_matches(const char* message,
+                                  u32 message_len,
+                                  const char* key,
+                                  u32 key_len,
+                                  const char* signature,
+                                  u32 signature_len,
+                                  const char* prefix,
+                                  u32 prefix_len) {
+    return hmac_sha256_matches(
+        {message, message_len}, {key, key_len}, {signature, signature_len}, {prefix, prefix_len});
 }
 
 u8 rut_helper_basic_matches(const char* authorization,
@@ -1619,84 +1673,6 @@ bool b64url_decode(Str in, char* out, u32 cap, u32& out_len) {
     return true;
 }
 
-enum class JwtDigest : u8 { Sha256, Sha384, Sha512 };
-
-bool jwt_hmac(JwtDigest kind,
-              Str secret,
-              const unsigned char* message,
-              u32 message_len,
-              unsigned char* out,
-              u32& out_len) {
-    const u32 block_len = kind == JwtDigest::Sha256 ? 64u : 128u;
-    const u32 digest_len = kind == JwtDigest::Sha256 ? 32u : kind == JwtDigest::Sha384 ? 48u : 64u;
-    unsigned char key[128]{};
-    unsigned char ipad[128];
-    unsigned char opad[128];
-    unsigned char inner[64];
-    if (secret.len > block_len) {
-        if (kind == JwtDigest::Sha256) {
-            SHA256_CTX ctx;
-            SHA256_Init(&ctx);
-            SHA256_Update(&ctx, secret.ptr, secret.len);
-            SHA256_Final(key, &ctx);
-        } else {
-            SHA512_CTX ctx;
-            if (kind == JwtDigest::Sha384) {
-                SHA384_Init(&ctx);
-                SHA384_Update(&ctx, secret.ptr, secret.len);
-                SHA384_Final(key, &ctx);
-            } else {
-                SHA512_Init(&ctx);
-                SHA512_Update(&ctx, secret.ptr, secret.len);
-                SHA512_Final(key, &ctx);
-            }
-        }
-    } else {
-        for (u32 i = 0; i < secret.len; ++i) key[i] = static_cast<unsigned char>(secret.ptr[i]);
-    }
-    for (u32 i = 0; i < block_len; ++i) {
-        ipad[i] = key[i] ^ 0x36;
-        opad[i] = key[i] ^ 0x5c;
-    }
-    if (kind == JwtDigest::Sha256) {
-        SHA256_CTX ctx;
-        SHA256_Init(&ctx);
-        SHA256_Update(&ctx, ipad, block_len);
-        SHA256_Update(&ctx, message, message_len);
-        SHA256_Final(inner, &ctx);
-        SHA256_Init(&ctx);
-        SHA256_Update(&ctx, opad, block_len);
-        SHA256_Update(&ctx, inner, digest_len);
-        SHA256_Final(out, &ctx);
-    } else if (kind == JwtDigest::Sha384) {
-        SHA512_CTX ctx;
-        SHA384_Init(&ctx);
-        SHA384_Update(&ctx, ipad, block_len);
-        SHA384_Update(&ctx, message, message_len);
-        SHA384_Final(inner, &ctx);
-        SHA384_Init(&ctx);
-        SHA384_Update(&ctx, opad, block_len);
-        SHA384_Update(&ctx, inner, digest_len);
-        SHA384_Final(out, &ctx);
-    } else {
-        SHA512_CTX ctx;
-        SHA512_Init(&ctx);
-        SHA512_Update(&ctx, ipad, block_len);
-        SHA512_Update(&ctx, message, message_len);
-        SHA512_Final(inner, &ctx);
-        SHA512_Init(&ctx);
-        SHA512_Update(&ctx, opad, block_len);
-        SHA512_Update(&ctx, inner, digest_len);
-        SHA512_Final(out, &ctx);
-    }
-    out_len = digest_len;
-    OPENSSL_cleanse(key, sizeof(key));
-    OPENSSL_cleanse(ipad, sizeof(ipad));
-    OPENSSL_cleanse(opad, sizeof(opad));
-    OPENSSL_cleanse(inner, sizeof(inner));
-    return true;
-}
-
 // Verify an HS256/384/512 JWT and return its claims object. The payload bytes
 // are copied into payload_out so the caller can persist them after this
 // synchronous helper returns.
@@ -1729,7 +1705,7 @@ bool jwt_decode_claims(
     if (header_len > 1024) return false;
     if (!document.parse({header_bytes, header_len})) return false;
     if (document.nodes[0].kind != json::Kind::Object) return false;
-    JwtDigest digest_kind = JwtDigest::Sha256;
+    HashAlgorithm digest_kind = HashAlgorithm::Sha256;
     bool has_alg = false;
     char key_bytes[16];
     char value_bytes[16];
@@ -1756,19 +1732,19 @@ bool jwt_decode_claims(
         if (!document.string(node, value_writer) || !value_writer.ok) return false;
         const Str alg{value_bytes, value_writer.len};
         if (alg.eq(lit_str("HS256")))
-            digest_kind = JwtDigest::Sha256;
+            digest_kind = HashAlgorithm::Sha256;
         else if (alg.eq(lit_str("HS384")))
-            digest_kind = JwtDigest::Sha384;
+            digest_kind = HashAlgorithm::Sha384;
         else if (alg.eq(lit_str("HS512")))
-            digest_kind = JwtDigest::Sha512;
+            digest_kind = HashAlgorithm::Sha512;
         else
             return false;
         has_alg = true;
     }
     if (has_crit || !has_alg) return false;
-    const u32 min_secret_len = digest_kind == JwtDigest::Sha256   ? 32u
-                               : digest_kind == JwtDigest::Sha384 ? 48u
-                                                                  : 64u;
+    const u32 min_secret_len = digest_kind == HashAlgorithm::Sha256   ? 32u
+                               : digest_kind == HashAlgorithm::Sha384 ? 48u
+                                                                      : 64u;
     if (secret.len < min_secret_len) return false;
 
     char signature[EVP_MAX_MD_SIZE];
@@ -1781,12 +1757,13 @@ bool jwt_decode_claims(
     u32 expected_len = 0;
     if (secret.len > 0x7fffffffu || token.len > 0x7fffffffu) return false;
     const u32 signing_len = static_cast<u32>(second - token.ptr);
-    if (!jwt_hmac(digest_kind,
-                  secret,
-                  reinterpret_cast<const unsigned char*>(token.ptr),
-                  signing_len,
-                  expected,
-                  expected_len))
+    if (!hash_digest(digest_kind,
+                     {token.ptr, signing_len},
+                     secret,
+                     true,
+                     expected,
+                     sizeof(expected),
+                     expected_len))
         return false;
     if (signature_len != expected_len || CRYPTO_memcmp(signature, expected, expected_len) != 0)
         return false;

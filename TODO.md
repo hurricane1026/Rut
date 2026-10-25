@@ -631,6 +631,16 @@ canonical spelling for common gateway tasks.
 
 ### M4：身份、安全与企业访问（清单 3、4）
 
+- [x] 通用 MD5、SHA-1/224/256/384/512 及对应 HMAC：固定函数名选择算法，
+  返回 `str?` 小写 hex；输入有界、request arena 拥有结果；JWT/Webhook 共用底座。
+- [ ] Hash const-evaluation、SHA-3 等其他摘要族及独立编码/字符串提取能力。
+
+
+执行范围与逐项验收见 [auth 覆盖清单](docs/auth-coverage.md)。本分支延续 #901：
+- [x] 固定 HMAC-SHA256 原语、Rut 身份映射与双密钥轮换、GitHub 原始 body 验签。
+- [ ] Kong/APISIX HTTP HMAC 签名完整 profile、Standard Webhooks 及持久重放防护。
+
+
 - [ ] 先以 Rut 模块交付 API Key、Basic、HMAC、JWT/JWE、ACL、外部授权、Webhook 校验。
 - [ ] 补齐 OIDC/OAuth2 内省、会话、密钥/JWKS 轮转、上游 Token、CAS、SAML 与
   Keycloak/Casdoor/OPA/Casbin/Wolf 协议适配；区分认证、授权及身份提供方职责。

@@ -94,6 +94,86 @@ TEST(auth, bearer_token_is_a_bounded_borrowed_view) {
     CHECK(bearer_token(lit_str("Basic a.b.c")).ptr == nullptr);
 }
 
+TEST(auth, hmac_sha256_standard_vectors) {
+    // RFC 4231 cases 1, 2 and 6 (including a key longer than one SHA-256 block).
+    char key[131];
+    for (char& c : key) c = 0x0b;
+    CHECK(hmac_sha256_matches(
+        lit_str("Hi There"),
+        {key, 20},
+        lit_str("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")));
+    CHECK(hmac_sha256_matches(
+        lit_str("what do ya want for nothing?"),
+        lit_str("Jefe"),
+        lit_str("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")));
+    for (char& c : key) c = static_cast<char>(0xaa);
+    CHECK(hmac_sha256_matches(
+        lit_str("Test Using Larger Than Block-Size Key - Hash Key First"),
+        {key, sizeof(key)},
+        lit_str("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")));
+    // Published GitHub webhook validation vector.
+    CHECK(hmac_sha256_matches(
+        lit_str("Hello, World!"),
+        lit_str("It's a Secret to Everybody"),
+        lit_str("757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17")));
+}
+
+TEST(auth, hmac_sha256_rejects_tampering_and_noncanonical_signatures) {
+    const Str digest = lit_str("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    CHECK(!hmac_sha256_matches(lit_str("what do ya want for nothing!"), lit_str("Jefe"), digest));
+    CHECK(!hmac_sha256_matches(lit_str("what do ya want for nothing?"), lit_str("Jeff"), digest));
+    CHECK(!hmac_sha256_matches(
+        lit_str("what do ya want for nothing?"),
+        lit_str("Jefe"),
+        lit_str("5BDCC146BF60754E6A042426089575C75A003F089D2739839DEC58B964EC3843")));
+    CHECK(!hmac_sha256_matches(lit_str(""), lit_str(""), digest));
+    CHECK(!hmac_sha256_matches({nullptr, 1}, lit_str("Jefe"), digest));
+    CHECK(!hmac_sha256_matches(lit_str(""), {nullptr, 4}, digest));
+    CHECK(!hmac_sha256_matches(lit_str(""), lit_str("Jefe"), {nullptr, 64}));
+    CHECK(!hmac_sha256_matches(lit_str(""), lit_str("Jefe"), {digest.ptr, 63}));
+    CHECK(!hmac_sha256_matches(lit_str(""), lit_str("Jefe"), {digest.ptr, 65}));
+    // Invalid oversized spans are rejected before dereferencing their payloads.
+    CHECK(!hmac_sha256_matches({"x", kMaxHmacMessageBytes + 1}, lit_str("key"), digest));
+    CHECK(!hmac_sha256_matches(lit_str(""), {"x", kMaxHmacKeyBytes + 1}, digest));
+}
+
+TEST(auth, hmac_sha256_empty_message) {
+    CHECK(hmac_sha256_matches(
+        {"", 0},
+        {"\x6b\x65\x79", 3},
+        lit_str("5d5d139563c95b5967b9bd9a8c9b233a9dedb45072794cd232dc1b74832607d0")));
+}
+
+TEST(auth, hmac_sha256_binary_message) {
+    CHECK(hmac_sha256_matches(
+        {"\x61\x00\x62\xff", 4},
+        {"\x6b\x65\x79\x00\x73\x65\x63\x72\x65\x74", 10},
+        lit_str("25ae054ebc485b2958453378b3d060442cb69825e7836451673a73c22a9a191c")));
+}
+
+TEST(auth, hmac_sha256_accepts_exact_capacity_limits) {
+    static char message[kMaxHmacMessageBytes];
+    char key[kMaxHmacKeyBytes];
+    for (char& c : message) c = 'm';
+    for (char& c : key) c = 'k';
+    CHECK(hmac_sha256_matches(
+        {message, sizeof(message)},
+        {key, sizeof(key)},
+        lit_str("198353ab61ddf53adf464b03d9348b87971198036f5ce991ebe901ee1b23df18")));
+}
+
+TEST(auth, hmac_sha256_prefix_is_an_exact_trusted_marker) {
+    const Str signature =
+        lit_str("sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17");
+    const Str message = lit_str("Hello, World!");
+    const Str key = lit_str("It's a Secret to Everybody");
+    CHECK(hmac_sha256_matches(message, key, signature, lit_str("sha256=")));
+    CHECK(!hmac_sha256_matches(message, key, signature));
+    CHECK(!hmac_sha256_matches(message, key, signature, lit_str("SHA256=")));
+    CHECK(!hmac_sha256_matches(message, key, signature, {nullptr, 7}));
+    CHECK(!hmac_sha256_matches(message, key, signature, {"x", 65}));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

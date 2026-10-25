@@ -108,3 +108,35 @@ func denyConsumer(_ identity: Identity, _ deniedConsumerId: str) -> Identity {
     guard identity.consumerId != deniedConsumerId else { respond 403 }
     identity
 }
+
+// Fixed HMAC-SHA256 over the caller's EXACT signed bytes, canonical lowercase hex.
+// This is integrity/authentication only: replay policy belongs to the protocol.
+func hmac(_ message: str, _ signature: str, _ key: str,
+          _ consumerId: str, _ credentialId: str) -> Identity {
+    guard key != "" && consumerId != "" && credentialId != "" else { respond 503 }
+    guard hmacSha256Matches(message, key, signature) else { respond 401 }
+    Identity(consumerId: consumerId, credentialId: credentialId, method: "hmac")
+}
+
+// GitHub X-Hub-Signature-256 must be a UNIQUE header. Verify raw body before JSON
+// parsing or transformations. Never accept a bare digest or SHA-1 fallback.
+func githubWebhook(_ body: str, _ signature: str, _ key: str,
+                   _ consumerId: str, _ credentialId: str) -> Identity {
+    guard key != "" && consumerId != "" && credentialId != "" else { respond 503 }
+    guard hmacSha256Matches(body, key, signature, "sha256=") else { respond 401 }
+    Identity(consumerId: consumerId, credentialId: credentialId, method: "hmac")
+}
+
+// Both slots are evaluated. Current wins if configured secrets are identical.
+func rotatingHmac(_ message: str, _ signature: str, _ currentKey: str, _ previousKey: str,
+                  _ consumerId: str, _ currentId: str, _ previousId: str) -> Identity {
+    guard consumerId != "" && currentId != "" && previousId != "" else { respond 503 }
+    guard currentKey != "" || previousKey != "" else { respond 503 }
+    let current = hmacSha256Matches(message, currentKey, signature)
+    let previous = hmacSha256Matches(message, previousKey, signature)
+    guard current || previous else { respond 401 }
+    match current {
+        true => Identity(consumerId: consumerId, credentialId: currentId, method: "hmac")
+        _ => Identity(consumerId: consumerId, credentialId: previousId, method: "hmac")
+    }
+}

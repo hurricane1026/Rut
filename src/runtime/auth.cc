@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
+#include "rut/runtime/hash.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -84,6 +85,24 @@ bool basic_matches(Str authorization, Str credentials) {
         encoded, reinterpret_cast<const u8*>(credentials.ptr), static_cast<int>(credentials.len));
     const bool kMatches =
         kWritten == kExpectedLen && CRYPTO_memcmp(kToken.ptr, encoded, kExpectedLen) == 0;
+    OPENSSL_cleanse(encoded, sizeof(encoded));
+    return kMatches;
+}
+
+bool hmac_sha256_matches(Str message, Str key, Str signature, Str prefix) {
+    if ((message.ptr == nullptr && message.len != 0) || message.len > kMaxHmacMessageBytes ||
+        key.ptr == nullptr || key.len == 0 || key.len > kMaxHmacKeyBytes ||
+        signature.ptr == nullptr || prefix.len > 64 || (prefix.ptr == nullptr && prefix.len != 0) ||
+        signature.len != prefix.len + 64)
+        return false;
+    // Prefix is a public wire-format marker chosen by trusted policy.
+    for (u32 i = 0; i < prefix.len; ++i)
+        if (signature.ptr[i] != prefix.ptr[i]) return false;
+    char encoded[kMaxHashHexBytes];
+    u32 length = 0;
+    const bool kComputed = hash_hex(HashAlgorithm::Sha256, message, key, true, encoded, length);
+    const bool kMatches = kComputed && length == 64 &&
+                          CRYPTO_memcmp(encoded, signature.ptr + prefix.len, length) == 0;
     OPENSSL_cleanse(encoded, sizeof(encoded));
     return kMatches;
 }

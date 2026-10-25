@@ -237,6 +237,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BearerMatches:
             buf.put_cstr("auth.bearer_matches");
             break;
+        case Opcode::HmacSha256Matches:
+            buf.put_cstr("hash.hmac_sha256_matches");
+            break;
         case Opcode::BasicMatches:
             buf.put_cstr("auth.basic_matches");
             break;
@@ -317,6 +320,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
             break;
         case Opcode::JsonOp:
             buf.put_cstr("json.op");
+            break;
+        case Opcode::HashDigest:
+            buf.put_cstr("hash.digest");
             break;
         case Opcode::Uuid:
             buf.put_cstr("uuid");
@@ -711,6 +717,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             break;
+        case Opcode::HashDigest:
         case Opcode::JsonOp:
             buf.put(' ');
             buf.put_i64(inst.imm.i32_val);
@@ -757,6 +764,12 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_i64(static_cast<i64>(inst.imm.i32_val));
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::HmacSha256Matches:
+            for (u32 i = 0; i < 4; ++i) {
+                buf.put_cstr(i == 0 ? " " : ", ");
+                print_value_ref(buf, inst.operand(i));
+            }
             break;
         case Opcode::BearerMatches:
         case Opcode::BasicMatches:

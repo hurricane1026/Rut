@@ -133,6 +133,16 @@ void rut_helper_parse_unprime();
 
 // UUID v4 from the OS CSPRNG. Outputs nil on entropy, context, or capacity failure.
 // Storage shares the existing request-owned JSON arena/budget; no view is retained.
+void rut_helper_hash(void* conn,
+                     void* arena,
+                     rut::u32 operation,
+                     const char* a,
+                     rut::u32 a_len,
+                     const char* b,
+                     rut::u32 b_len,
+                     rut::u8* has_value,
+                     const char** out_ptr,
+                     rut::u32* out_len);
 void rut_helper_uuid(
     void* conn, void* arena, rut::u8* has_value, const char** out_ptr, rut::u32* out_len);
 
@@ -147,6 +157,14 @@ rut::u8 rut_helper_bearer_matches(const char* authorization,
                                   rut::u32 authorization_len,
                                   const char* key,
                                   rut::u32 key_len);
+rut::u8 rut_helper_hmac_sha256_matches(const char* message,
+                                       rut::u32 message_len,
+                                       const char* key,
+                                       rut::u32 key_len,
+                                       const char* signature,
+                                       rut::u32 signature_len,
+                                       const char* prefix,
+                                       rut::u32 prefix_len);
 rut::u8 rut_helper_basic_matches(const char* authorization,
                                  rut::u32 authorization_len,
                                  const char* credentials,

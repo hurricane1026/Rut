@@ -23,4 +23,11 @@ bool bearer_matches(Str authorization, Str key);
 bool basic_credentials_valid(Str credentials);
 bool basic_matches(Str authorization, Str credentials);
 
+// Fixed SHA-256, exact message bytes and canonical lowercase hexadecimal digest.
+// An optional exact public prefix is limited to 64 bytes (empty by default).
+// Empty messages are valid; empty keys and oversized inputs fail closed.
+inline constexpr u32 kMaxHmacMessageBytes = 1024 * 1024;
+inline constexpr u32 kMaxHmacKeyBytes = 4096;
+bool hmac_sha256_matches(Str message, Str key, Str signature, Str prefix = {});
+
 }  // namespace rut

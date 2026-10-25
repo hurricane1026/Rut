@@ -109,6 +109,7 @@ struct Ctx {
     bool cur_fn_needs_parse = false;
     LLVMValueRef fn_bearer_matches;
     LLVMValueRef fn_basic_matches;
+    LLVMValueRef fn_hmac_sha256_matches;
     LLVMValueRef fn_str_constant_time_equal;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
@@ -531,6 +532,15 @@ struct Ctx {
             fn_bearer_matches = LLVMAddFunction(llvm_mod, "rut_helper_bearer_matches", ft);
         }
         return fn_bearer_matches;
+    }
+    LLVMValueRef get_hmac_sha256_matches() {
+        if (!fn_hmac_sha256_matches) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 8, 0);
+            fn_hmac_sha256_matches =
+                LLVMAddFunction(llvm_mod, "rut_helper_hmac_sha256_matches", ft);
+        }
+        return fn_hmac_sha256_matches;
     }
     LLVMValueRef get_basic_matches() {
         if (!fn_basic_matches) {
@@ -1306,6 +1316,24 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        case rir::Opcode::HmacSha256Matches: {
+            LLVMValueRef args[8];
+            for (u32 i = 0; i < 4; ++i) {
+                LLVMValueRef value = c.get_value(inst.operand(i));
+                args[static_cast<size_t>(i) * 2] =
+                    LLVMBuildExtractValue(c.builder, value, 0, "hmac.ptr");
+                args[static_cast<size_t>(i) * 2 + 1] =
+                    LLVMBuildExtractValue(c.builder, value, 1, "hmac.len");
+            }
+            LLVMValueRef fn = c.get_hmac_sha256_matches();
+            LLVMValueRef result =
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 8, "hmac");
+            c.set_value(
+                inst.result,
+                LLVMBuildICmp(
+                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "hmac.bool"));
+            break;
+        }
         // ── String operations ──
         case rir::Opcode::BearerMatches:
         case rir::Opcode::BasicMatches:
@@ -1599,6 +1627,66 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                     opt = LLVMBuildInsertValue(c.builder, opt, result, 1, "");
                 result = opt;
             }
+            c.set_value(inst.result, result);
+            break;
+        }
+        case rir::Opcode::HashDigest: {
+            LLVMTypeRef params[] = {c.ptr_ty,
+                                    c.ptr_ty,
+                                    c.i32_ty,
+                                    c.ptr_ty,
+                                    c.i32_ty,
+                                    c.ptr_ty,
+                                    c.i32_ty,
+                                    c.ptr_ty,
+                                    c.ptr_ty,
+                                    c.ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(c.void_ty, params, 10, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_hash");
+            if (!fn) fn = LLVMAddFunction(c.llvm_mod, "rut_helper_hash", ft);
+            LLVMValueRef has = LLVMBuildAlloca(c.builder, c.i8_ty, "hash.has");
+            LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "hash.ptr");
+            LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "hash.len");
+            LLVMValueRef input[4] = {LLVMConstNull(c.ptr_ty),
+                                     LLVMConstInt(c.i32_ty, 0, 0),
+                                     LLVMConstNull(c.ptr_ty),
+                                     LLVMConstInt(c.i32_ty, 0, 0)};
+            for (u32 i = 0; i < inst.operand_count; ++i) {
+                LLVMValueRef value = c.get_value(inst.operand(i));
+                const u32 kOffset = 2 * i;
+                input[kOffset] = LLVMBuildExtractValue(c.builder, value, 0, "hash.input.ptr");
+                input[kOffset + 1] = LLVMBuildExtractValue(c.builder, value, 1, "hash.input.len");
+            }
+            LLVMValueRef args[] = {c.param_conn,
+                                   c.param_arena,
+                                   LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0),
+                                   input[0],
+                                   input[1],
+                                   input[2],
+                                   input[3],
+                                   has,
+                                   ptr,
+                                   len};
+            LLVMBuildCall2(c.builder, ft, fn, args, 10, "");
+            LLVMValueRef result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+            result =
+                LLVMBuildInsertValue(c.builder,
+                                     result,
+                                     LLVMBuildLoad2(c.builder, c.i8_ty, has, "hash.result.has"),
+                                     0,
+                                     "");
+            result =
+                LLVMBuildInsertValue(c.builder,
+                                     result,
+                                     LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "hash.result.ptr"),
+                                     1,
+                                     "");
+            result =
+                LLVMBuildInsertValue(c.builder,
+                                     result,
+                                     LLVMBuildLoad2(c.builder, c.i32_ty, len, "hash.result.len"),
+                                     2,
+                                     "");
             c.set_value(inst.result, result);
             break;
         }
@@ -2437,6 +2525,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_parse_unprime = nullptr;
     c.fn_bearer_matches = nullptr;
     c.fn_basic_matches = nullptr;
+    c.fn_hmac_sha256_matches = nullptr;
     c.fn_str_constant_time_equal = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
