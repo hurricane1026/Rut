@@ -1818,14 +1818,17 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
-    if (op > static_cast<u32>(json::Op::JwtClaimsValid)) return;
+    if (op > static_cast<u32>(json::Op::JwtHasScope)) return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
     json::Writer writer{bytes};
     Str view{};
     i64 scalar = 0;
     const auto operation = static_cast<json::Op>(op);
-    if (operation == json::Op::JwtClaimsValid) {
+    if (operation == json::Op::JwtHasScope) {
+        scalar = jwt_has_scope(document, {a, a_len}, {b, b_len}) ? 1 : 0;
+        view = {"", 0};
+    } else if (operation == json::Op::JwtClaimsValid) {
         struct timespec now{};
         if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
             now.tv_nsec >= 1000000000)

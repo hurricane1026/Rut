@@ -74,4 +74,35 @@ bool jwt_claims_valid(
            (date(document, kIssuedAt, issued_at) && issued_at <= unix_seconds);
 }
 
+bool jwt_has_scope(json::Document& document, Str claims, Str required) {
+    const auto kTokenByte = [](unsigned char c) {
+        return c == 0x21 || (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x7e);
+    };
+    if (required.ptr == nullptr || required.len == 0 || required.len > json::kMaxBytes)
+        return false;
+    for (u32 i = 0; i < required.len; ++i)
+        if (!kTokenByte(static_cast<unsigned char>(required.ptr[i]))) return false;
+    if (claims.ptr == nullptr || !document.parse(claims) ||
+        document.nodes[0].kind != json::Kind::Object)
+        return false;
+    const u32 kScope = member(document, lit_str("scope"));
+    if (kScope == json::kNone) return false;
+    json::Writer decoded{document.scratch};
+    if (!document.string(kScope, decoded) || decoded.len == 0) return false;
+    // Validate the whole list even after a match: a malformed suffix cannot
+    // turn a malformed permission document into an authorization success.
+    bool found = false;
+    u32 start = 0;
+    for (u32 i = 0; i <= decoded.len; ++i) {
+        if (i == decoded.len || document.scratch[i] == ' ') {
+            if (i == start) return false;
+            found |= Str{document.scratch + start, i - start}.eq(required);
+            start = i + 1;
+        } else if (!kTokenByte(static_cast<unsigned char>(document.scratch[i]))) {
+            return false;
+        }
+    }
+    return found;
+}
+
 }  // namespace rut

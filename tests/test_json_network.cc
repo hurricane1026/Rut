@@ -942,6 +942,8 @@ import "middleware/auth.rut"
 route GET "/identity" {
     let document = auth.jwtDocument(req.authorization.or(""), "01234567890123456789012345678901")
     let identity = auth.jwtIdentity(document, "issuer", "gateway", "issuer-key")
+    guard jwtHasScope(document, "orders:read") else { return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""}) }
+    guard req.path != "/all" || jwtHasScope(document, "orders:write") else { return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""}) }
     let userId = identity.consumerId
     return response(200, body: userId)
 }
@@ -985,10 +987,12 @@ route GET "/identity" {
     struct Case {
         const char* claims;
         u16 status;
+        const char* path = "/identity";
     };
     const Case cases[] = {
-        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001})", 200},
-        {R"({"sub":"alice","iss":"issuer","aud":["other","gateway"],"exp":1001,"nbf":1000})", 200},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"scope":"orders:read"})", 200},
+        {R"({"sub":"alice","iss":"issuer","aud":["other","gateway"],"exp":1001,"nbf":1000,"scope":"profile orders:read"})",
+         200},
         {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1000})", 401},
         {R"({"sub":"alice","iss":"other","aud":"gateway","exp":1001})", 401},
         {R"({"sub":"alice","iss":"issuer","aud":"other","exp":1001})", 401},
@@ -996,12 +1000,26 @@ route GET "/identity" {
         {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"iat":1001})", 401},
         {R"({"sub":"","iss":"issuer","aud":"gateway","exp":1001})", 401},
         {R"({"sub":"alice","iss":"issuer","aud":"gateway"})", 401},
-        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001})", 200},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"scope":"orders:read"})", 200},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001})", 403},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"scope":"orders:reader"})",
+         403},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"scope":["orders:read"]})",
+         403},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"scope":"orders:read "})",
+         403},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1000,"scope":"orders:read"})", 401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"scope":"orders:read orders:write"})",
+         200,
+         "/all"},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"scope":"orders:read"})",
+         403,
+         "/all"},
     };
     for (const auto& tc : cases) {
-        const std::string request =
-            "GET /identity HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer " + sign(tc.claims) +
-            "\r\n\r\n";
+        const std::string request = std::string("GET ") + tc.path +
+                                    " HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer " +
+                                    sign(tc.claims) + "\r\n\r\n";
         // Match the production request boundary before reusing this connection.
         release_completed_jit_json(*conn);
         conn->recv_buf.reset();
@@ -1021,6 +1039,11 @@ route GET "/identity" {
             CHECK(conn->jit_response_body.eq(lit_str("alice")));
         else
             CHECK(!conn->jit_response_body_valid);
+        handle_jit_outcome(loop.get(), *conn, outcome, program.handler(), true);
+        const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+        if (tc.status == 403)
+            CHECK(wire.find("Bearer error=\"insufficient_scope\"") != std::string::npos);
     }
     loop->free_conn(*conn);
     pool.destroy();

@@ -9595,6 +9595,30 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    if (expr.name.eq(lit_str("jwtHasScope")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        HirExpr values[2]{};
+        for (u32 i = 0; i < 2; ++i) {
+            auto value = analyze_builtin_arg(*expr.args[i]);
+            if (!value) return core::make_unexpected(value.error());
+            const auto expected = i == 0 ? HirTypeKind::Json : HirTypeKind::Str;
+            if (value->type != expected || value->may_nil || value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, expr.name);
+            values[i] = value.value();
+        }
+        return make_json_op(json::Op::JwtHasScope,
+                            HirTypeKind::Bool,
+                            false,
+                            &values[0],
+                            &values[1],
+                            nullptr,
+                            expr.span,
+                            route);
+    }
+
     if (expr.name.eq(lit_str("jwtClaimsValid")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 3 || expr.args[0] == nullptr || expr.args[1] == nullptr ||
@@ -10553,11 +10577,19 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
             if (!body) return core::make_unexpected(body.error());
             term.response_body = body.value();
         }
-        // Carry response headers verbatim (parser already rejected
-        // explicit empty dicts and duplicate keys).
+        // Literal headers use the same decoded strings as expression values.
+        // Validate again after decoding so escaped control bytes cannot inject
+        // fields even when the raw source bytes passed parser validation.
         for (u32 i = 0; i < stmt.response_headers.len; i++) {
             const auto& p = stmt.response_headers[i];
-            if (!term.response_headers.push({p.key, p.value}))
+            auto value = decoded_expression_string(p.value, mod, stmt.span);
+            if (!value) return core::make_unexpected(value.error());
+            if (validate_response_header(p.key.ptr, p.key.len, value->ptr, value->len) !=
+                HttpHeaderValidation::Ok)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      stmt.span,
+                                      lit_str("invalid response header value"));
+            if (!term.response_headers.push({p.key, value.value()}))
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
         }
         return term;
