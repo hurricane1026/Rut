@@ -2009,6 +2009,7 @@ TEST(rate_limit_dsl, e2e_429_over_limit) {
     REQUIRE(register_jit_routes(cfg, rir.module, engine));
     REQUIRE_EQ(cfg.routes[0].rate_limit.count, 1u);
     CHECK_EQ(cfg.routes[0].rate_limit.rules[0].max, 3u);
+    CHECK_NE(cfg.routes[0].rate_limit_ids[0], 0u);
     const RouteConfig* active = &cfg;
 
     {

@@ -89,7 +89,7 @@ TEST(shard_control, control_block_init_zero) {
 
 TEST(shard_control, control_block_config_write_read) {
     ShardControlBlock cb{};
-    RouteConfig cfg;
+    RouteConfig cfg{};
     cfg.route_count = 42;
 
     cb.pending_config.store(&cfg, std::memory_order_release);
@@ -155,7 +155,7 @@ TEST_F(RealLoopF, poll_command_reload) {
     REQUIRE(self.ok);
     const RouteConfig* active_config = nullptr;
     ShardControlBlock cb{};
-    RouteConfig cfg;
+    RouteConfig cfg{};
     cfg.route_count = 7;
 
     self.loop->config_ptr = &active_config;
@@ -166,6 +166,195 @@ TEST_F(RealLoopF, poll_command_reload) {
     CHECK(active_config == &cfg);
     CHECK_EQ(active_config->route_count, 7u);
     CHECK(cb.pending_config == nullptr);
+}
+
+TEST_F(RealLoopF, poll_command_rate_limit_adopts_semantic_ids) {
+    REQUIRE(self.ok);
+    RouteConfig initial{};
+    REQUIRE(initial.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(initial.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(initial.add_route_rate_limit_rule(0, 1, 60, RateLimitScope::Global));
+
+    RouteConfig reordered{};
+    REQUIRE(reordered.add_static("/other", kRouteMethodGet, 204));
+    REQUIRE(reordered.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(reordered.add_route_rate_limit_rule(1, 1, 60, RateLimitScope::Global));
+    REQUIRE(reordered.add_route_rate_limit_rule(1, 1, 60));
+    CHECK_EQ(reordered.routes[1].rate_limit_ids[0], initial.routes[0].rate_limit_ids[1]);
+    CHECK_EQ(reordered.routes[1].rate_limit_ids[1], initial.routes[0].rate_limit_ids[0]);
+
+    const RouteConfig* active_config = &initial;
+    ShardControlBlock cb{};
+    GlobalRateLimiter global{};
+    global.reset();
+    self.loop->config_ptr = &active_config;
+    self.loop->control = &cb;
+    self.loop->global_rl = &global;
+
+    RateLimitKeyInput input{};
+    CHECK(!rate_limit_exceeded(
+        self.loop, initial.routes[0].rate_limit, initial.routes[0].rate_limit_ids, input, 1000));
+
+    cb.pending_config.store(&reordered, std::memory_order_release);
+    self.loop->poll_command();
+    CHECK(active_config == &reordered);
+    CHECK(rate_limit_exceeded(self.loop,
+                              reordered.routes[1].rate_limit,
+                              reordered.routes[1].rate_limit_ids,
+                              input,
+                              1000));
+}
+
+TEST_F(RealLoopF, poll_command_shard_rate_limit_preserves_history) {
+    REQUIRE(self.ok);
+    RouteConfig initial{};
+    REQUIRE(initial.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(initial.add_route_rate_limit_rule(0, 1, 60));
+    RouteConfig reordered{};
+    REQUIRE(reordered.add_static("/other", kRouteMethodGet, 204));
+    REQUIRE(reordered.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(reordered.add_route_rate_limit_rule(1, 1, 60));
+    CHECK_EQ(reordered.routes[1].rate_limit_ids[0], initial.routes[0].rate_limit_ids[0]);
+
+    const RouteConfig* active_config = &initial;
+    ShardControlBlock cb{};
+    self.loop->config_ptr = &active_config;
+    self.loop->control = &cb;
+    RateLimitKeyInput input{};
+    CHECK(!rate_limit_exceeded(
+        self.loop, initial.routes[0].rate_limit, initial.routes[0].rate_limit_ids, input, 1000));
+    cb.pending_config.store(&reordered, std::memory_order_release);
+    self.loop->poll_command();
+    CHECK(active_config == &reordered);
+    CHECK(rate_limit_exceeded(self.loop,
+                              reordered.routes[1].rate_limit,
+                              reordered.routes[1].rate_limit_ids,
+                              input,
+                              1000));
+}
+
+TEST_F(RealLoopF, poll_command_global_rate_limit_preserves_history) {
+    REQUIRE(self.ok);
+    RouteConfig initial{};
+    REQUIRE(initial.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(initial.add_route_rate_limit_rule(0, 1, 60, RateLimitScope::Global));
+    RouteConfig reordered{};
+    REQUIRE(reordered.add_static("/other", kRouteMethodGet, 204));
+    REQUIRE(reordered.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(reordered.add_route_rate_limit_rule(1, 1, 60, RateLimitScope::Global));
+    CHECK_EQ(reordered.routes[1].rate_limit_ids[0], initial.routes[0].rate_limit_ids[0]);
+
+    const RouteConfig* active_config = &initial;
+    ShardControlBlock cb{};
+    GlobalRateLimiter global{};
+    global.reset();
+    self.loop->config_ptr = &active_config;
+    self.loop->control = &cb;
+    self.loop->global_rl = &global;
+    RateLimitKeyInput input{};
+    CHECK(!rate_limit_exceeded(
+        self.loop, initial.routes[0].rate_limit, initial.routes[0].rate_limit_ids, input, 1000));
+    cb.pending_config.store(&reordered, std::memory_order_release);
+    self.loop->poll_command();
+    CHECK(active_config == &reordered);
+    CHECK(rate_limit_exceeded(self.loop,
+                              reordered.routes[1].rate_limit,
+                              reordered.routes[1].rate_limit_ids,
+                              input,
+                              1000));
+}
+
+TEST(shard_control, rate_limit_ids_follow_route_and_policy_semantics) {
+    static RouteConfig original{};
+    REQUIRE(original.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(original.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(original.add_route_rate_limit_rule(0, 2, 60, RateLimitScope::Global));
+    const u64 shard_id = original.routes[0].rate_limit_ids[0];
+    const u64 global_id = original.routes[0].rate_limit_ids[1];
+
+    static RouteConfig reordered{};
+    REQUIRE(reordered.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(reordered.add_route_rate_limit_rule(0, 2, 60, RateLimitScope::Global));
+    REQUIRE(reordered.add_route_rate_limit_rule(0, 1, 60));
+    CHECK_EQ(reordered.routes[0].rate_limit_ids[0], global_id);
+    CHECK_EQ(reordered.routes[0].rate_limit_ids[1], shard_id);
+
+    static RouteConfig shifted{};
+    REQUIRE(shifted.add_static("/other", kRouteMethodGet, 204));
+    REQUIRE(shifted.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(shifted.add_route_rate_limit_rule(1, 1, 60));
+    REQUIRE(shifted.add_route_rate_limit_rule(1, 2, 60, RateLimitScope::Global));
+    CHECK_EQ(shifted.routes[1].rate_limit_ids[0], shard_id);
+    CHECK_EQ(shifted.routes[1].rate_limit_ids[1], global_id);
+
+    static RouteConfig changed{};
+    REQUIRE(changed.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(changed.add_route_rate_limit_rule(0, 3, 60));
+    CHECK_NE(changed.routes[0].rate_limit_ids[0], shard_id);
+
+    static RouteConfig keyed{};
+    REQUIRE(keyed.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(keyed.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(keyed.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-Key", 5));
+    CHECK_NE(keyed.routes[0].rate_limit_ids[0], shard_id);
+
+    static RouteConfig changed_path{};
+    REQUIRE(changed_path.add_static("/other", kRouteMethodGet, 204));
+    REQUIRE(changed_path.add_route_rate_limit_rule(0, 1, 60));
+    CHECK_NE(changed_path.routes[0].rate_limit_ids[0], shard_id);
+
+    static RouteConfig changed_key_kind{};
+    REQUIRE(changed_key_kind.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(changed_key_kind.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(changed_key_kind.add_route_rate_limit_key(0, RateLimitKeyKind::Query, "X-Key", 5));
+    CHECK_NE(changed_key_kind.routes[0].rate_limit_ids[0], keyed.routes[0].rate_limit_ids[0]);
+
+    static RouteConfig changed_key_name{};
+    REQUIRE(changed_key_name.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(changed_key_name.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(changed_key_name.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "Y-Key", 5));
+    CHECK_NE(changed_key_name.routes[0].rate_limit_ids[0], keyed.routes[0].rate_limit_ids[0]);
+
+    RateLimiter shard{};
+    GlobalRateLimiter global{};
+    global.reset();
+    RateLimitKeyInput input{};
+    CHECK(!rate_limit_exceeded_with_limiters(shard,
+                                             &global,
+                                             original.routes[0].rate_limit,
+                                             original.routes[0].rate_limit_ids,
+                                             input,
+                                             1000));
+    CHECK(rate_limit_exceeded_with_limiters(shard,
+                                            &global,
+                                            reordered.routes[0].rate_limit,
+                                            reordered.routes[0].rate_limit_ids,
+                                            input,
+                                            1000));
+    // A changed policy uses a fresh shard namespace and does not inherit the
+    // prior route's shard bucket, while the global table remains shared.
+    CHECK(!rate_limit_exceeded_with_limiters(shard,
+                                             &global,
+                                             changed.routes[0].rate_limit,
+                                             changed.routes[0].rate_limit_ids,
+                                             input,
+                                             1000));
+
+    static RouteConfig duplicates{};
+    REQUIRE(duplicates.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(duplicates.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(duplicates.add_route_rate_limit_rule(0, 1, 60));
+    CHECK_NE(duplicates.routes[0].rate_limit_ids[0], duplicates.routes[0].rate_limit_ids[1]);
+
+    static RouteConfig duplicates_with_unrelated{};
+    REQUIRE(duplicates_with_unrelated.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(duplicates_with_unrelated.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(duplicates_with_unrelated.add_route_rate_limit_rule(0, 2, 60));
+    REQUIRE(duplicates_with_unrelated.add_route_rate_limit_rule(0, 1, 60));
+    CHECK_EQ(duplicates_with_unrelated.routes[0].rate_limit_ids[0],
+             duplicates.routes[0].rate_limit_ids[0]);
+    CHECK_EQ(duplicates_with_unrelated.routes[0].rate_limit_ids[2],
+             duplicates.routes[0].rate_limit_ids[1]);
 }
 
 TEST_F(RealLoopF, poll_command_swap_jit) {
@@ -204,7 +393,7 @@ TEST_F(RealLoopF, poll_command_simultaneous_config_and_jit) {
     self.loop->jit_code_ptr = &jit_code;
     self.loop->control = &cb;
 
-    RouteConfig cfg;
+    RouteConfig cfg{};
     cfg.route_count = 55;
     u8 fake_jit = 0x90;
 
@@ -327,6 +516,54 @@ TEST(shard_control, publish_refuses_hand_built_invalid_forward_policies) {
 
     CHECK(shard.reload_config(&cfg, /*shard_count=*/1));
     CHECK(shard.active_config == &cfg);
+}
+
+TEST(shard_control, publish_refuses_stale_or_malformed_rate_limit_ids) {
+    static RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(cfg.add_route_rate_limit_rule(0, 1, 60));
+
+    cfg.routes[0].rate_limit.rules[0].max = 2;
+    CHECK_FALSE(cfg.rate_limit_ids_valid());
+    Shard<RealLoop> shard{};
+    CHECK_FALSE(shard.reload_config(&cfg, /*shard_count=*/1));
+    CHECK(shard.active_config == nullptr);
+
+    cfg.routes[0].rate_limit.rules[0].max = 1;
+    CHECK(cfg.refresh_route_rate_limit_ids(0));
+    cfg.routes[0].rate_limit.count = kMaxRateLimitRules + 1;
+    CHECK_FALSE(cfg.rate_limit_ids_valid());
+    cfg.routes[0].rate_limit.count = 1;
+    cfg.routes[0].rate_limit.rules[0].key.count = kMaxRateLimitKeyComponents + 1;
+    CHECK_FALSE(cfg.rate_limit_ids_valid());
+    cfg.routes[0].rate_limit.rules[0].key.count = 1;
+    cfg.routes[0].rate_limit.rules[0].key.comps[0].kind = RateLimitKeyKind::Header;
+    cfg.routes[0].rate_limit.rules[0].key.comps[0].name_len = RateLimitKeyComponent::kMaxName + 1;
+    CHECK_FALSE(cfg.rate_limit_ids_valid());
+    cfg.routes[0].rate_limit.rules[0].key.comps[0].name_len = 0;
+    cfg.routes[0].rate_limit.rules[0].key.comps[0].kind = static_cast<RateLimitKeyKind>(255);
+    CHECK_FALSE(cfg.rate_limit_ids_valid());
+    cfg.routes[0].rate_limit.rules[0].key.comps[0].kind = RateLimitKeyKind::Ip;
+    cfg.routes[0].rate_limit.rules[0].key.comps[0].name_len = 1;
+    CHECK_FALSE(cfg.rate_limit_ids_valid());
+    cfg.routes[0].rate_limit.rules[0].key.comps[0].name_len = 0;
+    cfg.routes[0].rate_limit.rules[0].scope = static_cast<RateLimitScope>(255);
+    CHECK_FALSE(cfg.rate_limit_ids_valid());
+
+    static RouteConfig stale_spawn{};
+    REQUIRE(stale_spawn.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(stale_spawn.add_route_rate_limit_rule(0, 1, 60));
+    stale_spawn.routes[0].rate_limit.rules[0].window_sec = 61;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    const i32 lfd = lfd_result.value();
+    Shard<RealLoop> spawn_shard;
+    REQUIRE(spawn_shard.init(0, lfd).has_value());
+    spawn_shard.route_config = &stale_spawn;
+    CHECK_FALSE(spawn_shard.spawn().has_value());
+    CHECK(spawn_shard.active_config == nullptr);
+    spawn_shard.shutdown();
+    close(lfd);
 }
 
 // spawn() validates its seed config before installing it: a rejected startup
@@ -507,7 +744,7 @@ TEST(shard_control, config_ptr_readable_in_loop) {
     SmallLoop loop;
     loop.setup();
 
-    RouteConfig cfg;
+    RouteConfig cfg{};
     cfg.route_count = 77;
     const RouteConfig* active = &cfg;
     loop.config_ptr = &active;
@@ -522,9 +759,9 @@ TEST(shard_control, reload_config_updates_ptr) {
     SmallLoop loop;
     loop.setup();
 
-    RouteConfig cfg1;
+    RouteConfig cfg1{};
     cfg1.route_count = 10;
-    RouteConfig cfg2;
+    RouteConfig cfg2{};
     cfg2.route_count = 20;
 
     const RouteConfig* active = &cfg1;
@@ -551,7 +788,7 @@ TEST(shard_control, sequential_commands) {
     SmallLoop loop;
     loop.setup();
 
-    RouteConfig cfg;
+    RouteConfig cfg{};
     cfg.route_count = 42;
     const RouteConfig* active = nullptr;
     void* jit_code = nullptr;
@@ -688,7 +925,7 @@ TEST_F(RealLoopF, poll_command_without_config_ptr) {
     self.loop->control = &cb;
     self.loop->config_ptr = nullptr;
 
-    RouteConfig cfg;
+    RouteConfig cfg{};
     cfg.route_count = 50;
     cb.pending_config.store(&cfg, std::memory_order_release);
 
@@ -713,7 +950,7 @@ TEST_F(RealLoopF, poll_command_without_jit_ptr) {
 
 TEST_F(ShardF, reload_before_spawn_applies_directly) {
     REQUIRE(self.ok);
-    RouteConfig cfg;
+    RouteConfig cfg{};
     self.shard.reload_config_unchecked(&cfg);
     CHECK_EQ(self.shard.active_config, &cfg);
 }
@@ -738,7 +975,7 @@ TEST(shard_control, reload_after_stop_applies_directly) {
     s.stop();
     s.join();
 
-    RouteConfig cfg;
+    RouteConfig cfg{};
     s.reload_config_unchecked(&cfg);  // must not hang
     CHECK_EQ(s.active_config, &cfg);
 
@@ -760,7 +997,7 @@ TEST(shard_control, spawn_seeds_active_config_from_route_config) {
     REQUIRE(rc.has_value());
 
     // route_config set AFTER init, BEFORE spawn (standard pattern).
-    RouteConfig cfg;
+    RouteConfig cfg{};
     cfg.route_count = 42;
     s.route_config = &cfg;
 
@@ -794,7 +1031,7 @@ TEST(shard_control, reload_after_stop_before_join) {
     struct timespec ts = {0, 100000000L};  // 100ms
     nanosleep(&ts, nullptr);
 
-    RouteConfig new_cfg;
+    RouteConfig new_cfg{};
     new_cfg.route_count = 99;
     s.reload_config_unchecked(&new_cfg);  // must not deadlock
 
@@ -820,13 +1057,13 @@ TEST(shard_control, join_clears_stale_pending_without_overwrite) {
     REQUIRE(s.init(0, lfd).has_value());
     REQUIRE(s.spawn(false).has_value());
 
-    RouteConfig old_cfg;
+    RouteConfig old_cfg{};
     old_cfg.route_count = 77;
     s.reload_config_unchecked(&old_cfg);  // queue via control block (thread_spawned=true)
     s.stop();
 
     // thread_spawned is still true, so this overwrites old_cfg in pending_config.
-    RouteConfig new_cfg;
+    RouteConfig new_cfg{};
     new_cfg.route_count = 99;
     s.reload_config_unchecked(&new_cfg);
 
@@ -857,7 +1094,7 @@ TEST_F(ShardF, reload_before_spawn_drains_idle_pool) {
     REQUIRE(self.shard.upstream->put_idle(fd, /*upstream_id=*/1, /*backend_idx=*/0, /*now_sec=*/0));
     CHECK_EQ(self.shard.upstream->idle_count, 1u);
 
-    RouteConfig cfg;
+    RouteConfig cfg{};
     self.shard.reload_config_unchecked(&cfg);  // not-running direct-apply path
     CHECK_EQ(self.shard.active_config, &cfg);
     CHECK_EQ(self.shard.upstream->idle_count, 0u);  // drained (fd closed by drain())
@@ -910,7 +1147,7 @@ TEST(shard_control, reload_after_join_drains_idle_pool) {
     REQUIRE(s.upstream->put_idle(fd, /*upstream_id=*/2, /*backend_idx=*/1, /*now_sec=*/0));
     CHECK_EQ(s.upstream->idle_count, 1u);
 
-    RouteConfig cfg;
+    RouteConfig cfg{};
     cfg.route_count = 7;
     s.reload_config_unchecked(&cfg);  // direct apply (not running)
     CHECK_EQ(s.active_config, &cfg);
@@ -942,7 +1179,7 @@ TEST(shard_control, join_applies_pending_reload_drains_idle_pool) {
     REQUIRE(s.upstream->put_idle(fd, /*upstream_id=*/3, /*backend_idx=*/0, /*now_sec=*/0));
     CHECK_EQ(s.upstream->idle_count, 1u);
 
-    RouteConfig new_cfg;
+    RouteConfig new_cfg{};
     new_cfg.route_count = 99;
     s.reload_config_unchecked(&new_cfg);  // thread_spawned still true → queues to pending_config
 
@@ -1026,11 +1263,11 @@ TEST(shard_control, config_ptr_updates_after_reload) {
     SmallLoop loop;
     loop.setup();
 
-    RouteConfig cfg1;
+    RouteConfig cfg1{};
     cfg1.route_count = 10;
-    RouteConfig cfg2;
+    RouteConfig cfg2{};
     cfg2.route_count = 20;
-    RouteConfig cfg3;
+    RouteConfig cfg3{};
     cfg3.route_count = 30;
 
     const RouteConfig* active = &cfg1;
@@ -1104,9 +1341,9 @@ TEST(shard_control, consecutive_reload_last_wins) {
     loop.config_ptr = &active;
     loop.control = &cb;
 
-    RouteConfig cfg1;
+    RouteConfig cfg1{};
     cfg1.route_count = 11;
-    RouteConfig cfg2;
+    RouteConfig cfg2{};
     cfg2.route_count = 22;
 
     // Two writes, no poll in between — second overwrites first.
@@ -1151,9 +1388,9 @@ TEST(shard_control, reload_after_join_applies_directly) {
     s.join();
 
     // After join, thread_spawned=false. reload should apply directly.
-    RouteConfig cfg;
+    RouteConfig cfg{};
     cfg.route_count = 88;
-    s.reload_config_unchecked(&cfg);
+    REQUIRE(s.reload_config_unchecked(&cfg));
     CHECK_EQ(s.active_config, &cfg);
 
     s.shutdown();

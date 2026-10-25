@@ -393,7 +393,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         rate_limited = rate_limit_exceeded_with_limiters(*rate_limiter,
                                                          &state->global_rate_limiter,
                                                          route->rate_limit,
-                                                         out.route_index,
+                                                         route->rate_limit_ids,
                                                          key_input,
                                                          scenario.now_us);
     }

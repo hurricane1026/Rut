@@ -6796,6 +6796,18 @@ The shard limiter table belongs to its event-loop instance: HTTP/1 and HTTP/2
 dispatch on that loop share the table, while separate loop instances remain
 isolated even when they run on the same thread.
 
+Limiter buckets use an immutable semantic namespace rather than a route-array
+index. It serializes the route method and stored path, the complete rule policy
+and scope, ordered key components, and the rank among equivalent duplicate
+rules. Reloads therefore preserve history for unchanged routes/rules across
+route or stacked-rule reordering, while changed or new policy gets a distinct
+namespace. The bounded shard/global tables may still collide or reject under
+capacity pressure, so this does not promise a fresh physical slot. Removing
+and re-adding the same semantic rule may retain its history while the old slot
+remains live. Native hand-built configs must finalize IDs before publication;
+missing IDs fail closed before spending budget. Shared global limiter state is
+retained during shard config adoption and is not reset per shard.
+
 Stacked built-in rules meter each request attempt independently. Enforcement
 checks every active rule even if an earlier rule rejects: each conforming rule
 consumes one token, with no rollback when the final response is 429. A rule

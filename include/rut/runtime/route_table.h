@@ -138,6 +138,10 @@ struct RouteEntry {
     // pass every rule, so stacked rules (one per @rateLimit) give different caps
     // per dimension — e.g. anonymous per-IP plus a higher per-API-key cap.
     RateLimitRuleSet rate_limit{};
+    // Stable semantic namespaces for the route's rate-limit rules. These are
+    // rebuilt from the route declaration and complete rule policy after route
+    // construction; they deliberately do not contain route_idx or rule ordinal.
+    u64 rate_limit_ids[kMaxRateLimitRules]{};
     // Per-route client-send byte rate (bytes/sec, 0 = unlimited). The runtime
     // paces the response so it isn't sent faster than this.
     u32 throttle_down_bps = 0;
@@ -155,6 +159,103 @@ struct RouteEntry {
     ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
     u16 preflight_forward_policy_bundle_id = 0;
 };
+
+inline u64 rate_limit_id_mix(u64 hash, const void* data, u32 len) {
+    const auto* bytes = static_cast<const u8*>(data);
+    for (u32 i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+inline u64 rate_limit_id_mix_u32(u64 hash, u32 value) {
+    return rate_limit_id_mix(hash, &value, sizeof(value));
+}
+
+inline bool rate_limit_rule_identity_equal(const RateLimitRule& lhs, const RateLimitRule& rhs) {
+    if (lhs.max != rhs.max || lhs.window_sec != rhs.window_sec || lhs.burst != rhs.burst ||
+        lhs.scope != rhs.scope || lhs.emit_interval_us != rhs.emit_interval_us ||
+        lhs.tau_us != rhs.tau_us || lhs.key.count != rhs.key.count)
+        return false;
+    for (u32 i = 0; i < lhs.key.count; i++) {
+        const auto& a = lhs.key.comps[i];
+        const auto& b = rhs.key.comps[i];
+        if (a.kind != b.kind || a.name_len != b.name_len) return false;
+        for (u32 j = 0; j < a.name_len; j++)
+            if (a.name[j] != b.name[j]) return false;
+    }
+    return true;
+}
+
+inline u64 rate_limit_route_id(const RouteEntry& route) {
+    u64 hash = 14695981039346656037ull;
+    const u8 version = 1;
+    hash = rate_limit_id_mix(hash, &version, sizeof(version));
+    hash = rate_limit_id_mix(hash, &route.method, sizeof(route.method));
+    hash = rate_limit_id_mix_u32(hash, route.path_len);
+    hash = rate_limit_id_mix(hash, route.path, route.path_len);
+    return hash == 0 ? 1 : hash;
+}
+
+inline u64 rate_limit_rule_id(u64 route_id, const RateLimitRule& rule, u32 duplicate_rank) {
+    u64 hash = route_id;
+    const u8 domain = 2;
+    hash = rate_limit_id_mix(hash, &domain, sizeof(domain));
+    hash = rate_limit_id_mix_u32(hash, rule.max);
+    hash = rate_limit_id_mix_u32(hash, rule.window_sec);
+    hash = rate_limit_id_mix_u32(hash, rule.burst);
+    const u8 scope = static_cast<u8>(rule.scope);
+    hash = rate_limit_id_mix(hash, &scope, sizeof(scope));
+    hash = rate_limit_id_mix(hash, &rule.emit_interval_us, sizeof(rule.emit_interval_us));
+    hash = rate_limit_id_mix(hash, &rule.tau_us, sizeof(rule.tau_us));
+    hash = rate_limit_id_mix(hash, &rule.key.count, sizeof(rule.key.count));
+    for (u32 i = 0; i < rule.key.count; i++) {
+        const auto& component = rule.key.comps[i];
+        const u8 kind = static_cast<u8>(component.kind);
+        hash = rate_limit_id_mix(hash, &kind, sizeof(kind));
+        hash = rate_limit_id_mix(hash, &component.name_len, sizeof(component.name_len));
+        hash = rate_limit_id_mix(hash, component.name, component.name_len);
+    }
+    hash = rate_limit_id_mix_u32(hash, duplicate_rank);
+    return hash == 0 ? 1 : hash;
+}
+
+inline bool rate_limit_route_shape_valid(const RouteEntry& route) {
+    if (route.path_len >= RouteEntry::kMaxPathLen || route.rate_limit.count > kMaxRateLimitRules)
+        return false;
+    for (u32 i = 0; i < route.rate_limit.count; i++) {
+        const auto& rule = route.rate_limit.rules[i];
+        if (rule.scope != RateLimitScope::Shard && rule.scope != RateLimitScope::Global)
+            return false;
+        if (rule.key.count > kMaxRateLimitKeyComponents) return false;
+        for (u32 j = 0; j < rule.key.count; j++) {
+            const auto& component = rule.key.comps[j];
+            if (component.kind < RateLimitKeyKind::Ip || component.kind > RateLimitKeyKind::Param ||
+                component.name_len > RateLimitKeyComponent::kMaxName ||
+                (component.kind == RateLimitKeyKind::Ip && component.name_len != 0))
+                return false;
+        }
+    }
+    return true;
+}
+
+inline bool rate_limit_route_ids_match(const RouteEntry& route) {
+    if (!rate_limit_route_shape_valid(route)) return false;
+    u64 expected[kMaxRateLimitRules]{};
+    const u64 route_id = rate_limit_route_id(route);
+    for (u32 i = 0; i < route.rate_limit.count; i++) {
+        u32 duplicate_rank = 0;
+        for (u32 previous = 0; previous < i; previous++)
+            if (rate_limit_rule_identity_equal(route.rate_limit.rules[previous],
+                                               route.rate_limit.rules[i]))
+                duplicate_rank++;
+        expected[i] = rate_limit_rule_id(route_id, route.rate_limit.rules[i], duplicate_rank);
+    }
+    for (u32 i = 0; i < kMaxRateLimitRules; i++)
+        if (route.rate_limit_ids[i] != expected[i]) return false;
+    return true;
+}
 
 // RouteConfig — immutable after construction, atomically swappable.
 // Contains route entries + upstream targets. The entire config is replaced
@@ -1381,7 +1482,7 @@ public:
         if (idx >= route_count) return false;
         routes[idx].rate_limit = RateLimitRuleSet{};
         if (max > 0 && window_sec > 0) routes[idx].rate_limit.add_rule(max, window_sec);
-        return true;
+        return refresh_route_rate_limit_ids(idx);
     }
 
     // Append an additional rate-limit rule to a route (stacking): a request must
@@ -1394,7 +1495,8 @@ public:
                                    RateLimitScope scope = RateLimitScope::Shard,
                                    u32 burst = 0) {
         if (idx >= route_count) return false;
-        return routes[idx].rate_limit.add_rule(max, window_sec, burst, scope) >= 0;
+        if (routes[idx].rate_limit.add_rule(max, window_sec, burst, scope) < 0) return false;
+        return refresh_route_rate_limit_ids(idx);
     }
 
     // Append one metering-key component to a route's *most recently added* rule
@@ -1406,7 +1508,46 @@ public:
         if (idx >= route_count) return false;
         RateLimitRuleSet& rs = routes[idx].rate_limit;
         if (rs.count == 0) return false;
-        return rs.rules[rs.count - 1].key.add(kind, name, name_len);
+        if (!rs.rules[rs.count - 1].key.add(kind, name, name_len)) return false;
+        return refresh_route_rate_limit_ids(idx);
+    }
+
+    // Recompute all immutable rate-limit namespaces after direct hand-built
+    // RouteEntry mutation. Public construction helpers call this automatically;
+    // callers that write the exposed POD rule set directly must finalize before
+    // publishing the config. Runtime enforcement fails closed on any missing ID.
+    bool refresh_route_rate_limit_ids(u32 idx) {
+        if (idx >= route_count) return false;
+        RouteEntry& route = routes[idx];
+        if (!rate_limit_route_shape_valid(route)) return false;
+        for (u32 i = 0; i < kMaxRateLimitRules; i++) route.rate_limit_ids[i] = 0;
+        const u64 route_id = rate_limit_route_id(route);
+        for (u32 i = 0; i < route.rate_limit.count; i++) {
+            u32 duplicate_rank = 0;
+            for (u32 previous = 0; previous < i; previous++)
+                if (rate_limit_rule_identity_equal(route.rate_limit.rules[previous],
+                                                   route.rate_limit.rules[i]))
+                    duplicate_rank++;
+            route.rate_limit_ids[i] =
+                rate_limit_rule_id(route_id, route.rate_limit.rules[i], duplicate_rank);
+        }
+        return true;
+    }
+
+    bool refresh_all_rate_limit_ids() {
+        for (u32 i = 0; i < route_count; i++)
+            if (!refresh_route_rate_limit_ids(i)) return false;
+        return true;
+    }
+
+    // Publication trust boundary for hand-built or compiler-produced routes.
+    // Every route must carry IDs computed from exactly its current semantic
+    // policy; stale nonzero IDs and malformed POD bounds are rejected.
+    bool rate_limit_ids_valid() const {
+        if (route_count > kMaxRoutes) return false;
+        for (u32 i = 0; i < route_count; i++)
+            if (!rate_limit_route_ids_match(routes[i])) return false;
+        return true;
     }
 
     // Attach a per-route client-send byte rate (bytes/sec, 0 disables). Set by
