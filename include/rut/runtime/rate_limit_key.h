@@ -101,10 +101,12 @@ inline Str request_target(const RateLimitKeyInput& in) {
     u32 end = in.req_header_end;
     u32 i = 0;
     while (i < end && p[i] != ' ' && p[i] != '\r' && p[i] != '\n') i++;  // method
-    if (i >= end || p[i] != ' ') return {in.path, in.path_len};
+    if (i >= end || p[i] != ' ')
+        return in.path_is_trusted ? Str{in.path, in.path_len} : Str{nullptr, 0};
     u32 ts = ++i;
     while (i < end && p[i] != ' ' && p[i] != '\r' && p[i] != '\n') i++;  // request-target
-    if (i >= end || p[i] != ' ') return {in.path, in.path_len};
+    if (i >= end || p[i] != ' ')
+        return in.path_is_trusted ? Str{in.path, in.path_len} : Str{nullptr, 0};
     return {p + ts, i - ts};
 }
 

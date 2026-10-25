@@ -16261,6 +16261,41 @@ TEST(rate_limit_key, malformed_h1_recovered_path_is_untrusted) {
     CHECK_EQ(rate_limit_key(0, &query, 1, trusted), rate_limit_key(0, &query, 1, valid));
 }
 
+TEST(rate_limit_key, malformed_request_line_does_not_use_untrusted_path_fallbacks) {
+    using namespace rut;
+    using namespace rut::rl_detail;
+    RateLimitKeyComponent query{};
+    query.kind = RateLimitKeyKind::Query;
+    query.set_name("uid", 3);
+
+    static constexpr char no_method_space[] = "GETX/p?uid=wrong\r\n\r\n";
+    RateLimitKeyInput first{};
+    first.req_buf = reinterpret_cast<const u8*>(no_method_space);
+    first.req_header_end = sizeof(no_method_space) - 1u;
+    first.path = "/p?uid=trusted";
+    first.path_len = 14;
+    CHECK(query_value(first, "uid", 3).empty());
+    RateLimitKeyInput missing = first;
+    missing.path = "/p";
+    missing.path_len = 2;
+    CHECK_EQ(rate_limit_key(0, &query, 1, first), rate_limit_key(0, &query, 1, missing));
+    first.path_is_trusted = true;
+    CHECK(query_value(first, "uid", 3).eq(Str{"trusted", 7}));
+    CHECK(rate_limit_key(0, &query, 1, first) != rate_limit_key(0, &query, 1, missing));
+
+    static constexpr char no_target_space[] = "GET /p?uid=wrong\r\n\r\n";
+    RateLimitKeyInput second{};
+    second.req_buf = reinterpret_cast<const u8*>(no_target_space);
+    second.req_header_end = sizeof(no_target_space) - 1u;
+    second.path = "/p?uid=trusted";
+    second.path_len = 14;
+    CHECK(query_value(second, "uid", 3).empty());
+    CHECK_EQ(rate_limit_key(0, &query, 1, second), rate_limit_key(0, &query, 1, missing));
+    second.path_is_trusted = true;
+    CHECK(query_value(second, "uid", 3).eq(Str{"trusted", 7}));
+    CHECK(rate_limit_key(0, &query, 1, second) != rate_limit_key(0, &query, 1, missing));
+}
+
 TEST(rate_limit_key, composition) {
     using namespace rut;
     const char* raw1 = "GET /p HTTP/1.1\r\nX-User: alice\r\n\r\n";

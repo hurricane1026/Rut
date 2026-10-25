@@ -883,7 +883,8 @@ Key extraction follows the corresponding request accessors: header names are
 case-insensitive and optional whitespace around values is ignored; query,
 cookie, and route-parameter names are exact byte matches. Query and cookie
 lookups use the first matching field in request order (including all Cookie
-fields), and cookie names/values ignore optional whitespace around their tokens.
+fields), and cookie parsing uses the same optional-whitespace handling as
+`req.cookie`.
 Missing and explicitly empty values intentionally share the documented
 unattributed bucket.
 Query extraction uses the validated raw request target when available; a
