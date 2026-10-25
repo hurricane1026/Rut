@@ -8271,3 +8271,21 @@ See [the language card](docs/language-card.md#public-http-response-cache-impleme
 for policy limits, syntax and deferred capabilities. HTTP/1 and HTTP/2 both
 copy cache hits before scheduling output, and cache routes bypass prebuilt
 response shortcuts in both epoll and io_uring.
+
+Cache storage is separated from HTTP policy. `HttpCachePolicy` builds keys,
+checks request/response eligibility, accounts for freshness, and serializes
+hits. `HttpResponseCache<Store>` coordinates that policy with the compile-time
+store contract in `http_cache_store.h`; `HttpCache` selects
+`MemoryHttpCacheStore` for the existing transport callbacks. Only the memory
+store owns slots, replacement policy, copied keys/values and fill generations.
+Store lookup/reservation failure bypasses caching (or returns 504 for
+`only-if-cached`); failed publication discards that fill. Cancellation preserves
+a previously stored record, while invalidation/discard also remove it.
+
+The current store contract completes inline and forbids blocking I/O. Lookup
+views live until the next store mutation; reserve/publish copy borrowed inputs
+before returning. Cache hits are copied into connection-owned buffers before
+any store mutation. Disk/Redis backends are not implemented: they will require
+an asynchronous submission/completion adapter, owned operation buffers,
+connection cancellation and a shared namespace/invalidation design. This
+refactor adds no language syntax or runtime backend-selection configuration.

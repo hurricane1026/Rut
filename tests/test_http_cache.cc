@@ -30,7 +30,8 @@ std::string response(const char* headers = "Cache-Control: max-age=60\r\n",
                "HTTP/1.1 200 OK\r\nDate: Mon, 26 Oct 2026 00:00:00 GMT\r\nContent-Length: ") +
            std::to_string(std::strlen(body)) + "\r\n" + headers + "\r\n" + body;
 }
-bool store(HttpCache& cache,
+template <typename Store>
+bool store(HttpResponseCache<Store>& cache,
            const HttpCache::Key& request,
            const std::string& wire,
            u32 ttl = 60,
@@ -43,7 +44,8 @@ bool store(HttpCache& cache,
         return false;
     return cache.commit(token, reinterpret_cast<const u8*>(wire.data()), wire.size(), time, kWall);
 }
-HttpCache::Result lookup(HttpCache& cache,
+template <typename Store>
+HttpCache::Result lookup(HttpResponseCache<Store>& cache,
                          const HttpCache::Key& request,
                          u64 now,
                          std::string* wire = nullptr) {
@@ -161,7 +163,7 @@ TEST(http_cache, incomplete_cancelled_evicted_and_invalidated_fills_cannot_publi
     CHECK(!cache->commit(token, reinterpret_cast<const u8*>(wire.data()), wire.size(), 1, kWall));
     REQUIRE(cache->begin(request, 60, 1, true, out, sizeof(out), written, token) ==
             HttpCache::Result::Miss);
-    for (u32 i = 0; i < HttpCache::kCapacity + 1; ++i) {
+    for (u32 i = 0; i < MemoryHttpCacheStore::kCapacity + 1; ++i) {
         auto another = request;
         another.bytes[0] = static_cast<char>(i + 1);
         HttpCache::Token ignored;
@@ -184,6 +186,116 @@ TEST(http_cache, response_delay_ttl_cap_and_overflow) {
     cache->begin(request, 60, ~u64{0} - 1, true, out, sizeof(out), written, token);
     CHECK(!cache->commit(
         token, reinterpret_cast<const u8*>(wire.data()), wire.size(), ~u64{0} - 1, kWall));
+}
+
+namespace {
+// Exercise the policy without the memory store's layout or generation counter.
+struct UnavailableStore : HttpCacheStorage {
+    bool find(KeyView, Record&) const { return false; }
+    Token reserve(KeyView, u32, u64) { return {}; }
+    bool inspect(Token, Fill&) const { return false; }
+    bool publish(Token, const Record&) { return false; }
+    void cancel(Token) {}
+    void discard(Token) {}
+    void invalidate_host(u64, u64) {}
+};
+// An independent read-only backend with no slots or memory-store inheritance.
+struct SnapshotStore : UnavailableStore {
+    bool find(KeyView view, Record& record) const {
+        const auto expected = key();
+        if (view.config != expected.config || view.hash != expected.hash ||
+            view.len != expected.len || std::memcmp(view.bytes, expected.bytes, view.len) != 0)
+            return false;
+        static constexpr u8 kWire[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        record = {kWire, sizeof(kWire) - 1, 1000000, 6000000, 2000000};
+        return true;
+    }
+};
+struct RejectingStore : MemoryHttpCacheStore {
+    bool publish(Token, const Record&) { return false; }
+};
+}  // namespace
+
+TEST(http_cache, unavailable_storage_bypasses_origin_except_only_if_cached) {
+    HttpResponseCache<UnavailableStore> cache;
+    CHECK(lookup(cache, key(), 1000000) == HttpCache::Result::Bypass);
+    CHECK(lookup(cache, key("Cache-Control: only-if-cached\r\n"), 1000000) ==
+          HttpCache::Result::OnlyCachedMiss);
+    CHECK(!store(cache, key(), response()));
+    CHECK(!cache.pending({}));
+    cache.cancel({});
+    cache.invalidate_host(1, 1);
+}
+TEST(http_cache, alternative_storage_uses_the_same_http_freshness_and_serialization) {
+    HttpResponseCache<SnapshotStore> cache;
+    std::string wire;
+    CHECK(lookup(cache, key(), 3000000, &wire) == HttpCache::Result::Hit);
+    CHECK(wire.ends_with("hello") && wire.find("Age: 4\r\n") != std::string::npos);
+    CHECK(lookup(cache, key(), 6000000) == HttpCache::Result::Bypass);
+    CHECK(lookup(cache, key("Cache-Control: max-age=1\r\n"), 3000000) == HttpCache::Result::Bypass);
+    CHECK(lookup(cache, key("Cache-Control: only-if-cached\r\n"), 6000000) ==
+          HttpCache::Result::OnlyCachedMiss);
+}
+TEST(http_cache, invalid_storage_records_cannot_read_past_the_payload) {
+    const u8 truncated[] = "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nhello";
+    u8 output[HttpCache::kMaxResponse];
+    u32 written;
+    HttpCacheStorage::Record record{truncated, sizeof(truncated) - 1, 1, 10000000, 0};
+    CHECK(
+        !HttpCachePolicy::read_response(key(), record, 100, true, output, sizeof(output), written));
+    record.response = nullptr;
+    CHECK(
+        !HttpCachePolicy::read_response(key(), record, 100, true, output, sizeof(output), written));
+    record.response = truncated;
+    record.response_len = HttpCache::kMaxResponse + 1;
+    CHECK(
+        !HttpCachePolicy::read_response(key(), record, 100, true, output, sizeof(output), written));
+}
+TEST(http_cache, rejected_storage_write_cannot_leave_a_published_response) {
+    auto cache = std::make_unique<HttpResponseCache<RejectingStore>>();
+    CHECK(!store(*cache, key(), response()));
+    CHECK(lookup(*cache, key(), 1000000) == HttpCache::Result::Miss);
+}
+TEST(http_cache, storage_owns_bytes_and_rejects_stale_operations) {
+    auto storage = std::make_unique<MemoryHttpCacheStore>();
+    char bytes[] = "key";
+    HttpCacheStorage::KeyView view{bytes, 3, 42, 1, 2};
+    const auto token = storage->reserve(view, 30, 100);
+    HttpCacheStorage::Fill fill;
+    REQUIRE(storage->inspect(token, fill));
+    CHECK(fill.ttl == 30 && fill.started_us == 100);
+    bytes[0] = 'x';
+    u8 payload[] = {1, 2, 3};
+    const HttpCacheStorage::Record record{payload, 3, 200, 300, 0};
+    REQUIRE(storage->publish(token, record));
+    payload[0] = 9;
+    view.bytes = "key";  // Lookup remains valid after the caller reuses its key buffer.
+    HttpCacheStorage::Record found;
+    REQUIRE(storage->find(view, found));
+    CHECK(found.response[0] == 1 && found.response_len == 3);
+    CHECK(!storage->inspect(token, fill));
+    CHECK(!storage->publish(token, record));
+    const auto replacement = storage->reserve(view, 30, 400);
+    storage->cancel(token);
+    storage->discard(token);
+    CHECK(storage->inspect(replacement, fill));
+    REQUIRE(storage->find(view, found));
+    storage->cancel(replacement);
+    CHECK(!storage->inspect(replacement, fill));
+    REQUIRE(storage->find(view, found));
+    const auto invalidated = storage->reserve(view, 30, 500);
+    storage->invalidate_host(1, 2);
+    CHECK(!storage->find(view, found));
+    CHECK(!storage->inspect(invalidated, fill));
+    CHECK(!storage->publish(invalidated, record));
+    const auto current = storage->reserve(view, 30, 600);
+    storage->cancel(invalidated);
+    storage->discard(invalidated);
+    CHECK(storage->inspect(current, fill));
+    CHECK(storage->publish(current, record));
+    const auto discarded = storage->reserve(view, 30, 700);
+    storage->discard(discarded);
+    CHECK(!storage->find(view, found));
 }
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);

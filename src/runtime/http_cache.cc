@@ -129,8 +129,8 @@ u64 hash_bytes(u64 hash, const void* bytes, u32 size) {
     for (u32 i = 0; i < size; ++i) hash = (hash ^ data[i]) * 1099511628211ull;
     return hash;
 }
-bool append(HttpCache::Key& key, const void* bytes, u32 size) {
-    if (size > HttpCache::kMaxKey - key.len) return false;
+bool append(HttpCachePolicy::Key& key, const void* bytes, u32 size) {
+    if (size > HttpCachePolicy::kMaxKey - key.len) return false;
     __builtin_memcpy(key.bytes + key.len, bytes, size);
     key.len += size;
     return true;
@@ -187,8 +187,8 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
     if (parser.parse(wire, length, &response) != ParseStatus::Complete ||
         response.status_code != 200 || response.headers_truncated || response.chunked ||
         !response.has_content_length || response.content_length_count != 1 ||
-        response.content_length > HttpCache::kMaxResponse - 256 ||
-        parser.header_end > HttpCache::kMaxResponse - 256 - response.content_length)
+        response.content_length > HttpCachePolicy::kMaxResponse - 256 ||
+        parser.header_end > HttpCachePolicy::kMaxResponse - 256 - response.content_length)
         return false;
     info.header_end = parser.header_end;
     Controls policy;
@@ -225,7 +225,7 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
     }
     // A Date is necessary to account for upstream age without synthesizing
     // origin metadata. Date-less responses continue through the ordinary proxy.
-    if (policy.blocked || !date_seen || wall == 0 || cap == 0 || cap > HttpCache::kMaxTtl)
+    if (policy.blocked || !date_seen || wall == 0 || cap == 0 || cap > HttpCachePolicy::kMaxTtl)
         return false;
     u64 lifetime = cap;
     if (policy.shared_seen)
@@ -245,7 +245,7 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
     info.age_us = kInitial;
     return true;
 }
-bool copy_response(const HttpCache::Entry& entry,
+bool copy_response(const HttpCacheStorage::Record& entry,
                    u64 now,
                    bool keep_alive,
                    bool http10,
@@ -253,11 +253,16 @@ bool copy_response(const HttpCache::Entry& entry,
                    u32 capacity,
                    u32& written) {
     written = 0;
+    if (!entry.response || entry.response_len > HttpCacheStorage::kMaxResponse) return false;
     HttpResponseParser parser;
     ParsedResponse response;
     parser.reset();
     response.reset();
-    if (parser.parse(entry.response, entry.response_len, &response) != ParseStatus::Complete)
+    if (parser.parse(entry.response, entry.response_len, &response) != ParseStatus::Complete ||
+        response.status_code != 200 || response.headers_truncated || response.chunked ||
+        !response.has_content_length || response.content_length_count != 1 ||
+        parser.header_end > entry.response_len ||
+        response.content_length != entry.response_len - parser.header_end)
         return false;
     auto add = [&](const void* p, u32 n) {
         if (n > capacity - written) return false;
@@ -291,7 +296,7 @@ bool copy_response(const HttpCache::Entry& entry,
 }
 }  // namespace
 
-bool HttpCache::make_key(
+bool HttpCachePolicy::make_key(
     const u8* request, u32 length, u64 config, u32 route, bool tls, u32 peer, Key& key) {
     key = {};
     key.config = config;
@@ -358,72 +363,24 @@ bool HttpCache::make_key(
     return true;
 }
 
-HttpCache::Result HttpCache::begin(const Key& key,
-                                   u32 ttl,
-                                   u64 now_us,
-                                   bool keep_alive,
-                                   u8* output,
-                                   u32 capacity,
-                                   u32& output_len,
-                                   Token& token) {
-    output_len = 0;
-    token = {};
-    if (!key.eligible || !ttl || ttl > kMaxTtl || !output)
-        return key.only_cached && ttl ? Result::OnlyCachedMiss : Result::Bypass;
-    const u32 kStart = static_cast<u32>(key.hash % (kCapacity / kWays)) * kWays;
-    u32 victim = kStart;
-    for (u32 i = kStart; i < kStart + kWays; ++i) {
-        Entry& e = entries[i];
-        if (e.ready && e.config == key.config && e.hash == key.hash && e.key_len == key.len &&
-            __builtin_memcmp(e.key, key.bytes, key.len) == 0) {
-            const u64 kElapsed = now_us >= e.stored_us ? now_us - e.stored_us : ~u64{0};
-            const u64 kAgeUs =
-                kElapsed <= ~u64{0} - e.initial_age_us ? kElapsed + e.initial_age_us : ~u64{0};
-            const bool fresh = now_us < e.expires_us && now_us >= e.stored_us &&
-                               kAgeUs <= static_cast<u64>(key.max_age) * 1000000 &&
-                               key.min_fresh <= kMaxTtl &&
-                               static_cast<u64>(key.min_fresh) * 1000000 < e.expires_us - now_us;
-            if (fresh &&
-                copy_response(e, now_us, keep_alive, key.http10, output, capacity, output_len))
-                return Result::Hit;
-            victim = i;
-            break;
-        }
-        if ((!e.ready && !e.pending) || e.generation < entries[victim].generation) victim = i;
-    }
-    output_len = 0;
-    if (key.only_cached) return Result::OnlyCachedMiss;
-    if (generation == ~u64{0}) return Result::Bypass;
-    Entry& e = entries[victim];
-    e.ready = e.ready && e.config == key.config && e.hash == key.hash && e.key_len == key.len &&
-              __builtin_memcmp(e.key, key.bytes, key.len) == 0;
-    e.pending = true;
-    e.generation = ++generation;
-    e.hash = key.hash;
-    e.config = key.config;
-    e.host = key.host;
-    e.started_us = now_us;
-    e.ttl = ttl;
-    e.key_len = key.len;
-    __builtin_memcpy(e.key, key.bytes, key.len);
-    token = {e.generation, victim};
-    return Result::Miss;
+bool HttpCachePolicy::read_response(const Key& key,
+                                    const Record& record,
+                                    u64 now_us,
+                                    bool keep_alive,
+                                    u8* output,
+                                    u32 capacity,
+                                    u32& written) {
+    const u64 kElapsed = now_us >= record.stored_us ? now_us - record.stored_us : ~u64{0};
+    const u64 kAgeUs =
+        kElapsed <= ~u64{0} - record.initial_age_us ? kElapsed + record.initial_age_us : ~u64{0};
+    const bool kFresh = now_us < record.expires_us && now_us >= record.stored_us &&
+                        kAgeUs <= static_cast<u64>(key.max_age) * 1000000 &&
+                        key.min_fresh <= kMaxTtl &&
+                        static_cast<u64>(key.min_fresh) * 1000000 < record.expires_us - now_us;
+    return kFresh &&
+           copy_response(record, now_us, keep_alive, key.http10, output, capacity, written);
 }
-bool HttpCache::pending(Token token) const {
-    return token.generation && token.slot < kCapacity &&
-           entries[token.slot].generation == token.generation && entries[token.slot].pending;
-}
-void HttpCache::cancel(Token token) {
-    if (pending(token)) entries[token.slot].pending = false;
-}
-void HttpCache::invalidate_host(u64 config, u64 host) {
-    for (auto& entry : entries)
-        if (entry.config == config && entry.host == host) {
-            entry.ready = false;
-            entry.pending = false;
-        }
-}
-bool HttpCache::response_can_buffer(const u8* response, u32 length, u32& total) {
+bool HttpCachePolicy::response_can_buffer(const u8* response, u32 length, u32& total) {
     ResponseInfo info;
     // Eligibility that does not depend on the live clock; policy is checked at commit.
     HttpResponseParser parser;
@@ -438,25 +395,17 @@ bool HttpCache::response_can_buffer(const u8* response, u32 length, u32& total) 
     total = parser.header_end + info.parsed.content_length;
     return true;
 }
-bool HttpCache::commit(Token token, const u8* response, u32 length, u64 now_us, u64 wall_us) {
-    if (!pending(token)) return false;
-    Entry& e = entries[token.slot];
-    e.pending = false;
-    e.ready = false;
-    if (now_us < e.started_us) return false;
-    const u64 kElapsed = now_us - e.started_us;
+bool HttpCachePolicy::prepare_record(
+    const Fill& fill, const u8* response, u32 length, u64 now_us, u64 wall_us, Record& record) {
+    if (!response || length > kMaxResponse || now_us < fill.started_us) return false;
+    const u64 kElapsed = now_us - fill.started_us;
     ResponseInfo info;
-    if (!response_info(response, length, e.ttl, wall_us, kElapsed, info) ||
+    if (!response_info(response, length, fill.ttl, wall_us, kElapsed, info) ||
         length != info.header_end + info.parsed.content_length)
         return false;
     const u64 kRemainingUs = static_cast<u64>(info.ttl) * 1000000 - info.age_us;
     if (now_us > ~u64{0} - kRemainingUs) return false;
-    __builtin_memcpy(e.response, response, length);
-    e.response_len = length;
-    e.initial_age_us = info.age_us;
-    e.stored_us = now_us;
-    e.expires_us = now_us + kRemainingUs;
-    e.ready = true;
+    record = {response, length, now_us, now_us + kRemainingUs, info.age_us};
     return true;
 }
 HttpCache& local_http_cache() {
