@@ -75,6 +75,8 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_parse_unprime", reinterpret_cast<void*>(&rut_helper_parse_unprime)},
     {"rut_helper_uuid", reinterpret_cast<void*>(&rut_helper_uuid)},
     {"rut_helper_str_has_prefix", reinterpret_cast<void*>(&rut_helper_str_has_prefix)},
+    {"rut_helper_bearer_matches", reinterpret_cast<void*>(&rut_helper_bearer_matches)},
+    {"rut_helper_basic_matches", reinterpret_cast<void*>(&rut_helper_basic_matches)},
     {"rut_helper_str_constant_time_equal",
      reinterpret_cast<void*>(&rut_helper_str_constant_time_equal)},
     {"rut_helper_str_eq", reinterpret_cast<void*>(&rut_helper_str_eq)},
@@ -112,23 +114,10 @@ bool JitEngine::init() {
     // MangleAndIntern produces correctly mangled names for the target.
     LLVMOrcJITDylibRef main_jd = LLVMOrcLLJITGetMainJITDylib(lljit);
 
-    // Fixed stack buffer; raise kMaxHelpers in lockstep when kHelpers grows.
-    // Without the clamp on `count` the loop below can leave tail pairs
-    // uninitialized yet still hand them to LLVMOrcAbsoluteSymbols.
-    // If kHelpers ever grows past kMaxHelpers, fail loudly instead of
-    // silently skipping helpers (which would produce opaque JIT link
-    // failures at runtime).
-    static constexpr u32 kMaxHelpers = 40;
-    u32 count = 0;
-    for (const auto* h = kHelpers; h->name; h++) count++;
-    if (count > kMaxHelpers) {
-        log_error("jit: helper table exceeds kMaxHelpers — raise the cap", nullptr);
-        LLVMOrcDisposeLLJIT(lljit);
-        lljit = nullptr;
-        return false;
-    }
-
-    LLVMOrcCSymbolMapPair pairs[kMaxHelpers];
+    // Derive the registration buffer from the table (excluding its sentinel),
+    // so adding a helper cannot overflow or invalidate a separate magic cap.
+    static constexpr u32 count = sizeof(kHelpers) / sizeof(kHelpers[0]) - 1;
+    LLVMOrcCSymbolMapPair pairs[count];
     for (u32 i = 0; i < count; i++) {
         pairs[i].Name = LLVMOrcLLJITMangleAndIntern(lljit, kHelpers[i].name);
         pairs[i].Sym.Address = reinterpret_cast<LLVMOrcExecutorAddress>(kHelpers[i].addr);

@@ -234,6 +234,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::CtxStoreSlotI32:
             buf.put_cstr("ctx.store_slot_i32");
             break;
+        case Opcode::BearerMatches:
+            buf.put_cstr("auth.bearer_matches");
+            break;
+        case Opcode::BasicMatches:
+            buf.put_cstr("auth.basic_matches");
+            break;
         case Opcode::StrConstantTimeEqual:
             buf.put_cstr("str.constant_time_equal");
             break;
@@ -752,6 +758,8 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
             break;
+        case Opcode::BearerMatches:
+        case Opcode::BasicMatches:
         case Opcode::StrConstantTimeEqual:
         case Opcode::StrHasPrefix:
         case Opcode::StrTrimPrefix:
