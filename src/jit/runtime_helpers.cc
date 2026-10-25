@@ -11,6 +11,7 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/uuid.h"
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -26,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 using namespace rut;
 
@@ -1816,14 +1818,25 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
-    if (op > static_cast<u32>(json::Op::BearerToken)) return;
+    if (op > static_cast<u32>(json::Op::JwtClaimsValid)) return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
     json::Writer writer{bytes};
     Str view{};
     i64 scalar = 0;
     const auto operation = static_cast<json::Op>(op);
-    if (operation == json::Op::BearerToken) {
+    if (operation == json::Op::JwtClaimsValid) {
+        struct timespec now{};
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+            now.tv_nsec >= 1000000000)
+            return;
+        scalar = jwt_claims_valid(
+                     document, {a, a_len}, {b, b_len}, {c, c_len}, static_cast<i64>(now.tv_sec))
+                     ? 1
+                     : 0;
+        // This boolean operation borrows no output and needs no JSON arena.
+        view = {"", 0};
+    } else if (operation == json::Op::BearerToken) {
         view = bearer_token({a, a_len});
         if (view.ptr == nullptr) return;
     } else if (operation == json::Op::JwtDecode) {

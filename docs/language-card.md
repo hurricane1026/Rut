@@ -1172,3 +1172,35 @@ The example resolves secrets with existing compile-time `env()`. Missing variabl
 reject compilation, and compiled artifacts contain these constants. Serve credentials
 through TLS. Dynamic Consumer storage, live revocation, and automatic identity or
 credential forwarding are outside this static helper layer.
+
+## JWT resource-server claims profile
+
+`jwtDecode(token, secret)` retains its existing signature-only semantics.
+After verifying the signature, `jwtClaimsValid(claims, issuer, audience) -> bool`
+applies an explicit strict resource-server profile. Arguments are an unwrapped
+Json and two unwrapped strings; user functions can shadow the builtin.
+
+The profile requires a nonempty string `sub`, an exact case-sensitive decoded
+`iss` match, a matching `aud` string or nonempty array of nonempty strings, and
+`exp > now`. Optional `nbf` and `iat` must be integer dates no later than now.
+All dates are signed 64-bit integer Unix seconds; fractions, exponents and
+out-of-range values are rejected. Clock skew is zero. The shared JSON parser
+rejects duplicate decoded member names (including escaped aliases), malformed
+UTF-8, and byte/node/depth overflows. Empty configuration, invalid input, a failed
+CLOCK_REALTIME read, or an invalid/nonpositive epoch clock returns false.
+This profile does not verify a signature or provide revocation/JWKS by itself.
+
+The check borrows its inputs, reuses existing bounded per-shard JSON scratch,
+and returns a scalar without requiring a request arena or allocation. It does
+not use monotonic `time.nowMicros()` for NumericDate comparisons.
+
+`auth.jwtIdentity(verifiedClaims, issuer, audience, credentialId)` in the middleware
+library applies this profile and typed subject decoding, then returns `Identity`
+with method `"jwt"` and consumerId from the verified `sub`. Pass only the output
+of a successful `jwtDecode`, never arbitrary parsed JSON. The credentialId is
+trusted configuration, not an attacker-supplied JOSE header. Empty configuration
+returns 503 and invalid claims return 401 with a Bearer challenge. The runnable
+example first calls `auth.jwtDocument(authorization, secret)`, which composes
+`bearerToken` and `jwtDecode` and returns verified Json or a challenged 401.
+Then it calls the separate identity helper. Existing HS256/384/512 support is unchanged.
+See [examples/jwt-claims-auth.rut](../examples/jwt-claims-auth.rut).

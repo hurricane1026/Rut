@@ -53,3 +53,25 @@ func headerKey(_ presented: str, _ key: str, _ consumerId: str, _ credentialId: 
     guard constantTimeEqual(presented, key) else { respond denied }
     Identity(consumerId: consumerId, credentialId: credentialId, method: "apiKey")
 }
+
+// Signature verification remains a distinct step from claims policy.
+func jwtDocument(_ authorization: str, _ secret: str) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard secret != "" else { respond 503 }
+    guard let document = jwtDecode(bearerToken(authorization).or(""), secret) else { respond denied }
+    document
+}
+
+struct JwtSubject { sub: str }
+
+// Pass only a document already verified by jwtDecode; this helper applies claims
+// policy and maps the verified subject, keeping signature verification explicit.
+func jwtIdentity(_ document: Json, _ issuer: str, _ audience: str, _ credentialId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard issuer != "" && audience != "" && credentialId != "" else { respond 503 }
+    guard jwtClaimsValid(document, issuer, audience) else { respond denied }
+    guard let subject = json.decode(JwtSubject, document) else { respond denied }
+    Identity(consumerId: subject.sub, credentialId: credentialId, method: "jwt")
+}

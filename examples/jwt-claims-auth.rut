@@ -1,0 +1,11 @@
+// Set JWT_SECRET (at least 32 bytes), JWT_ISSUER and JWT_AUDIENCE at load time.
+// Serve behind TLS. Signature verification and claims policy are separate steps.
+import "middleware/auth.rut"
+listen :8080
+
+route GET "/identity" {
+    let document = auth.jwtDocument(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, env("JWT_ISSUER"), env("JWT_AUDIENCE"), "issuer-key")
+    let subject = identity.consumerId
+    return response(200, body: subject)
+}

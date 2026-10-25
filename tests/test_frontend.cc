@@ -40650,3 +40650,18 @@ TEST(frontend, auth_comparison_types_and_challenge_header_safety) {
         CHECK(!analyze_file_heap(a.value()));
     }
 }
+
+TEST(frontend, jwt_claims_policy_requires_unwrapped_json_and_string_configuration) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { if jwtClaimsValid("{}", "issuer", "aud") { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { if jwtClaimsValid(json.parse("{}"), "issuer", "aud") { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtClaimsValid(doc, 1, "aud") { return 200 } else { return 401 } })rut",
+    };
+    for (const char* src : invalid) {
+        auto tokens = lex(lit(src));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
