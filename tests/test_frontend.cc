@@ -374,6 +374,64 @@ TEST(frontend, listen_rejects_invalid_shape_and_multiple_declarations) {
     }
 }
 
+TEST(frontend, rate_limit_key_policy_diagnostics_are_token_local) {
+    const struct {
+        const char* source;
+        const char* token;
+        FrontendError code;
+        const char* detail;
+    } cases[] = {
+        {"@rateLimit(limit: 1, window: 1m, by: nope(\"x\"))\n"
+         "route GET \"/a\" { return 200 }\n",
+         "nope",
+         FrontendError::UnsupportedSyntax,
+         "rate-limit key source must be ip, header(\"name\"), query(\"name\"), "
+         "cookie(\"name\"), or param(\"name\")"},
+        {"@rateLimit(limit: 1, window: 1m, by: [ip, ip, ip, ip, header(\"z\")])\n"
+         "route GET \"/a\" { return 200 }\n",
+         "header",
+         FrontendError::UnsupportedSyntax,
+         "rate-limit keys support at most four components"},
+        {"@rateLimit(limit: 1, window: 1m, by: [header(\"a\"), header(\"b\"), "
+         "header(\"c\"), header(\"d\"), ip])\nroute GET \"/a\" { return 200 }\n",
+         "ip",
+         FrontendError::UnsupportedSyntax,
+         "rate-limit keys support at most four components"},
+        {"@rateLimit(limit: 1, window: 1m, scope: cluster)\n"
+         "route GET \"/a\" { return 200 }\n",
+         "cluster",
+         FrontendError::UnsupportedSyntax,
+         "rate-limit scope must be `shard` or `global`"},
+        {"@rateLimit(limit: 1, window: 1m, what: 1)\n"
+         "route GET \"/a\" { return 200 }\n",
+         "what",
+         FrontendError::UnsupportedSyntax,
+         "rate-limit named arguments are `by`, `scope`, or `burst`"},
+    };
+    for (const auto& tc : cases) {
+        auto lexed = lex(lit(tc.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast);
+        CHECK_EQ(ast.error().code, tc.code);
+        CHECK_EQ(ast.error().span.line, 1u);
+        const u32 token_start = static_cast<u32>(strstr(tc.source, tc.token) - tc.source);
+        CHECK_EQ(ast.error().span.start, token_start);
+        CHECK_EQ(ast.error().span.end, token_start + static_cast<u32>(strlen(tc.token)));
+        CHECK_EQ(ast.error().span.col, token_start + 1u);
+        CHECK_EQ(std::string(ast.error().detail.ptr, ast.error().detail.len),
+                 std::string(tc.detail));
+    }
+
+    const char valid[] =
+        "@rateLimit(limit: 1, window: 1m, by: [ip, header(\"x\"), query(\"q\"), "
+        "cookie(\"c\")])\nroute GET \"/a\" { return 200 }\n";
+    auto valid_lexed = lex(lit(valid));
+    REQUIRE(valid_lexed);
+    auto valid_ast = parse_file_heap(valid_lexed.value());
+    REQUIRE(valid_ast);
+}
+
 TEST(frontend, listener_analyzer_revalidates_forged_ast_metadata_before_narrowing) {
     const struct {
         ListenerAddress address;

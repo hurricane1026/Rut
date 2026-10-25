@@ -6792,6 +6792,11 @@ limited to 32 bytes. A longer name is a compile-time error at the name literal,
 not a truncated lookup. The native key-spec builder also rejects it without
 appending a component.
 
+Invalid `by:` source kinds, a fifth key component, invalid `scope` values, and
+unknown named arguments are compile-time errors at the offending token. Their
+diagnostics list the accepted source forms, the four-component limit, the two
+scope values, or the accepted named arguments respectively.
+
 Key extraction follows the corresponding request accessors: header names are
 case-insensitive and optional whitespace around values is ignored; query,
 cookie, and route-parameter names are exact byte matches. Query and cookie

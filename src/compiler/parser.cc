@@ -32,6 +32,13 @@ constexpr Str kListenerEndpointContiguousDetail =
     lit_str("numeric IPv4 listener endpoints must be byte-contiguous");
 constexpr Str kListenerWildcardSpellingDetail =
     lit_str("use `listen :PORT` for the IPv4 wildcard address");
+constexpr Str kRateLimitSourcesDetail = lit_str(
+    "rate-limit key source must be ip, header(\"name\"), query(\"name\"), "
+    "cookie(\"name\"), or param(\"name\")");
+constexpr Str kRateLimitKeyCountDetail = lit_str("rate-limit keys support at most four components");
+constexpr Str kRateLimitScopesDetail = lit_str("rate-limit scope must be `shard` or `global`");
+constexpr Str kRateLimitArgsDetail =
+    lit_str("rate-limit named arguments are `by`, `scope`, or `burst`");
 
 struct Parser {
     const LexedTokens* toks = nullptr;
@@ -4934,7 +4941,9 @@ struct Parser {
         const Str kName = src.value()->text;
         if (kName.eq({"ip", 2})) {
             if (!spec.add(RateLimitKeyKind::Ip, nullptr, 0))
-                return frontend_error(FrontendError::UnsupportedSyntax, deco_span, kName);
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*src.value()),
+                                      kRateLimitKeyCountDetail);
             return true;
         }
         RateLimitKeyKind kind;
@@ -4947,7 +4956,8 @@ struct Parser {
         else if (kName.eq({"param", 5}))
             kind = RateLimitKeyKind::Param;
         else
-            return frontend_error(FrontendError::UnsupportedSyntax, span_from(*src.value()), kName);
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(*src.value()), kRateLimitSourcesDetail);
         if (!expect(TokenType::LParen))
             return frontend_error(FrontendError::UnexpectedToken, deco_span, kName);
         auto arg = expect(TokenType::StringLit);
@@ -4959,7 +4969,9 @@ struct Parser {
                                   span_from(*arg.value()),
                                   lit_str("rate-limit key names must be at most 32 bytes"));
         if (!spec.add(kind, arg.value()->text.ptr, arg.value()->text.len))
-            return frontend_error(FrontendError::UnsupportedSyntax, deco_span, kName);
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(*src.value()),
+                                  kRateLimitKeyCountDetail);
         return true;
     }
 
@@ -5039,8 +5051,9 @@ struct Parser {
                     else if (sv.value()->text.eq({"global", 6}))
                         deco.rate_limit_scope = RateLimitScope::Global;
                     else
-                        return frontend_error(
-                            FrontendError::UnsupportedSyntax, deco.span, sv.value()->text);
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*sv.value()),
+                                              kRateLimitScopesDetail);
                 } else if (arg.value()->text.eq({"burst", 5})) {
                     auto bv = expect(TokenType::IntLit);
                     if (!bv) return core::make_unexpected(bv.error());
@@ -5053,8 +5066,9 @@ struct Parser {
                     }
                     deco.rate_limit_burst = static_cast<u32>(b);
                 } else {
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax, deco.span, arg.value()->text);
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*arg.value()),
+                                          kRateLimitArgsDetail);
                 }
             }
             if (!expect(TokenType::RParen))
