@@ -225,6 +225,7 @@ void rut_helper_req_set_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_req_add_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+void rut_helper_req_remove_header(void* conn, const char* name, rut::u32 nlen);
 void rut_helper_resp_set_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_resp_add_header(

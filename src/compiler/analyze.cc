@@ -92,6 +92,11 @@ constexpr Str kPipePlaceholderDetail = lit_str(
 constexpr Str kReqHeaderMutationDetail = lit_str(
     "req.set/add expect literal safe header name and value strings, and may only be used as a "
     "statement");
+constexpr Str kReqHeaderRemoveDetail =
+    lit_str("req.remove expects one literal safe header name and may only be used as a statement");
+constexpr Str kReqHeaderRemoveOrderDetail = lit_str(
+    "req.remove is currently supported only before guards/waits/for loops, or inside a "
+    "selected match arm");
 constexpr Str kReqHeaderMutationOrderDetail = lit_str(
     "req.set/add are currently supported only before guards/waits/for loops, or inside a "
     "selected match arm");
@@ -4460,26 +4465,39 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     // than one argument and would otherwise hide this contextual builtin.
     if (receiver_override == nullptr &&
         magic_req_receiver(*expr.lhs, mod, locals, local_count, binding) &&
-        (expr.name.eq({"set", 3}) || expr.name.eq({"add", 3}))) {
+        (expr.name.eq({"set", 3}) || expr.name.eq({"add", 3}) || expr.name.eq({"remove", 6}))) {
+        const bool is_remove = expr.name.eq({"remove", 6});
         const bool is_add = expr.name.eq({"add", 3});
-        if (!route->req_header_mutation_stmt_ok || expr.args.len != 2 || expr.args[0] == nullptr ||
-            expr.args[1] == nullptr || expr.args[0]->kind != AstExprKind::StrLit ||
-            expr.args[1]->kind != AstExprKind::StrLit)
-            return frontend_error(
-                FrontendError::UnsupportedSyntax, expr.span, kReqHeaderMutationDetail);
-        const Str header_name = expr.args[0]->str_value;
-        auto value = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (!route->req_header_mutation_stmt_ok || expr.args.len != (is_remove ? 1u : 2u) ||
+            expr.args[0] == nullptr || expr.args[0]->kind != AstExprKind::StrLit ||
+            (!is_remove && (expr.args[1] == nullptr || expr.args[1]->kind != AstExprKind::StrLit)))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  is_remove ? kReqHeaderRemoveDetail : kReqHeaderMutationDetail);
+        auto name = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!name) return core::make_unexpected(name.error());
+        const Str header_name = name->str_value;
+        HirExpr empty{};
+        empty.kind = HirExprKind::StrLit;
+        empty.type = HirTypeKind::Str;
+        empty.str_value = lit_str("");
+        FrontendResult<HirExpr> value =
+            is_remove ? FrontendResult<HirExpr>(empty)
+                      : analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
         if (!value) return core::make_unexpected(value.error());
         const Str header_value = value->str_value;
         if (validate_response_header(
                 header_name.ptr, header_name.len, header_value.ptr, header_value.len) !=
             HttpHeaderValidation::Ok)
-            return frontend_error(
-                FrontendError::UnsupportedSyntax, expr.args[0]->span, kReqHeaderMutationDetail);
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.args[0]->span,
+                                  is_remove ? kReqHeaderRemoveDetail : kReqHeaderMutationDetail);
         if (!route->exprs.push(value.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr out{};
-        out.kind = is_add ? HirExprKind::ReqAddHeader : HirExprKind::ReqSetHeader;
+        out.kind = is_remove ? HirExprKind::ReqRemoveHeader
+                   : is_add  ? HirExprKind::ReqAddHeader
+                             : HirExprKind::ReqSetHeader;
         out.type = HirTypeKind::Str;
         out.span = expr.span;
         out.str_value = header_name;
@@ -5771,7 +5789,7 @@ static FrontendResult<void> collect_function_response_effects(HirFunction* fn,
     for (u32 li = 0; li < scratch.locals.len; li++) {
         const auto kind = scratch.locals[li].init.kind;
         if (kind == HirExprKind::CacheSet || kind == HirExprKind::ReqSetHeader ||
-            kind == HirExprKind::ReqAddHeader) {
+            kind == HirExprKind::ReqAddHeader || kind == HirExprKind::ReqRemoveHeader) {
             fn->has_non_response_statement_effect = true;
             continue;
         }
@@ -11599,7 +11617,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
                     inner.expr.lhs->kind == AstExprKind::Ident &&
                     inner.expr.lhs->name.eq({"req", 3}) &&
-                    (inner.expr.name.eq({"set", 3}) || inner.expr.name.eq({"add", 3}));
+                    (inner.expr.name.eq({"set", 3}) || inner.expr.name.eq({"add", 3}) ||
+                     inner.expr.name.eq({"remove", 6}));
                 if (route->cache_ops_blocked || route->for_loops.len != 0)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax,
@@ -11615,7 +11634,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 if (!value) return core::make_unexpected(value.error());
                 const bool supported_effect = value->kind == HirExprKind::CacheSet ||
                                               value->kind == HirExprKind::ReqSetHeader ||
-                                              value->kind == HirExprKind::ReqAddHeader;
+                                              value->kind == HirExprKind::ReqAddHeader ||
+                                              value->kind == HirExprKind::ReqRemoveHeader;
                 if (route->guards.len > guards_before_set || !supported_effect)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, inner.span, kCacheStmtDetail);
@@ -15507,6 +15527,7 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqMethod:
         case HirExprKind::ReqSetHeader:
         case HirExprKind::ReqAddHeader:
+        case HirExprKind::ReqRemoveHeader:
             return true;
         default:
             break;
@@ -19818,12 +19839,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs != nullptr &&
                     stmt.expr.lhs->kind == AstExprKind::Ident &&
                     stmt.expr.lhs->name.eq({"req", 3}) &&
-                    (stmt.expr.name.eq({"set", 3}) || stmt.expr.name.eq({"add", 3}));
+                    (stmt.expr.name.eq({"set", 3}) || stmt.expr.name.eq({"add", 3}) ||
+                     stmt.expr.name.eq({"remove", 6}));
                 if (req_mutation_syntax) {
                     if (seen_wait || seen_for || seen_guard || route.guards.len > 0)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               stmt.span,
-                                              kReqHeaderMutationOrderDetail);
+                                              stmt.expr.name.eq({"remove", 6})
+                                                  ? kReqHeaderRemoveOrderDetail
+                                                  : kReqHeaderMutationOrderDetail);
                     const u32 guards_before_set = route.guards.len;
                     route.req_header_mutation_stmt_ok = true;
                     auto value = analyze_expr(
@@ -19832,10 +19856,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     if (!value) return core::make_unexpected(value.error());
                     if (route.guards.len > guards_before_set ||
                         (value->kind != HirExprKind::ReqSetHeader &&
-                         value->kind != HirExprKind::ReqAddHeader))
+                         value->kind != HirExprKind::ReqAddHeader &&
+                         value->kind != HirExprKind::ReqRemoveHeader))
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               stmt.span,
-                                              kReqHeaderMutationOrderDetail);
+                                              stmt.expr.name.eq({"remove", 6})
+                                                  ? kReqHeaderRemoveOrderDetail
+                                                  : kReqHeaderMutationOrderDetail);
                     HirLocal local{};
                     local.span = stmt.span;
                     local.name = Str{};

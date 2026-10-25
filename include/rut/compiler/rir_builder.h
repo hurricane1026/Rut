@@ -601,6 +601,12 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_req_remove_header(Str name, SourceLoc loc = {}) {
+        auto r = TRY(emit(Opcode::ReqRemoveHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        return {};
+    }
+
     Result<ValueId> emit_resp_header(Str name, ValueId fallback, SourceLoc loc = {}) {
         if (!val_has_type(fallback, TypeKind::Optional) ||
             cur_func->values[fallback.id].type->inner == nullptr ||

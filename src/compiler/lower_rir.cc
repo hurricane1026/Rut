@@ -2509,7 +2509,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
-    if (value.kind == MirValueKind::ReqSetHeader || value.kind == MirValueKind::ReqAddHeader) {
+    if (value.kind == MirValueKind::ReqSetHeader || value.kind == MirValueKind::ReqAddHeader ||
+        value.kind == MirValueKind::ReqRemoveHeader) {
         if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
         auto val = materialize_value(*value.lhs,
                                      mir,
@@ -2525,7 +2526,10 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                      local_count,
                                      span);
         if (!val) return core::make_unexpected(val.error());
-        const bool emitted = value.kind == MirValueKind::ReqAddHeader
+        const bool emitted = value.kind == MirValueKind::ReqRemoveHeader
+                                 ? static_cast<bool>(b.emit_req_remove_header(
+                                       value.str_value, {span.line, span.col}))
+                             : value.kind == MirValueKind::ReqAddHeader
                                  ? static_cast<bool>(b.emit_req_add_header(
                                        value.str_value, val.value(), {span.line, span.col}))
                                  : static_cast<bool>(b.emit_req_set_header(

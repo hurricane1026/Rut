@@ -13,6 +13,7 @@
 #include "rut/jit/jit_engine.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
@@ -23527,4 +23528,165 @@ TEST(jit, hash_helper_enforces_storage_budget_without_overwriting_prior_results)
     CHECK(first.eq(lit("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")));
     rut_helper_hash(nullptr, &arena, 0x200, "abc", 3, nullptr, 0, &has, &text, &length);
     CHECK_EQ(has, 0u);
+}
+
+TEST(jit, credential_removal_preserves_original_authentication_reads) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    const char* source = R"rut(
+import "middleware/auth.rut"
+upstream backend
+route GET "/bearer" {
+    req.remove("Authorization")
+    req.remove("X-API-Key")
+    req.remove("X-Consumer-ID")
+    let identity = auth.apiKey(req.authorization.or(""), "secret", "consumer", "key-1")
+    if identity.consumerId == "consumer" { return forward(backend, load_balance: .roundRobin) } else { return 403 }
+}
+route GET "/custom" {
+    req.remove("Authorization")
+    req.remove("X-API-Key")
+    req.remove("X-Consumer-ID")
+    let identity = auth.headerKey(req.uniqueHeader("X-API-Key").or(""), "opaque:key", "consumer", "key-2")
+    if identity.credentialId == "key-2" { return forward(backend, load_balance: .roundRobin) } else { return 403 }
+}
+route GET "/branch" {
+    match req.header("X-Strip").or("") {
+        "yes" => { req.remove("Authorization") return 200 }
+        _ => return 200
+    }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    if (!ast)
+        std::fprintf(stderr,
+                     "credential removal parse: %.*s at %u:%u\n",
+                     static_cast<int>(ast.error().detail.len),
+                     ast.error().detail.ptr,
+                     ast.error().span.line,
+                     ast.error().span.col);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "credential removal: %.*s at %u:%u\n",
+                     static_cast<int>(hir.error().detail.len),
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        bool forward;
+    };
+    const Case cases[] = {
+        {0, "Authorization: Bearer secret\r\n", true},
+        {0, "Authorization: Bearer wrong\r\n", false},
+        {0, "", false},
+        {0, "Authorization: Bearer secret\r\nauthorization: Bearer secret\r\n", false},
+        {0, "Authorization: Bearer secret\r\nX-Consumer-ID: attacker\r\n", true},
+        {1, "X-API-Key: opaque:key\r\nAuthorization: garbage\r\n", true},
+        {1, "X-API-Key: wrong\r\n", false},
+        {1, "X-API-Key: opaque:key\r\nx-api-key: opaque:key\r\n", false},
+        {1, "", false},
+        {1, "x-api-key: opaque:key\r\n", true},
+    };
+    Connection conn;
+    conn.reset();
+    for (const auto& test : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", test.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        conn.reset();
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + test.headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action ==
+              (test.forward ? HandlerAction::Forward : HandlerAction::ReturnStatus));
+        if (!test.forward) CHECK(result.status_code == 401);
+        CHECK(conn.req_header_override_count == 3);
+        CHECK(conn.req_header_remove_mask == 7);
+        CHECK(conn.req_header_append_mask == 0);
+        CHECK(conn.req_header_overrides[0].name.eq(lit("Authorization")));
+        CHECK(conn.req_header_overrides[1].name.eq(lit("X-API-Key")));
+        CHECK(conn.req_header_overrides[2].name.eq(lit("X-Consumer-ID")));
+        if (test.forward) {
+            u8 wire[512]{};
+            u32 wire_len = 0;
+            REQUIRE(h2_prepare_forward_request(conn,
+                                               reinterpret_cast<const u8*>(request.data()),
+                                               static_cast<u32>(request.size()),
+                                               wire,
+                                               sizeof(wire),
+                                               &wire_len));
+            const char expected[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            CHECK(wire_len == sizeof(expected) - 1);
+            CHECK(__builtin_memcmp(wire, expected, sizeof(expected) - 1) == 0);
+        }
+    }
+    auto branch_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_2"));
+    REQUIRE(branch_handler != nullptr);
+    for (bool strip : {true, false}) {
+        conn.reset();
+        const char* request = strip ? "GET / HTTP/1.1\r\nHost: localhost\r\nX-Strip: "
+                                      "yes\r\nAuthorization: secret\r\n\r\n"
+                                    : "GET / HTTP/1.1\r\nHost: localhost\r\nX-Strip: "
+                                      "no\r\nAuthorization: secret\r\n\r\n";
+        const auto result = HandlerResult::unpack(branch_handler(
+            &conn, nullptr, reinterpret_cast<const u8*>(request), lit(request).len, nullptr));
+        CHECK(result.status_code == 200);
+        CHECK(conn.req_header_override_count == (strip ? 1 : 0));
+        CHECK(conn.req_header_remove_mask == (strip ? 1 : 0));
+    }
+    conn.reset();
+    CHECK(conn.req_header_remove_mask == 0);
+    CHECK(conn.req_header_override_count == 0);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, direct_ir_credential_removal_overflow_is_explicit) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("remove_overflow"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    for (u32 i = 0; i <= ConnectionBase::kMaxReqHeaderOverrides; ++i)
+        VOK(b.emit_req_remove_header(lit("Authorization")));
+    VOK(b.emit_ret_status(200));
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_remove_overflow"));
+    REQUIRE(handler != nullptr);
+    Connection conn;
+    conn.reset();
+    handler(&conn, nullptr, nullptr, 0, nullptr);
+    CHECK(conn.req_header_override_overflow);
+    CHECK(conn.req_header_override_count == ConnectionBase::kMaxReqHeaderOverrides);
+    CHECK(conn.req_header_remove_mask == 0xffffu);
+    CHECK(conn.req_header_append_mask == 0);
+    engine.shutdown();
 }

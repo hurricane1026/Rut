@@ -153,6 +153,7 @@ enum class HirExprKind : u8 {
     // `req.add("Name", "value")`: preserves existing same-named fields and
     // appends one new field line.
     ReqAddHeader,
+    ReqRemoveHeader,  // Remove all case-insensitive matches before forwarding.
     // Compile-time Response builder. int_value is the validated status code;
     // field_inits stores ordered literal response headers.
     ResponseInit,

@@ -506,6 +506,8 @@ struct ConnectionBase {
     // Bit i selects append semantics (`req.add`) for override slot i; clear
     // means replace/dedupe (`req.set`).
     u16 req_header_append_mask;
+    // Bit i deletes every matching field; mutually exclusive with append.
+    u16 req_header_remove_mask;
     // Set when rut_helper_req_set_header is called past kMaxReqHeaderOverrides
     // (reachable only via direct RIR — the DSL caps + dedupes entries). The apply
     // path fails the request closed so a dropped override can't be forwarded as a
@@ -1983,6 +1985,7 @@ struct ConnectionBase {
         target_transform_recorded = false;
         req_header_override_count = 0;
         req_header_append_mask = 0;
+        req_header_remove_mask = 0;
         req_header_override_overflow = false;
         resp_header_mutation_pending_count = 0;
         resp_header_mutation_pending_overflow = false;

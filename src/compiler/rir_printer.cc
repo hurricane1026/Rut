@@ -210,6 +210,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqAddHeader:
             buf.put_cstr("req.add_header");
             break;
+        case Opcode::ReqRemoveHeader:
+            buf.put_cstr("req.remove_header");
+            break;
         case Opcode::RespHeader:
             buf.put_cstr("resp.header");
             break;
@@ -746,6 +749,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
             break;
+        case Opcode::ReqRemoveHeader:
         case Opcode::RespRemoveHeader:
             buf.put(' ');
             print_quoted_str(buf, inst.imm.str_val);
