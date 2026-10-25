@@ -15978,6 +15978,7 @@ TEST(rate_limit, token_bucket_gcra) {
 TEST(rate_limit, exceeded_helper_meters_and_isolates) {
     using namespace rut;
     struct NoGlobalLoop {
+        RateLimiter rate_limiter{};
     } loop;  // no global_rl member → shard-only limiter
     RateLimitRuleSet rules;
     rules.count = 1;

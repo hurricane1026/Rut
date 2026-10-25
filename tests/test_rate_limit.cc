@@ -19,6 +19,7 @@ TEST(rate_limit_enforce, missing_global_rejects_before_consuming_shard_budget) {
 
 TEST(rate_limit_enforce, missing_global_member_fails_closed) {
     struct Loop {
+        RateLimiter rate_limiter{};
     } loop;
     RateLimitRuleSet rules{};
     REQUIRE_EQ(rules.add_rule(1, 60, 1, RateLimitScope::Global), 0);
@@ -28,6 +29,7 @@ TEST(rate_limit_enforce, missing_global_member_fails_closed) {
 
 TEST(rate_limit_enforce, null_global_pointer_fails_closed) {
     struct Loop {
+        RateLimiter rate_limiter{};
         GlobalRateLimiter* global_rl = nullptr;
     } loop;
     RateLimitRuleSet rules{};
@@ -139,6 +141,23 @@ TEST(rate_limit_enforce, first_rejection_still_meters_every_tail_of_four_rule_st
         CHECK(rate_limit_exceeded_with_limiters(shard, &global, rules, 0, input, 1000));
         rules.rules[i].emit_interval_us = 0;
     }
+}
+
+TEST(rate_limit_enforce, shard_buckets_are_isolated_per_loop_instance) {
+    struct Loop {
+        RateLimiter rate_limiter{};
+    } first, second;
+    RateLimitRuleSet rules{};
+    REQUIRE_EQ(rules.add_rule(1, 60, 1), 0);
+    RateLimitKeyInput input{};
+    input.peer_addr = 1;
+
+    // Both loops run on this test thread; their shard buckets must still be
+    // independent. A function-template thread_local table would fail here.
+    CHECK(!rate_limit_exceeded(&first, rules, 0, input, 1000));
+    CHECK(rate_limit_exceeded(&first, rules, 0, input, 1000));
+    CHECK(!rate_limit_exceeded(&second, rules, 0, input, 1000));
+    CHECK(rate_limit_exceeded(&second, rules, 0, input, 1000));
 }
 
 int main(int argc, char** argv) {

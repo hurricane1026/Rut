@@ -56,6 +56,12 @@ class EventLoopCRTP {
     Derived& self() { return static_cast<Derived&>(*this); }
 
 public:
+    // Per-loop shard limiter for @rateLimit(scope: shard). HTTP/1 and HTTP/2
+    // dispatch through the same loop instance, so they intentionally share this
+    // table. Keeping it on the loop (rather than in rate_limit_exceeded's
+    // function-template thread_local) prevents unrelated loop instances on one
+    // thread from sharing bucket state.
+    RateLimiter rate_limiter{};
     // Set once after the kernel listener has been bound and before shard
     // threads accept connections. It is copied into each allocated connection.
     ListenerContext listener_context{};

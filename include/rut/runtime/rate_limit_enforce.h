@@ -61,10 +61,10 @@ bool rate_limit_exceeded(Loop* loop,
                          u32 route_idx,
                          const RateLimitKeyInput& key_in,
                          u64 now_us) {
-    static thread_local RateLimiter rate_limiter{};
     GlobalRateLimiter* grl = nullptr;
     if constexpr (requires { loop->global_rl; }) grl = loop->global_rl;
-    return rate_limit_exceeded_with_limiters(rate_limiter, grl, rules, route_idx, key_in, now_us);
+    return rate_limit_exceeded_with_limiters(
+        loop->rate_limiter, grl, rules, route_idx, key_in, now_us);
 }
 
 }  // namespace rut
