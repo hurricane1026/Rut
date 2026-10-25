@@ -8040,3 +8040,25 @@ cleansed after comparison. Imported helper challenge strings use the existing
 expression-string decoder and its owned HIR buffers. Request header validation
 runs on decoded bytes before lowering, preventing escaped CR/LF injection.
 Configuration remains static; CLI restart activates rotation/revocation changes.
+
+### JWT claims policy over existing signature verification
+
+`jwtDecode` continues to return signature-verified Json without silently imposing
+new claims rules. The opt-in `jwtClaimsValid(claims, issuer, audience) -> bool`
+profile requires nonempty sub, exact issuer and audience binding (including
+string-array audiences), and unexpired exp, and validates optional nbf/iat.
+It uses bounded existing JSON scratch, rejects duplicate decoded claim names,
+and compares signed i64 integer NumericDates with CLOCK_REALTIME epoch seconds,
+not monotonic process time. The strict profile has zero clock skew and rejects
+fractional/exponent dates rather than rounding. Clock failure or malformed data
+fails closed. It uses the existing JsonOp helper ABI to return a scalar with no
+arena allocation, preserving rut_runtime's independence from LLVM. No keyword,
+cryptographic algorithm, or dependency is added.
+
+The example first calls auth.jwtDocument to extract the unique Authorization
+Bearer token and verify its signature. The ordinary auth.jwtIdentity helper takes the verified Json, applies this
+profile, and decodes the subject before publishing Identity. Signature verification
+remains a distinct step from claims policy. Caller-configured credentialId remains independent of any
+untrusted kid header. Dynamic JWKS and live token/key revocation remain separate
+work; this profile is not a replacement for signature verification or a complete
+OIDC implementation. Exact behavior and bounds are in the language card.
