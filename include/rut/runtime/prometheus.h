@@ -116,6 +116,29 @@ inline u32 format_prometheus(const ShardMetrics& m, char* buf, u32 cap) {
         w.u64v(m.rate_limit_rejected_by_reason[i]);
         w.ch('\n');
     }
+    static constexpr const char* kRateLimitScopes[] = {"shard", "global"};
+    w.str("# HELP rut_rate_limit_rules_evaluated_total Active rate-limit rules evaluated.\n");
+    w.str("# TYPE rut_rate_limit_rules_evaluated_total counter\n");
+    for (u32 scope = 0; scope < ShardMetrics::kRateLimitScopeCount; scope++) {
+        w.str("rut_rate_limit_rules_evaluated_total{scope=\"");
+        w.str(kRateLimitScopes[scope]);
+        w.str("\"} ");
+        w.u64v(m.rate_limit_rules_evaluated_by_scope[scope]);
+        w.ch('\n');
+    }
+    w.str("# HELP rut_rate_limit_rules_rejected_total Active rate-limit rules rejected.\n");
+    w.str("# TYPE rut_rate_limit_rules_rejected_total counter\n");
+    for (u32 scope = 0; scope < ShardMetrics::kRateLimitScopeCount; scope++) {
+        for (u32 reason = 0; reason < ShardMetrics::kRateLimitRuleReasonCount; reason++) {
+            w.str("rut_rate_limit_rules_rejected_total{scope=\"");
+            w.str(kRateLimitScopes[scope]);
+            w.str("\",reason=\"");
+            w.str(kRateLimitReasons[reason]);
+            w.str("\"} ");
+            w.u64v(m.rate_limit_rules_rejected_by_scope_reason[scope][reason]);
+            w.ch('\n');
+        }
+    }
     emit_scalar(
         w, "rut_connections_total", "Total accepted connections.", "counter", m.connections_total);
     emit_scalar(

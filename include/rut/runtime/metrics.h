@@ -62,6 +62,8 @@ struct LatencyHistogram {
 
 struct ShardMetrics {
     static constexpr u32 kRateLimitReasonCount = 5;
+    static constexpr u32 kRateLimitScopeCount = RateLimitDecision::kScopeCount;
+    static constexpr u32 kRateLimitRuleReasonCount = RateLimitDecision::kRuleReasonCount;
     // --- Request metrics ---
     u64 requests_total;   // completed requests
     u64 requests_active;  // currently processing (inc on recv, dec on response sent)
@@ -72,6 +74,8 @@ struct ShardMetrics {
     u64 rate_limit_attempts_total;
     u64 rate_limit_rejected_total;
     u64 rate_limit_rejected_by_reason[kRateLimitReasonCount];
+    u64 rate_limit_rules_evaluated_by_scope[kRateLimitScopeCount];
+    u64 rate_limit_rules_rejected_by_scope_reason[kRateLimitScopeCount][kRateLimitRuleReasonCount];
 
     // Native gRPC RPC lifecycle, independent of connection-level HTTP accounting.
     u64 grpc_started;
@@ -99,6 +103,11 @@ struct ShardMetrics {
         rate_limit_attempts_total = 0;
         rate_limit_rejected_total = 0;
         for (auto& count : rate_limit_rejected_by_reason) count = 0;
+        for (u32 scope = 0; scope < kRateLimitScopeCount; scope++) {
+            rate_limit_rules_evaluated_by_scope[scope] = 0;
+            for (u32 reason = 0; reason < kRateLimitRuleReasonCount; reason++)
+                rate_limit_rules_rejected_by_scope_reason[scope][reason] = 0;
+        }
         grpc_started = grpc_active = 0;
         for (auto& count : grpc_completed) count = 0;
         grpc_latency.init();
@@ -139,6 +148,12 @@ struct ShardMetrics {
 
     void on_rate_limit(const RateLimitDecision& decision) {
         rate_limit_attempts_total++;
+        for (u32 scope = 0; scope < kRateLimitScopeCount; scope++) {
+            rate_limit_rules_evaluated_by_scope[scope] += decision.rules_evaluated_by_scope[scope];
+            for (u32 i = 0; i < kRateLimitRuleReasonCount; i++)
+                rate_limit_rules_rejected_by_scope_reason[scope][i] +=
+                    decision.rules_rejected_by_scope_reason[scope][i];
+        }
         if (decision.allowed) return;
         rate_limit_rejected_total++;
         u32 reason = 0;
@@ -187,6 +202,13 @@ inline ShardMetrics aggregate_metrics(ShardMetrics* const* shards, u32 count) {
         agg.rate_limit_rejected_total += s.rate_limit_rejected_total;
         for (u32 reason = 0; reason < ShardMetrics::kRateLimitReasonCount; reason++)
             agg.rate_limit_rejected_by_reason[reason] += s.rate_limit_rejected_by_reason[reason];
+        for (u32 scope = 0; scope < ShardMetrics::kRateLimitScopeCount; scope++) {
+            agg.rate_limit_rules_evaluated_by_scope[scope] +=
+                s.rate_limit_rules_evaluated_by_scope[scope];
+            for (u32 reason = 0; reason < ShardMetrics::kRateLimitRuleReasonCount; reason++)
+                agg.rate_limit_rules_rejected_by_scope_reason[scope][reason] +=
+                    s.rate_limit_rules_rejected_by_scope_reason[scope][reason];
+        }
         agg.grpc_started += s.grpc_started;
         agg.grpc_active += s.grpc_active;
         for (u32 code = 0; code < 17; code++) agg.grpc_completed[code] += s.grpc_completed[code];

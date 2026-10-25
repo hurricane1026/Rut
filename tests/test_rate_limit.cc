@@ -117,6 +117,54 @@ TEST(rate_limit_enforce, rejecting_rule_still_meters_later_rule_in_each_scope) {
     }
 }
 
+TEST(rate_limit_enforce, detailed_decision_counts_active_rules_by_scope_and_reason) {
+    RateLimiter shard{};
+    GlobalRateLimiter global{};
+    global.reset();
+    RateLimitRuleSet rules{};
+    REQUIRE_EQ(rules.add_rule(1, 60, 1, RateLimitScope::Shard), 0);
+    REQUIRE_EQ(rules.add_rule(1, 60, 1, RateLimitScope::Global), 1);
+    RateLimitKeyInput input{};
+    input.peer_addr = 1;
+    const u64 ids[] = {1, 2, 0, 0};
+
+    auto accepted = rate_limit_decision_with_limiters(shard, &global, rules, ids, input, 1000);
+    CHECK(accepted.allowed);
+    CHECK_EQ(accepted.rules_evaluated_by_scope[0], 1u);
+    CHECK_EQ(accepted.rules_evaluated_by_scope[1], 1u);
+    CHECK_EQ(accepted.rules_rejected_by_scope_reason[0][0], 0u);
+    CHECK_EQ(accepted.rules_rejected_by_scope_reason[1][0], 0u);
+
+    auto rejected = rate_limit_decision_with_limiters(shard, &global, rules, ids, input, 1000);
+    CHECK(!rejected.allowed);
+    CHECK_EQ(rejected.rules_evaluated_by_scope[0], 1u);
+    CHECK_EQ(rejected.rules_evaluated_by_scope[1], 1u);
+    CHECK_EQ(rejected.rules_rejected_by_scope_reason[0][0], 1u);
+    CHECK_EQ(rejected.rules_rejected_by_scope_reason[1][0], 1u);
+
+    const auto preflight =
+        rate_limit_decision_with_limiters(shard, nullptr, rules, ids, input, 1000);
+    CHECK(!preflight.allowed);
+    CHECK_EQ(preflight.rules_evaluated_by_scope[0], 0u);
+    CHECK_EQ(preflight.rules_evaluated_by_scope[1], 0u);
+    CHECK_EQ(preflight.rules_rejected_by_scope_reason[0][0], 0u);
+    CHECK_EQ(preflight.rules_rejected_by_scope_reason[1][0], 0u);
+
+    const auto missing_id = rate_limit_decision_with_limiters(
+        shard, &global, rules, static_cast<const u64*>(nullptr), input, 1000);
+    CHECK(!missing_id.allowed);
+    CHECK_EQ(missing_id.rules_evaluated_by_scope[0], 0u);
+    CHECK_EQ(missing_id.rules_evaluated_by_scope[1], 0u);
+
+    RateLimitRuleSet disabled{};
+    REQUIRE_EQ(disabled.add_rule(0, 60, 1, RateLimitScope::Global), 0);
+    const auto disabled_decision =
+        rate_limit_decision_with_limiters(shard, nullptr, disabled, ids, input, 1000);
+    CHECK(disabled_decision.allowed);
+    CHECK_EQ(disabled_decision.rules_evaluated_by_scope[0], 0u);
+    CHECK_EQ(disabled_decision.rules_evaluated_by_scope[1], 0u);
+}
+
 TEST(rate_limit_enforce, later_rejection_does_not_refund_earlier_rule) {
     const RateLimitScope scopes[] = {RateLimitScope::Shard, RateLimitScope::Global};
     for (auto first_scope : scopes) {
