@@ -1068,6 +1068,7 @@ bool format_response_with_body_and_headers(Connection& conn,
                                            bool headers_only = false,
                                            bool fallback_headers_only = false,
                                            HttpVersion response_version = HttpVersion::Http11);
+
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
 inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config);
 inline bool build_redirect_response(const Connection& conn,
@@ -2809,14 +2810,41 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         key_in.path_len = path_len;
         key_in.params = route_params;
         key_in.param_count = route_param_count;
-        if (rate_limit_exceeded(
-                loop, route->rate_limit, route->rate_limit_ids, key_in, monotonic_us())) {
+        const RateLimitDecision rate_limit = rate_limit_decision(
+            loop, route->rate_limit, route->rate_limit_ids, key_in, monotonic_us());
+        if constexpr (requires { loop->metrics; }) {
+            if (loop->metrics) loop->metrics->on_rate_limit(rate_limit);
+        }
+        if (!rate_limit.allowed) {
             conn.resp_status = 429;
-            format_static_response(conn,
-                                   429,
-                                   /*keep_alive=*/false,
-                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head),
-                                   ordinary_local_response_version(conn));
+            const bool headers_only = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+            if (rate_limit.retry_known) {
+                char retry_after[20];
+                const u32 retry_len =
+                    rate_limit_retry_after_value(rate_limit.next_wait_us, retry_after);
+                const char* reason = status_reason(429);
+                u32 reason_len = 0;
+                while (reason[reason_len] != '\0') reason_len++;
+                const ResponseHeaderKV retry_header{"Retry-After", 11, retry_after, retry_len};
+                format_response_with_body_and_headers(conn,
+                                                      429,
+                                                      reason,
+                                                      reason_len,
+                                                      &retry_header,
+                                                      1,
+                                                      /*keep_alive=*/false,
+                                                      /*body_is_fallback_reason_phrase=*/true,
+                                                      /*suppress_default_content_type=*/true,
+                                                      headers_only,
+                                                      headers_only,
+                                                      ordinary_local_response_version(conn));
+            } else {
+                format_static_response(conn,
+                                       429,
+                                       /*keep_alive=*/false,
+                                       headers_only,
+                                       ordinary_local_response_version(conn));
+            }
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());

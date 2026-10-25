@@ -476,6 +476,27 @@ void h2_emit_status(H2Dispatch<Loop>& d, u32 stream_id, u16 status) {
     h2_emit_response(d, stream_id, status, nullptr, 0, nullptr, 0);
 }
 
+template <typename Loop>
+void h2_emit_rate_limit(H2Dispatch<Loop>& d, u32 stream_id, const RateLimitDecision& decision) {
+    if (!decision.retry_known) {
+        h2_emit_status(d, stream_id, 429);
+        return;
+    }
+    char retry_after[20];
+    const u32 retry_len = rate_limit_retry_after_value(decision.next_wait_us, retry_after);
+    static constexpr char kRetryAfter[] = "retry-after";
+    hpack::Header header{{kRetryAfter, sizeof(kRetryAfter) - 1}, {retry_after, retry_len}};
+    const u32 before = d.resp_len;
+    h2_emit_response(d, stream_id, 429, &header, 1, nullptr, 0, /*allow_fallback=*/false);
+    if (d.overflow) {
+        // Retry-After is advisory. If a constrained HPACK/output buffer cannot
+        // encode it, preserve the rate-limit status rather than synthesizing 500.
+        d.overflow = false;
+        h2_emit_response(d, stream_id, 429, nullptr, 0, nullptr, 0, /*allow_fallback=*/false);
+        if (d.resp_len == before) d.overflow = true;
+    }
+}
+
 // Synthesize a minimal HTTP/1 request from decoded h2 headers into out, so a JIT
 // handler's parse-cache prime (which parses raw HTTP/1 bytes) sees the request.
 // Returns the byte length, or 0 on missing pseudo-headers / overflow.
@@ -1714,9 +1735,13 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         key_in.path_is_trusted = true;  // decoded and validated HTTP/2 :path
         key_in.params = params;
         key_in.param_count = param_count;
-        if (rate_limit_exceeded(
-                d.loop, route->rate_limit, route->rate_limit_ids, key_in, monotonic_us())) {
-            h2_emit_status(d, stream_id, 429);
+        const RateLimitDecision rate_limit = rate_limit_decision(
+            d.loop, route->rate_limit, route->rate_limit_ids, key_in, monotonic_us());
+        if constexpr (requires { d.loop->metrics; }) {
+            if (d.loop->metrics) d.loop->metrics->on_rate_limit(rate_limit);
+        }
+        if (!rate_limit.allowed) {
+            h2_emit_rate_limit(d, stream_id, rate_limit);
             return;
         }
     }

@@ -6850,6 +6850,15 @@ The request passes only when every rule passes. Disabled rules consume nothing;
 a missing required global limiter fails preflight without spending any budget.
 This does not change the policy chosen by Rut code over Cache.
 
+Known rate-limit waits are surfaced as an integer-second `Retry-After` advisory
+on both HTTP/1 and HTTP/2 429 responses (RFC 9110; RFC 6585 §4), rounded up from
+the maximum post-charge GCRA wait across all active stacked rules, including
+accepted rules that consumed a token. Unknown waits (missing IDs/global state or
+timestamp overflow) omit the field. The value is an advisory snapshot under
+concurrent traffic. The existing shard metrics aggregation and Prometheus
+export include bounded rate-limit attempts, rejections, and fixed reason labels;
+they never expose route or key cardinality.
+
 Source (`@rateLimit` is top-level route metadata, not a user helper):
 ```swift
 @rateLimit(limit: 100, window: 1m)

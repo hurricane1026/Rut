@@ -28,6 +28,11 @@ TEST(rate_limit_enforce, missing_global_member_fails_closed) {
     REQUIRE_EQ(rules.add_rule(1, 60, 1, RateLimitScope::Global), 0);
     RateLimitKeyInput input{};
     CHECK(rate_limit_exceeded(&loop, rules, kTestRateLimitIds, input, 1000));
+    const auto decision = rate_limit_decision_with_limiters(
+        loop.rate_limiter, nullptr, rules, kTestRateLimitIds, input, 1000);
+    CHECK(!decision.allowed);
+    CHECK(!decision.retry_known);
+    CHECK_EQ(decision.reject_reason, RateLimitRejectReason::MissingGlobal);
 }
 
 TEST(rate_limit_enforce, null_global_pointer_fails_closed) {
@@ -254,6 +259,80 @@ TEST(rate_limit_arithmetic, conformance_and_state_update_are_overflow_safe) {
     CHECK(global.allow_key(kKey, 1, kMax - 20, kMax - 10));
     CHECK(!shard.allow_key(0x9abc, 10, 0, kMax - 5));
     CHECK(!global.allow_key(0x9abc, 10, 0, kMax - 5));
+}
+
+TEST(rate_limit_decision, reports_wait_reason_and_unknown_fail_closed) {
+    RateLimiter shard{};
+    RateLimitRuleSet rules{};
+    REQUIRE_EQ(rules.add_rule(1, 60, 1), 0);
+    RateLimitKeyInput input{};
+    const auto accepted =
+        rate_limit_decision_with_limiters(shard, nullptr, rules, kTestRateLimitIds, input, 1000);
+    CHECK(accepted.allowed);
+    CHECK(accepted.retry_known);
+    CHECK_EQ(accepted.next_wait_us, 60'000'000ull);
+    const auto rejected =
+        rate_limit_decision_with_limiters(shard, nullptr, rules, kTestRateLimitIds, input, 1000);
+    CHECK(!rejected.allowed);
+    CHECK(rejected.retry_known);
+    CHECK_EQ(rejected.reject_reason, RateLimitRejectReason::Budget);
+    CHECK_EQ(rejected.next_wait_us, 60'000'000ull);
+
+    const u64 missing[] = {0, 0, 0, 0};
+    const auto missing_id =
+        rate_limit_decision_with_limiters(shard, nullptr, rules, missing, input, 1000);
+    CHECK(!missing_id.allowed);
+    CHECK(!missing_id.retry_known);
+    CHECK_EQ(missing_id.reject_reason, RateLimitRejectReason::MissingSemanticId);
+}
+
+TEST(rate_limit_decision, finite_collision_wait_and_overflow_unknown) {
+    RateLimiter shard{};
+    REQUIRE(shard.allow_key(1, 10, 20, 1000));
+    const auto collision = shard.allow_key_detailed(131, 10, 20, 1000);
+    CHECK(!collision.allowed);
+    CHECK(collision.retry_known);
+    CHECK_EQ(collision.reject_reason, RateLimitRejectReason::ShardCollision);
+    CHECK_EQ(collision.next_wait_us, 10ull);
+
+    constexpr u64 kMax = 0xffffffffffffffffull;
+    RateLimiter overflow{};
+    REQUIRE(overflow.allow_key(kTestRateLimitIds[0], 1, 0, kMax - 1));
+    const auto result = overflow.allow_key_detailed(kTestRateLimitIds[0], 10, 0, kMax);
+    CHECK(!result.allowed);
+    CHECK(!result.retry_known);
+    CHECK_EQ(result.reject_reason, RateLimitRejectReason::StateOverflow);
+}
+
+TEST(rate_limit_decision, stacked_post_charge_wait_dominates_global_rejection) {
+    RateLimiter shard{};
+    GlobalRateLimiter global{};
+    global.reset();
+    RateLimitRuleSet rules{};
+    REQUIRE_EQ(rules.add_rule(1, 60, 1, RateLimitScope::Shard), 0);
+    REQUIRE_EQ(rules.add_rule(60, 60, 1, RateLimitScope::Global), 1);
+    RateLimitKeyInput input{};
+    // Consume only the short global budget first. The shard rule remains fresh.
+    const u64 global_key = rate_limit_key(
+        kTestRateLimitIds[1], rules.rules[1].key.comps, rules.rules[1].key.count, input);
+    REQUIRE(global.allow_key(global_key, 1'000'000, 0, 1000));
+    const auto decision =
+        rate_limit_decision_with_limiters(shard, &global, rules, kTestRateLimitIds, input, 1000);
+    CHECK(!decision.allowed);
+    CHECK(decision.retry_known);
+    CHECK_EQ(decision.reject_reason, RateLimitRejectReason::Budget);
+    // The accepted shard rule's 60-second post-charge wait dominates the
+    // rejected global rule's one-second recovery wait.
+    CHECK_EQ(decision.next_wait_us, 60'000'000ull);
+}
+
+TEST(rate_limit_decision, retry_after_uses_integer_second_ceiling) {
+    char value[20];
+    const u32 n = rate_limit_retry_after_value(1'000'001, value);
+    CHECK_EQ(n, 1u);
+    CHECK_EQ(value[0], '2');
+    CHECK_EQ(rate_limit_retry_after_value(0, value), 1u);
+    CHECK_EQ(value[0], '0');
 }
 
 int main(int argc, char** argv) {

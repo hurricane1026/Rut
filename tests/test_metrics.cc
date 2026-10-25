@@ -105,6 +105,28 @@ TEST(shard_metrics, init_zeros) {
     CHECK_EQ(m.connections_total, 0u);
     CHECK_EQ(m.connections_active, 0u);
     CHECK_EQ(m.connections_closed, 0u);
+    CHECK_EQ(m.rate_limit_attempts_total, 0u);
+    CHECK_EQ(m.rate_limit_rejected_total, 0u);
+    for (u32 i = 0; i < ShardMetrics::kRateLimitReasonCount; i++)
+        CHECK_EQ(m.rate_limit_rejected_by_reason[i], 0u);
+}
+
+TEST(shard_metrics, rate_limit_rejection_has_one_stable_reason) {
+    ShardMetrics m;
+    m.init();
+    RateLimitDecision accepted{};
+    m.on_rate_limit(accepted);
+    RateLimitDecision rejected{};
+    rejected.allowed = false;
+    rejected.reject_reason = RateLimitRejectReason::ShardCollision;
+    m.on_rate_limit(rejected);
+    CHECK_EQ(m.rate_limit_attempts_total, 2u);
+    CHECK_EQ(m.rate_limit_rejected_total, 1u);
+    CHECK_EQ(m.rate_limit_rejected_by_reason[1], 1u);
+    CHECK_EQ(m.rate_limit_rejected_by_reason[0] + m.rate_limit_rejected_by_reason[1] +
+                 m.rate_limit_rejected_by_reason[2] + m.rate_limit_rejected_by_reason[3] +
+                 m.rate_limit_rejected_by_reason[4],
+             m.rate_limit_rejected_total);
 }
 
 TEST(shard_metrics, on_accept) {
@@ -164,6 +186,14 @@ TEST(aggregate, two_shards) {
     s2.on_accept();
     s2.on_request_start();
     s2.on_request_complete(2000);  // bucket 3
+    RateLimitDecision s1_reject{};
+    s1_reject.allowed = false;
+    s1_reject.reject_reason = RateLimitRejectReason::Budget;
+    s1.on_rate_limit(s1_reject);
+    RateLimitDecision s2_reject{};
+    s2_reject.allowed = false;
+    s2_reject.reject_reason = RateLimitRejectReason::MissingGlobal;
+    s2.on_rate_limit(s2_reject);
 
     ShardMetrics* ptrs[] = {&s1, &s2};
     auto agg = aggregate_metrics(ptrs, 2);
@@ -175,6 +205,10 @@ TEST(aggregate, two_shards) {
     CHECK_EQ(agg.request_latency.sum_us, 2100u);
     CHECK_EQ(agg.request_latency.buckets[1], 1u);
     CHECK_EQ(agg.request_latency.buckets[3], 1u);
+    CHECK_EQ(agg.rate_limit_attempts_total, 2u);
+    CHECK_EQ(agg.rate_limit_rejected_total, 2u);
+    CHECK_EQ(agg.rate_limit_rejected_by_reason[0], 1u);
+    CHECK_EQ(agg.rate_limit_rejected_by_reason[3], 1u);
 }
 
 TEST(aggregate, empty) {
@@ -246,6 +280,29 @@ TEST_F(MetricsLoopF, records_on_response) {
     CHECK_EQ(self.m.requests_total, 1u);
     CHECK_EQ(self.m.request_latency.count, 1u);
     CHECK(self.m.request_latency.sum_us < 1000000u);
+}
+
+TEST_F(MetricsLoopF, rate_limit_retry_after_h1_wire) {
+    REQUIRE(self.accept_and_recv());
+    self.c->send_buf.reset();
+    static constexpr char kRetry[] = "60";
+    static constexpr char kReason[] = "Too Many Requests";
+    const ResponseHeaderKV header{"Retry-After", 11, kRetry, sizeof(kRetry) - 1};
+    REQUIRE(format_response_with_body_and_headers(*self.c,
+                                                  429,
+                                                  kReason,
+                                                  sizeof(kReason) - 1,
+                                                  &header,
+                                                  1,
+                                                  false,
+                                                  true,
+                                                  true,
+                                                  false,
+                                                  false,
+                                                  HttpVersion::Http11));
+    CHECK(prom_contains(reinterpret_cast<const char*>(self.c->send_buf.data()),
+                        self.c->send_buf.len(),
+                        "Retry-After: 60\r\n"));
 }
 
 TEST(callback_metrics, no_crash_without_metrics) {
@@ -439,16 +496,22 @@ TEST(prometheus, counters_and_histogram) {
     m.init();
     m.requests_total = 5;
     m.connections_active = 3;
+    m.rate_limit_attempts_total = 8;
+    m.rate_limit_rejected_total = 2;
+    m.rate_limit_rejected_by_reason[0] = 1;
+    m.rate_limit_rejected_by_reason[1] = 1;
     m.request_latency.record(50);    // bucket 0 (<100us)
     m.request_latency.record(50);    // bucket 0
     m.request_latency.record(2000);  // bucket 3 (<5ms) — 2000us
     // sum_us = 2100, count = 3
 
-    char buf[4096];
+    char buf[8192];
     const u32 n = format_prometheus(m, buf, sizeof(buf));
     REQUIRE(n > 0);
     CHECK(prom_contains(buf, n, "# TYPE rut_requests_total counter\n"));
     CHECK(prom_contains(buf, n, "rut_requests_total 5\n"));
+    CHECK(prom_contains(buf, n, "rut_rate_limit_attempts_total 8\n"));
+    CHECK(prom_contains(buf, n, "rut_rate_limit_rejected_reason_total{reason=\"budget\"} 1\n"));
     CHECK(prom_contains(buf, n, "# TYPE rut_connections_active gauge\n"));
     CHECK(prom_contains(buf, n, "rut_connections_active 3\n"));
     CHECK(prom_contains(buf, n, "# TYPE rut_request_duration_seconds histogram\n"));
@@ -468,7 +531,7 @@ TEST(prometheus, cumulative_buckets_monotonic) {
     m.request_latency.record(50);       // le 0.0001
     m.request_latency.record(300);      // le 0.0005
     m.request_latency.record(7000000);  // >= 5s → only the +Inf bucket
-    char buf[4096];
+    char buf[8192];
     const u32 n = format_prometheus(m, buf, sizeof(buf));
     REQUIRE(n > 0);
     CHECK(prom_contains(buf, n, "rut_request_duration_seconds_bucket{le=\"0.0001\"} 1\n"));
@@ -493,7 +556,7 @@ TEST(prometheus, serializes_aggregated_metrics) {
     b.requests_total = 7;
     ShardMetrics* shards[] = {&a, &b};
     ShardMetrics agg = aggregate_metrics(shards, 2);
-    char buf[4096];
+    char buf[8192];
     const u32 n = format_prometheus(agg, buf, sizeof(buf));
     REQUIRE(n > 0);
     CHECK(prom_contains(buf, n, "rut_requests_total 17\n"));

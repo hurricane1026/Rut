@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/runtime/rate_limit.h"
 
 namespace rut {
 
@@ -60,9 +61,17 @@ struct LatencyHistogram {
 // on x86-64 are atomic at aligned addresses).
 
 struct ShardMetrics {
+    static constexpr u32 kRateLimitReasonCount = 5;
     // --- Request metrics ---
     u64 requests_total;   // completed requests
     u64 requests_active;  // currently processing (inc on recv, dec on response sent)
+
+    // Rate-limit admission is recorded once per request. Reason slots are fixed
+    // (budget, shard collision, state overflow, missing global, missing ID) so
+    // exposition remains bounded and label cardinality cannot follow user keys.
+    u64 rate_limit_attempts_total;
+    u64 rate_limit_rejected_total;
+    u64 rate_limit_rejected_by_reason[kRateLimitReasonCount];
 
     // Native gRPC RPC lifecycle, independent of connection-level HTTP accounting.
     u64 grpc_started;
@@ -87,6 +96,9 @@ struct ShardMetrics {
     void init() {
         requests_total = 0;
         requests_active = 0;
+        rate_limit_attempts_total = 0;
+        rate_limit_rejected_total = 0;
+        for (auto& count : rate_limit_rejected_by_reason) count = 0;
         grpc_started = grpc_active = 0;
         for (auto& count : grpc_completed) count = 0;
         grpc_latency.init();
@@ -125,6 +137,34 @@ struct ShardMetrics {
 
     void on_request_start() { requests_active++; }
 
+    void on_rate_limit(const RateLimitDecision& decision) {
+        rate_limit_attempts_total++;
+        if (decision.allowed) return;
+        rate_limit_rejected_total++;
+        u32 reason = 0;
+        switch (decision.reject_reason) {
+            case RateLimitRejectReason::Budget:
+                reason = 0;
+                break;
+            case RateLimitRejectReason::ShardCollision:
+                reason = 1;
+                break;
+            case RateLimitRejectReason::StateOverflow:
+                reason = 2;
+                break;
+            case RateLimitRejectReason::MissingGlobal:
+                reason = 3;
+                break;
+            case RateLimitRejectReason::MissingSemanticId:
+                reason = 4;
+                break;
+            case RateLimitRejectReason::None:
+                reason = 0;
+                break;
+        }
+        rate_limit_rejected_by_reason[reason]++;
+    }
+
     void on_request_complete(u32 duration_us) {
         requests_total++;
         if (requests_active > 0) requests_active--;
@@ -143,6 +183,10 @@ inline ShardMetrics aggregate_metrics(ShardMetrics* const* shards, u32 count) {
         const auto& s = *shards[i];
         agg.requests_total += s.requests_total;
         agg.requests_active += s.requests_active;
+        agg.rate_limit_attempts_total += s.rate_limit_attempts_total;
+        agg.rate_limit_rejected_total += s.rate_limit_rejected_total;
+        for (u32 reason = 0; reason < ShardMetrics::kRateLimitReasonCount; reason++)
+            agg.rate_limit_rejected_by_reason[reason] += s.rate_limit_rejected_by_reason[reason];
         agg.grpc_started += s.grpc_started;
         agg.grpc_active += s.grpc_active;
         for (u32 code = 0; code < 17; code++) agg.grpc_completed[code] += s.grpc_completed[code];

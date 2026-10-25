@@ -25,6 +25,22 @@
 // pressure can therefore reject otherwise-conforming keys.
 namespace rut {
 
+enum class RateLimitRejectReason : u8 {
+    None = 0,
+    Budget,
+    ShardCollision,
+    StateOverflow,
+    MissingGlobal,
+    MissingSemanticId,
+};
+
+struct RateLimitDecision {
+    bool allowed = true;
+    bool retry_known = true;
+    u64 next_wait_us = 0;
+    RateLimitRejectReason reject_reason = RateLimitRejectReason::None;
+};
+
 // Per-shard limiter (one thread per shard → no atomics). Value-initialized to all
 // zeros, which reads as an empty/idle bucket for every key.
 struct RateLimiter {
@@ -44,25 +60,47 @@ struct RateLimiter {
     // it conforms. `emit_us` = µs between tokens at the steady rate; `tau_us` =
     // burst tolerance in µs (both precomputed per rule from limit/window/burst).
     // `now_us` is a monotonic microsecond clock. emit_us == 0 disables the rule.
-    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us) {
-        if (emit_us == 0) return true;  // disabled
+    RateLimitDecision allow_key_detailed(u64 key, u64 emit_us, u64 tau_us, u64 now_us) {
+        RateLimitDecision out{};
+        if (emit_us == 0) return out;  // disabled
         u64 h = key * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
         Slot& s = slots[h % kSlots];
         if (s.key != key) {
             // Replacing active state would let alternating colliding keys refill
             // their buckets without waiting. Only a fully idle slot is reusable.
-            if (s.tat > now_us) return false;
+            if (s.tat > now_us) {
+                out.allowed = false;
+                out.reject_reason = RateLimitRejectReason::ShardCollision;
+                out.next_wait_us = s.tat - now_us;
+                return out;
+            }
             s.key = key;
             s.tat = 0;
         }
         // Avoid now+tau overflow: a future TAT conforms iff its distance from
         // now fits within the burst tolerance.
-        if (s.tat > now_us && s.tat - now_us > tau_us) return false;
+        if (s.tat > now_us && s.tat - now_us > tau_us) {
+            out.allowed = false;
+            out.reject_reason = RateLimitRejectReason::Budget;
+            out.next_wait_us = (s.tat - now_us) - tau_us;
+            return out;
+        }
         const u64 kBase = (now_us > s.tat) ? now_us : s.tat;
-        if (kBase > 0xffffffffffffffffull - emit_us) return false;
+        if (kBase > 0xffffffffffffffffull - emit_us) {
+            out.allowed = false;
+            out.retry_known = false;
+            out.reject_reason = RateLimitRejectReason::StateOverflow;
+            return out;
+        }
         s.tat = kBase + emit_us;
-        return true;
+        out.next_wait_us =
+            s.tat > now_us && s.tat - now_us > tau_us ? (s.tat - now_us) - tau_us : 0;
+        return out;
+    }
+
+    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us) {
+        return allow_key_detailed(key, emit_us, tau_us, now_us).allowed;
     }
 };
 
@@ -84,22 +122,40 @@ struct GlobalRateLimiter {
         for (u32 i = 0; i < kSlots; i++) slots[i].store(0, std::memory_order_relaxed);
     }
 
-    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us) {
-        if (emit_us == 0) return true;  // disabled
+    RateLimitDecision allow_key_detailed(u64 key, u64 emit_us, u64 tau_us, u64 now_us) {
+        RateLimitDecision out{};
+        if (emit_us == 0) return out;  // disabled
         u64 h = key * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
         std::atomic<u64>& slot = slots[h % kSlots];
         u64 tat = slot.load(std::memory_order_relaxed);
         for (;;) {
-            if (tat > now_us && tat - now_us > tau_us) return false;  // throttle — read-only
+            if (tat > now_us && tat - now_us > tau_us) {
+                out.allowed = false;
+                out.reject_reason = RateLimitRejectReason::Budget;
+                out.next_wait_us = (tat - now_us) - tau_us;
+                return out;
+            }
             const u64 kBase = (now_us > tat) ? now_us : tat;
-            if (kBase > 0xffffffffffffffffull - emit_us) return false;
+            if (kBase > 0xffffffffffffffffull - emit_us) {
+                out.allowed = false;
+                out.retry_known = false;
+                out.reject_reason = RateLimitRejectReason::StateOverflow;
+                return out;
+            }
             const u64 kNext = kBase + emit_us;
             if (slot.compare_exchange_weak(
-                    tat, kNext, std::memory_order_relaxed, std::memory_order_relaxed))
-                return true;
+                    tat, kNext, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                out.next_wait_us =
+                    kNext > now_us && kNext - now_us > tau_us ? (kNext - now_us) - tau_us : 0;
+                return out;
+            }
             // CAS failed: `tat` reloaded with the current value — retry.
         }
+    }
+
+    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us) {
+        return allow_key_detailed(key, emit_us, tau_us, now_us).allowed;
     }
 };
 
