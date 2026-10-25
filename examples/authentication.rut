@@ -1,0 +1,38 @@
+// Supply the RUT_* environment variables below before compilation/loading.
+// Missing variables fail compilation; empty credentials fail closed with 503.
+// Deploy behind TLS; compiled artifacts also contain these secret constants.
+import "middleware/auth.rut"
+listen :8080
+
+route GET "/identity" {
+    let apiKey = env("RUT_API_KEY")
+    let identity = auth.apiKey(req.authorization.or(""), apiKey, "example-app", "primary")
+    if identity.consumerId == "example-app" {
+        return 200
+    } else {
+        return 403
+    }
+}
+
+// Configure a user:password pair. Passwords may contain additional colons.
+route GET "/basic" {
+    let credentials = env("RUT_BASIC_CREDENTIALS")
+    let identity = auth.basic(req.authorization.or(""), credentials, "example-app", "password-1")
+    if identity.method == "basic" { return 200 } else { return 403 }
+}
+
+// During rotation both keys work; clear previousKey and restart to revoke it.
+route GET "/rotation" {
+    let currentKey = env("RUT_API_KEY_CURRENT")
+    let previousKey = env("RUT_API_KEY_PREVIOUS")
+    let identity = auth.rotatingApiKey(req.authorization.or(""), currentKey, previousKey,
+                                       "example-app", "current", "previous")
+    if identity.credentialId == "current" { return 200 } else { return 201 }
+}
+
+// A custom header key uses uniqueHeader to reject ambiguous duplicate fields.
+route GET "/header-key" {
+    let key = env("RUT_HEADER_KEY")
+    let identity = auth.headerKey(req.uniqueHeader("X-API-Key").or(""), key, "example-app", "header-1")
+    if identity.consumerId == "example-app" { return 200 } else { return 403 }
+}

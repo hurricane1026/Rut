@@ -1,0 +1,77 @@
+// API key authentication. Pass req.authorization.or("") as the first argument.
+// Identity is returned only after verification; never derive it from client headers.
+struct Identity {
+    consumerId: str
+    credentialId: str
+    method: str
+}
+
+// All arguments are positional. key is the opaque key WITHOUT the Bearer prefix.
+// Configuration is a snapshot: replace/remove credentials and redeploy to rotate/revoke.
+func apiKey(_ authorization: str, _ key: str, _ consumerId: str, _ credentialId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard key != "" && consumerId != "" && credentialId != "" else { respond 503 }
+    guard bearerMatches(authorization, key) else {
+        respond denied
+    }
+    Identity(consumerId: consumerId, credentialId: credentialId, method: "apiKey")
+}
+
+// Standard Basic authentication; credentials are the configured "user:password" bytes.
+func basic(_ authorization: str, _ credentials: str, _ consumerId: str, _ credentialId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Basic realm=\"rut\"")
+    guard credentials != "" && consumerId != "" && credentialId != "" else { respond 503 }
+    guard basicMatches(authorization, credentials) else { respond denied }
+    Identity(consumerId: consumerId, credentialId: credentialId, method: "basic")
+}
+
+// Two-key rotation window. Empty keys disable a slot; current wins if both match.
+// Remove the previous key to revoke it. Both slots must have stable, nonempty IDs.
+func rotatingApiKey(_ authorization: str, _ currentKey: str, _ previousKey: str,
+                    _ consumerId: str, _ currentId: str, _ previousId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard consumerId != "" && currentId != "" && previousId != "" else { respond 503 }
+    guard currentKey != "" || previousKey != "" else { respond 503 }
+    let current = bearerMatches(authorization, currentKey)
+    let previous = bearerMatches(authorization, previousKey)
+    guard current || previous else { respond denied }
+    match current {
+        true => Identity(consumerId: consumerId, credentialId: currentId, method: "apiKey")
+        _ => Identity(consumerId: consumerId, credentialId: previousId, method: "apiKey")
+    }
+}
+
+// Custom API key header: pass req.uniqueHeader("X-API-Key").or("").
+// Ordinary header() is not sufficient: it can select the first duplicate field.
+func headerKey(_ presented: str, _ key: str, _ consumerId: str, _ credentialId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "ApiKey")
+    guard key != "" && consumerId != "" && credentialId != "" else { respond 503 }
+    guard constantTimeEqual(presented, key) else { respond denied }
+    Identity(consumerId: consumerId, credentialId: credentialId, method: "apiKey")
+}
+
+// Signature verification remains a distinct step from claims policy.
+func jwtDocument(_ authorization: str, _ secret: str) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard secret != "" else { respond 503 }
+    guard let document = jwtDecode(bearerToken(authorization).or(""), secret) else { respond denied }
+    document
+}
+
+struct JwtSubject { sub: str }
+
+// Pass only a document already verified by jwtDecode; this helper applies claims
+// policy and maps the verified subject, keeping signature verification explicit.
+func jwtIdentity(_ document: Json, _ issuer: str, _ audience: str, _ credentialId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard issuer != "" && audience != "" && credentialId != "" else { respond 503 }
+    guard jwtClaimsValid(document, issuer, audience) else { respond denied }
+    guard let subject = json.decode(JwtSubject, document) else { respond denied }
+    Identity(consumerId: subject.sub, credentialId: credentialId, method: "jwt")
+}

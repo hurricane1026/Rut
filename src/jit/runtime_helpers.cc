@@ -7,9 +7,11 @@
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/auth.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/uuid.h"
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -25,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 using namespace rut;
 
@@ -974,6 +977,20 @@ u8 rut_helper_str_has_prefix(const char* s, u32 s_len, const char* pfx, u32 pfx_
     return 1;
 }
 
+u8 rut_helper_bearer_matches(const char* authorization,
+                             u32 authorization_len,
+                             const char* key,
+                             u32 key_len) {
+    return bearer_matches({authorization, authorization_len}, {key, key_len});
+}
+
+u8 rut_helper_basic_matches(const char* authorization,
+                            u32 authorization_len,
+                            const char* credentials,
+                            u32 credentials_len) {
+    return basic_matches({authorization, authorization_len}, {credentials, credentials_len});
+}
+
 u8 rut_helper_str_constant_time_equal(const char* a, u32 a_len, const char* b, u32 b_len) {
     if (a_len != b_len || a_len > kMaxConstantTimeEqualBytes) return 0;
     if (a_len == 0) return 1;
@@ -1801,14 +1818,28 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
-    if (op > static_cast<u32>(json::Op::JwtDecode)) return;
+    if (op > static_cast<u32>(json::Op::JwtClaimsValid)) return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
     json::Writer writer{bytes};
     Str view{};
     i64 scalar = 0;
     const auto operation = static_cast<json::Op>(op);
-    if (operation == json::Op::JwtDecode) {
+    if (operation == json::Op::JwtClaimsValid) {
+        struct timespec now{};
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+            now.tv_nsec >= 1000000000)
+            return;
+        scalar = jwt_claims_valid(
+                     document, {a, a_len}, {b, b_len}, {c, c_len}, static_cast<i64>(now.tv_sec))
+                     ? 1
+                     : 0;
+        // This boolean operation borrows no output and needs no JSON arena.
+        view = {"", 0};
+    } else if (operation == json::Op::BearerToken) {
+        view = bearer_token({a, a_len});
+        if (view.ptr == nullptr) return;
+    } else if (operation == json::Op::JwtDecode) {
         char payload[json::kMaxBytes];
         u32 payload_len = 0;
         if (!jwt_decode_claims({a, a_len}, {b, b_len}, document, payload, payload_len)) return;
