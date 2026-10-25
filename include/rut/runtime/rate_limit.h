@@ -35,10 +35,16 @@ enum class RateLimitRejectReason : u8 {
 };
 
 struct RateLimitDecision {
+    static constexpr u32 kScopeCount = 2;
+    static constexpr u32 kRuleReasonCount = 3;
     bool allowed = true;
     bool retry_known = true;
     u64 next_wait_us = 0;
     RateLimitRejectReason reject_reason = RateLimitRejectReason::None;
+    // Per-rule telemetry for the fixed-size stacked-rule policy. These are
+    // intentionally tiny and carry no route/key identity.
+    u8 rules_evaluated_by_scope[kScopeCount]{};
+    u8 rules_rejected_by_scope_reason[kScopeCount][kRuleReasonCount]{};
 };
 
 // Per-shard limiter (one thread per shard → no atomics). Value-initialized to all

@@ -6857,7 +6857,10 @@ accepted rules that consumed a token. Unknown waits (missing IDs/global state or
 timestamp overflow) omit the field. The value is an advisory snapshot under
 concurrent traffic. The existing shard metrics aggregation and Prometheus
 export include bounded rate-limit attempts, rejections, and fixed reason labels;
-they never expose route or key cardinality.
+they never expose route or key cardinality. Rule-level exports additionally
+count active rules evaluated and rejected by fixed `scope` and reason labels;
+the rule-level reason set is `budget`, `shard_collision`, and `state_overflow`;
+preflight failures contribute no rule-level counts.
 
 Source (`@rateLimit` is top-level route metadata, not a user helper):
 ```swift

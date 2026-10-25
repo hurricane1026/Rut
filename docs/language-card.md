@@ -947,7 +947,11 @@ IDs, missing global state, and timestamp overflow omit the header. The value is 
 snapshot and is not a reservation under concurrent traffic. The runtime exposes
 fixed-cardinality per-shard attempt, rejection, and rejection reason counters
 through `/metrics`; reason counters have stable labels and never include routes
-or metering keys.
+or metering keys. Rule-level counters are likewise fixed-cardinality, labelled
+only by `scope` (`shard`/`global`) and the three actual rule reasons
+(`budget`, `shard_collision`, `state_overflow`). They count every
+active stacked rule reached, including rules after an earlier rejection;
+missing semantic IDs or global state fail in preflight and add no rule counts.
 
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)

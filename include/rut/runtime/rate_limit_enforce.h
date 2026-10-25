@@ -46,6 +46,22 @@ inline bool rate_limit_reason_precedes(RateLimitRejectReason a, RateLimitRejectR
     return rank(a) > rank(b);
 }
 
+inline u32 rate_limit_reason_index(RateLimitRejectReason reason) {
+    switch (reason) {
+        case RateLimitRejectReason::Budget:
+            return 0;
+        case RateLimitRejectReason::ShardCollision:
+            return 1;
+        case RateLimitRejectReason::StateOverflow:
+            return 2;
+        case RateLimitRejectReason::MissingGlobal:
+        case RateLimitRejectReason::MissingSemanticId:
+        case RateLimitRejectReason::None:
+            return 0;
+    }
+    return 0;
+}
+
 inline RateLimitDecision rate_limit_decision_with_limiters(RateLimiter& rate_limiter,
                                                            GlobalRateLimiter* global_rate_limiter,
                                                            const RateLimitRuleSet& rules,
@@ -82,6 +98,8 @@ inline RateLimitDecision rate_limit_decision_with_limiters(RateLimiter& rate_lim
     for (u32 ri = 0; ri < rules.count; ri++) {
         const RateLimitRule& rule = rules.rules[ri];
         if (rule.emit_interval_us == 0) continue;
+        const u32 scope = rule.scope == RateLimitScope::Global ? 1u : 0u;
+        out.rules_evaluated_by_scope[scope]++;
         const u64 key = rate_limit_key(rate_limit_ids[ri], rule.key.comps, rule.key.count, key_in);
         const RateLimitDecision current =
             rule.scope == RateLimitScope::Global
@@ -91,6 +109,8 @@ inline RateLimitDecision rate_limit_decision_with_limiters(RateLimiter& rate_lim
         if (current.next_wait_us > out.next_wait_us) out.next_wait_us = current.next_wait_us;
         if (!current.retry_known) out.retry_known = false;
         if (!current.allowed) {
+            const u32 reason = rate_limit_reason_index(current.reject_reason);
+            out.rules_rejected_by_scope_reason[scope][reason]++;
             out.allowed = false;
             if (out.reject_reason == RateLimitRejectReason::None ||
                 rate_limit_reason_precedes(current.reject_reason, out.reject_reason))

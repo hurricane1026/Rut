@@ -115,10 +115,14 @@ TEST(shard_metrics, rate_limit_rejection_has_one_stable_reason) {
     ShardMetrics m;
     m.init();
     RateLimitDecision accepted{};
+    accepted.rules_evaluated_by_scope[0] = 1;
+    accepted.rules_evaluated_by_scope[1] = 1;
     m.on_rate_limit(accepted);
     RateLimitDecision rejected{};
     rejected.allowed = false;
     rejected.reject_reason = RateLimitRejectReason::ShardCollision;
+    rejected.rules_evaluated_by_scope[0] = 1;
+    rejected.rules_rejected_by_scope_reason[0][1] = 1;
     m.on_rate_limit(rejected);
     CHECK_EQ(m.rate_limit_attempts_total, 2u);
     CHECK_EQ(m.rate_limit_rejected_total, 1u);
@@ -127,6 +131,9 @@ TEST(shard_metrics, rate_limit_rejection_has_one_stable_reason) {
                  m.rate_limit_rejected_by_reason[2] + m.rate_limit_rejected_by_reason[3] +
                  m.rate_limit_rejected_by_reason[4],
              m.rate_limit_rejected_total);
+    CHECK_EQ(m.rate_limit_rules_evaluated_by_scope[0], 2u);
+    CHECK_EQ(m.rate_limit_rules_evaluated_by_scope[1], 1u);
+    CHECK_EQ(m.rate_limit_rules_rejected_by_scope_reason[0][1], 1u);
 }
 
 TEST(shard_metrics, on_accept) {
@@ -189,10 +196,14 @@ TEST(aggregate, two_shards) {
     RateLimitDecision s1_reject{};
     s1_reject.allowed = false;
     s1_reject.reject_reason = RateLimitRejectReason::Budget;
+    s1_reject.rules_evaluated_by_scope[0] = 1;
+    s1_reject.rules_rejected_by_scope_reason[0][0] = 1;
     s1.on_rate_limit(s1_reject);
     RateLimitDecision s2_reject{};
     s2_reject.allowed = false;
-    s2_reject.reject_reason = RateLimitRejectReason::MissingGlobal;
+    s2_reject.reject_reason = RateLimitRejectReason::Budget;
+    s2_reject.rules_evaluated_by_scope[1] = 1;
+    s2_reject.rules_rejected_by_scope_reason[1][0] = 1;
     s2.on_rate_limit(s2_reject);
 
     ShardMetrics* ptrs[] = {&s1, &s2};
@@ -207,8 +218,11 @@ TEST(aggregate, two_shards) {
     CHECK_EQ(agg.request_latency.buckets[3], 1u);
     CHECK_EQ(agg.rate_limit_attempts_total, 2u);
     CHECK_EQ(agg.rate_limit_rejected_total, 2u);
-    CHECK_EQ(agg.rate_limit_rejected_by_reason[0], 1u);
-    CHECK_EQ(agg.rate_limit_rejected_by_reason[3], 1u);
+    CHECK_EQ(agg.rate_limit_rejected_by_reason[0], 2u);
+    CHECK_EQ(agg.rate_limit_rules_evaluated_by_scope[0], 1u);
+    CHECK_EQ(agg.rate_limit_rules_evaluated_by_scope[1], 1u);
+    CHECK_EQ(agg.rate_limit_rules_rejected_by_scope_reason[0][0], 1u);
+    CHECK_EQ(agg.rate_limit_rules_rejected_by_scope_reason[1][0], 1u);
 }
 
 TEST(aggregate, empty) {
@@ -500,6 +514,9 @@ TEST(prometheus, counters_and_histogram) {
     m.rate_limit_rejected_total = 2;
     m.rate_limit_rejected_by_reason[0] = 1;
     m.rate_limit_rejected_by_reason[1] = 1;
+    m.rate_limit_rules_evaluated_by_scope[0] = 3;
+    m.rate_limit_rules_evaluated_by_scope[1] = 2;
+    m.rate_limit_rules_rejected_by_scope_reason[0][1] = 1;
     m.request_latency.record(50);    // bucket 0 (<100us)
     m.request_latency.record(50);    // bucket 0
     m.request_latency.record(2000);  // bucket 3 (<5ms) — 2000us
@@ -512,6 +529,11 @@ TEST(prometheus, counters_and_histogram) {
     CHECK(prom_contains(buf, n, "rut_requests_total 5\n"));
     CHECK(prom_contains(buf, n, "rut_rate_limit_attempts_total 8\n"));
     CHECK(prom_contains(buf, n, "rut_rate_limit_rejected_reason_total{reason=\"budget\"} 1\n"));
+    CHECK(prom_contains(buf, n, "rut_rate_limit_rules_evaluated_total{scope=\"shard\"} 3\n"));
+    CHECK(prom_contains(
+        buf,
+        n,
+        "rut_rate_limit_rules_rejected_total{scope=\"shard\",reason=\"shard_collision\"} 1\n"));
     CHECK(prom_contains(buf, n, "# TYPE rut_connections_active gauge\n"));
     CHECK(prom_contains(buf, n, "rut_connections_active 3\n"));
     CHECK(prom_contains(buf, n, "# TYPE rut_request_duration_seconds histogram\n"));
