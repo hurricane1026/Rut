@@ -7,6 +7,7 @@
 #include "test_helpers.h"
 
 #include <nghttp2/nghttp2.h>
+#include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #if RUT_GRPC_JIT
@@ -23,6 +24,56 @@
 using namespace rut;
 
 namespace {
+template <typename Call>
+inline bool grpc_test_ssl_call(SSL* ssl,
+                               int fd,
+                               u64 deadline_us,
+                               int* result,
+                               int* error_number,
+                               int* ssl_error,
+                               unsigned long* openssl_error,
+                               std::atomic<u32>* retry_count,
+                               Call&& call) {
+    for (;;) {
+        const u64 now = monotonic_us();
+        if (now >= deadline_us) {
+            *error_number = ETIMEDOUT;
+            *ssl_error = SSL_ERROR_SYSCALL;
+            *openssl_error = ERR_peek_error();
+            *result = -1;
+            return false;
+        }
+        const u64 remaining = deadline_us - now;
+        timeval timeout{static_cast<time_t>(remaining / 1000000),
+                        static_cast<suseconds_t>(remaining % 1000000)};
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+            *error_number = errno;
+            *ssl_error = SSL_ERROR_SYSCALL;
+            *openssl_error = ERR_peek_error();
+            *result = -1;
+            return false;
+        }
+        ERR_clear_error();
+        errno = 0;
+        *result = call();
+        if (*result > 0) return true;
+        *error_number = errno;
+        *ssl_error = SSL_get_error(ssl, *result);
+        *openssl_error = ERR_peek_error();
+        const bool interrupted = *error_number == EINTR && (*ssl_error == SSL_ERROR_WANT_READ ||
+                                                            *ssl_error == SSL_ERROR_WANT_WRITE ||
+                                                            *ssl_error == SSL_ERROR_SYSCALL);
+        if (!interrupted) return false;
+        if (retry_count) retry_count->fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+volatile sig_atomic_t grpc_test_signal_count = 0;
+void grpc_test_signal_handler(int) {
+    grpc_test_signal_count = grpc_test_signal_count + 1;
+}
+
 u64 grpc_jit_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_forward(0).pack();
 }
@@ -121,6 +172,9 @@ struct EchoServer {
     std::atomic<bool> saw_sni{false};
     std::atomic<bool> saw_client_cert{false};
     std::atomic<u32> bad_schemes{0};
+    std::atomic<bool> pause_handshake{false};
+    std::atomic<bool> handshake_waiting{false};
+    int handshake_gate[2] = {-1, -1};
     Stream* get(int id) {
         for (auto& s : streams)
             if (s.id == id) return &s;
@@ -300,6 +354,13 @@ struct EchoServer {
             set_socket_timeouts(self->fd, 2);
             SSL* ssl = nullptr;
             if (self->tls_context) {
+                if (self->pause_handshake.load(std::memory_order_acquire)) {
+                    self->handshake_waiting.store(true, std::memory_order_release);
+                    u8 release = 0;
+                    while (read(self->handshake_gate[0], &release, 1) < 0 && errno == EINTR) {
+                    }
+                    self->handshake_waiting.store(false, std::memory_order_release);
+                }
                 auto created = create_tls_server_ssl(self->tls_context, self->fd);
                 if (created) ssl = created.value();
                 if (!ssl || SSL_accept(ssl) != 1) {
@@ -359,12 +420,20 @@ struct EchoServer {
         }
         listen_fd = create_listen_socket(0).value_or(-1);
         if (listen_fd < 0) return false;
+        if (pause_handshake.load(std::memory_order_relaxed) && pipe(handshake_gate) != 0)
+            return false;
         started = pthread_create(&thread, nullptr, &run, this) == 0;
         return started;
     }
     ~EchoServer() {
         stop = true;
+        if (handshake_gate[1] >= 0) {
+            const u8 release = 1;
+            (void)write(handshake_gate[1], &release, 1);
+        }
         if (started) pthread_join(thread, nullptr);
+        if (handshake_gate[0] >= 0) close(handshake_gate[0]);
+        if (handshake_gate[1] >= 0) close(handshake_gate[1]);
         if (listen_fd >= 0) close(listen_fd);
         destroy_tls_server_context(tls_context);
     }
@@ -372,6 +441,8 @@ struct EchoServer {
 struct Client {
     SSL_CTX* tls_context = nullptr;
     SSL* ssl = nullptr;
+    std::atomic<u32> tls_connect_retries{0};
+    std::atomic<bool> tls_connecting{false};
     struct Rpc {
         u32 sent = 0, received = 0, size = 0;
         u32 status = 99;
@@ -445,20 +516,62 @@ struct Client {
         static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].closed = true;
         return 0;
     }
-    bool init(u16 port, bool tls = false) {
+    bool init(u16 port, bool tls = false, const char* client_name = "client") {
+        auto report_init_failure = [&](const char* stage, int result, int tls_error = 0) {
+            const int saved_errno = errno;
+            const unsigned long openssl_error = ERR_get_error();
+            char openssl_message[256]{};
+            if (openssl_error != 0)
+                ERR_error_string_n(openssl_error, openssl_message, sizeof(openssl_message));
+            fprintf(stderr,
+                    "grpc test client %s init failed at %s: port=%u fd=%d result=%d "
+                    "tls_error=%d errno=%d retries=%u openssl_error=%s\n",
+                    client_name,
+                    stage,
+                    port,
+                    fd,
+                    result,
+                    tls_error,
+                    saved_errno,
+                    tls_connect_retries.load(std::memory_order_relaxed),
+                    openssl_message[0] ? openssl_message : "none");
+            return false;
+        };
+        ERR_clear_error();
         fd = connect_to(port);
-        if (fd < 0) return false;
+        if (fd < 0) return report_init_failure("connect", fd);
         set_socket_timeouts(fd, 5);
         if (tls) {
             tls_context = SSL_CTX_new(TLS_client_method());
-            if (!tls_context) return false;
+            if (!tls_context) return report_init_failure("SSL_CTX_new", 0);
             ssl = SSL_new(tls_context);
             const u8 alpn[] = {2, 'h', '2'};
-            if (!ssl || !SSL_set_fd(ssl, fd) || SSL_set_alpn_protos(ssl, alpn, sizeof(alpn)) != 0 ||
-                SSL_connect(ssl) != 1)
-                return false;
+            if (!ssl) return report_init_failure("SSL_new", 0);
+            if (!SSL_set_fd(ssl, fd)) return report_init_failure("SSL_set_fd", 0);
+            const int alpn_rc = SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
+            if (alpn_rc != 0) return report_init_failure("SSL_set_alpn_protos", alpn_rc);
+            const u64 tls_deadline = monotonic_us() + 5000000;
+            int connect_rc = 0, connect_errno = 0, tls_error = 0;
+            unsigned long openssl_error = 0;
+            tls_connecting.store(true, std::memory_order_release);
+            const bool connected = grpc_test_ssl_call(ssl,
+                                                      fd,
+                                                      tls_deadline,
+                                                      &connect_rc,
+                                                      &connect_errno,
+                                                      &tls_error,
+                                                      &openssl_error,
+                                                      &tls_connect_retries,
+                                                      [&] { return SSL_connect(ssl); });
+            tls_connecting.store(false, std::memory_order_release);
+            if (!connected) {
+                errno = connect_errno;
+                return report_init_failure("SSL_connect", connect_rc, tls_error);
+            }
+            set_socket_timeouts(fd, 5);
         }
-        return init_session();
+        if (!init_session()) return report_init_failure("nghttp2_session", 0);
+        return true;
     }
     bool init_session() {
         nghttp2_session_callbacks* cb = nullptr;
@@ -633,7 +746,7 @@ void streaming_case(rut::test::TestCase* _tc,
     // No REQUIRE after spawning: always stop/join before destroying config.
     {
         Client a, b;
-        const bool connected = a.init(get_port(lfd), tls) && b.init(get_port(lfd), tls);
+        const bool connected = a.init(get_port(lfd), tls, "a") && b.init(get_port(lfd), tls, "b");
         CHECK(connected);
         if (connected) {
             CHECK_EQ(a.request(0, large_first ? 200000 : 128, false), 1);
@@ -730,7 +843,7 @@ void streaming_case(rut::test::TestCase* _tc,
                 // A client disconnect retires its open RPC as CANCELLED.
                 {
                     Client disconnected;
-                    CHECK(disconnected.init(get_port(lfd), tls));
+                    CHECK(disconnected.init(get_port(lfd), tls, "disconnected"));
                     CHECK_EQ(disconnected.request(0, 32, false), 1);
                     CHECK(disconnected.until(0, false));
                 }
@@ -3244,6 +3357,136 @@ TEST(grpc_proxy, idle_upstream_close_policy_respects_drain_and_activity) {
     g.active = 0;
     CHECK(!grpc_idle_upstream_should_close(g, false, false, 5001, 1000));
     CHECK(grpc_idle_upstream_should_close(g, false, false, 6000, 1000));
+}
+TEST(grpc_proxy, tls_client_init_retries_handshake_eintr) {
+    EchoServer server;
+    server.pause_handshake = true;
+    REQUIRE(server.start(true));
+
+    Client client;
+    struct ClientCall {
+        u16 port;
+        Client* client;
+        std::atomic<bool> initialized{false};
+    } call{get_port(server.listen_fd), &client};
+    auto run_client = +[](void* ptr) -> void* {
+        auto* call = static_cast<ClientCall*>(ptr);
+        call->initialized.store(call->client->init(call->port, true, "signal-test"),
+                                std::memory_order_release);
+        return nullptr;
+    };
+
+    struct sigaction action{}, old_action{};
+    action.sa_handler = grpc_test_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    grpc_test_signal_count = 0;
+    REQUIRE(sigaction(SIGUSR1, &action, &old_action) == 0);
+
+    pthread_t client_thread{};
+    const int thread_result = pthread_create(&client_thread, nullptr, run_client, &call);
+    if (thread_result != 0) {
+        sigaction(SIGUSR1, &old_action, nullptr);
+        CHECK_EQ(thread_result, 0);
+        return;
+    }
+
+    const u64 ready_deadline = monotonic_us() + 3000000;
+    while ((!server.handshake_waiting.load(std::memory_order_acquire) ||
+            !client.tls_connecting.load(std::memory_order_acquire)) &&
+           monotonic_us() < ready_deadline)
+        sched_yield();
+    const bool ready = server.handshake_waiting.load(std::memory_order_acquire) &&
+                       client.tls_connecting.load(std::memory_order_acquire);
+    CHECK(ready);
+
+    const u64 signal_deadline = monotonic_us() + 2000000;
+    while (ready && client.tls_connect_retries.load(std::memory_order_relaxed) == 0 &&
+           monotonic_us() < signal_deadline) {
+        CHECK_EQ(pthread_kill(client_thread, SIGUSR1), 0);
+        sched_yield();
+    }
+    CHECK_GT(client.tls_connect_retries.load(std::memory_order_relaxed), 0u);
+
+    const u8 release = 1;
+    CHECK_EQ(write(server.handshake_gate[1], &release, 1), 1);
+    pthread_join(client_thread, nullptr);
+    CHECK_GT(grpc_test_signal_count, 0);
+    CHECK(call.initialized.load(std::memory_order_acquire));
+    sigaction(SIGUSR1, &old_action, nullptr);
+}
+TEST(grpc_proxy, tls_client_init_rejects_non_eintr_without_retry) {
+    SSL_CTX* context = SSL_CTX_new(TLS_client_method());
+    REQUIRE(context != nullptr);
+    SSL* ssl = SSL_new(context);
+    REQUIRE(ssl != nullptr);
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
+    std::atomic<u32> retries{0};
+    int result = 0, error_number = 0, ssl_error = 0;
+    unsigned long openssl_error = 0;
+    u32 calls = 0;
+    const bool connected = grpc_test_ssl_call(ssl,
+                                              fd,
+                                              monotonic_us() + 1000000,
+                                              &result,
+                                              &error_number,
+                                              &ssl_error,
+                                              &openssl_error,
+                                              &retries,
+                                              [&] {
+                                                  calls++;
+                                                  errno = ECONNRESET;
+                                                  return -1;
+                                              });
+    CHECK(!connected);
+    CHECK_EQ(calls, 1u);
+    CHECK_EQ(retries.load(std::memory_order_relaxed), 0u);
+    CHECK_EQ(error_number, ECONNRESET);
+    calls = 0;
+    result = 0;
+    error_number = 0;
+    ssl_error = 0;
+    const bool would_block = grpc_test_ssl_call(ssl,
+                                                fd,
+                                                monotonic_us() + 1000000,
+                                                &result,
+                                                &error_number,
+                                                &ssl_error,
+                                                &openssl_error,
+                                                &retries,
+                                                [&] {
+                                                    calls++;
+                                                    errno = EAGAIN;
+                                                    return -1;
+                                                });
+    CHECK(!would_block);
+    CHECK_EQ(calls, 1u);
+    CHECK_EQ(retries.load(std::memory_order_relaxed), 0u);
+    CHECK_EQ(error_number, EAGAIN);
+    calls = 0;
+    result = 0;
+    error_number = 0;
+    ssl_error = 0;
+    const bool expired = grpc_test_ssl_call(ssl,
+                                            fd,
+                                            monotonic_us() - 1,
+                                            &result,
+                                            &error_number,
+                                            &ssl_error,
+                                            &openssl_error,
+                                            &retries,
+                                            [&] {
+                                                calls++;
+                                                return -1;
+                                            });
+    CHECK(!expired);
+    CHECK_EQ(calls, 0u);
+    CHECK_EQ(retries.load(std::memory_order_relaxed), 0u);
+    CHECK_EQ(error_number, ETIMEDOUT);
+    close(fd);
+    SSL_free(ssl);
+    SSL_CTX_free(context);
 }
 TEST(grpc_proxy, tls_downstream_jit_epoll) {
     streaming_case<EpollEventLoop>(_tc, true);
