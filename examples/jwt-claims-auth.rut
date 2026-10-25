@@ -4,14 +4,14 @@ import "middleware/auth.rut"
 listen :8080
 
 route GET "/identity" {
-    let document = auth.jwtDocumentWithAlgorithm(req.authorization.or(""), env("JWT_SECRET"), "HS256")
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
     let identity = auth.jwtIdentity(document, env("JWT_ISSUER"), env("JWT_AUDIENCE"), "issuer-key")
     let subject = identity.consumerId
     return response(200, body: subject)
 }
 
 route GET "/orders" {
-    let document = auth.jwtDocumentWithAlgorithm(req.authorization.or(""), env("JWT_SECRET"), "HS256")
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
     let identity = auth.jwtIdentity(document, env("JWT_ISSUER"), env("JWT_AUDIENCE"), "issuer-key")
     guard jwtHasScope(document, "orders:read") else { return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""}) }
     let subject = identity.consumerId
