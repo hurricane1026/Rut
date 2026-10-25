@@ -962,7 +962,7 @@ TEST(json_network, signed_jwt_claims_gate_identity_publication) {
     REQUIRE(program.init(R"rut(
 import "middleware/auth.rut"
 route GET "/identity" {
-    let document = auth.jwtDocumentWithAlgorithm(req.authorization.or(""), "01234567890123456789012345678901", "HS256")
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), "01234567890123456789012345678901")
     let identity = auth.jwtIdentity(document, "issuer", "gateway", "issuer-key")
     guard jwtHasScope(document, "orders:read") else { return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""}) }
     guard req.path != "/all" || jwtHasScope(document, "orders:write") else { return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""}) }
@@ -1071,17 +1071,16 @@ route GET "/identity" {
     pool.destroy();
 }
 
-TEST(json_network, jwt_algorithm_middleware_rejects_invalid_configuration) {
+TEST(json_network, jwt_algorithm_middleware_rejects_empty_secret) {
     const std::string file = __FILE__;
     const std::string source_path =
         file.substr(0, file.rfind("/tests/")) + "/examples/jwt-claims-auth.rut";
-    for (const char* algorithm : {"", "none", "hs256", "RS256"}) {
+    for (const char* helper : {"jwtDocumentHs256", "jwtDocumentHs384", "jwtDocumentHs512"}) {
         JsonProgram program;
         const std::string source =
             "import \"middleware/auth.rut\"\nroute GET \"/\" { "
-            "let doc = auth.jwtDocumentWithAlgorithm(req.authorization.or(\"\"), "
-            "\"01234567890123456789012345678901\", \"" +
-            std::string(algorithm) + "\") return 200 }";
+            "let doc = auth." +
+            std::string(helper) + "(req.authorization.or(\"\"), \"\") return 200 }";
         REQUIRE(program.init(source.c_str(), source_path.c_str()));
         auto loop = std::make_unique<SmallLoop>();
         loop->setup();

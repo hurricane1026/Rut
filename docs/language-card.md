@@ -1396,7 +1396,10 @@ See [hashing.rut](../examples/hashing.rut).
 ### Explicit JWT algorithm policy
 
 `jwtDecode(token, secret, algorithm) -> Json?` binds verification to one trusted
-algorithm string: exactly `HS256`, `HS384` or `HS512`. The decoded JOSE `alg`
+algorithm string: exactly `HS256`, `HS384` or `HS512`. The third argument must
+be provable at compile time (a literal, constant local or resolved `env()`);
+request-derived values and dynamic helper parameters are rejected. Use the
+fixed-algorithm middleware helpers when wrapping verification. The decoded JOSE `alg`
 must match it. Empty, unsupported, case-mismatched or malformed policy returns
 nil, even for an otherwise valid signature. The existing minimum key lengths
 and strict JOSE/Base64url/JSON checks still apply. Algorithm policy is configuration,
@@ -1405,8 +1408,9 @@ never a value copied from the token or request. This follows
 
 The two-argument overload retains its existing HS256/384/512 behavior for
 compatibility. Prefer the three-argument overload for new deployments.
-`auth.jwtDocumentWithAlgorithm(authorization, secret, algorithm)` maps empty or
-unsupported configuration to 503 and invalid tokens to a challenged 401.
+`auth.jwtDocumentHs256` / `auth.jwtDocumentHs384` / `auth.jwtDocumentHs512`
+bind the selected algorithm in configuration; empty secrets map to 503 and
+invalid tokens to a challenged 401.
 `examples/jwt-claims-auth.rut` pins HS256 before checking issuer, audience,
 expiry and scopes. Signature verification does not replace claims policy.
 This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism;

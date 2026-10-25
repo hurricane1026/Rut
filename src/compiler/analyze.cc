@@ -9217,6 +9217,13 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.span,
                                       lit_str("jwtDecode algorithm requires an unwrapped str"));
+            ConstValue known_algorithm{};
+            if (!const_eval_expr(analyzed.value(), locals, local_count, &known_algorithm, 0) ||
+                known_algorithm.type != HirTypeKind::Str)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("jwtDecode algorithm must be compile-time configuration"));
             algorithm = analyzed.value();
         }
         return make_json_op(expr.args.len == 3 ? json::Op::JwtDecodePinned : json::Op::JwtDecode,
