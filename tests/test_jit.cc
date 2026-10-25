@@ -7626,6 +7626,22 @@ TEST(helpers, req_header_case_insensitive) {
     CHECK(has == 0);
 }
 
+TEST(helpers, req_authorization_duplicate_is_ambiguous) {
+    static const char req[] =
+        "GET / HTTP/1.1\r\n"
+        "Authorization: first\r\n"
+        "authorization: second\r\n"
+        "\r\n";
+    u8 has = 0;
+    const char* ptr = nullptr;
+    u32 len = 0;
+    rut_helper_req_header(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "Authorization", 13, &has, &ptr, &len);
+    CHECK(has == 0);
+    CHECK(ptr == nullptr);
+    CHECK(len == 0);
+}
+
 // Regression: a JIT handler primes the per-thread parse cache for its
 // request buffer. After it returns, a direct rut_helper_req_* call that
 // reuses the same buffer address+length with different bytes must reparse

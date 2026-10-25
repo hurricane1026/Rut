@@ -886,7 +886,8 @@ diagnostics list the accepted source forms, the four-component limit, the two
 scope values, or the accepted named arguments respectively.
 
 Key extraction follows the corresponding request accessors: header names are
-case-insensitive and optional whitespace around values is ignored; query,
+case-insensitive (including the persisted rate-limit namespace) and optional whitespace around values is ignored; duplicate
+`Authorization` fields are ambiguous, matching `req.header`; query,
 cookie, and route-parameter names are exact byte matches. Query and cookie
 lookups use the first matching field in request order (including all Cookie
 fields), and cookie parsing uses the same optional-whitespace handling as

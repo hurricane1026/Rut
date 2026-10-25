@@ -16212,6 +16212,38 @@ TEST(rate_limit_key, extractors) {
     CHECK(param_value(in, "id", 2).eq(Str{"777", 3}));
 }
 
+TEST(rate_limit_key, duplicate_authorization_is_ambiguous) {
+    using namespace rut;
+    const char* raw =
+        "GET /p HTTP/1.1\r\n"
+        "Authorization: first\r\n"
+        "authorization: second\r\n"
+        "\r\n";
+    RateLimitKeyInput in = make_key_input(raw, "/p", nullptr, 0);
+    CHECK(rl_detail::header_value(in, "Authorization", 13).empty());
+
+    RateLimitKeyComponent auth{};
+    auth.kind = RateLimitKeyKind::Header;
+    REQUIRE(auth.set_name("Authorization", 13));
+    RateLimitKeyInput single =
+        make_key_input("GET /p HTTP/1.1\r\nAuthorization: first\r\n\r\n", "/p", nullptr, 0);
+    CHECK(rate_limit_key(0, &auth, 1, in) != rate_limit_key(0, &auth, 1, single));
+    CHECK_EQ(rate_limit_key(0, &auth, 1, in), rate_limit_key(0, &auth, 1, RateLimitKeyInput{}));
+}
+
+TEST(route, rate_limit_header_name_case_preserves_namespace) {
+    using namespace rut;
+    RouteConfig config{};
+    REQUIRE(config.add_static("/limited", 'G', 200));
+    REQUIRE(config.set_route_rate_limit(0, 1, 60, 1));
+    REQUIRE(config.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-Key", 5));
+    const u64 before = config.routes[0].rate_limit_ids[0];
+    config.routes[0].rate_limit.rules[0].key.comps[0].name[0] = 'x';
+    REQUIRE(config.refresh_route_rate_limit_ids(0));
+    CHECK_EQ(config.routes[0].rate_limit_ids[0], before);
+    CHECK(config.rate_limit_ids_valid());
+}
+
 TEST(rate_limit_key, query_uses_full_target_not_capped_path) {
     using namespace rut;
     using namespace rut::rl_detail;

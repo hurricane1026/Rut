@@ -233,6 +233,37 @@ TEST_F(RealLoopF, poll_command_shard_rate_limit_preserves_history) {
                               1000));
 }
 
+TEST_F(RealLoopF, poll_command_header_case_rate_limit_preserves_history) {
+    REQUIRE(self.ok);
+    RouteConfig initial{};
+    REQUIRE(initial.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(initial.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(initial.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-Key", 5));
+
+    RouteConfig reloaded{};
+    REQUIRE(reloaded.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(reloaded.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(reloaded.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "x-key", 5));
+    CHECK_EQ(reloaded.routes[0].rate_limit_ids[0], initial.routes[0].rate_limit_ids[0]);
+
+    const RouteConfig* active_config = &initial;
+    ShardControlBlock cb{};
+    self.loop->config_ptr = &active_config;
+    self.loop->control = &cb;
+    RateLimitKeyInput input{};
+    static constexpr char raw[] = "GET /limited HTTP/1.1\r\nX-Key: same\r\n\r\n";
+    input.req_buf = reinterpret_cast<const u8*>(raw);
+    input.req_header_end = sizeof(raw) - 1;
+    CHECK(!rate_limit_exceeded(
+        self.loop, initial.routes[0].rate_limit, initial.routes[0].rate_limit_ids, input, 1000));
+
+    cb.pending_config.store(&reloaded, std::memory_order_release);
+    self.loop->poll_command();
+    CHECK(active_config == &reloaded);
+    CHECK(rate_limit_exceeded(
+        self.loop, reloaded.routes[0].rate_limit, reloaded.routes[0].rate_limit_ids, input, 1000));
+}
+
 TEST_F(RealLoopF, poll_command_global_rate_limit_preserves_history) {
     REQUIRE(self.ok);
     RouteConfig initial{};
@@ -355,6 +386,30 @@ TEST(shard_control, rate_limit_ids_follow_route_and_policy_semantics) {
              duplicates.routes[0].rate_limit_ids[0]);
     CHECK_EQ(duplicates_with_unrelated.routes[0].rate_limit_ids[2],
              duplicates.routes[0].rate_limit_ids[1]);
+
+    static RouteConfig header_case_duplicates{};
+    REQUIRE(header_case_duplicates.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(header_case_duplicates.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(
+        header_case_duplicates.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-Key", 5));
+    REQUIRE(header_case_duplicates.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(
+        header_case_duplicates.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "x-key", 5));
+    CHECK_NE(header_case_duplicates.routes[0].rate_limit_ids[0],
+             header_case_duplicates.routes[0].rate_limit_ids[1]);
+
+    static RouteConfig header_case_duplicates_reordered{};
+    REQUIRE(header_case_duplicates_reordered.add_static("/limited", kRouteMethodGet, 204));
+    REQUIRE(header_case_duplicates_reordered.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(header_case_duplicates_reordered.add_route_rate_limit_key(
+        0, RateLimitKeyKind::Header, "x-key", 5));
+    REQUIRE(header_case_duplicates_reordered.add_route_rate_limit_rule(0, 1, 60));
+    REQUIRE(header_case_duplicates_reordered.add_route_rate_limit_key(
+        0, RateLimitKeyKind::Header, "X-Key", 5));
+    CHECK_EQ(header_case_duplicates_reordered.routes[0].rate_limit_ids[0],
+             header_case_duplicates.routes[0].rate_limit_ids[0]);
+    CHECK_EQ(header_case_duplicates_reordered.routes[0].rate_limit_ids[1],
+             header_case_duplicates.routes[0].rate_limit_ids[1]);
 }
 
 TEST_F(RealLoopF, poll_command_swap_jit) {
