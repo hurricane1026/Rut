@@ -10,7 +10,11 @@ namespace rut {
 // A failed copy is explicitly invalid and must be rejected before lowering.
 template <typename T>
 class NodePool {
+#if defined(__clang__)
     static_assert(__is_trivially_destructible(T));
+#else
+    static_assert(__has_trivial_destructor(T));
+#endif
     static constexpr u32 kChunkSize = 16;
     MmapArena arena_{};
     T** chunks_ = nullptr;
