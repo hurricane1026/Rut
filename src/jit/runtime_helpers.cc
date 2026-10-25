@@ -1685,9 +1685,18 @@ bool b64url_decode(Str in, char* out, u32 cap, u32& out_len) {
 // Verify an HS256/384/512 JWT and return its claims object. The payload bytes
 // are copied into payload_out so the caller can persist them after this
 // synchronous helper returns.
-bool jwt_decode_claims(
-    Str token, Str secret, json::Document& document, char* payload_out, u32& payload_len) {
+bool jwt_decode_claims(Str token,
+                       Str secret,
+                       Str algorithm,
+                       bool pinned,
+                       json::Document& document,
+                       char* payload_out,
+                       u32& payload_len) {
     payload_len = 0;
+    if (pinned && (algorithm.ptr == nullptr ||
+                   (!algorithm.eq(lit_str("HS256")) && !algorithm.eq(lit_str("HS384")) &&
+                    !algorithm.eq(lit_str("HS512")))))
+        return false;
     if (token.ptr == nullptr || secret.ptr == nullptr) return false;
     if (token.len > json::kMaxBytes * 3) return false;
     const char* first = nullptr;
@@ -1740,6 +1749,7 @@ bool jwt_decode_claims(
         json::Writer value_writer{value_bytes, sizeof(value_bytes)};
         if (!document.string(node, value_writer) || !value_writer.ok) return false;
         const Str alg{value_bytes, value_writer.len};
+        if (pinned && !alg.eq(algorithm)) return false;
         if (alg.eq(lit_str("HS256")))
             digest_kind = HashAlgorithm::Sha256;
         else if (alg.eq(lit_str("HS384")))
@@ -1804,7 +1814,7 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
-    if (op > static_cast<u32>(json::Op::JwtHasScope)) return;
+    if (op > static_cast<u32>(json::Op::JwtDecodePinned)) return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
     json::Writer writer{bytes};
@@ -1828,10 +1838,17 @@ extern "C" void rut_helper_json(void* conn,
     } else if (operation == json::Op::BearerToken) {
         view = bearer_token({a, a_len});
         if (view.ptr == nullptr) return;
-    } else if (operation == json::Op::JwtDecode) {
+    } else if (operation == json::Op::JwtDecode || operation == json::Op::JwtDecodePinned) {
         char payload[json::kMaxBytes];
         u32 payload_len = 0;
-        if (!jwt_decode_claims({a, a_len}, {b, b_len}, document, payload, payload_len)) return;
+        if (!jwt_decode_claims({a, a_len},
+                               {b, b_len},
+                               {c, c_len},
+                               operation == json::Op::JwtDecodePinned,
+                               document,
+                               payload,
+                               payload_len))
+            return;
         writer.text({payload, payload_len});
         if (!writer.ok) return;
     } else if (!json::apply(document,

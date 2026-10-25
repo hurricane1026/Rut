@@ -63,6 +63,15 @@ func jwtDocument(_ authorization: str, _ secret: str) -> Json {
     document
 }
 
+// Bind a key to one trusted algorithm; never pass a request field as policy.
+func jwtDocumentWithAlgorithm(_ authorization: str, _ secret: str, _ algorithm: str) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard secret != "" && (algorithm == "HS256" || algorithm == "HS384" || algorithm == "HS512") else { respond 503 }
+    guard let document = jwtDecode(bearerToken(authorization).or(""), secret, algorithm) else { respond denied }
+    document
+}
+
 struct JwtSubject { sub: str }
 
 // Pass only a document already verified by jwtDecode; this helper applies claims

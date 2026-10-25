@@ -40543,6 +40543,35 @@ TEST(frontend, jwt_decode_requires_two_unwrapped_strings) {
     REQUIRE(hir);
 }
 
+TEST(frontend, jwt_decode_algorithm_policy_is_an_unwrapped_string) {
+    const char* valid[] = {
+        "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", \"HS256\") return 200 }",
+        "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", req.header(\"X-Alg\").or(\"\")) return "
+        "200 }",
+        "func jwtDecode(_ a: i32, _ b: i32, _ c: i32) -> i32 => a + b + c\n"
+        "route GET \"/\" { let n = jwtDecode(1, 2, 3) return 200 }",
+    };
+    for (const char* source : valid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        REQUIRE(analyze_file_heap(ast.value()));
+    }
+    const char* invalid[] = {
+        "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", 1) return 200 }",
+        "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", req.header(\"X-Alg\")) return 200 }",
+        "route GET \"/\" { let c = jwtDecode(\"t\", \"s\", \"HS256\", \"HS512\") return 200 }",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+
 TEST(frontend, jwt_auth_example_policy_lowers) {
     const char* src = R"rut(
 listen :8080

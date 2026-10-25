@@ -682,28 +682,30 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     SliceArena arena;
     REQUIRE(arena.init(&pool));
 
-    auto decode = [&](const char* secret, const char* jwt = nullptr) {
-        if (jwt == nullptr) jwt = token;
-        u8 has = 0;
-        const char* out = nullptr;
-        u32 len = 0;
-        i64 number = 0;
-        rut_helper_json(nullptr,
-                        &arena,
-                        static_cast<u32>(json::Op::JwtDecode),
-                        jwt,
-                        static_cast<u32>(__builtin_strlen(jwt)),
-                        secret,
-                        static_cast<u32>(__builtin_strlen(secret)),
-                        nullptr,
-                        0,
-                        0,
-                        &has,
-                        &out,
-                        &len,
-                        &number);
-        return std::pair<bool, Str>{has != 0, Str{out, len}};
-    };
+    auto decode =
+        [&](const char* secret, const char* jwt = nullptr, const char* algorithm = nullptr) {
+            if (jwt == nullptr) jwt = token;
+            u8 has = 0;
+            const char* out = nullptr;
+            u32 len = 0;
+            i64 number = 0;
+            rut_helper_json(
+                nullptr,
+                &arena,
+                static_cast<u32>(algorithm ? json::Op::JwtDecodePinned : json::Op::JwtDecode),
+                jwt,
+                static_cast<u32>(__builtin_strlen(jwt)),
+                secret,
+                static_cast<u32>(__builtin_strlen(secret)),
+                algorithm,
+                algorithm ? static_cast<u32>(__builtin_strlen(algorithm)) : 0,
+                0,
+                &has,
+                &out,
+                &len,
+                &number);
+            return std::pair<bool, Str>{has != 0, Str{out, len}};
+        };
 
     const auto ok = decode("01234567890123456789012345678901");
     CHECK(ok.first);
@@ -727,6 +729,26 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
             .first);
     CHECK(decode(hs384_key.c_str(), hs384).first);
     CHECK(decode(hs512_key.c_str(), hs512).first);
+    CHECK(decode(hs384_key.c_str(), hs384, "HS384").first);
+    CHECK(decode(hs512_key.c_str(), hs512, "HS512").first);
+    // Both tokens are correctly signed with the SAME 64-byte key. Policy must
+    // reject a different supported algorithm, independently of key length.
+    const char* hs256_same_key =
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.acrJbLo2WVaennGuy-GBFdjrMmJWT5kD5M7o4-j7sW8";
+    CHECK(decode(hs512_key.c_str(), hs256_same_key).first);
+    CHECK(decode(hs512_key.c_str(), hs256_same_key, "HS256").first);
+    CHECK_FALSE(decode(hs512_key.c_str(), hs256_same_key, "HS512").first);
+    CHECK_FALSE(decode(hs512_key.c_str(), hs512, "HS256").first);
+
+    CHECK_FALSE(decode(hs384_key.c_str(), hs384, "HS256").first);
+    CHECK_FALSE(decode(hs512_key.c_str(), hs512, "HS384").first);
+    CHECK_FALSE(decode(hs512_key.c_str(), hs512, "").first);
+    CHECK_FALSE(decode(hs512_key.c_str(), hs512, "hs512").first);
+    CHECK_FALSE(decode(hs512_key.c_str(), hs512, "none").first);
+    CHECK_FALSE(decode(hs512_key.c_str(), hs512, "RS256").first);
+    CHECK(decode("01234567890123456789012345678901", token, "HS256").first);
+    CHECK_FALSE(decode("01234567890123456789012345678901", token, "HS512").first);
+
     CHECK(
         decode(std::string(65, 'x').c_str(),
                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.mtYtHuqIBzRucu6RKwhPy5qdCUlENvY0xsz9zqTioKg")
@@ -844,7 +866,7 @@ TEST(json_network, jit_jwt_decode_returns_claims_subject) {
     REQUIRE(program.init(R"rut(
 route POST "/jwt" {
     guard let token = req.header("Authorization") else { return 401 }
-    guard let claims = jwtDecode(token, env("RUT_TEST_JWT_SECRET")) else { return 401 }
+    guard let claims = jwtDecode(token, env("RUT_TEST_JWT_SECRET"), "HS256") else { return 401 }
     guard let sub_json = json.get(claims, "/sub") else { return 400 }
     guard let sub = json.string(sub_json) else { return 400 }
     return response(200, body: sub)
@@ -940,7 +962,7 @@ TEST(json_network, signed_jwt_claims_gate_identity_publication) {
     REQUIRE(program.init(R"rut(
 import "middleware/auth.rut"
 route GET "/identity" {
-    let document = auth.jwtDocument(req.authorization.or(""), "01234567890123456789012345678901")
+    let document = auth.jwtDocumentWithAlgorithm(req.authorization.or(""), "01234567890123456789012345678901", "HS256")
     let identity = auth.jwtIdentity(document, "issuer", "gateway", "issuer-key")
     guard jwtHasScope(document, "orders:read") else { return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""}) }
     guard req.path != "/all" || jwtHasScope(document, "orders:write") else { return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""}) }
@@ -1047,4 +1069,34 @@ route GET "/identity" {
     }
     loop->free_conn(*conn);
     pool.destroy();
+}
+
+TEST(json_network, jwt_algorithm_middleware_rejects_invalid_configuration) {
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/jwt-claims-auth.rut";
+    for (const char* algorithm : {"", "none", "hs256", "RS256"}) {
+        JsonProgram program;
+        const std::string source =
+            "import \"middleware/auth.rut\"\nroute GET \"/\" { "
+            "let doc = auth.jwtDocumentWithAlgorithm(req.authorization.or(\"\"), "
+            "\"01234567890123456789012345678901\", \"" +
+            std::string(algorithm) + "\") return 200 }";
+        REQUIRE(program.init(source.c_str(), source_path.c_str()));
+        auto loop = std::make_unique<SmallLoop>();
+        loop->setup();
+        auto* conn = loop->alloc_conn();
+        REQUIRE(conn);
+        const char* request = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request), __builtin_strlen(request)),
+            __builtin_strlen(request));
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        auto outcome = invoke_jit_handler(
+            program.handler(), conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        CHECK_EQ(outcome.status_code, 503u);
+        loop->free_conn(*conn);
+    }
 }
