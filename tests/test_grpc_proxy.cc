@@ -892,6 +892,7 @@ TEST(grpc_proxy, echo_reference_backpressures_upload_until_response_window_opens
 }
 
 struct GrpcDriveFixture {
+    RateLimiter rate_limiter{};
     ShardMetrics* metrics = nullptr;
     AccessLogRing* access_log = nullptr;
     SourceLiveAccessLogProducer* live_access_log = nullptr;
