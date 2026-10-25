@@ -104,6 +104,7 @@ endif()
 # Runtime library
 add_library(rut_runtime STATIC
     placement_new.cc
+    runtime/auth.cc
     runtime/arena.cc
     runtime/callbacks.cc
     runtime/shard.cc

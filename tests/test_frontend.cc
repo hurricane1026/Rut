@@ -40624,3 +40624,29 @@ TEST(frontend, unique_header_requires_literal_token_name_and_a_request) {
         CHECK(!analyze_file_heap(ast.value()));
     }
 }
+
+TEST(frontend, auth_comparison_types_and_challenge_header_safety) {
+    const char* valid = R"rut(route GET "/" {
+        let resp = response(401)
+        resp.set("WWW-Authenticate", "Basic realm=\"rut\"")
+        return resp
+    })rut";
+    auto tokens = lex(lit(valid));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+    const char* invalid[] = {
+        R"rut(route GET "/" { req.set("X-Test", "ok\r\nInjected: yes") return 200 })rut",
+        R"rut(route GET "/" { let resp = response(401) resp.set("X-Test", "ok\r\nInjected: yes") return resp })rut",
+        R"rut(route GET "/" { if basicMatches(req.authorization, "u:p") { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { if bearerMatches(1, "key") { return 200 } else { return 401 } })rut",
+    };
+    for (const char* src : invalid) {
+        auto t = lex(lit(src));
+        REQUIRE(t);
+        auto a = parse_file_heap(t.value());
+        REQUIRE(a);
+        CHECK(!analyze_file_heap(a.value()));
+    }
+}

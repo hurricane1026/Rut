@@ -2610,7 +2610,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
-    if (value.kind == MirValueKind::ConstantTimeEqual || value.kind == MirValueKind::Eq ||
+    if (value.kind == MirValueKind::BearerMatches || value.kind == MirValueKind::BasicMatches ||
+        value.kind == MirValueKind::ConstantTimeEqual || value.kind == MirValueKind::Eq ||
         value.kind == MirValueKind::Lt || value.kind == MirValueKind::Gt) {
         const MirValue& lhs_expr = *value.lhs;
         const auto lhs_shape = resolved_shape(mir, lhs_expr);
@@ -2642,9 +2643,15 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                      local_count,
                                      span);
         if (!rhs) return core::make_unexpected(rhs.error());
-        if (value.kind == MirValueKind::ConstantTimeEqual) {
+        if (value.kind == MirValueKind::BearerMatches || value.kind == MirValueKind::BasicMatches ||
+            value.kind == MirValueKind::ConstantTimeEqual) {
             auto result =
-                b.emit_str_constant_time_equal(lhs.value(), rhs.value(), {span.line, span.col});
+                value.kind == MirValueKind::BearerMatches
+                    ? b.emit_bearer_matches(lhs.value(), rhs.value(), {span.line, span.col})
+                : value.kind == MirValueKind::BasicMatches
+                    ? b.emit_basic_matches(lhs.value(), rhs.value(), {span.line, span.col})
+                    : b.emit_str_constant_time_equal(
+                          lhs.value(), rhs.value(), {span.line, span.col});
             if (!result) return frontend_error(FrontendError::OutOfMemory, span);
             return result.value();
         }

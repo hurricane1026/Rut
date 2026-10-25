@@ -143,6 +143,15 @@ rut::u8 rut_helper_str_has_prefix(const char* s, rut::u32 s_len, const char* pfx
 
 // Equal-length content comparison uses OpenSSL CRYPTO_memcmp. Lengths are public.
 // Empty spans compare equal; invalid or oversized spans fail closed without reads.
+rut::u8 rut_helper_bearer_matches(const char* authorization,
+                                  rut::u32 authorization_len,
+                                  const char* key,
+                                  rut::u32 key_len);
+rut::u8 rut_helper_basic_matches(const char* authorization,
+                                 rut::u32 authorization_len,
+                                 const char* credentials,
+                                 rut::u32 credentials_len);
+
 rut::u8 rut_helper_str_constant_time_equal(const char* a,
                                            rut::u32 a_len,
                                            const char* b,

@@ -192,6 +192,8 @@ enum class Opcode : u8 {
                             // is available, the write is ignored.
 
     // ── String operations ──
+    BearerMatches,
+    BasicMatches,
     StrConstantTimeEqual,  // bounded byte equality; public lengths, secret contents
     StrHasPrefix,          // %r = str.has_prefix %s, %pfx    → bool
     StrTrimPrefix,         // %r = str.trim_prefix %s, %pfx   → str
