@@ -17,7 +17,7 @@ whether a competing open-source edition includes them.
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window | Consumer registry, credential lifecycle and safe upstream credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR composition, disabled-slot handling, configuration failures | Multiple consumers, explicit AND/OR policy, anonymous only for absent credentials, no invalid-credential downgrade |
 | JWT verification | HS256/384/512 policy helpers; native fixed-key RS256 decoder and trusted configured JWK Set selection | Rut/JIT asymmetric key wiring, ES keys, request-key selection, JWKS rotation/cache, revocation and unknown-key policy |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks profile and replay persistence |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks HTTP/Rut wiring and replay persistence |
 | ACL / Consumer restriction | Exact verified-consumer allow/deny helpers | Multiple groups, membership lifecycle, default deny, no client identity spoofing |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
@@ -172,3 +172,38 @@ The caller must still enforce scopes, revocation and replay policy, and must
 not use unspecified output bytes after failure. Tests cover signed claim-policy
 failures, malformed/tampered tokens, stale-publication invalidation and crypto
 allocation hooks. This is a native API; Rut/JIT wiring remains pending.
+
+## Standard Webhooks symmetric verification
+
+The native `standard_webhook_valid` implements a bounded HMAC-SHA256 `v1`
+profile over the exact `id.timestamp.body` bytes, following the
+[Standard Webhooks specification](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md).
+The caller supplies trusted decoded secret bytes (1–4096 bytes, not a `whsec_`
+string), a positive Unix clock and a tolerance of 0–300 seconds. Both past and
+future boundaries are inclusive. Use endpoint-specific strong keys; signature
+headers never supply keys or select an algorithm.
+
+The ID is 1–256 visible ASCII bytes without a period; timestamps are canonical
+positive signed-64-bit decimal seconds. Raw bodies may be empty or binary and
+are bounded to 1 MiB. Signature headers are bounded to 4096 bytes and 16 entries
+separated by exactly one space. `v1` entries require canonical padded standard
+Base64; unknown alphanumeric version tags with nonempty visible opaque values
+are ignored. Malformed entries anywhere reject the entire header, including
+suffixes after an otherwise valid signature. Multiple valid-format signatures
+support sender key rotation. Callers may independently try another trusted key
+within their configured rotation window.
+
+`hash_digest_parts` reuses existing stack digest/HMAC contexts over at most 16
+borrowed spans, avoiding a body-sized concatenation buffer or request allocation.
+Inputs are borrowed synchronously; no HTTP parser, body JSON parsing, network
+operation or Rut/JIT surface is added. Callers must obtain singleton
+`webhook-id`, `webhook-timestamp` and `webhook-signature` fields and reject
+ambiguous HTTP fields before invoking the primitive.
+
+Freshness does not guarantee uniqueness: a repeated ID can still verify inside
+the time window. Applications must durably deduplicate authenticated IDs before
+side effects, including cross-shard/node coordination. This slice adds no replay
+store. Tests use fixed Python HMAC/Base64 oracle outputs with upstream Python
+fixture inputs, tampering and malformed lists, rotation, size/clock boundaries,
+and zero observed crypto allocations after warmup. HTTP/Rut end-to-end evidence
+and persisted replay handling remain pending.

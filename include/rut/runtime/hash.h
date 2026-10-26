@@ -23,6 +23,16 @@ bool hash_digest(HashAlgorithm algorithm,
                  u8* output,
                  u32 capacity,
                  u32& output_len);
+// Same digest/HMAC operation over up to 16 borrowed byte spans, concatenated
+// without copying. No retained views; output must not alias inputs or the key.
+bool hash_digest_parts(HashAlgorithm algorithm,
+                       const Str* parts,
+                       u32 count,
+                       Str key,
+                       bool keyed,
+                       u8* output,
+                       u32 capacity,
+                       u32& output_len);
 bool hash_hex(HashAlgorithm algorithm,
               Str data,
               Str key,

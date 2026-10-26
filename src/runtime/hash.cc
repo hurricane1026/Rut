@@ -107,16 +107,29 @@ bool hash_digest(HashAlgorithm algorithm,
                  u8* output,
                  u32 capacity,
                  u32& output_len) {
+    return hash_digest_parts(algorithm, &data, 1, key, keyed, output, capacity, output_len);
+}
+
+bool hash_digest_parts(HashAlgorithm algorithm,
+                       const Str* parts,
+                       u32 count,
+                       Str key,
+                       bool keyed,
+                       u8* output,
+                       u32 capacity,
+                       u32& output_len) {
     output_len = 0;
     const u32 kSize = digest_size(algorithm);
-    if (kSize == 0 || output == nullptr || capacity < kSize ||
-        (data.ptr == nullptr && data.len != 0) || (keyed && key.ptr == nullptr && key.len != 0))
+    if (kSize == 0 || output == nullptr || capacity < kSize || (parts == nullptr && count != 0) ||
+        count > 16 || (keyed && key.ptr == nullptr && key.len != 0))
         return false;
+    for (u32 i = 0; i < count; ++i)
+        if (!parts[i].ptr && parts[i].len != 0) return false;
     HashContext ctx{};
     u8 result[kMaxHashDigestBytes]{};
     if (!keyed) {
         init(ctx, algorithm);
-        update(ctx, algorithm, data.ptr, data.len);
+        for (u32 i = 0; i < count; ++i) update(ctx, algorithm, parts[i].ptr, parts[i].len);
         finish(ctx, algorithm, result);
     } else {
         // RFC 2104 over OpenSSL's allocation-free streaming digest primitives.
@@ -134,7 +147,7 @@ bool hash_digest(HashAlgorithm algorithm,
         for (u32 i = 0; i < kBlockSize; ++i) block[i] ^= 0x36;
         init(ctx, algorithm);
         update(ctx, algorithm, block, kBlockSize);
-        update(ctx, algorithm, data.ptr, data.len);
+        for (u32 i = 0; i < count; ++i) update(ctx, algorithm, parts[i].ptr, parts[i].len);
         finish(ctx, algorithm, inner);
         for (u32 i = 0; i < kBlockSize; ++i) block[i] ^= 0x36 ^ 0x5c;
         init(ctx, algorithm);

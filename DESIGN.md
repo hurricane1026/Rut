@@ -8471,3 +8471,21 @@ selection or remote JWKS retrieval. Token header hints cannot trigger import,
 fetching, fallback or refresh. Rotation still requires preparing a replacement
 configuration generation and draining readers of the old generation. No Rut/JIT
 key API or live JWKS lifecycle is added.
+
+### Native Standard Webhooks symmetric profile
+
+`standard_webhook_valid` authenticates singleton webhook ID, timestamp and raw
+body bytes using the fixed HMAC-SHA256 `v1` profile. Its trusted key is decoded
+configuration bytes; request version tags never change algorithms or establish
+trust. A caller-provided positive Unix clock enforces an inclusive 0–300-second
+past/future window. Timestamp parsing is overflow-safe canonical positive i64.
+
+Bounded ID/signature/body parsing, complete signature-list validation and
+constant-time MAC comparison reject malformed or tampered inputs. Existing
+stack hash contexts now accept up to 16 borrowed spans through
+`hash_digest_parts`, so signed metadata and a binary body need no concatenation
+allocation. All views remain synchronous and shard-local. No language API,
+network call, dependency or replay cache is introduced. Callers reject duplicate
+HTTP fields, provide endpoint-specific strong keys, and durably deduplicate
+verified IDs before side effects. See [auth coverage](docs/auth-coverage.md) for
+wire-profile bounds, fixtures and remaining acceptance work.
