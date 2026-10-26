@@ -346,7 +346,8 @@ def main():
                      "--shards", "1", "--no-pin", "--max-connections-per-shard", "128"],
                     stdout=log, stderr=log)
                 try:
-                    for _ in range(200):
+                    startup_deadline = time.monotonic() + 30.0
+                    while time.monotonic() < startup_deadline:
                         if process.poll() is not None:
                             log.seek(0)
                             output = log.read()
@@ -358,9 +359,14 @@ def main():
                             with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                                 break
                         except OSError:
-                            time.sleep(0.05)
+                            time.sleep(min(0.05, max(0.0, startup_deadline - time.monotonic())))
                     else:
-                        raise RuntimeError("gateway startup timed out")
+                        log.flush()
+                        log.seek(0)
+                        output = log.read()
+                        raise RuntimeError(
+                            "gateway startup timed out after 30s; runtime log tail:\n" +
+                            output[-4096:])
                     exercise(port)
                     exercise_h2(port)
                     exercise_policy_variants(port)
