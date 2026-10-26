@@ -23703,10 +23703,15 @@ func conditional_headers(_ req: i32, _ resp: Response) -> i32 {
     resp.set("X-Test", req.uniqueHeader("X-Test"))
     0
 }
+func fail_request() -> i32 => error(.timeout)
 chain headers { after conditional_headers(req, resp) }
 route GET "/" use chain headers {
     guard req.http11 else { return 505 }
     return 204
+}
+route GET "/fault" use chain headers {
+    let code = fail_request()
+    if code == 200 { return 204 } else { return 204 }
 }
 )rut";
     auto tokens = lex(lit(source));
@@ -23726,6 +23731,8 @@ route GET "/" use chain headers {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler);
+    auto fault_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(fault_handler);
     struct Case {
         const char* request;
         bool present;
@@ -23755,6 +23762,16 @@ route GET "/" use chain headers {
         CHECK(mutation.name.eq(lit("X-Test")));
         if (item.present) CHECK(mutation.value.eq(lit(item.value)));
     }
+    conn.reset();
+    const char* fault_request = "GET /fault HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const auto fault_result =
+        HandlerResult::unpack(fault_handler(&conn,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(fault_request),
+                                            lit(fault_request).len,
+                                            nullptr));
+    CHECK(fault_result.status_code == 500);
+    CHECK(conn.resp_header_mutation_count == 0);
     // Nil must not inspect an unspecified optional payload.
     conn.reset();
     rut_helper_resp_set_optional_header(
