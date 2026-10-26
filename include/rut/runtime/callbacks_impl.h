@@ -1118,7 +1118,9 @@ inline void reject_request_policy(Loop* loop, Connection& conn);
 template <typename Loop>
 inline void reject_response_policy(Loop* loop, Connection& conn);
 template <typename Loop>
-inline void respond_upstream_connect_failure(Loop* loop, Connection& conn);
+inline void respond_upstream_connect_failure(Loop* loop,
+                                             Connection& conn,
+                                             bool fresh_connect_failure = false);
 enum class ValidatedPreconnectFailureSite : u8 { SocketCreate, ConnectSubmit };
 template <typename Loop>
 inline void respond_validated_preconnect_failure(Loop* loop,
@@ -8128,27 +8130,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         if (try_connect_next_backend(loop, conn)) return;
-        if (conn.failure_policy_id != 0) {
-            respond_upstream_connect_failure(loop, conn);
-        } else {
-            if (http1_request_is_head(conn)) {
-                conn.send_buf.reset();
-                format_static_response(conn, 502, /*keep_alive=*/false, /*headers_only=*/true);
-            } else {
-                static const char k502[] =
-                    "HTTP/1.1 502 Bad Gateway\r\n"
-                    "Content-Length: 11\r\n"
-                    "Connection: close\r\n"
-                    "\r\n"
-                    "Bad Gateway";
-                conn.send_buf.reset();
-                conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
-            }
-            conn.keep_alive = false;
-            conn.resp_status = kStatusBadGateway;
-            conn.transition_to_sending(&on_response_sent<Loop>);
-            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
-        }
+        respond_upstream_connect_failure(loop, conn, /*fresh_connect_failure=*/true);
         return;
     }
 
@@ -8802,7 +8784,7 @@ void h2_proxy_flush(Loop* loop, Connection& conn, const u8* src, u32 resp_len) {
 // Answer the suspended proxy stream with a synthetic status (502 upstream
 // failure, 503 inflight cap) and tear down the upstream side.
 template <typename Loop>
-void h2_proxy_fail(Loop* loop, Connection& conn, u16 status) {
+void h2_proxy_fail(Loop* loop, Connection& conn, u16 status, bool connect_failure) {
     Http2Conn* h2 = conn.h2;
     const u32 kStreamId = h2->async_stream;
     h2_proxy_teardown_upstream(loop, conn);
@@ -8813,8 +8795,45 @@ void h2_proxy_fail(Loop* loop, Connection& conn, u16 status) {
     // tiny, so a small stack buffer is ample.
     u8 scratch[256];
     H2Dispatch<Loop> d{loop, &conn, scratch, sizeof(scratch), 0, false};
-    h2_emit_status(d, kStreamId, status);
+    if (connect_failure && status == 502 &&
+        (conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_overflow)) {
+        hpack::Header headers[Connection::kMaxRespHeaderMutations];
+        u32 header_count = 0;
+        bool valid = !conn.resp_header_mutation_overflow;
+        for (u32 mi = 0; mi < conn.resp_header_mutation_count && valid; mi++) {
+            const auto& mutation = conn.resp_header_mutations[mi];
+            if (mutation.mode != Connection::RespHeaderMutationMode::Remove &&
+                !response_mutation_survives(conn, mi))
+                continue;
+            const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
+            if (validate_response_header(mutation.name.ptr,
+                                         mutation.name.len,
+                                         remove ? "" : mutation.value.ptr,
+                                         remove ? 0 : mutation.value.len) !=
+                HttpHeaderValidation::Ok)
+                valid = false;
+            if (remove || h2_is_prohibited_response_header(mutation.name.ptr, mutation.name.len))
+                continue;
+            if (header_count >= Connection::kMaxRespHeaderMutations) {
+                valid = false;
+                break;
+            }
+            headers[header_count++] = {{mutation.name.ptr, mutation.name.len},
+                                       {mutation.value.ptr, mutation.value.len}};
+        }
+        if (valid)
+            h2_emit_response(d, kStreamId, status, headers, header_count, nullptr, 0);
+        else
+            h2_emit_status(d, kStreamId, 500);
+    } else {
+        h2_emit_status(d, kStreamId, status);
+    }
     h2_proxy_flush(loop, conn, scratch, d.resp_len);
+}
+
+template <typename Loop>
+void h2_proxy_fail(Loop* loop, Connection& conn, u16 status) {
+    h2_proxy_fail(loop, conn, status, /*connect_failure=*/false);
 }
 
 // The full h1 upstream response is buffered in upstream_recv_buf. Re-encode it as
@@ -9170,7 +9189,7 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     if (ev.result < 0) {
         record_backend_result(
             conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
-        h2_proxy_fail(loop, conn, 502);  // backend failover over h2: follow-up
+        h2_proxy_fail(loop, conn, 502, /*connect_failure=*/true);
         return;
     }
     record_backend_result(
@@ -9309,7 +9328,7 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     conn.upstream_attempted_backends = static_cast<u8>(1u << kBackend);
     hold_backend_active(conn, cfg);
     if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
-        h2_proxy_fail(loop, conn, 502);  // h2_proxy_fail closes the fd we just opened
+        h2_proxy_fail(loop, conn, 502);
     }
 }
 
@@ -12789,7 +12808,9 @@ void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev
 }
 
 template <typename Loop>
-inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
+inline void respond_upstream_connect_failure(Loop* loop,
+                                             Connection& conn,
+                                             bool fresh_connect_failure) {
     if constexpr (requires(Loop* candidate, Connection& c) {
                       candidate->disarm_response_read_deadline(c);
                   }) {
@@ -12847,7 +12868,62 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
             loop->close_conn(conn);
             return;
         }
-        if (http1_request_is_head(conn)) {
+        bool mutation_failure = false;
+        if (fresh_connect_failure && conn.failure_policy_id == 0 &&
+            (conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_overflow)) {
+            mutation_failure = true;
+            // Forward snapshots may anchor request-derived mutation values in
+            // send_buf. Stabilize them before resetting that buffer for the
+            // synthetic response; otherwise CORS values could dangle or be
+            // overwritten while the 502 is formatted.
+            const u8* source =
+                conn.response_mutations_snapshotted ? conn.send_buf.data() : conn.recv_buf.data();
+            const u32 source_len =
+                conn.response_mutations_snapshotted ? conn.send_buf.len() : conn.recv_buf.len();
+            if (!conn.resp_header_mutation_overflow && conn.response_header_buf.valid() &&
+                conn.stabilize_response_mutations(source, source_len)) {
+                constexpr u32 kMaxEffectiveHeaders =
+                    RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+                ResponseHeaderKV headers[kMaxEffectiveHeaders];
+                u32 header_count = 0;
+                if (collect_effective_response_headers(conn,
+                                                       conn.request_config,
+                                                       0,
+                                                       headers,
+                                                       kMaxEffectiveHeaders,
+                                                       &header_count)) {
+                    const char* body = "Bad Gateway";
+                    const u32 body_len = sizeof("Bad Gateway") - 1;
+                    const bool formatted =
+                        format_response_with_body_and_headers(conn,
+                                                              502,
+                                                              body,
+                                                              body_len,
+                                                              headers,
+                                                              header_count,
+                                                              false,
+                                                              true,
+                                                              false,
+                                                              http1_request_is_head(conn),
+                                                              http1_request_is_head(conn));
+                    serialized = true;
+                    mutation_failure = false;
+                    if (!formatted) policy_status = 500;
+                }
+            }
+        }
+        if (mutation_failure) {
+            conn.send_buf.reset();
+            conn.keep_alive = false;
+            conn.resp_status = kStatusInternalServerError;
+            format_static_response(conn, 500, /*keep_alive=*/false, http1_request_is_head(conn));
+            policy_status = 500;
+            serialized = true;
+        }
+        if (serialized) {
+            // The legacy 502 formatter above is policy-free and preserves the
+            // request-derived committed chain-after headers.
+        } else if (http1_request_is_head(conn)) {
             conn.send_buf.reset();
             format_static_response(conn, 502, /*keep_alive=*/false, /*headers_only=*/true);
         } else {

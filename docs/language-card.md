@@ -1508,9 +1508,11 @@ After-only OPTIONS decoration also requires a valid, permitted preflight method
 and request-header list, with unique preflight fields. Explicit status returns
 in guard failure bodies (including `respond` in before helpers) also commit
 chain-after headers. The response helper still independently validates
-Origin and policy on these paths. Runtime-generated failures and guard
-forward/redirect terminators do not gain automatic CORS decoration. CORS does
-not replace auth.
+Origin and policy on these paths. A policy-free upstream TCP connect failure
+that synthesizes the legacy 502 also applies committed chain-after headers when
+no upstream response bytes exist; custom failure policies and other runtime
+failures remain undecorated. Guard forward/redirect terminators do not gain
+automatic CORS decoration. CORS does not replace auth.
 
 For chain-after helpers, `resp.set("Name", optionalString)` now replaces when
 present and removes when nil. Present empty strings remain empty header values.
