@@ -1,6 +1,7 @@
 #include "rut/runtime/public_key.h"
 
 #include "rut/runtime/hash.h"
+#include "rut/runtime/json.h"
 
 #include <openssl/bn.h>
 #include <openssl/crypto.h>
@@ -74,6 +75,116 @@ bool RsaPublicKey::load(Str der) {
     }
     key_ = candidate;
     return true;
+}
+
+namespace {
+bool jwk_string(json::Document& document, u32 node, Str expected) {
+    if (document.nodes[node].kind != json::Kind::String) return false;
+    json::Writer writer{document.other};
+    return document.string(node, writer) && Str{document.other, writer.len}.eq(expected);
+}
+
+// RFC 7518 Base64urlUInt is unsigned and minimally encoded, with no ASN.1
+// sign-padding byte. Decode only bounded RSA moduli; exponent is fixed below.
+bool jwk_modulus(Str input, unsigned char (&output)[512], u32& length) {
+    length = 0;
+    if (input.len == 0 || input.len > 683 || input.len % 4 == 1) return false;
+    u32 accumulator = 0;
+    u32 bits = 0;
+    for (u32 i = 0; i < input.len; ++i) {
+        const char c = input.ptr[i];
+        u32 value = 0;
+        if (c >= 'A' && c <= 'Z')
+            value = static_cast<u32>(c - 'A');
+        else if (c >= 'a' && c <= 'z')
+            value = static_cast<u32>(c - 'a' + 26);
+        else if (c >= '0' && c <= '9')
+            value = static_cast<u32>(c - '0' + 52);
+        else if (c == '-')
+            value = 62;
+        else if (c == '_')
+            value = 63;
+        else
+            return false;
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (length == sizeof(output)) return false;
+            output[length++] = static_cast<unsigned char>((accumulator >> bits) & 255);
+        }
+    }
+    return length >= 256 && output[0] != 0 &&
+           (bits == 0 || (accumulator & ((1u << bits) - 1)) == 0);
+}
+}  // namespace
+
+bool RsaPublicKey::load_rs256_jwk(Str jwk) {
+    if (key_ || !jwk.ptr || jwk.len == 0 || jwk.len > kMaxDerBytes) return false;
+    ErrorScope errors;
+    json::Document document;
+    if (!document.parse(jwk) || document.nodes[0].kind != json::Kind::Object) return false;
+    bool has_type = false, has_algorithm = false, has_modulus = false, has_exponent = false;
+    unsigned char modulus[512];
+    u32 modulus_length = 0;
+    for (u32 node = document.nodes[0].child; node != json::kNone;
+         node = document.nodes[node].next) {
+        json::Writer writer{document.scratch};
+        if (!document.string(document.nodes[node].key, writer)) return false;
+        const Str name{document.scratch, writer.len};
+        if (name.eq(lit_str("kty"))) {
+            if (!jwk_string(document, node, lit_str("RSA"))) return false;
+            has_type = true;
+        } else if (name.eq(lit_str("alg"))) {
+            if (!jwk_string(document, node, lit_str("RS256"))) return false;
+            has_algorithm = true;
+        } else if (name.eq(lit_str("n"))) {
+            if (document.nodes[node].kind != json::Kind::String) return false;
+            json::Writer value{document.other};
+            if (!document.string(node, value) ||
+                !jwk_modulus({document.other, value.len}, modulus, modulus_length))
+                return false;
+            has_modulus = true;
+        } else if (name.eq(lit_str("e"))) {
+            if (!jwk_string(document, node, lit_str("AQAB"))) return false;
+            has_exponent = true;
+        } else if (name.eq(lit_str("use"))) {
+            if (!jwk_string(document, node, lit_str("sig"))) return false;
+        } else if (name.eq(lit_str("key_ops"))) {
+            const u32 child = document.nodes[node].child;
+            if (document.nodes[node].kind != json::Kind::Array || child == json::kNone ||
+                document.nodes[child].next != json::kNone ||
+                !jwk_string(document, child, lit_str("verify")))
+                return false;
+        } else if (name.eq(lit_str("d")) || name.eq(lit_str("p")) || name.eq(lit_str("q")) ||
+                   name.eq(lit_str("dp")) || name.eq(lit_str("dq")) || name.eq(lit_str("qi")) ||
+                   name.eq(lit_str("oth")))
+            return false;
+    }
+    if (!has_type || !has_algorithm || !has_modulus || !has_exponent) return false;
+    RSA* rsa = RSA_new();
+    BIGNUM* n = BN_bin2bn(modulus, static_cast<int>(modulus_length), nullptr);
+    BIGNUM* e = BN_new();
+    EVP_PKEY* owner = EVP_PKEY_new();
+    bool accepted = false;
+    if (rsa && n && e && owner && BN_set_word(e, 65537) && RSA_set0_key(rsa, n, e, nullptr)) {
+        n = nullptr;
+        e = nullptr;
+        if (EVP_PKEY_set1_RSA(owner, rsa)) {
+            unsigned char der[kMaxDerBytes];
+            const int size = i2d_PUBKEY(owner, nullptr);
+            if (size > 0 && static_cast<u32>(size) <= sizeof(der)) {
+                unsigned char* cursor = der;
+                if (i2d_PUBKEY(owner, &cursor) == size)
+                    accepted = load({reinterpret_cast<const char*>(der), static_cast<u32>(size)});
+            }
+        }
+    }
+    BN_free(n);
+    BN_free(e);
+    RSA_free(rsa);
+    EVP_PKEY_free(owner);
+    return accepted;
 }
 
 RsaSha256Verifier::~RsaSha256Verifier() {

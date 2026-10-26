@@ -115,3 +115,23 @@ Signature verification alone is not authorization: apply issuer/audience/time
 and subject policy using `jwt_claims_valid`. This is native coverage, with RFC
 7515 A.2 and authenticated negative-profile tests. Rut configuration/JIT wiring,
 JWK selection and JWKS refresh remain pending.
+
+### Fixed RS256 public JWK configuration
+
+The native configuration-only `RsaPublicKey::load_rs256_jwk` imports one public
+RSA JWK into the existing owning key object. This deliberately restricted profile
+requires `kty: "RSA"`, `alg: "RS256"`, minimally encoded unpadded base64urlUInt
+`n`, and `e: "AQAB"` (65537). It retains the DER loader’s 2048–4096-bit odd
+modulus bounds. Optional `use` must be `"sig"`; optional `key_ops` must be
+exactly `["verify"]`. RSA private parameters, duplicate decoded JSON names,
+noncanonical integers and inputs above 8192 bytes are rejected. A loaded owner
+cannot be replaced without reset, and does not borrow the JSON input.
+
+Unknown metadata is ignored and never establishes trust: no `kid` selection,
+certificate processing, URL fetching, JWK-set handling or JWKS refresh occurs.
+The caller must supply trusted configuration. Import allocates only during
+configuration; request verification continues through the existing shard-owned
+verifier. This adds no Rut/JIT API or complete asymmetric authorization flow.
+The representation follows [RFC 7518 §6.3.1](https://www.rfc-editor.org/rfc/rfc7518.html#section-6.3.1)
+and the usage fields follow [RFC 7517 §4](https://www.rfc-editor.org/rfc/rfc7517.html#section-4),
+with the stricter mandatory algorithm policy described above.
