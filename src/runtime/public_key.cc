@@ -1,5 +1,6 @@
 #include "rut/runtime/public_key.h"
 
+#include "rut/common/types.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 
@@ -390,8 +391,8 @@ void Rs256VerifierSet::reset() {
 Rs256VerifierSet::Selection Rs256VerifierSet::select(Str kid) {
     if (!kid.ptr || kid.len == 0 || kid.len > Rs256KeySet::kMaxKidBytes) return {};
     for (u32 i = 0; i < count_; ++i) {
-        const Str configured{ids_[i], lengths_[i]};
-        if (kid.eq(configured)) return {&verifiers_[i], configured};
+        const Str kConfigured{ids_[i], lengths_[i]};
+        if (kid.eq(kConfigured)) return {&verifiers_[i], kConfigured};
     }
     return {};
 }

@@ -2,8 +2,8 @@
 
 This ledger extends the existing M4 scope. A matching plugin name or successful
 HTTP request is insufficient evidence of protocol equivalence. Status describes
-this branch (based on the auth policy composition work in #901), not an older
-checkout or a claim that the whole auth milestone is complete.
+this branch. Native API, serving lifecycle and executable Rut/HTTP support are
+tracked separately; open PRs are not assumed merged and the milestone is not complete.
 
 Sources: [Kong authentication](https://developer.konghq.com/gateway/authentication/),
 [Kong plugin catalog](https://developer.konghq.com/plugins/),
@@ -14,9 +14,9 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window | Consumer registry, credential lifecycle and safe upstream credential hiding |
+| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping | Dynamic Consumer registry/credential lifecycle, query/body credential hiding and verified identity forwarding |
 | Bearer and multi-auth | Basic/Bearer OR composition, disabled-slot handling, configuration failures | Multiple consumers, explicit AND/OR policy, anonymous only for absent credentials, no invalid-credential downgrade |
-| JWT verification | HS256/384/512 policy helpers; native fixed-key RS256 decoder and trusted configured JWK Set selection | Rut/JIT asymmetric key wiring, ES keys, request-key selection, JWKS rotation/cache, revocation and unknown-key policy |
+| JWT verification | HS256/384/512 policy helpers; native fixed-key and approved-kid RS256 validation with claims-first publication | Rut key declarations, native artifact ownership and serving-shard activation hooks; ES keys, remote JWKS refresh/cache and end-to-end rotation/revocation |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks HTTP/Rut wiring and replay persistence |
 | ACL / Consumer restriction | Exact verified-consumer allow/deny helpers | Multiple groups, membership lifecycle, default deny, no client identity spoofing |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
@@ -97,8 +97,9 @@ empty/binary/bounded messages, owner release, and crypto allocation hooks that
 observe zero request-path allocations after initialization.
 
 The native decoder and trusted configuration importers below build on this
-foundation. A Rut key type, request-driven key selection and JWKS refresh remain
-acceptance work; the native slices do not complete asymmetric authorization.
+foundation. A Rut key type, program/shard activation wiring and remote JWKS refresh remain
+acceptance work. Approved-set native kid selection below is a separate profile;
+these native slices do not complete HTTP asymmetric authorization.
 
 ## Fixed-key RS256 compact JWT decoding
 
@@ -113,8 +114,9 @@ The caller supplies output and JSON workspace. On failure output length is zero
 and the document is invalidated; on success the document borrows the output.
 Signature verification alone is not authorization: apply issuer/audience/time
 and subject policy using `jwt_claims_valid`. This is native coverage, with RFC
-7515 A.2 and authenticated negative-profile tests. Rut configuration/JIT wiring,
-request-driven key selection and JWKS refresh remain pending.
+7515 A.2 and authenticated negative-profile tests. Rut configuration/JIT wiring
+and JWKS refresh remain pending; the approved-set profile below separately adds
+request-driven kid selection without changing this fixed-key decoder.
 
 ### Fixed RS256 public JWK configuration
 
@@ -147,8 +149,9 @@ Unknown IDs fail without fallback. Selected keys must pass the fixed public
 RSA/RS256 importer; unselected objects need only satisfy the ID constraints and
 may represent other algorithms. The whole set is checked before publication.
 
-This is configuration work with independent key ownership, not request-driven
-selection or remote JWKS retrieval. Token header hints cannot trigger import,
+This importer performs configuration-only selection with independent ownership.
+The approved-set JWT entry point below separately selects within preactivated
+trusted keys; neither API retrieves remote JWKS. Token header hints cannot trigger import,
 fetching, fallback or refresh. Rotation still requires preparing a replacement
 configuration generation and draining readers of the old generation. No Rut/JIT
 key API or live JWKS lifecycle is added.
@@ -179,8 +182,9 @@ The returned pointer and ID view belong to that verifier set and expire at its
 reset/destruction; a selection is not proof of authentication.
 
 Generation changes require preparing new owners and shard-local workspaces,
-then retaining old ones until their readers drain. This foundation adds no live
-JWKS refresh, Rut key/configuration surface or automatic token `kid` selection.
+then retaining old ones until their readers drain. This owner/activation layer
+does not parse JWTs; the entry point below performs bounded kid selection. No
+live JWKS refresh or Rut key/configuration surface is added.
 Tests cover subset trust, failure rollback/reuse, source lifetime, 16-key/128-byte
 bounds, embedded-NUL IDs, the independent RFC 7515 verification vector, and two
 concurrent threads activating their own verification state.
@@ -197,6 +201,60 @@ The caller must still enforce scopes, revocation and replay policy, and must
 not use unspecified output bytes after failure. Tests cover signed claim-policy
 failures, malformed/tampered tokens, stale-publication invalidation and crypto
 allocation hooks. This is a native API; Rut/JIT wiring remains pending.
+
+### Protected kid selection within approved RS256 sets
+
+`jwt_rs256_validate_set` accepts an already-activated `Rs256VerifierSet`, a
+caller-owned document/output workspace and trusted issuer/audience/clock policy.
+Its protected header requires a nonempty decoded string `kid` of at most 128
+bytes and fixed `alg: "RS256"`. The ID only selects from that explicitly approved
+set. Missing, unknown, unapproved, wrong-case, oversized or malformed IDs reject,
+even with one approved key. A signature under another approved key never causes
+a retry/fallback. Token `jku`, inline `jwk` and other hints cannot supply new
+trust or trigger fetching. Existing duplicate-name, critical-extension, encoding,
+header/payload-size and fixed RSA signature checks remain unchanged.
+
+This is a deliberately stricter required-kid application profile of
+[RFC 7515 §4.1.4](https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.4).
+IDs are compared as exact decoded bytes, including escaped JSON spelling; no
+Unicode normalization or C-string truncation is applied. All approved keys in a
+set must belong to the caller's configured issuer/audience trust policy. Use
+separate sets for distinct trust domains; unverified token claims must not
+choose the trusted issuer policy.
+
+Only after signature and strict claims checks both pass does the API publish
+`verified_kid`, borrowed from the verifier set's copied configuration ID, alongside
+claims borrowing the caller's payload buffer. The key ID identifies a verification
+credential, not a Consumer principal. Any failure clears the ID, sets
+payload length to zero and invalidates the document, including failure after a
+previous successful request. Scope/route authorization and replay policy remain
+separate checks. A replacement generation may drop an approval to revoke that
+key for new readers while old readers finish on their retained generation.
+
+Tests use independent 2048/3072-bit signing keys and cover cross-key confusion,
+unapproved-but-present keys, unknown/missing IDs, JSON escape aliases and duplicate
+names, rejected algorithms/extensions, 128/129-byte and embedded-NUL boundaries,
+signed invalid claims, stale publication, explicit retirement, zero observed
+request-path crypto allocations, and activation allocation-failure rollback/retry.
+The original fixed-key API still ignores key-selection hints as documented.
+
+### Remaining serving/Rut integration gate
+
+Native selection does not establish executable RS256 auth in Rut routes. The
+remaining integration must carry trusted bounded key descriptors through source
+analysis and native artifact serialization, own them for the loaded program /
+configuration generation, and initialize each execution shard's verifier state
+before accepting requests. Failure and teardown must clean partial state; old
+generations must survive their readers. Handler policy must select only compiled
+approved sets and publish authorized identity after claims/scope checks. Both
+backends need actual HTTP evidence before this gate is marked complete. Parsing
+or initializing keys on the request path is not an acceptable shortcut.
+
+Open earlier auth PRs remain separate integration work: #922/#923 (Standard
+Webhooks Rut wiring), #924/#925 (static Consumer composition), and #926/#927
+(field cardinality and absence-only anonymous policy). This branch builds on the
+native approved-set owner/activation work in
+[#929](https://github.com/hurricane1026/Rut/pull/929).
 
 ## Standard Webhooks symmetric verification
 
