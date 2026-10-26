@@ -20342,6 +20342,35 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     route_decl.span,
                     lit_str("chain after Response effects are not supported on WebSocket routes"));
             auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
+            // Explicit status returns in guard failure bodies are response
+            // terminators too. Chain-after values are request-derived and are
+            // already materialized before guard dispatch; publish them on the
+            // selected rejection path without running later route statements.
+            auto mark_guard_status = [](HirTerminator& term) {
+                if (term.kind == HirTerminatorKind::ReturnStatus)
+                    term.commit_response_mutations = true;
+            };
+            auto mark_guard = [&](HirGuard& guard) {
+                if (guard.fail_kind == HirGuard::FailKind::Term) {
+                    mark_guard_status(guard.fail_term);
+                } else if (guard.fail_kind == HirGuard::FailKind::Body) {
+                    if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
+                        mark_guard_status(guard.fail_body.then_term);
+                        mark_guard_status(guard.fail_body.else_term);
+                    } else {
+                        mark_guard_status(guard.fail_body.direct_term);
+                    }
+                } else {
+                    for (u32 ai = 0; ai < guard.fail_match_count; ++ai)
+                        mark_guard_status(
+                            mod.guard_match_arms[guard.fail_match_start + ai].direct_term);
+                }
+            };
+            for (u32 gi = 0; gi < route.guards.len; ++gi) mark_guard(route.guards[gi]);
+            for (u32 ai = 0; ai < route.control.match_arms.len; ++ai) {
+                auto& arm = route.control.match_arms[ai];
+                for (u32 gi = 0; gi < arm.guards.len; ++gi) mark_guard(arm.guards[gi]);
+            }
             if (route.control.kind == HirControlKind::Direct) {
                 mark_commit(route.control.direct_term);
             } else if (route.control.kind == HirControlKind::If) {
