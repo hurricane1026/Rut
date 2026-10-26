@@ -1,0 +1,20 @@
+import "middleware/auth.rut"
+
+listen :8080
+
+// STANDARD_WEBHOOK_RAW_KEY contains decoded secret bytes, not a whsec_ value.
+route POST "/webhooks/standard" {
+    let identity = auth.standardWebhook(
+        req.uniqueHeader("webhook-id").or(""),
+        req.uniqueHeader("webhook-timestamp").or(""),
+        req.uniqueHeader("webhook-signature").or(""),
+        req.body,
+        env("STANDARD_WEBHOOK_RAW_KEY"),
+        "billing-provider",
+        "billing-webhook-v1")
+    // Persistently deduplicate authenticated webhook-id values before side effects.
+    guard identity.consumerId == "billing-provider" else { return 500 }
+    return 204
+}
+
+route "/" { return 404 }

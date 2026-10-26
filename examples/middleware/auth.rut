@@ -152,6 +152,17 @@ func githubWebhook(_ body: str, _ signature: str, _ key: str,
     Identity(consumerId: consumerId, credentialId: credentialId, method: "hmac")
 }
 
+// Standard Webhooks v1. Pass singleton webhook-id, webhook-timestamp and
+// webhook-signature values, the exact raw body, and trusted decoded key bytes.
+// The key is not the whsec_ wire encoding. Freshness is bounded to 300 seconds;
+// receivers still need durable deduplication before performing side effects.
+func standardWebhook(_ id: str, _ timestamp: str, _ signature: str, _ body: str,
+                     _ rawKey: str, _ consumerId: str, _ credentialId: str) -> Identity {
+    guard rawKey != "" && consumerId != "" && credentialId != "" else { respond 503 }
+    guard standardWebhookValid(id, timestamp, signature, body, rawKey) else { respond 401 }
+    Identity(consumerId: consumerId, credentialId: credentialId, method: "standardWebhook")
+}
+
 // Both slots are evaluated. Current wins if configured secrets are identical.
 func rotatingHmac(_ message: str, _ signature: str, _ currentKey: str, _ previousKey: str,
                   _ consumerId: str, _ currentId: str, _ previousId: str) -> Identity {

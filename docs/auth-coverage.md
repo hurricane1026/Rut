@@ -17,7 +17,7 @@ whether a competing open-source edition includes them.
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window | Consumer registry, credential lifecycle and safe upstream credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR composition, disabled-slot handling, configuration failures | Multiple consumers, explicit AND/OR policy, anonymous only for absent credentials, no invalid-credential downgrade |
 | JWT verification | HS256/384/512 policy helpers; native fixed-key RS256 decoder and trusted configured JWK Set selection | Rut/JIT asymmetric key wiring, ES keys, request-key selection, JWKS rotation/cache, revocation and unknown-key policy |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks HTTP/Rut wiring and replay persistence |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification, freshness and Rut Identity wiring | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; durable Standard Webhooks replay persistence |
 | ACL / Consumer restriction | Exact verified-consumer allow/deny helpers | Multiple groups, membership lifecycle, default deny, no client identity spoofing |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
@@ -195,15 +195,22 @@ within their configured rotation window.
 
 `hash_digest_parts` reuses existing stack digest/HMAC contexts over at most 16
 borrowed spans, avoiding a body-sized concatenation buffer or request allocation.
-Inputs are borrowed synchronously; no HTTP parser, body JSON parsing, network
-operation or Rut/JIT surface is added. Callers must obtain singleton
-`webhook-id`, `webhook-timestamp` and `webhook-signature` fields and reject
-ambiguous HTTP fields before invoking the primitive.
+Inputs are borrowed synchronously. The Rut/JIT `standardWebhookValid(...)`
+builtin samples `CLOCK_REALTIME` and fixes tolerance at 300 seconds.
+`auth.standardWebhook(id, timestamp, signature, body, rawKey, consumerId,
+credentialId)` exposes the check as a Rut `Identity` helper. The route must pass
+`req.body` unchanged and get each signed field from
+`req.uniqueHeader(...).or("")`; a missing or duplicate field yields an empty
+value and authentication returns 401. Empty key configuration and empty identity
+metadata return 503. Keys over the native 4096-byte limit are rejected by the
+underlying verifier. See
+[standard-webhook-auth.rut](../examples/standard-webhook-auth.rut).
 
 Freshness does not guarantee uniqueness: a repeated ID can still verify inside
 the time window. Applications must durably deduplicate authenticated IDs before
 side effects, including cross-shard/node coordination. This slice adds no replay
 store. Tests use fixed Python HMAC/Base64 oracle outputs with upstream Python
 fixture inputs, tampering and malformed lists, rotation, size/clock boundaries,
-and zero observed crypto allocations after warmup. HTTP/Rut end-to-end evidence
-and persisted replay handling remain pending.
+and zero observed crypto allocations after warmup. The JIT route test exercises
+Rut header extraction and Identity mapping. Persistent replay handling remains
+the application's responsibility.
