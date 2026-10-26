@@ -134,20 +134,40 @@ TEST(http_tokens, origin_lists_validate_all_entries_and_credentials) {
     }
     CHECK(!http_origin_list_allows({nullptr, 1}, {}, false));
     CHECK(!http_origin_list_allows(lit_str("*"), {nullptr, 1}, false));
-    std::string list32 = "https://host";
-    for (u32 i = 1; i < 32; ++i) list32 += ",https://host";
-    CHECK(http_origin_list_allows({list32.data(), static_cast<u32>(list32.size())}, {}, true));
-    list32 += ",https://host";
-    CHECK(!http_origin_list_allows({list32.data(), static_cast<u32>(list32.size())}, {}, true));
-    const std::string long_text(4097, 'x');
-    CHECK(!http_origin_list_allows({long_text.data(), 4097}, {}, false));
-    CHECK(!http_origin_list_allows(lit_str("*"), {long_text.data(), 2049}, false));
-    const std::string too_long_ipv6 = "https://[" + std::string(46, 'a') + "]";
-    CHECK(!http_origin_list_allows(
-        {too_long_ipv6.data(), static_cast<u32>(too_long_ipv6.size())}, {}, false));
-    const std::string padded = "https://host" + std::string(4096 - 12, ' ');
-    CHECK(http_origin_list_allows({padded.data(), 4096}, lit_str("https://host"), true));
+    char list32[512];
+    __builtin_memcpy(list32, "https://host", 12);
+    u32 list32_len = 12;
+    for (u32 i = 1; i < 32; ++i) {
+        __builtin_memcpy(list32 + list32_len, ",https://host", 13);
+        list32_len += 13;
+    }
+    CHECK(http_origin_list_allows({list32, list32_len}, {}, true));
+    __builtin_memcpy(list32 + list32_len, ",https://host", 13);
+    list32_len += 13;
+    CHECK(!http_origin_list_allows({list32, list32_len}, {}, true));
+    char long_text[4097];
+    for (char& value : long_text) value = 'x';
+    CHECK(!http_origin_list_allows({long_text, 4097}, {}, false));
+    CHECK(!http_origin_list_allows(lit_str("*"), {long_text, 2049}, false));
+    char too_long_ipv6[64];
+    const u32 too_long_prefix_len = 9;
+    __builtin_memcpy(too_long_ipv6, "https://[", too_long_prefix_len);
+    for (u32 i = 0; i < 46; ++i) too_long_ipv6[too_long_prefix_len + i] = 'a';
+    too_long_ipv6[too_long_prefix_len + 46] = ']';
+    CHECK(!http_origin_list_allows({too_long_ipv6, too_long_prefix_len + 47}, {}, false));
+    char padded[4096];
+    __builtin_memcpy(padded, "https://host", 12);
+    for (u32 i = 12; i < sizeof(padded); ++i) padded[i] = ' ';
+    CHECK(http_origin_list_allows({padded, sizeof(padded)}, lit_str("https://host"), true));
     CHECK(http_origin_list_allows(lit_str("http://host:65535"), {}, false));
     const char binary[] = "https://host\0,https://other";
     CHECK(!http_origin_list_allows({binary, sizeof(binary) - 1}, {}, false));
+    const char invalid_ipv6_nul[] = "https://[::1\0not-an-address]";
+    const Str invalid_ipv6_nul_str{invalid_ipv6_nul, sizeof(invalid_ipv6_nul) - 1};
+    CHECK(!http_origin_list_allows(invalid_ipv6_nul_str, {}, false));
+    const char mixed_invalid_ipv6_nul[] = "https://host,https://[::1\0not-an-address]";
+    CHECK(!http_origin_list_allows(
+        {mixed_invalid_ipv6_nul, sizeof(mixed_invalid_ipv6_nul) - 1}, {}, false));
+    CHECK(!http_origin_list_allows(lit_str("*"), invalid_ipv6_nul_str, false));
+    CHECK(http_origin_list_allows(lit_str("https://[::1]"), lit_str("https://[::1]"), true));
 }

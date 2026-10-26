@@ -45,6 +45,12 @@ bool valid_origin(Str origin) {
         while (end < origin.len && origin.ptr[end] != ']') ++end;
         if (end == origin.len || end - start <= 1 || end - start - 1 >= INET6_ADDRSTRLEN)
             return false;
+        for (u32 i = start + 1; i < end; ++i) {
+            const char kC = origin.ptr[i];
+            const bool kHex =
+                (kC >= '0' && kC <= '9') || (kC >= 'a' && kC <= 'f') || (kC >= 'A' && kC <= 'F');
+            if (!kHex && kC != ':' && kC != '.') return false;
+        }
         char address[INET6_ADDRSTRLEN]{};
         __builtin_memcpy(address, origin.ptr + start + 1, end - start - 1);
         in6_addr parsed{};
