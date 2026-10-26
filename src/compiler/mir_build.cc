@@ -809,7 +809,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         return v;
     }
-    if (expr.kind == HirExprKind::HttpTokenListAllows ||
+    if (expr.kind == HirExprKind::HttpOriginListAllows ||
+        expr.kind == HirExprKind::HttpTokenListAllows ||
         expr.kind == HirExprKind::HmacSha256Matches || expr.kind == HirExprKind::BearerMatches ||
         expr.kind == HirExprKind::BasicMatches || expr.kind == HirExprKind::ConstantTimeEqual ||
         expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
@@ -831,6 +832,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* rhs_ptr = &fn->values[fn->values.len - 1];
         switch (expr.kind) {
+            case HirExprKind::HttpOriginListAllows:
+                v.kind = MirValueKind::HttpOriginListAllows;
+                break;
             case HirExprKind::HttpTokenListAllows:
                 v.kind = MirValueKind::HttpTokenListAllows;
                 break;
@@ -899,8 +903,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.lhs = lhs_ptr;
         v.rhs = rhs_ptr;
         if (expr.kind == HirExprKind::HmacSha256Matches ||
-            expr.kind == HirExprKind::HttpTokenListAllows) {
-            for (u32 i = 0; i < (expr.kind == HirExprKind::HttpTokenListAllows ? 1u : 2u); ++i) {
+            expr.kind == HirExprKind::HttpTokenListAllows ||
+            expr.kind == HirExprKind::HttpOriginListAllows) {
+            for (u32 i = 0; i < (expr.kind == HirExprKind::HmacSha256Matches ? 2u : 1u); ++i) {
                 auto signature = mir_value(*expr.args[i], module, fn, ctx);
                 if (!signature) return core::make_unexpected(signature.error());
                 if (!fn->values.push(signature.value()))

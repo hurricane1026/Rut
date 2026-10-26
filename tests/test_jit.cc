@@ -23690,3 +23690,77 @@ TEST(jit, direct_ir_credential_removal_overflow_is_explicit) {
     CHECK(conn.req_header_append_mask == 0);
     engine.shutdown();
 }
+
+TEST(jit, optional_response_headers_set_remove_and_do_not_commit_on_failure) {
+    const char* source = R"rut(
+func conditional_headers(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Test", req.uniqueHeader("X-Test"))
+    0
+}
+chain headers { after conditional_headers(req, resp) }
+route GET "/" use chain headers {
+    guard req.http11 else { return 505 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    struct Case {
+        const char* request;
+        bool present;
+        const char* value;
+        u16 status;
+    };
+    const Case cases[] = {
+        {"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: yes\r\n\r\n", true, "yes", 204},
+        {"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", false, "", 204},
+        {"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test:\r\n\r\n", true, "", 204},
+        {"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: a\r\nX-Test: b\r\n\r\n", false, "", 204},
+        {"GET / HTTP/1.0\r\nHost: localhost\r\nX-Test: yes\r\n\r\n", true, "yes", 505},
+    };
+    Connection conn;
+    for (const auto& item : cases) {
+        conn.reset();
+        const auto result = HandlerResult::unpack(handler(&conn,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(item.request),
+                                                          lit(item.request).len,
+                                                          nullptr));
+        CHECK(result.status_code == item.status);
+        CHECK(conn.resp_header_mutation_count == (item.status == 204 ? 1 : 0));
+        if (item.status != 204) continue;
+        const auto& mutation = conn.resp_header_mutations[0];
+        CHECK(mutation.mode == (item.present ? Connection::RespHeaderMutationMode::Set
+                                             : Connection::RespHeaderMutationMode::Remove));
+        CHECK(mutation.name.eq(lit("X-Test")));
+        if (item.present) CHECK(mutation.value.eq(lit(item.value)));
+    }
+    // Nil must not inspect an unspecified optional payload.
+    conn.reset();
+    rut_helper_resp_set_optional_header(
+        &conn, "X-Test", 6, reinterpret_cast<const char*>(1), ~u32{0}, 0);
+    REQUIRE(conn.resp_header_mutation_pending_count == 1);
+    CHECK(conn.resp_header_mutations[0].mode == Connection::RespHeaderMutationMode::Remove);
+    CHECK(!conn.resp_header_mutation_pending_overflow);
+    rut_helper_resp_set_optional_header(&conn, "X-Test", 6, nullptr, 0, 2);
+    CHECK(conn.resp_header_mutation_pending_overflow);
+    conn.reset();
+    CHECK(!conn.resp_header_mutation_pending_overflow);
+    engine.shutdown();
+    rir.destroy();
+}

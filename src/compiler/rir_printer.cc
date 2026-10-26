@@ -240,6 +240,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BearerMatches:
             buf.put_cstr("auth.bearer_matches");
             break;
+        case Opcode::HttpOriginListAllows:
+            buf.put_cstr("http.origin_list_allows");
+            break;
         case Opcode::HttpTokenListAllows:
             buf.put_cstr("http.token_list_allows");
             break;
@@ -772,6 +775,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
             break;
+        case Opcode::HttpOriginListAllows:
         case Opcode::HttpTokenListAllows:
             for (u32 i = 0; i < 3; ++i) {
                 buf.put_cstr(i == 0 ? " " : ", ");

@@ -41112,3 +41112,20 @@ TEST(frontend, http_token_list_builtin_rejects_wrong_types_and_optional_values) 
         REQUIRE_FALSE(hir.has_value());
     }
 }
+
+TEST(frontend, optional_chain_after_header_values_are_set_only) {
+    const char* source = R"rut(
+func optional_header(_ req: i32, _ resp: Response) -> i32 {
+    resp.add("X-Test", req.header("X-Test"))
+    0
+}
+chain headers { after optional_header(req, resp) }
+route GET "/" use chain headers { return 204 }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}

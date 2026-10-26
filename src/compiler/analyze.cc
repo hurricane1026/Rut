@@ -6587,7 +6587,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         auto analyzed = analyze_block_expr(
                             *inner.expr.args[1], cur_locals, cur_local_count, nullptr);
                         if (!analyzed) return core::make_unexpected(analyzed.error());
-                        if (analyzed->type != HirTypeKind::Str || analyzed->may_nil ||
+                        if (analyzed->type != HirTypeKind::Str || (analyzed->may_nil && !is_set) ||
                             analyzed->may_error)
                             return frontend_error(
                                 FrontendError::UnsupportedSyntax,
@@ -9686,10 +9686,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
     }
 
-    if (expr.name.eq(lit_str("httpTokenListAllows")) &&
+    if ((expr.name.eq(lit_str("httpTokenListAllows")) ||
+         expr.name.eq(lit_str("httpOriginListAllows"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr Str kDetail =
-            lit_str("httpTokenListAllows expects allowed str, requested str, caseSensitive bool");
+            lit_str("HTTP list matching expects two unwrapped str values and a bool");
         if (expr.args.len != 3)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
         HirExpr* values[3]{};
@@ -9707,7 +9708,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             values[i] = &route->exprs[route->exprs.len - 1];
         }
         HirExpr out{};
-        out.kind = HirExprKind::HttpTokenListAllows;
+        out.kind = expr.name.eq(lit_str("httpOriginListAllows")) ? HirExprKind::HttpOriginListAllows
+                                                                 : HirExprKind::HttpTokenListAllows;
         out.type = HirTypeKind::Bool;
         out.span = expr.span;
         out.lhs = values[0];
