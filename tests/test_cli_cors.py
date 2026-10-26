@@ -76,6 +76,20 @@ def exercise(port):
         response = conn.getresponse()
         assert response.status == 400, (duplicate, response.status)
         response.read()
+    for duplicate, first, second in [
+        ("Origin", "<missing>", allowed["Origin"]),
+        ("Access-Control-Request-Method", "<missing>", "POST"),
+        ("Access-Control-Request-Headers", "<missing>", "X-Secret"),
+        ("Access-Control-Request-Headers", "", "X-Secret"),
+    ]:
+        conn.putrequest("OPTIONS", "/api")
+        for name, value in allowed.items():
+            conn.putheader(name, first if name == duplicate else value)
+        conn.putheader(duplicate, second)
+        conn.endheaders()
+        response = conn.getresponse()
+        assert response.status == 400, (duplicate, first, response.status)
+        response.read()
     no_headers = dict(allowed)
     del no_headers["Access-Control-Request-Headers"]
     assert request(headers=no_headers)[0] == 204

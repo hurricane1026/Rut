@@ -11,7 +11,7 @@ func browserHeaders(_ result: Response) -> i32 {
 }
 
 func browserOrigin(_ req: i32) -> bool {
-    req.uniqueHeader("Origin").or("<missing>") == req.header("Origin").or("<missing>") &&
+    (req.uniqueHeader("Origin") != nil) == (req.header("Origin") != nil) &&
         cors.allowsOrigin(req.header("Origin").or(""), "https://app.example.com")
 }
 
@@ -21,9 +21,11 @@ chain browser {
 }
 route OPTIONS "/api" {
     guard cors.validOrigin("https://app.example.com") && cors.validLists("GET, POST", "Authorization, Content-Type, X-Trace") else { return 503 }
-    guard req.uniqueHeader("Origin").or("<missing>") == req.header("Origin").or("<missing>") else { return 400 }
-    guard req.uniqueHeader("Access-Control-Request-Method").or("<missing>") == req.header("Access-Control-Request-Method").or("<missing>") else { return 400 }
-    guard req.uniqueHeader("Access-Control-Request-Headers").or("<missing>") == req.header("Access-Control-Request-Headers").or("<missing>") else { return 400 }
+    guard (req.uniqueHeader("Origin") != nil) == (req.header("Origin") != nil) else { return 400 }
+    guard (req.uniqueHeader("Access-Control-Request-Method") != nil) ==
+        (req.header("Access-Control-Request-Method") != nil) else { return 400 }
+    guard (req.uniqueHeader("Access-Control-Request-Headers") != nil) ==
+        (req.header("Access-Control-Request-Headers") != nil) else { return 400 }
     let origin = req.uniqueHeader("Origin").or("")
     let method = req.uniqueHeader("Access-Control-Request-Method").or("")
     let headers = req.uniqueHeader("Access-Control-Request-Headers").or("")
