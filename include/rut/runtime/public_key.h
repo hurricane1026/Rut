@@ -27,6 +27,11 @@ public:
     // bits, exponent 65537. No certificates, private keys, PEM or RSA-PSS keys.
     // Failure leaves an empty owner empty and never replaces a loaded key.
     [[nodiscard]] bool load(Str der);
+    // Configuration-only single public RSA JWK, fixed RS256 verification profile.
+    // Requires kty=RSA, alg=RS256, minimal base64urlUInt n and e=65537.
+    // Optional use/key_ops must be sig/[verify]. Never fetches key URLs or
+    // selects by kid. Rejects private parameters. Same ownership/bounds as load.
+    [[nodiscard]] bool load_rs256_jwk(Str jwk);
     void reset();
     [[nodiscard]] bool valid() const { return key_ != nullptr; }
     [[nodiscard]] u32 bits() const;
