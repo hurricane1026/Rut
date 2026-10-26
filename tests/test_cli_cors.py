@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 class Origin(http.server.BaseHTTPRequestHandler):
@@ -29,6 +30,84 @@ class Origin(http.server.BaseHTTPRequestHandler):
         self.send_header("Vary", "Accept-Encoding")
         self.end_headers()
         self.wfile.write(b"ok")
+
+
+class StallOrigin:
+    """Accept upstream requests and hold them open without sending EOF/data."""
+
+    def __init__(self):
+        self.listener = socket.socket()
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(16)
+        self.listener.settimeout(0.2)
+        self.port = self.listener.getsockname()[1]
+        self.stop = threading.Event()
+        self.clients = []
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            client.settimeout(0.2)
+            self.clients.append(client)
+
+    def close(self):
+        self.stop.set()
+        self.listener.close()
+        self.thread.join(timeout=2)
+        for client in self.clients:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+
+def exercise_upstream_timeout(port):
+    def request(origins, method="GET"):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=40)
+        try:
+            conn.putrequest(method, "/upstream-timeout-error")
+            for origin in origins:
+                conn.putheader("Origin", origin)
+            conn.endheaders()
+            response = conn.getresponse()
+            return response.status, response.headers, response.read()
+        finally:
+            conn.close()
+
+    cases = [
+        (["https://app.example.com"], True),
+        (["https://evil.example"], False),
+        ([], False),
+        (["https://app.example.com", "https://app.example.com"], False),
+    ]
+
+    def check(case):
+        origins, allowed = case
+        status, headers, body = request(origins)
+        assert status == 504, (origins, status)
+        assert len(body) == 15
+        assert headers.get("Access-Control-Allow-Origin") == (
+            "https://app.example.com" if allowed else None)
+        if allowed:
+            assert headers.get("Access-Control-Allow-Credentials") == "true"
+
+    with ThreadPoolExecutor(max_workers=len(cases)) as pool:
+        for future in [pool.submit(check, case) for case in cases]:
+            future.result()
+
+    status, headers, body = request(["https://app.example.com"], method="HEAD")
+    assert status == 504
+    assert headers.get("Access-Control-Allow-Origin") == "https://app.example.com"
+    assert headers.get("Content-Length") == "15"
+    assert body == b""
 
 
 def exercise(port):
@@ -360,6 +439,7 @@ def main():
     binary, backend = sys.argv[1:]
     origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
     threading.Thread(target=origin.serve_forever, daemon=True).start()
+    stall = StallOrigin()
     source_root = Path(__file__).resolve().parent.parent
     try:
         with tempfile.TemporaryDirectory(prefix="rut-cors-") as directory:
@@ -377,7 +457,8 @@ def main():
             source = source.replace(
                 'upstream api at "127.0.0.1:9000"',
                 f'upstream api at "127.0.0.1:{origin.server_port}"\n'
-                f'upstream dead at "127.0.0.1:{dead_port}"')
+                f'upstream dead at "127.0.0.1:{dead_port}"\n'
+                f'upstream stall at "127.0.0.1:{stall.port}"')
             source = source.replace("127.0.0.1:9000", f"127.0.0.1:{origin.server_port}")
             source = source.replace("127.0.0.1:8080", f"127.0.0.1:{port}")
             source += '\nroute GET "/tokens" {\n'
@@ -405,6 +486,9 @@ def main():
             source += 'route OPTIONS "/after-only-preflight" use chain local_error_cors { return 204 }\n'
             source += 'chain upstream_error_cors { after applyPolicy(req, resp, browserPolicy()) }\n'
             source += 'route GET "/upstream-connect-error" use chain upstream_error_cors { return forward(dead, load_balance: .roundRobin) }\n'
+            source += 'chain upstream_timeout_cors { after applyPolicy(req, resp, browserPolicy()) }\n'
+            source += 'route GET "/upstream-timeout-error" use chain upstream_timeout_cors { return forward(stall, load_balance: .roundRobin) }\n'
+            source += 'route HEAD "/upstream-timeout-error" use chain upstream_timeout_cors { return forward(stall, load_balance: .roundRobin) }\n'
             for status in (401, 429, 503):
                 source += f'route GET "/guard-error-{status}" use chain local_error_cors {{ guard req.header("X-Allow").or("") == "yes" else {{ return {status} }} return 200 }}\n'
             source += 'chain local_error_invalid { after applyPolicy(req, resp, policy_invalid_age()) }\n'
@@ -443,6 +527,7 @@ def main():
                     exercise_local_errors(port)
                     exercise_after_only_preflight(port)
                     exercise_upstream_connect_failure(port)
+                    exercise_upstream_timeout(port)
                     exercise_guard_rejections(port)
                 finally:
                     process.terminate()
@@ -452,6 +537,7 @@ def main():
                         process.kill()
                         process.wait()
     finally:
+        stall.close()
         origin.shutdown()
         origin.server_close()
     print(f"{backend}: CORS socket tests passed")
