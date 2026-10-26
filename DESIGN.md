@@ -8303,5 +8303,15 @@ exponent 65537; key type, full consumption and canonical encoding are checked.
 Loaded owners reject replacement; configuration reload creates a successor and
 keeps the predecessor alive until its readers drain. `reset` and destruction
 release the resource; parse failure publishes nothing and restores crypto errors.
-There is no request-path parsing or language surface in this foundation. RS/ES
-verification contexts, static key integration and JWKS activation remain pending.
+`RsaSha256Verifier` retains a separate key reference and per-shard mutable BN
+and Montgomery scratch. Initialize on the execution shard before it serves
+requests, warming crypto thread-local state there. Activation reserves operands and warms full-width public
+exponentiation; request verification parses no keys and uses no heap allocation
+in the tested pinned crypto implementation. Allocation-hook regression tests
+cover supported key widths, accepted signatures and rejected encodings. Never
+share a verifier across concurrent shards; destroy/reset only after readers drain.
+The fixed profile is RSASSA-PKCS1-v1_5 with SHA-256: exact raw signature width,
+representative below modulus, complete canonical EMSA encoding comparison, and
+bounded exact-byte input. No request-controlled algorithm selection is exposed.
+There is no language surface in this foundation. Asymmetric JWT parsing, static
+key integration, ES verification and JWKS activation remain pending.
