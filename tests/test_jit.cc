@@ -23771,6 +23771,10 @@ route GET "/fault" use chain headers {
                                             lit(fault_request).len,
                                             nullptr));
     CHECK(fault_result.status_code == 500);
+    REQUIRE(conn.resp_header_mutation_pending_count == 1);
+    CHECK(conn.resp_header_mutations[0].mode == Connection::RespHeaderMutationMode::Remove);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Test")));
+    CHECK(conn.resp_header_mutations[0].value.empty());
     CHECK(conn.resp_header_mutation_count == 0);
     // Nil must not inspect an unspecified optional payload.
     conn.reset();
