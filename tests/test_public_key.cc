@@ -1,5 +1,6 @@
 #include "public_key_fixtures.h"
 #include "rsa_verify_fixtures.h"
+#include "rut/runtime/json.h"
 #include "rut/runtime/public_key.h"
 #include "test.h"
 
@@ -213,4 +214,105 @@ TEST(public_key, jwk_bounds_canonical_integer_and_crypto_error_preservation) {
     REQUIRE(key.load_rs256_jwk(jwk(buffer, prefix, suffix)));
     CHECK_EQ(ERR_peek_last_error(), previous);
     ERR_clear_error();
+}
+
+TEST(public_key, jwks_selects_only_trusted_exact_id_and_owns_selected_key) {
+    char buffer[2048];
+    const Str set = jwk(
+        buffer,
+        lit_str(
+            R"({"keys":[{"kid":"other","kty":"EC"},{"kid":"fixed","kty":"RSA","alg":"RS256","n":")"),
+        lit_str(R"(","e":"AQAB"}]})"));
+    RsaPublicKey key;
+    CHECK(!key.load_rs256_jwks(set, lit_str("unknown")));
+    CHECK(!key.valid());
+    CHECK(!key.load_rs256_jwks(set, lit_str("Fixed")));
+    REQUIRE(key.load_rs256_jwks(set, lit_str("fixed")));
+    CHECK(!key.load_rs256_jwks(set, lit_str("fixed")));
+    for (char& c : buffer) c = 0;
+    RsaSha256Verifier verifier;
+    REQUIRE(verifier.init(key));
+    key.reset();
+    CHECK(verifier.verify({kMessage, sizeof(kMessage) - 1}, der(kSignature)));
+}
+
+TEST(public_key, jwks_rejects_ambiguous_ids_and_invalid_set_shapes) {
+    RsaPublicKey key;
+    const Str bad[] = {
+        lit_str("null"),
+        lit_str("[]"),
+        lit_str("{}"),
+        lit_str(R"({"keys":{}})"),
+        lit_str(R"({"keys":[]})"),
+        lit_str(R"({"keys":[null]})"),
+        lit_str(R"({"keys":[{}]})"),
+        lit_str(R"({"keys":[{"kid":null}]})"),
+        lit_str(R"({"keys":[{"kid":""}]})"),
+        lit_str(R"({"keys":[{"kid":"fixed","kid":"fixed"}]})"),
+        lit_str(R"({"keys":[{"kid":"other"},{"kid":"oth\u0065r"}]})"),
+        lit_str(R"({"keys":[],"k\u0065ys":[]})"),
+    };
+    for (Str set : bad) {
+        CHECK(!key.load_rs256_jwks(set, lit_str("fixed")));
+        CHECK(!key.valid());
+    }
+    char buffer[2048];
+    const Str prefix = lit_str(R"({"keys":[{"kid":"fixed","kty":"RSA","alg":"RS256","n":")");
+    const Str suffixes[] = {
+        lit_str(R"(","e":"AQAB"},{"kid":"fixed"}]})"),
+        lit_str(R"(","e":"AQAB"},{"kid":"other"},{"kid":"oth\u0065r"}]})"),
+        lit_str(R"(","e":"AQAB"},{}]})"),
+        lit_str(R"(","e":"AQAB","d":null}]})"),
+        lit_str(R"(","e":"Aw"}]})"),
+    };
+    for (Str suffix : suffixes) {
+        CHECK(!key.load_rs256_jwks(jwk(buffer, prefix, suffix), lit_str("fixed")));
+        CHECK(!key.valid());
+    }
+    const Str valid = jwk(buffer, prefix, lit_str(R"(","e":"AQAB"}]})"));
+    CHECK(!key.load_rs256_jwks(valid, {nullptr, 1}));
+    CHECK(!key.load_rs256_jwks(valid, lit_str("")));
+    char oversized_id[129]{};
+    CHECK(!key.load_rs256_jwks(valid, {oversized_id, sizeof(oversized_id)}));
+    for (u32 length = 0; length < valid.len; ++length) {
+        CHECK(!key.load_rs256_jwks({valid.ptr, length}, lit_str("fixed")));
+        CHECK(!key.valid());
+    }
+    REQUIRE(key.load_rs256_jwks(valid, lit_str("fixed")));
+}
+
+TEST(public_key, jwks_enforces_set_count_and_decoded_id_bounds) {
+    char selected[2048];
+    const Str first = jwk(selected,
+                          lit_str(R"({"kid":"fixed","kty":"RSA","alg":"RS256","n":")"),
+                          lit_str(R"(","e":"AQAB"})"));
+    char buffer[8192];
+    const u32 counts[] = {16u, 17u};
+    for (u32 count : counts) {
+        json::Writer output{buffer};
+        output.text(lit_str(R"({"keys":[)"));
+        output.text(first);
+        for (u32 i = 1; i < count; ++i) {
+            output.text(lit_str(R"(,{"kid":")"));
+            output.put(static_cast<char>('A' + i));
+            output.text(lit_str(R"("})"));
+        }
+        output.text(lit_str("]}"));
+        RsaPublicKey key;
+        CHECK_EQ(key.load_rs256_jwks({buffer, output.len}, lit_str("fixed")), count == 16);
+    }
+    const u32 lengths[] = {128u, 129u};
+    for (u32 length : lengths) {
+        json::Writer output{buffer};
+        output.text(lit_str(R"({"keys":[)"));
+        output.text(first);
+        output.text(lit_str(R"(,{"kid":")"));
+        for (u32 i = 0; i < length; ++i) output.put('a');
+        output.text(lit_str(R"("}]})"));
+        RsaPublicKey key;
+        CHECK_EQ(key.load_rs256_jwks({buffer, output.len}, lit_str("fixed")), length == 128);
+    }
+    RsaPublicKey key;
+    CHECK(!key.load_rs256_jwks({nullptr, 1}, lit_str("fixed")));
+    CHECK(!key.load_rs256_jwks({buffer, sizeof(buffer) + 1}, lit_str("fixed")));
 }

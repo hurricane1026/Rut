@@ -32,6 +32,10 @@ public:
     // Optional use/key_ops must be sig/[verify]. Never fetches key URLs or
     // selects by kid. Rejects private parameters. Same ownership/bounds as load.
     [[nodiscard]] bool load_rs256_jwk(Str jwk);
+    // Configuration-only JWK Set selection by a trusted, nonempty kid <=128 bytes.
+    // At most 16 object entries, all with unique nonempty bounded string kids.
+    // Selected entry must satisfy load_rs256_jwk. No fallback or URL fetching.
+    [[nodiscard]] bool load_rs256_jwks(Str jwks, Str configured_kid);
     void reset();
     [[nodiscard]] bool valid() const { return key_ != nullptr; }
     [[nodiscard]] u32 bits() const;
