@@ -113,6 +113,51 @@ The JIT matrix covers each missing/wrong/duplicate factor, both valid factors,
 configuration failures, each allow-set member, case/prefix mismatches, invalid
 auth before authorization, and deny-before-allow composition.
 
+## Current audit: executable optional authentication
+
+The missing-versus-duplicate distinction is now available through
+`req.headerCount("Authorization")`: 0 proves absence, 1 includes an empty field,
+2+ reports duplicates, and -1 reports parsing failure. The field name is a
+literal HTTP token, counts use original headers, and header overflow cannot
+silently report absence. A nil singleton value alone is still insufficient.
+
+`auth.apiKeyOrAnonymous(count, authorization, key, consumerId, credentialId,
+anonymousId)` takes that count and `req.authorization.or("")` from the same
+request. Only count 0 with an empty value returns the explicit anonymous
+Consumer with method `anonymous` and no credential ID. Count 1 must verify the
+configured Bearer key. Empty or malformed presented fields, wrong schemes/keys,
+duplicates, parse failures and inconsistent count/value combinations return
+401, with no retry using a different source. Empty configuration or equal guest
+and authenticated Consumer IDs returns 503 even when credentials are absent.
+The guest ID is intentionally distinct, and all metadata comes from configuration.
+
+This is optional authentication for an explicitly public route, not a session
+or permission to bypass authorization. Applying `requireConsumer` afterward can
+reject the guest with 403; invalid authentication still returns 401. Leading
+credential-removal effects cannot turn a presented credential into absence.
+See `examples/anonymous-auth.rut`. The JIT matrix covers identity spoofing,
+empty/duplicate/malformed input, body/header separation, config errors, private
+route authorization and original reads after removal.
+
+The audit retains these separate outstanding gates:
+
+- Native RS256/JWK/JWKS and claims validation still need trusted Rut configuration
+  ownership and shard-verifier publication; key import must not move onto the
+  request path.
+- Forward-auth/OPA/introspection need reusable bounded response-consuming callouts
+  with both-backend failure/cancel/close and buffer-lifetime evidence.
+- OAuth/OIDC login, replay prevention and dynamic identity lifecycle require
+  persistent state and explicit shard/node consistency, not local best-effort cache.
+- mTLS identity mapping, LDAP and SAML/CAS need complete protocol-specific evidence.
+
+This branch is based on main with the bounded Consumer policy work from
+[#924](https://github.com/hurricane1026/Rut/pull/924), required credential pairs
+and the exact Consumer allow union from
+[#925](https://github.com/hurricane1026/Rut/pull/925), and the header-count
+primitive from [#926](https://github.com/hurricane1026/Rut/pull/926). The
+Standard Webhooks middleware still has a separate main integration tracked by
+[#934](https://github.com/hurricane1026/Rut/pull/934), which is not included here.
+
 ## Implementation order and gates
 
 1. Complete local credential foundations and signed-message primitives. Add

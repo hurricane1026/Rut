@@ -1,0 +1,21 @@
+import "middleware/auth.rut"
+listen :8080
+
+// Compile-time configuration. The authenticated and guest IDs must be distinct.
+// Deploy behind TLS. Empty configuration returns 503, including for absent auth.
+route GET "/optional" {
+    let identity = auth.apiKeyOrAnonymous(req.headerCount("Authorization"),
+        req.authorization.or(""), env("RUT_API_KEY"), "registered-app", "primary-key", "guest")
+    if identity.method == "anonymous" { return response(200, body: "guest") }
+    else { return response(200, body: "registered-app") }
+}
+
+// Reusing the policy on a private endpoint still requires explicit authorization.
+route GET "/private" {
+    let identity = auth.apiKeyOrAnonymous(req.headerCount("Authorization"),
+        req.authorization.or(""), env("RUT_API_KEY"), "registered-app", "primary-key", "guest")
+    let permitted = auth.requireConsumer(identity, "registered-app")
+    guard permitted.credentialId == "primary-key" else { return 500 }
+    return 204
+}
+route "/" { return 404 }

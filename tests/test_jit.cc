@@ -24261,3 +24261,154 @@ route GET "/removed" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, anonymous_authentication_requires_proven_absence_and_distinct_identity) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/anonymous-auth.rut";
+    std::string source = R"rut(
+import "middleware/auth.rut"
+route GET "/optional" {
+    let identity = auth.apiKeyOrAnonymous(req.headerCount("Authorization"), req.authorization.or(""),
+        "secret", "registered-app", "primary-key", "guest")
+    guard (identity.method == "anonymous" && identity.consumerId == "guest" && identity.credentialId == "") ||
+          (identity.method == "apiKey" && identity.consumerId == "registered-app" && identity.credentialId == "primary-key") else { return 500 }
+    match identity.method {
+        "anonymous" => return 200
+        "apiKey" => return 201
+        _ => return 500
+    }
+}
+route GET "/private" {
+    let identity = auth.apiKeyOrAnonymous(req.headerCount("Authorization"), req.authorization.or(""),
+        "secret", "registered-app", "primary-key", "guest")
+    let permitted = auth.requireConsumer(identity, "registered-app")
+    guard permitted.credentialId == "primary-key" else { return 500 }
+    return 204
+}
+route GET "/removed" {
+    req.remove("Authorization")
+    let identity = auth.apiKeyOrAnonymous(req.headerCount("Authorization"), req.authorization.or(""),
+        "secret", "registered-app", "primary-key", "guest")
+    let permitted = auth.requireConsumer(identity, "registered-app")
+    return 204
+}
+)rut";
+    const char* configurations[] = {
+        "\"\", \"registered-app\", \"primary-key\", \"guest\"",
+        "\"secret\", \"\", \"primary-key\", \"guest\"",
+        "\"secret\", \"registered-app\", \"\", \"guest\"",
+        "\"secret\", \"registered-app\", \"primary-key\", \"\"",
+        "\"secret\", \"registered-app\", \"primary-key\", \"registered-app\"",
+    };
+    for (u32 i = 0; i < 5; ++i) {
+        source += "route GET \"/bad-config-" + std::to_string(i) + "\" {\n" +
+                  "let identity = auth.apiKeyOrAnonymous(req.headerCount(\"Authorization\"), "
+                  "req.authorization.or(\"\"), " +
+                  configurations[i] + ")\nreturn 204\n}\n";
+    }
+    source += R"rut(
+route GET "/parse-error" {
+    let identity = auth.apiKeyOrAnonymous(-1, "", "secret", "registered-app", "primary-key", "guest")
+    return 204
+}
+route GET "/inconsistent-duplicate" {
+    let identity = auth.apiKeyOrAnonymous(2, "Bearer secret", "secret", "registered-app", "primary-key", "guest")
+    return 204
+}
+route GET "/inconsistent-absent" {
+    let identity = auth.apiKeyOrAnonymous(0, "Bearer secret", "secret", "registered-app", "primary-key", "guest")
+    return 204
+}
+)rut";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "anonymous auth: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        const char* body;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0, "", "", 200},
+        {0, "X-Consumer-ID: registered-app\r\nX-Credential-ID: primary-key\r\n", "", 200},
+        {0, "X-API-Key: secret\r\n", "", 200},
+        {0, "", "Authorization: Bearer secret", 200},
+        {0, "Authorization: Bearer secret\r\n", "", 201},
+        {0, "aUtHoRiZaTiOn: bEaReR   secret\r\nX-Consumer-ID: guest\r\n", "", 201},
+        {0, "Authorization:\r\n", "", 401},
+        {0, "Authorization: \t \r\n", "", 401},
+        {0, "Authorization: Bearer\r\n", "", 401},
+        {0, "Authorization: Bearer wrong\r\nX-API-Key: secret\r\n", "", 401},
+        {0, "Authorization: Basic dXNlcjpwYXNz\r\n", "", 401},
+        {0, "Authorization: Bearer secret,wrong\r\n", "", 401},
+        {0, "Authorization: Bearer secret\r\nauthorization: Bearer secret\r\n", "", 401},
+        {0, "Authorization: wrong\r\nAuthorization: Bearer secret\r\n", "", 401},
+        {0, "Authorization: Bearer secret\r\nAuthorization: wrong\r\n", "", 401},
+        {0, "Authorization:\r\nauthorization:\r\n", "", 401},
+        {0, "Bad Name: value\r\n", "", 401},
+        {1, "", "", 403},
+        {1, "Authorization: Bearer secret\r\n", "", 204},
+        {1, "Authorization: Bearer wrong\r\n", "", 401},
+        {2, "", "", 403},
+        {2, "Authorization: Bearer secret\r\n", "", 204},
+        {2, "Authorization: Bearer wrong\r\n", "", 401},
+        {2, "Authorization: Bearer secret\r\nauthorization: Bearer secret\r\n", "", 401},
+        {3, "", "", 503},
+        {4, "", "", 503},
+        {5, "", "", 503},
+        {6, "", "", 503},
+        {7, "", "", 503},
+        {7, "Authorization: Bearer secret\r\n", "", 503},
+        {8, "", "", 401},
+        {9, "", "", 401},
+        {10, "", "", 401},
+    };
+    Connection conn;
+    for (const auto& tc : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        conn.reset();
+        const std::string body(tc.body);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: ") +
+            std::to_string(body.size()) + "\r\n" + tc.headers + "\r\n" + body;
+        const auto result =
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != tc.status)
+            std::fprintf(stderr,
+                         "anonymous route %u got %u expected %u\n",
+                         tc.route,
+                         result.status_code,
+                         tc.status);
+        CHECK_EQ(result.status_code, tc.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
