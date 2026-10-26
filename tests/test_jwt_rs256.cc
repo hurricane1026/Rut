@@ -246,6 +246,120 @@ TEST(jwt_rs256, configured_jwks_to_verified_claims_policy) {
     tracking = false;
     CHECK_EQ(allocations, 0u);
 }
+TEST(jwt_rs256, validates_signed_claims_before_publication) {
+    BIGNUM* exponent = BN_new();
+    RSA* rsa = RSA_new();
+    REQUIRE(exponent && rsa);
+    REQUIRE(BN_set_word(exponent, 65537));
+    REQUIRE(RSA_generate_key_ex(rsa, 2048, exponent, nullptr));
+    BN_free(exponent);
+    EVP_PKEY* owner = EVP_PKEY_new();
+    REQUIRE(owner);
+    REQUIRE(EVP_PKEY_set1_RSA(owner, rsa));
+    unsigned char der[8192];
+    auto* cursor = der;
+    const int der_length = i2d_PUBKEY(owner, &cursor);
+    REQUIRE(der_length > 0);
+    RsaPublicKey key;
+    REQUIRE(key.load({reinterpret_cast<const char*>(der), static_cast<u32>(der_length)}));
+    EVP_PKEY_free(owner);
+    RsaSha256Verifier verifier;
+    REQUIRE(verifier.init(key));
+    key.reset();
+    json::Document document;
+    char output[8192];
+    char token[2048];
+    const Str issuer = lit_str("issuer");
+    const Str audience = lit_str("gateway");
+    const Str valid_claims = lit_str(
+        R"({"sub":"alice","iss":"issuer","aud":["other","gateway"],"exp":101,"nbf":100,"iat":100})");
+    const auto validate =
+        [&](Str signed_token, Str expected_issuer, Str expected_audience, i64 now, u32& length) {
+            return jwt_rs256_validate(verifier,
+                                      document,
+                                      signed_token,
+                                      expected_issuer,
+                                      expected_audience,
+                                      now,
+                                      output,
+                                      sizeof(output),
+                                      length);
+        };
+    const Str signed_token = token_for(rsa, lit_str(R"({"alg":"RS256"})"), valid_claims, token);
+    REQUIRE(signed_token.len > 0);
+    u32 length = 99;
+    allocations = 0;
+    tracking = true;
+    const bool accepted = validate(signed_token, issuer, audience, 100, length);
+    tracking = false;
+    REQUIRE(accepted);
+    CHECK_EQ(length, valid_claims.len);
+    CHECK(document.valid);
+    CHECK(document.source.ptr == output);
+    CHECK((Str{output, length}.eq(valid_claims)));
+    const auto rejected =
+        [&](Str signed_value, Str expected_issuer, Str expected_audience, i64 now) {
+            // Start from a published success every time, so failure cannot retain it.
+            u32 published = 0;
+            REQUIRE(validate(signed_token, issuer, audience, 100, published));
+            published = 99;
+            tracking = true;
+            const bool result =
+                validate(signed_value, expected_issuer, expected_audience, now, published);
+            tracking = false;
+            CHECK(!result);
+            CHECK_EQ(published, 0u);
+            CHECK(!document.valid);
+            CHECK_EQ(document.count, 0u);
+            CHECK(document.source.ptr == nullptr);
+        };
+    rejected(signed_token, lit_str("wrong"), audience, 100);
+    rejected(signed_token, issuer, lit_str("wrong"), 100);
+    rejected(signed_token, issuer, audience, 101);
+    rejected(signed_token, issuer, audience, 99);
+    rejected(signed_token, issuer, audience, 0);
+    rejected(signed_token, issuer, audience, -1);
+    rejected(signed_token, {}, audience, 100);
+    rejected(signed_token, issuer, {}, 100);
+    rejected(signed_token, {nullptr, 1}, audience, 100);
+    rejected(signed_token, issuer, {nullptr, 1}, 100);
+    rejected(lit_str("malformed"), issuer, audience, 100);
+    char invalid_token[2048];
+    const Str invalid_claims[] = {
+        lit_str(R"({"iss":"issuer","aud":"gateway","exp":101})"),
+        lit_str(R"({"sub":"","iss":"issuer","aud":"gateway","exp":101})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway"})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":"101"})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":101,"iat":101})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":101,"nbf":101})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":["gateway",42],"exp":101})"),
+    };
+    for (Str claims : invalid_claims) {
+        const Str invalid = token_for(rsa, lit_str(R"({"alg":"RS256"})"), claims, invalid_token);
+        REQUIRE(invalid.len > 0);
+        rejected(invalid, issuer, audience, 100);
+    }
+    for (u32 index = 0; index < signed_token.len; ++index) invalid_token[index] = token[index];
+    invalid_token[signed_token.len - 1] = token[signed_token.len - 1] == 'A' ? 'B' : 'A';
+    rejected({invalid_token, signed_token.len}, issuer, audience, 100);
+    length = 99;
+    CHECK(!jwt_rs256_validate(
+        verifier, document, signed_token, issuer, audience, 100, output, 1, length));
+    CHECK_EQ(length, 0u);
+    CHECK(!document.valid);
+    length = 99;
+    CHECK(!jwt_rs256_validate(
+        verifier, document, signed_token, issuer, audience, 100, nullptr, sizeof(output), length));
+    CHECK_EQ(length, 0u);
+    CHECK(!document.valid);
+    verifier.reset();
+    length = 99;
+    CHECK(!validate(signed_token, issuer, audience, 100, length));
+    CHECK_EQ(length, 0u);
+    CHECK(!document.valid);
+    CHECK_EQ(allocations, 0u);
+    RSA_free(rsa);
+}
 int main(int argc, char** argv) {
     if (!CRYPTO_set_mem_functions(counted_malloc, counted_realloc, counted_free)) return 2;
     return rut::test::run_all(argc, argv);

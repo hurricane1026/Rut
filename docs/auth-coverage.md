@@ -159,3 +159,16 @@ policy and exact scope checks together. It also confirms that signed token key
 hints do not change the configured key and observes no crypto allocations on
 that verification path. This is native integration evidence, not Rut/JIT or HTTP
 end-to-end coverage.
+
+## RS256 verification and claims publication
+
+The native `jwt_rs256_validate` entry point verifies the fixed-key compact JWS
+and applies the existing strict `jwt_claims_valid` policy before publishing its
+claims document and output length. Caller-configured issuer/audience, nonempty
+subject, integer expiry, optional nbf/iat and a positive caller-supplied clock
+are mandatory policy checks with zero skew. Signed but expired, premature or
+wrong-recipient tokens fail with an invalid document and zero output length.
+The caller must still enforce scopes, revocation and replay policy, and must
+not use unspecified output bytes after failure. Tests cover signed claim-policy
+failures, malformed/tampered tokens, stale-publication invalidation and crypto
+allocation hooks. This is a native API; Rut/JIT wiring remains pending.
