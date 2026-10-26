@@ -80,13 +80,23 @@ func exposedValue(_ preflight: bool, _ origin: str, _ policy: Policy) -> str {
 func varyValue(_ preflight: bool) -> str {
     if preflight { "Origin, Access-Control-Request-Method, Access-Control-Request-Headers" } else { "Origin" }
 }
+// Response decoration may also be attached to explicit local error responses.
+// Validate independently: an omitted before step must never reflect an
+// unapproved or duplicate Origin, or activate malformed configuration.
+func approvedResponseOrigin(_ origin: str, _ policy: Policy) -> str {
+    if validPolicy(policy) && origin != "" &&
+        httpOriginListAllows(policy.origins, origin, policy.credentials) {
+        origin
+    } else { "" }
+}
+
 func applyPolicy(_ req: i32, _ result: Response, _ policy: Policy) -> i32 {
-    result.set("Access-Control-Allow-Origin", originValue(req.header("Origin").or(""), policy))
-    result.set("Access-Control-Allow-Credentials", credentialsValue(req.header("Origin").or(""), policy))
-    result.set("Access-Control-Allow-Methods", preflightValue(req.method == OPTIONS, req.header("Origin").or(""), policy.methods))
-    result.set("Access-Control-Allow-Headers", preflightValue(req.method == OPTIONS, req.header("Origin").or(""), policy.headers))
-    result.set("Access-Control-Max-Age", preflightValue(req.method == OPTIONS, req.header("Origin").or(""), policy.maxAge))
-    result.set("Access-Control-Expose-Headers", exposedValue(req.method == OPTIONS, req.header("Origin").or(""), policy))
+    result.set("Access-Control-Allow-Origin", originValue(approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy))
+    result.set("Access-Control-Allow-Credentials", credentialsValue(approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy))
+    result.set("Access-Control-Allow-Methods", preflightValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy.methods))
+    result.set("Access-Control-Allow-Headers", preflightValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy.headers))
+    result.set("Access-Control-Max-Age", preflightValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy.maxAge))
+    result.set("Access-Control-Expose-Headers", exposedValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy))
     result.add("Vary", varyValue(req.method == OPTIONS))
     0
 }

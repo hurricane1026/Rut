@@ -1500,8 +1500,12 @@ the upstream. Successful actual responses emit the approved Origin and configure
 exposed headers; credentialed mode adds Allow-Credentials: true. Anonymous mode
 removes upstream credential headers. Preflight-only fields are removed from
 actual responses. Missing Origin removes upstream CORS fields. Existing Vary
-values are preserved. Rejections/runtime failures retain current success-only
-chain-after semantics and get no CORS decoration. CORS does not replace auth.
+values are preserved. `applyPolicy` independently validates the policy and unique
+Origin, so it can decorate explicit local `return 401`, `return 403`,
+`return 429`, or `return 503` routes even without a before step. Invalid policy,
+missing/duplicate Origin, and unapproved Origin emit no CORS permission headers.
+Guard rejections and runtime failures retain current chain-after semantics and
+get no CORS decoration. CORS does not replace auth.
 
 For chain-after helpers, `resp.set("Name", optionalString)` now replaces when
 present and removes when nil. Present empty strings remain empty header values.

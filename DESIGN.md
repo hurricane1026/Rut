@@ -8370,9 +8370,12 @@ on preflights. Absent Origin requests remain ordinary requests and remove any
 upstream CORS fields. Empty exposeHeaders removes upstream exposure. Existing
 Vary values are preserved; Origin is appended on actual responses, and Origin,
 Access-Control-Request-Method and Access-Control-Request-Headers on preflights.
-CORS effects are committed only by existing successful terminators: rejection,
-authentication, rate-limit and runtime-failure response decoration remains a
-separate feature. CORS is browser response-sharing policy, not authentication
+The response helper independently validates policy and unique Origin before
+emitting permission headers, including on explicit local error-status returns
+without a before step. Missing, duplicate or unapproved Origin and invalid
+policy emit no permission headers. CORS effects are committed only by existing
+normal terminators; guard rejection and runtime-failure response decoration
+remains a separate feature. CORS is browser response-sharing policy, not authentication
 or CSRF protection; see the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
 
 `httpOriginListAllows(allowed, origin, credentials)` validates the entire bounded

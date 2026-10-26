@@ -234,6 +234,37 @@ def exercise_policy_variants(port):
             assert headers.get("Access-Control-Allow-Origin") is None
 
 
+def exercise_local_errors(port):
+    def request(path, origins):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            conn.putrequest("GET", path)
+            for origin in origins:
+                conn.putheader("Origin", origin)
+            conn.endheaders()
+            response = conn.getresponse()
+            response.read()
+            return response.status, response.headers
+        finally:
+            conn.close()
+
+    for status in (401, 403, 429, 503):
+        for origins, expected in (
+                (["https://app.example.com"], "https://app.example.com"),
+                (["https://evil.example"], None), ([""], None), ([], None),
+                (["https://app.example.com", "https://app.example.com"], None),
+                (["https://app.example.com", "https://evil.example"], None)):
+            actual, headers = request(f"/local-error-{status}", origins)
+            assert actual == status
+            assert headers.get("Access-Control-Allow-Origin") == expected
+            assert headers.get("Access-Control-Allow-Credentials") == ("true" if expected else None)
+            assert headers.get("Access-Control-Max-Age") is None
+    actual, headers = request("/local-error-invalid", ["https://app.example.com"])
+    assert actual == 503
+    assert headers.get("Access-Control-Allow-Origin") is None
+    assert headers.get("Access-Control-Allow-Credentials") is None
+
+
 def main():
     binary, backend = sys.argv[1:]
     origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
@@ -270,6 +301,11 @@ def main():
                 source += f'chain chain_{symbol} {{ before requirePolicy(req, policy_{symbol}()) after applyPolicy(req, resp, policy_{symbol}()) }}\n'
                 source += f'route OPTIONS "/{name}" use chain chain_{symbol} {{ return 204 }}\n'
                 source += f'route GET "/{name}" use chain chain_{symbol} {{ return forward(api, load_balance: .roundRobin) }}\n'
+            source += 'chain local_error_cors { after applyPolicy(req, resp, browserPolicy()) }\n'
+            for status in (401, 403, 429, 503):
+                source += f'route GET "/local-error-{status}" use chain local_error_cors {{ return {status} }}\n'
+            source += 'chain local_error_invalid { after applyPolicy(req, resp, policy_invalid_age()) }\n'
+            source += 'route GET "/local-error-invalid" use chain local_error_invalid { return 503 }\n'
             (path / "main.rut").write_text(source)
             with (path / "runtime.log").open("w+") as log:
                 process = subprocess.Popen(
@@ -295,6 +331,7 @@ def main():
                     exercise(port)
                     exercise_h2(port)
                     exercise_policy_variants(port)
+                    exercise_local_errors(port)
                 finally:
                     process.terminate()
                     try:
