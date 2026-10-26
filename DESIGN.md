@@ -8361,8 +8361,11 @@ preflight method, request headers and field uniqueness. Explicit status returns
 in guard failure bodies, including before-helper and match-arm guards, also
 commit the request-derived chain-after headers. This does not run subsequent
 route statements. Runtime-generated failures and guard forward/redirect
-terminators retain their existing behavior. CORS is browser response-sharing
-policy, not authentication or CSRF protection; see the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
+terminators retain their existing behavior, except that a policy-free legacy
+502 synthesized for an upstream TCP connect failure may carry committed
+chain-after headers before any upstream response bytes exist. Custom failure
+policies and other runtime failures remain undecorated. CORS is browser
+response-sharing policy, not authentication or CSRF protection; see the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
 
 `httpOriginListAllows(allowed, origin, credentials)` validates the entire bounded
 allow-list before returning an exact match. An empty origin checks configuration
@@ -8390,7 +8393,8 @@ Chain-after `Response.set` now also accepts an optional string: a present value
 upstream occurrences. Nil never reads the optional payload. Ordered effects,
 capacity limits and wire validation are unchanged. Chain-after mutations commit
 on normal terminators and explicit guard status returns; runtime-generated
-failures still do not commit them.
+failures still do not commit them. The policy-free legacy upstream-connect 502
+may serialize already-committed mutations without changing mutation commit state.
 `add` still requires a non-optional string, and local Response builders retain
 their existing restrictions. This general primitive lets the CORS module omit
 credentials/preflight/exposure headers without adding conditional effect syntax.

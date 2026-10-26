@@ -8895,6 +8895,10 @@ TEST(proxy, connect_fail_502) {
         }
     }
     CHECK(has_502);
+    CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                             conn->send_buf.len(),
+                             "Access-Control-Allow-Origin",
+                             sizeof("Access-Control-Allow-Origin") - 1));
     // 502 sets keep_alive=false → on_response_sent will close, not loop
     CHECK_EQ(conn->keep_alive, false);
     // Simulate send completion → connection should be closed
@@ -8902,6 +8906,85 @@ TEST(proxy, connect_fail_502) {
     loop.inject_and_dispatch(
         make_ev(cid, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed, not looped back
+}
+
+TEST(proxy, connect_fail_502_commits_stable_chain_headers) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+    static u8 response_headers[4096];
+    conn->response_header_buf.bind(response_headers, sizeof(response_headers));
+    static constexpr char kOrigin[] = "https://app.example.com";
+    static constexpr char kCredentials[] = "true";
+    conn->resp_header_mutations[0] = {{"Access-Control-Allow-Origin", 27},
+                                      {kOrigin, sizeof(kOrigin) - 1},
+                                      Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[1] = {{"Access-Control-Allow-Credentials", 32},
+                                      {kCredentials, sizeof(kCredentials) - 1},
+                                      Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutation_count = 2;
+    conn->response_mutations_snapshotted = true;
+    conn->upstream_fd = 100;
+    const i32 failed_upstream_fd = conn->upstream_fd;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -111));
+    CHECK_EQ(conn->resp_status, kStatusBadGateway);
+    CHECK_EQ(conn->resp_header_mutation_count, 2u);
+    static constexpr char kOriginLine[] =
+        "Access-Control-Allow-Origin: https://app.example.com\r\n";
+    static constexpr char kCredentialsLine[] = "Access-Control-Allow-Credentials: true\r\n";
+    CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                       conn->send_buf.len(),
+                       kOriginLine,
+                       sizeof(kOriginLine) - 1));
+    CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                       conn->send_buf.len(),
+                       kCredentialsLine,
+                       sizeof(kCredentialsLine) - 1));
+    CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                       conn->send_buf.len(),
+                       "Content-Length: 11\r\n",
+                       20));
+    CHECK_EQ(conn->upstream_fd, failed_upstream_fd);
+    const u32 cid = conn->id;
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK_EQ(loop.conns[cid].upstream_fd, -1);
+}
+
+TEST(proxy, connect_fail_502_mutation_overflow_fails_closed_and_head_has_no_body) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+    conn->req_method = static_cast<u8>(LogHttpMethod::Head);
+    static u8 response_headers[4096];
+    conn->response_header_buf.bind(response_headers, sizeof(response_headers));
+    conn->resp_header_mutations[0] = {{"Access-Control-Allow-Origin", 27},
+                                      {"https://app.example.com", 23},
+                                      Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutation_count = 1;
+    conn->resp_header_mutation_overflow = true;
+    conn->upstream_fd = 100;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -111));
+    CHECK_EQ(conn->resp_status, kStatusInternalServerError);
+    CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                       conn->send_buf.len(),
+                       "Content-Length: 21\r\n",
+                       20));
+    const char* body = strstr(reinterpret_cast<const char*>(conn->send_buf.data()), "\r\n\r\n");
+    REQUIRE(body != nullptr);
+    CHECK_EQ(conn->send_buf.len(),
+             static_cast<u32>((body + 4) - reinterpret_cast<const char*>(conn->send_buf.data())));
 }
 
 TEST(proxy, upstream_initial_send_submit_failure_closes_immediately) {
@@ -10921,6 +11004,144 @@ TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
     CHECK_EQ(h2.outbound_stream, 0u);
     CHECK_FALSE(h2.response_flush_pending);
     CHECK_FALSE(conn->epoch_held);
+}
+
+TEST(http2, connect_fail_502_commits_chain_headers_only_for_connect_failure) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.async_stream = 1;
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static constexpr char kOrigin[] = "https://app.example.com";
+    static char kLargeValue[481];
+    for (u32 i = 0; i < 480; i++) kLargeValue[i] = 'v';
+    kLargeValue[480] = '\0';
+    conn->resp_header_mutations[0] = {{"access-control-allow-origin", 27},
+                                      {kOrigin, sizeof(kOrigin) - 1},
+                                      Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[1] = {
+        {"x-large-cors", 12}, {kLargeValue, 480}, Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutation_count = 2;
+
+    conn->upstream_idx = 0;
+    conn->upstream_backend_idx = 0;
+    h2_on_upstream_connected<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::UpstreamConnect, -111));
+    REQUIRE_GT(conn->send_buf.len(), 0u);
+    Http2FrameHeader frame{};
+    REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
+               ParseStatus::Complete);
+    CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+    hpack::DynamicTable decoded;
+    decoded.init(kDefaultHeaderTableSize);
+    hpack::Header headers[8];
+    u8 scratch[1024]{};
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(decoded,
+                                       conn->send_buf.data() + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       headers,
+                                       8,
+                                       &count));
+    bool saw_origin = false;
+    bool saw_large = false;
+    for (u32 i = 0; i < count; i++) {
+        if (headers[i].name.eq({"access-control-allow-origin", 27})) {
+            saw_origin = headers[i].value.eq({kOrigin, sizeof(kOrigin) - 1});
+        }
+        if (headers[i].name.eq({"x-large-cors", 12})) saw_large = headers[i].value.len == 480;
+    }
+    CHECK(saw_origin);
+    CHECK(saw_large);
+}
+
+TEST(http2, connect_fail_mutation_invalid_or_zero_count_overflow_is_500) {
+    auto run = [&](bool overflow, bool invalid) -> u16 {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        if (conn == nullptr) {
+            CHECK_FALSE(conn == nullptr);
+            return 0;
+        }
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1,
+                         Http2StreamState::Open,
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         true};
+        h2.async_stream = 1;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        conn->resp_header_mutation_overflow = overflow;
+        if (invalid) {
+            conn->resp_header_mutations[0] = {
+                {"bad\nname", 8}, {"x", 1}, Connection::RespHeaderMutationMode::Set};
+            conn->resp_header_mutation_count = 1;
+        }
+        conn->upstream_idx = 0;
+        conn->upstream_backend_idx = 0;
+        h2_on_upstream_connected<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::UpstreamConnect, -111));
+        if (conn->send_buf.len() == 0) {
+            CHECK_GT(conn->send_buf.len(), 0u);
+            return 0;
+        }
+        Http2FrameHeader frame{};
+        if (parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame) !=
+            ParseStatus::Complete) {
+            CHECK_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
+                     ParseStatus::Complete);
+            return 0;
+        }
+        hpack::DynamicTable decoded;
+        decoded.init(kDefaultHeaderTableSize);
+        hpack::Header headers[4];
+        u8 scratch[128]{};
+        u32 count = 0;
+        if (!hpack::decode_header_block(decoded,
+                                        conn->send_buf.data() + kFrameHeaderSize,
+                                        frame.length,
+                                        scratch,
+                                        sizeof(scratch),
+                                        headers,
+                                        4,
+                                        &count)) {
+            CHECK(hpack::decode_header_block(decoded,
+                                             conn->send_buf.data() + kFrameHeaderSize,
+                                             frame.length,
+                                             scratch,
+                                             sizeof(scratch),
+                                             headers,
+                                             4,
+                                             &count));
+            return 0;
+        }
+        if (count != 1 || !headers[0].name.eq({":status", 7})) {
+            CHECK_EQ(count, 1u);
+            CHECK(count != 0 && headers[0].name.eq({":status", 7}));
+            return 0;
+        }
+        return static_cast<u16>((headers[0].value.ptr[0] - '0') * 100 +
+                                (headers[0].value.ptr[1] - '0') * 10 +
+                                (headers[0].value.ptr[2] - '0'));
+    };
+    CHECK_EQ(run(/*overflow=*/true, /*invalid=*/false), 500u);
+    CHECK_EQ(run(/*overflow=*/false, /*invalid=*/true), 500u);
 }
 
 TEST(http2, proxy_finish_bodyless_and_head_preserve_framing_and_epoch) {

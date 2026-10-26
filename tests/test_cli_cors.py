@@ -297,6 +297,33 @@ def exercise_after_only_preflight(port):
             conn.close()
 
 
+def exercise_upstream_connect_failure(port):
+    def request(origins):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            conn.putrequest("GET", "/upstream-connect-error")
+            for origin in origins:
+                conn.putheader("Origin", origin)
+            conn.endheaders()
+            response = conn.getresponse()
+            body = response.read()
+            return response.status, response.headers, body
+        finally:
+            conn.close()
+
+    status, headers, body = request(["https://app.example.com"])
+    assert status == 502, status
+    assert headers.get("Access-Control-Allow-Origin") == "https://app.example.com"
+    assert headers.get("Access-Control-Allow-Credentials") == "true"
+    assert len(body) == 11
+    for origins in (["https://evil.example"], [], ["https://app.example.com",
+                                                       "https://app.example.com"]):
+        status, headers, body = request(origins)
+        assert status == 502, status
+        assert len(body) == 11
+        assert headers.get("Access-Control-Allow-Origin") is None
+
+
 def exercise_guard_rejections(port):
     for status in (401, 429, 503):
         for origins, expected in (
@@ -343,7 +370,14 @@ def main():
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = sock.getsockname()[1]
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                dead_port = sock.getsockname()[1]
             source = (source_root / "examples/cors.rut").read_text()
+            source = source.replace(
+                'upstream api at "127.0.0.1:9000"',
+                f'upstream api at "127.0.0.1:{origin.server_port}"\n'
+                f'upstream dead at "127.0.0.1:{dead_port}"')
             source = source.replace("127.0.0.1:9000", f"127.0.0.1:{origin.server_port}")
             source = source.replace("127.0.0.1:8080", f"127.0.0.1:{port}")
             source += '\nroute GET "/tokens" {\n'
@@ -369,6 +403,8 @@ def main():
             for status in (401, 403, 429, 503):
                 source += f'route GET "/local-error-{status}" use chain local_error_cors {{ return {status} }}\n'
             source += 'route OPTIONS "/after-only-preflight" use chain local_error_cors { return 204 }\n'
+            source += 'chain upstream_error_cors { after applyPolicy(req, resp, browserPolicy()) }\n'
+            source += 'route GET "/upstream-connect-error" use chain upstream_error_cors { return forward(dead, load_balance: .roundRobin) }\n'
             for status in (401, 429, 503):
                 source += f'route GET "/guard-error-{status}" use chain local_error_cors {{ guard req.header("X-Allow").or("") == "yes" else {{ return {status} }} return 200 }}\n'
             source += 'chain local_error_invalid { after applyPolicy(req, resp, policy_invalid_age()) }\n'
@@ -406,6 +442,7 @@ def main():
                     exercise_policy_variants(port)
                     exercise_local_errors(port)
                     exercise_after_only_preflight(port)
+                    exercise_upstream_connect_failure(port)
                     exercise_guard_rejections(port)
                 finally:
                     process.terminate()
