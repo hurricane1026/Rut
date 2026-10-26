@@ -1075,7 +1075,9 @@ rut::u8 rut_helper_standard_webhook_valid(const char* id,
                                           const char* raw_key,
                                           rut::u32 raw_key_len) {
     timespec now{};
-    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0) return 0;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+        now.tv_nsec >= 1000000000)
+        return 0;
     return standard_webhook_valid({id, id_len},
                                   {timestamp, timestamp_len},
                                   {signature, signature_len},
