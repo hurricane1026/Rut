@@ -187,6 +187,51 @@ bool RsaPublicKey::load_rs256_jwk(Str jwk) {
     return accepted;
 }
 
+bool RsaPublicKey::load_rs256_jwks(Str jwks, Str configured_kid) {
+    if (key_ || !jwks.ptr || jwks.len == 0 || jwks.len > kMaxDerBytes || !configured_kid.ptr ||
+        configured_kid.len == 0 || configured_kid.len > 128)
+        return false;
+    json::Document document;
+    if (!document.parse(jwks) || document.nodes[0].kind != json::Kind::Object) return false;
+    u32 keys = json::kNone;
+    for (u32 node = document.nodes[0].child; node != json::kNone;
+         node = document.nodes[node].next) {
+        json::Writer name{document.scratch};
+        if (!document.string(document.nodes[node].key, name)) return false;
+        if (Str{document.scratch, name.len}.eq(lit_str("keys"))) keys = node;
+    }
+    if (keys == json::kNone || document.nodes[keys].kind != json::Kind::Array) return false;
+    char ids[16][128];
+    u32 lengths[16];
+    u32 count = 0;
+    u32 selected = json::kNone;
+    for (u32 node = document.nodes[keys].child; node != json::kNone;
+         node = document.nodes[node].next) {
+        if (count == 16 || document.nodes[node].kind != json::Kind::Object) return false;
+        u32 kid = json::kNone;
+        for (u32 member = document.nodes[node].child; member != json::kNone;
+             member = document.nodes[member].next) {
+            json::Writer name{document.scratch};
+            if (!document.string(document.nodes[member].key, name)) return false;
+            if (Str{document.scratch, name.len}.eq(lit_str("kid"))) kid = member;
+        }
+        if (kid == json::kNone || document.nodes[kid].kind != json::Kind::String) return false;
+        json::Writer id{ids[count], 128};
+        if (!document.string(kid, id) || id.len == 0) return false;
+        const Str value{ids[count], id.len};
+        for (u32 i = 0; i < count; ++i) {
+            if (value.eq({ids[i], lengths[i]})) return false;
+        }
+        lengths[count++] = id.len;
+        if (value.eq(configured_kid)) selected = node;
+    }
+    if (selected == json::kNone) return false;
+    // Serialize only after validating the whole set, so ambiguity never publishes
+    // a key. The nested importer takes ownership independently of this workspace.
+    json::Writer output{document.other};
+    return document.write(selected, output) && load_rs256_jwk({document.other, output.len});
+}
+
 RsaSha256Verifier::~RsaSha256Verifier() {
     reset();
 }

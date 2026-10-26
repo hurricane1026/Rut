@@ -135,3 +135,20 @@ verifier. This adds no Rut/JIT API or complete asymmetric authorization flow.
 The representation follows [RFC 7518 §6.3.1](https://www.rfc-editor.org/rfc/rfc7518.html#section-6.3.1)
 and the usage fields follow [RFC 7517 §4](https://www.rfc-editor.org/rfc/rfc7517.html#section-4),
 with the stricter mandatory algorithm policy described above.
+
+### Trusted configuration selection from JWK Sets
+
+`RsaPublicKey::load_rs256_jwks` selects one key from a trusted, locally supplied
+JWK Set by an explicitly configured, case-sensitive `kid`. Input is bounded to
+8192 bytes and 16 key objects. Every entry must have a nonempty decoded string
+`kid` of at most 128 bytes; duplicate decoded IDs anywhere in the set reject
+the whole configuration, including duplicate IDs unrelated to the selected key.
+Unknown IDs fail without fallback. Selected keys must pass the fixed public
+RSA/RS256 importer; unselected objects need only satisfy the ID constraints and
+may represent other algorithms. The whole set is checked before publication.
+
+This is configuration work with independent key ownership, not request-driven
+selection or remote JWKS retrieval. Token header hints cannot trigger import,
+fetching, fallback or refresh. Rotation still requires preparing a replacement
+configuration generation and draining readers of the old generation. No Rut/JIT
+key API or live JWKS lifecycle is added.
