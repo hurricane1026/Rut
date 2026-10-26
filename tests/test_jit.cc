@@ -1527,7 +1527,7 @@ route GET "/api/users" {
     rir.destroy();
 }
 
-TEST(jit, chain_after_response_headers_commit_only_on_success) {
+TEST(jit, chain_after_response_headers_commit_on_guard_rejection) {
     const auto src = R"rut(
 func response_headers(_ req: i32, _ resp: Response) -> i32 {
     resp.set("X-Path", req.path)
@@ -1535,11 +1535,12 @@ func response_headers(_ req: i32, _ resp: Response) -> i32 {
     resp.remove("Server")
     0
 }
-chain access { after response_headers(req, resp) }
-route GET "/api/users" use chain access {
-    guard req.http11 else { return 505 }
-    return 200
+func require_http11(_ req: i32) -> i32 {
+    guard req.http11 else { respond 505 }
+    0
 }
+chain access { before require_http11(req) after response_headers(req, resp) }
+route GET "/api/users" use chain access { return 200 }
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1570,7 +1571,12 @@ route GET "/api/users" use chain access {
                                                         nullptr));
     CHECK(rejected.action == HandlerAction::ReturnStatus);
     CHECK_EQ(rejected.status_code, 505);
-    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 3u);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("after")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
 
     conn.reset();
     const auto result = HandlerResult::unpack(handler(&conn,
@@ -23691,16 +23697,21 @@ TEST(jit, direct_ir_credential_removal_overflow_is_explicit) {
     engine.shutdown();
 }
 
-TEST(jit, optional_response_headers_set_remove_and_do_not_commit_on_failure) {
+TEST(jit, optional_response_headers_set_remove_and_commit_on_guard_status) {
     const char* source = R"rut(
 func conditional_headers(_ req: i32, _ resp: Response) -> i32 {
     resp.set("X-Test", req.uniqueHeader("X-Test"))
     0
 }
+func fail_request() -> i32 => error(.timeout)
 chain headers { after conditional_headers(req, resp) }
 route GET "/" use chain headers {
     guard req.http11 else { return 505 }
     return 204
+}
+route GET "/fault" use chain headers {
+    let code = fail_request()
+    if code == 200 { return 204 } else { return 204 }
 }
 )rut";
     auto tokens = lex(lit(source));
@@ -23720,6 +23731,8 @@ route GET "/" use chain headers {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler);
+    auto fault_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(fault_handler);
     struct Case {
         const char* request;
         bool present;
@@ -23742,14 +23755,27 @@ route GET "/" use chain headers {
                                                           lit(item.request).len,
                                                           nullptr));
         CHECK(result.status_code == item.status);
-        CHECK(conn.resp_header_mutation_count == (item.status == 204 ? 1 : 0));
-        if (item.status != 204) continue;
+        CHECK(conn.resp_header_mutation_count == 1);
         const auto& mutation = conn.resp_header_mutations[0];
         CHECK(mutation.mode == (item.present ? Connection::RespHeaderMutationMode::Set
                                              : Connection::RespHeaderMutationMode::Remove));
         CHECK(mutation.name.eq(lit("X-Test")));
         if (item.present) CHECK(mutation.value.eq(lit(item.value)));
     }
+    conn.reset();
+    const char* fault_request = "GET /fault HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const auto fault_result =
+        HandlerResult::unpack(fault_handler(&conn,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(fault_request),
+                                            lit(fault_request).len,
+                                            nullptr));
+    CHECK(fault_result.status_code == 500);
+    REQUIRE(conn.resp_header_mutation_pending_count == 1);
+    CHECK(conn.resp_header_mutations[0].mode == Connection::RespHeaderMutationMode::Remove);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Test")));
+    CHECK(conn.resp_header_mutations[0].value.empty());
+    CHECK(conn.resp_header_mutation_count == 0);
     // Nil must not inspect an unspecified optional payload.
     conn.reset();
     rut_helper_resp_set_optional_header(

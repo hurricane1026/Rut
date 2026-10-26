@@ -1505,8 +1505,12 @@ Origin, so it can decorate explicit local `return 401`, `return 403`,
 `return 429`, or `return 503` routes even without a before step. Invalid policy,
 missing/duplicate Origin, and unapproved Origin emit no CORS permission headers.
 After-only OPTIONS decoration also requires a valid, permitted preflight method
-and request-header list, with unique preflight fields. Guard rejections and runtime failures retain current chain-after semantics and
-get no CORS decoration. CORS does not replace auth.
+and request-header list, with unique preflight fields. Explicit status returns
+in guard failure bodies (including `respond` in before helpers) also commit
+chain-after headers. The response helper still independently validates
+Origin and policy on these paths. Runtime-generated failures and guard
+forward/redirect terminators do not gain automatic CORS decoration. CORS does
+not replace auth.
 
 For chain-after helpers, `resp.set("Name", optionalString)` now replaces when
 present and removes when nil. Present empty strings remain empty header values.
