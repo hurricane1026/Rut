@@ -297,6 +297,38 @@ def exercise_after_only_preflight(port):
             conn.close()
 
 
+def exercise_guard_rejections(port):
+    for status in (401, 429, 503):
+        for origins, expected in (
+                (["https://app.example.com"], "https://app.example.com"),
+                (["https://evil.example"], None), ([], None),
+                (["https://app.example.com", "https://app.example.com"], None)):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            try:
+                conn.putrequest("GET", f"/guard-error-{status}")
+                for origin in origins:
+                    conn.putheader("Origin", origin)
+                conn.endheaders()
+                response = conn.getresponse()
+                response.read()
+                assert response.status == status
+                assert response.headers.get("Access-Control-Allow-Origin") == expected
+                assert response.headers.get("Access-Control-Allow-Credentials") == (
+                    "true" if expected else None)
+            finally:
+                conn.close()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            conn.request("GET", f"/guard-error-{status}", headers={
+                "X-Allow": "yes", "Origin": "https://app.example.com"})
+            response = conn.getresponse()
+            response.read()
+            assert response.status == 200
+            assert response.headers.get("Access-Control-Allow-Origin") == "https://app.example.com"
+        finally:
+            conn.close()
+
+
 def main():
     binary, backend = sys.argv[1:]
     origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
@@ -337,6 +369,8 @@ def main():
             for status in (401, 403, 429, 503):
                 source += f'route GET "/local-error-{status}" use chain local_error_cors {{ return {status} }}\n'
             source += 'route OPTIONS "/after-only-preflight" use chain local_error_cors { return 204 }\n'
+            for status in (401, 429, 503):
+                source += f'route GET "/guard-error-{status}" use chain local_error_cors {{ guard req.header("X-Allow").or("") == "yes" else {{ return {status} }} return 200 }}\n'
             source += 'chain local_error_invalid { after applyPolicy(req, resp, policy_invalid_age()) }\n'
             source += 'route GET "/local-error-invalid" use chain local_error_invalid { return 503 }\n'
             (path / "main.rut").write_text(source)
@@ -372,6 +406,7 @@ def main():
                     exercise_policy_variants(port)
                     exercise_local_errors(port)
                     exercise_after_only_preflight(port)
+                    exercise_guard_rejections(port)
                 finally:
                     process.terminate()
                     try:

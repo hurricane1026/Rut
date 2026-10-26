@@ -8356,11 +8356,13 @@ Access-Control-Request-Method and Access-Control-Request-Headers on preflights.
 The response helper independently validates policy and unique Origin before
 emitting permission headers, including on explicit local error-status returns
 without a before step. Missing, duplicate or unapproved Origin and invalid
-policy emit no permission headers. CORS effects are committed only by existing
-normal terminators. After-only OPTIONS decoration additionally validates the
-preflight method, request headers and field uniqueness; guard rejection and runtime-failure response decoration
-remains a separate feature. CORS is browser response-sharing policy, not authentication
-or CSRF protection; see the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
+policy emit no permission headers. After-only OPTIONS decoration validates the
+preflight method, request headers and field uniqueness. Explicit status returns
+in guard failure bodies, including before-helper and match-arm guards, also
+commit the request-derived chain-after headers. This does not run subsequent
+route statements. Runtime-generated failures and guard forward/redirect
+terminators retain their existing behavior. CORS is browser response-sharing
+policy, not authentication or CSRF protection; see the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
 
 `httpOriginListAllows(allowed, origin, credentials)` validates the entire bounded
 allow-list before returning an exact match. An empty origin checks configuration
@@ -8386,7 +8388,9 @@ helpers remain available for manual policies.
 Chain-after `Response.set` now also accepts an optional string: a present value
 (including an empty string) replaces the field; nil records removal of all
 upstream occurrences. Nil never reads the optional payload. Ordered effects,
-capacity limits, wire validation and success-only commit semantics are unchanged.
+capacity limits and wire validation are unchanged. Chain-after mutations commit
+on normal terminators and explicit guard status returns; runtime-generated
+failures still do not commit them.
 `add` still requires a non-optional string, and local Response builders retain
 their existing restrictions. This general primitive lets the CORS module omit
 credentials/preflight/exposure headers without adding conditional effect syntax.

@@ -8228,12 +8228,12 @@ route {
     REQUIRE(hir->routes[0].locals[0].init.lhs != nullptr);
     CHECK_EQ(hir->routes[0].locals[0].init.lhs->kind, HirExprKind::ReqPath);
     CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
-    CHECK_FALSE(hir->routes[0].guards[0].fail_term.commit_response_mutations);
+    CHECK(hir->routes[0].guards[0].fail_term.commit_response_mutations);
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     CHECK(mir->functions[0].blocks[1].term.commit_response_mutations);
-    CHECK_FALSE(mir->functions[0].blocks[2].term.commit_response_mutations);
+    CHECK(mir->functions[0].blocks[2].term.commit_response_mutations);
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
@@ -8253,11 +8253,11 @@ route {
     CHECK_EQ(sets, 1u);
     CHECK_EQ(adds, 1u);
     CHECK_EQ(removes, 1u);
-    CHECK_EQ(commits, 1u);
+    CHECK_EQ(commits, 2u);
     rir.destroy();
 }
 
-TEST(frontend, chain_after_never_commits_on_guard_failure_shapes) {
+TEST(frontend, chain_after_commits_on_explicit_guard_status_returns) {
     const char source[] = R"rut(
 variant Result { ok, err }
 func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
@@ -8281,18 +8281,18 @@ route "/" use chain access {
 
     auto check_fail_terms = [&](const HirModule& module, const HirGuard& guard) {
         if (guard.fail_kind == HirGuard::FailKind::Term) {
-            CHECK_FALSE(guard.fail_term.commit_response_mutations);
+            CHECK(guard.fail_term.commit_response_mutations);
         } else if (guard.fail_kind == HirGuard::FailKind::Body) {
             if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
-                CHECK_FALSE(guard.fail_body.then_term.commit_response_mutations);
-                CHECK_FALSE(guard.fail_body.else_term.commit_response_mutations);
+                CHECK(guard.fail_body.then_term.commit_response_mutations);
+                CHECK(guard.fail_body.else_term.commit_response_mutations);
             } else {
-                CHECK_FALSE(guard.fail_body.direct_term.commit_response_mutations);
+                CHECK(guard.fail_body.direct_term.commit_response_mutations);
             }
         } else {
             for (u32 ai = 0; ai < guard.fail_match_count; ai++)
-                CHECK_FALSE(module.guard_match_arms[guard.fail_match_start + ai]
-                                .direct_term.commit_response_mutations);
+                CHECK(module.guard_match_arms[guard.fail_match_start + ai]
+                          .direct_term.commit_response_mutations);
         }
     };
 
