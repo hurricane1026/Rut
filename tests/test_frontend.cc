@@ -41096,17 +41096,15 @@ route GET "/tokens" {
 }
 
 TEST(frontend, http_token_list_builtin_rejects_wrong_types_and_optional_values) {
-    const char* calls[] = {
-        "httpTokenListAllows(\"GET\", \"GET\")",
-        "httpTokenListAllows(1, \"GET\", true)",
-        "httpTokenListAllows(\"GET\", 1, true)",
-        "httpTokenListAllows(\"GET\", \"GET\", 1)",
-        "httpTokenListAllows(\"GET\", req.header(\"Method\"), true)",
+    const char* sources[] = {
+        R"rut(route GET "/" { guard httpTokenListAllows("GET", "GET") else { return 403 } return 204 })rut",
+        R"rut(route GET "/" { guard httpTokenListAllows(1, "GET", true) else { return 403 } return 204 })rut",
+        R"rut(route GET "/" { guard httpTokenListAllows("GET", 1, true) else { return 403 } return 204 })rut",
+        R"rut(route GET "/" { guard httpTokenListAllows("GET", "GET", 1) else { return 403 } return 204 })rut",
+        R"rut(route GET "/" { guard httpTokenListAllows("GET", req.header("Method"), true) else { return 403 } return 204 })rut",
     };
-    for (const char* call : calls) {
-        const std::string source =
-            std::string("route GET \"/\" { guard ") + call + " else { return 403 } return 204 }";
-        auto tokens = lex(lit(source.c_str()));
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
