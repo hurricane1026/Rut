@@ -105,6 +105,7 @@ endif()
 add_library(rut_runtime STATIC
     placement_new.cc
     runtime/auth.cc
+    runtime/webhook.cc
     runtime/hash.cc
     runtime/memory_http_cache_store.cc
     runtime/http_tokens.cc
