@@ -8953,6 +8953,7 @@ TEST(proxy, connect_fail_502_commits_stable_chain_headers) {
     const u32 cid = conn->id;
     loop.inject_and_dispatch(
         make_ev(cid, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(loop.conns[cid].fd, -1);
     CHECK_EQ(loop.conns[cid].upstream_fd, -1);
 }
 
