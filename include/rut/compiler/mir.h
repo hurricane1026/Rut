@@ -88,6 +88,7 @@ enum class MirValueKind : u8 {
     BearerMatches,
     BasicMatches,
     HmacSha256Matches,
+    StandardWebhookValid,
     HttpTokenListAllows,
     HttpOriginListAllows,
     HashDigest,

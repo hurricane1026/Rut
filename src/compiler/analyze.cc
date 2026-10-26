@@ -9760,6 +9760,37 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    if (expr.name.eq(lit_str("standardWebhookValid")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr Str kDetail = lit_str(
+            "standardWebhookValid expects id, timestamp, signature, body and rawKey as unwrapped "
+            "str values");
+        if (expr.args.len != 5)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr* values[5]{};
+        for (u32 i = 0; i < expr.args.len; ++i) {
+            if (expr.args[i] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            auto value = analyze_builtin_arg(*expr.args[i]);
+            if (!value) return core::make_unexpected(value.error());
+            if (value->type != HirTypeKind::Str || value->may_nil || value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, kDetail);
+            if (!route->exprs.push(value.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            values[i] = &route->exprs[route->exprs.len - 1];
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::StandardWebhookValid;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        out.lhs = values[0];
+        out.rhs = values[1];
+        if (!out.args.push(values[2]) || !out.args.push(values[3]) || !out.args.push(values[4]))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return out;
+    }
+
     if (expr.name.eq(lit_str("jwtHasScope")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)

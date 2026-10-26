@@ -8209,6 +8209,16 @@ not establish freshness, replay prevention, canonical HTTP request signing or
 any OAuth/SAML/LDAP protocol. Track those independently in
 [auth-coverage.md](docs/auth-coverage.md).
 
+`standardWebhookValid(id, timestamp, signature, body, rawKey)` returns a nonoptional
+`bool` and requires five unwrapped `str` arguments. It exposes the native bounded
+Standard Webhooks symmetric profile with the exact original body and decoded secret
+bytes (not `whsec_` serialization). The synchronous runtime samples `CLOCK_REALTIME`,
+fails closed on clock failure or nonpositive time, and enforces the fixed inclusive
+300-second freshness tolerance. Use `req.uniqueHeader(...).or("")` for each webhook
+field to reject duplicates. This verifies freshness and integrity; callers must
+deduplicate verified IDs durably across shards and nodes before side effects.
+The builtin uses dedicated HIR/MIR/RIR lowering and adds no keyword or dependency.
+
 ### Implemented generic digest and HMAC calls
 
 The six MD5/SHA-1/SHA-224/SHA-256/SHA-384/SHA-512 calls and their six HMAC

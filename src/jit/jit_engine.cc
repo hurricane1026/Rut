@@ -84,6 +84,8 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_http_token_list_allows",
      reinterpret_cast<void*>(&rut_helper_http_token_list_allows)},
     {"rut_helper_bearer_matches", reinterpret_cast<void*>(&rut_helper_bearer_matches)},
+    {"rut_helper_standard_webhook_valid",
+     reinterpret_cast<void*>(&rut_helper_standard_webhook_valid)},
     {"rut_helper_hmac_sha256_matches", reinterpret_cast<void*>(&rut_helper_hmac_sha256_matches)},
     {"rut_helper_basic_matches", reinterpret_cast<void*>(&rut_helper_basic_matches)},
     {"rut_helper_str_constant_time_equal",

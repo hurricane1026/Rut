@@ -756,6 +756,24 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_standard_webhook_valid(ValueId message,
+                                                ValueId key,
+                                                ValueId signature,
+                                                ValueId prefix,
+                                                ValueId raw_key,
+                                                SourceLoc loc = {}) {
+        if (!val_has_type(message, TypeKind::Str) || !val_has_type(key, TypeKind::Str) ||
+            !val_has_type(signature, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str) ||
+            !val_has_type(raw_key, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::StandardWebhookValid, ty, loc));
+        const ValueId kOperands[] = {message, key, signature, prefix, raw_key};
+        auto stored = set_operands(inst, kOperands, 5);
+        if (!stored) return err(stored.error());
+        return vid;
+    }
+
     Result<ValueId> emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
             return err(RirError::InvalidState);

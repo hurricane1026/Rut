@@ -41129,3 +41129,28 @@ route GET "/" use chain headers { return 204 }
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
 }
+
+TEST(frontend, standard_webhook_requires_five_unwrapped_strings_and_allows_shadowing) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { let x = standardWebhookValid("id", "1", "sig", "body") return 200 })rut",
+        R"rut(route GET "/" { let x = standardWebhookValid("id", "1", "sig", "body", "key", "extra") return 200 })rut",
+        R"rut(route GET "/" { let x = standardWebhookValid("id", 1, "sig", "body", "key") return 200 })rut",
+        R"rut(route GET "/" { let x = standardWebhookValid("id", "1", "sig", "body", req.authorization) return 200 })rut",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    const char* source = R"rut(
+func standardWebhookValid(_ value: str) -> str { value }
+route GET "/" { let value = standardWebhookValid("user") guard value == "user" else { return 500 } return 200 }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}

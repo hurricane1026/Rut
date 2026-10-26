@@ -28,9 +28,12 @@
 #include <fstream>
 #include <memory>
 
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 using namespace rut;
@@ -23787,6 +23790,96 @@ route GET "/fault" use chain headers {
     CHECK(conn.resp_header_mutation_pending_overflow);
     conn.reset();
     CHECK(!conn.resp_header_mutation_pending_overflow);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, standard_webhook_builtin_executes_five_operands_with_freshness) {
+    const char* source = R"rut(
+func verify(_ id: str, _ timestamp: str, _ signature: str, _ body: str) -> bool {
+    standardWebhookValid(id, timestamp, signature, body, "secret")
+}
+route POST "/" {
+    guard verify(req.uniqueHeader("webhook-id").or(""),
+                 req.uniqueHeader("webhook-timestamp").or(""),
+                 req.uniqueHeader("webhook-signature").or(""), req.body) else { return 401 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir_function_needs_req_body(rir.module.functions[0]));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    REQUIRE(now.tv_sec > 1000);
+    const std::string timestamp = std::to_string(now.tv_sec);
+    auto signature_for = [&](const std::string& timestamp, std::string& result) {
+        const std::string message = "msg_1." + timestamp + ".hello";
+        unsigned char digest[32];
+        unsigned int length = 0;
+        REQUIRE(HMAC(EVP_sha256(),
+                     "secret",
+                     6,
+                     reinterpret_cast<const unsigned char*>(message.data()),
+                     message.size(),
+                     digest,
+                     &length) != nullptr);
+        REQUIRE(length == 32);
+        unsigned char encoded[45];
+        REQUIRE(EVP_EncodeBlock(encoded, digest, 32) == 44);
+        result = std::string("v1,") + reinterpret_cast<const char*>(encoded);
+    };
+    std::string signature;
+    signature_for(timestamp, signature);
+    REQUIRE(!signature.empty());
+    const std::string stale = std::to_string(now.tv_sec - 1000);
+    std::string stale_signature;
+    signature_for(stale, stale_signature);
+    REQUIRE(!stale_signature.empty());
+    struct Case {
+        const char* id;
+        std::string timestamp;
+        std::string signature;
+        const char* body;
+        u16 status;
+    };
+    const Case cases[] = {
+        {"msg_1", timestamp, signature, "hello", 204},
+        {"msg_2", timestamp, signature, "hello", 401},
+        {"msg_1", timestamp, signature, "Hello", 401},
+        {"msg_1", timestamp, "v1,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "hello", 401},
+        {"msg_1", stale, stale_signature, "hello", 401},
+    };
+    for (const auto& tc : cases) {
+        const std::string body(tc.body);
+        const std::string request =
+            "POST / HTTP/1.1\r\nHost: localhost\r\nwebhook-id: " + std::string(tc.id) +
+            "\r\nwebhook-timestamp: " + tc.timestamp + "\r\nwebhook-signature: " + tc.signature +
+            "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK(result.status_code == tc.status);
+    }
     engine.shutdown();
     rir.destroy();
 }
