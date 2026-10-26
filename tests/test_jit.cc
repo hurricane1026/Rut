@@ -24246,6 +24246,191 @@ TEST(jit, consumer_groups_bind_verified_identity_and_default_deny) {
     rir.destroy();
 }
 
+TEST(jit, standard_webhook_identity_helper_rejects_ambiguous_headers_and_bad_config) {
+    const char* source = R"rut(
+import "middleware/auth.rut"
+route POST "/webhook" {
+    let identity = auth.standardWebhook(req.uniqueHeader("webhook-id").or(""),
+        req.uniqueHeader("webhook-timestamp").or(""),
+        req.uniqueHeader("webhook-signature").or(""), req.body,
+        "trusted-raw-key", "configured-consumer", "endpoint-v1")
+    guard identity.consumerId == "configured-consumer" && identity.credentialId == "endpoint-v1" &&
+          identity.method == "standardWebhook" else { return 500 }
+    return 204
+}
+route POST "/empty-key" {
+    let identity = auth.standardWebhook("", "", "", req.body, "", "configured-consumer", "endpoint-v1")
+    return 204
+}
+route POST "/empty-consumer" {
+    let identity = auth.standardWebhook("", "", "", req.body, "trusted-raw-key", "", "endpoint-v1")
+    return 204
+}
+route POST "/empty-credential" {
+    let identity = auth.standardWebhook("", "", "", req.body, "trusted-raw-key", "configured-consumer", "")
+    return 204
+}
+)rut";
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/standard-webhook-auth.rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "standard webhook middleware analysis %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    const std::string id = "evt_standard_1";
+    const std::string timestamp = std::to_string(static_cast<i64>(time(nullptr)));
+    const auto signature_for = [&](const std::string& body, std::string& signature) {
+        const std::string message = id + "." + timestamp + "." + body;
+        unsigned char digest[32];
+        unsigned int digest_len = 0;
+        REQUIRE(HMAC(EVP_sha256(),
+                     "trusted-raw-key",
+                     15,
+                     reinterpret_cast<const unsigned char*>(message.data()),
+                     message.size(),
+                     digest,
+                     &digest_len) != nullptr);
+        REQUIRE_EQ(digest_len, 32u);
+        unsigned char encoded[45];
+        REQUIRE_EQ(EVP_EncodeBlock(encoded, digest, digest_len), 44);
+        signature = std::string("v1,") + reinterpret_cast<const char*>(encoded);
+    };
+    const std::string body = "{\"event\":\"paid\"}";
+    std::string signature;
+    signature_for(body, signature);
+    const std::string valid = "webhook-id: " + id + "\r\nwebhook-timestamp: " + timestamp +
+                              "\r\nwebhook-signature: " + signature + "\r\n";
+    std::string bad_signature = signature;
+    bad_signature[3] = bad_signature[3] == 'A' ? 'B' : 'A';
+    std::string bad_timestamp = timestamp;
+    bad_timestamp.back() = bad_timestamp.back() == '1' ? '2' : '1';
+    const std::string binary_body("a\0b", 3);
+    std::string binary_signature;
+    signature_for(binary_body, binary_signature);
+    std::string empty_signature;
+    signature_for("", empty_signature);
+    struct Case {
+        u32 route;
+        const char* path;
+        std::string headers;
+        std::string body;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0, "/webhook", valid, body, 204},
+        {0, "/webhook", valid + "X-Consumer-ID: attacker\r\n", body, 204},
+        {0, "/webhook", valid + "Webhook-ID: " + id + "\r\n", body, 401},
+        {0, "/webhook", valid + "webhook-timestamp: " + timestamp + "\r\n", body, 401},
+        {0, "/webhook", valid + "webhook-signature: " + signature + "\r\n", body, 401},
+        {0,
+         "/webhook",
+         "webhook-timestamp: " + timestamp + "\r\nwebhook-signature: " + signature + "\r\n",
+         body,
+         401},
+        {0,
+         "/webhook",
+         "webhook-id: " + id + "\r\nwebhook-signature: " + signature + "\r\n",
+         body,
+         401},
+        {0,
+         "/webhook",
+         "webhook-id: " + id + "\r\nwebhook-timestamp: " + timestamp + "\r\n",
+         body,
+         401},
+        {0,
+         "/webhook",
+         "webhook-id: " + id + "\r\nwebhook-id: " + id + "\r\nwebhook-timestamp: " + timestamp +
+             "\r\nwebhook-signature: " + signature + "\r\n",
+         body,
+         401},
+        {0,
+         "/webhook",
+         "webhook-id: " + id + "\r\nwebhook-timestamp: " + timestamp +
+             "\r\nwebhook-timestamp: " + timestamp + "\r\nwebhook-signature: " + signature + "\r\n",
+         body,
+         401},
+        {0,
+         "/webhook",
+         "webhook-id: " + id + "\r\nwebhook-timestamp: " + timestamp +
+             "\r\nwebhook-signature: " + signature + "\r\nwebhook-signature: " + signature + "\r\n",
+         body,
+         401},
+        {0, "/webhook", valid, body + "!", 401},
+        {0,
+         "/webhook",
+         "webhook-id: evt_standard_2\r\nwebhook-timestamp: " + timestamp +
+             "\r\nwebhook-signature: " + signature + "\r\n",
+         body,
+         401},
+        {0,
+         "/webhook",
+         "webhook-id: " + id + "\r\nwebhook-timestamp: " + bad_timestamp +
+             "\r\nwebhook-signature: " + signature + "\r\n",
+         body,
+         401},
+        {0,
+         "/webhook",
+         "webhook-id: " + id + "\r\nwebhook-timestamp: " + timestamp +
+             "\r\nwebhook-signature: " + bad_signature + "\r\n",
+         body,
+         401},
+        {0,
+         "/webhook",
+         "webhook-id: " + id + "\r\nwebhook-timestamp: " + timestamp +
+             "\r\nwebhook-signature: " + empty_signature + "\r\n",
+         "",
+         204},
+        {0,
+         "/webhook",
+         "webhook-id: " + id + "\r\nwebhook-timestamp: " + timestamp +
+             "\r\nwebhook-signature: " + binary_signature + "\r\n",
+         binary_body,
+         204},
+        {1, "/empty-key", "", "", 503},
+        {2, "/empty-consumer", "", "", 503},
+        {3, "/empty-credential", "", "", 503},
+    };
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char handler_name[32];
+        snprintf(handler_name, sizeof(handler_name), "handler_route_%u", cases[i].route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(handler_name));
+        REQUIRE(handler != nullptr);
+        const std::string request = std::string("POST ") + cases[i].path +
+                                    " HTTP/1.1\r\nHost: localhost\r\nContent-Length: " +
+                                    std::to_string(cases[i].body.size()) + "\r\n" +
+                                    cases[i].headers + "\r\n" + cases[i].body;
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, cases[i].status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, header_count_distinguishes_absent_empty_duplicate_and_invalid_requests) {
     const char* source = R"rut(
 func countAuthorization() -> i32 { req.headerCount("aUtHoRiZaTiOn") }

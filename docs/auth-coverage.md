@@ -56,9 +56,10 @@ The 2026-10-27 audit separates these layers:
   cancellation/close behavior; redirects or fire-and-forget proxying do not
   implement forward-auth, OPA or introspection.
 
-Standard Webhooks middleware integration remains separate from this branch and
-is tracked by [#934](https://github.com/hurricane1026/Rut/pull/934). Its freshness
-checks do not implement persistent replay protection.
+The Standard Webhooks identity middleware is integrated here; its freshness
+checks do not implement persistent replay protection. The bounded Consumer
+policy work from #924, required credentials from #925, and header-count
+primitive from #926 are already present in this main base.
 
 ## Bounded multi-Consumer authentication
 
