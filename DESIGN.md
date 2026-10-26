@@ -8138,6 +8138,14 @@ ID and method. Rejection emits two ordered `WWW-Authenticate` fields, Bearer the
 Basic. Duplicate Authorization rejects the entire request; there is no alternate
 source or anonymous fallback. Existing verifiers supply all secret comparison.
 
+`multiAuth` extends the static OR policy to two trusted `ConsumerCredentials`
+values, each containing Bearer/Basic secrets and identity metadata. It evaluates
+all four verifiers before selecting an identity. Distinct Consumer IDs and
+nonempty credential IDs are mandatory. Empty secrets disable slots; all disabled
+or shared same-method secrets across Consumers return 503. Ambiguous ownership
+is never resolved by configuration order. It reuses existing primitives and
+singleton Authorization reads with no runtime registry or new language surface.
+
 `requireConsumer` and `denyConsumer` apply exact, case-sensitive single-consumer
 allow/deny rules to an already verified Identity. They return the original identity,
 403 on policy rejection, or 503 for an empty policy ID. Multiple deny checks can

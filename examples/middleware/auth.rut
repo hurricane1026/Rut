@@ -6,6 +6,55 @@ struct Identity {
     method: str
 }
 
+// Trusted static configuration, never populated from request headers or JSON.
+// Empty secrets disable individual methods; IDs remain stable during revocation.
+struct ConsumerCredentials {
+    consumerId: str
+    key: str
+    credentials: str
+    keyId: str
+    passwordId: str
+}
+
+func validConsumerPair(_ first: ConsumerCredentials, _ second: ConsumerCredentials) -> bool {
+    first.consumerId != "" && second.consumerId != "" && first.consumerId != second.consumerId &&
+        first.keyId != "" && first.passwordId != "" && second.keyId != "" && second.passwordId != "" &&
+        (first.key != "" || first.credentials != "" || second.key != "" || second.credentials != "") &&
+        (first.key == "" || !constantTimeEqual(first.key, second.key)) &&
+        (first.credentials == "" || !constantTimeEqual(first.credentials, second.credentials))
+}
+
+func consumerCredentialsMatch(_ authorization: str, _ consumer: ConsumerCredentials) -> bool {
+    let keyMatches = bearerMatches(authorization, consumer.key)
+    let passwordMatches = basicMatches(authorization, consumer.credentials)
+    keyMatches || passwordMatches
+}
+
+// Internal mapping step: call only after consumerCredentialsMatch succeeded.
+func matchedConsumerIdentity(_ authorization: str, _ consumer: ConsumerCredentials) -> Identity {
+    match bearerMatches(authorization, consumer.key) {
+        true => Identity(consumerId: consumer.consumerId, credentialId: consumer.keyId, method: "apiKey")
+        _ => Identity(consumerId: consumer.consumerId, credentialId: consumer.passwordId, method: "basic")
+    }
+}
+
+// Bounded two-consumer OR policy over one singleton Authorization field.
+// Ambiguous credential ownership is a configuration error, never first-match wins.
+func multiAuth(_ authorization: str, _ first: ConsumerCredentials,
+               _ second: ConsumerCredentials) -> Identity {
+    let denied = response(401)
+    denied.add("WWW-Authenticate", "Bearer")
+    denied.add("WWW-Authenticate", "Basic realm=\"rut\"")
+    guard validConsumerPair(first, second) else { respond 503 }
+    let firstMatches = consumerCredentialsMatch(authorization, first)
+    let secondMatches = consumerCredentialsMatch(authorization, second)
+    guard firstMatches || secondMatches else { respond denied }
+    match firstMatches {
+        true => matchedConsumerIdentity(authorization, first)
+        _ => matchedConsumerIdentity(authorization, second)
+    }
+}
+
 // All arguments are positional. key is the opaque key WITHOUT the Bearer prefix.
 // Configuration is a snapshot: replace/remove credentials and redeploy to rotate/revoke.
 func apiKey(_ authorization: str, _ key: str, _ consumerId: str, _ credentialId: str) -> Identity {
