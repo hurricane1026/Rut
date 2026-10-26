@@ -5742,18 +5742,68 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
     }
     (void)detach_upstream_close(loop, conn);
     conn.upstream_abandoned = true;
-    static const char k504[] =
-        "HTTP/1.1 504 Gateway Timeout\r\n"
-        "Content-Length: 15\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "Gateway Timeout";
-    conn.send_buf.reset();
-    if (http1_request_is_head(conn)) {
-        conn.send_buf.write(reinterpret_cast<const u8*>(k504),
-                            sizeof(k504) - 1 - (sizeof("Gateway Timeout") - 1));
-    } else {
-        conn.send_buf.write(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
+    const bool policy_free_http1_timeout = conn.protocol == ConnProtocol::Http11 &&
+                                           conn.failure_policy_id == 0 &&
+                                           conn.timeout_failure_policy_id == 0;
+    bool serialized = false;
+    bool mutation_failure = policy_free_http1_timeout && (conn.resp_header_mutation_count != 0 ||
+                                                          conn.resp_header_mutation_overflow);
+    if (mutation_failure) {
+        const u8* source =
+            conn.response_mutations_snapshotted ? conn.send_buf.data() : conn.recv_buf.data();
+        const u32 source_len =
+            conn.response_mutations_snapshotted ? conn.send_buf.len() : conn.recv_buf.len();
+        if (!conn.resp_header_mutation_overflow && conn.response_header_buf.valid() &&
+            conn.stabilize_response_mutations(source, source_len)) {
+            constexpr u32 kMaxEffectiveHeaders =
+                RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+            ResponseHeaderKV headers[kMaxEffectiveHeaders];
+            u32 header_count = 0;
+            if (collect_effective_response_headers(
+                    conn, conn.request_config, 0, headers, kMaxEffectiveHeaders, &header_count)) {
+                const bool formatted =
+                    format_response_with_body_and_headers(conn,
+                                                          504,
+                                                          "Gateway Timeout",
+                                                          sizeof("Gateway Timeout") - 1,
+                                                          headers,
+                                                          header_count,
+                                                          false,
+                                                          true,
+                                                          false,
+                                                          http1_request_is_head(conn),
+                                                          http1_request_is_head(conn));
+                if (formatted) {
+                    mutation_failure = false;
+                    serialized = true;
+                }
+            }
+        }
+    }
+    if (mutation_failure) {
+        conn.send_buf.reset();
+        conn.keep_alive = false;
+        conn.resp_status = kStatusInternalServerError;
+        format_static_response(conn, 500, /*keep_alive=*/false, http1_request_is_head(conn));
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len()))
+            close_conn_if_live(loop, conn);
+        return;
+    }
+    if (!serialized) {
+        static const char k504[] =
+            "HTTP/1.1 504 Gateway Timeout\r\n"
+            "Content-Length: 15\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "Gateway Timeout";
+        conn.send_buf.reset();
+        if (http1_request_is_head(conn)) {
+            conn.send_buf.write(reinterpret_cast<const u8*>(k504),
+                                sizeof(k504) - 1 - (sizeof("Gateway Timeout") - 1));
+        } else {
+            conn.send_buf.write(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
+        }
     }
     conn.keep_alive = false;
     conn.resp_status = 504;

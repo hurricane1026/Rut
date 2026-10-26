@@ -742,6 +742,12 @@ See `docs/language-card.md` for the exhaustive per-field/per-status grammar
 and `docs/envoy-converter.md` for the byte-level Envoy oracle these layouts
 reproduce.
 
+For a policy-free HTTP/1.1 upstream timeout with no response bytes, the legacy
+504 may fold committed chain-after response-header mutations using the bounded
+HTTP response serializer. Invalid or overflowing mutations fail closed with
+500. Explicit timeout policies, HTTP/2 timer failures, cache-only 504s, and
+partial upstream responses retain their existing behavior.
+
 When a request has been sent on an idle pooled upstream connection and that
 connection returns EOF or RST before any response byte, Rut does not replay a
 non-idempotent request. After the terminal receive owner has been settled, the
