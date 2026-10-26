@@ -8147,6 +8147,18 @@ or shared same-method secrets across Consumers return 503. Ambiguous ownership
 is never resolved by configuration order. It reuses existing primitives and
 singleton Authorization reads with no runtime registry or new language surface.
 
+`headerKeyAndBasic` supplies an explicit AND policy for a unique opaque header
+key and a unique Basic Authorization field. Both verifiers must succeed; neither
+can be disabled or satisfy the other source. Empty configuration returns 503;
+any failed factor returns 401. The Identity names the configured Consumer and
+required-pair policy ID, with method `apiKeyAndBasic`. It reuses constant-time
+key comparison and the bounded native Basic verifier without new syntax.
+
+`requireAnyConsumer` implements a two-ID allow union after authentication using
+exact case-sensitive equality. It preserves the Identity; nonmembers return 403,
+and empty policy IDs return 503. This complements intersection by sequential
+single-ID checks, without adding a group registry or client-derived membership.
+
 `requireConsumer` and `denyConsumer` apply exact, case-sensitive single-consumer
 allow/deny rules to an already verified Identity. They return the original identity,
 403 on policy rejection, or 503 for an empty policy ID. Multiple deny checks can

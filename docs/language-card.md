@@ -1197,6 +1197,17 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   success returns the matched Consumer, credential ID and method. This is a
   fixed two-Consumer configuration, with restart-based rotation/revocation.
   See [multi-consumer-auth.rut](../examples/multi-consumer-auth.rut).
+- `auth.headerKeyAndBasic(presentedKey, authorization, key, credentials, consumerId, policyId)`
+  requires both an opaque header key and Basic credentials for the configured
+  Consumer. Use `req.uniqueHeader("X-API-Key").or("")` and
+  `req.authorization.or("")`; neither factor is optional. Either failure returns
+  401; empty configuration returns 503. The returned method is `apiKeyAndBasic`,
+  and credentialId is the configured ID of the required pair.
+- `auth.requireAnyConsumer(identity, first, second)` permits either exact,
+  case-sensitive configured Consumer ID after authentication. It preserves the
+  Identity, returns 403 outside the set and 503 for an empty policy ID.
+  This is a two-member allow union; chained single-consumer allow checks remain
+  intersections. It does not provide dynamic group membership.
 - `auth.requireConsumer(identity, allowedConsumerId)` permits one exact,
   case-sensitive consumer ID; `auth.denyConsumer(identity, deniedConsumerId)`
   excludes one exact ID. Both return the unchanged verified identity on success,
