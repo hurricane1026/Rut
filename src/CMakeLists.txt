@@ -108,6 +108,7 @@ add_library(rut_runtime STATIC
     runtime/hash.cc
     runtime/memory_http_cache_store.cc
     runtime/http_cache.cc
+    runtime/public_key.cc
     runtime/jwt_claims.cc
     runtime/arena.cc
     runtime/callbacks.cc
