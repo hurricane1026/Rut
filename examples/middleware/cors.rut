@@ -54,10 +54,11 @@ func requirePolicy(_ req: i32, _ policy: Policy) -> i32 {
     let origin = req.uniqueHeader("Origin").or("")
     let method = req.uniqueHeader("Access-Control-Request-Method").or("")
     let headers = req.uniqueHeader("Access-Control-Request-Headers").or("")
-    // LF cannot occur in a valid HTTP field value, so the absence sentinel
-    // cannot collide with an attacker-supplied header value.
-    guard req.uniqueHeader("Origin").or("\n") == req.header("Origin").or("\n") else { respond 400 }
-    guard req.method != OPTIONS || (req.uniqueHeader("Access-Control-Request-Method").or("\n") == req.header("Access-Control-Request-Method").or("\n") && req.uniqueHeader("Access-Control-Request-Headers").or("\n") == req.header("Access-Control-Request-Headers").or("\n") && validPreflight(origin, method, headers)) else { respond 400 }
+    guard (req.uniqueHeader("Origin") != nil) == (req.header("Origin") != nil) else { respond 400 }
+    guard req.method != OPTIONS || ((req.uniqueHeader("Access-Control-Request-Method") != nil) ==
+        (req.header("Access-Control-Request-Method") != nil) &&
+        (req.uniqueHeader("Access-Control-Request-Headers") != nil) ==
+        (req.header("Access-Control-Request-Headers") != nil) && validPreflight(origin, method, headers)) else { respond 400 }
     guard httpOriginListAllows(policy.origins, origin, policy.credentials) && (req.method != OPTIONS || allowsPreflight(method, headers, policy.methods, policy.headers)) else { respond 403 }
     0
 }
