@@ -745,8 +745,9 @@ reproduce.
 For a policy-free HTTP/1.1 upstream timeout with no response bytes, the legacy
 504 may fold committed chain-after response-header mutations using the bounded
 HTTP response serializer. Invalid or overflowing mutations fail closed with
-500. Explicit timeout policies, HTTP/2 timer failures, cache-only 504s, and
-partial upstream responses retain their existing behavior.
+500. Policy-free HTTP/2 ordinary upstream timeouts also commit these headers
+before any response bytes arrive. Explicit timeout policies, cache-only 504s,
+and partial upstream responses retain their existing behavior.
 
 When a request has been sent on an idle pooled upstream connection and that
 connection returns EOF or RST before any response byte, Rut does not replay a
@@ -8369,8 +8370,10 @@ commit the request-derived chain-after headers. This does not run subsequent
 route statements. Runtime-generated failures and guard forward/redirect
 terminators retain their existing behavior, except that a policy-free legacy
 502 synthesized for an upstream TCP connect failure may carry committed
-chain-after headers before any upstream response bytes exist. Custom failure
-policies and other runtime failures remain undecorated. CORS is browser
+chain-after headers before any upstream response bytes exist. Policy-free HTTP/1.1
+and HTTP/2 ordinary upstream timeouts also commit these headers on their 504 before
+response bytes arrive. Custom failure policies and other runtime failures remain
+undecorated. CORS is browser
 response-sharing policy, not authentication or CSRF protection; see the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
 
 `httpOriginListAllows(allowed, origin, credentials)` validates the entire bounded

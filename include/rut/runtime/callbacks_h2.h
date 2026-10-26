@@ -1066,6 +1066,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_stream = 0;
     h2.async_headers_received_us = 0;
     h2.async_is_head = false;
+    h2.async_proxy_response_seen = false;
     h2.async_kind = H2AsyncKind::None;
     h2.async_cfg = nullptr;
     h2.async_synth_len = 0;

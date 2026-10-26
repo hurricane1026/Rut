@@ -273,6 +273,9 @@ void grpc_deadline_fired(Loop* loop, Connection& conn);
 template <typename Loop>
 void h2_proxy_fail(Loop* loop, Connection& conn, u16 status);
 
+template <typename Loop>
+void h2_proxy_timeout(Loop* loop, Connection& conn);
+
 // Resume a throttled (@throttle) client send parked for the next byte-rate
 // window — invoked from the per-shard timer tick. Defined in callbacks_impl.h.
 template <typename Loop>

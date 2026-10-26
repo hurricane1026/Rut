@@ -1510,11 +1510,12 @@ in guard failure bodies (including `respond` in before helpers) also commit
 chain-after headers. The response helper still independently validates
 Origin and policy on these paths. A policy-free upstream TCP connect failure
 that synthesizes the legacy 502 also applies committed chain-after headers when
-no upstream response bytes exist. A policy-free HTTP/1.1 upstream timeout that
-synthesizes the legacy 504 has the same bounded committed-header behavior when
-no upstream response bytes exist; custom failure/timeout policies, HTTP/2 timer
-failures, and other runtime failures remain undecorated. Guard forward/redirect
-terminators do not gain automatic CORS decoration. CORS does not replace auth.
+no upstream response bytes exist. Policy-free HTTP/1.1 and HTTP/2 ordinary
+upstream timeouts that synthesize the legacy 504 also apply committed chain-after
+headers before any upstream response bytes arrive. Custom failure/timeout
+policies, cache-only 504s, and other runtime failures remain undecorated. Guard
+forward/redirect terminators do not gain automatic CORS decoration. CORS does not
+replace auth.
 
 For chain-after helpers, `resp.set("Name", optionalString)` now replaces when
 present and removes when nil. Present empty strings remain empty header values.

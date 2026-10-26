@@ -196,6 +196,7 @@ struct Http2Conn {
     u32 async_stream;
     u64 async_headers_received_us;
     bool async_is_head;
+    bool async_proxy_response_seen;
     H2AsyncKind async_kind;
     const RouteConfig* async_cfg;
     u32 async_synth_len;

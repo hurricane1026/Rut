@@ -18884,6 +18884,47 @@ TEST(proxy_e2e, serves_http2_proxy_upstream_timeout) {
     close(c);
 }
 
+TEST(proxy_e2e, serves_http2_proxy_upstream_timeout_with_response_mutations) {
+    using namespace rut;
+    StallServer stall;
+    REQUIRE(stall.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("slow", 0x7F000001, stall.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_with_response_mutations_handler));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1500));
+    proxy.loop->upstream_timeout = 1;  // 1s upstream deadline (vs 60s keepalive)
+
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 6);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 12 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 5000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 504u);  // upstream-timeout, reframed as h2
+
+    CHECK(h2_response_has_header(resp, total, 1, "x-path", "/api"));
+    CHECK(h2_response_has_header(resp, total, 1, "x-folded", "final"));
+
+    close(c);
+}
+
 // Handler returns ReturnStatus with an out-of-range body_idx (e.g. no
 // body was registered). Runtime must fall back to the default status-
 // reason body rather than rendering garbage or hanging.

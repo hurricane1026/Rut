@@ -8835,10 +8835,16 @@ void h2_proxy_flush(Loop* loop, Connection& conn, const u8* src, u32 resp_len) {
 // Answer the suspended proxy stream with a synthetic status (502 upstream
 // failure, 503 inflight cap) and tear down the upstream side.
 template <typename Loop>
-void h2_proxy_fail(Loop* loop, Connection& conn, u16 status, bool connect_failure) {
+void h2_proxy_fail(
+    Loop* loop, Connection& conn, u16 status, bool connect_failure, bool ordinary_timeout = false) {
     Http2Conn* h2 = conn.h2;
     const u32 kStreamId = h2->async_stream;
-    h2_proxy_teardown_upstream(loop, conn);
+    const bool decorate_timeout =
+        ordinary_timeout && status == 504 && conn.failure_policy_id == 0 &&
+        conn.timeout_failure_policy_id == 0 &&
+        conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
+        !conn.failure_policy_suppress_body && !h2->async_proxy_response_seen &&
+        conn.upstream_recv_buf.len() == 0;
     // Serialize the synthetic response into bounded local scratch, NOT pending_synth:
     // on io_uring a timeout can fire while the upstream request send is still in
     // flight, and that SQE still sources pending_synth — overwriting it here would
@@ -8846,7 +8852,7 @@ void h2_proxy_fail(Loop* loop, Connection& conn, u16 status, bool connect_failur
     // bounded committed headers, so use the same 16KiB cap as H2 synthesis.
     u8 scratch[Http2Conn::kBodySynthCap];
     H2Dispatch<Loop> d{loop, &conn, scratch, sizeof(scratch), 0, false};
-    if (connect_failure && status == 502 &&
+    if (((connect_failure && status == 502) || decorate_timeout) &&
         (conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_overflow)) {
         hpack::Header headers[Connection::kMaxRespHeaderMutations];
         u32 header_count = 0;
@@ -8879,7 +8885,13 @@ void h2_proxy_fail(Loop* loop, Connection& conn, u16 status, bool connect_failur
     } else {
         h2_emit_status(d, kStreamId, status);
     }
+    h2_proxy_teardown_upstream(loop, conn);
     h2_proxy_flush(loop, conn, scratch, d.resp_len);
+}
+
+template <typename Loop>
+void h2_proxy_timeout(Loop* loop, Connection& conn) {
+    h2_proxy_fail(loop, conn, 504, false, true);
 }
 
 template <typename Loop>
@@ -9058,6 +9070,8 @@ void h2_proxy_finish(Loop* loop,
 template <typename Loop>
 void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    if (ev.result > 0 || conn.upstream_recv_buf.len() > 0)
+        conn.h2->async_proxy_response_seen = true;
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
         h2_proxy_fail(loop, conn, 502);
         return;
@@ -9275,6 +9289,7 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void h2_proxy_begin(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
+    h2->async_proxy_response_seen = false;
     const RouteConfig* cfg = h2->async_cfg;
     const u16 upstream_id = h2->async_upstream_id;
     if (cfg == nullptr || upstream_id >= cfg->upstream_count ||
