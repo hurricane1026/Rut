@@ -298,6 +298,20 @@ void rut_helper_req_header(const u8* req_data,
                       http_header_name_eq_ci(name, name_len, "Authorization", 13));
 }
 
+i32 rut_helper_req_header_count(const u8* req_data, u32 req_len, const char* name, u32 name_len) {
+    if (!req_data || !name || name_len == 0) return -1;
+    for (u32 i = 0; i < name_len; ++i)
+        if (!is_http_tchar(static_cast<u8>(name[i]))) return -1;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return -1;
+    i32 count = 0;
+    for (u32 i = 0; i < pc.req.header_count; ++i) {
+        const auto& header = pc.req.headers[i];
+        if (http_header_name_eq_ci(header.name.ptr, header.name.len, name, name_len)) ++count;
+    }
+    return count;
+}
+
 void rut_helper_req_unique_header(const u8* req_data,
                                   u32 req_len,
                                   const char* name,

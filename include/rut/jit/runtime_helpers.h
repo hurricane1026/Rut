@@ -68,6 +68,13 @@ void rut_helper_req_header(const rut::u8* req_data,
                            const char** out_ptr,
                            rut::u32* out_len);
 
+// Count original case-insensitive header occurrences, including empty/duplicate
+// fields. Returns -1 if request parsing or field-name validation fails.
+rut::i32 rut_helper_req_header_count(const rut::u8* req_data,
+                                     rut::u32 req_len,
+                                     const char* name,
+                                     rut::u32 name_len);
+
 // Absent unless exactly one field with this name exists (case-insensitive).
 void rut_helper_req_unique_header(const rut::u8* req_data,
                                   rut::u32 req_len,

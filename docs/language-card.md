@@ -1165,6 +1165,19 @@ Authorization is always a singleton: both `req.authorization` and
 `req.header("Authorization")` return nil for duplicate Authorization fields.
 Request-header mutation does not change these original-request reads.
 
+`req.headerCount("Name") -> i32` counts all case-insensitive occurrences in
+that original request. Its nonempty literal name must contain only HTTP token
+bytes. A missing field returns 0; a single empty field still returns 1;
+duplicates return 2 or more, including identical values. Invalid/incomplete
+request parsing returns -1, never 0. Test `== 0` to prove absence, not `<= 0`.
+The existing parser's 64-field bound is unchanged; overflowing it fails parsing
+rather than hiding an extra credential. The native helper also rejects invalid
+field names with -1. This count is not credential validation: combine count 1
+with the corresponding singleton read and verifier. Counts observe original
+headers even after set/add/remove mutations and work in ordinary helpers;
+timer/request-free contexts reject the operation. No keyword or dependency is
+added, and the synchronous bounded scan allocates no memory and retains no views.
+
 ## Static authentication helpers
 
 See [examples/authentication.rut](../examples/authentication.rut) and

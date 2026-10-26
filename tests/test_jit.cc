@@ -24142,3 +24142,122 @@ route GET "/denied-before-allow" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, header_count_distinguishes_absent_empty_duplicate_and_invalid_requests) {
+    const char* source = R"rut(
+func countAuthorization() -> i32 { req.headerCount("aUtHoRiZaTiOn") }
+route GET "/count" {
+    match countAuthorization() {
+        0 => return 204
+        1 => return 201
+        2 => return 202
+        _ => return 400
+    }
+}
+route GET "/unique" {
+    guard req.headerCount("Authorization") == 1 && req.authorization != nil else { return 401 }
+    return 204
+}
+route GET "/removed" {
+    req.remove("Authorization")
+    match req.headerCount("Authorization") {
+        0 => return 204
+        1 => return 201
+        2 => return 202
+        _ => return 400
+    }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* request;
+        u16 status;
+        i32 count;
+    };
+    const Case cases[] = {
+        {0, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", 204, 0},
+        {0, "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization:\r\n\r\n", 201, 1},
+        {0, "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: \t \r\n\r\n", 201, 1},
+        {0, "GET / HTTP/1.1\r\nHost: localhost\r\nauthorization: Bearer key\r\n\r\n", 201, 1},
+        {0,
+         "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer key\r\nAUTHORIZATION: Bearer "
+         "key\r\n\r\n",
+         202,
+         2},
+        {0,
+         "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: wrong\r\nauthorization: Bearer "
+         "key\r\n\r\n",
+         202,
+         2},
+        {0, "incomplete", 400, -1},
+        {0, "GET / HTTP/1.1\r\nBad Name: value\r\n\r\n", 400, -1},
+        {0, "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: value\r\n", 400, -1},
+        {1, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", 401, 0},
+        {1, "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization:\r\n\r\n", 204, 1},
+        {1,
+         "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: x\r\nauthorization: x\r\n\r\n",
+         401,
+         2},
+        {2, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", 204, 0},
+        {2, "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer key\r\n\r\n", 201, 1},
+        {2,
+         "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: x\r\nauthorization: x\r\n\r\n",
+         202,
+         2},
+    };
+    Connection conn;
+    for (const auto& tc : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        conn.reset();
+        const auto request = lit(tc.request);
+        const auto result = HandlerResult::unpack(handler(
+            &conn, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, tc.status);
+        CHECK_EQ(rut_helper_req_header_count(
+                     reinterpret_cast<const u8*>(request.ptr), request.len, "Authorization", 13),
+                 tc.count);
+    }
+    // Reusing the same storage for different requests must not reuse stale counts.
+    char request[] = "GET / HTTP/1.1\r\nAuthorization: x\r\n\r\n";
+    CHECK_EQ(rut_helper_req_header_count(
+                 reinterpret_cast<const u8*>(request), sizeof(request) - 1, "Authorization", 13),
+             1);
+    request[16] = 'X';
+    CHECK_EQ(rut_helper_req_header_count(
+                 reinterpret_cast<const u8*>(request), sizeof(request) - 1, "Authorization", 13),
+             0);
+    CHECK_EQ(rut_helper_req_header_count(nullptr, 0, "Authorization", 13), -1);
+    CHECK_EQ(rut_helper_req_header_count(
+                 reinterpret_cast<const u8*>(request), sizeof(request) - 1, "Bad Name", 8),
+             -1);
+    // Header overflow cannot masquerade as absence beyond the parser's retained fields.
+    std::string overflow = "GET / HTTP/1.1\r\n";
+    for (u32 i = 0; i < kMaxHeaders; ++i) overflow += "X-Pad: x\r\n";
+    overflow += "Authorization: key\r\n\r\n";
+    CHECK_EQ(rut_helper_req_header_count(reinterpret_cast<const u8*>(overflow.data()),
+                                         static_cast<u32>(overflow.size()),
+                                         "Authorization",
+                                         13),
+             -1);
+    engine.shutdown();
+    rir.destroy();
+}

@@ -2479,6 +2479,30 @@ TEST(RirPrinter, FailurePolicyForgedMetadataPrintsOneSafeMarker) {
     check_marker(mod);
 }
 
+TEST(rir, header_count_is_i32_and_preserves_validated_field_name) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("count"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto value = V(b.emit_req_header_count(lit("Authorization")));
+    CHECK(fn->values[value.id].type->kind == TypeKind::I32);
+    CHECK(!b.emit_req_header_count(lit("")));
+    CHECK(!b.emit_req_header_count(lit("Bad Name")));
+    VOK(b.emit_ret_status(204));
+    CHECK(verify_module(tc.mod).ok);
+    char data[1024];
+    PrintBuf buf;
+    buf.init(data, sizeof(data), -1);
+    print_module(buf, tc.mod);
+    CHECK(!buf.overflow);
+    CHECK(std::string(buf.data, buf.len).find("req.header_count \"Authorization\"") !=
+          std::string::npos);
+    tc.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
