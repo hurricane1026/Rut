@@ -12811,6 +12811,13 @@ template <typename Loop>
 inline void respond_upstream_connect_failure(Loop* loop,
                                              Connection& conn,
                                              bool fresh_connect_failure) {
+    // A fresh, policy-free connect completion historically keeps the failed
+    // upstream fd owned by the connection until the downstream legacy 502
+    // send retires.  Besides preserving fd/send distinction, this lets
+    // on_response_sent perform the single ordinary close_conn teardown.  The
+    // preconnect and custom-policy paths still detach immediately.
+    const bool retain_upstream_until_response =
+        fresh_connect_failure && conn.failure_policy_id == 0;
     if constexpr (requires(Loop* candidate, Connection& c) {
                       candidate->disarm_response_read_deadline(c);
                   }) {
@@ -12823,11 +12830,13 @@ inline void respond_upstream_connect_failure(Loop* loop,
     conn.upstream_keep_alive = false;
     conn.upstream_start_us = 0;
     conn.set_slots(nullptr, nullptr, nullptr, nullptr);
-    if constexpr (requires { loop->discard_upstream_send(conn); }) {
-        loop->discard_upstream_send(conn);
+    if (!retain_upstream_until_response) {
+        if constexpr (requires { loop->discard_upstream_send(conn); }) {
+            loop->discard_upstream_send(conn);
+        }
+        (void)detach_upstream_close(loop, conn);
+        release_upstream_slot(loop, conn);
     }
-    (void)detach_upstream_close(loop, conn);
-    release_upstream_slot(loop, conn);
 
     bool serialized = false;
     u16 policy_status = kStatusBadGateway;
