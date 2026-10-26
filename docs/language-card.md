@@ -1454,3 +1454,40 @@ cache namespace. HTTP/1.1 and HTTP/2 clients work with both I/O backends.
 
 Revalidation (304), stale serving, request coalescing, configurable capacity,
 private caches, persistence and distributed invalidation are not implemented.
+
+### CORS policy and HTTP token lists
+
+`import "middleware/cors.rut"` (from the examples directory) supplies ordinary
+boolean helpers: `validOrigin`, `allowsOrigin`, `validLists`, `validPreflight`,
+and `allowsPreflight`. Run `examples/cors.rut` for a complete fixed-origin,
+credentialed proxy example. Preflight responses are local 204s with a 600-second
+max age, an explicit method/header allow list and Vary fields. Unknown origins,
+methods and headers reject; malformed or duplicate preflight fields reject.
+Duplicate actual-request Origin fields also reject. Successful proxy responses
+replace upstream CORS origin/credentials, remove Expose-Headers, and preserve
+existing Vary fields. Absent Origin requests remain usable. Rejections/runtime
+failures follow current chain-after semantics and carry no added CORS policy.
+
+The example uses literal policy values: change validation and emitted headers
+together. Credentialed policies must never emit Allow-Origin `*`. The module
+also permits public `*` matching, but callers must omit Allow-Credentials for
+that policy. `validOrigin` accepts HTTP(S) DNS/IPv4-style hosts, optional numeric
+ports, `null`, or `*`; IPv6, general URL validation and origin-list configuration
+are outside this profile. CORS does not replace authentication or CSRF checks.
+
+```swift
+httpTokenListAllows("GET, POST", "POST", true)                 // true
+httpTokenListAllows("GET, POST", "post", true)                 // false
+httpTokenListAllows("Authorization, X-Trace", "x-trace", false) // true
+httpTokenListAllows("X-Trace", "X-Trace,", false)               // false
+```
+
+The builtin takes two unwrapped `str` values and an unwrapped `bool`, returning
+`bool`. It validates complete comma-separated HTTP token lists with SP/HTAB
+whitespace, then checks that every requested token belongs to the allowed list.
+Case folding is ASCII only. Empty lists are valid; empty items, CR/LF, quoted
+values and non-token bytes are invalid. `*` has no wildcard meaning here. Either
+input exceeding 4096 bytes or 64 tokens returns false. No allocation or retained
+state is involved. Use `uniqueHeader` plus an explicit absence/duplicate check
+when an empty list is allowed: `.or("")` alone cannot distinguish duplicate
+fields from absence. See `examples/cors.rut` for that check.

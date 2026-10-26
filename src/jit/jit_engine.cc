@@ -77,6 +77,8 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_hash", reinterpret_cast<void*>(&rut_helper_hash)},
     {"rut_helper_uuid", reinterpret_cast<void*>(&rut_helper_uuid)},
     {"rut_helper_str_has_prefix", reinterpret_cast<void*>(&rut_helper_str_has_prefix)},
+    {"rut_helper_http_token_list_allows",
+     reinterpret_cast<void*>(&rut_helper_http_token_list_allows)},
     {"rut_helper_bearer_matches", reinterpret_cast<void*>(&rut_helper_bearer_matches)},
     {"rut_helper_hmac_sha256_matches", reinterpret_cast<void*>(&rut_helper_hmac_sha256_matches)},
     {"rut_helper_basic_matches", reinterpret_cast<void*>(&rut_helper_basic_matches)},

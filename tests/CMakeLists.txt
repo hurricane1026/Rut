@@ -789,6 +789,12 @@ target_compile_definitions(test_auth_forwarding PRIVATE RUT_TESTING=1)
 add_test(NAME test_auth_forwarding COMMAND test_auth_forwarding)
 set_tests_properties(test_auth_forwarding PROPERTIES LABELS "unit;network")
 
+add_executable(test_http_tokens test_http_tokens.cc)
+target_link_libraries(test_http_tokens rut_runtime)
+target_include_directories(test_http_tokens PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_http_tokens COMMAND test_http_tokens)
+set_tests_properties(test_http_tokens PROPERTIES LABELS "unit;http")
+
 add_executable(test_http_cache test_http_cache.cc)
 target_link_libraries(test_http_cache rut_runtime)
 target_include_directories(test_http_cache PRIVATE ${PROJECT_SOURCE_DIR}/testing)
@@ -3793,6 +3799,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_compiler_node_pool>
         COMMAND $<TARGET_FILE:test_auth_forwarding>
 
+        COMMAND $<TARGET_FILE:test_http_tokens>
         COMMAND $<TARGET_FILE:test_http_cache>
         COMMAND $<TARGET_FILE:test_hash>
         COMMAND $<TARGET_FILE:test_rsa_verify>
@@ -3828,7 +3835,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_compiler_node_pool test_auth_forwarding test_http_cache test_auth test_hash test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_hash test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
         COMMENT "Running all tests..."
     )
 else()
@@ -3857,6 +3864,7 @@ else()
         COMMAND $<TARGET_FILE:test_compiler_node_pool>
         COMMAND $<TARGET_FILE:test_auth_forwarding>
 
+        COMMAND $<TARGET_FILE:test_http_tokens>
         COMMAND $<TARGET_FILE:test_http_cache>
         COMMAND $<TARGET_FILE:test_hash>
         COMMAND $<TARGET_FILE:test_rsa_verify>
@@ -3888,7 +3896,7 @@ else()
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_compiler_node_pool test_auth_forwarding test_http_cache test_auth test_hash test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_hash test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
         COMMENT "Running non-JIT tests..."
     )
 endif()
@@ -3962,5 +3970,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
                     $<TARGET_FILE:rut> ${backend})
         set_tests_properties(test_cli_http_cache_${backend} PROPERTIES
             LABELS "cli;http-cache;network" RUN_SERIAL TRUE TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
+    foreach(backend IN ITEMS epoll io_uring)
+        add_test(NAME test_cli_cors_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_cors.py
+                    $<TARGET_FILE:rut> ${backend})
+        set_tests_properties(test_cli_cors_${backend} PROPERTIES
+            LABELS "cli;cors;network" RUN_SERIAL TRUE TIMEOUT 45 SKIP_RETURN_CODE 77)
     endforeach()
 endif()

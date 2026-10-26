@@ -107,6 +107,7 @@ struct Ctx {
     // True while emitting a handler that reads the request (and therefore
     // primed the parse cache). Gates the parse-unprime calls at exits.
     bool cur_fn_needs_parse = false;
+    LLVMValueRef fn_http_token_list_allows;
     LLVMValueRef fn_bearer_matches;
     LLVMValueRef fn_basic_matches;
     LLVMValueRef fn_hmac_sha256_matches;
@@ -534,6 +535,15 @@ struct Ctx {
                 LLVMAddFunction(llvm_mod, "rut_helper_str_constant_time_equal", ft);
         }
         return fn_str_constant_time_equal;
+    }
+    LLVMValueRef get_http_token_list_allows() {
+        if (!fn_http_token_list_allows) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, i8_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 5, 0);
+            fn_http_token_list_allows =
+                LLVMAddFunction(llvm_mod, "rut_helper_http_token_list_allows", ft);
+        }
+        return fn_http_token_list_allows;
     }
     LLVMValueRef get_bearer_matches() {
         if (!fn_bearer_matches) {
@@ -1339,6 +1349,24 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        case rir::Opcode::HttpTokenListAllows: {
+            LLVMValueRef allowed = c.get_value(inst.operand(0));
+            LLVMValueRef requested = c.get_value(inst.operand(1));
+            LLVMValueRef args[] = {
+                LLVMBuildExtractValue(c.builder, allowed, 0, "tokens.ptr"),
+                LLVMBuildExtractValue(c.builder, allowed, 1, "tokens.len"),
+                LLVMBuildExtractValue(c.builder, requested, 0, "tokens.ptr"),
+                LLVMBuildExtractValue(c.builder, requested, 1, "tokens.len"),
+                LLVMBuildZExt(c.builder, c.get_value(inst.operand(2)), c.i8_ty, "tokens.case")};
+            LLVMValueRef fn = c.get_http_token_list_allows();
+            LLVMValueRef result =
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 5, "tokens");
+            c.set_value(
+                inst.result,
+                LLVMBuildICmp(
+                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "tokens.bool"));
+            break;
+        }
         case rir::Opcode::HmacSha256Matches: {
             LLVMValueRef args[8];
             for (u32 i = 0; i < 4; ++i) {
@@ -2546,6 +2574,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_time_now_micros = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;
+    c.fn_http_token_list_allows = nullptr;
     c.fn_bearer_matches = nullptr;
     c.fn_basic_matches = nullptr;
     c.fn_hmac_sha256_matches = nullptr;

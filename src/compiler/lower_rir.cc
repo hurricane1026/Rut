@@ -2620,7 +2620,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
-    if (value.kind == MirValueKind::HmacSha256Matches ||
+    if (value.kind == MirValueKind::HttpTokenListAllows ||
+        value.kind == MirValueKind::HmacSha256Matches ||
         value.kind == MirValueKind::BearerMatches || value.kind == MirValueKind::BasicMatches ||
         value.kind == MirValueKind::ConstantTimeEqual || value.kind == MirValueKind::Eq ||
         value.kind == MirValueKind::Lt || value.kind == MirValueKind::Gt) {
@@ -2654,6 +2655,26 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                      local_count,
                                      span);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (value.kind == MirValueKind::HttpTokenListAllows) {
+            auto sensitive = materialize_value(*value.args[0],
+                                               mir,
+                                               variant_infos,
+                                               tuple_infos,
+                                               tuple_info_count,
+                                               error_scalar_infos,
+                                               error_variant_infos,
+                                               error_struct_infos,
+                                               user_struct_defs,
+                                               b,
+                                               locals,
+                                               local_count,
+                                               span);
+            if (!sensitive) return core::make_unexpected(sensitive.error());
+            auto result = b.emit_http_token_list_allows(
+                lhs.value(), rhs.value(), sensitive.value(), {span.line, span.col});
+            if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+            return result.value();
+        }
         if (value.kind == MirValueKind::HmacSha256Matches) {
             rir::ValueId extra[2];
             for (u32 i = 0; i < 2; ++i) {
