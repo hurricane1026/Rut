@@ -2592,6 +2592,13 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                  : static_cast<bool>(b.emit_resp_set_header(
                                        value.str_value, val.value(), {span.line, span.col}));
         if (!emitted) return frontend_error(FrontendError::OutOfMemory, span);
+        // Header effects carry a dummy string local; optional payloads are never
+        // exposed as the effect's result.
+        if (value.lhs->may_nil) {
+            auto empty = b.emit_const_str({}, {span.line, span.col});
+            if (!empty) return frontend_error(FrontendError::OutOfMemory, span);
+            return empty.value();
+        }
         return val.value();
     }
     if (value.kind == MirValueKind::RespRemoveHeader) {
@@ -2620,7 +2627,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
-    if (value.kind == MirValueKind::HttpTokenListAllows ||
+    if (value.kind == MirValueKind::HttpOriginListAllows ||
+        value.kind == MirValueKind::HttpTokenListAllows ||
         value.kind == MirValueKind::HmacSha256Matches ||
         value.kind == MirValueKind::BearerMatches || value.kind == MirValueKind::BasicMatches ||
         value.kind == MirValueKind::ConstantTimeEqual || value.kind == MirValueKind::Eq ||
@@ -2655,7 +2663,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                      local_count,
                                      span);
         if (!rhs) return core::make_unexpected(rhs.error());
-        if (value.kind == MirValueKind::HttpTokenListAllows) {
+        if (value.kind == MirValueKind::HttpTokenListAllows ||
+            value.kind == MirValueKind::HttpOriginListAllows) {
             auto sensitive = materialize_value(*value.args[0],
                                                mir,
                                                variant_infos,
@@ -2670,8 +2679,12 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                                local_count,
                                                span);
             if (!sensitive) return core::make_unexpected(sensitive.error());
-            auto result = b.emit_http_token_list_allows(
-                lhs.value(), rhs.value(), sensitive.value(), {span.line, span.col});
+            auto result =
+                value.kind == MirValueKind::HttpOriginListAllows
+                    ? b.emit_http_origin_list_allows(
+                          lhs.value(), rhs.value(), sensitive.value(), {span.line, span.col})
+                    : b.emit_http_token_list_allows(
+                          lhs.value(), rhs.value(), sensitive.value(), {span.line, span.col});
             if (!result) return frontend_error(FrontendError::OutOfMemory, span);
             return result.value();
         }

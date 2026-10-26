@@ -415,6 +415,17 @@ void rut_helper_resp_set_header(void* conn, const char* name, u32 nlen, const ch
     record_resp_header(conn, name, nlen, val, vlen, Connection::RespHeaderMutationMode::Set);
 }
 
+void rut_helper_resp_set_optional_header(
+    void* conn, const char* name, u32 nlen, const char* val, u32 vlen, u8 present) {
+    if (present == 0) {
+        rut_helper_resp_remove_header(conn, name, nlen);
+    } else if (present == 1) {
+        rut_helper_resp_set_header(conn, name, nlen, val, vlen);
+    } else if (conn) {
+        static_cast<Connection*>(conn)->resp_header_mutation_pending_overflow = true;
+    }
+}
+
 void rut_helper_resp_add_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
     record_resp_header(conn, name, nlen, val, vlen, Connection::RespHeaderMutationMode::Add);
 }
@@ -1037,6 +1048,12 @@ u8 rut_helper_http_token_list_allows(const char* allowed,
     return case_sensitive <= 1 &&
            http_token_list_allows(
                {allowed, allowed_len}, {requested, requested_len}, case_sensitive != 0);
+}
+
+u8 rut_helper_http_origin_list_allows(
+    const char* allowed, u32 allowed_len, const char* origin, u32 origin_len, u8 credentials) {
+    return credentials <= 1 &&
+           http_origin_list_allows({allowed, allowed_len}, {origin, origin_len}, credentials != 0);
 }
 
 u8 rut_helper_bearer_matches(const char* authorization,

@@ -402,6 +402,16 @@ struct Ctx {
         }
         return fn_resp_set_header;
     }
+    LLVMValueRef fn_resp_set_optional_header = nullptr;
+    LLVMValueRef get_resp_set_optional_header() {
+        if (!fn_resp_set_optional_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, i8_ty};
+            fn_resp_set_optional_header = LLVMAddFunction(llvm_mod,
+                                                          "rut_helper_resp_set_optional_header",
+                                                          LLVMFunctionType(void_ty, params, 6, 0));
+        }
+        return fn_resp_set_optional_header;
+    }
     LLVMValueRef get_resp_add_header() {
         if (!fn_resp_add_header) {
             LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
@@ -535,6 +545,16 @@ struct Ctx {
                 LLVMAddFunction(llvm_mod, "rut_helper_str_constant_time_equal", ft);
         }
         return fn_str_constant_time_equal;
+    }
+    LLVMValueRef fn_http_origin_list_allows = nullptr;
+    LLVMValueRef get_http_origin_list_allows() {
+        if (!fn_http_origin_list_allows) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, i8_ty};
+            fn_http_origin_list_allows = LLVMAddFunction(llvm_mod,
+                                                         "rut_helper_http_origin_list_allows",
+                                                         LLVMFunctionType(i8_ty, params, 5, 0));
+        }
+        return fn_http_origin_list_allows;
     }
     LLVMValueRef get_http_token_list_allows() {
         if (!fn_http_token_list_allows) {
@@ -1165,6 +1185,19 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef name_ptr = c.make_global_str(name, add ? "respadd.name" : "respset.name");
             LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
             LLVMValueRef value = c.get_value(inst.operands[0]);
+            const bool optional =
+                !add && c.cur_fn->values[inst.operands[0].id].type->kind == rir::TypeKind::Optional;
+            if (optional) {
+                LLVMValueRef args[] = {c.param_conn,
+                                       name_ptr,
+                                       name_len,
+                                       LLVMBuildExtractValue(c.builder, value, 1, "resp.vptr"),
+                                       LLVMBuildExtractValue(c.builder, value, 2, "resp.vlen"),
+                                       LLVMBuildExtractValue(c.builder, value, 0, "resp.present")};
+                LLVMValueRef helper = c.get_resp_set_optional_header();
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 6, "");
+                break;
+            }
             LLVMValueRef vptr = LLVMBuildExtractValue(c.builder, value, 0, "resp.vptr");
             LLVMValueRef vlen = LLVMBuildExtractValue(c.builder, value, 1, "resp.vlen");
             LLVMValueRef args[] = {c.param_conn, name_ptr, name_len, vptr, vlen};
@@ -1349,6 +1382,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        case rir::Opcode::HttpOriginListAllows:
         case rir::Opcode::HttpTokenListAllows: {
             LLVMValueRef allowed = c.get_value(inst.operand(0));
             LLVMValueRef requested = c.get_value(inst.operand(1));
@@ -1358,7 +1392,9 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 LLVMBuildExtractValue(c.builder, requested, 0, "tokens.ptr"),
                 LLVMBuildExtractValue(c.builder, requested, 1, "tokens.len"),
                 LLVMBuildZExt(c.builder, c.get_value(inst.operand(2)), c.i8_ty, "tokens.case")};
-            LLVMValueRef fn = c.get_http_token_list_allows();
+            LLVMValueRef fn = inst.op == rir::Opcode::HttpOriginListAllows
+                                  ? c.get_http_origin_list_allows()
+                                  : c.get_http_token_list_allows();
             LLVMValueRef result =
                 LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 5, "tokens");
             c.set_value(

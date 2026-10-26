@@ -157,6 +157,11 @@ rut::u8 rut_helper_http_token_list_allows(const char* allowed,
                                           const char* requested,
                                           rut::u32 requested_len,
                                           rut::u8 case_sensitive);
+rut::u8 rut_helper_http_origin_list_allows(const char* allowed,
+                                           rut::u32 allowed_len,
+                                           const char* origin,
+                                           rut::u32 origin_len,
+                                           rut::u8 credentials);
 rut::u8 rut_helper_bearer_matches(const char* authorization,
                                   rut::u32 authorization_len,
                                   const char* key,
@@ -234,6 +239,9 @@ void rut_helper_req_add_header(
 void rut_helper_req_remove_header(void* conn, const char* name, rut::u32 nlen);
 void rut_helper_resp_set_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+// A nil optional removes the field without reading its payload.
+void rut_helper_resp_set_optional_header(
+    void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen, rut::u8 present);
 void rut_helper_resp_add_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_resp_remove_header(void* conn, const char* name, rut::u32 nlen);

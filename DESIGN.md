@@ -8316,29 +8316,25 @@ bounded exact-byte input. No request-controlled algorithm selection is exposed.
 There is no language surface in this foundation. Asymmetric JWT parsing, static
 key integration, ES verification and JWKS activation remain pending.
 
-### Explicit CORS policy module
+### Unified CORS policy module
 
-`examples/middleware/cors.rut` provides ordinary boolean policy helpers, with
-`examples/cors.rut` showing a credentialed HTTP proxy and local OPTIONS response.
-The example permits one literal HTTP(S) origin, GET/POST and an explicit header
-list. It rejects duplicate policy fields, malformed preflights (400), and
-unapproved origins/methods/headers (403). OPTIONS never reaches the upstream.
-Successful responses replace upstream Allow-Origin/Allow-Credentials, remove
-upstream Expose-Headers, and append Vary: Origin while preserving existing Vary.
-Chain-after effects follow the existing successful-response semantics: rejected
-requests and runtime failures do not acquire CORS headers. Requests without
-Origin remain ordinary requests and successful responses advertise the fixed
-policy. This is browser response-sharing policy, not authentication or CSRF
-protection. See the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
+`examples/middleware/cors.rut` defines an ordinary `Policy` struct containing
+`origins`, `methods`, `headers`, `exposeHeaders`, `maxAge`, and `credentials`.
+A single policy-producing function is passed to the module's `requirePolicy`
+chain-before step and `applyPolicy` chain-after step. Attach the chain to the
+actual routes and an explicit OPTIONS route returning 204. Validation and
+response generation then share the same fields; routes contain no duplicated
+CORS literals or handwritten header effects. `examples/cors.rut` demonstrates
+two exact credentialed origins. No language keyword or dependency is added.
 
-The module separates validation from response construction because current
-Response helpers require literal header effects. Configuration and emitted
-headers must be kept consistent; credentialed responses require an exact origin,
-never `*`. `validOrigin` admits `*`, `null`, and HTTP(S) DNS/IPv4-style hosts with
-an optional numeric port; it is a limited syntax profile, not a general URL
-validator. IPv6 origins, origin lists, dynamic reflection, exposed-header
-configuration and automatic error-response decoration are not provided. Avoid
-`null` for sensitive routes because unrelated opaque origins share that value.
+`requirePolicy` validates configuration before processing a request (503 for
+invalid policy), rejects duplicate Origin fields (400), and applies exact origin
+membership (403). On OPTIONS it also rejects missing/malformed/duplicate requested
+method/header fields (400) and requests outside the configured allow lists (403).
+Preflight responses remain local. Methods are case-sensitive, header names use
+ASCII case folding, and method/header/exposed-header wildcards are unsupported.
+`maxAge` is a decimal seconds string with 1–5 digits (0–99999); using its wire
+representation avoids introducing a numeric formatting API solely for CORS.
 
 `httpTokenListAllows(allowed, requested, caseSensitive)` is the reusable low-level
 primitive behind the policy. Both inputs must be complete comma-separated HTTP
@@ -8367,3 +8363,43 @@ request allocation. Success returns a document borrowing that output; failure
 sets length to zero and invalidates the document so no stack header view escapes.
 Output must not alias token or JSON workspace. No language API, key lookup or
 network operation is added in this slice.
+`applyPolicy` emits exactly the approved incoming origin, or `*` for an anonymous
+wildcard policy. It emits credentials only when configured, exposes configured
+headers only on actual responses, and emits method/header/max-age fields only
+on preflights. Absent Origin requests remain ordinary requests and remove any
+upstream CORS fields. Empty exposeHeaders removes upstream exposure. Existing
+Vary values are preserved; Origin is appended on actual responses, and Origin,
+Access-Control-Request-Method and Access-Control-Request-Headers on preflights.
+CORS effects are committed only by existing successful terminators: rejection,
+authentication, rate-limit and runtime-failure response decoration remains a
+separate feature. CORS is browser response-sharing policy, not authentication
+or CSRF protection; see the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
+
+`httpOriginListAllows(allowed, origin, credentials)` validates the entire bounded
+allow-list before returning an exact match. An empty origin checks configuration
+alone. Each allow-list is at most 4096 bytes/32 entries, each origin at most 2048
+bytes. Entries use SP/HTAB around comma separators. The origin profile accepts
+HTTP(S) DNS/IPv4-style hosts, bracketed IPv6 and optional numeric ports (0–65535),
+or the explicit opaque-origin value `null`. It rejects paths, userinfo, query,
+fragments, control bytes, empty entries and malformed suffixes even after an
+early match. No normalization, regex matching or subdomain matching occurs;
+configuration should contain browser-serialized origins. `*` must be the exact
+entire configuration string and credentials must be false. Arbitrary request
+values are never reflected through wildcard mode. Avoid `null` for sensitive
+routes because unrelated opaque origins share that value.
+
+`httpTokenListAllows(allowed, requested, caseSensitive)` validates complete
+comma-separated HTTP token lists before subset matching. Each input is at most
+4096 bytes/64 tokens. Empty/OWS-only lists are valid; empty items, CR/LF, quoted
+values and non-token bytes fail closed. `*` is an ordinary token in this primitive.
+Both list helpers borrow views only during the call and use bounded stack
+storage without allocations or retained state. Existing single-origin boolean
+helpers remain available for manual policies.
+
+Chain-after `Response.set` now also accepts an optional string: a present value
+(including an empty string) replaces the field; nil records removal of all
+upstream occurrences. Nil never reads the optional payload. Ordered effects,
+capacity limits, wire validation and success-only commit semantics are unchanged.
+`add` still requires a non-optional string, and local Response builders retain
+their existing restrictions. This general primitive lets the CORS module omit
+credentials/preflight/exposure headers without adding conditional effect syntax.

@@ -27,3 +27,65 @@ func validPreflight(_ origin: str, _ method: str, _ headers: str) -> bool {
 func allowsPreflight(_ method: str, _ headers: str, _ allowedMethods: str, _ allowedHeaders: str) -> bool {
     httpTokenListAllows(allowedMethods, method, true) && httpTokenListAllows(allowedHeaders, headers, false)
 }
+
+// One policy feeds both validation and response headers. maxAge is a decimal
+// seconds string (0..99999), avoiding a separate runtime formatting operation.
+struct Policy {
+    origins: str
+    methods: str
+    headers: str
+    exposeHeaders: str
+    maxAge: str
+    credentials: bool
+}
+
+func validPolicy(_ policy: Policy) -> bool {
+    httpOriginListAllows(policy.origins, "", policy.credentials) &&
+        validLists(policy.methods, policy.headers) &&
+        httpTokenListAllows(policy.exposeHeaders, policy.exposeHeaders, false) &&
+        !policy.exposeHeaders.matches(re".*\x2a.*") &&
+        policy.maxAge.matches(re"^[0-9]{1,5}$")
+}
+
+// Attach directly as a chain before step. OPTIONS is reserved for preflight
+// on routes using this chain; attach it to an explicit OPTIONS route returning 204.
+func requirePolicy(_ req: i32, _ policy: Policy) -> i32 {
+    guard validPolicy(policy) else { respond 503 }
+    let origin = req.uniqueHeader("Origin").or("")
+    let method = req.uniqueHeader("Access-Control-Request-Method").or("")
+    let headers = req.uniqueHeader("Access-Control-Request-Headers").or("")
+    // LF cannot occur in a valid HTTP field value, so the absence sentinel
+    // cannot collide with an attacker-supplied header value.
+    guard req.uniqueHeader("Origin").or("\n") == req.header("Origin").or("\n") else { respond 400 }
+    guard req.method != OPTIONS || (req.uniqueHeader("Access-Control-Request-Method").or("\n") == req.header("Access-Control-Request-Method").or("\n") && req.uniqueHeader("Access-Control-Request-Headers").or("\n") == req.header("Access-Control-Request-Headers").or("\n") && validPreflight(origin, method, headers)) else { respond 400 }
+    guard httpOriginListAllows(policy.origins, origin, policy.credentials) && (req.method != OPTIONS || allowsPreflight(method, headers, policy.methods, policy.headers)) else { respond 403 }
+    0
+}
+
+func originValue(_ origin: str, _ policy: Policy) -> str {
+    if origin == "" { nil } else { if policy.origins == "*" { "*" } else { origin } }
+}
+func credentialsValue(_ origin: str, _ policy: Policy) -> str {
+    if origin != "" && policy.credentials { "true" } else { nil }
+}
+func preflightValue(_ preflight: bool, _ origin: str, _ value: str) -> str {
+    if preflight && origin != "" { value } else { nil }
+}
+func exposedValue(_ preflight: bool, _ origin: str, _ policy: Policy) -> str {
+    if !preflight && origin != "" && policy.exposeHeaders != "" {
+        policy.exposeHeaders
+    } else { nil }
+}
+func varyValue(_ preflight: bool) -> str {
+    if preflight { "Origin, Access-Control-Request-Method, Access-Control-Request-Headers" } else { "Origin" }
+}
+func applyPolicy(_ req: i32, _ result: Response, _ policy: Policy) -> i32 {
+    result.set("Access-Control-Allow-Origin", originValue(req.header("Origin").or(""), policy))
+    result.set("Access-Control-Allow-Credentials", credentialsValue(req.header("Origin").or(""), policy))
+    result.set("Access-Control-Allow-Methods", preflightValue(req.method == OPTIONS, req.header("Origin").or(""), policy.methods))
+    result.set("Access-Control-Allow-Headers", preflightValue(req.method == OPTIONS, req.header("Origin").or(""), policy.headers))
+    result.set("Access-Control-Max-Age", preflightValue(req.method == OPTIONS, req.header("Origin").or(""), policy.maxAge))
+    result.set("Access-Control-Expose-Headers", exposedValue(req.method == OPTIONS, req.header("Origin").or(""), policy))
+    result.add("Vary", varyValue(req.method == OPTIONS))
+    0
+}

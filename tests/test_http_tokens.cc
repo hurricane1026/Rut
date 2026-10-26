@@ -70,3 +70,84 @@ TEST(http_tokens, bounded_bytes_and_items) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(http_tokens, origin_lists_validate_all_entries_and_credentials) {
+    const Str list = lit_str("https://app.example.com,\thttps://admin.example.com:8443 ");
+    CHECK(http_origin_list_allows(list, {}, true));
+    CHECK(http_origin_list_allows(list, lit_str("https://app.example.com"), true));
+    CHECK(http_origin_list_allows(list, lit_str("https://admin.example.com:8443"), true));
+    CHECK(!http_origin_list_allows(list, lit_str("https://app.example.com.evil"), true));
+    CHECK(!http_origin_list_allows(list, lit_str("https://APP.example.com"), true));
+    CHECK(http_origin_list_allows(lit_str("*"), {}, false));
+    CHECK(http_origin_list_allows(lit_str("*"), lit_str("https://any.example"), false));
+    CHECK(!http_origin_list_allows(lit_str("*"), {}, true));
+    CHECK(!http_origin_list_allows(lit_str("*"), lit_str("https://any.example"), true));
+    CHECK(!http_origin_list_allows(lit_str("*"), lit_str("*"), false));
+    CHECK(!http_origin_list_allows(lit_str("*"), lit_str("garbage"), false));
+    CHECK(http_origin_list_allows(lit_str("null"), lit_str("null"), true));
+    CHECK(!http_origin_list_allows(list, lit_str("null"), false));
+    CHECK(http_origin_list_allows(lit_str("http://[::1]:0"), lit_str("http://[::1]:0"), true));
+    CHECK(http_origin_list_allows(lit_str("https://[2001:db8::1]"), {}, true));
+    const char* invalid[] = {
+        "",
+        " ",
+        ",https://app.example",
+        "https://app.example,",
+        "https://app.example,,null",
+        "https://app.example,garbage",
+        "https://app.example,*",
+        " * ",
+        "*,null",
+        "http://",
+        "https://",
+        "http://user@host",
+        "http://host/",
+        "http://host?q=x",
+        "http://host#x",
+        "http://host:",
+        "http://host:65536",
+        "http://host:-1",
+        "http://host:80x",
+        "http://.host",
+        "http://host.",
+        "http://a..b",
+        "http://-host",
+        "http://host-",
+        "http://[::1",
+        "http://[]",
+        "http://[xyz]",
+        "http://[::1]x",
+        "http://[::1]:",
+        "http://[::1%zone]",
+        "HTTP://host",
+        "https://host\r\n",
+        "https://host;evil",
+        "file://host",
+        "https://host,\t",
+        "https://host\xc3\xa9",
+    };
+    for (const char* value : invalid) {
+        const Str text{value, static_cast<u32>(__builtin_strlen(value))};
+        CHECK(!http_origin_list_allows(text, {}, false));
+        CHECK(!http_origin_list_allows(text, lit_str("https://app.example"), true));
+        if (text.len) CHECK(!http_origin_list_allows(lit_str("*"), text, false));
+    }
+    CHECK(!http_origin_list_allows({nullptr, 1}, {}, false));
+    CHECK(!http_origin_list_allows(lit_str("*"), {nullptr, 1}, false));
+    std::string list32 = "https://host";
+    for (u32 i = 1; i < 32; ++i) list32 += ",https://host";
+    CHECK(http_origin_list_allows({list32.data(), static_cast<u32>(list32.size())}, {}, true));
+    list32 += ",https://host";
+    CHECK(!http_origin_list_allows({list32.data(), static_cast<u32>(list32.size())}, {}, true));
+    const std::string long_text(4097, 'x');
+    CHECK(!http_origin_list_allows({long_text.data(), 4097}, {}, false));
+    CHECK(!http_origin_list_allows(lit_str("*"), {long_text.data(), 2049}, false));
+    const std::string too_long_ipv6 = "https://[" + std::string(46, 'a') + "]";
+    CHECK(!http_origin_list_allows(
+        {too_long_ipv6.data(), static_cast<u32>(too_long_ipv6.size())}, {}, false));
+    const std::string padded = "https://host" + std::string(4096 - 12, ' ');
+    CHECK(http_origin_list_allows({padded.data(), 4096}, lit_str("https://host"), true));
+    CHECK(http_origin_list_allows(lit_str("http://host:65535"), {}, false));
+    const char binary[] = "https://host\0,https://other";
+    CHECK(!http_origin_list_allows({binary, sizeof(binary) - 1}, {}, false));
+}
