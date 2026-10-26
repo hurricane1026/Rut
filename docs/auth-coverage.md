@@ -99,3 +99,19 @@ observe zero request-path allocations after initialization.
 This native foundation does not yet expose a Rut key type, parse asymmetric
 JWTs, select JWKs or refresh JWKS. Complete asymmetric JWT support remains
 explicit acceptance work in the table.
+
+## Fixed-key RS256 compact JWT decoding
+
+The native `jwt_rs256_decode` verifies compact JWS with a caller-selected,
+shard-owned RSA verifier. It requires RS256, canonical unpadded base64url, an
+object protected header (1024 bytes maximum) and object claims (8192 bytes
+maximum). Duplicate decoded JSON names fail closed. `crit` and `b64` extensions
+are rejected; `kid`, `jku` and other hints never select or fetch a key. The exact
+encoded header and payload are authenticated before claims are published.
+
+The caller supplies output and JSON workspace. On failure output length is zero
+and the document is invalidated; on success the document borrows the output.
+Signature verification alone is not authorization: apply issuer/audience/time
+and subject policy using `jwt_claims_valid`. This is native coverage, with RFC
+7515 A.2 and authenticated negative-profile tests. Rut configuration/JIT wiring,
+JWK selection and JWKS refresh remain pending.
