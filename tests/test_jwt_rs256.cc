@@ -2,6 +2,7 @@
 #include "rsa_verify_fixtures.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/jwt_rs256.h"
 #include "rut/runtime/public_key.h"
 #include "test.h"
@@ -186,6 +187,64 @@ TEST(jwt_rs256, authenticated_profile_rejections_and_bounds) {
     CHECK(!jwt_rs256_decode(verifier, doc, header_oversize, output, sizeof(output), length));
     CHECK_EQ(length, 0u);
     RSA_free(rsa);
+}
+TEST(jwt_rs256, configured_jwks_to_verified_claims_policy) {
+    BIGNUM* exponent = BN_new();
+    RSA* rsa = RSA_new();
+    REQUIRE(exponent && rsa);
+    REQUIRE(BN_set_word(exponent, 65537));
+    REQUIRE(RSA_generate_key_ex(rsa, 2048, exponent, nullptr));
+    BN_free(exponent);
+    const BIGNUM* modulus = nullptr;
+    RSA_get0_key(rsa, &modulus, nullptr, nullptr);
+    unsigned char binary[256];
+    REQUIRE(BN_bn2bin(modulus, binary) == sizeof(binary));
+    char encoded[342];
+    const u32 encoded_length =
+        encode({reinterpret_cast<const char*>(binary), sizeof(binary)}, encoded);
+    char configuration[1024];
+    json::Writer set{configuration};
+    set.text(lit_str(
+        R"({"keys":[{"kid":"unused","kty":"EC"},{"kid":"configured","kty":"RSA","alg":"RS256","n":")"));
+    set.text({encoded, encoded_length});
+    set.text(lit_str(R"(","e":"AQAB"}]})"));
+    RsaPublicKey key;
+    CHECK(!key.load_rs256_jwks({configuration, set.len}, lit_str("unknown")));
+    REQUIRE(key.load_rs256_jwks({configuration, set.len}, lit_str("configured")));
+    RsaSha256Verifier verifier;
+    REQUIRE(verifier.init(key));
+    key.reset();
+    for (char& byte : configuration) byte = 0;
+    char token[2048];
+    // A signed token's kid is a hint, never authority to change configured keys.
+    const Str signed_token = token_for(
+        rsa,
+        lit_str(R"({"alg":"RS256","kid":"untrusted","jku":"https://invalid/keys"})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"scope":"read write"})"),
+        token);
+    REQUIRE(signed_token.len > 0);
+    RSA_free(rsa);
+    json::Document document;
+    char payload[8192];
+    u32 length = 0;
+    allocations = 0;
+    tracking = true;
+    const bool verified =
+        jwt_rs256_decode(verifier, document, signed_token, payload, sizeof(payload), length);
+    tracking = false;
+    REQUIRE(verified);
+    tracking = true;
+    CHECK(
+        jwt_claims_valid(document, {payload, length}, lit_str("issuer"), lit_str("gateway"), 100));
+    CHECK(jwt_has_scope(document, {payload, length}, lit_str("read")));
+    CHECK(!jwt_has_scope(document, {payload, length}, lit_str("admin")));
+    CHECK(
+        !jwt_claims_valid(document, {payload, length}, lit_str("other"), lit_str("gateway"), 100));
+    CHECK(!jwt_claims_valid(document, {payload, length}, lit_str("issuer"), lit_str("other"), 100));
+    CHECK(
+        !jwt_claims_valid(document, {payload, length}, lit_str("issuer"), lit_str("gateway"), 200));
+    tracking = false;
+    CHECK_EQ(allocations, 0u);
 }
 int main(int argc, char** argv) {
     if (!CRYPTO_set_mem_functions(counted_malloc, counted_realloc, counted_free)) return 2;

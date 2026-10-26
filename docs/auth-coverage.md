@@ -16,7 +16,7 @@ whether a competing open-source edition includes them.
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window | Consumer registry, credential lifecycle and safe upstream credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR composition, disabled-slot handling, configuration failures | Multiple consumers, explicit AND/OR policy, anonymous only for absent credentials, no invalid-credential downgrade |
-| JWT verification | HS256/384/512 with explicit per-key algorithm policy, verified subject, issuer/audience, expiry/nbf, exact scopes | Algorithm-pinned RS/ES keys, JWK selection, JWKS rotation/cache, revocation and unknown-key policy |
+| JWT verification | HS256/384/512 policy helpers; native fixed-key RS256 decoder and trusted configured JWK Set selection | Rut/JIT asymmetric key wiring, ES keys, request-key selection, JWKS rotation/cache, revocation and unknown-key policy |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks profile and replay persistence |
 | ACL / Consumer restriction | Exact verified-consumer allow/deny helpers | Multiple groups, membership lifecycle, default deny, no client identity spoofing |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
@@ -96,9 +96,9 @@ Tests cover the RFC 7515 A.2 vector, 2048/2049/3072/4096-bit generated keys,
 empty/binary/bounded messages, owner release, and crypto allocation hooks that
 observe zero request-path allocations after initialization.
 
-This native foundation does not yet expose a Rut key type, parse asymmetric
-JWTs, select JWKs or refresh JWKS. Complete asymmetric JWT support remains
-explicit acceptance work in the table.
+The native decoder and trusted configuration importers below build on this
+foundation. A Rut key type, request-driven key selection and JWKS refresh remain
+acceptance work; the native slices do not complete asymmetric authorization.
 
 ## Fixed-key RS256 compact JWT decoding
 
@@ -114,7 +114,7 @@ and the document is invalidated; on success the document borrows the output.
 Signature verification alone is not authorization: apply issuer/audience/time
 and subject policy using `jwt_claims_valid`. This is native coverage, with RFC
 7515 A.2 and authenticated negative-profile tests. Rut configuration/JIT wiring,
-JWK selection and JWKS refresh remain pending.
+request-driven key selection and JWKS refresh remain pending.
 
 ### Fixed RS256 public JWK configuration
 
@@ -152,3 +152,10 @@ selection or remote JWKS retrieval. Token header hints cannot trigger import,
 fetching, fallback or refresh. Rotation still requires preparing a replacement
 configuration generation and draining readers of the old generation. No Rut/JIT
 key API or live JWKS lifecycle is added.
+
+The native integration fixture exercises JWK Set import, verifier activation,
+configuration/owner release, compact JWT verification, issuer/audience/expiry
+policy and exact scope checks together. It also confirms that signed token key
+hints do not change the configured key and observes no crypto allocations on
+that verification path. This is native integration evidence, not Rut/JIT or HTTP
+end-to-end coverage.
