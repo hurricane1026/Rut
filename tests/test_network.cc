@@ -8928,6 +8928,7 @@ TEST(proxy, connect_fail_502_commits_stable_chain_headers) {
     conn->resp_header_mutation_count = 2;
     conn->response_mutations_snapshotted = true;
     conn->upstream_fd = 100;
+    const i32 failed_upstream_fd = conn->upstream_fd;
     conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
 
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -111));
@@ -8935,8 +8936,7 @@ TEST(proxy, connect_fail_502_commits_stable_chain_headers) {
     CHECK_EQ(conn->resp_header_mutation_count, 2u);
     static constexpr char kOriginLine[] =
         "Access-Control-Allow-Origin: https://app.example.com\r\n";
-    static constexpr char kCredentialsLine[] =
-        "Access-Control-Allow-Credentials: true\r\n";
+    static constexpr char kCredentialsLine[] = "Access-Control-Allow-Credentials: true\r\n";
     CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
                        conn->send_buf.len(),
                        kOriginLine,
@@ -8949,6 +8949,11 @@ TEST(proxy, connect_fail_502_commits_stable_chain_headers) {
                        conn->send_buf.len(),
                        "Content-Length: 11\r\n",
                        20));
+    CHECK_EQ(conn->upstream_fd, failed_upstream_fd);
+    const u32 cid = conn->id;
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(loop.conns[cid].upstream_fd, -1);
 }
 
 TEST(proxy, connect_fail_502_mutation_overflow_fails_closed_and_head_has_no_body) {
@@ -8977,8 +8982,8 @@ TEST(proxy, connect_fail_502_mutation_overflow_fails_closed_and_head_has_no_body
                        20));
     const char* body = strstr(reinterpret_cast<const char*>(conn->send_buf.data()), "\r\n\r\n");
     REQUIRE(body != nullptr);
-    CHECK_EQ(conn->send_buf.len(), static_cast<u32>((body + 4) -
-                                                    reinterpret_cast<const char*>(conn->send_buf.data())));
+    CHECK_EQ(conn->send_buf.len(),
+             static_cast<u32>((body + 4) - reinterpret_cast<const char*>(conn->send_buf.data())));
 }
 
 TEST(proxy, upstream_initial_send_submit_failure_closes_immediately) {
@@ -11023,9 +11028,8 @@ TEST(http2, connect_fail_502_commits_chain_headers_only_for_connect_failure) {
     conn->resp_header_mutations[0] = {{"access-control-allow-origin", 27},
                                       {kOrigin, sizeof(kOrigin) - 1},
                                       Connection::RespHeaderMutationMode::Set};
-    conn->resp_header_mutations[1] = {{"x-large-cors", 12},
-                                      {kLargeValue, 480},
-                                      Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[1] = {
+        {"x-large-cors", 12}, {kLargeValue, 480}, Connection::RespHeaderMutationMode::Set};
     conn->resp_header_mutation_count = 2;
 
     conn->upstream_idx = 0;
@@ -11035,7 +11039,7 @@ TEST(http2, connect_fail_502_commits_chain_headers_only_for_connect_failure) {
     REQUIRE_GT(conn->send_buf.len(), 0u);
     Http2FrameHeader frame{};
     REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
-                ParseStatus::Complete);
+               ParseStatus::Complete);
     CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
     hpack::DynamicTable decoded;
     decoded.init(kDefaultHeaderTableSize);
@@ -11084,9 +11088,8 @@ TEST(http2, connect_fail_mutation_invalid_or_zero_count_overflow_is_500) {
         conn->epoch_held = true;
         conn->resp_header_mutation_overflow = overflow;
         if (invalid) {
-            conn->resp_header_mutations[0] = {{"bad\nname", 8},
-                                              {"x", 1},
-                                              Connection::RespHeaderMutationMode::Set};
+            conn->resp_header_mutations[0] = {
+                {"bad\nname", 8}, {"x", 1}, Connection::RespHeaderMutationMode::Set};
             conn->resp_header_mutation_count = 1;
         }
         conn->upstream_idx = 0;
