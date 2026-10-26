@@ -23697,7 +23697,7 @@ TEST(jit, direct_ir_credential_removal_overflow_is_explicit) {
     engine.shutdown();
 }
 
-TEST(jit, optional_response_headers_set_remove_and_do_not_commit_on_failure) {
+TEST(jit, optional_response_headers_set_remove_and_commit_on_guard_status) {
     const char* source = R"rut(
 func conditional_headers(_ req: i32, _ resp: Response) -> i32 {
     resp.set("X-Test", req.uniqueHeader("X-Test"))
@@ -23748,8 +23748,7 @@ route GET "/" use chain headers {
                                                           lit(item.request).len,
                                                           nullptr));
         CHECK(result.status_code == item.status);
-        CHECK(conn.resp_header_mutation_count == (item.status == 204 ? 1 : 0));
-        if (item.status != 204) continue;
+        CHECK(conn.resp_header_mutation_count == 1);
         const auto& mutation = conn.resp_header_mutations[0];
         CHECK(mutation.mode == (item.present ? Connection::RespHeaderMutationMode::Set
                                              : Connection::RespHeaderMutationMode::Remove));
