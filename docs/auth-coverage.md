@@ -160,6 +160,31 @@ hints do not change the configured key and observes no crypto allocations on
 that verification path. This is native integration evidence, not Rut/JIT or HTTP
 end-to-end coverage.
 
+### Approved multi-key ownership and per-shard activation
+
+The native `Rs256KeySet` prepares an explicitly approved subset of a local JWK
+Set: 1–16 unique, nonempty decoded IDs, each at most 128 bytes, with source JSON
+at most 8192 bytes. Every approved entry must satisfy the existing fixed RSA/
+RS256 public-key importer. Unapproved entries never become trusted merely by
+appearing in the source; the existing whole-set ID shape/uniqueness checks still
+apply. A missing approved key or any invalid selected key rolls back all prepared
+entries. A loaded set cannot be overwritten without explicit reset.
+
+`Rs256VerifierSet` initializes separate mutable verification workspaces on each
+execution shard before serving requests. Each retains independent key references
+and copies the canonical IDs. Configuration JSON, approval-list storage and the
+source key owner may then be released. Selection compares exact decoded ID bytes
+with no case folding, prefix match, empty/default key or unknown-key fallback.
+The returned pointer and ID view belong to that verifier set and expire at its
+reset/destruction; a selection is not proof of authentication.
+
+Generation changes require preparing new owners and shard-local workspaces,
+then retaining old ones until their readers drain. This foundation adds no live
+JWKS refresh, Rut key/configuration surface or automatic token `kid` selection.
+Tests cover subset trust, failure rollback/reuse, source lifetime, 16-key/128-byte
+bounds, embedded-NUL IDs, the independent RFC 7515 verification vector, and two
+concurrent threads activating their own verification state.
+
 ## RS256 verification and claims publication
 
 The native `jwt_rs256_validate` entry point verifies the fixed-key compact JWS
