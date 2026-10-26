@@ -710,6 +710,21 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_http_token_list_allows(ValueId allowed,
+                                                ValueId requested,
+                                                ValueId sensitive,
+                                                SourceLoc loc = {}) {
+        if (!val_has_type(allowed, TypeKind::Str) || !val_has_type(requested, TypeKind::Str) ||
+            !val_has_type(sensitive, TypeKind::Bool))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::HttpTokenListAllows, ty, loc));
+        const ValueId kOperands[] = {allowed, requested, sensitive};
+        auto stored = set_operands(inst, kOperands, 3);
+        if (!stored) return err(stored.error());
+        return vid;
+    }
+
     Result<ValueId> emit_hmac_sha256_matches(
         ValueId message, ValueId key, ValueId signature, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(message, TypeKind::Str) || !val_has_type(key, TypeKind::Str) ||

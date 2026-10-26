@@ -8315,3 +8315,37 @@ representative below modulus, complete canonical EMSA encoding comparison, and
 bounded exact-byte input. No request-controlled algorithm selection is exposed.
 There is no language surface in this foundation. Asymmetric JWT parsing, static
 key integration, ES verification and JWKS activation remain pending.
+
+### Explicit CORS policy module
+
+`examples/middleware/cors.rut` provides ordinary boolean policy helpers, with
+`examples/cors.rut` showing a credentialed HTTP proxy and local OPTIONS response.
+The example permits one literal HTTP(S) origin, GET/POST and an explicit header
+list. It rejects duplicate policy fields, malformed preflights (400), and
+unapproved origins/methods/headers (403). OPTIONS never reaches the upstream.
+Successful responses replace upstream Allow-Origin/Allow-Credentials, remove
+upstream Expose-Headers, and append Vary: Origin while preserving existing Vary.
+Chain-after effects follow the existing successful-response semantics: rejected
+requests and runtime failures do not acquire CORS headers. Requests without
+Origin remain ordinary requests and successful responses advertise the fixed
+policy. This is browser response-sharing policy, not authentication or CSRF
+protection. See the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
+
+The module separates validation from response construction because current
+Response helpers require literal header effects. Configuration and emitted
+headers must be kept consistent; credentialed responses require an exact origin,
+never `*`. `validOrigin` admits `*`, `null`, and HTTP(S) DNS/IPv4-style hosts with
+an optional numeric port; it is a limited syntax profile, not a general URL
+validator. IPv6 origins, origin lists, dynamic reflection, exposed-header
+configuration and automatic error-response decoration are not provided. Avoid
+`null` for sensitive routes because unrelated opaque origins share that value.
+
+`httpTokenListAllows(allowed, requested, caseSensitive)` is the reusable low-level
+primitive behind the policy. Both inputs must be complete comma-separated HTTP
+token lists, optionally separated by SP/HTAB. It validates both complete inputs
+before subset matching, rejects empty items and malformed suffixes, and treats
+`*` as an ordinary token. Empty/OWS-only lists are valid. Each input is limited to
+4096 bytes and 64 tokens; overflow returns false. Matching uses exact bytes for
+methods and ASCII case folding for header names. The runtime borrows input views
+only during the call and uses bounded stack storage without allocations,
+retained state, additional libraries, or I/O.

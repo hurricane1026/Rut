@@ -12,6 +12,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/uuid.h"
 
@@ -1026,6 +1027,16 @@ u8 rut_helper_str_has_prefix(const char* s, u32 s_len, const char* pfx, u32 pfx_
         if (s[i] != pfx[i]) return 0;
     }
     return 1;
+}
+
+u8 rut_helper_http_token_list_allows(const char* allowed,
+                                     u32 allowed_len,
+                                     const char* requested,
+                                     u32 requested_len,
+                                     u8 case_sensitive) {
+    return case_sensitive <= 1 &&
+           http_token_list_allows(
+               {allowed, allowed_len}, {requested, requested_len}, case_sensitive != 0);
 }
 
 u8 rut_helper_bearer_matches(const char* authorization,

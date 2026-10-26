@@ -9686,6 +9686,37 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
     }
 
+    if (expr.name.eq(lit_str("httpTokenListAllows")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr Str kDetail =
+            lit_str("httpTokenListAllows expects allowed str, requested str, caseSensitive bool");
+        if (expr.args.len != 3)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr* values[3]{};
+        for (u32 i = 0; i < 3; ++i) {
+            if (!expr.args[i])
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            auto value = analyze_builtin_arg(*expr.args[i]);
+            if (!value) return core::make_unexpected(value.error());
+            if (value->type != (i == 2 ? HirTypeKind::Bool : HirTypeKind::Str) || value->may_nil ||
+                value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, kDetail);
+            if (!route->exprs.push(value.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            values[i] = &route->exprs[route->exprs.len - 1];
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::HttpTokenListAllows;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        out.lhs = values[0];
+        out.rhs = values[1];
+        if (!out.args.push(values[2]))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return out;
+    }
+
     if (expr.name.eq(lit_str("hmacSha256Matches")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr Str kDetail = lit_str(

@@ -1,0 +1,29 @@
+// Explicit CORS policies. Check uniqueness before using .or("") for absence;
+// see ../cors.rut. This is response-sharing policy, not authentication.
+
+// One exact configured origin, or public '*'. No origin reflection or regex
+// allow-list. Missing Origin is an ordinary non-CORS request.
+func validOrigin(_ allowedOrigin: str) -> bool {
+    allowedOrigin != "" &&
+        (allowedOrigin == "*" || allowedOrigin == "null" ||
+         allowedOrigin.matches(re"^https?://[A-Za-z0-9.-]+(:[0-9]+)?$"))
+}
+
+func allowsOrigin(_ origin: str, _ allowedOrigin: str) -> bool {
+    origin == "" || origin == allowedOrigin || allowedOrigin == "*"
+}
+
+func validLists(_ allowedMethods: str, _ allowedHeaders: str) -> bool {
+    allowedMethods != "" && !allowedMethods.matches(re".*\x2a.*") && !allowedHeaders.matches(re".*\x2a.*") &&
+        httpTokenListAllows(allowedMethods, allowedMethods, true) &&
+        httpTokenListAllows(allowedHeaders, allowedHeaders, false)
+}
+
+func validPreflight(_ origin: str, _ method: str, _ headers: str) -> bool {
+    origin != "" && method != "" && !method.matches(re".*,.*") &&
+        httpTokenListAllows(method, method, true) && httpTokenListAllows(headers, headers, false)
+}
+
+func allowsPreflight(_ method: str, _ headers: str, _ allowedMethods: str, _ allowedHeaders: str) -> bool {
+    httpTokenListAllows(allowedMethods, method, true) && httpTokenListAllows(allowedHeaders, headers, false)
+}

@@ -41069,3 +41069,48 @@ route GET "/" { return forward(origin, load_balance: .roundRobin) }
         if (bad_ast) CHECK(!analyze_file_heap(bad_ast.value()));
     }
 }
+
+TEST(frontend, http_token_list_builtin_types_and_lowering) {
+    const char* source = R"rut(
+route GET "/tokens" {
+    let allowed = req.header("Allowed").or("")
+    let requested = req.header("Requested").or("")
+    let sensitive = req.header("Sensitive").or("") == "yes"
+    guard httpTokenListAllows(allowed, requested, sensitive) else { return 403 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir.module.func_count > 0);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::HttpTokenListAllows));
+    rir.destroy();
+}
+
+TEST(frontend, http_token_list_builtin_rejects_wrong_types_and_optional_values) {
+    const char* calls[] = {
+        "httpTokenListAllows(\"GET\", \"GET\")",
+        "httpTokenListAllows(1, \"GET\", true)",
+        "httpTokenListAllows(\"GET\", 1, true)",
+        "httpTokenListAllows(\"GET\", \"GET\", 1)",
+        "httpTokenListAllows(\"GET\", req.header(\"Method\"), true)",
+    };
+    for (const char* call : calls) {
+        const std::string source =
+            std::string("route GET \"/\" { guard ") + call + " else { return 403 } return 204 }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}

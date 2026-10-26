@@ -151,8 +151,12 @@ void rut_helper_uuid(
 // Check if string s has prefix pfx. Returns 1 (true) or 0 (false).
 rut::u8 rut_helper_str_has_prefix(const char* s, rut::u32 s_len, const char* pfx, rut::u32 pfx_len);
 
-// Equal-length content comparison uses OpenSSL CRYPTO_memcmp. Lengths are public.
-// Empty spans compare equal; invalid or oversized spans fail closed without reads.
+// Bounded HTTP token subset matching; case_sensitive is a canonical boolean.
+rut::u8 rut_helper_http_token_list_allows(const char* allowed,
+                                          rut::u32 allowed_len,
+                                          const char* requested,
+                                          rut::u32 requested_len,
+                                          rut::u8 case_sensitive);
 rut::u8 rut_helper_bearer_matches(const char* authorization,
                                   rut::u32 authorization_len,
                                   const char* key,
@@ -170,6 +174,8 @@ rut::u8 rut_helper_basic_matches(const char* authorization,
                                  const char* credentials,
                                  rut::u32 credentials_len);
 
+// Equal-length content comparison uses OpenSSL CRYPTO_memcmp. Lengths are public.
+// Empty spans compare equal; invalid or oversized spans fail closed without reads.
 rut::u8 rut_helper_str_constant_time_equal(const char* a,
                                            rut::u32 a_len,
                                            const char* b,
