@@ -9094,6 +9094,51 @@ TEST(proxy, upstream_timeout_504_head_commits_headers_without_body) {
              static_cast<u32>(body + 4 - reinterpret_cast<const char*>(conn->send_buf.data())));
 }
 
+TEST(proxy, upstream_timeout_with_incomplete_response_bytes_keeps_legacy_504) {
+    for (const u8 mode : {u8{0}, u8{1}, u8{2}}) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        conn->protocol = ConnProtocol::Http11;
+        conn->state = ConnState::Proxying;
+        conn->upstream_fd = 100;
+        conn->upstream_recv_armed = true;
+        conn->set_slots(nullptr, nullptr, &on_upstream_response<SmallLoop>, nullptr);
+        static constexpr char kPartial[] = "HTTP/1.1 200 OK\r\nX-Partial: value";
+        static u8 upstream_storage[4096];
+        conn->upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kPartial),
+                                                 sizeof(kPartial) - 1),
+                   sizeof(kPartial) - 1);
+        on_upstream_response<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::UpstreamRecv, 1));
+        REQUIRE_GT(conn->upstream_recv_buf.len(), 0u);
+        CHECK_FALSE(conn->proxy_resp_started);
+        CHECK_EQ(conn->resp_status, 0u);
+        static u8 response_headers[4096];
+        conn->response_header_buf.bind(response_headers, sizeof(response_headers));
+        if (mode == 1) {
+            conn->resp_header_mutations[0] = {
+                {"bad\nname", 8}, {"x", 1}, Connection::RespHeaderMutationMode::Set};
+        } else if (mode == 2) {
+            conn->resp_header_mutation_overflow = true;
+        } else {
+            conn->resp_header_mutations[0] = {{"Access-Control-Allow-Origin", 27},
+                                              {"https://app.example.com", 23},
+                                              Connection::RespHeaderMutationMode::Set};
+        }
+        conn->resp_header_mutation_count = mode == 2 ? 0u : 1u;
+        respond_upstream_timeout(&loop, *conn);
+        CHECK_EQ(conn->resp_status, 504u);
+        CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                 conn->send_buf.len(),
+                                 "Access-Control-Allow-Origin",
+                                 sizeof("Access-Control-Allow-Origin") - 1));
+    }
+}
+
 TEST(http2, upstream_timeout_helper_does_not_apply_http1_cors_mutations) {
     SmallLoop loop;
     loop.setup();

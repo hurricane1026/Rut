@@ -5740,11 +5740,12 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
+    const bool no_upstream_response_bytes = conn.upstream_recv_buf.len() == 0;
     (void)detach_upstream_close(loop, conn);
     conn.upstream_abandoned = true;
-    const bool policy_free_http1_timeout = conn.protocol == ConnProtocol::Http11 &&
-                                           conn.failure_policy_id == 0 &&
-                                           conn.timeout_failure_policy_id == 0;
+    const bool policy_free_http1_timeout =
+        conn.protocol == ConnProtocol::Http11 && conn.failure_policy_id == 0 &&
+        conn.timeout_failure_policy_id == 0 && no_upstream_response_bytes;
     bool serialized = false;
     bool mutation_failure = policy_free_http1_timeout && (conn.resp_header_mutation_count != 0 ||
                                                           conn.resp_header_mutation_overflow);
