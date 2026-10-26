@@ -1,6 +1,5 @@
 #include "rut/runtime/http_tokens.h"
 #include "test.h"
-#include <string>
 
 using namespace rut;
 
@@ -48,19 +47,25 @@ TEST(http_tokens, both_complete_lists_must_be_valid) {
     CHECK(!http_token_list_allows({}, lit_str("X"), false));
 }
 TEST(http_tokens, bounded_bytes_and_items) {
-    std::string list;
-    for (u32 i = 0; i < kMaxHttpTokenListItems; ++i) list += i ? ",x" : "x";
-    CHECK(http_token_list_allows({list.data(), static_cast<u32>(list.size())}, lit_str("x"), true));
-    list += ",x";
-    CHECK(
-        !http_token_list_allows({list.data(), static_cast<u32>(list.size())}, lit_str("x"), true));
-    CHECK(
-        !http_token_list_allows(lit_str("x"), {list.data(), static_cast<u32>(list.size())}, true));
-    std::string bytes(kMaxHttpTokenListBytes, 'x');
-    const Str limit{bytes.data(), static_cast<u32>(bytes.size())};
+    char list[2 * kMaxHttpTokenListItems + 2];
+    u32 list_len = 0;
+    for (u32 i = 0; i < kMaxHttpTokenListItems; ++i) {
+        if (i) list[list_len++] = ',';
+        list[list_len++] = 'x';
+    }
+    const Str item_limit{list, list_len};
+    CHECK(http_token_list_allows(item_limit, lit_str("x"), true));
+    list[list_len++] = ',';
+    list[list_len++] = 'x';
+    const Str item_over_limit{list, list_len};
+    CHECK(!http_token_list_allows(item_over_limit, lit_str("x"), true));
+    CHECK(!http_token_list_allows(lit_str("x"), item_over_limit, true));
+    char bytes[kMaxHttpTokenListBytes + 1];
+    for (u32 i = 0; i < kMaxHttpTokenListBytes; ++i) bytes[i] = 'x';
+    const Str limit{bytes, kMaxHttpTokenListBytes};
     CHECK(http_token_list_allows(limit, limit, false));
-    bytes += 'x';
-    CHECK(!http_token_list_allows({bytes.data(), static_cast<u32>(bytes.size())}, {}, false));
+    bytes[kMaxHttpTokenListBytes] = 'x';
+    CHECK(!http_token_list_allows({bytes, kMaxHttpTokenListBytes + 1}, {}, false));
 }
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
