@@ -8788,12 +8788,12 @@ void h2_proxy_fail(Loop* loop, Connection& conn, u16 status, bool connect_failur
     Http2Conn* h2 = conn.h2;
     const u32 kStreamId = h2->async_stream;
     h2_proxy_teardown_upstream(loop, conn);
-    // Serialize the status-only response into a local scratch, NOT pending_synth:
+    // Serialize the synthetic response into bounded local scratch, NOT pending_synth:
     // on io_uring a timeout can fire while the upstream request send is still in
     // flight, and that SQE still sources pending_synth — overwriting it here would
-    // corrupt the bytes the backend is reading. A status-only HEADERS frame is
-    // tiny, so a small stack buffer is ample.
-    u8 scratch[256];
+    // corrupt the bytes the backend is reading. Decorated failures may carry
+    // bounded committed headers, so use the same 16KiB cap as H2 synthesis.
+    u8 scratch[Http2Conn::kBodySynthCap];
     H2Dispatch<Loop> d{loop, &conn, scratch, sizeof(scratch), 0, false};
     if (connect_failure && status == 502 &&
         (conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_overflow)) {

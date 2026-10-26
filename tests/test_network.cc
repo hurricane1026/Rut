@@ -11017,10 +11017,16 @@ TEST(http2, connect_fail_502_commits_chain_headers_only_for_connect_failure) {
     conn->h2 = &h2;
     conn->epoch_held = true;
     static constexpr char kOrigin[] = "https://app.example.com";
+    static char kLargeValue[481];
+    for (u32 i = 0; i < 480; i++) kLargeValue[i] = 'v';
+    kLargeValue[480] = '\0';
     conn->resp_header_mutations[0] = {{"access-control-allow-origin", 27},
                                       {kOrigin, sizeof(kOrigin) - 1},
                                       Connection::RespHeaderMutationMode::Set};
-    conn->resp_header_mutation_count = 1;
+    conn->resp_header_mutations[1] = {{"x-large-cors", 12},
+                                      {kLargeValue, 480},
+                                      Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutation_count = 2;
 
     conn->upstream_idx = 0;
     conn->upstream_backend_idx = 0;
@@ -11034,7 +11040,7 @@ TEST(http2, connect_fail_502_commits_chain_headers_only_for_connect_failure) {
     hpack::DynamicTable decoded;
     decoded.init(kDefaultHeaderTableSize);
     hpack::Header headers[8];
-    u8 scratch[256]{};
+    u8 scratch[1024]{};
     u32 count = 0;
     REQUIRE(hpack::decode_header_block(decoded,
                                        conn->send_buf.data() + kFrameHeaderSize,
@@ -11045,12 +11051,93 @@ TEST(http2, connect_fail_502_commits_chain_headers_only_for_connect_failure) {
                                        8,
                                        &count));
     bool saw_origin = false;
+    bool saw_large = false;
     for (u32 i = 0; i < count; i++) {
         if (headers[i].name.eq({"access-control-allow-origin", 27})) {
             saw_origin = headers[i].value.eq({kOrigin, sizeof(kOrigin) - 1});
         }
+        if (headers[i].name.eq({"x-large-cors", 12})) saw_large = headers[i].value.len == 480;
     }
     CHECK(saw_origin);
+    CHECK(saw_large);
+}
+
+TEST(http2, connect_fail_mutation_invalid_or_zero_count_overflow_is_500) {
+    auto run = [&](bool overflow, bool invalid) -> u16 {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        if (conn == nullptr) {
+            CHECK_FALSE(conn == nullptr);
+            return 0;
+        }
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1,
+                         Http2StreamState::Open,
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         true};
+        h2.async_stream = 1;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        conn->resp_header_mutation_overflow = overflow;
+        if (invalid) {
+            conn->resp_header_mutations[0] = {{"bad\nname", 8},
+                                              {"x", 1},
+                                              Connection::RespHeaderMutationMode::Set};
+            conn->resp_header_mutation_count = 1;
+        }
+        conn->upstream_idx = 0;
+        conn->upstream_backend_idx = 0;
+        h2_on_upstream_connected<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::UpstreamConnect, -111));
+        if (conn->send_buf.len() == 0) {
+            CHECK_GT(conn->send_buf.len(), 0u);
+            return 0;
+        }
+        Http2FrameHeader frame{};
+        if (parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame) !=
+            ParseStatus::Complete) {
+            CHECK_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
+                     ParseStatus::Complete);
+            return 0;
+        }
+        hpack::DynamicTable decoded;
+        decoded.init(kDefaultHeaderTableSize);
+        hpack::Header headers[4];
+        u8 scratch[128]{};
+        u32 count = 0;
+        if (!hpack::decode_header_block(decoded,
+                                        conn->send_buf.data() + kFrameHeaderSize,
+                                        frame.length,
+                                        scratch,
+                                        sizeof(scratch),
+                                        headers,
+                                        4,
+                                        &count)) {
+            CHECK(hpack::decode_header_block(decoded,
+                                             conn->send_buf.data() + kFrameHeaderSize,
+                                             frame.length,
+                                             scratch,
+                                             sizeof(scratch),
+                                             headers,
+                                             4,
+                                             &count));
+            return 0;
+        }
+        if (count != 1 || !headers[0].name.eq({":status", 7})) {
+            CHECK_EQ(count, 1u);
+            CHECK(count != 0 && headers[0].name.eq({":status", 7}));
+            return 0;
+        }
+        return static_cast<u16>((headers[0].value.ptr[0] - '0') * 100 +
+                                (headers[0].value.ptr[1] - '0') * 10 +
+                                (headers[0].value.ptr[2] - '0'));
+    };
+    CHECK_EQ(run(/*overflow=*/true, /*invalid=*/false), 500u);
+    CHECK_EQ(run(/*overflow=*/false, /*invalid=*/true), 500u);
 }
 
 TEST(http2, proxy_finish_bodyless_and_head_preserve_framing_and_epoch) {
