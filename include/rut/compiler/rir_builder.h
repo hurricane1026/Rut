@@ -622,7 +622,10 @@ struct Builder {
     }
 
     VoidResult emit_resp_set_header(Str name, ValueId val, SourceLoc loc = {}) {
-        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        const bool kOptionalStr = val_has_type(val, TypeKind::Optional) &&
+                                  cur_func->values[val.id].type->inner != nullptr &&
+                                  cur_func->values[val.id].type->inner->kind == TypeKind::Str;
+        if (!val_has_type(val, TypeKind::Str) && !kOptionalStr) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RespSetHeader, nullptr, loc));
         r.inst->imm.str_val = name;
         r.inst->operands[0] = val;
@@ -710,19 +713,34 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_http_list_allows(
+        Opcode op, ValueId allowed, ValueId requested, ValueId flag, SourceLoc loc) {
+        if ((op != Opcode::HttpTokenListAllows && op != Opcode::HttpOriginListAllows) ||
+            !val_has_type(allowed, TypeKind::Str) || !val_has_type(requested, TypeKind::Str) ||
+            !val_has_type(flag, TypeKind::Bool))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(op, ty, loc));
+        const ValueId kOperands[] = {allowed, requested, flag};
+        auto stored = set_operands(inst, kOperands, 3);
+        if (!stored) return err(stored.error());
+        return vid;
+    }
+
     Result<ValueId> emit_http_token_list_allows(ValueId allowed,
                                                 ValueId requested,
                                                 ValueId sensitive,
                                                 SourceLoc loc = {}) {
-        if (!val_has_type(allowed, TypeKind::Str) || !val_has_type(requested, TypeKind::Str) ||
-            !val_has_type(sensitive, TypeKind::Bool))
-            return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::Bool));
-        auto [inst, vid] = TRY(emit(Opcode::HttpTokenListAllows, ty, loc));
-        const ValueId kOperands[] = {allowed, requested, sensitive};
-        auto stored = set_operands(inst, kOperands, 3);
-        if (!stored) return err(stored.error());
-        return vid;
+        return emit_http_list_allows(
+            Opcode::HttpTokenListAllows, allowed, requested, sensitive, loc);
+    }
+
+    Result<ValueId> emit_http_origin_list_allows(ValueId allowed,
+                                                 ValueId origin,
+                                                 ValueId credentials,
+                                                 SourceLoc loc = {}) {
+        return emit_http_list_allows(
+            Opcode::HttpOriginListAllows, allowed, origin, credentials, loc);
     }
 
     Result<ValueId> emit_hmac_sha256_matches(

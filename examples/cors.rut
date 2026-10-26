@@ -2,45 +2,18 @@ import "middleware/cors.rut"
 
 upstream api at "127.0.0.1:9000"
 
-func browserHeaders(_ result: Response) -> i32 {
-    result.set("Access-Control-Allow-Origin", "https://app.example.com")
-    result.set("Access-Control-Allow-Credentials", "true")
-    result.remove("Access-Control-Expose-Headers")
-    result.add("Vary", "Origin")
-    0
-}
-
-func browserOrigin(_ req: i32) -> bool {
-    (req.uniqueHeader("Origin") != nil) == (req.header("Origin") != nil) &&
-        cors.allowsOrigin(req.header("Origin").or(""), "https://app.example.com")
+func browserPolicy() -> cors.Policy {
+    cors.Policy(origins: "https://app.example.com, https://admin.example.com",
+                methods: "GET, POST", headers: "Authorization, Content-Type, X-Trace",
+                exposeHeaders: "X-Request-ID", maxAge: "600", credentials: true)
 }
 
 chain browser {
-    before browserOrigin(req) else 403
-    after browserHeaders(resp)
+    before requirePolicy(req, browserPolicy())
+    after applyPolicy(req, resp, browserPolicy())
 }
-route OPTIONS "/api" {
-    guard cors.validOrigin("https://app.example.com") && cors.validLists("GET, POST", "Authorization, Content-Type, X-Trace") else { return 503 }
-    guard (req.uniqueHeader("Origin") != nil) == (req.header("Origin") != nil) else { return 400 }
-    guard (req.uniqueHeader("Access-Control-Request-Method") != nil) ==
-        (req.header("Access-Control-Request-Method") != nil) else { return 400 }
-    guard (req.uniqueHeader("Access-Control-Request-Headers") != nil) ==
-        (req.header("Access-Control-Request-Headers") != nil) else { return 400 }
-    let origin = req.uniqueHeader("Origin").or("")
-    let method = req.uniqueHeader("Access-Control-Request-Method").or("")
-    let headers = req.uniqueHeader("Access-Control-Request-Headers").or("")
-    guard cors.validPreflight(origin, method, headers) else { return 400 }
-    guard cors.allowsOrigin(origin, "https://app.example.com") else { return 403 }
-    guard cors.allowsPreflight(method, headers, "GET, POST", "Authorization, Content-Type, X-Trace") else { return 403 }
-    let result = response(204)
-    result.set("Access-Control-Allow-Origin", "https://app.example.com")
-    result.set("Access-Control-Allow-Credentials", "true")
-    result.set("Access-Control-Allow-Methods", "GET, POST")
-    result.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Trace")
-    result.set("Access-Control-Max-Age", "600")
-    result.add("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
-    return result
-}
+
+route OPTIONS "/api" use chain browser { return 204 }
 route GET "/api" use chain browser { return forward(api, load_balance: .roundRobin) }
 route POST "/api" use chain browser { return forward(api, load_balance: .roundRobin) }
 
