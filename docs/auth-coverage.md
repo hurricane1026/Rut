@@ -86,6 +86,16 @@ reader drains, then destroy it. Parsing and destruction are configuration work,
 never request-path operations. Failure does not leave a partially published key
 or pollute the caller's crypto error queue.
 
-This foundation has native lifecycle and negative parsing tests. It does not
-yet expose a Rut key type, verify RS256 signatures, select JWKs, refresh JWKS or
-claim asymmetric JWT support. Those remain explicit acceptance work in the table.
+The native `RsaSha256Verifier` retains a key reference and initializes mutable
+BN/Montgomery scratch before activation. Each shard initializes its own verifier on that shard before serving requests,
+including warming crypto thread-local state.
+It verifies raw fixed-width RSASSA-PKCS1-v1_5 SHA-256 signatures over exact bytes
+(up to 1 MiB), comparing the entire canonical encoded message. It rejects
+out-of-range representatives, malformed padding and DigestInfo, and mismatches.
+Tests cover the RFC 7515 A.2 vector, 2048/2049/3072/4096-bit generated keys,
+empty/binary/bounded messages, owner release, and crypto allocation hooks that
+observe zero request-path allocations after initialization.
+
+This native foundation does not yet expose a Rut key type, parse asymmetric
+JWTs, select JWKs or refresh JWKS. Complete asymmetric JWT support remains
+explicit acceptance work in the table.
