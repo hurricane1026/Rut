@@ -131,12 +131,15 @@ bool RsaSha256Verifier::verify(Str message, Str signature) {
         message.len > kMaxHashInputBytes || (!message.ptr && message.len != 0))
         return false;
     ErrorScope errors;
-    if (!BN_bin2bn(reinterpret_cast<const unsigned char*>(signature.ptr), bytes_, input_) ||
+    if (!BN_bin2bn(reinterpret_cast<const unsigned char*>(signature.ptr),
+                   static_cast<int>(bytes_),
+                   input_) ||
         BN_cmp(input_, modulus_) >= 0 ||
         !BN_mod_exp_mont(output_, input_, exponent_, modulus_, scratch_, mont_))
         return false;
     u8 actual[512];
-    if (BN_bn2binpad(output_, actual, bytes_) != static_cast<int>(bytes_)) return false;
+    if (BN_bn2binpad(output_, actual, static_cast<int>(bytes_)) != static_cast<int>(bytes_))
+        return false;
 
     // RFC 8017 9.2: encode a fixed SHA-256 DigestInfo and compare the COMPLETE
     // EM, avoiding permissive ASN.1 or padding parsing of attacker input.
