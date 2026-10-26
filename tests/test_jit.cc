@@ -1527,7 +1527,7 @@ route GET "/api/users" {
     rir.destroy();
 }
 
-TEST(jit, chain_after_response_headers_commit_only_on_success) {
+TEST(jit, chain_after_response_headers_commit_on_guard_rejection) {
     const auto src = R"rut(
 func response_headers(_ req: i32, _ resp: Response) -> i32 {
     resp.set("X-Path", req.path)
@@ -1535,11 +1535,12 @@ func response_headers(_ req: i32, _ resp: Response) -> i32 {
     resp.remove("Server")
     0
 }
-chain access { after response_headers(req, resp) }
-route GET "/api/users" use chain access {
-    guard req.http11 else { return 505 }
-    return 200
+func require_http11(_ req: i32) -> i32 {
+    guard req.http11 else { respond 505 }
+    0
 }
+chain access { before require_http11(req) after response_headers(req, resp) }
+route GET "/api/users" use chain access { return 200 }
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1570,7 +1571,12 @@ route GET "/api/users" use chain access {
                                                         nullptr));
     CHECK(rejected.action == HandlerAction::ReturnStatus);
     CHECK_EQ(rejected.status_code, 505);
-    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 3u);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("after")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
 
     conn.reset();
     const auto result = HandlerResult::unpack(handler(&conn,
