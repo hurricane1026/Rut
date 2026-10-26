@@ -9088,10 +9088,10 @@ TEST(proxy, upstream_timeout_504_head_commits_headers_without_body) {
                        conn->send_buf.len(),
                        "Content-Length: 15\r\n",
                        sizeof("Content-Length: 15\r\n") - 1));
-    CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
-                             conn->send_buf.len(),
-                             "Gateway Timeout",
-                             sizeof("Gateway Timeout") - 1));
+    const char* body = strstr(reinterpret_cast<const char*>(conn->send_buf.data()), "\r\n\r\n");
+    REQUIRE(body != nullptr);
+    CHECK_EQ(conn->send_buf.len(),
+             static_cast<u32>(body + 4 - reinterpret_cast<const char*>(conn->send_buf.data())));
 }
 
 TEST(http2, upstream_timeout_helper_does_not_apply_http1_cors_mutations) {

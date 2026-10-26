@@ -1514,8 +1514,7 @@ no upstream response bytes exist. A policy-free HTTP/1.1 upstream timeout that
 synthesizes the legacy 504 has the same bounded committed-header behavior when
 no upstream response bytes exist; custom failure/timeout policies, HTTP/2 timer
 failures, and other runtime failures remain undecorated. Guard forward/redirect
-terminators do not gain
-automatic CORS decoration. CORS does not replace auth.
+terminators do not gain automatic CORS decoration. CORS does not replace auth.
 
 For chain-after helpers, `resp.set("Name", optionalString)` now replaces when
 present and removes when nil. Present empty strings remain empty header values.
