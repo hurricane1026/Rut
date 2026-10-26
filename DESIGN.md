@@ -8349,3 +8349,21 @@ before subset matching, rejects empty items and malformed suffixes, and treats
 methods and ASCII case folding for header names. The runtime borrows input views
 only during the call and uses bounded stack storage without allocations,
 retained state, additional libraries, or I/O.
+
+### Fixed-key RS256 compact JWT decoding
+
+`jwt_rs256_decode` is a bounded native resource-server primitive using an
+already activated shard-local `RsaSha256Verifier`. The caller selects the trusted
+key; protected-header key hints cannot change it. Only RS256 compact JWS is
+accepted, with strict unpadded base64url, a protected object header up to 1024
+bytes, and object claims up to 8192 bytes. Unsupported `crit`/`b64` extensions and
+duplicate decoded member names are rejected. The exact encoded signing input is
+verified before decoding/publishing claims. Claims validation remains a separate
+mandatory authorization policy (`jwt_claims_valid`), including issuer, audience,
+clock and subject requirements.
+
+Caller-provided JSON workspace and output preserve shard ownership and avoid
+request allocation. Success returns a document borrowing that output; failure
+sets length to zero and invalidates the document so no stack header view escapes.
+Output must not alias token or JSON workspace. No language API, key lookup or
+network operation is added in this slice.
