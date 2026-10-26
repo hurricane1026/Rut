@@ -1,6 +1,7 @@
 #include "rut/runtime/jwt_rs256.h"
 
 #include "rut/runtime/json.h"
+#include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/public_key.h"
 
 namespace rut {
@@ -103,6 +104,28 @@ bool jwt_rs256_decode(RsaSha256Verifier& verifier,
         !document.parse({payload_out, length}) || document.nodes[0].kind != json::Kind::Object)
         return false;
     payload_len = length;
+    publication.committed = true;
+    return true;
+}
+
+bool jwt_rs256_validate(RsaSha256Verifier& verifier,
+                        json::Document& document,
+                        Str token,
+                        Str issuer,
+                        Str audience,
+                        i64 unix_seconds,
+                        char* payload_out,
+                        u32 capacity,
+                        u32& payload_len) {
+    payload_len = 0;
+    Publication publication{document};
+    if (!issuer.ptr || issuer.len == 0 || !audience.ptr || audience.len == 0 || unix_seconds <= 0)
+        return false;
+    u32 decoded_length = 0;
+    if (!jwt_rs256_decode(verifier, document, token, payload_out, capacity, decoded_length) ||
+        !jwt_claims_valid(document, {payload_out, decoded_length}, issuer, audience, unix_seconds))
+        return false;
+    payload_len = decoded_length;
     publication.committed = true;
     return true;
 }

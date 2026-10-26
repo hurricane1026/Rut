@@ -8413,6 +8413,24 @@ sets length to zero and invalidates the document so no stack header view escapes
 Output must not alias token or JSON workspace. No language API, key lookup or
 network operation is added in this slice.
 
+### RS256 verification with claims policy
+
+`jwt_rs256_validate` composes the fixed-key decoder with the strict
+`jwt_claims_valid` resource-server profile. It publishes the output length and
+claims document only after both checks succeed. Require a nonempty string
+subject, an exact caller-configured issuer and audience, integer expiry strictly
+after the caller's positive Unix time, and optional integer nbf/iat no later than
+that time. Audience arrays use the same strict existing claims policy; clock
+skew is zero. The caller remains responsible for obtaining a trusted clock and
+applying scopes, revocation and replay policy.
+
+Every failure, including a valid signature with rejected claims or invalid
+policy configuration, returns zero output length and an invalid document.
+Decoded bytes in caller storage remain unspecified on failure and must not be
+used. Issuer/audience storage must not overlap output or JSON workspace. The
+verifier and workspace remain shard-owned, with no new language surface or
+network access.
+
 ### Fixed RS256 public JWK configuration
 
 The native configuration-only `RsaPublicKey::load_rs256_jwk` imports one public

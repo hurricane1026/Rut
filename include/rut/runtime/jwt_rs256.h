@@ -22,4 +22,21 @@ bool jwt_rs256_decode(RsaSha256Verifier& verifier,
                       char* payload_out,
                       u32 capacity,
                       u32& payload_len);
+
+// Decode and apply the strict jwt_claims_valid resource-server profile before
+// publishing claims: nonempty subject, exact trusted issuer/audience, required
+// integer expiry, optional nbf/iat, positive caller-supplied Unix seconds and
+// zero clock skew. Does not enforce scopes, revocation or replay policy.
+// Same workspace/lifetime/non-overlap contract as decode; issuer and audience
+// must also not alias payload_out or document. Every failure sets payload_len
+// to zero and invalidates document; output bytes remain unspecified.
+bool jwt_rs256_validate(RsaSha256Verifier& verifier,
+                        json::Document& document,
+                        Str token,
+                        Str issuer,
+                        Str audience,
+                        i64 unix_seconds,
+                        char* payload_out,
+                        u32 capacity,
+                        u32& payload_len);
 }  // namespace rut
