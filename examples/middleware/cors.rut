@@ -83,20 +83,47 @@ func varyValue(_ preflight: bool) -> str {
 // Response decoration may also be attached to explicit local error responses.
 // Validate independently: an omitted before step must never reflect an
 // unapproved or duplicate Origin, or activate malformed configuration.
-func approvedResponseOrigin(_ origin: str, _ policy: Policy) -> str {
+func approvedResponseOrigin(_ origin: str, _ preflight: bool, _ method: str,
+                            _ headers: str, _ uniqueHeaders: bool, _ policy: Policy) -> str {
     if validPolicy(policy) && origin != "" &&
-        httpOriginListAllows(policy.origins, origin, policy.credentials) {
+        httpOriginListAllows(policy.origins, origin, policy.credentials) &&
+        (!preflight || (uniqueHeaders && validPreflight(origin, method, headers) &&
+            allowsPreflight(method, headers, policy.methods, policy.headers))) {
         origin
     } else { "" }
 }
 
 func applyPolicy(_ req: i32, _ result: Response, _ policy: Policy) -> i32 {
-    result.set("Access-Control-Allow-Origin", originValue(approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy))
-    result.set("Access-Control-Allow-Credentials", credentialsValue(approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy))
-    result.set("Access-Control-Allow-Methods", preflightValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy.methods))
-    result.set("Access-Control-Allow-Headers", preflightValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy.headers))
-    result.set("Access-Control-Max-Age", preflightValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy.maxAge))
-    result.set("Access-Control-Expose-Headers", exposedValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), policy), policy))
+    result.set("Access-Control-Allow-Origin", originValue(approvedResponseOrigin(req.uniqueHeader("Origin").or(""), req.method == OPTIONS,
+        req.uniqueHeader("Access-Control-Request-Method").or(""),
+        req.uniqueHeader("Access-Control-Request-Headers").or(""),
+        (req.uniqueHeader("Access-Control-Request-Headers") != nil) ==
+            (req.header("Access-Control-Request-Headers") != nil), policy), policy))
+    result.set("Access-Control-Allow-Credentials", credentialsValue(approvedResponseOrigin(req.uniqueHeader("Origin").or(""), req.method == OPTIONS,
+        req.uniqueHeader("Access-Control-Request-Method").or(""),
+        req.uniqueHeader("Access-Control-Request-Headers").or(""),
+        (req.uniqueHeader("Access-Control-Request-Headers") != nil) ==
+            (req.header("Access-Control-Request-Headers") != nil), policy), policy))
+    result.set("Access-Control-Allow-Methods", preflightValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), req.method == OPTIONS,
+        req.uniqueHeader("Access-Control-Request-Method").or(""),
+        req.uniqueHeader("Access-Control-Request-Headers").or(""),
+        (req.uniqueHeader("Access-Control-Request-Headers") != nil) ==
+            (req.header("Access-Control-Request-Headers") != nil), policy), policy.methods))
+    result.set("Access-Control-Allow-Headers", preflightValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), req.method == OPTIONS,
+        req.uniqueHeader("Access-Control-Request-Method").or(""),
+        req.uniqueHeader("Access-Control-Request-Headers").or(""),
+        (req.uniqueHeader("Access-Control-Request-Headers") != nil) ==
+            (req.header("Access-Control-Request-Headers") != nil), policy), policy.headers))
+    result.set("Access-Control-Max-Age", preflightValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), req.method == OPTIONS,
+        req.uniqueHeader("Access-Control-Request-Method").or(""),
+        req.uniqueHeader("Access-Control-Request-Headers").or(""),
+        (req.uniqueHeader("Access-Control-Request-Headers") != nil) ==
+            (req.header("Access-Control-Request-Headers") != nil), policy), policy.maxAge))
+    result.set("Access-Control-Expose-Headers", exposedValue(req.method == OPTIONS, approvedResponseOrigin(req.uniqueHeader("Origin").or(""), req.method == OPTIONS,
+        req.uniqueHeader("Access-Control-Request-Method").or(""),
+        req.uniqueHeader("Access-Control-Request-Headers").or(""),
+        (req.uniqueHeader("Access-Control-Request-Headers") != nil) ==
+            (req.header("Access-Control-Request-Headers") != nil), policy), policy))
     result.add("Vary", varyValue(req.method == OPTIONS))
     0
 }

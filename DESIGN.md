@@ -8374,7 +8374,8 @@ The response helper independently validates policy and unique Origin before
 emitting permission headers, including on explicit local error-status returns
 without a before step. Missing, duplicate or unapproved Origin and invalid
 policy emit no permission headers. CORS effects are committed only by existing
-normal terminators; guard rejection and runtime-failure response decoration
+normal terminators. After-only OPTIONS decoration additionally validates the
+preflight method, request headers and field uniqueness; guard rejection and runtime-failure response decoration
 remains a separate feature. CORS is browser response-sharing policy, not authentication
 or CSRF protection; see the [Fetch CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
 

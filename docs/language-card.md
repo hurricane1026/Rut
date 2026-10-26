@@ -1504,7 +1504,8 @@ values are preserved. `applyPolicy` independently validates the policy and uniqu
 Origin, so it can decorate explicit local `return 401`, `return 403`,
 `return 429`, or `return 503` routes even without a before step. Invalid policy,
 missing/duplicate Origin, and unapproved Origin emit no CORS permission headers.
-Guard rejections and runtime failures retain current chain-after semantics and
+After-only OPTIONS decoration also requires a valid, permitted preflight method
+and request-header list, with unique preflight fields. Guard rejections and runtime failures retain current chain-after semantics and
 get no CORS decoration. CORS does not replace auth.
 
 For chain-after helpers, `resp.set("Name", optionalString)` now replaces when

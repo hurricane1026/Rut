@@ -265,6 +265,38 @@ def exercise_local_errors(port):
     assert headers.get("Access-Control-Allow-Credentials") is None
 
 
+def exercise_after_only_preflight(port):
+    cases = [
+        ([("Access-Control-Request-Method", "POST")], True),
+        ([], False),
+        ([("Access-Control-Request-Method", "DELETE")], False),
+        ([("Access-Control-Request-Method", "POST"),
+          ("Access-Control-Request-Method", "POST")], False),
+        ([("Access-Control-Request-Method", "POST"),
+          ("Access-Control-Request-Headers", "X-Forbidden")], False),
+        ([("Access-Control-Request-Method", "POST"),
+          ("Access-Control-Request-Headers", "X-Trace"),
+          ("Access-Control-Request-Headers", "X-Trace")], False),
+    ]
+    for fields, allowed in cases:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            conn.putrequest("OPTIONS", "/after-only-preflight")
+            conn.putheader("Origin", "https://app.example.com")
+            for name, value in fields:
+                conn.putheader(name, value)
+            conn.endheaders()
+            response = conn.getresponse()
+            response.read()
+            assert response.status == 204
+            assert response.headers.get("Access-Control-Allow-Origin") == (
+                "https://app.example.com" if allowed else None)
+            assert response.headers.get("Access-Control-Allow-Methods") == (
+                "GET, POST" if allowed else None)
+        finally:
+            conn.close()
+
+
 def main():
     binary, backend = sys.argv[1:]
     origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
@@ -304,6 +336,7 @@ def main():
             source += 'chain local_error_cors { after applyPolicy(req, resp, browserPolicy()) }\n'
             for status in (401, 403, 429, 503):
                 source += f'route GET "/local-error-{status}" use chain local_error_cors {{ return {status} }}\n'
+            source += 'route OPTIONS "/after-only-preflight" use chain local_error_cors { return 204 }\n'
             source += 'chain local_error_invalid { after applyPolicy(req, resp, policy_invalid_age()) }\n'
             source += 'route GET "/local-error-invalid" use chain local_error_invalid { return 503 }\n'
             (path / "main.rut").write_text(source)
@@ -332,6 +365,7 @@ def main():
                     exercise_h2(port)
                     exercise_policy_variants(port)
                     exercise_local_errors(port)
+                    exercise_after_only_preflight(port)
                 finally:
                     process.terminate()
                     try:
