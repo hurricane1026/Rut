@@ -93,16 +93,27 @@ def exercise(port):
     no_headers = dict(allowed)
     del no_headers["Access-Control-Request-Headers"]
     assert request(headers=no_headers)[0] == 204
+    for method in ("OPTIONS", "GET"):
+        conn.putrequest(method, "/api")
+        conn.putheader("Origin", "<missing>")
+        conn.putheader("Origin", "https://app.example.com")
+        conn.endheaders()
+        response = conn.getresponse()
+        assert response.status == 400, response.status
+        response.read()
     assert Origin.calls == 0, "preflights must not reach upstream"
     for origin in ("https://evil.example", "https://app.example.com.evil"):
         assert request("GET", {"Origin": origin})[0] == 403
     assert Origin.calls == 0
-    for origin in (allowed["Origin"], None, allowed["Origin"]):
+    for origin in (allowed["Origin"], None, "https://admin.example.com"):
         status, headers, body = request("GET", {"Origin": origin} if origin else {})
         assert (status, body) == (200, b"ok")
-        assert headers.get_all("Access-Control-Allow-Origin") == [allowed["Origin"]]
-        assert headers.get_all("Access-Control-Allow-Credentials") == ["true"]
-        assert headers.get("Access-Control-Expose-Headers") is None
+        assert headers.get_all("Access-Control-Allow-Origin") == ([origin] if origin else None)
+        assert headers.get_all("Access-Control-Allow-Credentials") == (["true"] if origin else None)
+        assert headers.get("Access-Control-Allow-Methods") is None
+        assert headers.get("Access-Control-Allow-Headers") is None
+        assert headers.get("Access-Control-Max-Age") is None
+        assert headers.get("Access-Control-Expose-Headers") == ("X-Request-ID" if origin else None)
         vary = ",".join(headers.get_all("Vary"))
         assert "Origin" in vary and "Accept-Encoding" in vary, vary
     # The explicit uniqueness check rejects duplicate Origin before forwarding.
@@ -111,7 +122,7 @@ def exercise(port):
     conn.putheader("Origin", "https://evil.example")
     conn.endheaders()
     response = conn.getresponse()
-    assert response.status == 403, response.status
+    assert response.status == 400, response.status
     response.read()
     conn.close()
     assert Origin.calls == 3
@@ -188,6 +199,104 @@ def exercise_h2(port):
     request("GET", allowed[:1], 0x88)  # HPACK static :status 200.
 
 
+def exercise_policy_variants(port):
+    def request(method, path, fields):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            conn.request(method, path, headers=fields)
+            response = conn.getresponse()
+            response.read()
+            return response.status, response.headers
+        finally:
+            conn.close()
+
+    for origin in ("https://any.example", "null", "http://[::1]:8080"):
+        status, headers = request("OPTIONS", "/public", {"Origin": origin,
+                                "Access-Control-Request-Method": "GET"})
+        assert status == 204, status
+        assert headers["Access-Control-Allow-Origin"] == "*"
+        assert headers.get("Access-Control-Allow-Credentials") is None
+        assert headers["Access-Control-Max-Age"] == "0"
+        assert headers["Access-Control-Allow-Methods"] == "GET"
+        status, headers = request("GET", "/public", {"Origin": origin})
+        assert status == 200
+        assert headers.get_all("Access-Control-Allow-Origin") == ["*"]
+        assert headers.get("Access-Control-Allow-Credentials") is None
+        assert headers.get("Access-Control-Expose-Headers") is None
+        assert headers.get("Access-Control-Max-Age") is None
+    status, headers = request("GET", "/public", {})
+    assert status == 200 and headers.get("Access-Control-Allow-Origin") is None
+    for path in ("/invalid-credentials", "/invalid-origin", "/invalid-age", "/invalid-expose"):
+        for method in ("GET", "OPTIONS"):
+            status, headers = request(method, path, {"Origin": "https://app.example.com",
+                                      "Access-Control-Request-Method": "GET"})
+            assert status == 503, (path, method, status)
+            assert headers.get("Access-Control-Allow-Origin") is None
+
+
+def exercise_local_errors(port):
+    def request(path, origins):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            conn.putrequest("GET", path)
+            for origin in origins:
+                conn.putheader("Origin", origin)
+            conn.endheaders()
+            response = conn.getresponse()
+            response.read()
+            return response.status, response.headers
+        finally:
+            conn.close()
+
+    for status in (401, 403, 429, 503):
+        for origins, expected in (
+                (["https://app.example.com"], "https://app.example.com"),
+                (["https://evil.example"], None), ([""], None), ([], None),
+                (["https://app.example.com", "https://app.example.com"], None),
+                (["https://app.example.com", "https://evil.example"], None)):
+            actual, headers = request(f"/local-error-{status}", origins)
+            assert actual == status
+            assert headers.get("Access-Control-Allow-Origin") == expected
+            assert headers.get("Access-Control-Allow-Credentials") == ("true" if expected else None)
+            assert headers.get("Access-Control-Max-Age") is None
+    actual, headers = request("/local-error-invalid", ["https://app.example.com"])
+    assert actual == 503
+    assert headers.get("Access-Control-Allow-Origin") is None
+    assert headers.get("Access-Control-Allow-Credentials") is None
+
+
+def exercise_after_only_preflight(port):
+    cases = [
+        ([("Access-Control-Request-Method", "POST")], True),
+        ([], False),
+        ([("Access-Control-Request-Method", "DELETE")], False),
+        ([("Access-Control-Request-Method", "POST"),
+          ("Access-Control-Request-Method", "POST")], False),
+        ([("Access-Control-Request-Method", "POST"),
+          ("Access-Control-Request-Headers", "X-Forbidden")], False),
+        ([("Access-Control-Request-Method", "POST"),
+          ("Access-Control-Request-Headers", "X-Trace"),
+          ("Access-Control-Request-Headers", "X-Trace")], False),
+    ]
+    for fields, allowed in cases:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            conn.putrequest("OPTIONS", "/after-only-preflight")
+            conn.putheader("Origin", "https://app.example.com")
+            for name, value in fields:
+                conn.putheader(name, value)
+            conn.endheaders()
+            response = conn.getresponse()
+            response.read()
+            assert response.status == 204
+            assert response.headers.get("Access-Control-Allow-Origin") == (
+                "https://app.example.com" if allowed else None)
+            assert response.headers.get("Access-Control-Allow-Methods") == (
+                "GET, POST" if allowed else None)
+        finally:
+            conn.close()
+
+
 def main():
     binary, backend = sys.argv[1:]
     origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
@@ -211,6 +320,25 @@ def main():
             source += 'route GET "/policy" {\n'
             source += 'guard cors.validOrigin(req.header("Origin").or("")) && cors.validLists(req.header("Methods").or(""), req.header("Headers").or("")) else { return 503 }\n'
             source += 'return 204\n}\n'
+            for name, origins, credentials, age, expose in [
+                ("public", "*", "false", "0", ""),
+                ("invalid-credentials", "*", "true", "600", "X-ID"),
+                ("invalid-origin", "https://app.example.com,garbage", "true", "600", "X-ID"),
+                ("invalid-age", "https://app.example.com", "true", "-1", "X-ID"),
+                ("invalid-expose", "https://app.example.com", "true", "600", "*"),
+            ]:
+                symbol = name.replace("-", "_")
+                source += f'func policy_{symbol}() -> cors.Policy {{\n'
+                source += f'cors.Policy(origins: "{origins}", methods: "GET", headers: "", exposeHeaders: "{expose}", maxAge: "{age}", credentials: {credentials})\n}}\n'
+                source += f'chain chain_{symbol} {{ before requirePolicy(req, policy_{symbol}()) after applyPolicy(req, resp, policy_{symbol}()) }}\n'
+                source += f'route OPTIONS "/{name}" use chain chain_{symbol} {{ return 204 }}\n'
+                source += f'route GET "/{name}" use chain chain_{symbol} {{ return forward(api, load_balance: .roundRobin) }}\n'
+            source += 'chain local_error_cors { after applyPolicy(req, resp, browserPolicy()) }\n'
+            for status in (401, 403, 429, 503):
+                source += f'route GET "/local-error-{status}" use chain local_error_cors {{ return {status} }}\n'
+            source += 'route OPTIONS "/after-only-preflight" use chain local_error_cors { return 204 }\n'
+            source += 'chain local_error_invalid { after applyPolicy(req, resp, policy_invalid_age()) }\n'
+            source += 'route GET "/local-error-invalid" use chain local_error_invalid { return 503 }\n'
             (path / "main.rut").write_text(source)
             with (path / "runtime.log").open("w+") as log:
                 process = subprocess.Popen(
@@ -218,7 +346,8 @@ def main():
                      "--shards", "1", "--no-pin", "--max-connections-per-shard", "128"],
                     stdout=log, stderr=log)
                 try:
-                    for _ in range(200):
+                    startup_deadline = time.monotonic() + 30.0
+                    while time.monotonic() < startup_deadline:
                         if process.poll() is not None:
                             log.seek(0)
                             output = log.read()
@@ -230,11 +359,19 @@ def main():
                             with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                                 break
                         except OSError:
-                            time.sleep(0.05)
+                            time.sleep(min(0.05, max(0.0, startup_deadline - time.monotonic())))
                     else:
-                        raise RuntimeError("gateway startup timed out")
+                        log.flush()
+                        log.seek(0)
+                        output = log.read()
+                        raise RuntimeError(
+                            "gateway startup timed out after 30s; runtime log tail:\n" +
+                            output[-4096:])
                     exercise(port)
                     exercise_h2(port)
+                    exercise_policy_variants(port)
+                    exercise_local_errors(port)
+                    exercise_after_only_preflight(port)
                 finally:
                     process.terminate()
                     try:

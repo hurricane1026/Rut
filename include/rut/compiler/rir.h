@@ -197,6 +197,7 @@ enum class Opcode : u8 {
     BasicMatches,
     HmacSha256Matches,
     HttpTokenListAllows,
+    HttpOriginListAllows,
     HashDigest,
     StrConstantTimeEqual,  // bounded byte equality; public lengths, secret contents
     StrHasPrefix,          // %r = str.has_prefix %s, %pfx    → bool

@@ -1804,6 +1804,10 @@ TEST(RirBuilder, ResponseHeaderOperandsRequireStringShapes) {
     auto string = V(b.emit_const_str(lit("value")));
     auto optional_string = V(b.emit_opt_wrap(string));
     VOK(b.emit_resp_set_header(lit("X-Test"), string));
+    VOK(b.emit_resp_set_header(lit("X-Test"), optional_string));
+    auto optional_integer = V(b.emit_opt_wrap(integer));
+    CHECK_FALSE(static_cast<bool>(b.emit_resp_set_header(lit("X-Test"), optional_integer)));
+    CHECK_FALSE(static_cast<bool>(b.emit_resp_add_header(lit("X-Test"), optional_string)));
     VOK(b.emit_resp_add_header(lit("X-Test"), string));
     (void)V(b.emit_resp_header(lit("X-Test"), optional_string));
 

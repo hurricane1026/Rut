@@ -278,7 +278,7 @@ Dynamic handler-local Response mutations require a direct route with no guards,
 decorators, `wait`, or `for`, exactly one builder, and that builder must be
 returned directly. A `chain after` helper must have exactly one `Response`
 parameter and may use `set`/`add`/`remove` with literal names and runtime string
-values; its effects apply to successful direct and forwarded responses on routes
+values (`set` also accepts an optional string, with nil meaning removal); its effects apply to successful direct and forwarded responses on routes
 without `wait` or `for`. Pending mutations are published only by the selected
 success terminator, so guard and pre-middleware short circuits cannot inherit
 them. Reading or changing a buffered response body/status remains ⏳ and needs a
@@ -1455,39 +1455,80 @@ cache namespace. HTTP/1.1 and HTTP/2 clients work with both I/O backends.
 Revalidation (304), stale serving, request coalescing, configurable capacity,
 private caches, persistence and distributed invalidation are not implemented.
 
-### CORS policy and HTTP token lists
+### Unified CORS policy
 
-`import "middleware/cors.rut"` (from the examples directory) supplies ordinary
-boolean helpers: `validOrigin`, `allowsOrigin`, `validLists`, `validPreflight`,
-and `allowsPreflight`. Run `examples/cors.rut` for a complete fixed-origin,
-credentialed proxy example. Preflight responses are local 204s with a 600-second
-max age, an explicit method/header allow list and Vary fields. Unknown origins,
-methods and headers reject; malformed or duplicate preflight fields reject.
-Duplicate actual-request Origin fields also reject. Successful proxy responses
-replace upstream CORS origin/credentials, remove Expose-Headers, and preserve
-existing Vary fields. Absent Origin requests remain usable. Rejections/runtime
-failures follow current chain-after semantics and carry no added CORS policy.
-
-The example uses literal policy values: change validation and emitted headers
-together. Credentialed policies must never emit Allow-Origin `*`. The module
-also permits public `*` matching, but callers must omit Allow-Credentials for
-that policy. `validOrigin` accepts HTTP(S) DNS/IPv4-style hosts, optional numeric
-ports, `null`, or `*`; IPv6, general URL validation and origin-list configuration
-are outside this profile. CORS does not replace authentication or CSRF checks.
+Import `middleware/cors.rut` from the examples directory. Define the policy once,
+then use the same function in both chain steps:
 
 ```swift
-httpTokenListAllows("GET, POST", "POST", true)                 // true
-httpTokenListAllows("GET, POST", "post", true)                 // false
-httpTokenListAllows("Authorization, X-Trace", "x-trace", false) // true
-httpTokenListAllows("X-Trace", "X-Trace,", false)               // false
+import "middleware/cors.rut"
+func browserPolicy() -> cors.Policy {
+    cors.Policy(origins: "https://app.example.com, https://admin.example.com",
+                methods: "GET, POST", headers: "Authorization, Content-Type",
+                exposeHeaders: "X-Request-ID", maxAge: "600", credentials: true)
+}
+chain browser {
+    before requirePolicy(req, browserPolicy())
+    after applyPolicy(req, resp, browserPolicy())
+}
+route OPTIONS "/api" use chain browser { return 204 }
+route GET "/api" use chain browser { return 200 }
 ```
 
-The builtin takes two unwrapped `str` values and an unwrapped `bool`, returning
-`bool`. It validates complete comma-separated HTTP token lists with SP/HTAB
-whitespace, then checks that every requested token belongs to the allowed list.
-Case folding is ASCII only. Empty lists are valid; empty items, CR/LF, quoted
-values and non-token bytes are invalid. `*` has no wildcard meaning here. Either
-input exceeding 4096 bytes or 64 tokens returns false. No allocation or retained
-state is involved. Use `uniqueHeader` plus an explicit absence/duplicate check
-when an empty list is allowed: `.or("")` alone cannot distinguish duplicate
-fields from absence. See `examples/cors.rut` for that check.
+Declare OPTIONS explicitly; the shared chain supplies preflight validation and
+headers. Every actual route that should participate must use the same chain.
+The module's functions are ordinary imported helpers, not new keywords or
+built-in decorators. See `examples/cors.rut` for a proxy example.
+
+`origins` is a comma-separated exact allow-list, at most 4096 bytes/32 entries.
+HTTP(S) DNS/IPv4-style and bracketed IPv6 origins with optional ports (0–65535)
+are supported; origins are compared exactly without normalization. Use browser-
+serialized values. Paths, userinfo, query, fragments and malformed entries reject.
+An explicit `null` is supported but shared by unrelated opaque origins. Public
+wildcard mode uses exactly `origins: "*", credentials: false`; wildcard plus
+credentials, wildcard mixed with origins, or other invalid policy returns 503.
+
+`methods`, `headers`, and `exposeHeaders` are explicit HTTP token lists, each
+limited to 4096 bytes/64 tokens, with no wildcard semantics. Methods must be
+nonempty and match case-sensitively. Header names match ASCII case-insensitively;
+empty header/exposure lists are allowed. `maxAge` is a 1–5 digit decimal **seconds
+string**, e.g. `"600"` or `"0"`, representing 0–99999 seconds. `credentials` is bool.
+
+Malformed or duplicate preflight fields return 400; nonmatching origin/method/
+headers return 403. Duplicate actual Origin returns 400. Preflights never reach
+the upstream. Successful actual responses emit the approved Origin and configured
+exposed headers; credentialed mode adds Allow-Credentials: true. Anonymous mode
+removes upstream credential headers. Preflight-only fields are removed from
+actual responses. Missing Origin removes upstream CORS fields. Existing Vary
+values are preserved. `applyPolicy` independently validates the policy and unique
+Origin, so it can decorate explicit local `return 401`, `return 403`,
+`return 429`, or `return 503` routes even without a before step. Invalid policy,
+missing/duplicate Origin, and unapproved Origin emit no CORS permission headers.
+After-only OPTIONS decoration also requires a valid, permitted preflight method
+and request-header list, with unique preflight fields. Guard rejections and runtime failures retain current chain-after semantics and
+get no CORS decoration. CORS does not replace auth.
+
+For chain-after helpers, `resp.set("Name", optionalString)` now replaces when
+present and removes when nil. Present empty strings remain empty header values.
+`add` still requires a non-optional string. Local Response builder restrictions
+are unchanged. This reuses existing optional expression syntax; no `if` statement
+with conditional Response effects is added.
+
+The lower-level boolean helpers remain available:
+
+```swift
+httpOriginListAllows("https://a.example, https://b.example", "https://b.example", true)
+httpOriginListAllows("*", "https://a.example", true)              // false
+httpTokenListAllows("GET, POST", "POST", true)                    // true
+httpTokenListAllows("GET, POST", "post", true)                    // false
+httpTokenListAllows("Authorization, X-Trace", "x-trace", false)   // true
+httpTokenListAllows("X-Trace", "X-Trace,", false)                 // false
+```
+
+Both builtins take two unwrapped `str` values and an unwrapped `bool`, returning
+`bool`. The third origin-list argument controls credential mode; the third token-
+list argument controls case sensitivity. An empty origin validates configuration
+alone. Token-list empty inputs are valid, and `*` is an ordinary token. Both
+validate complete lists, fail closed at their bounds and retain no views or
+mutable state. `uniqueHeader(...).or("")` alone cannot distinguish absence from
+duplicates when empty is allowed; the policy module checks uniqueness explicitly.
