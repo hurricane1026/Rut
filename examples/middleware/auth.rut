@@ -279,3 +279,34 @@ func requireGroup(_ identity: Identity, _ required: str,
     guard firstMatches || secondMatches else { respond 403 }
     identity
 }
+
+// Trusted static policy; requiredScope is one nonempty RFC 6749 scope token.
+struct JwtScopePolicy {
+    secret: str
+    issuer: str
+    audience: str
+    credentialId: str
+    requiredScope: str
+}
+
+// Internal policy step: document and identity must already be authenticated.
+func identityWithScope(_ document: Json, _ required: str, _ identity: Identity) -> Identity {
+    let denied = response(403)
+    denied.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasScope(document, required) else { respond denied }
+    identity
+}
+
+// Identity is published only after fixed HS256, claims and exact scope checks.
+func jwtHs256Scoped(_ authorization: str, _ policy: JwtScopePolicy) -> Identity {
+    guard policy.secret != "" && policy.issuer != "" && policy.audience != "" &&
+        policy.credentialId != "" && policy.requiredScope != "" else { respond 503 }
+    let unauthorized = response(401)
+    unauthorized.set("WWW-Authenticate", "Bearer")
+    guard let document = jwtDecode(bearerToken(authorization).or(""), policy.secret, "HS256") else { respond unauthorized }
+    let subject = json.decode(JwtSubject, document).or(JwtSubject(sub: ""))
+    guard subject.sub != "" && jwtClaimsValid(document, policy.issuer, policy.audience) else { respond unauthorized }
+    let checked = identityWithScope(document, policy.requiredScope,
+        Identity(consumerId: subject.sub, credentialId: policy.credentialId, method: "jwt"))
+    checked
+}

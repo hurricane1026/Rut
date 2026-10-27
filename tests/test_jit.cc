@@ -24581,3 +24581,192 @@ TEST(jit, owned_request_headers_copy_borrowed_inputs_and_fail_closed) {
     arena.destroy();
     pool.destroy();
 }
+
+TEST(jit, scoped_jwt_identity_requires_signature_claims_and_exact_scope) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    std::string source = R"rut(
+import "middleware/auth.rut"
+route GET "/" {
+    let identity = auth.jwtHs256Scoped(req.authorization.or(""),
+        auth.JwtScopePolicy(secret: "test-key-0123456789abcdef0123456789", issuer: "issuer", audience: "audience",
+            credentialId: "key-id", requiredScope: "orders:read"))
+    guard identity.consumerId == "alice" && identity.credentialId == "key-id" &&
+        identity.method == "jwt" else { return 500 }
+    return 204
+}
+route GET "/bad-config" {
+    let identity = auth.jwtHs256Scoped(req.authorization.or(""),
+        auth.JwtScopePolicy(secret: "test-key-0123456789abcdef0123456789", issuer: "issuer", audience: "audience",
+            credentialId: "key-id", requiredScope: ""))
+    return 500
+}
+)rut";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "jwt-scoped(code %u): %.*s at %u:%u\n",
+                     static_cast<unsigned>(hir.error().code),
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczpyZWFkIG9yZGVyczp3cml0ZSJ9.UlofDA4kDhz4QrCMcEBuywMt8y0m_Rh2adgR_"
+         "z2w0rM\r\n",
+         204},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczp3cml0ZSJ9.oQriK6VgMJvbM7MCnIJo6mhTdWvcdhQ6ztv1PT6yLo4\r\n",
+         403},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczpyZWFkZXIifQ.cRqgFLskk4OpljbTTuu_kB5G1DH8U9af2TkudJdp2iE\r\n",
+         403},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Ik9yZGVyczpyZWFkIn0.z10Q4Qhe80bJhtmA7H_etc__C3wIE9IxKfJNeR5Hkqs\r\n",
+         403},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczpyZWFkICBvcmRlcnM6d3JpdGUifQ."
+         "nZLCSF14E0qBoONBSuwrLQwateKfrXSRbG32yvd7kzo\r\n",
+         403},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwfQ."
+         "Ev-SiCXWyhwWEHL0HWOWU6-9Yv6AT_gpHUaOk5AzSi4\r\n",
+         403},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6WyJvcmRlcnM6cmVhZCJdfQ.8zvFlvQ7xDEK96dYXQWq7zhJzJDJ6Bkxm6by0-I3dMU\r\n",
+         403},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJ3cm9uZyIsImF1ZCI6ImF1ZGllbmNlIiwic3ViIjoiYWxpY2UiLCJleHAiOjQxMDI0NDQ4MDAsInNjb"
+         "3BlIjoib3JkZXJzOnJlYWQgb3JkZXJzOndyaXRlIn0."
+         "MKaTDsot2a9PIXRZecaPhoa5BwaJP2vIkjM4MjC0uzw\r\n",
+         401},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJ3cm9uZyIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY29wZ"
+         "SI6Im9yZGVyczpyZWFkIG9yZGVyczp3cml0ZSJ9.ssH_KMvJXkstcUbC4gk49OnvNKkZJ5foFjxB-hr7c8U\r\n",
+         401},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjoxLCJzY29wZSI6Im9yZ"
+         "GVyczpyZWFkIG9yZGVyczp3cml0ZSJ9.W3w6nZNFwdlQGeGQnCkA4WowTqRmSeXwLGiwZG3ZB1Y\r\n",
+         401},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6IiIsImV4cCI6NDEwMjQ0NDgwMCwic2NvcGUiO"
+         "iJvcmRlcnM6cmVhZCBvcmRlcnM6d3JpdGUifQ.6nGV322AnS4X0FQXb4gzmGqnC01srYD_t4TRps2SqLQ\r\n",
+         401},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzM4NCIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczpyZWFkIG9yZGVyczp3cml0ZSJ9."
+         "eVrDhqPw9AcQJWhNAYLVMj9VC8m4oCkARWIkUEr3Vk0\r\n",
+         401},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczpyZWFkIG9yZGVyczp3cml0ZSJ9.4INcs2N6ZTeA5cK2CSy_LYgCqWGV_"
+         "dYMPbDrP5zYwkc\r\n",
+         401},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczpyZWFkIG9yZGVyczp3cml0ZSIsIm5iZiI6NDEwMjQ0NDcwMH0.HUllrYL-oWmmbzDu8X-"
+         "rv7qoAM8HSLUVs_d-wrkAPLs\r\n",
+         401},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczpyZWFkIG9yZGVyczp3cml0ZSIsImlhdCI6NDEwMjQ0NDcwMH0."
+         "HySUhvb4vwVbq8i2OVBZi7o4wIXmzC9YCAHayk-HWKs\r\n",
+         401},
+        {0, "", 401},
+        {1, "", 503},
+        {0,
+         "Authorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczpyZWFkIG9yZGVyczp3cml0ZSJ9.UlofDA4kDhz4QrCMcEBuywMt8y0m_Rh2adgR_"
+         "z2w0rM\r\nauthorization: Bearer "
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+         "eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhdWRpZW5jZSIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwLCJzY"
+         "29wZSI6Im9yZGVyczpyZWFkIG9yZGVyczp3cml0ZSJ9.UlofDA4kDhz4QrCMcEBuywMt8y0m_Rh2adgR_"
+         "z2w0rM\r\n",
+         401},
+    };
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    for (const auto& tc : cases) {
+        SliceArena arena;
+        REQUIRE(arena.init(&pool));
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + tc.headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          &arena));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != tc.status)
+            std::fprintf(
+                stderr, "route %u got %u expected %u\n", tc.route, result.status_code, tc.status);
+        CHECK_EQ(result.status_code, tc.status);
+        arena.destroy();
+    }
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}

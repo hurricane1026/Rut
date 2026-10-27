@@ -1614,3 +1614,13 @@ each. Empty slots disable membership. Unknown Consumers and missing membership
 receive 403; invalid configuration receives 503. Replacing the trusted snapshot
 revokes membership. Client identity/group headers never populate the registry.
 See `examples/consumer-group-auth.rut` (relative to the repository root).
+
+### Scoped HS256 identity helper
+
+`auth.jwtHs256Scoped(authorization, policy)` with trusted
+`auth.JwtScopePolicy(secret: ..., issuer: ..., audience: ..., credentialId: ...,
+requiredScope: ...)` verifies fixed HS256, applies strict claims policy and requires
+one exact RFC 6749 scope token before returning `auth.Identity`. Empty trusted
+configuration is 503, invalid authentication is 401, and insufficient scope is
+403. This reuses existing language/runtime primitives; it adds no algorithm or
+key selection surface. See `examples/jwt-scoped-identity.rut` at the repo root.
