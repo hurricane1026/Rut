@@ -4475,6 +4475,9 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   is_remove ? kReqHeaderRemoveDetail : kReqHeaderMutationDetail);
+        // Consume statement-only permission before analyzing arguments so eager
+        // nested expressions cannot hide another request mutation in a value.
+        route->req_header_mutation_stmt_ok = false;
         auto name = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
         if (!name) return core::make_unexpected(name.error());
         const Str header_name = name->str_value;

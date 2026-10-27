@@ -33634,10 +33634,22 @@ TEST(frontend, req_set_is_statement_only_and_validates_arguments) {
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
-        CHECK(hir.error().detail.eq(lit(
-            "req.set/add expect literal safe header name and value strings, and may only be used "
-            "as a statement")));
+        CHECK(hir.error().detail.eq(
+            lit("req.set expects a literal safe header name and an unwrapped str value; req.add "
+                "requires literal name and value strings; both are statement-only")));
     }
+}
+
+TEST(frontend, nested_request_set_in_eager_fallback_is_rejected) {
+    const char* src =
+        "route GET \"/x\" { req.set(\"X-Test\", "
+        "req.uniqueHeader(\"X-Input\").or(req.set(\"X-Other\", \"fallback\"))) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
 }
 
 TEST(frontend, req_set_after_guard_is_rejected_until_ordered_effect_lowering) {
