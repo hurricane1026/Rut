@@ -1,24 +1,10 @@
 #include "rut/runtime/ws_terminate.h"
 
+#include <openssl/rand.h>
+
 namespace rut {
 
 namespace {
-// Advance a splitmix64 PRNG and derive a fresh 4-byte masking key — RFC 6455 §5.3 wants a
-// new unpredictable key per client->server frame, so the inspector can't reuse one fixed
-// key. Unpredictability comes from the caller's entropy seed (mask_rng); this only spreads
-// it across frames.
-void next_mask_key(u64& s, u8 key[4]) {
-    s += 0x9E3779B97F4A7C15ull;
-    u64 z = s;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    z = z ^ (z >> 31);
-    key[0] = static_cast<u8>(z);
-    key[1] = static_cast<u8>(z >> 8);
-    key[2] = static_cast<u8>(z >> 16);
-    key[3] = static_cast<u8>(z >> 24);
-}
-
 // RFC 6455 §8.1: a Text message's payload MUST be valid UTF-8. Validate the whole
 // reassembled message (rejecting overlong forms, surrogates, and out-of-range code
 // points), so a terminating gateway fails the connection instead of forwarding or
@@ -73,7 +59,8 @@ bool emit_frame(u8* out,
                 bool masked,
                 u64& mask_rng) {
     u8 key[4] = {0, 0, 0, 0};
-    if (masked) next_mask_key(mask_rng, key);
+    (void)mask_rng;  // Retained for compatibility with the existing inspector API.
+    if (masked && RAND_bytes(key, sizeof(key)) != 1) return false;
     u8 hdr[kWsMaxHeaderSize];
     const u32 hdr_len = ws_write_header(hdr, op, /*fin=*/true, masked, key, len);
     if (hdr_len == 0) return false;
@@ -133,6 +120,16 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // The whole frame (header + payload) must be present before we act on it.
         const u64 frame_total = static_cast<u64>(h.header_len) + h.payload_len;
         if (avail < frame_total) break;  // partial payload — leave the frame unconsumed
+        // A completed fragmented message can be larger than this input chunk. Flush
+        // already-produced frames first when the next output might not fit; leave this
+        // frame and the assembler state untouched for the next call.
+        if (*produced != 0) {
+            const u64 needed =
+                ws_opcode_is_control(h.opcode)
+                    ? frame_total
+                    : (h.fin ? st.message_len + h.payload_len + kWsMaxHeaderSize : 0);
+            if (needed > out_cap - *produced) break;
+        }
         const u8* payload = p + h.header_len;
 
         if (ws_opcode_is_control(h.opcode)) {
@@ -171,8 +168,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             continue;
         }
 
-        // Data frame (Text/Binary). Fragmentation was already rejected at the header (above),
-        // so reaching here means a whole, final, single-frame message.
+        // Data frame (Text/Binary or continuation).
         // Accumulate the (unmasked) payload into the reassembly buffer (bound already
         // checked above), then ask the reassembler whether the message is complete.
         for (u64 i = 0; i < h.payload_len; i++) msg_buf[st.message_len + i] = payload[i];

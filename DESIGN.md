@@ -2552,6 +2552,11 @@ post /api/orders {
 
 #### 3.4.8 WebSocket Proxying
 
+The examples in this section include planned syntax and actions. The current
+terminate implementation supports bounded reassembled text/binary messages,
+forward/drop/close verdicts, and relays control frames; modification, injection,
+extension negotiation, and the options shown below are not all implemented.
+
 Transparent WebSocket proxy with optional per-frame inspection and modification.
 Ping/pong handled automatically by runtime (RFC 6455).
 
@@ -2634,8 +2639,8 @@ get /ws/events {
 
 **Runtime semantics (passthrough tunnel).**
 
-The current runtime implements transparent **passthrough** (no frame parsing yet;
-frame inspection above is the planned terminate mode). After a proxied upstream
+The runtime implements transparent **passthrough** and a bounded terminate mode
+with message inspection. In passthrough, after a proxied upstream
 answers `101 Switching Protocols`, the connection becomes a full-duplex byte
 tunnel: two independent ping-pong loops (read one side → send to the other →
 re-read), each with its own buffer for natural backpressure.

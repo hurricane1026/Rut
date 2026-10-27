@@ -19813,9 +19813,8 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     destroy_real_loop(loop);
 }
 
-// v1 terminate is single-frame only: a fragmented client message (a data frame with
-// FIN=0) is failed closed rather than mis-reassembled by the in-place re-frame.
-TEST(websocket_e2e, terminate_rejects_fragmented) {
+// Fragments arriving in separate reads are reassembled before inspection and forwarding.
+TEST(websocket_e2e, terminate_forwards_fragmented) {
     using namespace rut;
     WsFrameEchoServer backend;
     REQUIRE(backend.setup());
@@ -19847,23 +19846,33 @@ TEST(websocket_e2e, terminate_rejects_fragmented) {
     u32 n = recv_http_headers(c, buf, sizeof(buf));
     CHECK(n > 0 && buf_contains(buf, n, "101", 3));
 
-    // A masked first fragment (Text, FIN=0): the gateway must tear the tunnel down.
     const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
     u8 fr[64];
-    u32 hl = ws_write_header(fr, WsOpcode::Text, /*fin=*/false, true, kKey, 3);
-    fr[hl] = 'A';
-    fr[hl + 1] = 'A';
-    fr[hl + 2] = 'A';
+    u32 hl = ws_write_header(fr, WsOpcode::Text, false, true, kKey, 3);
+    memcpy(fr + hl, "HEL", 3);
     ws_unmask(fr + hl, 3, kKey);
     REQUIRE(send_all(c, reinterpret_cast<char*>(fr), hl + 3));
-    bool closed = false;
-    for (int i = 0; i < 5; i++) {
-        if (recv_timeout(c, buf, sizeof(buf), 10000) <= 0) {
-            closed = true;
+    usleep(50000);
+    hl = ws_write_header(fr, WsOpcode::Continuation, true, true, kKey, 2);
+    memcpy(fr + hl, "LO", 2);
+    ws_unmask(fr + hl, 2, kKey);
+    REQUIRE(send_all(c, reinterpret_cast<char*>(fr), hl + 2));
+    u8 received[64];
+    u32 have = 0;
+    WsFrameHeader h{};
+    for (int i = 0; i < 10; ++i) {
+        i32 nread = recv_timeout(
+            c, reinterpret_cast<char*>(received + have), sizeof(received) - have, 10000);
+        REQUIRE(nread > 0);
+        have += static_cast<u32>(nread);
+        if (ws_parse_header(received, have, false, &h) == ParseStatus::Complete &&
+            have >= h.header_len + h.payload_len)
             break;
-        }
     }
-    CHECK(closed);
+    CHECK(h.opcode == WsOpcode::Text);
+    REQUIRE_EQ(h.payload_len, 5u);
+    REQUIRE(have >= h.header_len + h.payload_len);
+    CHECK(memcmp(received + h.header_len, "HELLO", 5) == 0);
 
     close(c);
     lt.stop();
@@ -19874,7 +19883,7 @@ TEST(websocket_e2e, terminate_rejects_fragmented) {
 
 // Same terminate round-trip on io_uring: exercises the multishot-recv re-arm on the
 // produced==0 path (a dropped/partial frame leaves recv armed) and the same-fd pause/
-// re-arm during the in-place inspected send.
+// re-arm during the inspected send.
 TEST(websocket_e2e, terminate_iouring) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     using namespace rut;

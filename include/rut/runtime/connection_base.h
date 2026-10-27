@@ -671,13 +671,12 @@ struct ConnectionBase {
     u16 ws_echo_close_code;         // code for the echo Close (set from the inspector on close)
     WsInspector ws_c2u;             // client->upstream inspection state (masked)
     WsInspector ws_u2c;             // upstream->client inspection state (unmasked)
-    // Reassembly scratch, one per direction (pure CPU — never kernel-referenced, so freed
-    // immediately on close). The re-framed output is written IN PLACE over the recv buffer
-    // (ws_inspect's output is always <= its consumed input), so no separate output slice is
-    // needed. ws_*_consumed remembers the unconsumed-tail start across an in-flight send so
-    // the sent callback can compact the partial trailing frame to the front.
+    // Separate reassembly and output slices per direction. Output remains stable while
+    // an asynchronous send is in flight; consumed input is compacted on completion.
     u8* ws_c2u_msg = nullptr;  // client->upstream reassembly slice
     u8* ws_u2c_msg = nullptr;  // upstream->client reassembly slice
+    u8* ws_c2u_out = nullptr;  // client->upstream output, retained until send completion
+    u8* ws_u2c_out = nullptr;  // upstream->client output, retained until send completion
     u32 ws_c2u_consumed;       // recv_buf bytes consumed by the in-flight c->u send
     u32 ws_u2c_consumed;       // upstream_recv_buf bytes consumed by the in-flight u->c send
     // Bidirectional Close handshake (RFC 6455 §5.5.1). When a Close is determined (a peer
@@ -2041,6 +2040,8 @@ struct ConnectionBase {
         ws_u2c.message_len = 0;
         ws_c2u_msg = nullptr;
         ws_u2c_msg = nullptr;
+        ws_c2u_out = nullptr;
+        ws_u2c_out = nullptr;
         ws_c2u_consumed = 0;
         ws_u2c_consumed = 0;
         ws_closing = false;

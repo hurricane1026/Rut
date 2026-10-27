@@ -37784,7 +37784,7 @@ TEST(legacy_loop, lazy_aux_buffers_handle_exhaustion_atomically) {
     REQUIRE(c != nullptr);
 
     // Freeze growth at the currently committed size, then leave one slice.
-    // The two-slice WebSocket allocation must roll the first allocation back.
+    // The four-slice WebSocket allocation must roll partial allocations back.
     const u32 original_max = loop->pool.max_count;
     loop->pool.max_count = loop->pool.count;
     std::vector<u8*> held;
@@ -37828,6 +37828,30 @@ TEST(legacy_async_loop, immediate_free_releases_all_lazy_buffers) {
     CHECK_EQ(c->response_header_slice, nullptr);
     CHECK_EQ(c->ws_c2u_msg, nullptr);
     CHECK_EQ(c->ws_u2c_msg, nullptr);
+    CHECK_EQ(c->ws_c2u_out, nullptr);
+    CHECK_EQ(c->ws_u2c_out, nullptr);
+    loop->shutdown();
+}
+
+TEST(legacy_async_loop, websocket_output_waits_for_pending_io) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_ws_terminate_bufs(*c));
+    u8* c2u = c->ws_c2u_out;
+    u8* u2c = c->ws_u2c_out;
+    c->fd = -1;
+    c->pending_ops = 1;
+    loop->free_conn(*c);
+    CHECK_EQ(c->ws_c2u_out, c2u);
+    CHECK_EQ(c->ws_u2c_out, u2c);
+    loop->reclaim_pending();
+    CHECK_EQ(c->ws_c2u_out, c2u);
+    c->pending_ops = 0;
+    loop->reclaim_pending();
+    CHECK_EQ(c->ws_c2u_out, nullptr);
+    CHECK_EQ(c->ws_u2c_out, nullptr);
     loop->shutdown();
 }
 

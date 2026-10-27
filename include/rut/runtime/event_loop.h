@@ -833,6 +833,14 @@ public:
             pool.free(conns[cid].response_header_slice);
             conns[cid].response_header_slice = nullptr;
         }
+        if (conns[cid].ws_c2u_out) {
+            pool.free(conns[cid].ws_c2u_out);
+            conns[cid].ws_c2u_out = nullptr;
+        }
+        if (conns[cid].ws_u2c_out) {
+            pool.free(conns[cid].ws_u2c_out);
+            conns[cid].ws_u2c_out = nullptr;
+        }
         free_stack[free_top++] = cid;
     }
 
@@ -860,6 +868,14 @@ public:
                 if (conns[cid].response_header_slice) {
                     pool.free(conns[cid].response_header_slice);
                     conns[cid].response_header_slice = nullptr;
+                }
+                if (conns[cid].ws_c2u_out) {
+                    pool.free(conns[cid].ws_c2u_out);
+                    conns[cid].ws_c2u_out = nullptr;
+                }
+                if (conns[cid].ws_u2c_out) {
+                    pool.free(conns[cid].ws_u2c_out);
+                    conns[cid].ws_u2c_out = nullptr;
                 }
                 free_stack[free_top++] = cid;
             } else {
@@ -918,20 +934,26 @@ public:
         return true;
     }
 
-    // Two WebSocket terminate-mode reassembly slices (one per direction). All-or-nothing;
+    // WebSocket reassembly and output slices for both directions. All-or-nothing;
     // freed in free_conn_impl. Without this the legacy EventLoop's ws_arm_terminate would
     // hit the requires-guard's false branch and close a terminate tunnel at the 101.
     bool alloc_ws_terminate_bufs(ConnectionBase& c) {
         if (c.ws_c2u_msg) return true;  // already allocated
         u8* a = pool.alloc();
         u8* b = pool.alloc();
-        if (!a || !b) {
+        u8* x = pool.alloc();
+        u8* y = pool.alloc();
+        if (!a || !b || !x || !y) {
             if (a) pool.free(a);
             if (b) pool.free(b);
+            if (x) pool.free(x);
+            if (y) pool.free(y);
             return false;
         }
         c.ws_c2u_msg = a;
         c.ws_u2c_msg = b;
+        c.ws_c2u_out = x;
+        c.ws_u2c_out = y;
         return true;
     }
 
@@ -993,6 +1015,8 @@ public:
             // Async backend (io_uring): reclaim immediately only when ordinary
             // ops and the separately-accounted response-read timer are drained.
             if (c.pending_ops == 0 && c.response_read_timer_owner_is_neutral()) {
+                if (c.ws_c2u_out) pool.free(c.ws_c2u_out);
+                if (c.ws_u2c_out) pool.free(c.ws_u2c_out);
                 if (c.recv_slice) pool.free(c.recv_slice);
                 if (c.send_slice) pool.free(c.send_slice);
                 if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -1002,12 +1026,16 @@ public:
                 return;
             }
             // Kernel ownership remains: defer until its CQEs drain.
+            u8* ws_c2u_out = c.ws_c2u_out;
+            u8* ws_u2c_out = c.ws_u2c_out;
             u8* rs = c.recv_slice;
             u8* ss = c.send_slice;
             u8* us = c.upstream_recv_slice;
             u8* hs = c.response_header_slice;
             u32 ops = c.pending_ops;
             c.reset();
+            conns[cid].ws_c2u_out = ws_c2u_out;
+            conns[cid].ws_u2c_out = ws_u2c_out;
             conns[cid].recv_slice = rs;
             conns[cid].recv_slice_capacity = rs != nullptr ? SlicePool::kSliceSize : 0;
             conns[cid].send_slice = ss;
@@ -1018,6 +1046,8 @@ public:
         } else {
             // Sync backend (epoll): kernel is done with buffers when
             // read/write returns. Return slices to pool immediately.
+            if (c.ws_c2u_out) pool.free(c.ws_c2u_out);
+            if (c.ws_u2c_out) pool.free(c.ws_u2c_out);
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);

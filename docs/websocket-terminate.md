@@ -1,5 +1,10 @@
 # WebSocket terminate mode — `.rut` frame handlers (Phase 4 design)
 
+> Historical design notes: the language surface and direction/close-code support have
+> since been implemented. The tunnel now reassembles fragmented messages up to its
+> single-slice limit using separate per-direction output slices. Statements below
+> describing fragmentation as unsupported or output as in-place are historical.
+
 Status: **Designed** (not yet implemented). The runtime engine and route API exist and are
 merged (#137/#139/#140); this document specifies the missing piece — the `.rut` **language
 surface** that lets a program author per-message terminate logic instead of registering it

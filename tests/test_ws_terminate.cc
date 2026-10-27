@@ -59,7 +59,7 @@ WsInspector make_state(bool masked) {
     st.masked = masked;
     st.from_client = masked;  // the masked leg is the client→upstream direction
     st.max_message_size = 1u << 20;
-    st.mask_rng = 0xC0FFEEull;  // deterministic seed (real tunnels seed with entropy)
+    st.mask_rng = 0xC0FFEEull;  // Legacy inspector field; mask keys come from RAND_bytes.
     return st;
 }
 
@@ -91,6 +91,40 @@ TEST(ws_terminate, forward_unmasked_text) {
     CHECK(h.opcode == WsOpcode::Text);
     CHECK_EQ(h.payload_len, 5u);
     CHECK_EQ(memcmp(pl, msg, 5), 0);
+}
+
+TEST(ws_terminate, flushes_output_before_large_fragment_completion) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[128], out[32], msg[64];
+    const u8 first[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
+    u32 n = build(in, WsOpcode::Text, false, false, first, sizeof(first));
+    u32 consumed = 0, produced = 0;
+    REQUIRE(ws_inspect(
+                st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &consumed, &produced) ==
+            WsInspectStatus::Ok);
+    CHECK_EQ(produced, 0u);
+    const u8 ping[] = {'p', 'i', 'n', 'g'};
+    n = build(in, WsOpcode::Ping, true, false, ping, sizeof(ping));
+    const u32 ping_len = n;
+    n += build(in + n, WsOpcode::Continuation, true, false, first, sizeof(first));
+    REQUIRE(ws_inspect(st, in, n, out, 20, msg, sizeof(msg), record, &r, &consumed, &produced) ==
+            WsInspectStatus::Ok);
+    CHECK_EQ(consumed, ping_len);
+    CHECK_EQ(r.calls, 0);
+    REQUIRE(ws_inspect(st,
+                       in + consumed,
+                       n - consumed,
+                       out,
+                       sizeof(out),
+                       msg,
+                       sizeof(msg),
+                       record,
+                       &r,
+                       &consumed,
+                       &produced) == WsInspectStatus::Ok);
+    CHECK_EQ(r.calls, 1);
+    CHECK_EQ(r.last_len, 16u);
 }
 
 // === Forward (client->upstream, masked both ways) ===
