@@ -252,6 +252,10 @@ void rut_helper_req_set_target_transform(void* conn, rut::u32 transform_id);
 // the outbound request later. Bounded per connection.
 void rut_helper_req_set_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+// Copies name/value into the request arena before recording replace semantics.
+// Invalid input, exhausted storage or overflow poisons forwarding (fail closed).
+void rut_helper_req_set_owned_header(
+    void* conn, void* arena, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_req_add_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_req_remove_header(void* conn, const char* name, rut::u32 nlen);

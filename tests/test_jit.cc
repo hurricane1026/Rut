@@ -24412,3 +24412,69 @@ route GET "/inconsistent-absent" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, owned_request_headers_copy_borrowed_inputs_and_fail_closed) {
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    Connection conn;
+    conn.reset();
+    char name[] = "X-Consumer-ID";
+    char value[] = "alice";
+    rut_helper_req_set_owned_header(
+        &conn, &arena, name, sizeof(name) - 1, value, sizeof(value) - 1);
+    REQUIRE_EQ(conn.req_header_override_count, 1u);
+    name[0] = 'z';
+    value[0] = 'z';
+    CHECK(conn.req_header_overrides[0].name.eq(lit("X-Consumer-ID")));
+    CHECK(conn.req_header_overrides[0].value.eq(lit("alice")));
+    CHECK_EQ(conn.req_header_owned_bytes, 18u);
+    CHECK(!conn.req_header_override_overflow);
+    CHECK_EQ(conn.req_header_append_mask, 0u);
+    rut_helper_req_set_owned_header(&conn, &arena, "X-Empty", 7, nullptr, 0);
+    REQUIRE_EQ(conn.req_header_override_count, 2u);
+    CHECK(conn.req_header_overrides[1].value.empty());
+    const char* invalid_values[] = {"a\r\nb", "a\nb", "a\x7f"};
+    for (const char* invalid : invalid_values) {
+        conn.reset();
+        rut_helper_req_set_owned_header(&conn, &arena, "X-Test", 6, invalid, lit(invalid).len);
+        CHECK(conn.req_header_override_overflow);
+        CHECK_EQ(conn.req_header_override_count, 0u);
+    }
+    conn.reset();
+    rut_helper_req_set_owned_header(&conn, &arena, "Content-Length", 14, "1", 1);
+    CHECK(conn.req_header_override_overflow);
+    CHECK_EQ(conn.req_header_override_count, 0u);
+    conn.reset();
+    char large[ConnectionBase::kMaxReqHeaderOwnedBytes];
+    __builtin_memset(large, 'a', sizeof(large));
+    rut_helper_req_set_owned_header(&conn, &arena, "X", 1, large, sizeof(large) - 1);
+    REQUIRE_EQ(conn.req_header_owned_bytes, ConnectionBase::kMaxReqHeaderOwnedBytes);
+    rut_helper_req_set_owned_header(&conn, &arena, "X", 1, "", 0);
+    CHECK(conn.req_header_override_overflow);
+    CHECK_EQ(conn.req_header_override_count, 1u);
+    conn.reset();
+    CHECK_EQ(conn.req_header_owned_bytes, 0u);
+    CHECK(!conn.req_header_override_overflow);
+    for (u32 i = 0; i <= ConnectionBase::kMaxReqHeaderOverrides; ++i)
+        rut_helper_req_set_owned_header(&conn, &arena, "X", 1, "a", 1);
+    CHECK(conn.req_header_override_overflow);
+    CHECK_EQ(conn.req_header_override_count, ConnectionBase::kMaxReqHeaderOverrides);
+    conn.reset();
+    rut_helper_req_set_owned_header(&conn, nullptr, "X", 1, "a", 1);
+    CHECK(conn.req_header_override_overflow);  // No request pool in this direct caller.
+    CHECK_EQ(conn.req_header_override_count, 0u);
+    arena.destroy();
+    pool.destroy();
+    REQUIRE(pool.init(1));
+    REQUIRE(arena.init(&pool));
+    REQUIRE(arena.alloc(arena.current->remaining()));
+    conn.reset();
+    rut_helper_req_set_owned_header(&conn, &arena, "X", 1, "a", 1);
+    CHECK(conn.req_header_override_overflow);
+    CHECK_EQ(conn.req_header_override_count, 0u);
+    CHECK_EQ(conn.req_header_owned_bytes, 0u);
+    arena.destroy();
+    pool.destroy();
+}
