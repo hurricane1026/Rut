@@ -1912,6 +1912,65 @@ void throttle_resume(Loop* loop, Connection& conn) {
     }
 }
 
+// Only request-derived CORS sharing fields may be replayed on a public-cache hit.
+// Cache policy and response framing mutations must continue to bypass the cache.
+inline bool http_cache_cors_mutations_admitted(const Connection& conn) {
+    using Mode = Connection::RespHeaderMutationMode;
+    if (conn.resp_header_mutation_count > Connection::kMaxRespHeaderMutations ||
+        conn.resp_header_mutation_overflow || conn.resp_header_mutation_pending_overflow ||
+        conn.resp_header_mutation_pending_count != conn.resp_header_mutation_count ||
+        conn.protocol != ConnProtocol::Http11 || conn.response_mutations_snapshotted ||
+        conn.upstream_fd >= 0 || conn.upstream_recv_armed || conn.upstream_recv_cancel_inflight ||
+        conn.upstream_recv_pause_cancel_pending || conn.upstream_recv_terminal_stale ||
+        conn.idle_return_fd >= 0 || conn.upstream_recv_close_quarantine ||
+        conn.upstream_recv_pause_rearm_pending || conn.h2_proxy_recv_draining ||
+        conn.h2_proxy_synth_quarantined || conn.upstream_send_armed ||
+        conn.on_upstream_send != nullptr || conn.req_header_override_overflow)
+        return false;
+    const auto aliases_buffer = [](Str value, const auto& buffer) {
+        if (value.ptr == nullptr || !buffer.valid()) return false;
+        const u64 begin = reinterpret_cast<u64>(value.ptr);
+        const u64 base = reinterpret_cast<u64>(buffer.data());
+        // Reject even a zero-length view pointing into a buffer we will rewrite.
+        return begin >= base ? begin - base < buffer.capacity() : value.len > base - begin;
+    };
+    for (u32 i = 0; i < conn.resp_header_mutation_count; ++i) {
+        const auto& m = conn.resp_header_mutations[i];
+        if (m.name.ptr == nullptr || (m.value.len != 0 && m.value.ptr == nullptr) ||
+            aliases_buffer(m.name, conn.send_buf) || aliases_buffer(m.value, conn.send_buf) ||
+            aliases_buffer(m.name, conn.response_header_buf) ||
+            aliases_buffer(m.value, conn.response_header_buf) ||
+            aliases_buffer(m.name, conn.upstream_recv_buf) ||
+            aliases_buffer(m.value, conn.upstream_recv_buf))
+            return false;
+        const bool vary = http_header_name_eq_ci(m.name.ptr, m.name.len, "vary", 4);
+        const bool cors =
+            http_header_name_eq_ci(m.name.ptr, m.name.len, "access-control-allow-origin", 27) ||
+            http_header_name_eq_ci(
+                m.name.ptr, m.name.len, "access-control-allow-credentials", 32) ||
+            http_header_name_eq_ci(m.name.ptr, m.name.len, "access-control-allow-methods", 28) ||
+            http_header_name_eq_ci(m.name.ptr, m.name.len, "access-control-allow-headers", 28) ||
+            http_header_name_eq_ci(m.name.ptr, m.name.len, "access-control-max-age", 22) ||
+            http_header_name_eq_ci(m.name.ptr, m.name.len, "access-control-expose-headers", 29);
+        const bool remove = m.mode == Mode::Remove;
+        if (vary && (m.value.ptr == nullptr ||
+                     !http_header_name_eq_ci(m.value.ptr, m.value.len, "origin", 6)))
+            return false;
+        if ((!cors || (m.mode != Mode::Set && !remove)) && !(vary && m.mode == Mode::Add))
+            return false;
+        if (validate_response_header(
+                m.name.ptr, m.name.len, remove ? "" : m.value.ptr, remove ? 0 : m.value.len) !=
+            HttpHeaderValidation::Ok)
+            return false;
+    }
+    return true;
+}
+
+inline bool build_h1_forward_response_headers(Connection& conn,
+                                              u32 header_len,
+                                              bool draining,
+                                              bool force_connection_close = false);
+
 template <typename Loop>
 bool try_http_cache_response(Loop* loop, Connection& conn, u16 upstream) {
     if (!conn.http_cache_ttl) return false;
@@ -1919,13 +1978,16 @@ bool try_http_cache_response(Loop* loop, Connection& conn, u16 upstream) {
     conn.http_cache_route = (conn.http_cache_route << 16) | upstream;
     const bool keep_alive = conn.keep_alive && conn.req_keep_alive;
     u32 length = 0;
+    const bool replay_mutations =
+        conn.resp_header_mutation_count != 0 && http_cache_cors_mutations_admitted(conn);
     const auto result = http_cache_lookup(conn,
                                           conn.recv_buf.data(),
                                           conn.req_header_end,
                                           keep_alive,
                                           conn.send_buf.write_ptr(),
                                           conn.send_buf.write_avail(),
-                                          length);
+                                          length,
+                                          replay_mutations);
     if (result != HttpCache::Result::Hit && result != HttpCache::Result::OnlyCachedMiss)
         return false;
     conn.keep_alive = keep_alive;
@@ -1935,6 +1997,39 @@ bool try_http_cache_response(Loop* loop, Connection& conn, u16 upstream) {
     } else {
         conn.resp_status = 200;
         conn.send_buf.commit(length);
+        if (replay_mutations) {
+            if (!loop->alloc_upstream_buf(conn) || !loop->alloc_response_header_buf(conn)) {
+                loop->close_conn(conn);
+                return true;
+            }
+            conn.upstream_recv_buf.reset();
+            if (conn.upstream_recv_buf.write(conn.send_buf.data(), length) != length) {
+                loop->close_conn(conn);
+                return true;
+            }
+            HttpResponseParser parser;
+            ParsedResponse response;
+            parser.reset();
+            response.reset();
+            if (parser.parse(conn.upstream_recv_buf.data(), length, &response) !=
+                    ParseStatus::Complete ||
+                !build_h1_forward_response_headers(
+                    conn, parser.header_end, loop->is_draining(), false)) {
+                loop->close_conn(conn);
+                return true;
+            }
+            const u32 body_len = length - parser.header_end;
+            conn.send_buf.reset();
+            if (conn.send_buf.write(conn.response_header_buf.data(),
+                                    conn.response_header_buf.len()) !=
+                    conn.response_header_buf.len() ||
+                conn.send_buf.write(conn.upstream_recv_buf.data() + parser.header_end, body_len) !=
+                    body_len) {
+                loop->close_conn(conn);
+                return true;
+            }
+            conn.upstream_recv_buf.reset();
+        }
     }
     conn.transition_to_sending(&on_response_sent<Loop>);
     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -3518,7 +3613,7 @@ inline bool request_policy_downstream_close_shape(const Connection& conn) {
 inline bool build_h1_forward_response_headers(Connection& conn,
                                               u32 header_len,
                                               bool draining,
-                                              bool force_connection_close = false) {
+                                              bool force_connection_close) {
     if ((conn.resp_header_mutation_count == 0 && !force_connection_close) ||
         conn.resp_header_mutation_overflow || !conn.response_header_buf.valid() || header_len < 4 ||
         header_len > conn.upstream_recv_buf.len())
@@ -14919,7 +15014,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         u32 upgrade_response_len = conn.ws_upgrade_response_len;
         if (conn.resp_header_mutation_count != 0) {
             if (!build_h1_forward_response_headers(
-                    conn, conn.ws_upgrade_response_len, /*draining=*/false)) {
+                    conn, conn.ws_upgrade_response_len, /*draining=*/false, false)) {
                 loop->close_conn(conn);
                 return;
             }

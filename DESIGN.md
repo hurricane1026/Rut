@@ -8291,7 +8291,11 @@ host entries on the local shard; cross-shard coherence is deliberately absent.
 See [the language card](docs/language-card.md#public-http-response-cache-implemented)
 for policy limits, syntax and deferred capabilities. HTTP/1 and HTTP/2 both
 copy cache hits before scheduling output, and cache routes bypass prebuilt
-response shortcuts in both epoll and io_uring.
+response shortcuts in both epoll and io_uring. HTTP/1 routes may cache with
+validated CORS Set/Remove mutations and `Vary: Origin` Add: entries retain the
+raw upstream wire response, and each hit applies the current request's mutation
+log before sending. Other mutations, HTTP/2 mutations, and `only-if-cached`
+requests with such mutations remain on the existing bypass path.
 
 Cache storage is separated from HTTP policy. `HttpCachePolicy` builds keys,
 checks request/response eligibility, accounts for freshness, and serializes

@@ -1452,7 +1452,16 @@ and a wire size at most 16 KiB minus 256 bytes are stored. `private`,
 `no-cache`, `no-store`, `Set-Cookie`, `Vary: *`, chunked, incomplete and
 unsupported responses are forwarded without storage. Origin `s-maxage`,
 `max-age`, `Expires`, `Date` and `Age` affect freshness; `ttl` is the default
-and upper bound. Hits include an updated `Age` header.
+and upper bound. Hits include an updated `Age` header. HTTP/1 requests can use the cache with
+committed Set/Remove mutations for `Access-Control-Allow-Origin`,
+`Access-Control-Allow-Credentials`, `Access-Control-Allow-Methods`,
+`Access-Control-Allow-Headers`, `Access-Control-Max-Age`, or
+`Access-Control-Expose-Headers`, and Add of `Vary: Origin`. The raw
+upstream response is stored and the current request's mutations are applied on
+each hit. If the decorated hit exceeds the bounded send buffer, the connection
+closes before sending its response. Other response mutations and HTTP/2 response
+mutations bypass the cache. For requests with these committed mutations, `only-if-cached` retains
+the bypass behavior and can contact upstream.
 
 Keys include configuration, route, upstream, peer address, transport, exact
 path/query and end-to-end request headers, so header variants remain separate.
