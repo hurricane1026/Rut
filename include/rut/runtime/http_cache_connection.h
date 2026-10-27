@@ -47,12 +47,16 @@ inline HttpCache::Result http_cache_lookup(Connection& conn,
                                            bool keep_alive,
                                            u8* output,
                                            u32 capacity,
-                                           u32& written) {
+                                           u32& written,
+                                           bool allow_response_mutations = false) {
     written = 0;
     if (!conn.http_cache_ttl || conn.req_header_override_count || conn.req_path_overridden ||
-        conn.target_transform_recorded || conn.resp_header_mutation_count ||
-        conn.resp_header_mutation_pending_count || conn.resp_header_mutation_overflow ||
-        conn.resp_header_mutation_pending_overflow)
+        conn.target_transform_recorded ||
+        (!allow_response_mutations && conn.resp_header_mutation_count) ||
+        (!allow_response_mutations && conn.resp_header_mutation_pending_count) ||
+        (allow_response_mutations &&
+         conn.resp_header_mutation_pending_count != conn.resp_header_mutation_count) ||
+        conn.resp_header_mutation_overflow || conn.resp_header_mutation_pending_overflow)
         return HttpCache::Result::Bypass;
     HttpCache::Key key;
     if (!HttpCache::make_key(request,
@@ -62,6 +66,10 @@ inline HttpCache::Result http_cache_lookup(Connection& conn,
                              conn.tls_active,
                              conn.peer_addr,
                              key))
+        return HttpCache::Result::Bypass;
+    // Explicit only-if-cached stays on the pre-existing bypass path when
+    // response mutations are present; synthetic 504 handling is separate.
+    if (allow_response_mutations && conn.resp_header_mutation_count && key.only_cached)
         return HttpCache::Result::Bypass;
     return local_http_cache().begin(key,
                                     conn.http_cache_ttl,

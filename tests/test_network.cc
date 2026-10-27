@@ -8987,6 +8987,100 @@ TEST(proxy, connect_fail_502_mutation_overflow_fails_closed_and_head_has_no_body
              static_cast<u32>((body + 4) - reinterpret_cast<const char*>(conn->send_buf.data())));
 }
 
+TEST(http_cache, cors_replay_admission_rejects_unsafe_response_mutations) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    using Mode = Connection::RespHeaderMutationMode;
+    conn->protocol = ConnProtocol::Http11;
+    conn->resp_header_mutation_count = 1;
+    conn->resp_header_mutation_pending_count = 1;
+    conn->resp_header_mutations[0] = {
+        {"Access-Control-Allow-Origin", 27}, {"https://app.example.com", 23}, Mode::Set};
+    CHECK(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0].mode = Mode::Remove;
+    CHECK(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0].mode = Mode::Add;
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0] = {{"Vary", 4}, {"Origin", 6}, Mode::Add};
+    CHECK(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0].value = {"*", 1};
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0] = {{"Cache-Control", 13}, {"public", 6}, Mode::Set};
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0] = {{"Content-Length", 14}, {"0", 1}, Mode::Set};
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0] = {
+        {"Access-Control-Allow-Origin", 27}, {"bad\nvalue", 9}, Mode::Set};
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0].value = {nullptr, 1};
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0].value = {"https://app.example.com", 23};
+    conn->protocol = ConnProtocol::Http2;
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->protocol = ConnProtocol::Http11;
+    conn->response_mutations_snapshotted = true;
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->response_mutations_snapshotted = false;
+    conn->resp_header_mutations[0].value = {reinterpret_cast<const char*>(conn->send_buf.data()),
+                                            1};
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->resp_header_mutations[0].value = {"https://app.example.com", 23};
+    conn->upstream_recv_close_quarantine = true;
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->upstream_recv_close_quarantine = false;
+    conn->upstream_send_armed = true;
+    CHECK_FALSE(http_cache_cors_mutations_admitted(*conn));
+    conn->upstream_send_armed = false;
+    conn->http_cache_ttl = 30;
+    conn->http_cache_config = 42;
+    static constexpr char kRequest[] = "GET /cache-admission HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 output[1024]{};
+    u32 written = 0;
+    // Uncommitted or overflowed logs never become cache inputs.
+    conn->resp_header_mutation_pending_count = 0;
+    CHECK_EQ(http_cache_lookup(*conn,
+                               reinterpret_cast<const u8*>(kRequest),
+                               sizeof(kRequest) - 1,
+                               true,
+                               output,
+                               sizeof(output),
+                               written,
+                               true),
+             HttpCache::Result::Bypass);
+    conn->resp_header_mutation_pending_count = 1;
+    conn->resp_header_mutation_pending_overflow = true;
+    CHECK_EQ(http_cache_lookup(*conn,
+                               reinterpret_cast<const u8*>(kRequest),
+                               sizeof(kRequest) - 1,
+                               true,
+                               output,
+                               sizeof(output),
+                               written,
+                               true),
+             HttpCache::Result::Bypass);
+    conn->resp_header_mutation_pending_overflow = false;
+    CHECK_EQ(http_cache_lookup(*conn,
+                               reinterpret_cast<const u8*>(kRequest),
+                               sizeof(kRequest) - 1,
+                               true,
+                               output,
+                               sizeof(output),
+                               written),
+             HttpCache::Result::Bypass);  // H2 and other callers do not opt in.
+    CHECK_EQ(http_cache_lookup(*conn,
+                               reinterpret_cast<const u8*>(kRequest),
+                               sizeof(kRequest) - 1,
+                               true,
+                               output,
+                               sizeof(output),
+                               written,
+                               true),
+             HttpCache::Result::Miss);
+    if (conn->http_cache_token.generation) local_http_cache().cancel(conn->http_cache_token);
+}
+
 TEST(proxy, upstream_timeout_504_commits_stable_chain_headers) {
     SmallLoop loop;
     loop.setup();

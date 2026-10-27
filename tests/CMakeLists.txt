@@ -4006,5 +4006,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
                     $<TARGET_FILE:rut> ${backend})
         set_tests_properties(test_cli_cors_h2_timeout_${backend} PROPERTIES
             LABELS "cli;cors;network" RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME test_cli_cors_cache_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_cors_cache.py
+                    $<TARGET_FILE:rut> ${backend})
+        set_tests_properties(test_cli_cors_cache_${backend} PROPERTIES
+            LABELS "cli;cors;http-cache;network" RUN_SERIAL TRUE TIMEOUT 45 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
