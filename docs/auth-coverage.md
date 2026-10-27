@@ -1,9 +1,9 @@
 # Gateway authentication and authorization coverage
 
 This ledger extends the existing M4 scope. A matching plugin name or successful
-HTTP request is insufficient evidence of protocol equivalence. Status describes
-this branch (based on the auth policy composition work in #901), not an older
-checkout or a claim that the whole auth milestone is complete.
+HTTP request is insufficient evidence of protocol equivalence. Status describes the implementation and tests on this branch. Open integration
+PRs are tracked separately below; native-only APIs do not count as executable Rut
+features, and this ledger does not claim the whole auth milestone is complete.
 
 Sources: [Kong authentication](https://developer.konghq.com/gateway/authentication/),
 [Kong plugin catalog](https://developer.konghq.com/plugins/),
@@ -14,8 +14,8 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window | Consumer registry, credential lifecycle and safe upstream credential hiding |
-| Bearer and multi-auth | Basic/Bearer OR composition, disabled-slot handling, configuration failures | Multiple consumers, explicit AND/OR policy, anonymous only for absent credentials, no invalid-credential downgrade |
+| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping | Dynamic Consumer registry/credential lifecycle, query/body credential hiding and verified identity forwarding |
+| Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair of configured Consumers; disabled-slot handling and ambiguous ownership rejection | Dynamic Consumer registry, explicit AND policy, anonymous only for absent credentials, no invalid-credential downgrade |
 | JWT verification | HS256/384/512 policy helpers; native fixed-key RS256 decoder and trusted configured JWK Set selection | Rut/JIT asymmetric key wiring, ES keys, request-key selection, JWKS rotation/cache, revocation and unknown-key policy |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks HTTP/Rut wiring and replay persistence |
 | ACL / Consumer restriction | Exact verified-consumer allow/deny helpers | Multiple groups, membership lifecycle, default deny, no client identity spoofing |
@@ -32,6 +32,59 @@ whether a competing open-source edition includes them.
 | Keycloak / Casdoor | Pending | Explicit supported OIDC/OAuth2 or provider protocols and conformance fixtures, role mapping and outage behavior |
 | Casbin / Wolf RBAC | Pending | Named access model, trusted identity/policy mapping, policy update semantics and deny/error behavior |
 | Shared identity / sessions | Pending | Session lifecycle, fixation/CSRF defenses, rotation/revocation, shard ownership and explicit cross-node consistency |
+
+## Audit of executable gaps
+
+The 2026-10-27 audit separates these layers:
+
+- Header stripping is implemented: `req.remove` removes every case-insensitive
+  occurrence before forwarding while auth reads the original request. See
+  `examples/auth-proxy.rut` and the language card's credential-stripping section.
+  Dynamic verified-identity forwarding is still separate work.
+- `apiKeyOrBasic` supports one Consumer. `multiAuth` now checks four configured
+  slots (Bearer/Basic for each of two Consumers), rejects ambiguous ownership,
+  and returns metadata from the matched configuration. This is a static bounded
+  policy, not a persistent Consumer registry or a claim of plugin equivalence.
+- Native RS256/JWK/JWKS verification and claims validation exist, but no Rut key
+  owner/configuration surface publishes shard verifiers. HTTP asymmetric auth
+  remains pending; parsing keys on each request would violate the hot-path goal.
+- Anonymous access needs a presence distinction: singleton Authorization reads
+  return nil for both absence and duplicates. Falling back on nil would turn
+  malformed duplicate credentials into anonymous access. No anonymous helper is
+  advertised until absence can be distinguished safely.
+- External authorization needs bounded response-consuming callouts with tested
+  cancellation/close behavior; redirects or fire-and-forget proxying do not
+  implement forward-auth, OPA or introspection.
+
+Open integration work (not yet on the audited main base):
+[#922](https://github.com/hurricane1026/Rut/pull/922) exposes Standard Webhooks to
+Rut/JIT, and [#923](https://github.com/hurricane1026/Rut/pull/923) supplies its
+Identity middleware and request tests. Their freshness checks do not implement
+persistent replay protection.
+
+## Bounded multi-Consumer authentication
+
+`auth.ConsumerCredentials` contains trusted `consumerId`, `key`, `credentials`
+(`user:password`), `keyId` and `passwordId` strings. Pass two configurations and
+`req.authorization.or("")` to `auth.multiAuth`. Both Consumers must have distinct,
+nonempty IDs, and all credential IDs must be nonempty, even for disabled slots.
+Empty secrets disable individual slots; at least one slot must remain enabled.
+A shared nonempty Bearer key or Basic credential across the two Consumers is a
+503 configuration error, independently of the presented request. This prevents
+configuration order from deciding credential ownership.
+
+Each enabled method retains its native syntax/size validation. Matching uses
+only one singleton Authorization field, with no query/header fallback. Invalid,
+missing, duplicate or unknown credentials return 401 with Bearer and Basic
+challenges. Successful identity/credential IDs come only from the matched
+configuration, including when the client supplies spoofed identity headers.
+Disabled Consumer slots cannot authenticate. Configuration is compiled in; change
+and restart to rotate/revoke credentials. See `examples/multi-consumer-auth.rut`.
+
+The JIT request matrix checks both methods for both Consumers, exact identity
+mapping, cross-method confusion, duplicate Authorization, disabled slots,
+ambiguous ownership and bad metadata. Consumer authorization remains a separate
+step after verification.
 
 ## Implementation order and gates
 

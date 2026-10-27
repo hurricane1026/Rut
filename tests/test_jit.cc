@@ -399,6 +399,128 @@ TEST(jit, frontend_nil_presence_test_executes_both_ways) {
     rir.destroy();
 }
 
+TEST(jit, static_multi_consumer_authentication_maps_credentials_and_rejects_ambiguity) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    const auto config = [](const char* consumer,
+                           const char* key,
+                           const char* password,
+                           const char* key_id,
+                           const char* password_id) {
+        return std::string("auth.ConsumerCredentials(consumerId: \"") + consumer + "\", key: \"" +
+               key + "\", credentials: \"" + password + "\", keyId: \"" + key_id +
+               "\", passwordId: \"" + password_id + "\")";
+    };
+    const std::string alice =
+        config("alice", "alice-key", "alice:pass", "alice-key-id", "alice-password-id");
+    const std::string bob = config("bob", "bob-key", "bob:pass", "bob-key-id", "bob-password-id");
+    const std::string configurations[][2] = {
+        {alice, bob},
+        {config("alice", "", "", "alice-key-id", "alice-password-id"), bob},
+        {config("alice", "", "", "a", "b"), config("bob", "", "", "c", "d")},
+        {alice, config("bob", "alice-key", "bob:pass", "c", "d")},
+        {alice, config("bob", "bob-key", "alice:pass", "c", "d")},
+        {alice, config("alice", "bob-key", "bob:pass", "c", "d")},
+        {alice, config("bob", "bob-key", "bob:pass", "", "d")},
+    };
+    std::string source = "import \"middleware/auth.rut\"\n";
+    for (u32 i = 0; i < sizeof(configurations) / sizeof(configurations[0]); ++i) {
+        source += "route GET \"/" + std::to_string(i) +
+                  "\" { let identity = auth.multiAuth(req.authorization.or(\"\"), " +
+                  configurations[i][0] + ", " + configurations[i][1] + ")\n";
+        if (i == 0) {
+            source += R"rut(
+    guard (identity.consumerId == "alice" &&
+        ((identity.method == "apiKey" && identity.credentialId == "alice-key-id") ||
+         (identity.method == "basic" && identity.credentialId == "alice-password-id"))) ||
+        (identity.consumerId == "bob" &&
+        ((identity.method == "apiKey" && identity.credentialId == "bob-key-id") ||
+         (identity.method == "basic" && identity.credentialId == "bob-password-id"))) else { return 500 }
+    match identity.credentialId {
+        "alice-key-id" => return 201
+        "alice-password-id" => return 202
+        "bob-key-id" => return 203
+        "bob-password-id" => return 204
+        _ => return 500
+    }
+)rut";
+        } else
+            source += "return 200\n";
+        source += "}\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "multi-consumer: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0, "Authorization: Bearer alice-key\r\n", 201},
+        {0, "Authorization: Basic YWxpY2U6cGFzcw==\r\n", 202},
+        {0, "Authorization: Bearer bob-key\r\n", 203},
+        {0, "Authorization: bAsIc   Ym9iOnBhc3M=\r\n", 204},
+        {0, "Authorization: Bearer bob-key\r\nX-Consumer-ID: alice\r\n", 203},
+        {0, "", 401},
+        {0, "Authorization: Bearer unknown\r\n", 401},
+        {0, "Authorization: Basic Ym9iOndyb25n\r\n", 401},
+        {0, "Authorization: Basic bob-key\r\n", 401},
+        {0, "Authorization: Bearer Ym9iOnBhc3M=\r\n", 401},
+        {0, "Authorization: Bearer alice-key\r\nauthorization: Bearer bob-key\r\n", 401},
+        {0, "Authorization: Bearer bob-key\r\nAuthorization: Bearer bob-key\r\n", 401},
+        {1, "Authorization: Bearer alice-key\r\n", 401},
+        {1, "Authorization: Basic YWxpY2U6cGFzcw==\r\n", 401},
+        {1, "Authorization: Bearer bob-key\r\n", 200},
+        {1, "Authorization: Basic Ym9iOnBhc3M=\r\n", 200},
+        {2, "", 503},
+        {3, "Authorization: Bearer alice-key\r\n", 503},
+        {4, "Authorization: Basic YWxpY2U6cGFzcw==\r\n", 503},
+        {5, "Authorization: Bearer bob-key\r\n", 503},
+        {6, "Authorization: Bearer bob-key\r\n", 503},
+    };
+    for (const auto& tc : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + tc.headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != tc.status)
+            std::fprintf(
+                stderr, "route %u got %u expected %u\n", tc.route, result.status_code, tc.status);
+        CHECK_EQ(result.status_code, tc.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_req_header_any_fallback) {
     const char* src =
         "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, "

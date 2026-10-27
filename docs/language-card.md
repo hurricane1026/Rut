@@ -1188,6 +1188,15 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   `WWW-Authenticate` fields (Bearer, then Basic). Read only the unique
   `req.authorization` field: duplicates reject the whole request, with no fallback
   to another header, query parameter, or anonymous identity.
+- `auth.multiAuth(authorization, first, second)` accepts two trusted
+  `auth.ConsumerCredentials(consumerId: ..., key: ..., credentials: ...,
+  keyId: ..., passwordId: ...)` values. Each Consumer may use Bearer or Basic;
+  empty secrets disable slots. Consumer IDs must be distinct, all IDs nonempty,
+  and at least one slot enabled. Sharing a nonempty same-method secret across
+  Consumers returns 503. Missing/invalid/duplicate Authorization returns 401;
+  success returns the matched Consumer, credential ID and method. This is a
+  fixed two-Consumer configuration, with restart-based rotation/revocation.
+  See [multi-consumer-auth.rut](../examples/multi-consumer-auth.rut).
 - `auth.requireConsumer(identity, allowedConsumerId)` permits one exact,
   case-sensitive consumer ID; `auth.denyConsumer(identity, deniedConsumerId)`
   excludes one exact ID. Both return the unchanged verified identity on success,

@@ -1,0 +1,25 @@
+import "middleware/auth.rut"
+listen :8080
+
+// Compile-time snapshots. Empty secrets disable slots; use TLS for credentials.
+func alice() -> auth.ConsumerCredentials {
+    auth.ConsumerCredentials(consumerId: "alice", key: env("ALICE_API_KEY"),
+        credentials: env("ALICE_BASIC_CREDENTIALS"), keyId: "alice-key", passwordId: "alice-password")
+}
+func bob() -> auth.ConsumerCredentials {
+    auth.ConsumerCredentials(consumerId: "bob", key: env("BOB_API_KEY"),
+        credentials: env("BOB_BASIC_CREDENTIALS"), keyId: "bob-key", passwordId: "bob-password")
+}
+
+route GET "/private" {
+    let identity = auth.multiAuth(req.authorization.or(""), alice(), bob())
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
+route GET "/alice-only" {
+    let identity = auth.multiAuth(req.authorization.or(""), alice(), bob())
+    let permitted = auth.requireConsumer(identity, "alice")
+    let consumerId = permitted.consumerId
+    return response(200, body: consumerId)
+}
+route "/" { return 404 }
