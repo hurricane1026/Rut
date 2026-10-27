@@ -13,8 +13,8 @@
 // direction (client->upstream is client-role on both; upstream->client is server-role on
 // both), a single `masked` flag covers both the inbound unmask and the outbound mask.
 //
-// This is the pure decision engine — it touches no sockets. The tunnel pump (a later
-// slice) calls ws_inspect at the forward boundary and sends the produced bytes.
+// This is the pure decision engine — it touches no sockets. The tunnel pump calls
+// ws_inspect at the forward boundary and sends the produced bytes.
 namespace rut {
 
 // RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close frame.
@@ -63,9 +63,7 @@ struct WsInspector {
     // client leg, but masking is a wire-format property and direction is a routing one —
     // conflating them would break the day they diverge. The caller sets it at arm time.
     bool from_client = false;
-    u64 mask_rng = 0;          // PRNG state for fresh per-frame outbound mask keys when
-                               // `masked`; the caller MUST seed it with real entropy
-                               // (e.g. RAND_bytes) per RFC 6455 §5.3 unpredictability.
+    u64 mask_rng = 0;          // Reserved for compatibility; masking keys use RAND_bytes.
     u64 max_message_size = 0;  // 0 = unbounded
     // `frame.close(code)` support. close_code (INPUT) is the RFC 6455 status the handler's
     // Close verdict should put on the wire — set by the caller from the route config (1000 =
@@ -75,12 +73,8 @@ struct WsInspector {
     // unchanged — the peer's own code is already relayed verbatim on the forward leg).
     u16 close_code = 1000;
     u16 echo_close_code = 1000;
-    // Reject fragmented messages (a Continuation frame, or a data frame with FIN=0) with
-    // Error. The in-place tunnel integration uses this: it re-frames over the recv buffer,
-    // which is only sound when a message's output fits its single frame's consumed input —
-    // a fragmented message completing in a later (smaller) read would overflow. Single-
-    // frame terminate is the v1; spanning-read fragmentation support needs a separate
-    // output buffer. Off by default (the engine still reassembles for non-tunnel callers).
+    // Reject fragmented messages when a caller cannot provide a separate output buffer.
+    // The tunnel supplies one and leaves this disabled.
     bool reject_fragmented = false;
     WsMessageAssembler assembler;  // fragmentation state across frames
     u64 message_len = 0;           // bytes accumulated into the message buffer so far
@@ -98,7 +92,8 @@ struct WsInspector {
 //     Text messages are rejected (Error) unless the reassembled payload is valid UTF-8.
 //   - control frames (Ping/Pong/Close): passed through verbatim into `out`; a Close
 //     additionally ends the stream.
-// A partial trailing frame is left unconsumed for the next call; an oversized frame
+// A partial trailing frame, or a complete frame that cannot fit after earlier output,
+// is left unconsumed for the next call; an oversized frame
 // (advertised length exceeds msg_cap or max_message_size) fails closed immediately rather
 // than waiting for its payload. Sets *consumed (input bytes processed) and *produced
 // (output bytes written). Returns Error on any framing violation, an over-cap message,
@@ -121,7 +116,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
 
 // Serialize a Close frame carrying RFC 6455 status `code` into out for the terminate close
 // handshake. `masked` true for the gateway→backend (client-role) leg, false for
-// gateway→client. Advances mask_rng when masked. Returns bytes written, 0 on overflow.
+// gateway→client. Returns bytes written, 0 on overflow or random generator failure.
 u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code = 1000);
 
 }  // namespace rut

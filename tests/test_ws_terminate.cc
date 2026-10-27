@@ -59,7 +59,7 @@ WsInspector make_state(bool masked) {
     st.masked = masked;
     st.from_client = masked;  // the masked leg is the client→upstream direction
     st.max_message_size = 1u << 20;
-    st.mask_rng = 0xC0FFEEull;  // deterministic seed (real tunnels seed with entropy)
+    st.mask_rng = 0xC0FFEEull;  // Legacy inspector field; mask keys come from RAND_bytes.
     return st;
 }
 
@@ -91,6 +91,40 @@ TEST(ws_terminate, forward_unmasked_text) {
     CHECK(h.opcode == WsOpcode::Text);
     CHECK_EQ(h.payload_len, 5u);
     CHECK_EQ(memcmp(pl, msg, 5), 0);
+}
+
+TEST(ws_terminate, flushes_output_before_large_fragment_completion) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[128], out[32], msg[64];
+    const u8 first[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
+    u32 n = build(in, WsOpcode::Text, false, false, first, sizeof(first));
+    u32 consumed = 0, produced = 0;
+    REQUIRE(ws_inspect(
+                st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &consumed, &produced) ==
+            WsInspectStatus::Ok);
+    CHECK_EQ(produced, 0u);
+    const u8 ping[] = {'p', 'i', 'n', 'g'};
+    n = build(in, WsOpcode::Ping, true, false, ping, sizeof(ping));
+    const u32 ping_len = n;
+    n += build(in + n, WsOpcode::Continuation, true, false, first, sizeof(first));
+    REQUIRE(ws_inspect(st, in, n, out, 20, msg, sizeof(msg), record, &r, &consumed, &produced) ==
+            WsInspectStatus::Ok);
+    CHECK_EQ(consumed, ping_len);
+    CHECK_EQ(r.calls, 0);
+    REQUIRE(ws_inspect(st,
+                       in + consumed,
+                       n - consumed,
+                       out,
+                       sizeof(out),
+                       msg,
+                       sizeof(msg),
+                       record,
+                       &r,
+                       &consumed,
+                       &produced) == WsInspectStatus::Ok);
+    CHECK_EQ(r.calls, 1);
+    CHECK_EQ(r.last_len, 16u);
 }
 
 // === Forward (client->upstream, masked both ways) ===
@@ -421,6 +455,68 @@ TEST(ws_terminate, fragmented_message_handler_sees_whole) {
     CHECK_EQ(h.payload_len, 5u);
     CHECK(h.fin);
     CHECK_EQ(memcmp(pl, "AAABB", 5), 0);  // "AAA" + "BB"
+}
+
+TEST(ws_terminate, fragmented_utf8_with_interleaved_ping) {
+    WsInspector st = make_state(true);
+    Recorder r;
+    u8 in[64], out[64], msg[64], payload[64];
+    const u8 first[] = {0xe2, 0x82};
+    const u8 last[] = {0xac};
+    const u8 ping[] = {'p'};
+    u32 n = build(in, WsOpcode::Text, false, true, first, sizeof(first));
+    n += build(in + n, WsOpcode::Ping, true, true, ping, sizeof(ping));
+    n += build(in + n, WsOpcode::Continuation, true, true, last, sizeof(last));
+    u32 consumed = 0, produced = 0;
+    REQUIRE(ws_inspect(
+                st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &consumed, &produced) ==
+            WsInspectStatus::Ok);
+    CHECK_EQ(consumed, n);
+    CHECK_EQ(r.calls, 1);
+    CHECK_EQ(r.last_len, 3u);
+    WsFrameHeader h{};
+    const u32 ping_len = parse_one(out, produced, true, &h, payload);
+    REQUIRE(ping_len > 0);
+    CHECK(h.opcode == WsOpcode::Ping);
+    CHECK_EQ(payload[0], 'p');
+    REQUIRE(parse_one(out + ping_len, produced - ping_len, true, &h, payload) > 0);
+    CHECK(h.opcode == WsOpcode::Text);
+    CHECK_EQ(h.payload_len, 3u);
+    CHECK(payload[0] == 0xe2 && payload[1] == 0x82 && payload[2] == 0xac);
+}
+
+TEST(ws_terminate, fragmented_message_enforces_total_size) {
+    WsInspector st = make_state(false);
+    st.max_message_size = 4;
+    Recorder r;
+    u8 in[64], out[64], msg[64];
+    const u8 first[] = {'a', 'b', 'c'};
+    const u8 last[] = {'d', 'e'};
+    u32 n = build(in, WsOpcode::Binary, false, false, first, sizeof(first));
+    u32 consumed = 0, produced = 0;
+    REQUIRE(ws_inspect(
+                st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &consumed, &produced) ==
+            WsInspectStatus::Ok);
+    n = build(in, WsOpcode::Continuation, true, false, last, sizeof(last));
+    CHECK(ws_inspect(
+              st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &consumed, &produced) ==
+          WsInspectStatus::Error);
+    CHECK_EQ(r.calls, 0);
+}
+
+TEST(ws_terminate, fragmented_invalid_utf8_never_reaches_handler) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[64], out[64], msg[64];
+    const u8 first[] = {0xe2};
+    const u8 last[] = {0x28, 0xa1};
+    u32 n = build(in, WsOpcode::Text, false, false, first, sizeof(first));
+    n += build(in + n, WsOpcode::Continuation, true, false, last, sizeof(last));
+    u32 consumed = 0, produced = 0;
+    CHECK(ws_inspect(
+              st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &consumed, &produced) ==
+          WsInspectStatus::Error);
+    CHECK_EQ(r.calls, 0);
 }
 
 // reject_fragmented (the in-place tunnel mode) fails closed on a fragmented message — a

@@ -3015,18 +3015,24 @@ public:
         return true;
     }
 
-    // Two WebSocket terminate-mode reassembly slices (one per direction). All-or-nothing.
+    // WebSocket reassembly and output slices for both directions. All-or-nothing.
     bool alloc_ws_terminate_bufs(ConnectionBase& c) {
         if (c.ws_c2u_msg) return true;  // already allocated
         u8* a = pool.alloc();
         u8* b = pool.alloc();
-        if (!a || !b) {
+        u8* x = pool.alloc();
+        u8* y = pool.alloc();
+        if (!a || !b || !x || !y) {
             if (a) pool.free(a);
             if (b) pool.free(b);
+            if (x) pool.free(x);
+            if (y) pool.free(y);
             return false;
         }
         c.ws_c2u_msg = a;
         c.ws_u2c_msg = b;
+        c.ws_c2u_out = x;
+        c.ws_u2c_out = y;
         return true;
     }
 
@@ -3165,6 +3171,14 @@ public:
             pool.free(conns[cid].response_header_slice);
             conns[cid].response_header_slice = nullptr;
         }
+        if (conns[cid].ws_c2u_out) {
+            pool.free(conns[cid].ws_c2u_out);
+            conns[cid].ws_c2u_out = nullptr;
+        }
+        if (conns[cid].ws_u2c_out) {
+            pool.free(conns[cid].ws_u2c_out);
+            conns[cid].ws_u2c_out = nullptr;
+        }
         close_response_splice_pipe(conns[cid]);
         release_deferred_epoch(conns[cid]);
         conns[cid].response_body_tail.release();
@@ -3207,6 +3221,14 @@ public:
                 if (conns[cid].response_header_slice) {
                     pool.free(conns[cid].response_header_slice);
                     conns[cid].response_header_slice = nullptr;
+                }
+                if (conns[cid].ws_c2u_out) {
+                    pool.free(conns[cid].ws_c2u_out);
+                    conns[cid].ws_c2u_out = nullptr;
+                }
+                if (conns[cid].ws_u2c_out) {
+                    pool.free(conns[cid].ws_u2c_out);
+                    conns[cid].ws_u2c_out = nullptr;
                 }
                 close_response_splice_pipe(conns[cid]);
                 release_deferred_epoch(conns[cid]);
@@ -3297,8 +3319,8 @@ public:
         // io_uring-referenced slices — safe to free now even with ops in flight.
         if (c.tls_engine.ssl) tls_engine_free(c.tls_engine);
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
-        // kernel op — the re-framed output goes in place in the recv slices), so reclaim
-        // them now too, regardless of in-flight ops.
+        // kernel op), so reclaim them now. Output slices can be owned by a send and
+        // are reclaimed only after pending operations drain.
         if (c.ws_c2u_msg) {
             pool.free(c.ws_c2u_msg);
             c.ws_c2u_msg = nullptr;
@@ -3318,6 +3340,8 @@ public:
             !c.relay_owner.read_cancel_retry && !c.relay_owner.write_cancel_retry &&
             !c.relay_owner.close_pending && c.relay_owner.segment_len == 0) {
             close_response_splice_pipe(c);
+            if (c.ws_c2u_out) pool.free(c.ws_c2u_out);
+            if (c.ws_u2c_out) pool.free(c.ws_u2c_out);
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -3332,6 +3356,8 @@ public:
             return;
         }
         // Kernel ownership remains: defer until its CQEs drain.
+        u8* ws_c2u_out = c.ws_c2u_out;
+        u8* ws_u2c_out = c.ws_u2c_out;
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
         auto response_body_tail = c.response_body_tail;
@@ -3364,6 +3390,8 @@ public:
         c.reset();
         conns[cid].id = cid;
         conns[cid].shard_id = allocated_shard;
+        conns[cid].ws_c2u_out = ws_c2u_out;
+        conns[cid].ws_u2c_out = ws_u2c_out;
         conns[cid].recv_slice = rs;
         conns[cid].recv_slice_capacity = rs != nullptr ? SlicePool::kSliceSize : 0;
         conns[cid].send_slice = ss;

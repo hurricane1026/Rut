@@ -29,7 +29,6 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <openssl/rand.h>  // RAND_bytes — fresh outbound mask-key seed (terminate mode)
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -10744,9 +10743,9 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 // the paired send drains it) is ignored rather than treated as a close.
 
 #if RUT_ENABLE_WEBSOCKET
-// Arm terminate mode at the 101: acquire the two reassembly slices, initialize both
+// Arm terminate mode at the 101: acquire reassembly and output slices, initialize both
 // per-direction inspectors (client->upstream masked, upstream->client unmasked), bound the
-// message cap to one slice, and seed the outbound mask PRNG with real entropy. Returns
+// message cap to one slice. Returns
 // false if the slice pool is exhausted (or the loop has no pool) — the caller closes.
 template <typename Loop>
 bool ws_arm_terminate(Loop* loop, Connection& conn) {
@@ -10760,17 +10759,13 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_c2u.from_client = true;  // this leg is the client→upstream direction
         conn.ws_c2u.max_message_size = cap;
         conn.ws_c2u.close_code = conn.ws_close_code;  // frame.close(code) status for this route
-        conn.ws_c2u.reject_fragmented = true;  // in-place re-frame: single-frame messages only
+        conn.ws_c2u.reject_fragmented = false;
         conn.ws_u2c.reset();
         conn.ws_u2c.masked = false;       // upstream->client is server-role on both ends → unmasked
         conn.ws_u2c.from_client = false;  // this leg is the upstream→client direction
         conn.ws_u2c.max_message_size = cap;
         conn.ws_u2c.close_code = conn.ws_close_code;
-        conn.ws_u2c.reject_fragmented = true;
-        u64 seed = 0;
-        // Fail closed on an RNG failure rather than emit predictable mask keys (§5.3).
-        if (RAND_bytes(reinterpret_cast<u8*>(&seed), sizeof(seed)) != 1) return false;
-        conn.ws_c2u.mask_rng = seed;  // only the masked direction emits fresh mask keys
+        conn.ws_u2c.reject_fragmented = false;
         conn.is_ws_terminate = true;
         return true;
     } else {
@@ -10910,16 +10905,14 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
     if (conn.ws_client_send_pending) return ws_pause_client_recv(loop, conn);
 #if RUT_ENABLE_WEBSOCKET
     if (conn.is_ws_terminate) {
-        // Terminate: parse/reassemble/inspect the client frames and re-frame the result
-        // IN PLACE over recv_buf (output is always <= consumed input). Send the produced
-        // prefix; the unconsumed (partial trailing) bytes are dropped via consume() in the
-        // sent callback once the send drains.
+        // Reassemble and inspect frames into a separate output slice. Keep the input
+        // until the send drains, then consume the parsed prefix and retain any tail.
         u32 consumed = 0, produced = 0;
         const WsInspectStatus st = ws_inspect(conn.ws_c2u,
                                               conn.recv_buf.data(),
                                               conn.recv_buf.len(),
-                                              const_cast<u8*>(conn.recv_buf.data()),
-                                              conn.recv_buf.len(),
+                                              conn.ws_c2u_out,
+                                              SlicePool::kSliceSize,
                                               conn.ws_c2u_msg,
                                               conn.ws_max_message_size,
                                               conn.ws_handler,
@@ -10939,7 +10932,7 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                 conn.ws_close_client_need = true;
                 conn.ws_echo_close_code = conn.ws_c2u.echo_close_code;
             }
-            if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), produced)) return false;
+            if (!loop->submit_send_upstream(conn, conn.ws_c2u_out, produced)) return false;
             conn.ws_client_send_pending = true;
             conn.ws_client_send_len = produced;
             if (conn.ws_closing)
@@ -10996,8 +10989,8 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
         const WsInspectStatus st = ws_inspect(conn.ws_u2c,
                                               conn.upstream_recv_buf.data(),
                                               conn.upstream_recv_buf.len(),
-                                              const_cast<u8*>(conn.upstream_recv_buf.data()),
-                                              conn.upstream_recv_buf.len(),
+                                              conn.ws_u2c_out,
+                                              SlicePool::kSliceSize,
                                               conn.ws_u2c_msg,
                                               conn.ws_max_message_size,
                                               conn.ws_handler,
@@ -11016,7 +11009,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
                 conn.ws_close_upstream_need = true;
                 conn.ws_echo_close_code = conn.ws_u2c.echo_close_code;
             }
-            if (!client_send(loop, conn, conn.upstream_recv_buf.data(), produced)) return false;
+            if (!client_send(loop, conn, conn.ws_u2c_out, produced)) return false;
             conn.ws_upstream_send_pending = true;
             conn.ws_upstream_send_len = produced;
             if (conn.ws_closing)

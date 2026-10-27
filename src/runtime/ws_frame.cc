@@ -12,18 +12,8 @@ ParseStatus ws_parse_header(const u8* buf, u32 len, bool require_mask, WsFrameHe
     if ((b0 & 0x70) != 0) return ParseStatus::Error;
 
     const u8 opcode_bits = b0 & 0x0F;
-    switch (opcode_bits) {
-        case 0x0:
-        case 0x1:
-        case 0x2:
-        case 0x8:
-        case 0x9:
-        case 0xA:
-            break;
-        default:
-            return ParseStatus::Error;  // reserved opcodes 0x3-0x7 and 0xB-0xF
-    }
     const WsOpcode opcode = static_cast<WsOpcode>(opcode_bits);
+    if (!ws_opcode_valid(opcode)) return ParseStatus::Error;
     const bool fin = (b0 & 0x80) != 0;
     const bool masked = (b1 & 0x80) != 0;
     const u8 len7 = b1 & 0x7F;
@@ -91,6 +81,7 @@ u32 ws_write_header(
     // put a protocol-invalid frame on the wire. Return 0 (never a valid header length —
     // the minimum is 2) to signal "rejected, nothing written". This mirrors the parser's
     // control-frame validation exactly (§5.5/§5.5.1) plus the 64-bit reserved bit (§5.2).
+    if (!ws_opcode_valid(op)) return 0;
     if (ws_opcode_is_control(op)) {
         if (!fin) return 0;                                // control frames are never fragmented
         if (payload_len > kWsMaxControlPayload) return 0;  // and never use extended length
@@ -130,7 +121,7 @@ WsMessageStatus ws_message_feed(WsMessageAssembler& m,
                                 WsOpcode* out_opcode,
                                 u64* out_total_len) {
     // Control frames are handled per-frame, never reassembled (§5.4).
-    if (ws_opcode_is_control(h.opcode)) return WsMessageStatus::Error;
+    if (!ws_opcode_valid(h.opcode) || ws_opcode_is_control(h.opcode)) return WsMessageStatus::Error;
 
     if (h.opcode == WsOpcode::Continuation) {
         // A continuation is only meaningful once a message has been started.
@@ -143,11 +134,11 @@ WsMessageStatus ws_message_feed(WsMessageAssembler& m,
         m.in_fragmented = true;
     }
 
-    // Enforce maxMessageSize before accumulating. Written as a subtraction so an
-    // attacker-controlled 64-bit payload_len can't wrap accumulated_len + payload_len
-    // past the cap. accumulated_len <= max_message_size holds by induction, so
-    // (max_message_size - accumulated_len) never underflows.
-    if (max_message_size != 0 && h.payload_len > max_message_size - m.accumulated_len) {
+    // Reject integer overflow even with an unbounded size, and enforce the configured
+    // cap without underflow if a caller supplies a smaller cap on a later fragment.
+    if (h.payload_len > ~u64{0} - m.accumulated_len ||
+        (max_message_size != 0 && (m.accumulated_len > max_message_size ||
+                                   h.payload_len > max_message_size - m.accumulated_len))) {
         m.reset();
         return WsMessageStatus::Error;
     }

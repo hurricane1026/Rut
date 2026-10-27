@@ -821,7 +821,9 @@ return forward(users, load_balance: .roundRobin, streaming: true)         // ⏳
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
-// WebSocket proxy
+// WebSocket proxy. The inspection sketch below is a target API; current terminate
+// handlers use `return websocket(chat) { frame in ... }` and forward/drop/close.
+// Reassembled messages are currently limited to approximately one 16 KB slice.
 guard req.upgrade == .websocket else { return 400 }
 return websocket(chat)                          // transparent
 websocket(chat, maxMessageSize: 64kb) { frame in    // per-frame inspection

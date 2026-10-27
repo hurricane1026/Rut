@@ -230,6 +230,18 @@ TEST(ws_frame_write, refuses_frames_the_parser_would_reject) {
     CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, true, false, key, 2), 2u);
 }
 
+TEST(ws_frame_write, rejects_reserved_and_out_of_range_opcodes_without_writing) {
+    const u8 key[4] = {0, 0, 0, 0};
+    for (u32 value = 0; value <= 255; ++value) {
+        const auto opcode = static_cast<WsOpcode>(value);
+        if (ws_opcode_valid(opcode)) continue;
+        u8 header[kWsMaxHeaderSize];
+        memset(header, 0xa5, sizeof(header));
+        CHECK_EQ(ws_write_header(header, opcode, true, false, key, 0), 0u);
+        for (u32 i = 0; i < sizeof(header); ++i) CHECK_EQ(header[i], 0xa5u);
+    }
+}
+
 // === Message reassembly (RFC 6455 §5.4) ===
 
 namespace {
@@ -261,6 +273,21 @@ TEST(ws_message, single_unfragmented_text) {
     CHECK(r.opcode == WsOpcode::Text);
     CHECK_EQ(r.total, 5u);
     CHECK(!m.in_fragmented);  // state reset after completion
+}
+
+TEST(ws_message, unbounded_fragment_lengths_cannot_overflow) {
+    WsMessageAssembler m;
+    CHECK(feed(m, WsOpcode::Binary, false, ~u64{0} - 1, 0).st == WsMessageStatus::NeedMore);
+    CHECK(feed(m, WsOpcode::Continuation, true, 2, 0).st == WsMessageStatus::Error);
+    CHECK(!m.in_fragmented);
+    CHECK(feed(m, static_cast<WsOpcode>(3), true, 0, 0).st == WsMessageStatus::Error);
+}
+
+TEST(ws_message, cap_reduced_between_fragments_cannot_underflow) {
+    WsMessageAssembler m;
+    CHECK(feed(m, WsOpcode::Binary, false, 5, 0).st == WsMessageStatus::NeedMore);
+    CHECK(feed(m, WsOpcode::Continuation, true, 1, 4).st == WsMessageStatus::Error);
+    CHECK(!m.in_fragmented);
 }
 
 TEST(ws_message, single_unfragmented_binary) {
