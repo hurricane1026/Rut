@@ -15,12 +15,17 @@
 using namespace rut;
 static bool tracking = false;
 static u32 allocations = 0;
+static i64 allocation_budget = -1;
 static void* counted_malloc(size_t n, const char*, int) {
     if (tracking) ++allocations;
+    if (allocation_budget == 0) return nullptr;
+    if (allocation_budget > 0) --allocation_budget;
     return malloc(n);
 }
 static void* counted_realloc(void* p, size_t n, const char*, int) {
     if (tracking) ++allocations;
+    if (allocation_budget == 0) return nullptr;
+    if (allocation_budget > 0) --allocation_budget;
     return realloc(p, n);
 }
 static void counted_free(void* p, const char*, int) {
@@ -363,4 +368,458 @@ TEST(jwt_rs256, validates_signed_claims_before_publication) {
 int main(int argc, char** argv) {
     if (!CRYPTO_set_mem_functions(counted_malloc, counted_realloc, counted_free)) return 2;
     return rut::test::run_all(argc, argv);
+}
+
+struct SelectedSigningKey {
+    RSA* rsa = nullptr;
+    ~SelectedSigningKey() { RSA_free(rsa); }
+    bool init(int bits) {
+        BIGNUM* exponent = BN_new();
+        rsa = RSA_new();
+        const bool ok = exponent && rsa && BN_set_word(exponent, 65537) &&
+                        RSA_generate_key_ex(rsa, bits, exponent, nullptr);
+        BN_free(exponent);
+        return ok;
+    }
+    bool append_jwk(json::Writer& out, Str kid) const {
+        const BIGNUM* modulus = nullptr;
+        RSA_get0_key(rsa, &modulus, nullptr, nullptr);
+        const int size = BN_num_bytes(modulus);
+        if (size <= 0 || size > 512) return false;
+        unsigned char bytes[512];
+        if (BN_bn2bin(modulus, bytes) != size) return false;
+        char encoded[684];
+        const u32 length =
+            encode({reinterpret_cast<const char*>(bytes), static_cast<u32>(size)}, encoded);
+        out.text(lit_str("{\"kid\":"));
+        if (!json::quote(kid, out)) return false;
+        out.text(lit_str(R"(,"kty":"RSA","alg":"RS256","e":"AQAB","n":")"));
+        out.text({encoded, length});
+        out.text(lit_str("\"}"));
+        return out.ok;
+    }
+};
+static constexpr Str kSelectedClaims =
+    lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"scope":"read write"})");
+struct SelectedKeyFixture {
+    SelectedSigningKey current;
+    SelectedSigningKey previous;
+    Rs256KeySet owners;
+    Rs256VerifierSet verifiers;
+    char configuration[4096];
+    Str configuration_view{};
+    char first_token[2048];
+    char second_token[2048];
+    Str first{};
+    Str second{};
+    bool init() {
+        if (!current.init(2048) || !previous.init(3072)) return false;
+        json::Writer out{configuration, sizeof(configuration)};
+        out.text(lit_str("{\"keys\":["));
+        if (!current.append_jwk(out, lit_str("current"))) return false;
+        out.put(',');
+        if (!previous.append_jwk(out, lit_str("previous"))) return false;
+        out.put(',');
+        if (!current.append_jwk(out, lit_str("not-approved"))) return false;
+        out.text(lit_str(",{\"kid\":\"ignored\",\"kty\":\"EC\"}]}"));
+        if (!out.ok) return false;
+        configuration_view = {configuration, out.len};
+        const Str approved[] = {lit_str("current"), lit_str("previous")};
+        if (!owners.load(configuration_view, approved, 2) || !verifiers.init(owners)) return false;
+        owners.reset();
+        first = token_for(current.rsa,
+                          lit_str(R"({"alg":"RS256","kid":"current"})"),
+                          kSelectedClaims,
+                          first_token);
+        second = token_for(previous.rsa,
+                           lit_str(R"({"kid":"previous","alg":"RS256"})"),
+                           kSelectedClaims,
+                           second_token);
+        return first.len != 0 && second.len != 0;
+    }
+};
+
+TEST(jwt_rs256, approved_kid_selection_verifies_both_keys_without_request_allocations) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    json::Document document;
+    char payload[8192];
+    u32 length = 0;
+    Str verified_kid;
+    allocations = 0;
+    tracking = true;
+    bool first = jwt_rs256_validate_set(fixture.verifiers,
+                                        document,
+                                        fixture.first,
+                                        lit_str("issuer"),
+                                        lit_str("gateway"),
+                                        100,
+                                        payload,
+                                        sizeof(payload),
+                                        length,
+                                        verified_kid);
+    tracking = false;
+    REQUIRE(first);
+    CHECK(verified_kid.eq(lit_str("current")));
+    CHECK(verified_kid.ptr == fixture.verifiers.select(lit_str("current")).kid.ptr);
+    CHECK(document.valid);
+    CHECK(document.source.ptr == payload);
+    CHECK(jwt_has_scope(document, {payload, length}, lit_str("read")));
+    tracking = true;
+    bool second = jwt_rs256_validate_set(fixture.verifiers,
+                                         document,
+                                         fixture.second,
+                                         lit_str("issuer"),
+                                         lit_str("gateway"),
+                                         100,
+                                         payload,
+                                         sizeof(payload),
+                                         length,
+                                         verified_kid);
+    tracking = false;
+    REQUIRE(second);
+    CHECK(verified_kid.eq(lit_str("previous")));
+    CHECK_EQ(allocations, 0u);
+    // Policy-bearing output must not borrow token/header storage.
+    for (char& byte : fixture.second_token) byte = 0;
+    CHECK(verified_kid.eq(lit_str("previous")));
+    CHECK(document.valid);
+}
+
+TEST(jwt_rs256, kid_profiles_never_fallback_or_publish_unverified_identity) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    json::Document document;
+    char payload[8192];
+    char token[4096];
+    u32 length = 0;
+    Str verified_kid;
+    const char* rejected[] = {
+        R"({"alg":"RS256"})",
+        R"({"alg":"RS256","kid":""})",
+        R"({"alg":"RS256","kid":"unknown"})",
+        R"({"alg":"RS256","kid":"not-approved"})",
+        R"({"alg":"RS256","kid":"Current"})",
+        R"({"alg":"RS256","kid":"cur"})",
+        R"({"alg":"RS256","kid":"previous"})",  // signed with current, never try other keys
+        R"({"alg":"RS256","kid":"current\u0000tail"})",
+        R"({"alg":"RS256","kid":null})",
+        R"({"alg":"RS256","kid":123})",
+        R"({"alg":"RS256","kid":[]})",
+        R"({"alg":"RS256","Kid":"current"})",
+        R"({"alg":"RS256","kid":"current","k\u0069d":"previous"})",
+        R"({"alg":"RS256","kid":"current","crit":[]})",
+        R"({"alg":"RS256","kid":"current","b64":true})",
+        R"({"alg":"HS256","kid":"current"})",
+        R"({"alg":"none","kid":"current"})",
+        R"({"alg":"PS256","kid":"current"})",
+        R"({"kid":"current"})",
+        R"([])",
+    };
+    allocations = 0;
+    for (const char* header : rejected) {
+        const Str signed_token = token_for(fixture.current.rsa,
+                                           {header, static_cast<u32>(__builtin_strlen(header))},
+                                           kSelectedClaims,
+                                           token);
+        REQUIRE(signed_token.len > 0);
+        REQUIRE(jwt_rs256_validate_set(fixture.verifiers,
+                                       document,
+                                       fixture.first,
+                                       lit_str("issuer"),
+                                       lit_str("gateway"),
+                                       100,
+                                       payload,
+                                       sizeof(payload),
+                                       length,
+                                       verified_kid));
+        tracking = true;
+        const bool accepted = jwt_rs256_validate_set(fixture.verifiers,
+                                                     document,
+                                                     signed_token,
+                                                     lit_str("issuer"),
+                                                     lit_str("gateway"),
+                                                     100,
+                                                     payload,
+                                                     sizeof(payload),
+                                                     length,
+                                                     verified_kid);
+        tracking = false;
+        CHECK(!accepted);
+        CHECK_EQ(length, 0u);
+        CHECK(!document.valid);
+        CHECK_EQ(document.count, 0u);
+        CHECK(document.source.ptr == nullptr);
+        CHECK(verified_kid.ptr == nullptr);
+        CHECK_EQ(verified_kid.len, 0u);
+    }
+    CHECK_EQ(allocations, 0u);
+    const Str escaped = token_for(
+        fixture.current.rsa,
+        lit_str(
+            R"({"alg":"RS256","kid":"cu\u0072rent","jku":"https://attacker.invalid/keys","jwk":{"kty":"RSA","n":"bogus"}})"),
+        kSelectedClaims,
+        token);
+    REQUIRE(jwt_rs256_validate_set(fixture.verifiers,
+                                   document,
+                                   escaped,
+                                   lit_str("issuer"),
+                                   lit_str("gateway"),
+                                   100,
+                                   payload,
+                                   sizeof(payload),
+                                   length,
+                                   verified_kid));
+    CHECK(verified_kid.eq(lit_str("current")));
+}
+
+TEST(jwt_rs256, selected_key_claim_failures_invalidate_all_publication_and_revocation_is_explicit) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    json::Document document;
+    char payload[8192];
+    char token[4096];
+    u32 length = 0;
+    Str verified_kid;
+    const char* rejected_claims[] = {
+        R"({"sub":"alice","iss":"other","aud":"gateway","exp":200})",
+        R"({"sub":"alice","iss":"issuer","aud":"other","exp":200})",
+        R"({"sub":"","iss":"issuer","aud":"gateway","exp":200})",
+        R"({"iss":"issuer","aud":"gateway","exp":200})",
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":100})",
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"nbf":101})",
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"iat":101})",
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200.0})",
+        R"({"sub":"alice","iss":"issuer","aud":"gateway"})",
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"exp":300})",
+    };
+    for (const char* claims : rejected_claims) {
+        const Str signed_token = token_for(fixture.current.rsa,
+                                           lit_str(R"({"alg":"RS256","kid":"current"})"),
+                                           {claims, static_cast<u32>(__builtin_strlen(claims))},
+                                           token);
+        REQUIRE(jwt_rs256_validate_set(fixture.verifiers,
+                                       document,
+                                       fixture.first,
+                                       lit_str("issuer"),
+                                       lit_str("gateway"),
+                                       100,
+                                       payload,
+                                       sizeof(payload),
+                                       length,
+                                       verified_kid));
+        tracking = true;
+        const bool accepted = jwt_rs256_validate_set(fixture.verifiers,
+                                                     document,
+                                                     signed_token,
+                                                     lit_str("issuer"),
+                                                     lit_str("gateway"),
+                                                     100,
+                                                     payload,
+                                                     sizeof(payload),
+                                                     length,
+                                                     verified_kid);
+        tracking = false;
+        CHECK(!accepted);
+        CHECK_EQ(length, 0u);
+        CHECK(!document.valid);
+        CHECK(verified_kid.ptr == nullptr);
+    }
+    // Retiring a key in a new generation does not silently mutate in-flight readers.
+    Rs256KeySet replacement;
+    const Str approved[] = {lit_str("previous")};
+    REQUIRE(replacement.load(fixture.configuration_view, approved, 1));
+    Rs256VerifierSet active;
+    REQUIRE(active.init(replacement));
+    replacement.reset();
+    REQUIRE(jwt_rs256_validate_set(active,
+                                   document,
+                                   fixture.second,
+                                   lit_str("issuer"),
+                                   lit_str("gateway"),
+                                   100,
+                                   payload,
+                                   sizeof(payload),
+                                   length,
+                                   verified_kid));
+    const Str missing_id =
+        token_for(fixture.previous.rsa, lit_str(R"({"alg":"RS256"})"), kSelectedClaims, token);
+    CHECK(!jwt_rs256_validate_set(active,
+                                  document,
+                                  missing_id,
+                                  lit_str("issuer"),
+                                  lit_str("gateway"),
+                                  100,
+                                  payload,
+                                  sizeof(payload),
+                                  length,
+                                  verified_kid));
+    CHECK(verified_kid.ptr == nullptr);
+    CHECK(!jwt_rs256_validate_set(active,
+                                  document,
+                                  fixture.first,
+                                  lit_str("issuer"),
+                                  lit_str("gateway"),
+                                  100,
+                                  payload,
+                                  sizeof(payload),
+                                  length,
+                                  verified_kid));
+    CHECK(!document.valid);
+    CHECK_EQ(length, 0u);
+    CHECK(verified_kid.ptr == nullptr);
+    CHECK(jwt_rs256_validate_set(fixture.verifiers,
+                                 document,
+                                 fixture.first,
+                                 lit_str("issuer"),
+                                 lit_str("gateway"),
+                                 100,
+                                 payload,
+                                 sizeof(payload),
+                                 length,
+                                 verified_kid));
+    fixture.verifiers.reset();
+    CHECK(!jwt_rs256_validate_set(fixture.verifiers,
+                                  document,
+                                  fixture.first,
+                                  lit_str("issuer"),
+                                  lit_str("gateway"),
+                                  100,
+                                  payload,
+                                  sizeof(payload),
+                                  length,
+                                  verified_kid));
+    CHECK(!document.valid);
+    CHECK_EQ(length, 0u);
+    CHECK(verified_kid.ptr == nullptr);
+}
+
+TEST(jwt_rs256, selected_key_id_bounds_decoding_and_output_arguments) {
+    SelectedSigningKey signing;
+    REQUIRE(signing.init(2048));
+    const char embedded[] = "id\0tail";
+    char long_id[129];
+    for (char& byte : long_id) byte = 'a';
+    const Str ids[] = {{long_id, 128}, {embedded, sizeof(embedded) - 1}};
+    for (Str kid : ids) {
+        char configuration[2048];
+        json::Writer out{configuration, sizeof(configuration)};
+        out.text(lit_str("{\"keys\":["));
+        REQUIRE(signing.append_jwk(out, kid));
+        out.text(lit_str("]}"));
+        Rs256KeySet owners;
+        REQUIRE(owners.load({configuration, out.len}, &kid, 1));
+        Rs256VerifierSet verifiers;
+        REQUIRE(verifiers.init(owners));
+        owners.reset();
+        char header[1024];
+        json::Writer encoded{header, sizeof(header)};
+        encoded.text(lit_str("{\"alg\":\"RS256\",\"kid\":"));
+        REQUIRE(json::quote(kid, encoded));
+        encoded.put('}');
+        char token[2048];
+        const Str signed_token =
+            token_for(signing.rsa, {header, encoded.len}, kSelectedClaims, token);
+        json::Document document;
+        char payload[8192];
+        u32 length = 0;
+        Str verified_kid;
+        REQUIRE(jwt_rs256_validate_set(verifiers,
+                                       document,
+                                       signed_token,
+                                       lit_str("issuer"),
+                                       lit_str("gateway"),
+                                       100,
+                                       payload,
+                                       sizeof(payload),
+                                       length,
+                                       verified_kid));
+        CHECK(verified_kid.eq(kid));
+        CHECK(verified_kid.ptr == verifiers.select(kid).kid.ptr);
+        struct InvalidArgs {
+            Str issuer;
+            Str audience;
+            i64 time;
+            char* output;
+            u32 capacity;
+        };
+        const InvalidArgs invalid[] = {
+            {lit_str(""), lit_str("gateway"), 100, payload, sizeof(payload)},
+            {lit_str("issuer"), lit_str(""), 100, payload, sizeof(payload)},
+            {lit_str("issuer"), lit_str("gateway"), 0, payload, sizeof(payload)},
+            {lit_str("issuer"), lit_str("gateway"), 100, nullptr, sizeof(payload)},
+            {lit_str("issuer"), lit_str("gateway"), 100, payload, 1},
+        };
+        for (const auto& arg : invalid) {
+            REQUIRE(document.parse(lit_str("{}")));
+            verified_kid = kid;
+            length = 999;
+            CHECK(!jwt_rs256_validate_set(verifiers,
+                                          document,
+                                          signed_token,
+                                          arg.issuer,
+                                          arg.audience,
+                                          arg.time,
+                                          arg.output,
+                                          arg.capacity,
+                                          length,
+                                          verified_kid));
+            CHECK(!document.valid);
+            CHECK_EQ(length, 0u);
+            CHECK(verified_kid.ptr == nullptr);
+        }
+        if (kid.len == 128) {
+            json::Writer too_long{header, sizeof(header)};
+            too_long.text(lit_str("{\"alg\":\"RS256\",\"kid\":"));
+            REQUIRE(json::quote({long_id, 129}, too_long));
+            too_long.put('}');
+            const Str rejected =
+                token_for(signing.rsa, {header, too_long.len}, kSelectedClaims, token);
+            CHECK(!jwt_rs256_validate_set(verifiers,
+                                          document,
+                                          rejected,
+                                          lit_str("issuer"),
+                                          lit_str("gateway"),
+                                          100,
+                                          payload,
+                                          sizeof(payload),
+                                          length,
+                                          verified_kid));
+            CHECK(!document.valid);
+            CHECK_EQ(length, 0u);
+            CHECK(verified_kid.ptr == nullptr);
+        }
+    }
+}
+
+TEST(jwt_rs256, shard_set_activation_crypto_allocation_failures_rollback_and_retry) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    const Str approved[] = {lit_str("current"), lit_str("previous")};
+    Rs256KeySet owners;
+    REQUIRE(owners.load(fixture.configuration_view, approved, 2));
+    bool failed = false;
+    bool succeeded = false;
+    for (i64 budget = 0; budget < 256; ++budget) {
+        Rs256VerifierSet probe;
+        allocation_budget = budget;
+        const bool initialized = probe.init(owners);
+        allocation_budget = -1;
+        if (initialized) {
+            CHECK(probe.valid());
+            CHECK_EQ(probe.size(), 2u);
+            succeeded = true;
+            break;
+        }
+        failed = true;
+        CHECK(!probe.valid());
+        CHECK_EQ(probe.size(), 0u);
+        CHECK(!probe.select(approved[0]).verifier);
+        CHECK(!probe.select(approved[1]).verifier);
+        REQUIRE(probe.init(owners));
+        CHECK(probe.select(approved[0]).verifier != nullptr);
+        CHECK(probe.select(approved[1]).verifier != nullptr);
+    }
+    CHECK(failed);
+    CHECK(succeeded);
 }
