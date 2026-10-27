@@ -4585,7 +4585,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (receiver_override == nullptr &&
         magic_req_receiver(*expr.lhs, mod, locals, local_count, binding) &&
         (expr.name.eq({"header", 6}) || expr.name.eq({"uniqueHeader", 12}) ||
-         expr.name.eq({"param", 5}) || expr.name.eq({"cookie", 6}) || expr.name.eq({"query", 5}))) {
+         expr.name.eq({"headerCount", 11}) || expr.name.eq({"param", 5}) ||
+         expr.name.eq({"cookie", 6}) || expr.name.eq({"query", 5}))) {
         if (expr.args.len != 1 || expr.args[0] == nullptr ||
             expr.args[0]->kind != AstExprKind::StrLit) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
@@ -4603,13 +4604,18 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             out.kind = HirExprKind::ReqQuery;
             out.may_nil = true;
         } else {
-            if (expr.name.eq({"uniqueHeader", 12})) {
+            if (expr.name.eq({"uniqueHeader", 12}) || expr.name.eq({"headerCount", 11})) {
                 if (out.str_value.len == 0)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
                 for (u32 i = 0; i < out.str_value.len; ++i)
                     if (!is_http_tchar(static_cast<u8>(out.str_value.ptr[i])))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, expr.span, expr.name);
+                if (expr.name.eq({"headerCount", 11})) {
+                    out.kind = HirExprKind::ReqHeaderCount;
+                    out.type = HirTypeKind::I32;
+                    return out;
+                }
                 out.kind = HirExprKind::ReqUniqueHeader;
             } else {
                 out.kind = HirExprKind::ReqHeader;
@@ -15589,6 +15595,7 @@ static bool hir_expr_uses_request(const HirExpr& e) {
     switch (e.kind) {
         case HirExprKind::HashDigest:
         case HirExprKind::Uuid:
+        case HirExprKind::ReqHeaderCount:
         case HirExprKind::ReqUniqueHeader:
         case HirExprKind::ReqHeader:
         case HirExprKind::ReqParam:

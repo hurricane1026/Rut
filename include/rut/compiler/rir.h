@@ -152,6 +152,7 @@ enum class Opcode : u8 {
     ConstStatus,    // %r = const.status <code>       (printed as raw i32)
 
     // ── Request access ──
+    ReqHeaderCount,  // original case-insensitive field count; -1 on parse failure
     ReqUniqueHeader,
     ReqHeader,            // %r = req.header "Name"        → Optional(str)
     ReqParam,             // %r = req.param "id"           → str

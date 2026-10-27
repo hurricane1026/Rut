@@ -41154,3 +41154,33 @@ route GET "/" { let value = standardWebhookValid("user") guard value == "user" e
     REQUIRE(ast);
     CHECK(analyze_file_heap(ast.value()));
 }
+
+TEST(frontend, header_count_requires_literal_token_name_and_request_context) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { let n = req.headerCount("") return 200 })rut",
+        R"rut(route GET "/" { let n = req.headerCount("Bad Name") return 200 })rut",
+        R"rut(route GET "/" { let n = req.headerCount("Bad:Name") return 200 })rut",
+        R"rut(route GET "/" { let n = req.headerCount("X\r\nBad") return 200 })rut",
+        R"rut(route GET "/" { let name = "Authorization" let n = req.headerCount(name) return 200 })rut",
+        R"rut(route GET "/" { let n = req.headerCount() return 200 })rut",
+        R"rut(route GET "/" { let n = req.headerCount("X", "Y") return 200 })rut",
+        R"rut(route GET "/" { if req.headerCount("X") { return 200 } else { return 401 } })rut",
+        R"rut(timer t, every: 1s { let n = req.headerCount("Authorization") })rut",
+        R"rut(func count() -> i32 { req.headerCount("Authorization") }
+               timer t, every: 1s { let n = count() })rut",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    const char* source = R"rut(func count() -> i32 { req.headerCount("Authorization") }
+        route GET "/" { if count() == 0 { return 204 } else { return 401 } })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}

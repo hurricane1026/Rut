@@ -143,6 +143,7 @@ enum class HirExprKind : u8 {
     Call,
     StructInit,
     Field,
+    ReqHeaderCount,  // original case-insensitive field count; -1 on parse failure
     ReqUniqueHeader,
     ReqHeader,
     // `req.set("Name", value)` statement effect. `str_value` is the validated

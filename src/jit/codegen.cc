@@ -91,6 +91,7 @@ struct Ctx {
     LLVMValueRef fn_req_method;
     LLVMValueRef fn_req_unique_header;
     LLVMValueRef fn_req_header;
+    LLVMValueRef fn_req_header_count;
     LLVMValueRef fn_req_cookie;
     LLVMValueRef fn_req_query;
     LLVMValueRef fn_req_query_string;
@@ -312,6 +313,15 @@ struct Ctx {
             fn_req_header = LLVMAddFunction(llvm_mod, "rut_helper_req_header", ft);
         }
         return fn_req_header;
+    }
+
+    LLVMValueRef get_req_header_count() {
+        if (!fn_req_header_count) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, params, 4, 0);
+            fn_req_header_count = LLVMAddFunction(llvm_mod, "rut_helper_req_header_count", ft);
+        }
+        return fn_req_header_count;
     }
 
     // void rut_helper_req_unique_header(ptr, i32, ptr, i32, ptr, ptr, ptr)
@@ -1085,6 +1095,18 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef slot_i64 = LLVMBuildLoad2(c.builder, c.i64_ty, selected_ptr, "ctx.slot64");
             LLVMValueRef v = LLVMBuildTrunc(c.builder, slot_i64, c.i32_ty, "ctx.slot.value");
             c.set_value(inst.result, v);
+            break;
+        }
+        case rir::Opcode::ReqHeaderCount: {
+            LLVMValueRef name = c.make_global_str(inst.imm.str_val, "hdr.count.name");
+            LLVMValueRef args[] = {c.param_req_data,
+                                   c.param_req_len,
+                                   name,
+                                   LLVMConstInt(c.i32_ty, inst.imm.str_val.len, 0)};
+            LLVMValueRef fn = c.get_req_header_count();
+            c.set_value(
+                inst.result,
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 4, "header.count"));
             break;
         }
         case rir::Opcode::ReqUniqueHeader:
@@ -2396,6 +2418,7 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
         if (!blk.insts) continue;
         for (u32 ii = 0; ii < blk.inst_count; ii++) {
             switch (blk.insts[ii].op) {
+                case rir::Opcode::ReqHeaderCount:
                 case rir::Opcode::ReqUniqueHeader:
                 case rir::Opcode::ReqHeader:
                 case rir::Opcode::ReqQuery:
@@ -2628,6 +2651,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_method = nullptr;
     c.fn_req_unique_header = nullptr;
     c.fn_req_header = nullptr;
+    c.fn_req_header_count = nullptr;
     c.fn_req_cookie = nullptr;
     c.fn_req_query = nullptr;
     c.fn_req_query_string = nullptr;

@@ -8088,6 +8088,27 @@ owned by the compiled program; generation performs no per-request allocation.
 Use existing `wait` for application delay. Timed response fragments are not
 provided by this builder.
 
+### Original request field cardinality
+
+`req.headerCount("Name") -> i32` counts all case-insensitive occurrences in
+that original request. Its nonempty literal name must contain only HTTP token
+bytes. A missing field returns 0; a single empty field still returns 1;
+duplicates return 2 or more, including identical values. Invalid/incomplete
+request parsing returns -1, never 0. Test `== 0` to prove absence, not `<= 0`.
+The existing parser's 64-field bound is unchanged; overflowing it fails parsing
+rather than hiding an extra credential. The native helper also rejects invalid
+field names with -1. This count is not credential validation: combine count 1
+with the corresponding singleton read and verifier. Counts observe original
+headers even after set/add/remove mutations and work in ordinary helpers;
+timer/request-free contexts reject the operation. No keyword or dependency is
+added, and the synchronous bounded scan allocates no memory and retains no views.
+
+The count has a dedicated I32 HIR/MIR/RIR operation and native helper symbol.
+JIT functions using it prime and unprime the existing request parse cache, so
+one invocation shares a parse while later requests cannot reuse stale counts.
+The operation supplies the presence evidence needed for absence-only anonymous
+policy; a nil singleton field by itself cannot distinguish absence from duplicates.
+
 ### Static authentication helper layer
 
 `examples/middleware/auth.rut` provides API key, custom-header key, Basic and
