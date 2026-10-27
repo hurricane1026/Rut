@@ -37783,17 +37783,21 @@ TEST(legacy_loop, lazy_aux_buffers_handle_exhaustion_atomically) {
     c = loop->alloc_conn();
     REQUIRE(c != nullptr);
 
-    // Freeze growth at the currently committed size, then leave one slice.
-    // The four-slice WebSocket allocation must roll partial allocations back.
+    // The four-slice WebSocket allocation must roll back at every partial acquisition.
     const u32 original_max = loop->pool.max_count;
     loop->pool.max_count = loop->pool.count;
     std::vector<u8*> held;
-    while (loop->pool.available() > 1) held.push_back(loop->pool.alloc());
-    REQUIRE_EQ(loop->pool.available(), 1u);
-    CHECK(!loop->alloc_ws_terminate_bufs(*c));
-    CHECK_EQ(c->ws_c2u_msg, nullptr);
-    CHECK_EQ(c->ws_u2c_msg, nullptr);
-    CHECK_EQ(loop->pool.available(), 1u);
+    while (loop->pool.available() > 3) held.push_back(loop->pool.alloc());
+    for (u32 remaining = 3; remaining > 0; --remaining) {
+        REQUIRE_EQ(loop->pool.available(), remaining);
+        CHECK(!loop->alloc_ws_terminate_bufs(*c));
+        CHECK_EQ(c->ws_c2u_msg, nullptr);
+        CHECK_EQ(c->ws_u2c_msg, nullptr);
+        CHECK_EQ(c->ws_c2u_out, nullptr);
+        CHECK_EQ(c->ws_u2c_out, nullptr);
+        CHECK_EQ(loop->pool.available(), remaining);
+        if (remaining > 1) held.push_back(loop->pool.alloc());
+    }
 
     u8* last = loop->pool.alloc();
     REQUIRE(last != nullptr);

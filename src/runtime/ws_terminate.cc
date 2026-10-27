@@ -198,15 +198,9 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 return WsInspectStatus::Error;
             }
         } else if (action == WsFrameAction::Close) {
-            // Handler-initiated close. Carry the route's frame.close(code) status as a 2-byte
-            // body to the forward peer WHEN IT FITS the in-place out buffer. That buffer is
-            // bounded by the consumed input (the tunnel passes out_cap = the bytes received),
-            // and a coded Close can be larger than a tiny data frame — e.g. a 0/1-byte message
-            // whose whole frame is smaller than header+2 — so when there's no room, fall back
-            // to a no-status Close, which always fits (it has the same header as the data frame
-            // it replaces, with no body). The echo leg uses a dedicated buffer, so it carries
-            // the code regardless; only this in-place forward leg can degrade, and only for
-            // those tiny messages.
+            // Include the configured code when it fits. Standalone callers may provide a
+            // smaller output buffer than the tunnel's dedicated slice, so retain the
+            // no-status fallback for them.
             const u8 cc[2] = {static_cast<u8>(st.close_code >> 8), static_cast<u8>(st.close_code)};
             const u32 hdr = 2u + (st.masked ? 4u : 0u);  // base header + optional mask key
             const u64 body = (*produced + hdr + 2u <= out_cap) ? 2u : 0u;

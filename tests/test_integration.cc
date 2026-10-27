@@ -19962,6 +19962,20 @@ TEST(websocket_e2e, terminate_iouring) {
     CHECK(recv_text(pl, &pn));
     CHECK(pn == 5 && memcmp(pl, "WORLD", 5) == 0);
 
+    // The first fragment produces no output; a later recv must reassemble and forward it.
+    u8 fragment[32];
+    u32 hl = ws_write_header(fragment, WsOpcode::Text, false, true, kKey, 3);
+    memcpy(fragment + hl, "SPL", 3);
+    ws_unmask(fragment + hl, 3, kKey);
+    REQUIRE(send_all(c, reinterpret_cast<char*>(fragment), hl + 3));
+    usleep(50000);
+    hl = ws_write_header(fragment, WsOpcode::Continuation, true, true, kKey, 2);
+    memcpy(fragment + hl, "IT", 2);
+    ws_unmask(fragment + hl, 2, kKey);
+    REQUIRE(send_all(c, reinterpret_cast<char*>(fragment), hl + 2));
+    CHECK(recv_text(pl, &pn));
+    CHECK(pn == 5 && memcmp(pl, "SPLIT", 5) == 0);
+
     close(c);
     backend.teardown();
     shard.stop();
