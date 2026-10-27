@@ -8571,3 +8571,19 @@ network call, dependency or replay cache is introduced. Callers reject duplicate
 HTTP fields, provide endpoint-specific strong keys, and durably deduplicate
 verified IDs before side effects. See [auth coverage](docs/auth-coverage.md) for
 wire-profile bounds, fixtures and remaining acceptance work.
+
+### Dynamic request header replacement
+
+`req.set` retains a literal safe name but accepts an unwrapped runtime string
+value. The JIT/AOT backend copies nonconstant values and names to bounded request
+arena storage before recording replacement; literal values retain their existing
+constant-memory path. Invalid bytes, allocation failure and bound overflow fail
+forwarding closed. Limits are 16 operations and 8192 owned bytes per request.
+`req.add` remains literal-only. Existing statement ordering remains in force:
+selected match-arm mutations may follow authentication guards, whereas ordinary
+top-level mutations after a guard or wait remain rejected. The proxy's shared
+header rewrite deduplicates spoofed fields for HTTP/1 and HTTP/2 forwarding.
+
+A selected match arm supports up to four ordered header/cache effects, enough
+to strip two credential fields and replace two verified identity fields. A fifth
+effect is rejected during compilation.

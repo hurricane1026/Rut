@@ -496,7 +496,7 @@ struct ConnectionBase {
     // aligned request-header override array, so it does not grow Connection.
     u16 req_header_owned_bytes;
     // forward(set_header:) request mutation: rut_helper_req_set_header records
-    // (name, value) overrides (views into stable JIT constant memory);
+    // (name, value) overrides (stable constants or request-arena copies);
     // on_upstream_connected injects/replaces those header lines in recv_buf before
     // forwarding. Bounded; reset per request. No default member initializers, so
     // the struct stays trivially constructible for the SlabPool.

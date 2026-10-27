@@ -237,7 +237,7 @@ req.authorization (str?)   req.host  req.userAgent  req.origin (str?)
 // Raw headers — function access ONLY (never req.X-Foo property syntax)
 req.header("X-Request-ID")   // str?
 req.uniqueHeader("X-API-Key") // str?; missing or duplicate fields yield nil
-req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only
+req.set("X-User-ID", identity.consumerId) // ✅ runtime str; replace/dedupe, statement-only
 req.add("X-Tag", "a")        // ✅ preserve existing fields and append
 req.remove("Authorization")  // ✅ delete every matching field before forwarding
 req.getAll("Accept")         // ⏳ [str]
@@ -1603,3 +1603,27 @@ alone. Token-list empty inputs are valid, and `*` is an ordinary token. Both
 validate complete lists, fail closed at their bounds and retain no views or
 mutable state. `uniqueHeader(...).or("")` alone cannot distinguish absence from
 duplicates when empty is allowed; the policy module checks uniqueness explicitly.
+
+## Verified identity forwarding
+
+`req.set("literal-name", value)` accepts an unwrapped runtime `str`. Header names
+remain safe literals and reserved framing headers are rejected. Literal values
+are checked during compilation; runtime values are checked and copied into the
+request arena before forwarding. CR/LF/control bytes, storage exhaustion and
+bounds failures prevent forwarding. The limit is 8192 copied bytes (names plus
+values) and 16 total header operations per request. `req.add` still requires a
+literal value. Optional/error-capable values must be explicitly handled first.
+
+Top-level request mutations still belong to the leading statement prefix. To
+forward an authenticated identity, use a selected `match` arm after the auth
+helper, as in `examples/verified-identity-proxy.rut`. This executes mutations only
+after authentication succeeds; ordinary top-level writes after guards remain
+rejected. Set replaces every case-insensitive occurrence, eliminating spoofed
+duplicates. Authentication reads the original request. Strip credential fields
+with `req.remove`, and configure upstreams to trust only the explicit identity
+header names and traffic from the gateway. This is not identity signing or
+cross-service trust establishment.
+
+A selected match arm supports up to four ordered header/cache effects, enough
+to strip two credential fields and replace two verified identity fields. A fifth
+effect is rejected during compilation.

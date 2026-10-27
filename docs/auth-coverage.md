@@ -14,7 +14,7 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping | Dynamic Consumer registry/credential lifecycle, query/body credential hiding and verified identity forwarding |
+| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping | Dynamic Consumer registry/credential lifecycle, query/body credential hiding and upstream trust lifecycle |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection | Dynamic Consumer registry, anonymous only for absent credentials, no invalid-credential downgrade |
 | JWT verification | HS256/384/512 policy helpers; native fixed-key RS256 decoder and trusted configured JWK Set selection | Rut/JIT asymmetric key wiring, ES keys, request-key selection, JWKS rotation/cache, revocation and unknown-key policy |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks HTTP/Rut wiring and replay persistence |
@@ -40,7 +40,8 @@ The 2026-10-27 audit separates these layers:
 - Header stripping is implemented: `req.remove` removes every case-insensitive
   occurrence before forwarding while auth reads the original request. See
   `examples/auth-proxy.rut` and the language card's credential-stripping section.
-  Dynamic verified-identity forwarding is still separate work.
+  `req.set` can now forward verified runtime identity strings from a selected
+  match arm; see `examples/verified-identity-proxy.rut`.
 - `apiKeyOrBasic` supports one Consumer. `multiAuth` now checks four configured
   slots (Bearer/Basic for each of two Consumers), rejects ambiguous ownership,
   and returns metadata from the matched configuration. This is a static bounded
@@ -374,3 +375,15 @@ This is storage groundwork, not a new Rut mutation surface or a complete
 verified-identity forwarding policy. The language integration must still enforce
 literal header names, unwrapped runtime values, replacement of spoofed headers,
 credential stripping and correct ordering after authentication.
+
+## Verified identity forwarding through request replacement
+
+`examples/verified-identity-proxy.rut` authenticates a configured Consumer before
+entering a selected match arm. The arm removes Authorization and X-API-Key and
+replaces every case-insensitive X-Consumer-ID/X-Credential-ID occurrence from
+verified identity fields. Rejected credentials cause no mutation or upstream
+forward. Values are request-owned and validated before wire serialization, so
+source-buffer rewrites cannot change the recorded identity. Upstreams must trust
+only these configured fields and accept traffic only from the gateway; arbitrary
+client identity headers are not made authoritative. Query/body credential hiding
+and cryptographically signed cross-service identities remain separate work.
