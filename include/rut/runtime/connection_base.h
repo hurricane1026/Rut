@@ -492,6 +492,9 @@ struct ConnectionBase {
     // before upstream selection until target materialization exists.
     u16 target_transform_id;
     bool target_transform_recorded;
+    // Request-arena copy accounting fits in the existing padding before the
+    // aligned request-header override array, so it does not grow Connection.
+    u16 req_header_owned_bytes;
     // forward(set_header:) request mutation: rut_helper_req_set_header records
     // (name, value) overrides (views into stable JIT constant memory);
     // on_upstream_connected injects/replaces those header lines in recv_buf before
@@ -517,7 +520,6 @@ struct ConnectionBase {
     // Request-arena copies for runtime header mutations, bounded independently
     // of other JSON/string allocations. No per-connection inline byte buffer.
     static constexpr u32 kMaxReqHeaderOwnedBytes = 8192;
-    u32 req_header_owned_bytes;
     // Ordered response-header mutations recorded by compiled Response builders.
     // Forward paths re-anchor request-backed values into a stable request snapshot
     // before recv_buf is released.
