@@ -895,8 +895,17 @@ target_include_directories(test_frontend PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
 )
-add_test(NAME test_frontend COMMAND test_frontend)
-set_tests_properties(test_frontend PROPERTIES LABELS "unit;compiler" TIMEOUT 180)
+add_test(NAME test_frontend.shard_0_of_2
+    COMMAND test_frontend --shard-index=0 --shard-count=2)
+add_test(NAME test_frontend.shard_1_of_2
+    COMMAND test_frontend --shard-index=1 --shard-count=2)
+set_tests_properties(
+    test_frontend.shard_0_of_2
+    test_frontend.shard_1_of_2
+    PROPERTIES
+        LABELS "unit;compiler"
+        RUN_SERIAL TRUE
+        TIMEOUT 120)
 
 add_executable(test_hir_generated_names_lifetime test_hir_generated_names_lifetime.cc)
 target_include_directories(test_hir_generated_names_lifetime PRIVATE
