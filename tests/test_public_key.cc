@@ -5,6 +5,7 @@
 #include "test.h"
 
 #include <openssl/err.h>
+#include <pthread.h>
 
 using namespace rut;
 
@@ -315,4 +316,187 @@ TEST(public_key, jwks_enforces_set_count_and_decoded_id_bounds) {
     RsaPublicKey key;
     CHECK(!key.load_rs256_jwks({nullptr, 1}, lit_str("fixed")));
     CHECK(!key.load_rs256_jwks({buffer, sizeof(buffer) + 1}, lit_str("fixed")));
+}
+
+static Str rfc_jwk_set(char* buffer, u32 capacity, const Str* ids, u32 count) {
+    json::Writer out{buffer, capacity};
+    out.text(lit_str("{\"keys\":["));
+    for (u32 i = 0; i < count; ++i) {
+        if (i) out.put(',');
+        out.text(lit_str("{\"kid\":"));
+        if (!json::quote(ids[i], out)) return {};
+        out.text(lit_str(R"(,"kty":"RSA","alg":"RS256","e":"AQAB","n":")"));
+        out.text({kJwkModulus, sizeof(kJwkModulus) - 1});
+        out.text(lit_str("\"}"));
+    }
+    out.text(lit_str("]}"));
+    return out.ok ? Str{buffer, out.len} : Str{};
+}
+
+TEST(public_key, trusted_key_subset_and_shard_verifiers_own_independent_lifetimes) {
+    char configuration[8192];
+    char current_id[] = "current";
+    char previous_id[] = "previous";
+    const Str available[] = {{current_id, sizeof(current_id) - 1},
+                             {previous_id, sizeof(previous_id) - 1},
+                             lit_str("not-approved")};
+    const Str approved[] = {available[1], available[0]};
+    auto input = rfc_jwk_set(configuration, sizeof(configuration), available, 3);
+    REQUIRE(input.len > 0);
+    Rs256KeySet keys;
+    REQUIRE(keys.load(input, approved, 2));
+    CHECK_EQ(keys.size(), 2u);
+    CHECK(!keys.load(input, available, 3));
+    CHECK_EQ(keys.size(), 2u);
+    for (char& byte : current_id) byte = 0;
+    for (char& byte : previous_id) byte = 0;
+    Rs256VerifierSet first;
+    Rs256VerifierSet second;
+    REQUIRE(first.init(keys));
+    REQUIRE(second.init(keys));
+    CHECK(!first.init(keys));
+    keys.reset();
+    for (char& byte : configuration) byte = 0;
+    const auto current = first.select(lit_str("current"));
+    REQUIRE(current.verifier);
+    CHECK(current.kid.eq(lit_str("current")));
+    CHECK(current.verifier->verify({kMessage, sizeof(kMessage) - 1}, der(kSignature)));
+    const auto previous = first.select(lit_str("previous"));
+    REQUIRE(previous.verifier);
+    CHECK(previous.verifier != current.verifier);
+    CHECK(previous.verifier->verify({kMessage, sizeof(kMessage) - 1}, der(kSignature)));
+    CHECK(!first.select(lit_str("not-approved")).verifier);
+    CHECK(!first.select(lit_str("Current")).verifier);
+    CHECK(!first.select(lit_str("curr")).verifier);
+    CHECK(!first.select({nullptr, 1}).verifier);
+    CHECK(!first.select(lit_str("")).verifier);
+    first.reset();
+    first.reset();
+    CHECK(!first.valid());
+    CHECK(!first.select(lit_str("current")).verifier);
+    auto retained = second.select(lit_str("current"));
+    REQUIRE(retained.verifier);
+    CHECK(retained.verifier->verify({kMessage, sizeof(kMessage) - 1}, der(kSignature)));
+}
+
+TEST(public_key, trusted_key_set_rejects_ambiguous_or_partial_preparation) {
+    char configuration[8192];
+    const Str ids[] = {lit_str("current"), lit_str("previous")};
+    auto input = rfc_jwk_set(configuration, sizeof(configuration), ids, 2);
+    Rs256KeySet keys;
+    Rs256VerifierSet verifiers;
+    CHECK(!verifiers.init(keys));
+    CHECK(!keys.load(input, nullptr, 1));
+    CHECK(!keys.load(input, ids, 0));
+    CHECK(!keys.load(input, ids, 17));
+    const Str duplicate[] = {ids[0], ids[0]};
+    CHECK(!keys.load(input, duplicate, 2));
+    const Str missing[] = {ids[0], lit_str("unknown")};
+    CHECK(!keys.load(input, missing, 2));
+    CHECK(!keys.valid());
+    CHECK_EQ(keys.size(), 0u);
+    // Failure after the first key load must permit clean preparation afterward.
+    REQUIRE(keys.load(input, ids, 2));
+    REQUIRE(verifiers.init(keys));
+    Rs256KeySet empty;
+    CHECK(!verifiers.init(empty));
+    CHECK(verifiers.select(ids[0]).verifier != nullptr);
+    keys.reset();
+    const Str ambiguous[] = {ids[0], ids[1], ids[1]};
+    input = rfc_jwk_set(configuration, sizeof(configuration), ambiguous, 3);
+    CHECK(!keys.load(input, ids, 1));
+    CHECK(!keys.valid());
+    CHECK(!keys.load(lit_str("{\"keys\":[{\"kid\":\"current\",\"kty\":\"EC\"}]}"), ids, 1));
+    CHECK(!keys.load({nullptr, 1}, ids, 1));
+    CHECK(!keys.load({configuration, sizeof(configuration) + 1}, ids, 1));
+    const Str invalid_ids[] = {{nullptr, 1}, lit_str("")};
+    for (Str id : invalid_ids) CHECK(!keys.load(input, &id, 1));
+}
+
+TEST(public_key, trusted_key_set_bounds_ids_and_preserves_decoded_bytes) {
+    char configuration[8192];
+    char id_bytes[17];
+    Str ids[17];
+    for (u32 i = 0; i < 17; ++i) {
+        id_bytes[i] = static_cast<char>('A' + i);
+        ids[i] = {id_bytes + i, 1};
+    }
+    Rs256KeySet keys;
+    auto input = rfc_jwk_set(configuration, sizeof(configuration), ids, 16);
+    REQUIRE(input.len > 0);
+    REQUIRE(keys.load(input, ids, 16));
+    CHECK_EQ(keys.size(), 16u);
+    Rs256VerifierSet verifiers;
+    REQUIRE(verifiers.init(keys));
+    for (u32 i = 0; i < 16; ++i) CHECK(verifiers.select(ids[i]).verifier != nullptr);
+    CHECK(!verifiers.select(ids[16]).verifier);
+    keys.reset();
+    input = rfc_jwk_set(configuration, sizeof(configuration), ids, 17);
+    REQUIRE(input.len > 0);
+    CHECK(!keys.load(input, ids, 1));
+    char long_id[129];
+    for (char& byte : long_id) byte = 'a';
+    const u32 lengths[] = {128u, 129u};
+    for (u32 length : lengths) {
+        Str id{long_id, length};
+        input = rfc_jwk_set(configuration, sizeof(configuration), &id, 1);
+        CHECK_EQ(keys.load(input, &id, 1), length == 128);
+        keys.reset();
+    }
+    const char nul_id[] = "id\0tail";
+    const Str id{nul_id, sizeof(nul_id) - 1};
+    input = rfc_jwk_set(configuration, sizeof(configuration), &id, 1);
+    REQUIRE(keys.load(input, &id, 1));
+    verifiers.reset();
+    REQUIRE(verifiers.init(keys));
+    CHECK(verifiers.select(id).verifier != nullptr);
+    CHECK(!verifiers.select(lit_str("id")).verifier);
+}
+
+struct KeySetThreadInput {
+    const Rs256KeySet* keys;
+    bool ok = false;
+};
+static void* exercise_key_set_on_shard(void* value) {
+    auto* input = static_cast<KeySetThreadInput*>(value);
+    Rs256VerifierSet verifiers;
+    if (!verifiers.init(*input->keys)) return nullptr;
+    const Str ids[] = {lit_str("current"), lit_str("previous")};
+    for (u32 i = 0; i < 32; ++i) {
+        for (Str kid : ids) {
+            auto selected = verifiers.select(kid);
+            if (!selected.verifier ||
+                !selected.verifier->verify({kMessage, sizeof(kMessage) - 1}, der(kSignature)))
+                return nullptr;
+        }
+    }
+    input->ok = true;
+    return nullptr;
+}
+TEST(public_key, each_execution_thread_activates_its_own_verifier_set) {
+    char configuration[8192];
+    const Str ids[] = {lit_str("current"), lit_str("previous")};
+    auto input = rfc_jwk_set(configuration, sizeof(configuration), ids, 2);
+    Rs256KeySet keys;
+    REQUIRE(keys.load(input, ids, 2));
+    struct Threads {
+        pthread_t threads[2]{};
+        u32 count = 0;
+        ~Threads() {
+            for (u32 i = 0; i < count; ++i) pthread_join(threads[i], nullptr);
+        }
+    };
+    KeySetThreadInput cases[] = {{&keys}, {&keys}};
+    Threads threads;
+    for (u32 i = 0; i < 2; ++i) {
+        REQUIRE(pthread_create(
+                    &threads.threads[i], nullptr, exercise_key_set_on_shard, &cases[i]) == 0);
+        ++threads.count;
+    }
+    while (threads.count != 0) {
+        REQUIRE(pthread_join(threads.threads[threads.count - 1], nullptr) == 0);
+        --threads.count;
+    }
+    CHECK(cases[0].ok);
+    CHECK(cases[1].ok);
 }

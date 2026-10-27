@@ -69,4 +69,57 @@ public:
     [[nodiscard]] bool verify(Str message, Str signature);
 };
 
+// Trusted configuration subset of a local JWK Set. Load before publication;
+// each approved ID must select an RS256 key. Other JWKs never become trusted
+// merely by appearing in the input. Owns keys and copied decoded ID bytes.
+class Rs256KeySet {
+    friend class Rs256VerifierSet;
+    static constexpr u32 kCapacity = 16;
+    RsaPublicKey keys_[kCapacity];
+    char ids_[kCapacity][128]{};
+    u32 lengths_[kCapacity]{};
+    u32 count_ = 0;
+
+public:
+    static constexpr u32 kMaxKeys = kCapacity;
+    static constexpr u32 kMaxKidBytes = 128;
+    Rs256KeySet() = default;
+    Rs256KeySet(const Rs256KeySet&) = delete;
+    Rs256KeySet& operator=(const Rs256KeySet&) = delete;
+    // Nonempty approved subset, unique IDs, <=16 keys and <=8192 input bytes.
+    // Failed preparation rolls back all entries. A valid set cannot be replaced
+    // without reset; prepare a separate generation while readers drain.
+    [[nodiscard]] bool load(Str jwks, const Str* approved_ids, u32 count);
+    void reset();
+    [[nodiscard]] bool valid() const { return count_ != 0; }
+    [[nodiscard]] u32 size() const { return count_; }
+};
+
+// Shard-owned verification workspace. Initialize on the execution shard before
+// serving requests; never share mutable verifiers across concurrent shards.
+// Retains independent key references and copies IDs, so the source set may be
+// released after activation. Request selection is bounded and allocation-free.
+class Rs256VerifierSet {
+    RsaSha256Verifier verifiers_[Rs256KeySet::kMaxKeys];
+    char ids_[Rs256KeySet::kMaxKeys][Rs256KeySet::kMaxKidBytes]{};
+    u32 lengths_[Rs256KeySet::kMaxKeys]{};
+    u32 count_ = 0;
+
+public:
+    struct Selection {
+        RsaSha256Verifier* verifier = nullptr;
+        Str kid{};  // borrowed canonical configuration ID, not proof of authentication
+    };
+    Rs256VerifierSet() = default;
+    Rs256VerifierSet(const Rs256VerifierSet&) = delete;
+    Rs256VerifierSet& operator=(const Rs256VerifierSet&) = delete;
+    [[nodiscard]] bool init(const Rs256KeySet& keys);
+    void reset();
+    [[nodiscard]] bool valid() const { return count_ != 0; }
+    [[nodiscard]] u32 size() const { return count_; }
+    // Exact decoded ID bytes, case-sensitive; no default key or fallback.
+    // Returned views/pointers expire at reset/destruction of this verifier set.
+    [[nodiscard]] Selection select(Str kid);
+};
+
 }  // namespace rut

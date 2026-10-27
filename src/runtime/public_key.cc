@@ -333,4 +333,67 @@ bool RsaSha256Verifier::verify(Str message, Str signature) {
     return CRYPTO_memcmp(actual, expected, bytes_) == 0;
 }
 
+bool Rs256KeySet::load(Str jwks, const Str* approved_ids, u32 count) {
+    if (valid() || !approved_ids || count == 0 || count > kMaxKeys || !jwks.ptr || jwks.len == 0 ||
+        jwks.len > RsaPublicKey::kMaxDerBytes)
+        return false;
+    for (u32 i = 0; i < count; ++i) {
+        if (!approved_ids[i].ptr || approved_ids[i].len == 0 || approved_ids[i].len > kMaxKidBytes)
+            return false;
+        for (u32 j = 0; j < i; ++j)
+            if (approved_ids[i].eq(approved_ids[j])) return false;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        // Reuse the existing whole-set ambiguity/profile checks during bounded
+        // configuration work. Nothing is visible until every selected key loads.
+        if (!keys_[i].load_rs256_jwks(jwks, approved_ids[i])) {
+            reset();
+            return false;
+        }
+        lengths_[i] = approved_ids[i].len;
+        for (u32 j = 0; j < approved_ids[i].len; ++j) ids_[i][j] = approved_ids[i].ptr[j];
+    }
+    count_ = count;
+    return true;
+}
+
+void Rs256KeySet::reset() {
+    count_ = 0;
+    for (u32 i = 0; i < kMaxKeys; ++i) {
+        keys_[i].reset();
+        lengths_[i] = 0;
+    }
+}
+
+bool Rs256VerifierSet::init(const Rs256KeySet& keys) {
+    if (valid() || !keys.valid()) return false;
+    for (u32 i = 0; i < keys.count_; ++i) {
+        if (!verifiers_[i].init(keys.keys_[i])) {
+            reset();
+            return false;
+        }
+        lengths_[i] = keys.lengths_[i];
+        for (u32 j = 0; j < lengths_[i]; ++j) ids_[i][j] = keys.ids_[i][j];
+    }
+    count_ = keys.count_;
+    return true;
+}
+
+void Rs256VerifierSet::reset() {
+    count_ = 0;
+    for (u32 i = 0; i < Rs256KeySet::kMaxKeys; ++i) {
+        verifiers_[i].reset();
+        lengths_[i] = 0;
+    }
+}
+
+Rs256VerifierSet::Selection Rs256VerifierSet::select(Str kid) {
+    if (!kid.ptr || kid.len == 0 || kid.len > Rs256KeySet::kMaxKidBytes) return {};
+    for (u32 i = 0; i < count_; ++i) {
+        const Str configured{ids_[i], lengths_[i]};
+        if (kid.eq(configured)) return {&verifiers_[i], configured};
+    }
+    return {};
+}
+
 }  // namespace rut
