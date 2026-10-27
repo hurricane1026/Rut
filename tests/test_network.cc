@@ -11241,6 +11241,76 @@ TEST(http2, connect_fail_502_commits_chain_headers_only_for_connect_failure) {
     CHECK(saw_large);
 }
 
+TEST(http2, ordinary_timeout_applies_committed_headers_only_before_response_bytes) {
+    for (u32 variant = 0; variant < 10; ++variant) {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        h2.nstreams = 1;
+        h2.streams[0] = {1,
+                         Http2StreamState::Open,
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         static_cast<i32>(kDefaultInitialWindowSize),
+                         true};
+        h2.async_stream = 1;
+        conn->h2 = &h2;
+        conn->epoch_held = true;
+        conn->resp_header_mutations[0] = {{"access-control-allow-origin", 27},
+                                          {"https://app.example.com", 23},
+                                          Connection::RespHeaderMutationMode::Set};
+        conn->resp_header_mutation_count = 1;
+        u8 upstream[16]{};
+        conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+        if (variant == 1)
+            REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>("H"), 1), 1u);
+        if (variant == 2) conn->failure_policy_id = 1;
+        if (variant == 3) conn->timeout_failure_policy_id = 1;
+        if (variant == 4) conn->failure_policy_suppress_body = true;
+        if (variant == 5) conn->resp_header_mutation_overflow = true;
+        if (variant == 6) conn->resp_header_mutations[0].name = {"bad\nname", 8};
+        if (variant == 7) conn->response_read_deadline_state = ResponseReadDeadlineState::Validated;
+        if (variant == 9) h2.async_proxy_response_seen = true;
+        if (variant == 8)
+            h2_proxy_fail(&loop, *conn, 504);
+        else
+            h2_proxy_timeout(&loop, *conn);
+        REQUIRE_GT(conn->send_buf.len(), 0u);
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame),
+                   ParseStatus::Complete);
+        CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+        CHECK((frame.flags & http2_flag::kEndStream) != 0);
+        hpack::DynamicTable decoded;
+        decoded.init(kDefaultHeaderTableSize);
+        hpack::Header headers[8];
+        u8 scratch[512]{};
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(decoded,
+                                           conn->send_buf.data() + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           8,
+                                           &count));
+        bool origin = false, status = false;
+        for (u32 i = 0; i < count; ++i) {
+            if (headers[i].name.eq({"access-control-allow-origin", 27})) origin = true;
+            if (headers[i].name.eq({":status", 7}))
+                status = headers[i].value.eq((variant == 5 || variant == 6) ? Str{"500", 3}
+                                                                            : Str{"504", 3});
+        }
+        CHECK(status);
+        CHECK_EQ(origin, variant == 0);
+        CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+        CHECK_FALSE(conn->epoch_held);
+        CHECK_FALSE(h2.async_proxy_response_seen);
+    }
+}
+
 TEST(http2, connect_fail_mutation_invalid_or_zero_count_overflow_is_500) {
     auto run = [&](bool overflow, bool invalid) -> u16 {
         SmallLoop loop;

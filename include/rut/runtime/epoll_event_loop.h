@@ -1248,7 +1248,7 @@ public:
                             // the HTTP/1 path.
                             if (c->protocol == ConnProtocol::Http2 && c->h2 != nullptr &&
                                 c->h2->async_stream != 0)
-                                h2_proxy_fail<EpollEventLoop>(this, *c, 504);
+                                h2_proxy_timeout<EpollEventLoop>(this, *c);
                             else
                                 respond_upstream_timeout<EpollEventLoop>(this, *c);
                         } else if (c->throttle_paused) {

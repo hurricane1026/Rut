@@ -76,6 +76,7 @@ void Http2Conn::init() {
     async_stream = 0;
     async_headers_received_us = 0;
     async_is_head = false;
+    async_proxy_response_seen = false;
     async_kind = H2AsyncKind::None;
     async_cfg = nullptr;
     async_synth_len = 0;

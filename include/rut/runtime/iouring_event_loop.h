@@ -8193,7 +8193,7 @@ public:
                             // the HTTP/1 path.
                             if (c->protocol == ConnProtocol::Http2 && c->h2 != nullptr &&
                                 c->h2->async_stream != 0)
-                                h2_proxy_fail<IoUringEventLoop>(this, *c, 504);
+                                h2_proxy_timeout<IoUringEventLoop>(this, *c);
                             else
                                 respond_upstream_timeout<IoUringEventLoop>(this, *c);
                         } else if (c->throttle_paused) {

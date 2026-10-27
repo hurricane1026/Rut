@@ -3998,3 +3998,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
             LABELS "cli;cors;network" RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
+    foreach(backend IN ITEMS epoll io_uring)
+        add_test(NAME test_cli_cors_h2_timeout_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_cors_h2_timeout.py
+                    $<TARGET_FILE:rut> ${backend})
+        set_tests_properties(test_cli_cors_h2_timeout_${backend} PROPERTIES
+            LABELS "cli;cors;network" RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()
