@@ -30,6 +30,11 @@ inline bool ws_opcode_is_control(WsOpcode op) {
     return (static_cast<u8>(op) & 0x8) != 0;
 }
 
+constexpr bool ws_opcode_valid(WsOpcode op) {
+    return op == WsOpcode::Continuation || op == WsOpcode::Text || op == WsOpcode::Binary ||
+           op == WsOpcode::Close || op == WsOpcode::Ping || op == WsOpcode::Pong;
+}
+
 // A parsed frame header — everything before the payload (§5.2).
 struct WsFrameHeader {
     bool fin;
@@ -57,8 +62,8 @@ void ws_unmask(u8* payload, u64 len, const u8 mask_key[4]);
 // Serialize a frame header into `out` (caller guarantees >= kWsMaxHeaderSize bytes).
 // When `masked`, writes `mask_key` (the caller masks the payload separately via
 // ws_unmask). Returns the number of header octets written (2..14), or 0 if the inputs
-// would form a frame ws_parse_header rejects — a control frame that is fragmented
-// (fin=false), carries >125 bytes, or is a Close with a 1-byte body, or any payload
+// would form a frame ws_parse_header rejects — a reserved opcode, a control frame that is
+// fragmented (fin=false), carries >125 bytes, or is a Close with a 1-byte body, or any payload
 // length with the reserved 64-bit high bit set — in which case nothing is written.
 // Callers must treat a 0 return as a refusal.
 u32 ws_write_header(
