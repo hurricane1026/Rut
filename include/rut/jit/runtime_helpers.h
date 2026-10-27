@@ -166,6 +166,17 @@ rut::u8 rut_helper_bearer_matches(const char* authorization,
                                   rut::u32 authorization_len,
                                   const char* key,
                                   rut::u32 key_len);
+rut::u8 rut_helper_standard_webhook_valid(const char* id,
+                                          rut::u32 id_len,
+                                          const char* timestamp,
+                                          rut::u32 timestamp_len,
+                                          const char* signature,
+                                          rut::u32 signature_len,
+                                          const char* body,
+                                          rut::u32 body_len,
+                                          const char* raw_key,
+                                          rut::u32 raw_key_len);
+
 rut::u8 rut_helper_hmac_sha256_matches(const char* message,
                                        rut::u32 message_len,
                                        const char* key,

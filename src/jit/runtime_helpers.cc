@@ -15,6 +15,7 @@
 #include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/uuid.h"
+#include "rut/runtime/webhook.h"
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/random.h>
@@ -1061,6 +1062,28 @@ u8 rut_helper_bearer_matches(const char* authorization,
                              const char* key,
                              u32 key_len) {
     return bearer_matches({authorization, authorization_len}, {key, key_len});
+}
+
+rut::u8 rut_helper_standard_webhook_valid(const char* id,
+                                          rut::u32 id_len,
+                                          const char* timestamp,
+                                          rut::u32 timestamp_len,
+                                          const char* signature,
+                                          rut::u32 signature_len,
+                                          const char* body,
+                                          rut::u32 body_len,
+                                          const char* raw_key,
+                                          rut::u32 raw_key_len) {
+    timespec now{};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+        now.tv_nsec >= 1000000000)
+        return 0;
+    return standard_webhook_valid({id, id_len},
+                                  {timestamp, timestamp_len},
+                                  {signature, signature_len},
+                                  {body, body_len},
+                                  {raw_key, raw_key_len},
+                                  static_cast<i64>(now.tv_sec));
 }
 
 u8 rut_helper_hmac_sha256_matches(const char* message,

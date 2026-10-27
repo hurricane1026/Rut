@@ -111,6 +111,7 @@ struct Ctx {
     LLVMValueRef fn_bearer_matches;
     LLVMValueRef fn_basic_matches;
     LLVMValueRef fn_hmac_sha256_matches;
+    LLVMValueRef fn_standard_webhook_valid;
     LLVMValueRef fn_str_constant_time_equal;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
@@ -581,6 +582,16 @@ struct Ctx {
                 LLVMAddFunction(llvm_mod, "rut_helper_hmac_sha256_matches", ft);
         }
         return fn_hmac_sha256_matches;
+    }
+    LLVMValueRef get_standard_webhook_valid() {
+        if (!fn_standard_webhook_valid) {
+            LLVMTypeRef params[] = {
+                ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 10, 0);
+            fn_standard_webhook_valid =
+                LLVMAddFunction(llvm_mod, "rut_helper_standard_webhook_valid", ft);
+        }
+        return fn_standard_webhook_valid;
     }
     LLVMValueRef get_basic_matches() {
         if (!fn_basic_matches) {
@@ -1415,6 +1426,24 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef fn = c.get_hmac_sha256_matches();
             LLVMValueRef result =
                 LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 8, "hmac");
+            c.set_value(
+                inst.result,
+                LLVMBuildICmp(
+                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "hmac.bool"));
+            break;
+        }
+        case rir::Opcode::StandardWebhookValid: {
+            LLVMValueRef args[10];
+            for (u32 i = 0; i < 5; ++i) {
+                LLVMValueRef value = c.get_value(inst.operand(i));
+                args[static_cast<size_t>(i) * 2] =
+                    LLVMBuildExtractValue(c.builder, value, 0, "hmac.ptr");
+                args[static_cast<size_t>(i) * 2 + 1] =
+                    LLVMBuildExtractValue(c.builder, value, 1, "hmac.len");
+            }
+            LLVMValueRef fn = c.get_standard_webhook_valid();
+            LLVMValueRef result =
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 10, "hmac");
             c.set_value(
                 inst.result,
                 LLVMBuildICmp(
@@ -2614,6 +2643,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_bearer_matches = nullptr;
     c.fn_basic_matches = nullptr;
     c.fn_hmac_sha256_matches = nullptr;
+    c.fn_standard_webhook_valid = nullptr;
     c.fn_str_constant_time_equal = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;

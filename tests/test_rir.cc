@@ -2482,3 +2482,31 @@ TEST(RirPrinter, FailurePolicyForgedMetadataPrintsOneSafeMarker) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(RirBuilder, StandardWebhookFiveOperands) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("webhook"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    ValueId args[5];
+    const char* inputs[] = {"id", "1", "signature", "body", "key"};
+    for (u32 i = 0; i < 5; ++i) args[i] = V(b.emit_const_str(lit(inputs[i])));
+    auto result = V(b.emit_standard_webhook_valid(args[0], args[1], args[2], args[3], args[4]));
+    CHECK(fn->values[result.id].type->kind == TypeKind::Bool);
+    const auto& inst = fn->entry()->insts[5];
+    CHECK(inst.op == Opcode::StandardWebhookValid);
+    CHECK_EQ(inst.operand_count, 5u);
+    for (u32 i = 0; i < 5; ++i) CHECK_EQ(inst.operand(i).id, args[i].id);
+    auto integer = V(b.emit_const_i32(1));
+    CHECK(!b.emit_standard_webhook_valid(args[0], args[1], args[2], args[3], integer));
+    VOK(b.emit_ret_status(204));
+    char print_buf[4096];
+    PrintBuf pb;
+    pb.init(print_buf, sizeof(print_buf), -1);
+    print_function(pb, *fn);
+    CHECK(std::string(print_buf, pb.len).find("auth.standard_webhook_valid") != std::string::npos);
+    ctx.destroy();
+}

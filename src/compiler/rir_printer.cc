@@ -246,6 +246,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::HttpTokenListAllows:
             buf.put_cstr("http.token_list_allows");
             break;
+        case Opcode::StandardWebhookValid:
+            buf.put_cstr("auth.standard_webhook_valid");
+            break;
         case Opcode::HmacSha256Matches:
             buf.put_cstr("hash.hmac_sha256_matches");
             break;
@@ -778,6 +781,12 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::HttpOriginListAllows:
         case Opcode::HttpTokenListAllows:
             for (u32 i = 0; i < 3; ++i) {
+                buf.put_cstr(i == 0 ? " " : ", ");
+                print_value_ref(buf, inst.operand(i));
+            }
+            break;
+        case Opcode::StandardWebhookValid:
+            for (u32 i = 0; i < 5; ++i) {
                 buf.put_cstr(i == 0 ? " " : ", ");
                 print_value_ref(buf, inst.operand(i));
             }

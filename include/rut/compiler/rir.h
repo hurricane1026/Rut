@@ -196,6 +196,7 @@ enum class Opcode : u8 {
     BearerMatches,
     BasicMatches,
     HmacSha256Matches,
+    StandardWebhookValid,
     HttpTokenListAllows,
     HttpOriginListAllows,
     HashDigest,
