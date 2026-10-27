@@ -1603,3 +1603,14 @@ alone. Token-list empty inputs are valid, and `*` is an ordinary token. Both
 validate complete lists, fail closed at their bounds and retain no views or
 mutable state. `uniqueHeader(...).or("")` alone cannot distinguish absence from
 duplicates when empty is allowed; the policy module checks uniqueness explicitly.
+
+### Static Consumer groups
+
+The imported `auth` module provides `ConsumerGroups(consumerId: ..., first: ...,
+second: ...)` and `requireGroup(identity, required, first, second)`. Supply a
+verified `auth.Identity` and trusted static membership records. This bounded
+policy maps two distinct Consumers to up to two exact, case-sensitive groups
+each. Empty slots disable membership. Unknown Consumers and missing membership
+receive 403; invalid configuration receives 503. Replacing the trusted snapshot
+revokes membership. Client identity/group headers never populate the registry.
+See `examples/consumer-group-auth.rut` (relative to the repository root).

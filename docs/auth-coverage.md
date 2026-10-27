@@ -56,11 +56,9 @@ The 2026-10-27 audit separates these layers:
   cancellation/close behavior; redirects or fire-and-forget proxying do not
   implement forward-auth, OPA or introspection.
 
-Open integration work (not yet on the audited main base):
-[#922](https://github.com/hurricane1026/Rut/pull/922) exposes Standard Webhooks to
-Rut/JIT, and [#923](https://github.com/hurricane1026/Rut/pull/923) supplies its
-Identity middleware and request tests. Their freshness checks do not implement
-persistent replay protection.
+Standard Webhooks middleware integration remains separate from this branch and
+is tracked by [#934](https://github.com/hurricane1026/Rut/pull/934). Its freshness
+checks do not implement persistent replay protection.
 
 ## Bounded multi-Consumer authentication
 
@@ -157,6 +155,20 @@ and the exact Consumer allow union from
 primitive from [#926](https://github.com/hurricane1026/Rut/pull/926). The
 Standard Webhooks middleware still has a separate main integration tracked by
 [#934](https://github.com/hurricane1026/Rut/pull/934), which is not included here.
+## Static Consumer groups
+
+`auth.ConsumerGroups` binds one verified Consumer ID to up to two exact,
+case-sensitive group names. `auth.requireGroup(identity, group, first, second)`
+preserves the verified identity only when the Consumer is configured for the
+requested group; empty group slots are disabled. An empty required group is a
+503 configuration failure. Missing, malformed, duplicate or invalid credentials
+remain authentication failures, while a valid identity outside the group is
+denied with 403. Empty Consumer IDs are configuration failures. Group membership comes only from trusted configuration,
+not client identity or group headers, and is compiled in until restart.
+
+The JIT matrix covers successful membership, default deny, invalid and duplicate
+credentials, empty slots, duplicate groups, Consumer ID case mismatches and
+spoofed identity headers. See `examples/consumer-group-auth.rut`.
 
 ## Implementation order and gates
 

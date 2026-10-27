@@ -253,3 +253,29 @@ func rotatingHmac(_ message: str, _ signature: str, _ currentKey: str, _ previou
         _ => Identity(consumerId: consumerId, credentialId: previousId, method: "hmac")
     }
 }
+
+// Trusted static membership snapshot; an empty group disables that slot.
+struct ConsumerGroups {
+    consumerId: str
+    first: str
+    second: str
+}
+
+func validGroupMember(_ member: ConsumerGroups) -> bool {
+    member.consumerId != "" &&
+        (member.first == "" || member.second == "" || member.first != member.second)
+}
+
+// Membership is bound to the verified identity, never to a request header.
+// The bounded registry holds two distinct consumers; no match denies by default.
+func requireGroup(_ identity: Identity, _ required: str,
+                  _ first: ConsumerGroups, _ second: ConsumerGroups) -> Identity {
+    guard required != "" && validGroupMember(first) && validGroupMember(second) &&
+        first.consumerId != second.consumerId else { respond 503 }
+    let firstMatches = identity.consumerId == first.consumerId &&
+        (required == first.first || required == first.second)
+    let secondMatches = identity.consumerId == second.consumerId &&
+        (required == second.first || required == second.second)
+    guard firstMatches || secondMatches else { respond 403 }
+    identity
+}

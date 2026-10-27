@@ -24143,6 +24143,109 @@ route GET "/denied-before-allow" {
     rir.destroy();
 }
 
+TEST(jit, consumer_groups_bind_verified_identity_and_default_deny) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    std::string source = "import \"middleware/auth.rut\"\n";
+    const char* groups[] = {
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\")",
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"\", second: \"\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\")",
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"\"), "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"ops\", second: \"\")",
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"reports\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\")",
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"ops\", second: \"reports\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\")",
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"ops\", second: \"\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"reports\", second: \"\")",
+        "auth.ConsumerGroups(consumerId: \"Alice\", first: \"reports\", second: \"\"), "
+        "auth.ConsumerGroups(consumerId: \"carol\", first: \"reports\", second: \"\")",
+        "auth.ConsumerGroups(consumerId: \"\", first: \"reports\", second: \"\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"reports\", second: \"\")",
+    };
+    for (u32 i = 0; i < sizeof(groups) / sizeof(groups[0]); ++i) {
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        source += R"rut(
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "a", credentials: "", keyId: "ak", passwordId: "ap"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "b", credentials: "", keyId: "bk", passwordId: "bp"))
+    let allowed = auth.requireGroup(identity, "reports",
+)rut";
+        source += groups[i];
+        source +=
+            ")\n guard (allowed.credentialId == \"ak\" || allowed.credentialId == \"bk\") && "
+            "allowed.method == \"apiKey\" else { return 500 }\n return 204\n}\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "consumer-groups: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0, "Authorization: Bearer a\r\n", 204},
+        {0, "Authorization: Bearer b\r\n", 403},
+        {0,
+         "Authorization: Bearer b\r\nX-Consumer-ID: alice\r\nX-Consumer-Groups: reports\r\n",
+         403},
+        {0, "Authorization: Bearer wrong\r\n", 401},
+        {0, "", 401},
+        {0, "Authorization: Bearer a\r\nauthorization: Bearer a\r\n", 401},
+        {1, "Authorization: Bearer a\r\n", 403},
+        {2, "Authorization: Bearer a\r\n", 503},
+        {3, "Authorization: Bearer a\r\n", 503},
+        {4, "Authorization: Bearer a\r\n", 204},
+        {5, "Authorization: Bearer b\r\n", 204},
+        {5, "Authorization: Bearer a\r\n", 403},
+        {6, "Authorization: Bearer a\r\n", 403},
+        {7, "Authorization: Bearer a\r\n", 503},
+    };
+    for (const auto& tc : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + tc.headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != tc.status)
+            std::fprintf(
+                stderr, "route %u got %u expected %u\n", tc.route, result.status_code, tc.status);
+        CHECK_EQ(result.status_code, tc.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, header_count_distinguishes_absent_empty_duplicate_and_invalid_requests) {
     const char* source = R"rut(
 func countAuthorization() -> i32 { req.headerCount("aUtHoRiZaTiOn") }
