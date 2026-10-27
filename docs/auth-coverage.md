@@ -357,3 +357,20 @@ store. Tests use fixed Python HMAC/Base64 oracle outputs with upstream Python
 fixture inputs, tampering and malformed lists, rotation, size/clock boundaries,
 and zero observed crypto allocations after warmup. HTTP/Rut end-to-end evidence
 and persisted replay handling remain pending.
+
+## Request-owned identity header storage foundation
+
+The internal `rut_helper_req_set_owned_header` copies header names and values to
+request-arena storage before recording a replace/dedupe operation. It validates
+HTTP bytes and framing-reserved names before copying, limits copies to 8192 bytes
+per request and retains the existing 16-operation limit. Invalid values, exhausted
+storage or overflow poison forwarding rather than silently omitting an identity
+header. Source buffers may be released or overwritten after recording; the
+request arena must live through forwarding. HTTP/1 request and HTTP/2 stream
+boundaries reset the copy budget. No inline per-connection byte buffer or new
+allocator/dependency is added.
+
+This is storage groundwork, not a new Rut mutation surface or a complete
+verified-identity forwarding policy. The language integration must still enforce
+literal header names, unwrapped runtime values, replacement of spoofed headers,
+credential stripping and correct ordering after authentication.

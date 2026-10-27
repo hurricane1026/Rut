@@ -384,6 +384,38 @@ void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const cha
     record_req_header(conn, name, nlen, val, vlen, false);
 }
 
+void rut_helper_req_set_owned_header(
+    void* conn, void* arena, const char* name, u32 nlen, const char* val, u32 vlen) {
+    if (conn == nullptr) return;
+    auto& c = *static_cast<ConnectionBase*>(conn);
+    if (c.req_header_override_overflow) return;
+    const u32 remaining = ConnectionBase::kMaxReqHeaderOwnedBytes - c.req_header_owned_bytes;
+    if (c.req_header_override_count >= ConnectionBase::kMaxReqHeaderOverrides || name == nullptr ||
+        (val == nullptr && vlen != 0) || nlen > remaining || vlen > remaining - nlen ||
+        validate_response_header(name, nlen, val, vlen) != HttpHeaderValidation::Ok) {
+        c.req_header_override_overflow = true;
+        return;
+    }
+    if (arena == nullptr) {
+        auto& owned = c.json_arena;
+        if (owned.backend.pool == nullptr ||
+            (owned.current == nullptr && !owned.init(owned.backend.pool))) {
+            c.req_header_override_overflow = true;
+            return;
+        }
+        arena = &owned;
+    }
+    auto* storage = static_cast<char*>(static_cast<SliceArena*>(arena)->alloc(nlen + vlen));
+    if (storage == nullptr) {
+        c.req_header_override_overflow = true;
+        return;
+    }
+    __builtin_memcpy(storage, name, nlen);
+    if (vlen != 0) __builtin_memcpy(storage + nlen, val, vlen);
+    c.req_header_owned_bytes += nlen + vlen;
+    record_req_header(&c, storage, nlen, storage + nlen, vlen, false);
+}
+
 void rut_helper_req_add_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
     record_req_header(conn, name, nlen, val, vlen, true);
 }

@@ -2618,6 +2618,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_path_override = {nullptr, 0};
     conn.target_transform_id = 0;
     conn.target_transform_recorded = false;
+    conn.req_header_owned_bytes = 0;
     conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
     conn.req_header_append_mask = 0;
     conn.req_header_remove_mask = 0;

@@ -124,7 +124,9 @@ TEST(http2, forward_request_removes_credentials_and_reset_clears_removal_modes) 
                                        &out_len));
     CHECK_EQ(out_len, sizeof(kExpected) - 1);
     CHECK(__builtin_memcmp(out, kExpected, sizeof(kExpected) - 1) == 0);
+    conn.req_header_owned_bytes = 42;
     h2_reset_request_mutations(conn);
+    CHECK_EQ(conn.req_header_owned_bytes, 0u);
     CHECK_EQ(conn.req_header_override_count, 0u);
     CHECK_EQ(conn.req_header_remove_mask, 0u);
     CHECK_EQ(conn.req_header_append_mask, 0u);
@@ -137,7 +139,9 @@ TEST(http2, forward_request_removes_credentials_and_reset_clears_removal_modes) 
     CHECK_EQ(out_len, sizeof(kRequest) - 1);
     CHECK(__builtin_memcmp(out, kRequest, sizeof(kRequest) - 1) == 0);
     conn.req_header_remove_mask = 3;
+    conn.req_header_owned_bytes = 42;
     conn.reset();
+    CHECK_EQ(conn.req_header_owned_bytes, 0u);
     CHECK_EQ(conn.req_header_remove_mask, 0u);
 }
 
@@ -147,6 +151,7 @@ TEST(remove_header, http1_new_request_boundary_discards_old_removal_modes) {
     auto* c = loop.alloc_conn();
     REQUIRE(c != nullptr);
     c->req_header_override_count = 1;
+    c->req_header_owned_bytes = 42;
     c->req_header_remove_mask = 1;
     c->req_header_overrides[0] = {lit_str("Authorization"), lit_str("")};
     static const char kRequest[] = "GET / HTTP/1.1\r\nHost: client\r\nAuthorization: next\r\n\r\n";
@@ -155,6 +160,7 @@ TEST(remove_header, http1_new_request_boundary_discards_old_removal_modes) {
     on_header_received<SmallLoop>(
         &loop, *c, make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
     CHECK_EQ(c->req_header_override_count, 0u);
+    CHECK_EQ(c->req_header_owned_bytes, 0u);
     CHECK_EQ(c->req_header_remove_mask, 0u);
     loop.free_conn(*c);
 }
