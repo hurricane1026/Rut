@@ -1,0 +1,13 @@
+import "middleware/auth.rut"
+
+listen :8080
+
+// Configure an endpoint-specific secret and fixed issuer/audience/scope.
+// Set JWT_SECRET to at least 32 trusted secret bytes at load time.
+route GET "/orders" {
+    let identity = auth.jwtHs256Scoped(req.authorization.or(""),
+        auth.JwtScopePolicy(secret: env("JWT_SECRET"), issuer: "https://issuer.example",
+            audience: "orders-api", credentialId: "orders-key", requiredScope: "orders:read"))
+    return identity.consumerId
+}
+route "/" { return 404 }

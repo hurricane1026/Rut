@@ -386,3 +386,20 @@ This is storage groundwork, not a new Rut mutation surface or a complete
 verified-identity forwarding policy. The language integration must still enforce
 literal header names, unwrapped runtime values, replacement of spoofed headers,
 credential stripping and correct ordering after authentication.
+
+## Scoped HS256 identity publication
+
+`auth.jwtHs256Scoped` combines the existing fixed HS256 decoder, strict
+issuer/audience/subject/expiry claims policy and exact `jwtHasScope` check. It
+returns an Identity only after all three succeed. Empty configuration receives
+503; malformed, duplicate or invalid credentials and claim failures receive 401;
+authenticated tokens lacking a valid matching scope receive 403 with the Bearer
+insufficient_scope challenge. Configure one nonempty RFC 6749 scope token;
+malformed required tokens fail closed as insufficient scope. No token-controlled
+algorithm selection, implicit group mapping, remote key fetching or revocation
+store is added. Key retirement remains a trusted configuration replacement.
+
+The JIT matrix uses independently generated fixed HMAC fixtures and covers scope
+boundaries/case/malformed lists, absent or array-valued scope, wrong issuer or
+audience, expired/empty-subject tokens, wrong algorithms/keys, duplicate
+Authorization and configuration failure. See `examples/jwt-scoped-identity.rut`.
