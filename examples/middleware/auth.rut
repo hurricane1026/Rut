@@ -76,6 +76,20 @@ func basic(_ authorization: str, _ credentials: str, _ consumerId: str, _ creden
     Identity(consumerId: consumerId, credentialId: credentialId, method: "basic")
 }
 
+// AND policy: both an opaque singleton header key and singleton Basic field
+// must verify. policyId identifies this configured pair, not a single factor.
+func headerKeyAndBasic(_ presentedKey: str, _ authorization: str, _ key: str,
+                       _ credentials: str, _ consumerId: str, _ policyId: str) -> Identity {
+    let denied = response(401)
+    denied.add("WWW-Authenticate", "ApiKey")
+    denied.add("WWW-Authenticate", "Basic realm=\"rut\"")
+    guard key != "" && credentials != "" && consumerId != "" && policyId != "" else { respond 503 }
+    let keyMatches = constantTimeEqual(presentedKey, key)
+    let passwordMatches = basicMatches(authorization, credentials)
+    guard keyMatches && passwordMatches else { respond denied }
+    Identity(consumerId: consumerId, credentialId: policyId, method: "apiKeyAndBasic")
+}
+
 // Two-key rotation window. Empty keys disable a slot; current wins if both match.
 // Remove the previous key to revoke it. Both slots must have stable, nonempty IDs.
 func rotatingApiKey(_ authorization: str, _ currentKey: str, _ previousKey: str,
@@ -173,6 +187,14 @@ func apiKeyOrBasic(_ authorization: str, _ key: str, _ credentials: str,
 func requireConsumer(_ identity: Identity, _ allowedConsumerId: str) -> Identity {
     guard allowedConsumerId != "" else { respond 503 }
     guard identity.consumerId == allowedConsumerId else { respond 403 }
+    identity
+}
+
+// Union of two exact configured IDs. Authenticate before calling this helper.
+// Repeated requireConsumer calls are intersections, so cannot express this union.
+func requireAnyConsumer(_ identity: Identity, _ first: str, _ second: str) -> Identity {
+    guard first != "" && second != "" else { respond 503 }
+    guard identity.consumerId == first || identity.consumerId == second else { respond 403 }
     identity
 }
 

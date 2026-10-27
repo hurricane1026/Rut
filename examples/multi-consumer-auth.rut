@@ -22,4 +22,19 @@ route GET "/alice-only" {
     let consumerId = permitted.consumerId
     return response(200, body: consumerId)
 }
+// Either exact Consumer is allowed; authentication still precedes authorization.
+route GET "/allowed-consumers" {
+    let identity = auth.multiAuth(req.authorization.or(""), alice(), bob())
+    let permitted = auth.requireAnyConsumer(identity, "alice", "bob")
+    let consumerId = permitted.consumerId
+    return response(200, body: consumerId)
+}
+// Both credentials are mandatory, bound to one configured Consumer/policy pair.
+route GET "/both-credentials" {
+    let identity = auth.headerKeyAndBasic(req.uniqueHeader("X-API-Key").or(""),
+        req.authorization.or(""), env("ALICE_API_KEY"), env("ALICE_BASIC_CREDENTIALS"),
+        "alice", "alice-required-pair")
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
 route "/" { return 404 }

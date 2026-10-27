@@ -24005,3 +24005,140 @@ route POST "/" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, required_credentials_and_exact_consumer_union_fail_closed) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/multi-consumer-auth.rut";
+    std::string source = R"rut(
+import "middleware/auth.rut"
+route GET "/dual" {
+    let identity = auth.headerKeyAndBasic(req.uniqueHeader("X-API-Key").or(""), req.authorization.or(""),
+        "opaque:secret", "user:pass", "alice", "required-pair")
+    guard identity.consumerId == "alice" && identity.credentialId == "required-pair" &&
+          identity.method == "apiKeyAndBasic" else { return 500 }
+    return 204
+}
+route GET "/empty-key" {
+    let identity = auth.headerKeyAndBasic("", "", "", "user:pass", "alice", "pair")
+    return 204
+}
+route GET "/empty-password" {
+    let identity = auth.headerKeyAndBasic("", "", "key", "", "alice", "pair")
+    return 204
+}
+route GET "/empty-consumer" {
+    let identity = auth.headerKeyAndBasic("", "", "key", "user:pass", "", "pair")
+    return 204
+}
+route GET "/empty-policy" {
+    let identity = auth.headerKeyAndBasic("", "", "key", "user:pass", "alice", "")
+    return 204
+}
+)rut";
+    const char* consumers[] = {"alice", "bob", "carol", "Alice", "alice-extra", "alice", "alice"};
+    for (u32 i = 0; i < 7; ++i) {
+        source += "route GET \"/allow-" + std::to_string(i) + "\" {\n" +
+                  "let identity = auth.apiKey(req.authorization.or(\"\"), \"secret\", \"" +
+                  consumers[i] + "\", \"key\")\n" +
+                  "let allowed = auth.requireAnyConsumer(identity, \"" + (i == 5 ? "" : "alice") +
+                  "\", \"" + (i == 6 ? "" : "bob") + "\")\n" +
+                  "guard allowed.consumerId == identity.consumerId && allowed.credentialId == "
+                  "\"key\" && allowed.method == \"apiKey\" else { return 500 }\nreturn 204\n}\n";
+    }
+    source += R"rut(
+route GET "/denied-before-allow" {
+    let identity = auth.apiKey(req.authorization.or(""), "secret", "alice", "key")
+    let excluded = auth.denyConsumer(identity, "alice")
+    let allowed = auth.requireAnyConsumer(excluded, "alice", "bob")
+    return 204
+}
+)rut";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "required auth: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0, "X-API-Key: opaque:secret\r\nAuthorization: Basic dXNlcjpwYXNz\r\n", 204},
+        {0,
+         "x-api-key: opaque:secret\r\nAuthorization: bAsIc   dXNlcjpwYXNz\r\nX-Consumer-ID: "
+         "carol\r\n",
+         204},
+        {0, "", 401},
+        {0, "X-API-Key: opaque:secret\r\n", 401},
+        {0, "Authorization: Basic dXNlcjpwYXNz\r\n", 401},
+        {0, "X-API-Key: wrong\r\nAuthorization: Basic dXNlcjpwYXNz\r\n", 401},
+        {0, "X-API-Key: opaque:secret\r\nAuthorization: Basic dXNlcjp3cm9uZw==\r\n", 401},
+        {0, "X-API-Key: opaque:secret\r\nAuthorization: Bearer opaque:secret\r\n", 401},
+        {0,
+         "X-API-Key: opaque:secret\r\nx-api-key: opaque:secret\r\nAuthorization: Basic "
+         "dXNlcjpwYXNz\r\n",
+         401},
+        {0,
+         "X-API-Key: opaque:secret\r\nx-api-key: wrong\r\nAuthorization: Basic dXNlcjpwYXNz\r\n",
+         401},
+        {0,
+         "X-API-Key: opaque:secret\r\nAuthorization: Basic dXNlcjpwYXNz\r\nauthorization: Basic "
+         "dXNlcjpwYXNz\r\n",
+         401},
+        {0, "X-API-Key: opaque:secret\r\nAuthorization: \r\n", 401},
+        {1, "", 503},
+        {2, "", 503},
+        {3, "", 503},
+        {4, "", 503},
+        {5, "Authorization: Bearer secret\r\n", 204},
+        {6, "Authorization: Bearer secret\r\n", 204},
+        {7, "Authorization: Bearer secret\r\n", 403},
+        {8, "Authorization: Bearer secret\r\n", 403},
+        {9, "Authorization: Bearer secret\r\n", 403},
+        {10, "Authorization: Bearer secret\r\n", 503},
+        {11, "Authorization: Bearer secret\r\n", 503},
+        {5, "Authorization: Bearer wrong\r\n", 401},
+        {5, "", 401},
+        {5, "Authorization: Bearer secret\r\nAuthorization: Bearer secret\r\n", 401},
+        {12, "Authorization: Bearer secret\r\n", 403},
+    };
+    for (const auto& tc : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + tc.headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != tc.status)
+            std::fprintf(
+                stderr, "route %u got %u expected %u\n", tc.route, result.status_code, tc.status);
+        CHECK_EQ(result.status_code, tc.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}

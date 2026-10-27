@@ -15,10 +15,10 @@ whether a competing open-source edition includes them.
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping | Dynamic Consumer registry/credential lifecycle, query/body credential hiding and verified identity forwarding |
-| Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair of configured Consumers; disabled-slot handling and ambiguous ownership rejection | Dynamic Consumer registry, explicit AND policy, anonymous only for absent credentials, no invalid-credential downgrade |
+| Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection | Dynamic Consumer registry, anonymous only for absent credentials, no invalid-credential downgrade |
 | JWT verification | HS256/384/512 policy helpers; native fixed-key RS256 decoder and trusted configured JWK Set selection | Rut/JIT asymmetric key wiring, ES keys, request-key selection, JWKS rotation/cache, revocation and unknown-key policy |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks HTTP/Rut wiring and replay persistence |
-| ACL / Consumer restriction | Exact verified-consumer allow/deny helpers | Multiple groups, membership lifecycle, default deny, no client identity spoofing |
+| ACL / Consumer restriction | Exact single-consumer allow/deny and two-consumer allow union after verification | Multiple groups, membership lifecycle, registry-backed default deny, no client identity spoofing |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
 | Forward auth / OPA | Pending | Consume bounded external response, identity allowlist, strip spoofed identity, deny vs unavailable, timeout/cancellation/close in both backends |
@@ -85,6 +85,33 @@ The JIT request matrix checks both methods for both Consumers, exact identity
 mapping, cross-method confusion, duplicate Authorization, disabled slots,
 ambiguous ownership and bad metadata. Consumer authorization remains a separate
 step after verification.
+
+## Required credentials and bounded authorization union
+
+`auth.headerKeyAndBasic(presentedKey, authorization, key, credentials, consumerId,
+policyId)` requires both an exact opaque header key and valid Basic credentials.
+There are no disabled slots or fallback methods. Pass the header key from
+`req.uniqueHeader("X-API-Key").or("")` and the Basic field from
+`req.authorization.or("")`. Missing, malformed, duplicate or wrong input in either
+source returns 401, even when the other source verifies. Empty trusted keys,
+credentials, Consumer IDs or policy IDs return 503. The published Identity uses
+method `apiKeyAndBasic` and the configured policy ID as its credential ID, naming
+the required pair. This is an explicit pair of shared credentials, not a claim
+of independent multi-factor assurance. Both verifiers reuse the existing runtime.
+
+`auth.requireAnyConsumer(identity, first, second)` allows either of two exact,
+case-sensitive configured Consumer IDs and preserves the verified Identity.
+Empty policy IDs return 503; an identity outside the set returns 403. A case or
+prefix match does not count. Repeating `requireConsumer` applies intersection,
+so it cannot implement this union. Authenticate before either policy helper:
+missing/invalid credentials remain 401. Chained explicit deny checks still take
+precedence when they occur first. No group membership is inferred from client
+headers, and these ordinary functions do not prove the origin of a constructed
+Identity. See the `/both-credentials` and `/allowed-consumers` example routes.
+
+The JIT matrix covers each missing/wrong/duplicate factor, both valid factors,
+configuration failures, each allow-set member, case/prefix mismatches, invalid
+auth before authorization, and deny-before-allow composition.
 
 ## Implementation order and gates
 
