@@ -896,7 +896,7 @@ target_include_directories(test_frontend PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 add_test(NAME test_frontend COMMAND test_frontend)
-set_tests_properties(test_frontend PROPERTIES LABELS "unit;compiler")
+set_tests_properties(test_frontend PROPERTIES LABELS "unit;compiler" TIMEOUT 180)
 
 add_executable(test_hir_generated_names_lifetime test_hir_generated_names_lifetime.cc)
 target_include_directories(test_hir_generated_names_lifetime PRIVATE
