@@ -1186,6 +1186,16 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
 
 - `auth.apiKey(authorization, key, consumerId, credentialId)` verifies an opaque
   Bearer key. Scheme spelling is case-insensitive and accepts 1*SP.
+- `auth.apiKeyOrAnonymous(count, authorization, key, consumerId, credentialId, anonymousId)`
+  takes `req.headerCount("Authorization")` and `req.authorization.or("")`
+  from the same original request field. Only count 0 with an empty value returns
+  `Identity(consumerId: anonymousId, credentialId: "", method: "anonymous")`.
+  Count 1 requires valid Bearer verification; empty/invalid/duplicate fields or
+  parsing failure return 401 with a Bearer challenge, never an anonymous fallback.
+  Empty configuration or identical authenticated/anonymous Consumer IDs returns
+  503. The anonymous ID must be explicitly allowed by downstream policy; an
+  existing `requireConsumer` check can reject it with 403.
+  See [anonymous-auth.rut](../examples/anonymous-auth.rut).
 - `auth.headerKey(req.uniqueHeader("X-API-Key").or(""), key, consumerId, credentialId)`
   verifies a custom header key. Do not replace uniqueHeader with first-field reads.
 - `auth.basic(authorization, credentials, consumerId, credentialId)` takes configured

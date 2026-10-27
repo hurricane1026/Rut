@@ -117,6 +117,23 @@ func headerKey(_ presented: str, _ key: str, _ consumerId: str, _ credentialId: 
     Identity(consumerId: consumerId, credentialId: credentialId, method: "apiKey")
 }
 
+// Anonymous only when the ORIGINAL Authorization field count is exactly zero.
+// Pair req.headerCount("Authorization") with req.authorization.or(""). A nil
+// singleton value alone also means duplicates and is not proof of absence.
+func apiKeyOrAnonymous(_ authorizationCount: i32, _ authorization: str, _ key: str,
+                       _ consumerId: str, _ credentialId: str, _ anonymousId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard key != "" && consumerId != "" && credentialId != "" && anonymousId != "" &&
+          consumerId != anonymousId else { respond 503 }
+    guard authorizationCount == 1 || (authorizationCount == 0 && authorization == "") else { respond denied }
+    guard authorizationCount == 0 || bearerMatches(authorization, key) else { respond denied }
+    match authorizationCount {
+        0 => Identity(consumerId: anonymousId, credentialId: "", method: "anonymous")
+        _ => Identity(consumerId: consumerId, credentialId: credentialId, method: "apiKey")
+    }
+}
+
 // Signature verification remains a distinct step from claims policy.
 func jwtDocument(_ authorization: str, _ secret: str) -> Json {
     let denied = response(401)

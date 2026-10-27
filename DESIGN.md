@@ -8126,6 +8126,24 @@ expression-string decoder and its owned HIR buffers. Request header validation
 runs on decoded bytes before lowering, preventing escaped CR/LF injection.
 Configuration remains static; CLI restart activates rotation/revocation changes.
 
+### Absence-only anonymous API key policy
+
+`auth.apiKeyOrAnonymous` requires the original Authorization field count together
+with its singleton value. Count 0 and an empty value returns an explicit guest
+Identity with method `anonymous` and empty credential ID. Count 1 must pass the
+existing Bearer verifier. Other counts, including the -1 parse-error sentinel,
+and inconsistent count/value inputs fail with 401. Invalid presented credentials
+never become anonymous. Empty configuration and equal authenticated/guest IDs
+return 503 before any fallback, preventing anonymous Consumer impersonation.
+Metadata comes only from trusted configuration; client identity headers are ignored.
+
+This is per-request optional authentication, not a session, login or proof that
+an endpoint should allow guests. Run an explicit authorization helper afterward
+to restrict a private route; it may return 403 for the guest identity. Request
+mutations do not create absence, because both reads use the original buffer.
+Configuration and key rotation still require compile/load and restart. The
+helper uses ordinary existing Rut guards, match and Identity construction.
+
 ### Explicit credential header stripping
 
 `req.remove("Name")` extends the existing statement-only request mutation surface
