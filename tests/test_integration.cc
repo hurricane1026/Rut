@@ -18982,11 +18982,17 @@ struct WsEchoServer {
                 break;
             }
             char req[2048];
-            (void)recv_timeout(client, req, sizeof(req), 1000);  // the upgrade request
+            u32 req_len = recv_http_headers(client, req, sizeof(req));
             const char k101[] =
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: "
                 "Upgrade\r\n\r\n";
-            (void)send_all(client, k101, sizeof(k101) - 1);
+            const char k101_ext[] =
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: "
+                "Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+            if (buf_contains(req, req_len, "Sec-WebSocket-Extensions: permessage-deflate", 44))
+                (void)send_all(client, k101_ext, sizeof(k101_ext) - 1);
+            else
+                (void)send_all(client, k101, sizeof(k101) - 1);
             char buf[4096];
             while (s->running.load(std::memory_order_acquire)) {
                 i32 n = recv_timeout(client, buf, sizeof(buf), 200);
@@ -19058,12 +19064,14 @@ TEST(websocket_e2e, passthrough_tunnel_echoes_both_ways) {
     REQUIRE(c >= 0);
     const char kUpgrade[] =
         "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
 
     char buf[1024];
     u32 n = recv_http_headers(c, buf, sizeof(buf));
     CHECK(n > 0 && buf_contains(buf, n, "101", 3));  // upgrade relayed
+    CHECK(buf_contains(buf, n, "Sec-WebSocket-Extensions: permessage-deflate", 44));
 
     REQUIRE(send_all(c, "HELLO", 5));
     i32 m = recv_timeout(c, buf, sizeof(buf), 2000);
@@ -19112,12 +19120,14 @@ TEST(websocket_e2e, passthrough_tunnel_iouring) {
     set_socket_timeouts(c, 5);
     const char kUpgrade[] =
         "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
 
     char buf[1024];
     u32 n = recv_http_headers(c, buf, sizeof(buf));
     CHECK(n > 0 && buf_contains(buf, n, "101", 3));  // upgrade relayed
+    CHECK(buf_contains(buf, n, "Sec-WebSocket-Extensions: permessage-deflate", 44));
 
     // Multiple echo rounds: a tunnel recv silently cancelled by the same-fd re-arm
     // race would hang one of these reads.
