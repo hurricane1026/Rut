@@ -24747,3 +24747,28 @@ route POST "/codec" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, json_allocation_failure_is_explicit) {
+    u8 has = 1;
+    const char* ptr = "old";
+    u32 len = 3;
+    i64 number = 1;
+    rut_helper_json(nullptr,
+                    nullptr,
+                    static_cast<u32>(json::Op::Quote),
+                    "x",
+                    1,
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    0,
+                    &has,
+                    &ptr,
+                    &len,
+                    &number);
+    CHECK_EQ(has, 0);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+    CHECK_EQ(number, 0);
+}
