@@ -210,6 +210,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqSetHeader:
             buf.put_cstr("req.set_header");
             break;
+        case Opcode::ReqSetOwnedHeader:
+            buf.put_cstr("req.set_owned_header");
+            break;
         case Opcode::ReqAddHeader:
             buf.put_cstr("req.add_header");
             break;
@@ -753,6 +756,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             // No operands.
             break;
         case Opcode::ReqSetHeader:
+        case Opcode::ReqSetOwnedHeader:
         case Opcode::ReqAddHeader:
         case Opcode::RespHeader:
         case Opcode::RespSetHeader:

@@ -24767,6 +24767,76 @@ TEST(jit, owned_request_headers_copy_borrowed_inputs_and_fail_closed) {
     pool.destroy();
 }
 
+TEST(jit, verified_identity_header_is_only_recorded_on_selected_auth_path) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    const char* source = R"rut(
+import "middleware/auth.rut"
+upstream backend
+route GET "/" {
+    req.remove("Authorization")
+    let identity = auth.apiKey(req.authorization.or(""), "secret", "alice", "key")
+    match identity.consumerId {
+        "alice" => { req.set("X-Consumer-ID", identity.consumerId) return forward(backend, load_balance: .roundRobin) }
+        _ => return 403
+    }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    Connection conn;
+    for (bool valid : {false, true}) {
+        conn.reset();
+        conn.json_arena.backend.pool = &pool;
+        const char* request = valid ? "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer "
+                                      "secret\r\nX-Consumer-ID: attacker\r\n\r\n"
+                                    : "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer "
+                                      "wrong\r\nX-Consumer-ID: attacker\r\n\r\n";
+        const auto result = HandlerResult::unpack(handler(
+            &conn, nullptr, reinterpret_cast<const u8*>(request), lit(request).len, nullptr));
+        if (!valid) {
+            CHECK_EQ(result.status_code, 401);
+            CHECK_EQ(conn.req_header_override_count, 1u);
+        } else {
+            CHECK(result.action == HandlerAction::Forward);
+            REQUIRE_EQ(conn.req_header_override_count, 2u);
+            CHECK(conn.req_header_overrides[1].value.eq(lit("alice")));
+            u8 wire[512]{};
+            u32 wire_len = 0;
+            REQUIRE(h2_prepare_forward_request(conn,
+                                               reinterpret_cast<const u8*>(request),
+                                               lit(request).len,
+                                               wire,
+                                               sizeof(wire),
+                                               &wire_len));
+            const char expected[] =
+                "GET / HTTP/1.1\r\nHost: localhost\r\nX-Consumer-ID: alice\r\n\r\n";
+            CHECK_EQ(wire_len, sizeof(expected) - 1);
+            CHECK(__builtin_memcmp(wire, expected, sizeof(expected) - 1) == 0);
+        }
+    }
+    conn.json_arena.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, json_type_parse_construct_edit_and_extract) {
     const char* src = R"rut(
 func identity(_ value: Json) -> Json => value

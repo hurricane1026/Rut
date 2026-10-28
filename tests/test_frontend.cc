@@ -33634,9 +33634,9 @@ TEST(frontend, req_set_is_statement_only_and_validates_arguments) {
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
-        CHECK(hir.error().detail.eq(lit(
-            "req.set/add expect literal safe header name and value strings, and may only be used "
-            "as a statement")));
+        CHECK(hir.error().detail.eq(
+            lit("req.set/add expect a literal safe header name and a non-optional string value "
+                "(req.add requires a literal), and may only be used as a statement")));
     }
 }
 

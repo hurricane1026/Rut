@@ -8,7 +8,12 @@ route GET "/private" {
     // the original request; rejected requests return locally with a challenge.
     req.remove("Authorization")
     req.remove("X-API-Key")
-    req.remove("X-Consumer-ID")
     let identity = auth.apiKey(req.authorization.or(""), env("RUT_API_KEY"), "example-app", "primary")
-    if identity.consumerId == "example-app" { return forward(backend, load_balance: .roundRobin) } else { return 403 }
+    match identity.consumerId {
+        "example-app" => {
+            req.set("X-Consumer-ID", identity.consumerId)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => return 403
+    }
 }

@@ -180,6 +180,7 @@ enum class Opcode : u8 {
 
     // ── Request mutation ──
     ReqSetHeader,           // req.set_header "Name", %val
+    ReqSetOwnedHeader,      // validated request-owned copy of a runtime value
     ReqAddHeader,           // req.add_header "Name", %val
     ReqRemoveHeader,        // Remove all case-insensitive matches before forwarding.
     RespHeader,             // %opt = resp.header "Name", %fallback_opt

@@ -2537,6 +2537,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                              : value.kind == MirValueKind::ReqAddHeader
                                  ? static_cast<bool>(b.emit_req_add_header(
                                        value.str_value, val.value(), {span.line, span.col}))
+                             : value.lhs->kind != MirValueKind::StrConst
+                                 ? static_cast<bool>(b.emit_req_set_owned_header(
+                                       value.str_value, val.value(), {span.line, span.col}))
                                  : static_cast<bool>(b.emit_req_set_header(
                                        value.str_value, val.value(), {span.line, span.col}));
         if (!emitted) return frontend_error(FrontendError::OutOfMemory, span);

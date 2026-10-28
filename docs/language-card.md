@@ -237,8 +237,8 @@ req.authorization (str?)   req.host  req.userAgent  req.origin (str?)
 // Raw headers — function access ONLY (never req.X-Foo property syntax)
 req.header("X-Request-ID")   // str?
 req.uniqueHeader("X-API-Key") // str?; missing or duplicate fields yield nil
-req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only
-req.add("X-Tag", "a")        // ✅ preserve existing fields and append
+req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only; string values may be dynamic
+req.add("X-Tag", "a")        // ✅ preserve existing fields and append; literal value
 req.remove("Authorization")  // ✅ delete every matching field before forwarding
 req.getAll("Accept")         // ⏳ [str]
 
@@ -1293,8 +1293,11 @@ forwarded. Removal modes reset at each request/HTTP/2 stream boundary.
 
 See [examples/auth-proxy.rut](../examples/auth-proxy.rut). Explicitly remove each
 configured credential source and any client identity fields you do not trust.
-Query/body credentials and dynamically forwarding verified Identity fields are
-separate capabilities; this helper only removes named header fields.
+Query/body credentials require separate handling. To forward a verified Identity,
+use `req.set("X-Consumer-ID", identity.consumerId)` in a selected match arm
+after authentication, as in the example. Replacement removes every client-supplied
+field with that name. Runtime values are validated and copied into bounded
+request-owned storage; invalid values or exhausted storage fail forwarding closed.
 
 ## JWT resource-server claims profile
 

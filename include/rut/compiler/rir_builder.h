@@ -603,6 +603,15 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_req_set_owned_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::ReqSetOwnedHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
     VoidResult emit_req_add_header(Str name, ValueId val, SourceLoc loc = {}) {
         if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqAddHeader, nullptr, loc));
