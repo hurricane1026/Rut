@@ -14,6 +14,7 @@
 #include "rut/serve_loader.h"
 #endif
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 
 #include <poll.h>
@@ -24,6 +25,13 @@
 using namespace rut;
 
 namespace {
+bool grpc_temp_template(char* path, size_t capacity, const char* name) {
+    const char* directory = std::getenv("TMPDIR");
+    if (!directory || !directory[0]) directory = "/tmp";
+    const int length = snprintf(path, capacity, "%s/%s", directory, name);
+    return length >= 0 && static_cast<size_t>(length) < capacity;
+}
+
 template <typename Call>
 inline bool grpc_test_ssl_call(SSL* ssl,
                                int fd,
@@ -699,7 +707,8 @@ void streaming_case(rut::test::TestCase* _tc,
     };
     auto compiled = std::make_unique<Program>();
     if (tls || upstream_tls) {
-        char path[] = "/tmp/rut-grpc-XXXXXX";
+        char path[256];
+        REQUIRE(grpc_temp_template(path, sizeof(path), "rut-grpc-XXXXXX"));
         const int file = mkstemp(path);
         REQUIRE(file >= 0);
         char source[2048];
@@ -3515,12 +3524,14 @@ void tls_rejection_case(rut::test::TestCase* _tc, u32 mode) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start(true, mode == 1, mode != 2));
     struct TemporaryCa {
-        char path[64] = "/tmp/rut-grpc-untrusted-XXXXXX";
+        char path[256]{};
         bool created = false;
         ~TemporaryCa() {
             if (created) unlink(path);
         }
     } temporary_ca;
+    REQUIRE(grpc_temp_template(
+        temporary_ca.path, sizeof(temporary_ca.path), "rut-grpc-untrusted-XXXXXX"));
     if (mode == 3) {
         EVP_PKEY* key = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "prime256v1");
         REQUIRE(key);
