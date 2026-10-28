@@ -41184,3 +41184,22 @@ TEST(frontend, header_count_requires_literal_token_name_and_request_context) {
     REQUIRE(ast);
     CHECK(analyze_file_heap(ast.value()));
 }
+
+TEST(frontend, json_type_is_not_a_string_and_arguments_are_checked) {
+    const char* invalid[] = {
+        "route GET \"/x\" { let x: Json = \"{}\" return 200 }",
+        "route GET \"/x\" { let x = json.get(\"{}\", \"/a\") return 200 }",
+        "route GET \"/x\" { let x = json.parse(12) return 200 }",
+        "route GET \"/x\" { let x = json.unknown(\"{}\") return 200 }",
+        "route GET \"/x\" { let x = json({ a: 1, a: 2 }) return 200 }",
+        "route GET \"/x\" { let x = json.parse(\"{}\") let y = json.keys(x) return 200 }",
+    };
+    for (const char* src : invalid) {
+        auto tokens = lex(lit(src));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(!hir);
+    }
+}
