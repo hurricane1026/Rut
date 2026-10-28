@@ -1,5 +1,6 @@
 // Per-shard independent control system tests.
 #include "rs256_fixture.h"
+#include "rut/runtime/mapped_array.h"
 #include "rut/runtime/route_table.h"
 #ifdef __linux__
 #include "rut/runtime/iouring_event_loop.h"
@@ -1644,16 +1645,18 @@ void rs256_reload_activates_only_the_adopting_shard(rut::test::TestCase* _tc) {
     Rs256Policies new_owner;
     REQUIRE(old_owner.load(&old_key.policy, 1));
     REQUIRE(new_owner.load(&new_key.policy, 1));
-    MmapArena arena;
-    REQUIRE(arena.init(4096));
-    struct Cleanup {
-        MmapArena& arena;
-        ~Cleanup() { arena.destroy(); }
-    } cleanup{arena};
-    auto* before = arena.alloc_t<RouteConfig>();
-    auto* after = arena.alloc_t<RouteConfig>();
-    auto* loop = arena.alloc_t<Loop>();
-    REQUIRE(before && after && loop);
+    MappedArray<RouteConfig> before_storage;
+    MappedArray<RouteConfig> after_storage;
+    MappedArray<Loop> loop_storage;
+    REQUIRE(before_storage.init(1).has_value());
+    REQUIRE(after_storage.init(1).has_value());
+    REQUIRE(loop_storage.init(1).has_value());
+    auto* before = before_storage.data();
+    auto* after = after_storage.data();
+    auto* loop = loop_storage.data();
+    CHECK_EQ(reinterpret_cast<uintptr_t>(before) % alignof(RouteConfig), 0u);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(after) % alignof(RouteConfig), 0u);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(loop) % alignof(Loop), 0u);
     REQUIRE(before->add_rs256_configuration(old_key.policy));
     REQUIRE(after->add_rs256_configuration(new_key.policy));
     before->rs256 = &old_owner;
@@ -1685,7 +1688,6 @@ void rs256_reload_activates_only_the_adopting_shard(rut::test::TestCase* _tc) {
     CHECK(verify(new_owner, 3, new_key.policy, new_token));
     CHECK(!verify(new_owner, 2, new_key.policy, new_token));
     CHECK(!verify(old_owner, 3, old_key.policy, new_token));
-    loop->~Loop();
 }
 }  // namespace
 

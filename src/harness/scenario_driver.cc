@@ -342,6 +342,13 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     }
 
     activate_rut_program(scenario.target->program);
+    if (!scenario.target->program.config.activate_rs256(scenario.shard_id)) {
+        out.harness.outcome = Outcome::Failed;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness, "scenario RS256 policy activation failed");
+        connection.destroy();
+        return out;
+    }
     ScenarioState local_state{};
     ScenarioState* state = scenario.state != nullptr ? scenario.state : &local_state;
     if (!state->ensure_cache_state()) {
