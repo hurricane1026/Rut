@@ -40,7 +40,15 @@ int main(int argc, char** argv) {
         return 2;
     }
 #endif
-    char directory[] = "/tmp/rut-compile-XXXXXX";
+    const char* temporary = getenv("TMPDIR");
+    if (!temporary || !temporary[0]) temporary = "/tmp";
+    char directory[4096];
+    // Leave room for program.so and its temporary object file below.
+    if (snprintf(directory, sizeof(directory), "%s/rut-compile-XXXXXX", temporary) >=
+        static_cast<int>(sizeof(directory) - 16)) {
+        fprintf(stderr, "rut-compile temporary directory is too long\n");
+        return 1;
+    }
     if (!mkdtemp(directory)) {
         perror("rut-compile directory");
         return 1;

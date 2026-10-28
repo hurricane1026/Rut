@@ -21,6 +21,7 @@
 #include "rut/runtime/route_canon.h"   // canonicalize_request
 #include "rut/runtime/route_select.h"  // path_has_param_segment
 #include "rut/runtime/route_trie.h"
+#include "rut/runtime/rs256_policy.h"
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn (terminate-mode routes)
 #include <new>  // Existing std::nothrow allocations during configuration staging.
 
@@ -353,6 +354,8 @@ struct RouteConfig {
     // Runtime sidecars are excluded from native metadata. Each shard exclusively
     // owns its row; the existing request epoch pins the sidecar with its config.
     mutable BackendSelectionState backend_selection[kMaxShards]{};
+    // Sidecar is excluded from native metadata and retained with the program.
+    Rs256Policies* rs256 = nullptr;
 
     // Phase 2 dispatch — 2-way tagged union.
     //
@@ -691,6 +694,30 @@ struct RouteConfig {
     u32 exact_strict_local_response_binding_count = 0;
     char strict_local_response_bytes[kStrictLocalResponseBytesPoolBytes];
     u32 strict_local_response_bytes_used = 0;
+    Str rs256_configurations[Rs256Policies::kMaxPolicies]{};
+    u32 rs256_configuration_count = 0;
+    char rs256_configuration_bytes[Rs256Policy::kMaxText * Rs256Policies::kMaxPolicies]{};
+    u32 rs256_configuration_bytes_used = 0;
+
+    bool add_rs256_configuration(Str value) {
+        if (rs256_configuration_count > Rs256Policies::kMaxPolicies ||
+            rs256_configuration_bytes_used > sizeof(rs256_configuration_bytes))
+            return false;
+        for (u32 i = 0; i < rs256_configuration_count; ++i)
+            if (rs256_configurations[i].eq(value)) return true;
+        if (!value.ptr || value.len == 0 || value.len > Rs256Policy::kMaxText ||
+            rs256_configuration_count == Rs256Policies::kMaxPolicies ||
+            value.len > sizeof(rs256_configuration_bytes) - rs256_configuration_bytes_used)
+            return false;
+        char* out = rs256_configuration_bytes + rs256_configuration_bytes_used;
+        __builtin_memcpy(out, value.ptr, value.len);
+        rs256_configurations[rs256_configuration_count++] = {out, value.len};
+        rs256_configuration_bytes_used += value.len;
+        return true;
+    }
+    bool activate_rs256(u32 shard) const {
+        return rs256_configuration_count == 0 || (rs256 && rs256->activate(shard));
+    }
 
     bool has_strict_local_response_policy_inventory() const {
         return strict_local_response_policy_count != 0 || strict_local_response_bytes_used != 0;

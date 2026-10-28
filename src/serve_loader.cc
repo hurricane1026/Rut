@@ -41,6 +41,7 @@ void LoadedProgram::destroy() {
         engine.shutdown();
         jit_inited = false;
     }
+    rs256.destroy();
     rir.destroy();
     if (src_map) {
         munmap(src_map, src_map_len);
@@ -330,6 +331,9 @@ bool load_rut_program(const char* path,
     // the routes. Both fail closed.
     err.stage = LoadStage::Register;
     if (!populate_route_config_with_retained_body_views(out.config, out.rir.module)) return false;
+    if (!out.rs256.load(out.config.rs256_configurations, out.config.rs256_configuration_count))
+        return false;
+    out.config.rs256 = &out.rs256;
     // After the transactional populate: a failed populate restores a byte
     // snapshot, which would leak files created inside it.
     attach_response_body_files(out.config);

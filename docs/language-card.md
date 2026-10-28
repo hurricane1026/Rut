@@ -1059,7 +1059,8 @@ hash:    md5/sha1/sha224/sha256/sha384/sha512(data) -> str? (lowercase hex)
          hmacMd5/hmacSha1/hmacSha224/hmacSha256/hmacSha384/hmacSha512(key, data) -> str?
          ⏳ fnv32 fnv64
 jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
-         decode with json.decode/json.get). ⏳ publicKey/RS/ES and jwtEncode
+         decode with json.decode/json.get). jwtVerifyRs256(tok, policy) -> Json?
+         (static JWKS + claims policy). ⏳ other RS/ES algorithms and jwtEncode
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
 time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
@@ -1474,7 +1475,8 @@ invalid tokens to a challenged 401.
 `examples/jwt-claims-auth.rut` pins HS256 before checking issuer, audience,
 expiry and scopes. Signature verification does not replace claims policy.
 This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism;
-asymmetric JWT/JWKS remain separate work.
+Other asymmetric algorithms and remote JWKS refresh remain separate work;
+configured RS256 verification is described below.
 
 ## Public HTTP response cache (implemented)
 
@@ -1621,3 +1623,51 @@ each. Empty slots disable membership. Unknown Consumers and missing membership
 receive 403; invalid configuration receives 503. Replacing the trusted snapshot
 revokes membership. Client identity/group headers never populate the registry.
 See `examples/consumer-group-auth.rut` (relative to the repository root).
+
+
+### RS256 with a configured trust policy
+
+`jwtVerifyRs256(token, policy) -> Json?` verifies RS256 and claims together.
+Both arguments are unwrapped `str`; policy must be compile-time configuration,
+including through inlined helpers. Use a literal, constant, or `env()` snapshot.
+A request-derived policy is a compile error. The JSON policy has exactly:
+
+```json
+{"issuer":"https://issuer.example","audience":"orders","kids":["current","previous"],"jwks":{"keys":[]}}
+```
+
+Replace the empty example `keys` with public RSA JWKs whose `kid` matches every
+approved ID. Empty/missing/duplicate kids, invalid selected keys, empty issuer or
+audience, extra policy members and duplicate decoded JSON names are rejected
+before serving. Policy text is at most 8192 bytes; at most 8 distinct policies
+per configuration, 16 keys per JWKS, kid 1–128 decoded bytes, issuer/audience
+1–1024 decoded bytes each. Approved keys require `kty=RSA`, `alg=RS256`, exponent
+65537, 2048–4096 bit modulus, canonical base64urlUInt; private parameters are
+rejected. Optional `use`/`key_ops` must be `sig`/`["verify"]`.
+
+The protected JOSE header must contain exactly RS256 and an approved kid. URLs
+and embedded keys never create trust. No algorithm, default-key or unknown-kid
+fallback occurs. Compact tokens use canonical unpadded base64url, object header
+≤1024 bytes, claims ≤8192 bytes, and total input ≤24 KiB; duplicate member names
+and `crit`/`b64` extensions fail closed. Claims require nonempty string `sub`,
+exact trusted `iss`, matching string or string-array `aud`, integer `exp` later
+than the current Unix second, and optional integer `nbf`/`iat` no later than now.
+Clock failure rejects. No skew is allowed. Any signature/claims failure returns
+nil; no partially verified document is published. Success returns claims as Json
+with the existing request-arena lifetime.
+
+`auth.jwtDocumentRs256(authorization, policy)` challenges invalid Bearer input
+with 401. Pass `req.authorization.or("")` to reject duplicate Authorization
+fields. `auth.jwtIdentityRs256(authorization, policy, scope, credentialId)` also
+requires an exact scope (403 plus Bearer insufficient_scope on rejection) before
+returning Identity with verified subject, configured credentialId, and method
+`jwtRS256`. Empty scope/credentialId configuration returns 503. See
+[jwt-rs256-auth.rut](../examples/jwt-rs256-auth.rut).
+
+Key parsing runs during configuration loading; each shard activates independent
+verification scratch before serving, including reloads. Policy bytes and keys
+are retained through in-flight requests, for both JIT and native programs.
+Replace configuration to rotate/remove approved keys; old in-flight readers
+finish against their original policy. Remote JWKS fetching/cache/refresh, OIDC,
+revocation lists, replay prevention, other RSA/EC algorithms and JWT signing
+are not implemented by this API.

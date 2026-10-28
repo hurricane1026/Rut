@@ -16,7 +16,7 @@ whether a competing open-source edition includes them.
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping | Dynamic Consumer registry/credential lifecycle, query/body credential hiding and verified identity forwarding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection | Dynamic Consumer registry, anonymous only for absent credentials, no invalid-credential downgrade |
-| JWT verification | HS256/384/512 policy helpers; native fixed-key RS256 decoder and trusted configured JWK Set selection | Rut/JIT asymmetric key wiring, ES keys, request-key selection, JWKS rotation/cache, revocation and unknown-key policy |
+| JWT verification | HS256/384/512 policy helpers; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation | ES keys, remote JWKS refresh/cache, token revocation |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks HTTP/Rut wiring and replay persistence |
 | ACL / Consumer restriction | Exact single-consumer allow/deny and two-consumer allow union after verification | Multiple groups, membership lifecycle, registry-backed default deny, no client identity spoofing |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
@@ -45,9 +45,9 @@ The 2026-10-27 audit separates these layers:
   slots (Bearer/Basic for each of two Consumers), rejects ambiguous ownership,
   and returns metadata from the matched configuration. This is a static bounded
   policy, not a persistent Consumer registry or a claim of plugin equivalence.
-- Native RS256/JWK/JWKS verification and claims validation exist, but no Rut key
-  owner/configuration surface publishes shard verifiers. HTTP asymmetric auth
-  remains pending; parsing keys on each request would violate the hot-path goal.
+- RS256/JWK/JWKS now has a trusted static Rut policy surface, configuration-owned
+  keys and shard-local activation. Public-key parsing stays off the request path.
+  Remote discovery/refresh and live token revocation remain outstanding.
 - Anonymous access needs a presence distinction: singleton Authorization reads
   return nil for both absence and duplicates. Falling back on nil would turn
   malformed duplicate credentials into anonymous access. No anonymous helper is
@@ -140,9 +140,8 @@ route authorization and original reads after removal.
 
 The audit retains these separate outstanding gates:
 
-- Native RS256/JWK/JWKS and claims validation still need trusted Rut configuration
-  ownership and shard-verifier publication; key import must not move onto the
-  request path.
+- Remote JWKS discovery/refresh and token-level revocation remain separate from
+  the implemented configuration-owned RS256 integration.
 - Forward-auth/OPA/introspection need reusable bounded response-consuming callouts
   with both-backend failure/cancel/close and buffer-lifetime evidence.
 - OAuth/OIDC login, replay prevention and dynamic identity lifecycle require
@@ -176,7 +175,8 @@ spoofed identity headers. See `examples/consumer-group-auth.rut`.
 1. Complete local credential foundations and signed-message primitives. Add
    independent RFC vectors, binary/empty/oversize inputs, duplicate fields,
    rotation/revocation and JIT-to-runtime evidence.
-2. Complete signed-request freshness/replay policy and asymmetric JWT/JWKS.
+2. Complete signed-request freshness/replay policy, remaining asymmetric algorithms,
+   and remote JWKS refresh.
    Canonicalization and supported algorithms must be explicit profiles, with
    negative interoperability vectors; do not accept token-controlled algorithms.
 3. Build reusable bounded response-consuming callouts, then forward-auth, OPA
@@ -269,7 +269,8 @@ Unknown metadata is ignored and never establishes trust: no `kid` selection,
 certificate processing, URL fetching, JWK-set handling or JWKS refresh occurs.
 The caller must supply trusted configuration. Import allocates only during
 configuration; request verification continues through the existing shard-owned
-verifier. This adds no Rut/JIT API or complete asymmetric authorization flow.
+verifier. The configured RS256 integration below supplies the Rut/JIT
+authorization surface around this native importer.
 The representation follows [RFC 7518 §6.3.1](https://www.rfc-editor.org/rfc/rfc7518.html#section-6.3.1)
 and the usage fields follow [RFC 7517 §4](https://www.rfc-editor.org/rfc/rfc7517.html#section-4),
 with the stricter mandatory algorithm policy described above.
@@ -334,7 +335,8 @@ wrong-recipient tokens fail with an invalid document and zero output length.
 The caller must still enforce scopes, revocation and replay policy, and must
 not use unspecified output bytes after failure. Tests cover signed claim-policy
 failures, malformed/tampered tokens, stale-publication invalidation and crypto
-allocation hooks. This is a native API; Rut/JIT wiring remains pending.
+allocation hooks. The configured Rut/JIT/native integration below uses this same
+profile with approved protected-header kid selection.
 
 ## Standard Webhooks symmetric verification
 
@@ -387,3 +389,28 @@ This is storage groundwork, not a new Rut mutation surface or a complete
 verified-identity forwarding policy. The language integration must still enforce
 literal header names, unwrapped runtime values, replacement of spoofed headers,
 credential stripping and correct ordering after authentication.
+
+
+## Configured RS256 end-to-end integration
+
+`jwtVerifyRs256(token, policy)` now connects approved public JWK Sets to Rut,
+JIT handlers and exported native programs. The static policy binds issuer,
+audience, approved kids and public JWKS. Invalid policies fail at compilation or
+loading. Mutable verification state belongs to individual shards, activates
+before accepts/config adoption, and is retained with its configuration generation
+until readers retire. Unactivated/failed rows reject without lazy key import.
+
+`auth.jwtDocumentRs256` verifies the Bearer signature and mandatory claims;
+`auth.jwtIdentityRs256` additionally authorizes scope before publishing subject
+and a trusted policy credential ID. HTTP tests cover valid tokens, signature
+modification, wrong algorithms, unknown/missing kid, wrong issuer/audience,
+expiry/future nbf, empty subject, scope rejection, duplicate Authorization and
+clock failure. Native artifact tests remove the source after compiler exit and
+verify against reconstructed configuration owners. Native crypto tests cover
+approved multi-key rotation, removed-key rejection, independent generations and
+zero crypto allocations during warmed verification.
+
+See [the language card](language-card.md#rs256-with-a-configured-trust-policy)
+for exact bounds and [the runnable example](../examples/jwt-rs256-auth.rut).
+Remote key refresh, OAuth/OIDC and persistent revocation/replay state remain
+outside this implemented static resource-server profile.

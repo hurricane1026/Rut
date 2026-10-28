@@ -8,6 +8,7 @@
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/route_method.h"
+#include "rut/runtime/rs256_policy.h"
 #include "rut/runtime/ws_terminate.h"  // ws_valid_close_code (shared close-code predicate)
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
 #include <hs.h>
@@ -3862,6 +3863,55 @@ static FrontendResult<HirExpr> make_json_op(json::Op op,
     return out;
 }
 
+// Helper parameters are only values after inlining. Defer the static policy
+// obligation in helper scratch, then discharge it on every concrete route use.
+static FrontendResult<void> normalize_rs256_policy(HirExpr& expression,
+                                                   HirRoute* route,
+                                                   const HirLocal* locals,
+                                                   u32 local_count) {
+    if (expression.kind != HirExprKind::JsonOp ||
+        expression.int_value != static_cast<i64>(json::Op::JwtVerifyRs256))
+        return {};
+    if (expression.args.len != 2 || !expression.args[1])
+        return frontend_error(FrontendError::UnsupportedSyntax, expression.span);
+    const HirExpr* value = expression.args[1];
+    // LocalRef holds a stable ref_index, which may differ from the array slot
+    // after guards, shadowing, or synthesized helper locals. Never prove trust
+    // using an unrelated local that happens to occupy that numeric slot.
+    for (u32 depth = 0; depth <= local_count && value->kind == HirExprKind::LocalRef; ++depth) {
+        const HirExpr* next = nullptr;
+        for (u32 i = 0; i < local_count; ++i) {
+            if (locals[i].ref_index == value->local_index) {
+                next = &locals[i].init;
+                break;
+            }
+        }
+        if (!next) break;
+        value = next;
+    }
+    if (value->kind != HirExprKind::StrLit || value->type != HirTypeKind::Str || value->may_nil ||
+        value->may_error) {
+        if (route && route->is_helper_scratch) return {};
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expression.span,
+                              lit_str("RS256 policy must be compile-time configuration"));
+    }
+    Rs256Policy trust;
+    if (!trust.load(value->str_value))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expression.span,
+                              lit_str("invalid RS256 trust policy"));
+    HirExpr literal{};
+    literal.kind = HirExprKind::StrLit;
+    literal.type = HirTypeKind::Str;
+    literal.str_value = value->str_value;
+    literal.span = expression.span;
+    if (!route->exprs.push(literal))
+        return frontend_error(FrontendError::OutOfMemory, expression.span);
+    expression.args[1] = &route->exprs[route->exprs.len - 1];
+    return {};
+}
+
 static u32 next_local_ref_index(const HirRoute* route, const HirLocal* locals, u32 local_count);
 
 // Convert an already analyzed value to JSON. Keeping the analyzed HIR value
@@ -5661,6 +5711,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     out.span = expr.span;
+    auto policy = normalize_rs256_policy(out, route, route->locals.data, route->locals.len);
+    if (!policy) return core::make_unexpected(policy.error());
     return out;
 }
 
@@ -9193,6 +9245,34 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.str_value = interned.value();
         out.span = expr.span;
         return out;
+    }
+    if (expr.name.eq(lit_str("jwtVerifyRs256")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("jwtVerifyRs256"))) {
+        if (pipe_lhs || expr.args.len != 2)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("use jwtVerifyRs256(token, policy) directly"));
+        auto token = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!token) return token;
+        auto policy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (!policy) return policy;
+        if (token->type != HirTypeKind::Str || token->may_nil || token->may_error ||
+            policy->type != HirTypeKind::Str || policy->may_nil || policy->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("jwtVerifyRs256 requires unwrapped str values"));
+        auto operation = make_json_op(json::Op::JwtVerifyRs256,
+                                      HirTypeKind::Json,
+                                      true,
+                                      &token.value(),
+                                      &policy.value(),
+                                      nullptr,
+                                      expr.span,
+                                      route);
+        if (!operation) return operation;
+        auto normalized = normalize_rs256_policy(operation.value(), route, locals, local_count);
+        if (!normalized) return core::make_unexpected(normalized.error());
+        return operation;
     }
     if (expr.name.eq(lit_str("jwtDecode")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, lit_str("jwtDecode"))) {

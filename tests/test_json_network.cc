@@ -1,4 +1,5 @@
 #include "fault_injection.h"
+#include "rs256_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -48,6 +49,7 @@ struct JsonProgram {
     std::unique_ptr<MirModule> mir;
     FrontendRirModule rir{};
     jit::JitEngine engine;
+    Rs256Policies rs256;
     std::unique_ptr<RouteConfig> config = std::make_unique<RouteConfig>();
     bool init(const char* custom_source = nullptr, const char* source_path = nullptr) {
         const Str source = custom_source != nullptr ? cstr(custom_source) : lit_str(R"rut(
@@ -71,8 +73,11 @@ route POST "/json" {
         if (!lower_to_rir(*mir, rir)) return false;
         auto cg = jit::codegen(rir.module);
         if (!cg.ok || !engine.init() || !engine.compile(cg.mod, cg.ctx)) return false;
-        return populate_route_config(*config, rir.module) &&
-               register_jit_routes(*config, rir.module, engine);
+        if (!populate_route_config(*config, rir.module) ||
+            !rs256.load(config->rs256_configurations, config->rs256_configuration_count))
+            return false;
+        config->rs256 = &rs256;
+        return register_jit_routes(*config, rir.module, engine);
     }
     jit::HandlerFn handler(u32 route_index = 0) {
         char name[] = "handler_route_0";
@@ -1098,4 +1103,125 @@ TEST(json_network, jwt_algorithm_middleware_rejects_empty_secret) {
         CHECK_EQ(outcome.status_code, 503u);
         loop->free_conn(*conn);
     }
+}
+
+TEST(json_network, rs256_http_identity_requires_static_trust_signature_claims_and_scope) {
+    test::Rs256Fixture fixture;
+    REQUIRE(fixture.init());
+    Rs256Policy checked;
+    REQUIRE(checked.load(fixture.policy));
+    const std::string policy(fixture.policy.ptr, fixture.policy.len);
+    REQUIRE_EQ(setenv("RUT_TEST_RS256_POLICY", policy.c_str(), 1), 0);
+    struct Environment {
+        ~Environment() { unsetenv("RUT_TEST_RS256_POLICY"); }
+    } environment;
+    JsonProgram program;
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/jwt-rs256-auth.rut";
+    REQUIRE(program.init(R"rut(
+import "middleware/auth.rut"
+route GET "/rs256" {
+    let configured = env("RUT_TEST_RS256_POLICY")
+    let policy = configured
+    let identity = auth.jwtIdentityRs256(req.authorization.or(""), policy, "read", "issuer-rs256")
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
+)rut",
+                         source_path.c_str()));
+    CHECK_EQ(program.config->rs256_configuration_count, 1u);
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    conn->json_arena.backend.pool = &pool;
+    auto run = [&](Str token, u32 status, bool duplicate = false) {
+        const std::string auth(token.ptr ? token.ptr : "", token.len);
+        const std::string request = "GET /rs256 HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer " +
+                                    auth + (duplicate ? "\r\nAuthorization: Bearer " + auth : "") +
+                                    "\r\n\r\n";
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        conn->json_arena.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        const auto result = invoke_jit_handler(
+            program.handler(), conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        CHECK_EQ(result.status_code, status);
+        handle_jit_outcome(loop.get(), *conn, result, program.handler(), true);
+        const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+        if (status == 200)
+            CHECK(response.ends_with("alice"));
+        else
+            CHECK(response.find("alice") == std::string::npos);
+        if (status == 401) CHECK(response.find("WWW-Authenticate: Bearer") != std::string::npos);
+    };
+    char token[4096];
+    Str good = fixture.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
+    REQUIRE(good.len);
+    // No lazy initialization on the first request, and each shard needs its own activation.
+    run(good, 401);
+    REQUIRE(program.config->activate_rs256(0));
+    run(good, 200);
+    run(good, 401, true);
+    conn->shard_id = 1;
+    run(good, 401);
+    REQUIRE(program.config->activate_rs256(1));
+    run(good, 200);
+    struct Case {
+        const char* header;
+        const char* claims;
+        u32 status;
+    };
+    const Case cases[] = {
+        {R"({"alg":"RS256","kid":"unknown"})", nullptr, 401},
+        {R"({"alg":"RS256"})", nullptr, 401},
+        {R"({"alg":"HS256","kid":"current"})", nullptr, 401},
+        {R"({"alg":"none","kid":"current"})", nullptr, 401},
+        {R"({"alg":"RS256","kid":"current","crit":["x"],"x":true})", nullptr, 401},
+        {nullptr,
+         R"({"sub":"alice","iss":"other","aud":"gateway","exp":4102444800,"scope":"read"})",
+         401},
+        {nullptr,
+         R"({"sub":"alice","iss":"issuer","aud":"other","exp":4102444800,"scope":"read"})",
+         401},
+        {nullptr, R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1,"scope":"read"})", 401},
+        {nullptr,
+         R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800,"nbf":4102444799,"scope":"read"})",
+         401},
+        {nullptr,
+         R"({"sub":"","iss":"issuer","aud":"gateway","exp":4102444800,"scope":"read"})",
+         401},
+        {nullptr,
+         R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800,"scope":"reader"})",
+         403},
+        {nullptr, R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800})", 403},
+    };
+    for (const auto& item : cases) {
+        const Str header = item.header ? cstr(item.header) : test::Rs256Fixture::header;
+        const Str claims = item.claims ? cstr(item.claims) : test::Rs256Fixture::claims;
+        run(fixture.sign(header, claims, token), item.status);
+    }
+    good = fixture.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
+    token[good.len - 4] = token[good.len - 4] == 'a' ? 'b' : 'a';
+    run(good, 401);
+    run(lit_str("not-a-jwt"), 401);
+    good = fixture.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
+    test_fault::SyscallFaultConfig clock;
+    clock.clock_gettime_errno = EIO;
+    clock.clock_gettime_failures = 100;
+    {
+        test_fault::ScopedSyscallFault fault(clock);
+        run(good, 401);
+    }
+    loop->free_conn(*conn);
+    pool.destroy();
 }

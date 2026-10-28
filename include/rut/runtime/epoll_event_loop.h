@@ -398,6 +398,7 @@ public:
     }
 
     void run() {
+        if (config_ptr && *config_ptr) (void)(*config_ptr)->activate_rs256(shard_id);
         backend.add_accept();
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
@@ -452,6 +453,7 @@ public:
         if (!control) return;
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
         if (cfg && config_ptr) {
+            (void)cfg->activate_rs256(shard_id);
             *config_ptr = cfg;
             // A reload may repoint an upstream endpoint under the same
             // (upstream_id, backend_idx); drop idle sockets parked under the old

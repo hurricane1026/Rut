@@ -1,5 +1,6 @@
 #include "deferred_preflight_fixture.h"
 #include "framing_selection_preflight_fixture.h"
+#include "rs256_fixture.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_program.h"
 #include "rut/runtime/cache_table.h"
@@ -19,8 +20,15 @@
 using namespace rut;
 namespace {
 struct Source {
-    char path[80] = "/tmp/rut native source-XXXXXX";
-    int fd = mkstemp(path);
+    char path[4096] = "/tmp/rut native source-XXXXXX";
+    int fd = -1;
+    Source() {
+        const char* directory = getenv("TMPDIR");
+        if (directory && snprintf(path, sizeof(path), "%s/rut native source-XXXXXX", directory) >=
+                             static_cast<int>(sizeof(path)))
+            return;
+        fd = mkstemp(path);
+    }
     bool append(const char* bytes, u32 len) {
         while (len) {
             ssize_t n = write(fd, bytes, len);
@@ -495,4 +503,67 @@ TEST(native_program, forward_load_balance_survives_relocation_without_live_gauge
         CHECK_EQ(cfg.backend_selection[0].active[0][0], 0u);
         CHECK_EQ(cfg.backend_selection[0].cursor[i], 0u);
     }
+}
+
+TEST(native_program, rs256_policy_survives_compiler_exit_source_removal_and_shard_activation) {
+    test::Rs256Fixture fixture;
+    REQUIRE(fixture.init());
+    char source_bytes[8192];
+    json::Writer source_text{source_bytes, sizeof(source_bytes) - 1};
+    source_text.text(lit_str(R"rut(route GET "/" {
+    guard let claims = jwtVerifyRs256(bearerToken(req.authorization.or("")).or(""), )rut"));
+    REQUIRE(json::quote(fixture.policy, source_text));
+    source_text.text(lit_str(R"rut() else { return 401 }
+    guard jwtHasScope(claims, "read") else { return 403 }
+    return 200
+}
+)rut"));
+    REQUIRE(source_text.ok);
+    source_bytes[source_text.len] = '\0';
+    Source source;
+    REQUIRE(source.append(source_bytes));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& config = owner.p->config;
+    REQUIRE_EQ(config.rs256_configuration_count, 1u);
+    REQUIRE(config.rs256);
+    auto* connection = owner.arena.alloc_t<ConnectionBase>();
+    REQUIRE(connection);
+    connection->request_config = &config;
+    connection->shard_id = 2;
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    connection->json_arena.backend.pool = &pool;
+    char token[4096];
+    Str signed_token = fixture.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
+    REQUIRE(signed_token.len);
+    auto run = [&]() {
+        char request[8192];
+        const int count =
+            snprintf(request,
+                     sizeof(request),
+                     "GET / HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer %.*s\r\n\r\n",
+                     signed_token.len,
+                     signed_token.ptr);
+        jit::HandlerCtx context{};
+        connection->json_arena.reset();
+        const auto result =
+            jit::HandlerResult::unpack(config.routes[0].fn(connection,
+                                                           &context,
+                                                           reinterpret_cast<const u8*>(request),
+                                                           static_cast<u32>(count),
+                                                           nullptr));
+        return result.status_code;
+    };
+    CHECK_EQ(run(), 401u);
+    REQUIRE(config.activate_rs256(2));
+    CHECK_EQ(run(), 200u);
+    token[signed_token.len - 4] = token[signed_token.len - 4] == 'a' ? 'b' : 'a';
+    CHECK_EQ(run(), 401u);
+    signed_token = fixture.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
+    CHECK_EQ(run(), 200u);
+    connection->json_arena.destroy();
+    pool.destroy();
 }
