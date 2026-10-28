@@ -1,4 +1,4 @@
-// 仅 TLS 体积测量:用 OpenSSL static 作 BoringSSL 的上界代理。
+// 仅 TLS 体积测量:使用 OpenSSL static。
 #include <stdio.h>
 
 #include <openssl/sha.h>

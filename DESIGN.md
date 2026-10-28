@@ -7095,7 +7095,7 @@ A Language Server Protocol implementation for editor support and LLM integration
 | google/brotli | Static link | ~300KB | Brotli response compression |
 | zstd | Static link | already in tree | zstd response compression + access log compression |
 | Custom DNS client | Built-in | ~200 lines C++ | Async DNS resolution (UDP over io_uring, A/AAAA queries) |
-| OpenSSL / BoringSSL (Phase 2) | Dynamic link | ~3MB .so | TLS for inbound + outbound |
+| OpenSSL | Static, pinned build | build-dependent | TLS for inbound + outbound |
 
 Total external dependencies: **7-9**
 
@@ -7229,7 +7229,7 @@ let res = get https://dev-service/test {
 
 ```
 Implementation:
-  - OpenSSL / BoringSSL via BIO_s_mem (non-blocking, io_uring compatible)
+  - OpenSSL via BIO_s_mem (non-blocking, io_uring compatible)
   - Per-shard TLS session cache (per host:port)
     → Reuse TLS session on reconnect: saves ~5ms per connection
   - Connection pool preserves TLS state
@@ -7787,7 +7787,7 @@ native code is distributed to sidecars. Sidecars contain no compiler.
 | HTTP Parser (SIMD) | ✅ | ✅ |
 | Memory allocators (Arena/Slab/Slice) | ✅ | ✅ |
 | State types (Cache/LRU/Set...) | ✅ | ✅ |
-| TLS (BoringSSL) | ✅ | ✅ |
+| TLS (OpenSSL) | ✅ | ✅ |
 | Compression (zstd/brotli/libdeflate) | ✅ | ✅ |
 | Vectorscan (regex) | ✅ | ✅ |
 

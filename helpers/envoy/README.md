@@ -18,7 +18,7 @@ build-envoy-helper/rut-envoy-convert bootstrap.json > gateway.rut
 ```
 
 This build needs a C++23 toolchain and the repository headers, but no LLVM,
-BoringSSL, gateway runtime, or external Envoy libraries. In a full repository
+TLS libraries, gateway runtime, or external Envoy libraries. In a full repository
 build the binary is `build/helpers/envoy/rut-envoy-convert`.
 
 Run the emitted program separately with `build/src/rut gateway.rut`.

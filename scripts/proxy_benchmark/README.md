@@ -13,7 +13,7 @@ This is an optional Linux benchmark tool; it does not change Rut's runtime or ad
 
 The measured tool versions were kind `v0.33.0`, Kubernetes node image `kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0`, Linkerd CLI `edge-26.10.1` (SHA-256 `66d634f5318c8016f0b5face246a688964b6e2c86d6c3be34be68ab9fcd2a8cc`), Gateway API `v1.5.1`, and pinned Envoy/Nginx image digests in `prepare.py`. These are benchmark inputs, not dependencies of Rut.
 
-Build the optional client image from this repository root. It includes `/bin/sh`, `curl`, and `wrk`; `wrk` is built from the pinned source revision and independently statically linked against checksum-pinned OpenSSL 3.5.9 for the benchmark client. The current Rut CMake build still configures vendored BoringSSL; migrating Rut's TLS backend is outside this benchmark recipe. OpenSSL and its Perl build tools stay in the image's build stage; the recipe does not add an OpenSSL CLI or link `wrk` against system OpenSSL libraries. Override the tag with a unique local name if needed:
+Build the optional client image from this repository root. It includes `/bin/sh`, `curl`, and `wrk`; `wrk` is built from the pinned source revision and independently statically linked against checksum-pinned OpenSSL 3.5.9 for the benchmark client. Rut independently builds the same checksum-pinned OpenSSL release for its TLS backend. OpenSSL and its Perl build tools stay in the image's build stage; the recipe does not add an OpenSSL CLI or link `wrk` against system OpenSSL libraries. Override the tag with a unique local name if needed:
 
 ```sh
 CHECKPOINT=/absolute/path/to/benchmark-checkpoint

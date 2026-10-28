@@ -16,7 +16,7 @@ inline constexpr int kSendFlags = MSG_NOSIGNAL;
 
 // A write to a socket whose peer has closed raises SIGPIPE unless the call
 // passes MSG_NOSIGNAL (or the socket sets SO_NOSIGPIPE). Some write paths
-// cannot: BoringSSL's socket BIO uses plain write(2). A server must never be
+// cannot: the standard socket BIO uses plain write(2). A server must never be
 // killed by a client disconnecting, so SIGPIPE is ignored process-wide and
 // each writer handles EPIPE instead. Returns false if it cannot be ignored.
 inline bool ignore_sigpipe() {

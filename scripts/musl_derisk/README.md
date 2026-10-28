@@ -7,30 +7,30 @@
 > 必须在带完整 musl C++ 工具链的环境里跑(Alpine / musl-cross-make)。
 > Fedora 的 `musl-gcc` 是 C-only wrapper,编不了 vectorscan 的 C++。
 
-> **链的是 vendored 库,不是系统包。** Vectorscan 与 BoringSSL 都从 `third_party/` 子模块
-> 现场编译,头也走 `third_party/.../`(`-I`)。否则验的是系统 OpenSSL/发行版 vectorscan,
-> 不是 rut-node 实际要发的那套。
+> Vectorscan 从子模块构建；OpenSSL 从与正常构建相同的固定版本和校验和构建，
+> 不使用系统 OpenSSL。2026-10-28 在 x86_64 Alpine 3.20 完成静态链接与
+> TLS/扫描验证（本机需 host 网络并禁用容器 SELinux 标签）；其他平台尚未复验。
 
 ## 文件
 
 - `gen_db.c` —— **master 侧**:链*完整* `libhs.a`,`hs_compile` + `hs_serialize_database`
   一个小模式("foo")成可移植 DB 字节。rut-node 永不做这步。
-- `derisk.c` —— **node 侧**:只链 `libhs_runtime.a`(无编译器)+ BoringSSL,反序列化 DB →
-  `hs_alloc_scratch` → `hs_scan` 真扫出命中,并验 BoringSSL TLS。每步 fail-hard。
+- `derisk.c` —— **node 侧**:只链 `libhs_runtime.a`(无编译器)+ OpenSSL,反序列化 DB →
+  `hs_alloc_scratch` → `hs_scan` 真扫出命中,并验 OpenSSL TLS。每步 fail-hard。
   *节点* 二进制只链 runtime —— 若它需要 compile 符号,**链接**就会失败。
 
 ## 复现(需 docker + checkout 的 submodule)
 
 ```bash
 # 从仓库根目录
-git submodule update --init --depth 1 third_party/boringssl third_party/vectorscan
+git submodule update --init --depth 1 third_party/vectorscan
 
 docker run --rm -v "$PWD":/repo alpine:3.20 sh -c '
   set -e
-  # build-base 给 g++;go + perl 是 BoringSSL 配置/生成所需(见其 BUILDING.md);
+  # build-base 给 g++;perl 是 OpenSSL 配置/生成所需;
   # file 给 BusyBox 没有的 file(1)(下面用它确认真静态)。
   apk add --no-cache build-base cmake samurai boost-dev ragel python3 \
-    pkgconf sqlite-dev linux-headers go perl file
+    pkgconf sqlite-dev linux-headers perl file wget tar
 
   # 保守 ISA 基线:FAT_RUNTIME=OFF 默认 -march=native,会把 runtime 钉死在构建机的
   # AVX2/AVX512 上,older 节点跑不了。按容器架构选基线(arm64 镜像下 -march=x86-64-v2
@@ -51,13 +51,16 @@ docker run --rm -v "$PWD":/repo alpine:3.20 sh -c '
   VS_FULL=$(find /tmp/vs -name libhs.a | head -1)
   VS_RT=$(find /tmp/vs -name libhs_runtime.a | head -1)
 
-  # 2) vendored BoringSSL(不装 openssl-*;rut-node 发的就是 BoringSSL)
-  cmake -B /tmp/bssl -G Ninja /repo/third_party/boringssl -DCMAKE_BUILD_TYPE=Release
-  samu -C /tmp/bssl ssl crypto
-  BSSL_SSL=$(find /tmp/bssl -name libssl.a | head -1)
-  BSSL_CRYPTO=$(find /tmp/bssl -name libcrypto.a | head -1)
-  [ -n "$VS_FULL" ] && [ -n "$VS_RT" ] && [ -n "$BSSL_SSL" ] && [ -n "$BSSL_CRYPTO" ] \
-    || { echo "FAIL: vendored static libs not all built"; exit 1; }
+  # 2) 与 Rut 正常构建相同的固定 OpenSSL，下载后先校验。
+  wget -O /tmp/openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+  echo "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a  /tmp/openssl.tar.gz" | sha256sum -c -
+  mkdir /tmp/openssl-src
+  tar -xzf /tmp/openssl.tar.gz -C /tmp/openssl-src --strip-components=1
+  (cd /tmp/openssl-src && perl Configure no-shared no-module no-dso no-autoload-config \
+    --prefix=/tmp/openssl-install --libdir=lib && make -j4 build_libs && make install_dev)
+  [ -n "$VS_FULL" ] && [ -n "$VS_RT" ] && [ -f /tmp/openssl-install/lib/libssl.a ] \
+    && [ -f /tmp/openssl-install/lib/libcrypto.a ] \
+    || { echo "FAIL: static libs not all built"; exit 1; }
 
   cd /repo/scripts/musl_derisk
   VS_INC="-I /repo/third_party/vectorscan/src -I /tmp/vs"  # /tmp/vs 提供生成的 hs_version.h
@@ -65,10 +68,10 @@ docker run --rm -v "$PWD":/repo alpine:3.20 sh -c '
   g++ -static -O2 $VS_INC gen_db.c -o /tmp/gen_db "$VS_FULL" -lpthread
   /tmp/gen_db /tmp/db.bin
 
-  # node 二进制:只链 hs_runtime + BoringSSL;-static 真静态。
+  # node 二进制:只链 hs_runtime + OpenSSL;-static 真静态。
   g++ -static -O2 -ffunction-sections -fdata-sections -Wl,--gc-sections \
-    $VS_INC -I /repo/third_party/boringssl/include \
-    derisk.c -o /tmp/derisk_musl "$VS_RT" "$BSSL_SSL" "$BSSL_CRYPTO" -lpthread
+    $VS_INC -I /tmp/openssl-install/include \
+    derisk.c -o /tmp/derisk_musl "$VS_RT" /tmp/openssl-install/lib/libssl.a /tmp/openssl-install/lib/libcrypto.a -lpthread
 
   file /tmp/derisk_musl
   # --- 断言全部 fail-hard;在 strip *之前* 看符号表(strip 后 nm 必 0,会假阳) ---

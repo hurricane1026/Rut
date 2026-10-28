@@ -92,7 +92,7 @@ hardware/kernel offload (see §7):
   fired on the real drain CQE; proxy streaming carries **none** (it completes on
   fully-buffered + drained, per §3.0). Independent of how the bytes are produced.
 - **Output provider** — the "plaintext → sendable bytes" step. Today there is one
-  provider (userspace records: BoringSSL `SSL_write` → ciphertext). kTLS / NIC
+  provider (userspace records: OpenSSL `SSL_write` → ciphertext). kTLS / NIC
   inline offload is a second provider that swaps only this step (write plaintext;
   kernel/NIC encrypts), reusing the generic layer unchanged.
 
@@ -556,8 +556,8 @@ So userspace records and kTLS are two providers of one seam, not two code paths:
 
 | Provider | Handshake | Data path | `out_buf` holds |
 |---|---|---|---|
-| `UserspaceRecord` (today) | BoringSSL in userspace | `SSL_write` → ciphertext | ciphertext |
-| `Ktls` | BoringSSL in userspace, then keys installed into the socket | write **plaintext** to the fd; kernel (or NIC) frames + AES-GCM encrypts inline | plaintext |
+| `UserspaceRecord` (today) | OpenSSL in userspace | `SSL_write` → ciphertext | ciphertext |
+| `Ktls` | OpenSSL in userspace, then keys installed into the socket | write **plaintext** to the fd; kernel (or NIC) frames + AES-GCM encrypts inline | plaintext |
 
 What carries over **unchanged** to kTLS: own-the-bytes (no aliasing
 `upstream_recv_buf` across a send), one in-flight raw send draining `out_buf`,
@@ -569,7 +569,7 @@ expansion, no `SSL_write` `WANT_WRITE`/`WANT_READ` handling, and the §3.5(1)
 Mechanics to wire when adding the `Ktls` provider (out of scope for this PR, but
 the seam is reserved now):
 
-1. **Mode switch at handshake completion.** After BoringSSL finishes the
+1. **Mode switch at handshake completion.** After OpenSSL finishes the
    handshake, install the negotiated keys into the socket
    (`setsockopt(TCP_ULP, "tls")` + `TLS_TX`/`TLS_RX`) and set
    `conn.tls_output_mode = Ktls`. The generic layer then routes `fill_output`

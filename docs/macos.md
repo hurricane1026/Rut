@@ -49,7 +49,7 @@ stop; SIGINT/SIGTERM follow the normal graceful drain path.
 
 ## Scope
 
-- The normal compiler, LLVM JIT, BoringSSL TLS, routing, reverse proxy and tools
+- The normal compiler, LLVM JIT, OpenSSL TLS, routing, reverse proxy and tools
   are built. `-DRUT_ENABLE_JIT=OFF` is also supported for runtime-only work;
   it cannot load `.rut` programs.
 - macOS defaults to one shard and rejects `--shards` values above one. This keeps
@@ -67,5 +67,5 @@ stop; SIGINT/SIGTERM follow the normal graceful drain path.
 - The test fault shims are built as a test-only dylib on macOS so memory-protection
   failures also reach LLVM's dynamic library. This adds no external dependency
   and is not linked into Rut or its tools.
-- No system OpenSSL is required; TLS uses the existing BoringSSL submodule.
+- No system OpenSSL is required; TLS uses the checksum-pinned static OpenSSL built by CMake.
   Test certificates are checked-in fixtures.
