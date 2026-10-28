@@ -24772,3 +24772,56 @@ TEST(jit, json_allocation_failure_is_explicit) {
     CHECK_EQ(len, 0u);
     CHECK_EQ(number, 0);
 }
+
+TEST(jit, json_literal_escapes_null_and_number_lexemes) {
+    const char* src = R"rut(
+route GET "/literal" {
+    guard let doc = json.parse("{\"text\":\"\\uD83D\\uDE00\\n\",\"number\":1e999,\"nil\":null}") else { return 400 }
+    guard let item = json.get(doc, "/text") else { return 401 }
+    guard let text = json.string(item) else { return 402 }
+    if text == "\u{1F600}\n" { return 200 } else { return 500 }
+}
+route GET "/number" {
+    guard let doc = json.number("1.2300e+999") else { return 400 }
+    guard let text = json.numberText(doc) else { return 401 }
+    if text == "1.2300e+999" { return 200 } else { return 500 }
+}
+route GET "/null" {
+    guard let doc = json.value(nil) else { return 400 }
+    guard let kind = json.kind(doc) else { return 401 }
+    if kind == "null" { return 200 } else { return 500 }
+}
+)rut";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    for (u32 i = 0; i < 3; ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", i);
+        auto fn = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(fn);
+        const auto result = HandlerResult::unpack(fn(nullptr, nullptr, nullptr, 0, &arena));
+        CHECK_EQ(result.status_code, 200);
+        arena.reset();
+    }
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
