@@ -41203,3 +41203,14 @@ TEST(frontend, json_type_is_not_a_string_and_arguments_are_checked) {
         CHECK(!hir);
     }
 }
+
+TEST(frontend, json_builtin_can_be_shadowed_by_user_function) {
+    auto tokens =
+        lex(lit("func json(_ x: i32) -> i32 => x\nroute GET \"/x\" { if json(1) == 1 { return 200 "
+                "} else { return 500 } }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
