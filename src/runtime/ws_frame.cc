@@ -72,7 +72,12 @@ ParseStatus ws_parse_header(const u8* buf, u32 len, bool require_mask, WsFrameHe
 }
 
 void ws_unmask(u8* payload, u64 len, const u8 mask_key[4]) {
-    for (u64 i = 0; i < len; i++) payload[i] ^= mask_key[i & 3];
+    ws_unmask_chunk(payload, len, mask_key, 0);
+}
+
+void ws_unmask_chunk(u8* payload, u64 len, const u8 mask_key[4], u64 offset) {
+    const u32 phase = static_cast<u32>(offset & 3);
+    for (u64 i = 0; i < len; i++) payload[i] ^= mask_key[(phase + (i & 3)) & 3];
 }
 
 u32 ws_write_header(
