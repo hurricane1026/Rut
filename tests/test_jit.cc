@@ -24668,3 +24668,82 @@ route GET "/build" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, json_struct_codec_and_dynamic_response_body) {
+    const char* src = R"rut(
+struct User {
+    name: str
+    active: bool
+    age: i32
+}
+route POST "/codec" {
+    guard let doc = req.bodyJson() else { return 400 }
+    guard let user = json.decode(User, doc) else { return 422 }
+    guard let encoded = json.value(user) else { return 500 }
+    return response(200, body: encoded)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir)
+        fprintf(stderr,
+                "JSON codec analyze error %u at %u:%u: %.*s\n",
+                static_cast<u32>(hir.error().code),
+                hir.error().span.line,
+                hir.error().span.col,
+                hir.error().detail.len,
+                hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    auto conn = std::make_unique<Connection>();
+    conn->reset();
+    conn->json_arena.backend.pool = &pool;
+    const char* cases[] = {"{\"name\":\"Rut\",\"active\":false,\"age\":42}",
+                           "{\"name\":\"Rut\",\"active\":false}",
+                           "{\"name\":1,\"active\":false,\"age\":42}",
+                           "{\"name\":\"Rut\",\"active\":false,\"age\":2147483648}",
+                           "null",
+                           "not-json"};
+    const u32 statuses[] = {200, 422, 422, 422, 422, 400};
+    for (u32 i = 0; i < 6; ++i) {
+        char request[256];
+        const int len = snprintf(request,
+                                 sizeof(request),
+                                 "POST /codec HTTP/1.1\r\nContent-Length: %zu\r\n\r\n%s",
+                                 strlen(cases[i]),
+                                 cases[i]);
+        conn->json_arena.destroy();
+        conn->jit_response_body_valid = false;
+        const auto result = HandlerResult::unpack(handler(conn.get(),
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(request),
+                                                          static_cast<u32>(len),
+                                                          nullptr));
+        CHECK_EQ(result.status_code, statuses[i]);
+        if (i == 0) {
+            CHECK_EQ(result.upstream_id, 0xffffu);
+            CHECK(conn->jit_response_body_valid);
+            CHECK(conn->jit_response_body.eq(lit(cases[i])));
+        } else
+            CHECK(!conn->jit_response_body_valid);
+    }
+    conn->reset();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
