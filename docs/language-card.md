@@ -1377,7 +1377,12 @@ fails closed on clock failure or nonpositive time, and enforces the fixed inclus
 300-second freshness tolerance. Use `req.uniqueHeader(...).or("")` for each webhook
 field to reject duplicates. This verifies freshness and integrity; callers must
 deduplicate verified IDs durably across shards and nodes before side effects.
-The builtin uses dedicated HIR/MIR/RIR lowering and adds no keyword or dependency.
+`auth.standardWebhook(id, timestamp, signature, body, rawKey, consumerId, credentialId)`
+returns a configured `Identity` after verification; empty key configuration or
+empty identity metadata returns 503, while malformed input, an oversized key,
+or invalid signatures return 401.
+See [standard-webhook-auth.rut](../examples/standard-webhook-auth.rut). The builtin
+uses dedicated HIR/MIR/RIR lowering and adds no keyword or dependency.
 
 `auth.hmac(message, signature, key, consumerId, credentialId)` publishes an
 Identity only after verification. `auth.rotatingHmac(...)` evaluates current
@@ -1393,10 +1398,10 @@ before parsing or transforming JSON; payload signatures do not prevent replay.
 Durable delivery deduplication remains the receiving application's duty.
 The 1 MiB primitive bound does not extend the runtime's request-body limit.
 
-This is not the Kong/APISIX canonical HTTP-signature protocol or Standard
-Webhooks: those additionally define signed header lists, timestamp/nonce
-validation, encoding and replay state. Their full profiles remain pending in
-[auth coverage](auth-coverage.md).
+Kong/APISIX canonical HTTP-signature protocols define additional signed header
+lists, timestamp/nonce validation, encoding and replay state; those profiles
+remain pending in [auth coverage](auth-coverage.md). Standard Webhooks freshness
+does not enforce ID uniqueness, so durable replay storage remains the receiver's responsibility.
 
 ## Digest and HMAC builtins (implemented)
 
