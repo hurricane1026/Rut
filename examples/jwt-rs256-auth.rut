@@ -1,0 +1,13 @@
+// JWT_RS256_POLICY is read once while compiling/loading this configuration.
+// Supply a trusted JSON document with issuer, audience, approved kids and jwks:
+// {"issuer":"https://issuer.example","audience":"orders",
+//  "kids":["current","previous"],"jwks":{"keys":[...public RSA JWKs...]}}.
+// Keys must explicitly declare alg=RS256. Never populate policy from a request.
+import "middleware/auth.rut"
+
+route GET "/orders" {
+    let identity = auth.jwtIdentityRs256(req.authorization.or(""), env("JWT_RS256_POLICY"),
+                                       "orders:read", "orders-issuer-rs256")
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}

@@ -1,5 +1,10 @@
 // Per-shard independent control system tests.
+#include "rs256_fixture.h"
+#include "rut/runtime/mapped_array.h"
 #include "rut/runtime/route_table.h"
+#ifdef __linux__
+#include "rut/runtime/iouring_event_loop.h"
+#endif
 #include "rut/runtime/shard.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/socket.h"
@@ -1628,3 +1633,69 @@ TEST_F(ShardF, capture_shutdown_cleans_up) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+namespace {
+template <typename Loop>
+void rs256_reload_activates_only_the_adopting_shard(rut::test::TestCase* _tc) {
+    test::Rs256Fixture old_key;
+    test::Rs256Fixture new_key;
+    REQUIRE(old_key.init());
+    REQUIRE(new_key.init());
+    Rs256Policies old_owner;
+    Rs256Policies new_owner;
+    REQUIRE(old_owner.load(&old_key.policy, 1));
+    REQUIRE(new_owner.load(&new_key.policy, 1));
+    MappedArray<RouteConfig> before_storage;
+    MappedArray<RouteConfig> after_storage;
+    MappedArray<Loop> loop_storage;
+    REQUIRE(before_storage.init(1).has_value());
+    REQUIRE(after_storage.init(1).has_value());
+    REQUIRE(loop_storage.init(1).has_value());
+    auto* before = before_storage.data();
+    auto* after = after_storage.data();
+    auto* loop = loop_storage.data();
+    CHECK_EQ(reinterpret_cast<uintptr_t>(before) % alignof(RouteConfig), 0u);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(after) % alignof(RouteConfig), 0u);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(loop) % alignof(Loop), 0u);
+    REQUIRE(before->add_rs256_configuration(old_key.policy));
+    REQUIRE(after->add_rs256_configuration(new_key.policy));
+    before->rs256 = &old_owner;
+    after->rs256 = &new_owner;
+    REQUIRE(before->activate_rs256(3));
+    const RouteConfig* active = before;
+    ShardControlBlock control;
+    loop->shard_id = 3;
+    loop->control = &control;
+    loop->config_ptr = &active;
+    control.pending_config.store(after, std::memory_order_release);
+    loop->poll_command();
+    CHECK(active == after);
+    CHECK(control.pending_config.load(std::memory_order_acquire) == nullptr);
+    json::Document document;
+    char payload[8192];
+    char token[4096];
+    u32 length = 0;
+    auto verify = [&](Rs256Policies& owner, u32 shard, Str policy, Str jwt) {
+        return owner.verify(
+            shard, policy, document, jwt, 2000000000, payload, sizeof(payload), length);
+    };
+    const Str old_token =
+        old_key.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
+    CHECK(verify(old_owner, 3, old_key.policy, old_token));
+    CHECK(!verify(new_owner, 3, new_key.policy, old_token));
+    const Str new_token =
+        new_key.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
+    CHECK(verify(new_owner, 3, new_key.policy, new_token));
+    CHECK(!verify(new_owner, 2, new_key.policy, new_token));
+    CHECK(!verify(old_owner, 3, old_key.policy, new_token));
+}
+}  // namespace
+
+TEST(shard_control, rs256_reload_activates_epoll_shard_without_replacing_inflight_policy) {
+    rs256_reload_activates_only_the_adopting_shard<RealLoop>(_tc);
+}
+#ifdef __linux__
+TEST(shard_control, rs256_reload_activates_iouring_shard_without_replacing_inflight_policy) {
+    rs256_reload_activates_only_the_adopting_shard<IoUringEventLoop>(_tc);
+}
+#endif

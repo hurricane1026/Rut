@@ -82,6 +82,7 @@ struct LoadedProgram {
     AccessLogSinkSpec access_log{};
     bool has_ebpf_plan = false;
     ebpf::Plan ebpf_plan{};
+    Rs256Policies rs256;
     RouteConfig config;  // what the shards read (1.28 MB — heap/BSS only)
 
     void destroy();

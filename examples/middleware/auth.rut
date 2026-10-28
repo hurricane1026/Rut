@@ -290,3 +290,28 @@ func requireGroup(_ identity: Identity, _ required: str,
     guard firstMatches || secondMatches else { respond 403 }
     identity
 }
+
+// policy is trusted compile-time JSON (literal, constant, or env snapshot):
+// {"issuer":"...","audience":"...","kids":["..."],"jwks":{"keys":[...]}}.
+// Unlike jwtDocumentHs*, this verifies issuer/audience/time/sub before returning.
+// Pass req.authorization.or("") so duplicate Authorization fields fail closed.
+func jwtDocumentRs256(_ authorization: str, _ policy: str) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard let document = jwtVerifyRs256(bearerToken(authorization).or(""), policy) else { respond denied }
+    document
+}
+
+// The credentialId names this configured issuer/key policy, not a claim or
+// attacker-provided header. All approved rotation keys share that trust policy.
+// Publish an identity only after both authentication and scope authorization.
+func jwtIdentityRs256(_ authorization: str, _ policy: str, _ scope: str,
+                     _ credentialId: str) -> Identity {
+    guard credentialId != "" && scope != "" else { respond 503 }
+    let document = jwtDocumentRs256(authorization, policy)
+    let forbidden = response(403)
+    forbidden.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasScope(document, scope) else { respond forbidden }
+    guard let subject = json.decode(JwtSubject, document) else { respond 401 }
+    Identity(consumerId: subject.sub, credentialId: credentialId, method: "jwtRS256")
+}

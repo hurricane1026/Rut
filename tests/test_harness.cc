@@ -2,6 +2,7 @@
 #include "test.h"
 #if RUT_ENABLE_JIT_TESTS
 #include "fault_injection.h"
+#include "rs256_fixture.h"
 #include "rut/harness/connection_execution.h"
 #include "rut/harness/handler_execution.h"
 #include "rut/harness/scenario_driver.h"
@@ -187,7 +188,7 @@ bool capture_response_observation(void* context, const harness::Observation& eve
 }
 
 struct TempSource {
-    char path[64] = "/tmp/rut_harness_XXXXXX";
+    char path[256] = "/tmp/rut_harness_XXXXXX";
 
     bool write(const char* source) {
         const int fd = ::mkstemp(path);
@@ -686,6 +687,88 @@ TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     CHECK_EQ(result.harness.virtual_time_us, scenario.now_us);
     REQUIRE(result.has_terminal);
     CHECK_EQ(result.terminal.status_code, 204);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, activates_rs256_policies_for_scenario_shard) {
+    test::Rs256Fixture fixture{};
+    REQUIRE(fixture.init());
+    char source_text[8192]{};
+    json::Writer source_writer{source_text, sizeof(source_text) - 1};
+    source_writer.text(lit_str(
+        R"rut(route GET "/auth" {
+    guard let claims = jwtVerifyRs256(bearerToken(req.authorization.or("")).or(""), )rut"));
+    REQUIRE(json::quote(fixture.policy, source_writer));
+    source_writer.text(lit_str(
+        R"rut() else { return 401 }
+    guard jwtHasScope(claims, "read") else { return 403 }
+    return 200
+}
+)rut"));
+    REQUIRE(source_writer.ok);
+    source_text[source_writer.len] = '\0';
+    TempSource source;
+    const char* temp_dir = ::getenv("TMPDIR");
+    if (temp_dir == nullptr || temp_dir[0] == '\0') temp_dir = "/tmp";
+    const int source_path_length =
+        ::snprintf(source.path, sizeof(source.path), "%s/rutXXXXXX", temp_dir);
+    REQUIRE(source_path_length > 0);
+    REQUIRE(static_cast<u32>(source_path_length) < sizeof(source.path));
+    REQUIRE(source.write(source_text));
+    harness::SourceTarget target{};
+    auto load_spec = harness::HarnessSpec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/auth", 5};
+    scenario.method = kRouteMethodGet;
+    scenario.shard_id = 1;
+    char token_bytes[4096]{};
+    const Str token =
+        fixture.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token_bytes);
+    REQUIRE(token.len != 0);
+    char request[8192]{};
+    const int request_length = ::snprintf(request,
+                                          sizeof(request),
+                                          "GET /auth HTTP/1.1\r\nHost: test\r\n"
+                                          "Authorization: Bearer %.*s\r\n\r\n",
+                                          static_cast<int>(token.len),
+                                          token.ptr);
+    REQUIRE(request_length > 0);
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = static_cast<u32>(request_length);
+
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.action, jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(result.terminal.status_code, 200u);
+
+    char* auth_value = ::strstr(request, "Bearer ");
+    REQUIRE(auth_value != nullptr);
+    auth_value += 7;
+    auth_value[0] = auth_value[0] == 'A' ? 'B' : 'A';
+    const auto rejected = harness::drive_scenario(scenario, scripted_scenario_harness());
+    CHECK_EQ(rejected.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(rejected.has_terminal);
+    CHECK_EQ(rejected.terminal.action, jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(rejected.terminal.status_code, 401u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, reports_rs256_activation_failure) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_static("/static", kRouteMethodGet, 204));
+    REQUIRE(target.program.config.add_rs256_configuration(lit_str("invalid")));
+    target.prepared = true;
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/static", 7};
+    scenario.method = kRouteMethodGet;
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Failed);
+    CHECK(std::strcmp(result.harness.detail, "scenario RS256 policy activation failed") == 0);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

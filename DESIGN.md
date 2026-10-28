@@ -3600,9 +3600,10 @@ hmacSha256(key, data)         // str? (lowercase hex)
 hmacSha384(key, data)         // str? (lowercase hex)
 hmacSha512(key, data)         // str? (lowercase hex)
 
-// --- JWT (HMAC slice implemented; asymmetric forms are roadmap) ---
+// --- JWT (HMAC and configured RS256 verification implemented) ---
 jwtDecode(token, secret)                    // Json? — verified HS256/384/512 claims
-// ⏳ jwtDecode(token, publicKey: pem)       // RS256/384/512, ES256/384/512
+jwtVerifyRs256(token, policy)               // Json? — approved RS256 key + issuer/audience/time
+// ⏳ other RSA/EC algorithms and arbitrary PEM overloads
 // ⏳ jwtEncode(claims, secret: key, alg: .HS256)
 // ⏳ jwtEncode(claims, privateKey: pem, alg: .RS256)
 
@@ -4011,7 +4012,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 
 | Feature Category | DSL Capability |
 |-----------------|----------------|
-| JWT auth | `jwtDecode(tok, secret)` built-in (HS256/384/512); RS/ES and `jwtEncode` are roadmap |
+| JWT auth | `jwtDecode(tok, secret)` built-in (HS256/384/512), `jwtVerifyRs256(tok, policy)` with trusted static JWKS; other RS/ES and `jwtEncode` are roadmap |
 | HMAC auth | `hmacSha256()` built-in |
 | Basic auth | `base64` decode + string compare |
 | API key auth | header/query access + compare |
@@ -8335,7 +8336,8 @@ invalid tokens to a challenged 401.
 `examples/jwt-claims-auth.rut` pins HS256 before checking issuer, audience,
 expiry and scopes. Signature verification does not replace claims policy.
 This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism;
-asymmetric JWT/JWKS remain separate work.
+Other asymmetric algorithms and remote JWKS refresh remain separate work;
+configured RS256 verification is described below.
 
 ### Public HTTP response cache
 
@@ -8537,7 +8539,8 @@ Unknown metadata is ignored and never establishes trust: no `kid` selection,
 certificate processing, URL fetching, JWK-set handling or JWKS refresh occurs.
 The caller must supply trusted configuration. Import allocates only during
 configuration; request verification continues through the existing shard-owned
-verifier. This adds no Rut/JIT API or complete asymmetric authorization flow.
+verifier. The configured RS256 integration below supplies the Rut/JIT
+authorization surface around this native importer.
 The representation follows [RFC 7518 §6.3.1](https://www.rfc-editor.org/rfc/rfc7518.html#section-6.3.1)
 and the usage fields follow [RFC 7517 §4](https://www.rfc-editor.org/rfc/rfc7517.html#section-4),
 with the stricter mandatory algorithm policy described above.
@@ -8587,3 +8590,36 @@ each. Empty slots disable membership. Unknown Consumers and missing membership
 receive 403; invalid configuration receives 503. Replacing the trusted snapshot
 revokes membership. Client identity/group headers never populate the registry.
 See `examples/consumer-group-auth.rut` (relative to the repository root).
+
+
+### Configured RS256 resource-server verification
+
+`jwtVerifyRs256(token, policy) -> Json?` accepts an unwrapped token and a
+compile-time JSON policy string (literal, constant, or resolved `env`). The
+policy has exactly four members: `issuer`, `audience`, `kids` (explicit approved
+key IDs), and `jwks` (a public JWK Set object). Invalid configuration fails
+compilation/loading, including missing approved keys and duplicate decoded names.
+The configured issuer and audience bind every approved rotation key to one trust
+domain. No token-supplied URL, JWK, algorithm fallback, or unknown-key fallback is
+used. RSA profile and compact-JWS bounds are specified in the language card.
+
+The frontend normalizes policy arguments to literals. Configuration inventory
+copies distinct policies into `RouteConfig`; each program owns a separate
+`Rs256Policies` sidecar. Public keys load before publication; preallocated
+verifier rows activate on their own shard before accepting requests or adopting
+a reload. Failed or unactivated rows publish no claims. Request helpers read
+only `ConnectionBase::request_config`, so suspended old requests retain the
+matching generation through the existing RCU lifetime. Destroy after readers
+retire; no global mutable key registry or request-time key parsing is involved.
+Native artifacts serialize owned policy bytes and reconstruct key owners after
+the compiler exits; crypto pointers and mutable shard workspaces are excluded.
+
+Successful verification requires a protected approved `kid`, exactly RS256,
+valid signature, nonempty `sub`, exact issuer/audience, integer `exp`, valid
+optional `nbf`/`iat`, and a positive Unix clock with zero skew. The result is the
+verified claims object with ordinary request-arena Json lifetime. Existing
+`jwtHasScope` can then authorize it. `auth.jwtIdentityRs256` checks the requested
+scope before mapping subject to Identity; its credential ID names trusted
+configuration rather than a token claim. Static key rotation/revocation uses
+configuration replacement. Remote JWKS refresh, OIDC discovery/login, token
+revocation lists and replay tracking remain separate capabilities.

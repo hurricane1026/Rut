@@ -1,5 +1,6 @@
 #include "rut/runtime/jwt_rs256.h"
 
+#include "rut/common/types.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/public_key.h"
@@ -47,17 +48,19 @@ struct Publication {
         }
     }
 };
-}  // namespace
-
-bool jwt_rs256_decode(RsaSha256Verifier& verifier,
-                      json::Document& document,
-                      Str token,
-                      char* payload_out,
-                      u32 capacity,
-                      u32& payload_len) {
+bool decode_with_key(RsaSha256Verifier* verifier,
+                     Rs256VerifierSet* keys,
+                     json::Document& document,
+                     Str token,
+                     char* payload_out,
+                     u32 capacity,
+                     u32& payload_len,
+                     Str& selected_kid) {
     payload_len = 0;
+    selected_kid = {};
     Publication publication{document};
-    if (!verifier.valid() || !token.ptr || !payload_out || token.len > json::kMaxBytes * 3)
+    if ((verifier == nullptr) == (keys == nullptr) || (verifier && !verifier->valid()) ||
+        (keys && !keys->valid()) || !token.ptr || !payload_out || token.len > json::kMaxBytes * 3)
         return false;
     u32 first = token.len;
     u32 second = token.len;
@@ -78,13 +81,23 @@ bool jwt_rs256_decode(RsaSha256Verifier& verifier,
         !document.parse({header, length}) || document.nodes[0].kind != json::Kind::Object)
         return false;
     bool has_algorithm = false;
+    bool has_kid = false;
+    char kid[Rs256KeySet::kMaxKidBytes];
+    u32 kid_length = 0;
     for (u32 node = document.nodes[0].child; node != json::kNone;
          node = document.nodes[node].next) {
         json::Writer key{document.scratch};
         if (!document.string(document.nodes[node].key, key)) return false;
-        Str name{document.scratch, key.len};
-        if (name.eq(lit_str("crit")) || name.eq(lit_str("b64"))) return false;
-        if (!name.eq(lit_str("alg"))) continue;
+        const Str kName{document.scratch, key.len};
+        if (kName.eq(lit_str("crit")) || kName.eq(lit_str("b64"))) return false;
+        if (keys && kName.eq(lit_str("kid"))) {
+            if (has_kid || document.nodes[node].kind != json::Kind::String) return false;
+            json::Writer value{kid, sizeof(kid)};
+            if (!document.string(node, value) || value.len == 0) return false;
+            kid_length = value.len;
+            has_kid = true;
+        }
+        if (!kName.eq(lit_str("alg"))) continue;
         if (has_algorithm || document.nodes[node].kind != json::Kind::String) return false;
         json::Writer value{document.other};
         if (!document.string(node, value) || !Str{document.other, value.len}.eq(lit_str("RS256")))
@@ -92,20 +105,41 @@ bool jwt_rs256_decode(RsaSha256Verifier& verifier,
         has_algorithm = true;
     }
     if (!has_algorithm) return false;
+    Str candidate_id{};
+    if (keys) {
+        if (!has_kid) return false;
+        const auto kSelected = keys->select({kid, kid_length});
+        if (!kSelected.verifier) return false;
+        verifier = kSelected.verifier;
+        candidate_id = kSelected.kid;
+    }
     char signature[512];
     if (!decode({token.ptr + second + 1, token.len - second - 1},
                 signature,
                 sizeof(signature),
                 length) ||
-        !verifier.verify({token.ptr, second}, {signature, length}))
+        !verifier->verify({token.ptr, second}, {signature, length}))
         return false;
     const u32 limit = capacity < json::kMaxBytes ? capacity : json::kMaxBytes;
     if (!decode({token.ptr + first + 1, second - first - 1}, payload_out, limit, length) ||
         !document.parse({payload_out, length}) || document.nodes[0].kind != json::Kind::Object)
         return false;
     payload_len = length;
+    selected_kid = candidate_id;
     publication.committed = true;
     return true;
+}
+}  // namespace
+
+bool jwt_rs256_decode(RsaSha256Verifier& verifier,
+                      json::Document& document,
+                      Str token,
+                      char* payload_out,
+                      u32 capacity,
+                      u32& payload_len) {
+    Str ignored;
+    return decode_with_key(
+        &verifier, nullptr, document, token, payload_out, capacity, payload_len, ignored);
 }
 
 bool jwt_rs256_validate(RsaSha256Verifier& verifier,
@@ -126,6 +160,32 @@ bool jwt_rs256_validate(RsaSha256Verifier& verifier,
         !jwt_claims_valid(document, {payload_out, decoded_length}, issuer, audience, unix_seconds))
         return false;
     payload_len = decoded_length;
+    publication.committed = true;
+    return true;
+}
+bool jwt_rs256_validate_set(Rs256VerifierSet& keys,
+                            json::Document& document,
+                            Str token,
+                            Str issuer,
+                            Str audience,
+                            i64 unix_seconds,
+                            char* payload_out,
+                            u32 capacity,
+                            u32& payload_len,
+                            Str& verified_kid) {
+    payload_len = 0;
+    verified_kid = {};
+    Publication publication{document};
+    if (!issuer.ptr || issuer.len == 0 || !audience.ptr || audience.len == 0 || unix_seconds <= 0)
+        return false;
+    u32 decoded_length = 0;
+    Str selected_id;
+    if (!decode_with_key(
+            nullptr, &keys, document, token, payload_out, capacity, decoded_length, selected_id) ||
+        !jwt_claims_valid(document, {payload_out, decoded_length}, issuer, audience, unix_seconds))
+        return false;
+    payload_len = decoded_length;
+    verified_kid = selected_id;
     publication.committed = true;
     return true;
 }

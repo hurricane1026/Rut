@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rut/runtime/json.h"
+
 // Bridge header: copy the RIR module's declarative content (upstreams
 // with addresses, response bodies, response header sets) into a
 // RouteConfig so the runtime can serve the compiled handlers.
@@ -702,6 +704,42 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
 
 }  // namespace detail
 
+namespace detail {
+inline bool populate_rs256_configurations(RouteConfig& cfg, const rir::Module& mod) {
+    bool ok = true;
+    // The analyzer materializes every static trust policy as a literal.
+    // Verify this again at the RIR boundary (including hand-built modules).
+    for (u32 fi = 0; ok && fi < mod.func_count; ++fi) {
+        const auto& fn = mod.functions[fi];
+        for (u32 bi = 0; ok && bi < fn.block_count; ++bi) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ok && ii < block.inst_count; ++ii) {
+                const auto& inst = block.insts[ii];
+                if (inst.op != rir::Opcode::JsonOp ||
+                    inst.imm.i32_val != static_cast<i32>(json::Op::JwtVerifyRs256))
+                    continue;
+                if (inst.operand_count != 2 || !fn.values ||
+                    inst.operands[1].id >= fn.value_count) {
+                    ok = false;
+                    break;
+                }
+                const auto& value = fn.values[inst.operands[1].id];
+                if (value.def_block.id >= fn.block_count ||
+                    value.def_inst >= fn.blocks[value.def_block.id].inst_count) {
+                    ok = false;
+                    break;
+                }
+                const auto& policy = fn.blocks[value.def_block.id].insts[value.def_inst];
+                Rs256Policy trust;
+                ok = policy.op == rir::Opcode::ConstStr && trust.load(policy.imm.str_val) &&
+                     cfg.add_rs256_configuration(policy.imm.str_val);
+            }
+        }
+    }
+    return ok;
+}
+}  // namespace detail
+
 // The default copies response bodies into RouteConfig's 8 KiB owned pool.
 // Modules with larger response bodies must use
 // populate_route_config_with_retained_body_views() instead. That API stores
@@ -737,9 +775,9 @@ inline bool populate_route_config(RouteConfig& cfg,
         populated &&
         (!strict_local_response_probe ||
          cfg.copy_strict_local_response_table_from_owned(*strict_local_response_probe));
-    if (!strict_copied)
-        __builtin_memcpy(static_cast<void*>(&cfg), before.get(), sizeof(RouteConfig));
-    return strict_copied;
+    const bool auth_copied = strict_copied && detail::populate_rs256_configurations(cfg, mod);
+    if (!auth_copied) __builtin_memcpy(static_cast<void*>(&cfg), before.get(), sizeof(RouteConfig));
+    return auth_copied;
 }
 
 // Populate response bodies as views into the RIR module. Use this for bodies
@@ -782,7 +820,7 @@ inline bool populate_route_config_for_internal_propagation(RouteConfig& cfg,
         populated && (!strict_local_response_probe ||
                       cfg.copy_strict_local_response_table_from_owned_for_internal_propagation(
                           *strict_local_response_probe));
-    if (!strict_copied) {
+    if (!strict_copied || !detail::populate_rs256_configurations(cfg, mod)) {
         __builtin_memcpy(static_cast<void*>(&cfg), before.get(), sizeof(RouteConfig));
         return false;
     }

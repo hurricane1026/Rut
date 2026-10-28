@@ -138,6 +138,7 @@ void NativeProgram::destroy() {
     library = nullptr;
     if (artifact_fd >= 0) close(artifact_fd);
     artifact_fd = -1;
+    rs256.destroy();
     arena.destroy();
     config.~RouteConfig();
     ::new (&config) RouteConfig();
@@ -477,6 +478,21 @@ bool load_native_program(const char* source,
             return fail("TLS cannot use sockmap body plans");
         out.has_ebpf_plan = true;
     }
+    if (c.rs256_configuration_count > Rs256Policies::kMaxPolicies ||
+        c.rs256_configuration_bytes_used > sizeof(c.rs256_configuration_bytes))
+        return fail("invalid native RS256 configuration counts");
+    // Only owned configuration byte views may reach the public-key parser.
+    for (u32 i = 0; i < c.rs256_configuration_count; ++i) {
+        const auto text = c.rs256_configurations[i];
+        const uintptr_t base = reinterpret_cast<uintptr_t>(c.rs256_configuration_bytes);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(text.ptr);
+        if (address < base || address - base > c.rs256_configuration_bytes_used ||
+            text.len > c.rs256_configuration_bytes_used - (address - base))
+            return fail("invalid native RS256 configuration view");
+    }
+    if (!out.rs256.load(c.rs256_configurations, c.rs256_configuration_count))
+        return fail("cannot initialize native RS256 policies");
+    c.rs256 = &out.rs256;
     attach_response_body_files(c);
     out.has_listener = h.has_listener;
     out.listener = h.listener;
