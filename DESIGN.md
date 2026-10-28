@@ -8236,6 +8236,15 @@ untrusted kid header. Dynamic JWKS and live token/key revocation remain separate
 work; this profile is not a replacement for signature verification or a complete
 OIDC implementation. Exact behavior and bounds are in the language card.
 
+## Static JWT ID revocation
+
+After signature and issuer/audience/time validation, the ordinary Rut helper
+`auth.requireUnrevokedJwt` requires a nonempty string `jti` and rejects exact
+matches against two configured revoked IDs with a Bearer invalid-token 401.
+Each snapshot is scoped by the caller to the issuer already validated; empty
+slots are disabled. This bounded configuration is neither a live revocation
+registry nor durable cross-node state. The helper does not verify the document.
+
 ## JWT scope authorization (implemented)
 
 `jwtHasScope(claims: Json, required: str) -> bool` checks one complete,

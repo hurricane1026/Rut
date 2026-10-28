@@ -1072,6 +1072,65 @@ route GET "/identity" {
         if (tc.status == 403)
             CHECK(wire.find("Bearer error=\"insufficient_scope\"") != std::string::npos);
     }
+    JsonProgram revocation;
+    REQUIRE(revocation.init(R"rut(
+import "middleware/auth.rut"
+route GET "/identity" {
+    guard let document = jwtDecode(bearerToken(req.authorization.or("")).or(""), "01234567890123456789012345678901", "HS256") else { return 401 }
+    guard jwtClaimsValid(document, "issuer", "gateway") else { return 401 }
+    let checked = auth.requireUnrevokedJwt(document, "revoked-one", "revoked-two")
+    guard jwtHasScope(checked, "orders:read") else { return 403 }
+    return 200
+}
+)rut",
+                            source_path.c_str()));
+    const Case revocation_cases[] = {
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"jti":"allowed","scope":"orders:read"})",
+         200},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"jti":"revoked-one","scope":"orders:read"})",
+         401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"jti":"revoked-two","scope":"orders:read"})",
+         401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"jti":"Revoked-one","scope":"orders:read"})",
+         200},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"jti":"","scope":"orders:read"})",
+         401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"scope":"orders:read"})", 401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"jti":12,"scope":"orders:read"})",
+         401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"jti":"allowed","\u006ati":"revoked-one","scope":"orders:read"})",
+         401},
+        {R"({"sub":"alice","iss":"other","aud":"gateway","exp":1001,"jti":"allowed","scope":"orders:read"})",
+         401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1001,"jti":"allowed","scope":"orders:write"})",
+         403},
+    };
+    for (const auto& tc : revocation_cases) {
+        const std::string request =
+            std::string("GET /identity HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer ") +
+            sign(tc.claims) + "\r\n\r\n";
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = revocation.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        test_fault::ScopedSyscallFault clock(
+            test_fault::fixed_clock_gettime(CLOCK_REALTIME, 1000, 0));
+        auto outcome = invoke_jit_handler(
+            revocation.handler(), conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        CHECK_EQ(outcome.status_code, tc.status);
+        CHECK(!conn->jit_response_body_valid);
+        if (tc.status == 401 && __builtin_strstr(tc.claims, "\"jti\":\"revoked-one\"") != nullptr) {
+            handle_jit_outcome(loop.get(), *conn, outcome, revocation.handler(), true);
+            const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+            CHECK(wire.find("Bearer error=\"invalid_token\"") != std::string::npos);
+        }
+    }
     loop->free_conn(*conn);
     pool.destroy();
 }
