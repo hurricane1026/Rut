@@ -24581,3 +24581,90 @@ TEST(jit, owned_request_headers_copy_borrowed_inputs_and_fail_closed) {
     arena.destroy();
     pool.destroy();
 }
+
+TEST(jit, json_type_parse_construct_edit_and_extract) {
+    const char* src = R"rut(
+func identity(_ value: Json) -> Json => value
+route POST "/json" {
+    guard let doc = json.parse(req.body) else { return 400 }
+    guard let items = json.get(doc, "/items") else { return 401 }
+    guard let n = json.count(items) else { return 402 }
+    guard let first = json.at(items, 0) else { return 403 }
+    guard let number = json.int(first) else { return 404 }
+    if n == 2 && number == 9223372036854775807 { return 200 } else { return 500 }
+}
+route GET "/build" {
+    guard let v = json.parse("{\"name\":\"rut\",\"items\":[true,null,42],\"nested\":{\"active\":false}}") else { return 405 }
+    guard let replacement = json.value("gateway") else { return 406 }
+    guard let edited = json.set(v, "/name", replacement) else { return 407 }
+    guard let name = json.get(identity(edited), "/name") else { return 408 }
+    guard let text = json.string(name) else { return 409 }
+    guard let encoded = json(edited) else { return 410 }
+    if text == "gateway" {
+        return 200
+    } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    if (!ast)
+        fprintf(stderr,
+                "JSON parse error %u at %u:%u: %.*s\n",
+                static_cast<u32>(ast.error().code),
+                ast.error().span.line,
+                ast.error().span.col,
+                ast.error().detail.len,
+                ast.error().detail.ptr);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir)
+        fprintf(stderr,
+                "JSON analyze error %u at %u:%u: %.*s\n",
+                static_cast<u32>(hir.error().code),
+                hir.error().span.line,
+                hir.error().span.col,
+                hir.error().detail.len,
+                hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const char request[] =
+        "POST /json HTTP/1.1\r\nContent-Length: 35\r\n\r\n{\"items\":[9223372036854775807,null]}";
+    // Build length from the actual body so this also exercises runtime body extraction.
+    const char body[] = "{\"items\":[9223372036854775807,null]}";
+    char bytes[256];
+    const int len = snprintf(bytes,
+                             sizeof(bytes),
+                             "POST /json HTTP/1.1\r\nContent-Length: %zu\r\n\r\n%s",
+                             sizeof(body) - 1,
+                             body);
+    (void)request;
+    auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(bytes), static_cast<u32>(len), &arena));
+    CHECK_EQ(result.status_code, 200);
+    arena.reset();
+    auto build = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(build);
+    result = HandlerResult::unpack(
+        build(nullptr, nullptr, reinterpret_cast<const u8*>(bytes), static_cast<u32>(len), &arena));
+    CHECK_EQ(result.status_code, 200);
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
