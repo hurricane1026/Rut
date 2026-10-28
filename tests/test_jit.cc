@@ -11,6 +11,7 @@
 #include "rut/jit/codegen.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/jit/native_helper_symbols.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/callbacks_h2.h"
@@ -39,6 +40,28 @@
 using namespace rut;
 using namespace rut::rir;
 using namespace rut::jit;
+
+TEST(jit, native_helper_allowlist_matches_orc_symbol_bindings) {
+    JitEngine engine;
+    REQUIRE(engine.init());
+    u32 count = 0;
+    const NativeHelperSymbol* symbols = native_helper_symbols(count);
+    REQUIRE(symbols != nullptr);
+    REQUIRE(count > 0);
+    for (u32 i = 0; i < count; ++i) {
+        const Str name{symbols[i].name, static_cast<u32>(__builtin_strlen(symbols[i].name))};
+        REQUIRE(symbols[i].address != nullptr);
+        CHECK(find_native_helper(name) == symbols[i].address);
+        CHECK(engine.lookup(symbols[i].name) == symbols[i].address);
+        for (u32 j = 0; j < i; ++j)
+            CHECK(!name.eq({symbols[j].name, static_cast<u32>(__builtin_strlen(symbols[j].name))}));
+    }
+    CHECK(find_native_helper(lit_str("malloc")) == nullptr);
+    CHECK(find_native_helper(lit_str("rut_helper_hash_suffix")) == nullptr);
+    CHECK(find_native_helper({nullptr, 1}) == nullptr);
+    CHECK(find_native_helper({"", 0}) == nullptr);
+    engine.shutdown();
+}
 
 extern "C" u32 rut_helper_regex_scratch_cache_entry_count_for_test();
 extern "C" u32 rut_helper_regex_scratch_cache_count_for_test();

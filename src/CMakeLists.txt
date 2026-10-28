@@ -352,7 +352,7 @@ if(RUT_ENABLE_JIT)
         "${PROJECT_BINARY_DIR}/generated/rut/native_build_id.h" @ONLY)
 
     # Native handler helpers are shared by the compiler and LLVM-free server.
-    add_library(rut_native_helpers STATIC jit/runtime_helpers.cc)
+    add_library(rut_native_helpers STATIC jit/runtime_helpers.cc jit/native_helper_symbols.cc)
     target_include_directories(rut_native_helpers PUBLIC ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/third_party/vectorscan/src
         ${PROJECT_BINARY_DIR}/src/third_party/vectorscan
