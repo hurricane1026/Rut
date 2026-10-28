@@ -776,7 +776,7 @@ TEST(ws_terminate, peer_close_echo_stays_1000) {
 
 // === Partial frames across chunks ===
 
-TEST(ws_terminate, partial_frame_left_unconsumed) {
+TEST(ws_terminate, partial_data_payload_consumed_incrementally) {
     WsInspector st = make_state(false);
     Recorder r;
     u8 in[64];
@@ -789,16 +789,105 @@ TEST(ws_terminate, partial_frame_left_unconsumed) {
     WsInspectStatus s = ws_inspect(
         st, in, full - 2, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
     CHECK(s == WsInspectStatus::Ok);
-    CHECK_EQ(consumed, 0u);  // incomplete frame — nothing consumed
+    CHECK_EQ(consumed, full - 2);
     CHECK_EQ(produced, 0u);
     CHECK_EQ(r.calls, 0);
-    // Now feed the whole frame.
-    s = ws_inspect(
-        st, in, full, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    // Feed only the remaining bytes, preserving the message buffer.
+    s = ws_inspect(st,
+                   in + full - 2,
+                   2,
+                   out,
+                   sizeof(out),
+                   mbuf,
+                   sizeof(mbuf),
+                   record,
+                   &r,
+                   &consumed,
+                   &produced);
     CHECK(s == WsInspectStatus::Ok);
-    CHECK_EQ(consumed, full);
+    CHECK_EQ(consumed, 2u);
     CHECK_EQ(r.calls, 1);
     CHECK_EQ(r.last_len, 6u);
+}
+
+TEST(ws_terminate, masked_payload_split_at_every_byte) {
+    const u8 message[] = "split masked payload";
+    u8 frame[128];
+    const u32 n = build(frame, WsOpcode::Text, true, true, message, sizeof(message) - 1);
+    for (u32 split = 6; split < n; ++split) {
+        WsInspector st = make_state(true);
+        Recorder r;
+        u8 out[128], msg[128], decoded[128];
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           frame,
+                           split,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(consumed, split);
+        CHECK_EQ(produced, 0u);
+        REQUIRE(ws_inspect(st,
+                           frame + split,
+                           n - split,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(consumed, n - split);
+        CHECK_EQ(r.calls, 1);
+        WsFrameHeader h;
+        CHECK_EQ(parse_one(out, produced, true, &h, decoded), produced);
+        CHECK_EQ(h.payload_len, sizeof(message) - 1);
+        CHECK_EQ(memcmp(decoded, message, sizeof(message) - 1), 0);
+    }
+}
+
+TEST(ws_terminate, large_frame_arrives_in_bounded_chunks) {
+    constexpr u32 kLen = 70000;
+    static u8 input[kLen + kWsMaxHeaderSize], message[kLen], output[kLen + kWsMaxHeaderSize];
+    const u8 key[] = {0x11, 0x22, 0x33, 0x44};
+    const u32 header = ws_write_header(input, WsOpcode::Binary, true, true, key, kLen);
+    for (u32 i = 0; i < kLen; ++i) input[header + i] = static_cast<u8>(i);
+    ws_unmask(input + header, kLen, key);
+    WsInspector st = make_state(true);
+    Recorder recorder;
+    u32 offset = 0, produced = 0;
+    while (offset < header + kLen) {
+        const u32 left = header + kLen - offset;
+        const u32 chunk = left < 4093 ? left : 4093;
+        u32 consumed = 0;
+        REQUIRE(ws_inspect(st,
+                           input + offset,
+                           chunk,
+                           output,
+                           sizeof(output),
+                           message,
+                           sizeof(message),
+                           record,
+                           &recorder,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        REQUIRE(consumed == chunk);
+        offset += consumed;
+        if (offset < header + kLen) CHECK_EQ(produced, 0u);
+    }
+    CHECK_EQ(recorder.calls, 1);
+    CHECK_EQ(recorder.last_len, kLen);
+    WsFrameHeader h;
+    REQUIRE(ws_parse_header(output, produced, true, &h) == ParseStatus::Complete);
+    CHECK_EQ(h.payload_len, kLen);
+    ws_unmask(output + h.header_len, h.payload_len, h.mask_key);
+    for (u32 i = 0; i < kLen; ++i) REQUIRE(output[h.header_len + i] == static_cast<u8>(i));
 }
 
 // === Bounds & errors ===

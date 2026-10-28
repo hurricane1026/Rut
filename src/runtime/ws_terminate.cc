@@ -93,9 +93,13 @@ WsInspectStatus ws_inspect(WsInspector& st,
         const u8* p = in + *consumed;
 
         WsFrameHeader h;
-        const ParseStatus ps = ws_parse_header(p, avail, st.masked, &h);
-        if (ps == ParseStatus::Incomplete) break;  // partial header — wait for more bytes
-        if (ps == ParseStatus::Error) return WsInspectStatus::Error;
+        if (st.partial_data_frame) {
+            h = st.partial_header;
+        } else {
+            const ParseStatus ps = ws_parse_header(p, avail, st.masked, &h);
+            if (ps == ParseStatus::Incomplete) break;  // partial header — wait for more bytes
+            if (ps == ParseStatus::Error) return WsInspectStatus::Error;
+        }
 
         // Reject fragmentation the instant the header proves it — before waiting for (or
         // buffering) the payload. The in-place re-frame can't size a message spanning reads,
@@ -117,9 +121,12 @@ WsInspectStatus ws_inspect(WsInspector& st,
             }
         }
 
-        // The whole frame (header + payload) must be present before we act on it.
-        const u64 frame_total = static_cast<u64>(h.header_len) + h.payload_len;
-        if (avail < frame_total) break;  // partial payload — leave the frame unconsumed
+        // Control payloads are small and processed whole; data payloads can span reads.
+        const u32 header_len = st.partial_data_frame ? 0 : h.header_len;
+        const u64 frame_total =
+            static_cast<u64>(header_len) + h.payload_len - st.partial_payload_len;
+        if (ws_opcode_is_control(h.opcode) && avail < frame_total) break;
+        if (!ws_opcode_is_control(h.opcode) && avail < frame_total && *produced != 0) break;
         // A completed fragmented message can be larger than this input chunk. Flush
         // already-produced frames first when the next output might not fit; leave this
         // frame and the assembler state untouched for the next call.
@@ -130,7 +137,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     : (h.fin ? st.message_len + h.payload_len + kWsMaxHeaderSize : 0);
             if (needed > out_cap - *produced) break;
         }
-        const u8* payload = p + h.header_len;
+        const u8* payload = p + header_len;
 
         if (ws_opcode_is_control(h.opcode)) {
             // Copy + unmask the control payload (<=125 bytes) so we can validate it and
@@ -171,8 +178,21 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // Data frame (Text/Binary or continuation).
         // Accumulate the (unmasked) payload into the reassembly buffer (bound already
         // checked above), then ask the reassembler whether the message is complete.
-        for (u64 i = 0; i < h.payload_len; i++) msg_buf[st.message_len + i] = payload[i];
-        if (st.masked) ws_unmask(msg_buf + st.message_len, h.payload_len, h.mask_key);
+        const u64 remain = h.payload_len - st.partial_payload_len;
+        const u32 available_payload = avail - header_len;
+        const u32 chunk = remain < available_payload ? static_cast<u32>(remain) : available_payload;
+        u8* dst = msg_buf + st.message_len + st.partial_payload_len;
+        for (u32 i = 0; i < chunk; i++) dst[i] = payload[i];
+        if (st.masked) ws_unmask_chunk(dst, chunk, h.mask_key, st.partial_payload_len);
+        st.partial_payload_len += chunk;
+        *consumed += header_len + chunk;
+        if (st.partial_payload_len < h.payload_len) {
+            st.partial_data_frame = true;
+            st.partial_header = h;
+            break;
+        }
+        st.partial_data_frame = false;
+        st.partial_payload_len = 0;
 
         WsOpcode msg_op;
         u64 total;
@@ -180,7 +200,6 @@ WsInspectStatus ws_inspect(WsInspector& st,
             ws_message_feed(st.assembler, h, st.max_message_size, &msg_op, &total);
         if (ms == WsMessageStatus::Error) return WsInspectStatus::Error;
         st.message_len += h.payload_len;
-        *consumed += static_cast<u32>(frame_total);
 
         if (ms == WsMessageStatus::NeedMore) continue;  // awaiting more fragments
 
