@@ -926,7 +926,7 @@ struct HirMatchArm {
     // Source-ordered side effects that execute after this arm's prelude
     // guards and immediately before its terminal body. Entries index the
     // owning HirRoute::exprs pool. CacheSet and request-header mutations are supported.
-    static constexpr u32 kMaxEffects = 2;
+    static constexpr u32 kMaxEffects = 4;
     FixedVec<u32, kMaxEffects> effect_expr_indices;
     static constexpr u32 kMaxPreludeGuards = 4;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;

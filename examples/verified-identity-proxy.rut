@@ -1,0 +1,26 @@
+import "middleware/auth.rut"
+
+listen :8080
+upstream application at "127.0.0.1:9000"
+
+// Configure distinct secrets at load time. The application trusts only the two
+// identity headers replaced below, and accepts traffic only from this gateway.
+route GET "/profile" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: env("ALICE_KEY"), credentials: "",
+            keyId: "alice-key", passwordId: "alice-disabled-basic"),
+        auth.ConsumerCredentials(consumerId: "bob", key: env("BOB_KEY"), credentials: "",
+            keyId: "bob-key", passwordId: "bob-disabled-basic"))
+    // A selected match arm executes after the helper's authentication guards.
+    match identity.method {
+        "apiKey" => {
+            req.remove("Authorization")
+            req.remove("X-API-Key")
+            req.set("X-Consumer-ID", identity.consumerId)
+            req.set("X-Credential-ID", identity.credentialId)
+            return forward(application, load_balance: .roundRobin)
+        }
+        _ => return 403
+    }
+}
+route "/" { return 404 }

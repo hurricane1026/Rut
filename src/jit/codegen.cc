@@ -379,6 +379,17 @@ struct Ctx {
         return fn_req_set_header;
     }
 
+    LLVMValueRef fn_req_set_owned_header = nullptr;
+    LLVMValueRef get_req_set_owned_header() {
+        if (!fn_req_set_owned_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            fn_req_set_owned_header = LLVMAddFunction(llvm_mod,
+                                                      "rut_helper_req_set_owned_header",
+                                                      LLVMFunctionType(void_ty, params, 6, 0));
+        }
+        return fn_req_set_owned_header;
+    }
+
     // void rut_helper_req_add_header(ptr conn, ptr name, i32 nlen, ptr val, i32 vlen)
     LLVMValueRef fn_req_add_header = nullptr;
     LLVMValueRef get_req_add_header() {
@@ -1173,6 +1184,16 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef value = c.get_value(inst.operands[0]);
             LLVMValueRef vptr = LLVMBuildExtractValue(c.builder, value, 0, "setheader.vptr");
             LLVMValueRef vlen = LLVMBuildExtractValue(c.builder, value, 1, "setheader.vlen");
+            if (!LLVMIsConstant(value)) {
+                LLVMValueRef args[] = {c.param_conn, c.param_arena, name_ptr, name_len, vptr, vlen};
+                LLVMBuildCall2(c.builder,
+                               LLVMGlobalGetValueType(c.get_req_set_owned_header()),
+                               c.get_req_set_owned_header(),
+                               args,
+                               6,
+                               "");
+                break;
+            }
             LLVMValueRef args[] = {c.param_conn, name_ptr, name_len, vptr, vlen};
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_req_set_header()),

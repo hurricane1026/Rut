@@ -24465,6 +24465,14 @@ TEST(jit, owned_request_headers_copy_borrowed_inputs_and_fail_closed) {
     rut_helper_req_set_owned_header(&conn, nullptr, "X", 1, "a", 1);
     CHECK(conn.req_header_override_overflow);  // No request pool in this direct caller.
     CHECK_EQ(conn.req_header_override_count, 0u);
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    rut_helper_req_set_owned_header(&conn, nullptr, "X", 1, "owned", 5);
+    REQUIRE_EQ(conn.req_header_override_count, 1u);
+    CHECK(conn.req_header_overrides[0].value.eq(lit("owned")));
+    CHECK(!conn.req_header_override_overflow);
+    conn.reset();
+    conn.json_arena.backend.pool = nullptr;
     arena.destroy();
     pool.destroy();
     REQUIRE(pool.init(1));
@@ -24477,4 +24485,167 @@ TEST(jit, owned_request_headers_copy_borrowed_inputs_and_fail_closed) {
     CHECK_EQ(conn.req_header_owned_bytes, 0u);
     arena.destroy();
     pool.destroy();
+}
+
+TEST(jit, verified_identity_headers_replace_spoofing_after_authentication) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    std::string source = R"rut(
+import "middleware/auth.rut"
+upstream app at "127.0.0.1:9000"
+route GET "/" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "a", credentials: "", keyId: "ak", passwordId: "ap"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "b", credentials: "", keyId: "bk", passwordId: "bp"))
+    match identity.method {
+        "apiKey" => {
+            req.remove("Authorization")
+            req.remove("X-API-Key")
+            req.set("X-Consumer-ID", identity.consumerId)
+            req.set("X-Credential-ID", identity.credentialId)
+            return forward(app, load_balance: .roundRobin)
+        }
+        _ => return 403
+    }
+}
+route GET "/raw" {
+    req.set("X-Copy", req.uniqueHeader("X-Input").or(""))
+    return forward(app, load_balance: .roundRobin)
+}
+route GET "/invalid" {
+    req.set("X-Copy", req.uniqueHeader("X-Input").or("bad\r\nInjected: yes"))
+    return forward(app, load_balance: .roundRobin)
+}
+)rut";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    if (!ast)
+        std::fprintf(stderr,
+                     "identity parse error %u at %u:%u %.*s\n",
+                     static_cast<unsigned>(ast.error().code),
+                     ast.error().span.line,
+                     ast.error().span.col,
+                     ast.error().detail.len,
+                     ast.error().detail.ptr);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "identity-forwarding: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    struct Case {
+        const char* headers;
+        const char* consumer;
+        const char* credential;
+    };
+    const Case cases[] = {
+        {"Authorization: Bearer a\r\nX-Consumer-ID: forged\r\nx-consumer-id: "
+         "forged2\r\nX-Credential-ID: forged\r\nX-API-Key: leak\r\n",
+         "alice",
+         "ak"},
+        {"Authorization: Bearer b\r\n", "bob", "bk"},
+        {"Authorization: Bearer wrong\r\n", nullptr, nullptr},
+        {"Authorization: Bearer a\r\nauthorization: Bearer a\r\n", nullptr, nullptr},
+        {"", nullptr, nullptr},
+    };
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    Connection conn;
+    for (const auto& tc : cases) {
+        conn.reset();
+        SliceArena arena;
+        REQUIRE(arena.init(&pool));
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: test\r\n") + tc.headers + "\r\n";
+        auto result = HandlerResult::unpack(handler(&conn,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(request.data()),
+                                                    static_cast<u32>(request.size()),
+                                                    &arena));
+        if (tc.consumer == nullptr) {
+            CHECK(result.action == HandlerAction::ReturnStatus);
+            CHECK_EQ(result.status_code, 401u);
+            CHECK_EQ(conn.req_header_override_count, 0u);
+        } else {
+            CHECK(result.action == HandlerAction::Forward);
+            REQUIRE_EQ(conn.req_header_override_count, 4u);
+            CHECK(!conn.req_header_override_overflow);
+            CHECK(conn.req_header_owned_bytes > 0);
+            CHECK(conn.req_header_overrides[2].value.eq(lit(tc.consumer)));
+            CHECK(conn.req_header_overrides[3].value.eq(lit(tc.credential)));
+            u8 out[4096];
+            u32 out_len = 0;
+            REQUIRE(h2_prepare_forward_request(conn,
+                                               reinterpret_cast<const u8*>(request.data()),
+                                               static_cast<u32>(request.size()),
+                                               out,
+                                               sizeof(out),
+                                               &out_len));
+            const std::string wire(reinterpret_cast<const char*>(out), out_len);
+            CHECK(wire.find("Authorization:") == std::string::npos);
+            CHECK(wire.find("X-API-Key:") == std::string::npos);
+            CHECK(wire.find("forged") == std::string::npos);
+            CHECK(wire.find(std::string("X-Consumer-ID: ") + tc.consumer + "\r\n") !=
+                  std::string::npos);
+            CHECK(wire.find(std::string("X-Credential-ID: ") + tc.credential + "\r\n") !=
+                  std::string::npos);
+        }
+        arena.destroy();
+    }
+    auto raw = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(raw);
+    conn.reset();
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    std::string request = "GET /raw HTTP/1.1\r\nHost: test\r\nX-Input: original\r\n\r\n";
+    CHECK(HandlerResult::unpack(raw(&conn,
+                                    nullptr,
+                                    reinterpret_cast<const u8*>(request.data()),
+                                    static_cast<u32>(request.size()),
+                                    &arena))
+              .action == HandlerAction::Forward);
+    REQUIRE_EQ(conn.req_header_override_count, 1u);
+    auto position = request.find("original");
+    REQUIRE(position != std::string::npos);
+    request.replace(position, 8, "modified");
+    CHECK(conn.req_header_overrides[0].value.eq(lit("original")));
+    conn.reset();
+    auto invalid = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_2"));
+    REQUIRE(invalid);
+    request = "GET /invalid HTTP/1.1\r\nHost: test\r\n\r\n";
+    invalid(&conn,
+            nullptr,
+            reinterpret_cast<const u8*>(request.data()),
+            static_cast<u32>(request.size()),
+            &arena);
+    CHECK(conn.req_header_override_overflow);
+    CHECK_EQ(conn.req_header_override_count, 0u);
+    u8 rejected[4096];
+    u32 rejected_len = 0;
+    CHECK(!h2_prepare_forward_request(conn,
+                                      reinterpret_cast<const u8*>(request.data()),
+                                      static_cast<u32>(request.size()),
+                                      rejected,
+                                      sizeof(rejected),
+                                      &rejected_len));
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
 }

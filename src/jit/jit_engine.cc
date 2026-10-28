@@ -60,6 +60,7 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_req_set_target_transform",
      reinterpret_cast<void*>(&rut_helper_req_set_target_transform)},
     {"rut_helper_req_set_header", reinterpret_cast<void*>(&rut_helper_req_set_header)},
+    {"rut_helper_req_set_owned_header", reinterpret_cast<void*>(&rut_helper_req_set_owned_header)},
     {"rut_helper_req_add_header", reinterpret_cast<void*>(&rut_helper_req_add_header)},
     {"rut_helper_req_remove_header", reinterpret_cast<void*>(&rut_helper_req_remove_header)},
     {"rut_helper_resp_set_header", reinterpret_cast<void*>(&rut_helper_resp_set_header)},

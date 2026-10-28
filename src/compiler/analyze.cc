@@ -90,8 +90,8 @@ constexpr Str kPipePlaceholderDetail = lit_str(
     "right side of | must be a call with a _ placeholder; write f(y, _) or f(_, y) to show "
     "where the value lands");
 constexpr Str kReqHeaderMutationDetail = lit_str(
-    "req.set/add expect literal safe header name and value strings, and may only be used as a "
-    "statement");
+    "req.set expects a literal safe header name and an unwrapped str value; req.add requires "
+    "literal name and value strings; both are statement-only");
 constexpr Str kReqHeaderRemoveDetail =
     lit_str("req.remove expects one literal safe header name and may only be used as a statement");
 constexpr Str kReqHeaderRemoveOrderDetail = lit_str(
@@ -4470,10 +4470,14 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         const bool is_add = expr.name.eq({"add", 3});
         if (!route->req_header_mutation_stmt_ok || expr.args.len != (is_remove ? 1u : 2u) ||
             expr.args[0] == nullptr || expr.args[0]->kind != AstExprKind::StrLit ||
-            (!is_remove && (expr.args[1] == nullptr || expr.args[1]->kind != AstExprKind::StrLit)))
+            (!is_remove &&
+             (expr.args[1] == nullptr || (is_add && expr.args[1]->kind != AstExprKind::StrLit))))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   is_remove ? kReqHeaderRemoveDetail : kReqHeaderMutationDetail);
+        // Consume statement-only permission before analyzing arguments so eager
+        // nested expressions cannot hide another request mutation in a value.
+        route->req_header_mutation_stmt_ok = false;
         auto name = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
         if (!name) return core::make_unexpected(name.error());
         const Str header_name = name->str_value;
@@ -4485,7 +4489,12 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             is_remove ? FrontendResult<HirExpr>(empty)
                       : analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
         if (!value) return core::make_unexpected(value.error());
-        const Str header_value = value->str_value;
+        if (value->type != HirTypeKind::Str || value->may_nil || value->may_error)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, kReqHeaderMutationDetail);
+        // Dynamic bytes are checked and copied by the owned runtime helper.
+        const Str header_value =
+            value->kind == HirExprKind::StrLit ? value->str_value : lit_str("");
         if (validate_response_header(
                 header_name.ptr, header_name.len, header_value.ptr, header_value.len) !=
             HttpHeaderValidation::Ok)

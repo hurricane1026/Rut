@@ -6336,8 +6336,8 @@ inline bool apply_request_header_overrides(Connection& conn) {
     // here — e.g. a request-derived value recorded straight through RIR — would be
     // shifted/overwritten by the in-place rewrite below before it's serialized, so
     // we can't apply it safely and must fail closed rather than forward a corrupted
-    // header. (DSL set_header values are string literals in stable JIT constant
-    // memory, so they never alias recv_buf and this never trips for compiled .rut.)
+    // header. Compiled literal values use stable constants; runtime req.set
+    // values use request-arena copies. Neither aliases this rewrite buffer.
     const uintptr_t kBufLo = reinterpret_cast<uintptr_t>(buf);
     const uintptr_t kBufHi = kBufLo + conn.recv_buf.capacity();
     auto aliases_recv_buf = [&](const Str& s) {
