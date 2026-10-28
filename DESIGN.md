@@ -543,7 +543,7 @@ req.header("X-Timestamp")    // string?
 req.set("X-User-ID", "123")
 req.remove("Authorization")  // remove all matching fields before upstream forwarding
 // Target only: unwrap uuid() with guard let, then set the ID.
-// Dynamic req.set/add values remain pending; do not emit uuid() directly here.
+// req.set accepts a non-optional runtime string; req.add still requires a literal.
 
 // Route parameters — path captures live in the req.params namespace,
 // so a capture can never shadow a built-in property (req.path, req.host, ...)
@@ -8165,9 +8165,11 @@ Effects are declared before authentication guards in the existing leading route
 region (or in supported selected match arms) and apply only when forwarding.
 Request reads retain the original credentials for verification; authentication
 failure still returns locally. This provides explicit hide-credentials behavior
-without new keywords or dependencies. Dynamic identity header values, query/body
-credential removal, and a general ordered middleware effect model remain separate
-work. See `examples/auth-proxy.rut` and the language card for current syntax.
+without new keywords or dependencies. A selected match arm can use `req.set` to
+replace untrusted identity headers with a verified runtime string, copied into
+bounded request-owned storage and validated before forwarding. Query/body credential
+removal and a general ordered middleware effect model remain separate work. See
+`examples/auth-proxy.rut` and the language card for current syntax.
 
 Compiler expression storage for HIR helpers/routes and MIR functions uses
 Arena-backed node pools. Nodes keep stable addresses across chunk growth; copies
