@@ -42,7 +42,7 @@ The stream carries a protocol version and source/build-configuration fingerprint
 
 Prerequisites: `clang++`, `cmake`, `ninja`. LLVM and Vectorscan are
 required for the JIT (enabled by default via `RUT_ENABLE_JIT=ON`); the
-BoringSSL and zstd dependencies are vendored under `third_party/`.
+zstd is vendored under `third_party/`; TLS uses checksum-pinned static OpenSSL built by CMake.
 
 ```bash
 ./dev.sh build

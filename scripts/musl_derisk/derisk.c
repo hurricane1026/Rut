@@ -1,22 +1,22 @@
 // rut-NODE 侧的 musl-static 去风险:只链 vectorscan *runtime*(libhs_runtime.a,无编译器)
-// + BoringSSL,验证两者能静态链进一个零 .so 的 musl 二进制,并且**真正跑通** rut-node 的
+// + OpenSSL,验证两者能静态链进一个零 .so 的 musl 二进制,并且**真正跑通** rut-node 的
 // 路径:反序列化 master 下发的 DB -> 分配 scratch -> hs_scan 出命中。
 //
 // DB 由 gen_db(master 侧,完整 libhs)预先编译+序列化,经 argv[1] 传入 —— 精确镜像
 // rut-master(编译)/ rut-node(只反序列化+扫描)的拆分。每步 fail-hard:一次成功运行
 // 才是真的成功,而不是 -O2 把检查优化掉后照样打印 "derisk ok"。
 //
-// 头走 vendored(-I third_party/vectorscan/src + third_party/boringssl/include),不依赖系统包。
+// 头走 Vectorscan 子模块及固定版 OpenSSL 的安装目录,不依赖系统包。
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <hs_common.h>   // hs_valid_platform / hs_deserialize_database / hs_free_database
 #include <hs_runtime.h>  // hs_scan / hs_alloc_scratch / hs_free_scratch / hs_scratch_t
-#include <openssl/bio.h>  // BoringSSL: mem BIO for the in-process handshake
-#include <openssl/rand.h>  // BoringSSL: RAND_bytes (RNG path)
-#include <openssl/sha.h>   // BoringSSL
-#include <openssl/ssl.h>   // BoringSSL TLS
+#include <openssl/bio.h>  // OpenSSL: mem BIO for the in-process handshake
+#include <openssl/rand.h>  // OpenSSL: RAND_bytes (RNG path)
+#include <openssl/sha.h>   // OpenSSL
+#include <openssl/ssl.h>   // OpenSSL TLS
 
 static int on_match(unsigned int id, unsigned long long from, unsigned long long to,
                     unsigned int flags, void* ctx) {
@@ -34,18 +34,18 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // --- BoringSSL: 哈希 + TLS 上下文 (确保链到 crypto + ssl) ---
+    // --- OpenSSL: 哈希 + TLS 上下文 (确保链到 crypto + ssl) ---
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256((const unsigned char*)"rut", 3, digest);
     // RNG is the most common musl-static TLS failure (entropy/getrandom). Exercise it.
     unsigned char rnd[32];
     if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
-        fprintf(stderr, "FAIL: RAND_bytes (BoringSSL RNG)\n");
+        fprintf(stderr, "FAIL: RAND_bytes (OpenSSL RNG)\n");
         return 1;
     }
     SSL_CTX* ctx = SSL_CTX_new(TLS_method());
     if (!ctx) {
-        fprintf(stderr, "FAIL: SSL_CTX_new (BoringSSL TLS)\n");
+        fprintf(stderr, "FAIL: SSL_CTX_new (OpenSSL TLS)\n");
         return 1;
     }
     // Drive a real handshake start, not just ctx alloc: a client SSL over a mem BIO must

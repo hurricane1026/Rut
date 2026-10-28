@@ -1,3 +1,7 @@
+> 历史实验记录：正常构建现使用固定版本 OpenSSL；BoringSSL 子模块已移除。
+> 文中 BoringSSL 的构建步骤与容量推测不再是当前复现方法。
+> 请以 `scripts/musl_derisk/README.md` 中的 OpenSSL 步骤及其验证范围为准。
+
 # rut-node:静态、零依赖的边缘分发
 
 > 状态:设计完成;去风险**部分验证**(2026-06-22 跑过,但当时 harness 链的是系统
