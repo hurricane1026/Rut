@@ -173,6 +173,15 @@
 
 ## 已核对的部分证据
 
+本批核对基线：`4f216970`。下列状态只反映所列代码与测试的静态核对；本批没有执行测试或竞品差分。
+
+- **K001 HTTP/HTTPS 反向代理 — 部分实现。** [语言卡](language-card.md)提供 `upstream` 和显式负载均衡的 `forward`；[集成测试](../tests/test_integration.cc) 包含 HTTP 转发、TLS 和请求分帧路径。仍需分别对照普通转发与各策略组合的 HTTP 版本、流式 body、错误和连接复用；不能将单一请求测试视为 REST 全覆盖。
+- **K002 HTTP/2 / 原生 gRPC — 部分实现。** [语言卡的 Native gRPC forwarding](language-card.md#native-grpc-forwarding)描述下游 h2c/TLS、上游 `.http2` 和四类 RPC 流；[gRPC 测试](../tests/test_grpc_proxy.cc)包含 epoll/io_uring 的流和连接池用例。该路径对消息和元数据按文档保持不透明，受头、缓冲和连接资源上限约束；协议及竞品行为矩阵仍待运行验收。
+- **K003 gRPC-Web — 当前 `.http2` 转发选项不实现。** [语言卡](language-card.md#native-grpc-forwarding)明确将 gRPC-Web 排除在该选项之外。浏览器跨域、文本/二进制 framing、trailers 与流式能力仍需设计、实现及验证；此结论不推断任意外部适配器的能力。
+- **K004 HTTP/JSON 到 gRPC 转码 — 当前 `.http2` 转发选项不实现。** 同一[语言卡](language-card.md#native-grpc-forwarding)明确排除 JSON transcoding；尚需定义 schema、方法映射及双向错误语义并验证。
+- **K007 SSE / 流 — 部分底座，场景未验收。** [集成测试](../tests/test_integration.cc)包含大请求体分段转发、早期上游响应及取消相关路径；这不是 SSE 语义或竞品等价的证明。需单独验证持续响应、缓冲、超时、背压和客户端断开。
+- **K009 TLS 终止 / SNI / 透传 — 部分证据。** [TLS 实现](../src/runtime/tls.cc)包含客户端验证及 SNI 设置，[集成测试](../tests/test_integration.cc)包含 TLS 握手和 HTTP/2 ALPN。上游客户端 SNI 不能证明下游 SNI 路由或 TLS 透传；后两项及证书轮换仍需单独审计和验收。
+
 - **K005 WebSocket 代理 — 部分实现，未完成竞品验收。** Rut 提供 `return websocket(chat)` 透明代理入口（[语言卡](language-card.md)）；[集成测试](../tests/test_integration.cc)包含 WebSocket 连接与分片往返。还需固定 Nginx/Envoy 版本并比较握手、超时、背压、半关闭和扩展等行为，不能据此声明完整兼容。
 - **K006 消息检查 — 部分实现，未完成竞品验收。** 终止模式支持 `forward`、`drop`、`close` 和分片重组；[实现](../include/rut/runtime/callbacks_impl.h) 将消息上限约束在一个 slice 内，[测试](../tests/test_ws_terminate.cc)覆盖跨帧 UTF-8、控制帧和总大小限制。[#937](https://github.com/hurricane1026/Rut/pull/937) 已合并；大消息、压缩内容检查和完整竞品差分仍待处理。
 
