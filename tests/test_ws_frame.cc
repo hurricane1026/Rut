@@ -67,6 +67,24 @@ TEST(ws_frame_rfc, masked_hello_text_unmasks) {
     CHECK_EQ(memcmp(f + r.h.header_len, "Hello", 5), 0);
 }
 
+TEST(ws_frame_rfc, masked_payload_can_be_decoded_in_arbitrary_chunks) {
+    const u8 key[] = {0x37, 0xfa, 0x21, 0x3d};
+    const u8 expected[] = "WebSocket split across reads";
+    u8 masked[sizeof(expected) - 1];
+    memcpy(masked, expected, sizeof(masked));
+    ws_unmask(masked, sizeof(masked), key);
+    for (u32 split = 0; split <= sizeof(masked); ++split) {
+        u8 decoded[sizeof(masked)];
+        memcpy(decoded, masked, sizeof(decoded));
+        ws_unmask_chunk(decoded, split, key, 0);
+        ws_unmask_chunk(decoded + split, sizeof(decoded) - split, key, split);
+        CHECK_EQ(memcmp(decoded, expected, sizeof(decoded)), 0);
+    }
+    u8 byte = 0;
+    ws_unmask_chunk(&byte, 1, key, ~u64{0});
+    CHECK_EQ(byte, key[3]);
+}
+
 TEST(ws_frame_rfc, unmasked_ping_hello) {
     const u8 f[] = {0x89, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f};
     ParseResult r = parse(f, sizeof(f), false);

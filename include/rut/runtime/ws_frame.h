@@ -59,6 +59,11 @@ ParseStatus ws_parse_header(const u8* buf, u32 len, bool require_mask, WsFrameHe
 // the 4-byte key (§5.3). Safe for len == 0.
 void ws_unmask(u8* payload, u64 len, const u8 mask_key[4]);
 
+// Apply a frame's mask to a payload chunk beginning at `offset` bytes into that
+// frame. The offset is relative to the payload, not to the message: each new
+// continuation frame starts at zero with its own mask key.
+void ws_unmask_chunk(u8* payload, u64 len, const u8 mask_key[4], u64 offset);
+
 // Serialize a frame header into `out` (caller guarantees >= kWsMaxHeaderSize bytes).
 // When `masked`, writes `mask_key` (the caller masks the payload separately via
 // ws_unmask). Returns the number of header octets written (2..14), or 0 if the inputs
