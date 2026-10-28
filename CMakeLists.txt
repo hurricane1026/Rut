@@ -34,6 +34,10 @@ add_library(rut_ebpf_settings INTERFACE)
 target_compile_definitions(rut_ebpf_settings INTERFACE
     RUT_ENABLE_EBPF=$<BOOL:${RUT_ENABLE_EBPF}>)
 
+option(RUT_BUILD_EBPF_PROBE "Build the Linux-only experimental sockmap capability probe" OFF)
+if(RUT_BUILD_EBPF_PROBE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "RUT_BUILD_EBPF_PROBE requires Linux")
+endif()
 # WebSocket/Upgrade passthrough tunnel. ON by default; turn OFF for a minimal
 # build (e.g. a k8s mesh sidecar that never proxies WebSocket) to compile out the
 # 101 tunnel path entirely.

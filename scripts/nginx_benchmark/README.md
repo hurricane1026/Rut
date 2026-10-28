@@ -337,3 +337,10 @@ The optional Python masking accelerator is selected with
 `bench_ws_mask` CMake target, excluded from the default build. The same origin
 setting must apply to every frontend. Small-message ctypes calls can be slower;
 64B diagnostics found a regression, so the accelerator remains off by default.
+
+## Separate kernel-relay experiment
+
+The [container copy/splice probe](../kernel_relay_benchmark.md) compares raw TCP
+relay mechanisms in a shared container network namespace. It reuses body and
+origin-reuse preflights, but is separate from Rut/nginx performance acceptance
+and does not establish a production Rut speedup.
