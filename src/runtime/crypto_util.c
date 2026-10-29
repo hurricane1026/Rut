@@ -39,6 +39,37 @@ uint32_t rut_crypto_equal_v1(const uint8_t* a, const uint8_t* b, uint32_t length
     return CRYPTO_memcmp(a, b, length) == 0;
 }
 
+uint32_t rut_crypto_hmac_sha256_matches_v1(const uint8_t* message,
+                                           uint32_t message_len,
+                                           const uint8_t* key,
+                                           uint32_t key_len,
+                                           const uint8_t* signature,
+                                           uint32_t signature_len,
+                                           const uint8_t* prefix,
+                                           uint32_t prefix_len) {
+    if ((!message && message_len) || message_len > 1024u * 1024u || !key || !key_len ||
+        key_len > 4096 || !signature || prefix_len > 64 || (!prefix && prefix_len) ||
+        signature_len != prefix_len + 64)
+        return 0;
+    for (uint32_t i = 0; i < prefix_len; ++i)
+        if (signature[i] != prefix[i]) return 0;
+    uint8_t encoded[128];
+    uint32_t length = 0;
+    const uint32_t computed = rut_crypto_digest_hex_v1(RUT_CRYPTO_SHA256_V1,
+                                                       message,
+                                                       message_len,
+                                                       key,
+                                                       key_len,
+                                                       1,
+                                                       encoded,
+                                                       sizeof(encoded),
+                                                       &length);
+    const uint32_t matches =
+        computed && length == 64 && rut_crypto_equal_v1(encoded, signature + prefix_len, length);
+    rut_crypto_clear_v1(encoded, sizeof(encoded));
+    return matches;
+}
+
 void rut_crypto_clear_v1(void* data, uint32_t length) {
     if (data && length) OPENSSL_cleanse(data, length);
 }

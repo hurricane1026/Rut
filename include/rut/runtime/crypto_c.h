@@ -81,6 +81,19 @@ uint32_t rut_crypto_hmac_long_key_v1(uint32_t algorithm,
 /* Compare equally sized byte strings without content-dependent timing. A null
  * pointer is valid only for zero length. Length itself is public. */
 uint32_t rut_crypto_equal_v1(const uint8_t* a, const uint8_t* b, uint32_t length);
+/* Verify a canonical lowercase hexadecimal HMAC-SHA256 signature with an
+ * optional exact public prefix (at most 64 bytes). The message is bounded to
+ * 1 MiB and the nonempty key to 4096 bytes. Inputs are borrowed synchronously;
+ * null is allowed only for a zero-length message or prefix. Returns 0 for an
+ * invalid input or mismatch and retains no pointers. */
+uint32_t rut_crypto_hmac_sha256_matches_v1(const uint8_t* message,
+                                           uint32_t message_len,
+                                           const uint8_t* key,
+                                           uint32_t key_len,
+                                           const uint8_t* signature,
+                                           uint32_t signature_len,
+                                           const uint8_t* prefix,
+                                           uint32_t prefix_len);
 /* Wipe caller-owned bytes; null is valid only for zero length. */
 void rut_crypto_clear_v1(void* data, uint32_t length);
 /* Padded Base64. Output includes a trailing NUL, excluded from output_len.

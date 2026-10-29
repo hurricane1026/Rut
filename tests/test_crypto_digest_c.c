@@ -16,5 +16,35 @@ int main(void) {
     rut_crypto_clear_v1(output, sizeof(output));
     for (uint32_t i = 0; i < sizeof(output); ++i)
         if (output[i]) return 3;
+    static const uint8_t key[] = {'k', 'e', 'y'};
+    static const uint8_t signature[] =
+        "sha256=9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab";
+    static const uint8_t prefix[] = "sha256=";
+    if (!rut_crypto_hmac_sha256_matches_v1(input,
+                                           sizeof(input),
+                                           key,
+                                           sizeof(key),
+                                           signature,
+                                           sizeof(signature) - 1,
+                                           prefix,
+                                           sizeof(prefix) - 1))
+        return 4;
+    if (rut_crypto_hmac_sha256_matches_v1(input,
+                                          sizeof(input) - 1,
+                                          key,
+                                          sizeof(key),
+                                          signature,
+                                          sizeof(signature) - 1,
+                                          prefix,
+                                          sizeof(prefix) - 1) ||
+        rut_crypto_hmac_sha256_matches_v1(input,
+                                          sizeof(input),
+                                          0,
+                                          0,
+                                          signature,
+                                          sizeof(signature) - 1,
+                                          prefix,
+                                          sizeof(prefix) - 1))
+        return 5;
     return 0;
 }

@@ -95,32 +95,14 @@ bool basic_matches(Str authorization, Str credentials) {
 }
 
 bool hmac_sha256_matches(Str message, Str key, Str signature, Str prefix) {
-    if ((message.ptr == nullptr && message.len != 0) || message.len > kMaxHmacMessageBytes ||
-        key.ptr == nullptr || key.len == 0 || key.len > kMaxHmacKeyBytes ||
-        signature.ptr == nullptr || prefix.len > 64 || (prefix.ptr == nullptr && prefix.len != 0) ||
-        signature.len != prefix.len + 64)
-        return false;
-    // Prefix is a public wire-format marker chosen by trusted policy.
-    for (u32 i = 0; i < prefix.len; ++i)
-        if (signature.ptr[i] != prefix.ptr[i]) return false;
-    char encoded[kMaxHashHexBytes];
-    u32 length = 0;
-    const bool kComputed = rut_crypto_digest_hex_v1(RUT_CRYPTO_SHA256_V1,
-                                                    reinterpret_cast<const u8*>(message.ptr),
-                                                    message.len,
-                                                    reinterpret_cast<const u8*>(key.ptr),
-                                                    key.len,
-                                                    1,
-                                                    reinterpret_cast<u8*>(encoded),
-                                                    sizeof(encoded),
-                                                    &length);
-    const bool kMatches =
-        kComputed && length == 64 &&
-        rut_crypto_equal_v1(reinterpret_cast<const u8*>(encoded),
-                            reinterpret_cast<const u8*>(signature.ptr + prefix.len),
-                            length);
-    rut_crypto_clear_v1(encoded, sizeof(encoded));
-    return kMatches;
+    return rut_crypto_hmac_sha256_matches_v1(reinterpret_cast<const u8*>(message.ptr),
+                                             message.len,
+                                             reinterpret_cast<const u8*>(key.ptr),
+                                             key.len,
+                                             reinterpret_cast<const u8*>(signature.ptr),
+                                             signature.len,
+                                             reinterpret_cast<const u8*>(prefix.ptr),
+                                             prefix.len) != 0;
 }
 
 }  // namespace rut
