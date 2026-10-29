@@ -1152,9 +1152,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     r.loop->timer.add(c, r.loop->keepalive_timeout);  // a bare add
     CHECK(!c->idle_trim_examined);
     // RelayOwner, BufferedSendVector, and the four WebSocket inspection slices
-    // are part of the hot connection slot. Keep the current layout explicit so
-    // future owner fields cannot grow it unnoticed.
-    CHECK_EQ(sizeof(Connection), 4184u);
+    // are part of the hot connection slot. Fixed-text rewriting adds one route
+    // view on the connection and one view per direction; keep the resulting
+    // bounded layout explicit so future owner fields cannot grow it unnoticed.
+    CHECK_EQ(sizeof(Connection), 4240u);
 }
 
 TEST(iouring_idle_trim,
