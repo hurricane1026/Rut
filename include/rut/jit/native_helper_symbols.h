@@ -38,6 +38,7 @@
     X(rut_helper_parse_unprime)            \
     X(rut_helper_hash)                     \
     X(rut_crypto_digest_v1)                \
+    X(rut_crypto_digest_parts_v1)          \
     X(rut_helper_uuid)                     \
     X(rut_helper_str_has_prefix)           \
     X(rut_helper_http_origin_list_allows)  \

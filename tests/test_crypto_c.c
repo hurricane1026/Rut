@@ -62,5 +62,36 @@ int main(void) {
         return 9;
     for (uint32_t i = 0; i < sizeof(hmac_expected); ++i)
         if (out[i] != hmac_expected[i]) return 10;
+    const rut_crypto_span_v1 parts[] = {{message, 3}, {message + 3, sizeof(message) - 3}};
+    if (!rut_crypto_digest_parts_v1(RUT_CRYPTO_SHA256_V1,
+                                    parts,
+                                    2,
+                                    hmac_key,
+                                    sizeof(hmac_key),
+                                    1,
+                                    out,
+                                    sizeof(out),
+                                    &len) ||
+        len != sizeof(hmac_expected))
+        return 11;
+    for (uint32_t i = 0; i < sizeof(hmac_expected); ++i)
+        if (out[i] != hmac_expected[i]) return 12;
+    out[0] = 0xa5;
+    if (rut_crypto_digest_parts_v1(
+            RUT_CRYPTO_SHA256_V1, NULL, 1, hmac_key, sizeof(hmac_key), 1, out, sizeof(out), &len) ||
+        len != 0 || out[0] != 0xa5)
+        return 13;
+    const rut_crypto_span_v1 invalid[] = {{NULL, 1}};
+    if (rut_crypto_digest_parts_v1(RUT_CRYPTO_SHA256_V1,
+                                   invalid,
+                                   1,
+                                   hmac_key,
+                                   sizeof(hmac_key),
+                                   1,
+                                   out,
+                                   sizeof(out),
+                                   &len) ||
+        len != 0 || out[0] != 0xa5)
+        return 14;
     return 0;
 }

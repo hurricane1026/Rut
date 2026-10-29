@@ -1,6 +1,7 @@
 #include "rut/runtime/webhook.h"
 
 #include "rut/common/types.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
 
 #include <openssl/crypto.h>
@@ -45,11 +46,24 @@ bool standard_webhook_valid(Str id,
     }
     const u64 kNow = static_cast<u64>(unix_seconds);
     if ((seconds > kNow ? seconds - kNow : kNow - seconds) > tolerance_seconds) return false;
-    const Str kParts[] = {id, lit_str("."), timestamp, lit_str("."), body};
+    const rut_crypto_span_v1 kParts[] = {
+        {reinterpret_cast<const u8*>(id.ptr), id.len},
+        {reinterpret_cast<const u8*>("."), 1},
+        {reinterpret_cast<const u8*>(timestamp.ptr), timestamp.len},
+        {reinterpret_cast<const u8*>("."), 1},
+        {reinterpret_cast<const u8*>(body.ptr), body.len},
+    };
     u8 digest[32];
     u32 length = 0;
-    if (!hash_digest_parts(
-            HashAlgorithm::Sha256, kParts, 5, raw_key, true, digest, sizeof(digest), length))
+    if (!rut_crypto_digest_parts_v1(RUT_CRYPTO_SHA256_V1,
+                                    kParts,
+                                    5,
+                                    reinterpret_cast<const u8*>(raw_key.ptr),
+                                    raw_key.len,
+                                    1,
+                                    digest,
+                                    sizeof(digest),
+                                    &length))
         return false;
     u8 encoded[45];
     const int kWritten = EVP_EncodeBlock(encoded, digest, sizeof(digest));

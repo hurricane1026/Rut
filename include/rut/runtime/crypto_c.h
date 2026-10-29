@@ -34,6 +34,24 @@ uint32_t rut_crypto_digest_v1(uint32_t algorithm,
                               uint32_t capacity,
                               uint32_t* output_len);
 
+typedef struct rut_crypto_span_v1 {
+    const uint8_t* data;
+    uint32_t len;
+} rut_crypto_span_v1;
+
+/* Hash up to 16 borrowed spans as one byte sequence without concatenation.
+ * The aggregate input is bounded to 1 MiB + 4096 bytes; key and output rules
+ * are identical to rut_crypto_digest_v1. No pointer is retained. */
+uint32_t rut_crypto_digest_parts_v1(uint32_t algorithm,
+                                    const rut_crypto_span_v1* parts,
+                                    uint32_t count,
+                                    const uint8_t* key,
+                                    uint32_t key_len,
+                                    uint32_t keyed,
+                                    uint8_t* output,
+                                    uint32_t capacity,
+                                    uint32_t* output_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -230,3 +230,38 @@ extern "C" uint32_t rut_crypto_digest_v1(uint32_t algorithm,
     *output_len = length;
     return ok ? 1u : 0u;
 }
+
+extern "C" uint32_t rut_crypto_digest_parts_v1(uint32_t algorithm,
+                                               const rut_crypto_span_v1* parts,
+                                               uint32_t count,
+                                               const uint8_t* key,
+                                               uint32_t key_len,
+                                               uint32_t keyed,
+                                               uint8_t* output,
+                                               uint32_t capacity,
+                                               uint32_t* output_len) {
+    if (!output_len) return 0;
+    *output_len = 0;
+    if (algorithm > RUT_CRYPTO_SHA512_V1 || keyed > 1 || count > 16 || (!parts && count) ||
+        key_len > rut::kMaxHashKeyBytes || (!key && key_len))
+        return 0;
+    rut::Str spans[16]{};
+    uint32_t total = 0;
+    constexpr uint32_t kMaxTotal = rut::kMaxHashInputBytes + 4096;
+    for (uint32_t i = 0; i < count; ++i) {
+        if ((!parts[i].data && parts[i].len) || parts[i].len > kMaxTotal - total) return 0;
+        spans[i] = {reinterpret_cast<const char*>(parts[i].data), parts[i].len};
+        total += parts[i].len;
+    }
+    rut::u32 length = 0;
+    const bool ok = rut::hash_digest_parts(static_cast<rut::HashAlgorithm>(algorithm),
+                                           spans,
+                                           count,
+                                           {reinterpret_cast<const char*>(key), key_len},
+                                           keyed != 0,
+                                           output,
+                                           capacity,
+                                           length);
+    *output_len = length;
+    return ok ? 1u : 0u;
+}
