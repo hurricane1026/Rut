@@ -822,7 +822,10 @@ return read(root: "/var/www")                  // zero-copy (uses *catch-all cap
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
 // Current terminate handlers: up to 4 guards over direction, text/binary opcode,
-// frame.len (< > == <= >= != integer literal, either side), and text.matches(re).
+// frame.len (< > == <= >= != integer literal, either side), text.matches(re),
+// text ==/!= string literal (either side), and text.isEmpty. Text predicates
+// compare raw payload bytes; use frame.isText for text-only filtering.
+// Literal equality decodes ordinary escapes, including embedded NUL.
 // Conditions support !, &&, ||, parentheses and left-to-right short-circuiting.
 // ! binds tighter than comparisons; && binds tighter than ||.
 // At most 32 condition nodes (leaf predicates + binary operators); nesting is bounded.
@@ -830,12 +833,22 @@ return websocket(chat) { frame in
     guard !frame.fromClient || !frame.isText || !frame.text.matches(re".*spam.*") else {
         frame.drop()
     }
+    guard !frame.fromClient || frame.text != "ping" else { frame.drop() }
     guard frame.len <= 4096 else { frame.close() }
     frame.forward()
 }
 
+// Fixed text replacement (final verdict only). An empty literal emits an empty
+// Text message; binary input becomes Text. The literal must fit maxMessageSize
+// and the single-slice cap. Dynamic expressions/interpolation remain unsupported.
+return websocket(chat, maxMessageSize: 4kb) { frame in
+    guard frame.fromClient && frame.isText else { frame.forward() }
+    frame.forward("message replaced")
+}
+
 // WebSocket proxy. The inspection sketch below is a target API; current terminate
-// handlers use `return websocket(chat) { frame in ... }` and forward/drop/close.
+// handlers use `return websocket(chat) { frame in ... }`, forward/drop/close,
+// and final frame.forward("fixed text").
 // Reassembled messages are currently limited to approximately one 16 KB slice.
 guard req.upgrade == .websocket else { return 400 }
 return websocket(chat)                          // transparent

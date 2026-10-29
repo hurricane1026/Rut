@@ -4513,6 +4513,16 @@ public:
     // plaintext owner without a response policy. Pipeline progress is consumed
     // by pipeline_advance/recover; it does not change the recv primitive.
     [[nodiscard]] bool use_one_shot_upstream_recv(const Connection& c) const {
+#if RUT_ENABLE_WEBSOCKET
+        // A fixed rewrite can expand several tiny inputs into multiple full
+        // output batches. Bound each upstream read by available receive space:
+        // multishot CQEs otherwise append before callbacks can drain that space.
+        if (c.is_ws_tunnel && c.is_ws_terminate && c.ws_forward_text.len != 0 && !c.ws_closing &&
+            c.fd >= 0 && c.upstream_fd >= 0 && c.on_upstream_recv == &on_ws_upstream_recv<Self> &&
+            valid_upstream_episode(c.upstream_episode) && !c.upstream_episode_quarantined &&
+            !c.upstream_abandoned)
+            return true;
+#endif
         const RouteConfig* cfg = c.request_config;
         const bool ordinary_response_owner = c.on_upstream_recv == &on_upstream_response<Self> ||
                                              c.on_upstream_recv == &on_response_body_recvd<Self>;

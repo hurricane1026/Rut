@@ -20612,6 +20612,19 @@ TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
 }
 
+TEST(jit, websocket_text_literal_rejects_missing_storage) {
+    WsLenGuardSpec node{};
+    node.accessor = 6;
+    node.pattern_len = 4;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.pattern_len = 0;
+    auto empty = codegen_ws_handler(0, &node, 1, 0);
+    REQUIRE(empty.ok);
+    dispose_module(empty.mod, empty.ctx);
+    node.accessor = 7;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+}
+
 // Compile a `websocket(x){ frame in frame.<verdict>() }` program end-to-end through the
 // constant-verdict frame-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup -> CALL),
 // and return the verdict the compiled function actually produces. Returns 255 on any failure.

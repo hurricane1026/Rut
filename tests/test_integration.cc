@@ -19824,6 +19824,136 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
 }
 
 // Fragments arriving in separate reads are reassembled before inspection and forwarding.
+template <typename Loop>
+static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc) {
+    using namespace rut;
+    for (bool rewrite_client : {false, true}) {
+        WsFrameEchoServer backend;
+        REQUIRE(backend.setup());
+        RouteConfig cfg{};
+        auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+        REQUIRE(id.has_value());
+        char replacement[8000];
+        memset(replacement, 'R', sizeof(replacement));
+        WsMessageHandlerFn handler = rewrite_client
+            ? +[](void*, WsOpcode, const u8*, u64, bool client) {
+                return client ? WsFrameAction::ForwardText : WsFrameAction::Forward;
+              }
+            : +[](void*, WsOpcode, const u8*, u64, bool client) {
+                return client ? WsFrameAction::Forward : WsFrameAction::ForwardText;
+              };
+        REQUIRE(cfg.add_ws_terminate(
+            "/ws", 0, id.value(), handler, 16370, 1000, {replacement, sizeof(replacement)}));
+        const RouteConfig* active = &cfg;
+        Shard<Loop> shard;
+        i32 listener = -1, client = -1;
+        struct Cleanup {
+            Shard<Loop>& shard;
+            WsFrameEchoServer& backend;
+            i32& listener;
+            i32& client;
+            ~Cleanup() {
+                if (client >= 0) close(client);
+                backend.teardown();
+                shard.shutdown();
+                if (listener >= 0) close(listener);
+            }
+        } cleanup{shard, backend, listener, client};
+        listener = create_listen_socket(0).value_or(-1);
+        REQUIRE(listener >= 0);
+        const u16 port = get_port(listener);
+        REQUIRE(shard.init(0, listener).has_value());
+        shard.loop->config_ptr = &active;
+        REQUIRE(shard.spawn(-1).has_value());
+        client = connect_to(port);
+        REQUIRE(client >= 0);
+        set_socket_timeouts(client, 5);
+        const char upgrade[] =
+            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        REQUIRE(send_all(client, upgrade, sizeof(upgrade) - 1));
+        char response[1024];
+        const u32 headers = recv_http_headers(client, response, sizeof(response));
+        REQUIRE(headers > 0 && buf_contains(response, headers, "101", 3));
+        const u8 key[4] = {1, 2, 3, 4};
+        u8 input[64];
+        u32 total = 0;
+        // Three coalesced messages; the first is fragmented. Rewriting them to
+        // 8 KB each forces the tunnel's output to drain before all three fit.
+        for (u32 i = 0; i < 4; i++) {
+            const WsOpcode op = i == 1 ? WsOpcode::Continuation : WsOpcode::Text;
+            const u32 header = ws_write_header(input + total, op, i != 0, true, key, 1);
+            input[total + header] = 'x';
+            ws_unmask(input + total + header, 1, key);
+            total += header + 1;
+        }
+        REQUIRE(send_all(client, reinterpret_cast<const char*>(input), total));
+        u8 received[8192];
+        u32 have = 0;
+        for (u32 message = 0; message < 3; message++) {
+            WsFrameHeader h{};
+            for (;;) {
+                if (ws_parse_header(received, have, false, &h) == ParseStatus::Complete &&
+                    have >= h.header_len + h.payload_len)
+                    break;
+                const i32 n = recv_timeout(client,
+                                           reinterpret_cast<char*>(received + have),
+                                           sizeof(received) - have,
+                                           5000);
+                if (n <= 0) {
+                    const int error = errno;
+                    shard.stop();
+                    shard.join();
+                    fprintf(
+                        stderr,
+                        "rewrite timeout: client_leg=%d message=%u have=%u result=%d errno=%d\n",
+                        rewrite_client,
+                        message,
+                        have,
+                        n,
+                        error);
+                    for (u32 i = 0; i < Loop::kMaxConns; i++) {
+                        const auto& c = shard.loop->conns[i];
+                        if (c.fd <= 0 && c.upstream_fd <= 0) continue;
+                        fprintf(stderr,
+                                "conn %u fd=%d ufd=%d term=%d recv=%u urecv=%u armed=%d uarmed=%d "
+                                "pending=%d upending=%d partial=%d upartial=%d\n",
+                                i,
+                                c.fd,
+                                c.upstream_fd,
+                                c.is_ws_terminate,
+                                c.recv_buf.len(),
+                                c.upstream_recv_buf.len(),
+                                c.recv_armed,
+                                c.upstream_recv_armed,
+                                c.ws_client_send_pending,
+                                c.ws_upstream_send_pending,
+                                c.ws_c2u.partial_data_frame,
+                                c.ws_u2c.partial_data_frame);
+                    }
+                }
+                REQUIRE(n > 0);
+                have += static_cast<u32>(n);
+            }
+            CHECK(h.opcode == WsOpcode::Text);
+            REQUIRE_EQ(h.payload_len, sizeof(replacement));
+            CHECK(memcmp(received + h.header_len, replacement, sizeof(replacement)) == 0);
+            const u32 consumed = h.header_len + static_cast<u32>(h.payload_len);
+            memmove(received, received + consumed, have - consumed);
+            have -= consumed;
+        }
+    }
+}
+
+TEST(websocket_e2e, fixed_text_rewrite_grows_and_drains) {
+    check_fixed_ws_rewrite_round_trip<RealLoop>(_tc);
+}
+
+TEST(websocket_e2e, fixed_text_rewrite_grows_and_drains_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    check_fixed_ws_rewrite_round_trip<rut::IoUringEventLoop>(_tc);
+}
+
 TEST(websocket_e2e, terminate_forwards_fragmented) {
     using namespace rut;
     WsFrameEchoServer backend;

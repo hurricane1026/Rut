@@ -246,6 +246,41 @@ TEST(native_program, timer_cache_activation_and_fail_closed) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_rewrite_survives_compiler_exit_and_source_removal) {
+    Source source;
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\n"
+                      "route GET \"/ws\" { return websocket(backend) { frame in "
+                      "frame.forward(\"native\\0text\") } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    REQUIRE_EQ(route.ws_forward_text.len, 11u);
+    CHECK(memcmp(route.ws_forward_text.ptr, "native\0text", 11) == 0);
+    WsInspector st;
+    st.forward_text = route.ws_forward_text;
+    st.max_message_size = route.ws_max_message_size;
+    const u8 input[] = {0x82, 0};
+    u8 output[64], msg[64];
+    u32 consumed = 0, produced = 0;
+    REQUIRE(ws_inspect(st,
+                       input,
+                       sizeof(input),
+                       output,
+                       sizeof(output),
+                       msg,
+                       sizeof(msg),
+                       route.ws_frame_handler,
+                       nullptr,
+                       &consumed,
+                       &produced) == WsInspectStatus::Ok);
+    REQUIRE_EQ(produced, 13u);
+    CHECK_EQ(output[0], 0x81);
+    CHECK(memcmp(output + 2, "native\0text", 11) == 0);
+}
+
 TEST(native_program, websocket_regex_handler_survives_compiler_exit) {
     Source source;
     REQUIRE(

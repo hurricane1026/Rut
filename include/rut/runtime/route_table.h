@@ -157,6 +157,7 @@ struct RouteEntry {
     u32 ws_max_message_size = 0;
     // RFC 6455 status the handler's `frame.close(code)` verdict puts on the wire (1000 default).
     u16 ws_close_code = 1000;
+    Str ws_forward_text{};  // immutable replacement for ForwardText verdicts
     // Nonzero only for the bounded static direct-forward timeout preflight.
     // Resolves through the same pinned RouteConfig as this RouteEntry.
     ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
@@ -1505,7 +1506,8 @@ public:
                           u16 upstream_id,
                           WsMessageHandlerFn handler,
                           u32 max_message_size,
-                          u16 close_code = 1000) {
+                          u16 close_code = 1000,
+                          Str forward_text = {}) {
 #if !RUT_ENABLE_WEBSOCKET
         // The 101/tunnel path is compiled out in this build — a terminate route could
         // never enter terminate mode, so fail loud instead of publishing an unusable route.
@@ -1515,9 +1517,12 @@ public:
         (void)handler;
         (void)max_message_size;
         (void)close_code;
+        (void)forward_text;
         return false;
 #else
-        if (handler == nullptr || max_message_size == 0) return false;
+        if (handler == nullptr || max_message_size == 0 || forward_text.len > max_message_size ||
+            forward_text.len > kWsTerminateMessageCapacity || !ws_valid_text_payload(forward_text))
+            return false;
         // Fail closed on a close code the runtime would refuse to put on the wire, using the
         // SAME predicate as the receive-side validator (ws_inspect) and the .rut analyze check
         // — including the reserved 1016–2999 range — so this C++ surface can't publish a route
@@ -1529,6 +1534,7 @@ public:
         r.ws_frame_handler = handler;
         r.ws_max_message_size = max_message_size;
         r.ws_close_code = close_code;
+        r.ws_forward_text = forward_text;
         return true;
 #endif
     }

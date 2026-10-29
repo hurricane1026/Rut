@@ -48,11 +48,12 @@ struct WsLenGuardSpec {
                   //                                2=FromClient (direction, i8 param 4),
                   //                                3=TextMatch (regex over payload, params 2+3)
                   //                                4=And, 5=Or (short-circuit child conditions)
+                  //                                6=TextEqual (byte-exact literal equality)
     u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
     u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
                   // FromClient: 1 (client→upstream leg)
     u8 verdict;   // WsFrameAction yielded when the guard CONDITION is false
-    // TextMatch only: the regex pattern (pattern_len is authoritative).
+    // TextMatch/TextEqual: regex or decoded literal (pattern_len is authoritative).
     const char* pattern;
     u32 pattern_len;
     u8 negate;    // invert this condition, including a compound subtree
@@ -66,7 +67,8 @@ struct WsLenGuardSpec {
 // matching WsMessageHandlerFn (WsFrameAction(*)(void*, WsOpcode, const u8*, u64, bool)). It checks
 // each guard root in order, with short-circuit &&/|| — the first FALSE root returns
 // its verdict — then returns `default_verdict`. Verdicts are WsFrameAction values
-// (Forward=0/Drop=1/Close=2). This bypasses the RIR/MIR HTTP pipeline. Returns false on error.
+// (Forward=0/Drop=1/Close=2/ForwardText=3). ForwardText uses route-owned fixed text. This bypasses
+// the RIR/MIR HTTP pipeline. Returns false on error.
 bool emit_ws_handler(LLVMModuleRef mod,
                      LLVMContextRef ctx,
                      u8 default_verdict,

@@ -1076,16 +1076,16 @@ enum class WsVerdict : u8 {
 };
 
 // Frame-handler condition nodes. Leaf nodes inspect message length, opcode,
-// direction or payload regex; And/Or nodes combine earlier child nodes. Only roots
+// direction or payload predicates; And/Or nodes combine earlier child nodes. Only roots
 // are source guards and yield their else verdict when false.
 struct WsLenGuard {
-    enum class Accessor : u8 { Len, Opcode, FromClient, TextMatch, And, Or };
+    enum class Accessor : u8 { Len, Opcode, FromClient, TextMatch, And, Or, TextEqual };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
     Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
     u32 bound = 0;  // Len: the byte literal frame.len is compared to. Opcode: the WsOpcode value.
-    // TextMatch only: source/intern memory, valid through codegen.
+    // TextMatch/TextEqual: regex or decoded literal, valid through codegen.
     Str pattern{};
     bool negate = false;  // invert this node's condition, including an entire subtree
     // Compound conditions reference earlier nodes in the handler's postorder array.
@@ -1103,9 +1103,9 @@ struct HirWsHandler {
     static constexpr u32 kMaxConditionNodes = 32;
     FixedVec<WsLenGuard, kMaxConditionNodes> len_guards;
     // `frame.forward(payload)` modify form: forward a rewritten message instead of the
-    // original. The payload expression (Str-typed) is stored in HirRoute.exprs;
+    // original. The fixed text literal is stored in HirRoute.exprs;
     // forward_payload_expr is its index there (0xffffffffu when has_forward_payload is false).
-    // Lowering the modify path (the bounded output buffer) is Phase 4b; build_mir still rejects.
+    // The loader retains its bytes and emits a ForwardText default verdict.
     bool has_forward_payload = false;
     u32 forward_payload_expr = 0xffffffffu;
     // `frame.close(code)` status code (default 1000 = normal closure). Only meaningful when

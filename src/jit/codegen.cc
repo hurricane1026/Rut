@@ -2761,7 +2761,10 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 5 || guards[i].cmp > 2 || guards[i].verdict > 2) return false;
+        if (guards[i].accessor > 6 || guards[i].cmp > 2 || guards[i].verdict > 2) return false;
+        if ((guards[i].accessor == 3 || guards[i].accessor == 6) && guards[i].pattern_len != 0 &&
+            !guards[i].pattern)
+            return false;
         if (guards[i].accessor == 4 || guards[i].accessor == 5) {
             const u32 children[2] = {guards[i].lhs, guards[i].rhs};
             for (u32 child : children) {
@@ -2848,6 +2851,36 @@ bool emit_ws_handler(LLVMModuleRef mod,
             LLVMValueRef is_match =
                 LLVMBuildICmp(builder, LLVMIntNE, r, LLVMConstInt(i8_ty, 0, 0), "rx.m");
             cond = is_match;
+        } else if (guards[i].accessor == 6) {  // TextEqual
+            // Check the full 64-bit length before narrowing for the shared string
+            // helper. A forged large length must not alias a small literal length.
+            LLVMBasicBlockRef compare = LLVMAppendBasicBlockInContext(ctx, fn, "text.equal");
+            LLVMValueRef same_len = LLVMBuildICmp(builder,
+                                                  LLVMIntEQ,
+                                                  len,
+                                                  LLVMConstInt(i64_ty, guards[i].pattern_len, 0),
+                                                  "text.len");
+            LLVMBuildCondBr(builder, same_len, compare, no);
+            LLVMPositionBuilderAtEnd(builder, compare);
+            LLVMValueRef literal = LLVMBuildGlobalStringPtr(builder, "", "text.empty");
+            if (guards[i].pattern_len != 0) {
+                LLVMValueRef bytes =
+                    LLVMConstStringInContext(ctx, guards[i].pattern, guards[i].pattern_len, 1);
+                literal = LLVMAddGlobal(mod, LLVMTypeOf(bytes), "text.literal");
+                LLVMSetInitializer(literal, bytes);
+                LLVMSetGlobalConstant(literal, 1);
+                LLVMSetLinkage(literal, LLVMPrivateLinkage);
+                LLVMSetUnnamedAddress(literal, LLVMGlobalUnnamedAddr);
+            }
+            LLVMTypeRef eq_params[4] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef eq_ty = LLVMFunctionType(i8_ty, eq_params, 4, 0);
+            LLVMValueRef eq_fn = LLVMGetNamedFunction(mod, "rut_helper_str_eq");
+            if (!eq_fn) eq_fn = LLVMAddFunction(mod, "rut_helper_str_eq", eq_ty);
+            LLVMValueRef size = LLVMConstInt(i32_ty, guards[i].pattern_len, 0);
+            LLVMValueRef args[4] = {payload, size, literal, size};
+            LLVMValueRef equal = LLVMBuildCall2(builder, eq_ty, eq_fn, args, 4, "text.eq");
+            cond =
+                LLVMBuildICmp(builder, LLVMIntNE, equal, LLVMConstInt(i8_ty, 0, 0), "text.match");
         } else {
             LLVMIntPredicate pred = LLVMIntEQ;
             switch (guards[i].cmp) {  // WsLenGuard::Cmp ordinals: 0=Lt, 1=Gt, 2=Eq

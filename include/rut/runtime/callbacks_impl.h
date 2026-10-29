@@ -1548,11 +1548,6 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
 
-#if RUT_ENABLE_WEBSOCKET
-template <typename Loop>
-void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev);
-#endif
-
 // ── JIT handler dispatch ───────────────────────────────────────────
 // Route-matched JitHandler action → invoke the compiled handler and
 // translate JitDispatchOutcome into event-loop operations (send, forward,
@@ -3003,6 +2998,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_handler = ws_term ? route->ws_frame_handler : nullptr;
     conn.ws_max_message_size = ws_term ? route->ws_max_message_size : 0;
     conn.ws_close_code = ws_term ? route->ws_close_code : 1000;
+    conn.ws_forward_text = ws_term ? route->ws_forward_text : Str{};
 #endif
 
     if (route && route->action == RouteAction::Proxy) {
@@ -10752,18 +10748,20 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* lp, Connection& c) { lp->alloc_ws_terminate_bufs(c); }) {
         if (!loop->alloc_ws_terminate_bufs(conn)) return false;
         u32 cap = conn.ws_max_message_size;
-        const u32 kCap = SlicePool::kSliceSize - kWsMaxHeaderSize;
+        const u32 kCap = kWsTerminateMessageCapacity;
         if (cap == 0 || cap > kCap) cap = kCap;
         conn.ws_c2u.reset();
         conn.ws_c2u.masked = true;       // client->upstream is client-role on both ends → masked
         conn.ws_c2u.from_client = true;  // this leg is the client→upstream direction
         conn.ws_c2u.max_message_size = cap;
+        conn.ws_c2u.forward_text = conn.ws_forward_text;
         conn.ws_c2u.close_code = conn.ws_close_code;  // frame.close(code) status for this route
         conn.ws_c2u.reject_fragmented = false;
         conn.ws_u2c.reset();
         conn.ws_u2c.masked = false;       // upstream->client is server-role on both ends → unmasked
         conn.ws_u2c.from_client = false;  // this leg is the upstream→client direction
         conn.ws_u2c.max_message_size = cap;
+        conn.ws_u2c.forward_text = conn.ws_forward_text;
         conn.ws_u2c.close_code = conn.ws_close_code;
         conn.ws_u2c.reject_fragmented = false;
         conn.is_ws_terminate = true;

@@ -12,6 +12,11 @@ enum class HttpMethod : u8;
 struct EpollEventLoop;
 struct IoUringEventLoop;
 
+#if RUT_ENABLE_WEBSOCKET
+template <typename Loop>
+void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev);
+#endif
+
 template <typename Loop>
 void proxy_stream_complete(Loop* loop, Connection& conn);
 
