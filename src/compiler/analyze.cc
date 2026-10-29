@@ -7083,15 +7083,48 @@ static Str ws_frame_text_match_pattern(const AstExpr& cond) {
     return cond.args[0]->str_value;
 }
 
+static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& mod, Span span);
+
 // Match a leaf condition for the frame handler. `negate` is logical !, accepted
 // on boolean frame properties or `frame.text.matches(re)` (the blocklist form). Direction is a
 // bare `frame.fromClient` (true on the client→upstream leg); opcode discrimination is a bare
 // `frame.isText` / `frame.isBinary` (== the WsOpcode value); content is
 // `frame.text.matches(re"…")` (a regex over the payload); else a `frame.len <cmp> N`
-// comparison. Anything else → UnsupportedSyntax.
+// comparison. Literal text equality and text.isEmpty are also supported.
+// Anything else → UnsupportedSyntax.
+
 static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
                                                            WsVerdict verdict,
-                                                           bool negate) {
+                                                           bool negate,
+                                                           const HirModule& mod) {
+    // Literal comparison is byte-exact, like ordinary string equality. Reuse the
+    // expression decoder so escapes and embedded NULs have the same semantics.
+    if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
+        const AstExpr* literal = nullptr;
+        if (ws_is_frame_field(*cond.lhs, {"text", 4}) && cond.rhs->kind == AstExprKind::StrLit)
+            literal = cond.rhs;
+        else if (ws_is_frame_field(*cond.rhs, {"text", 4}) && cond.lhs->kind == AstExprKind::StrLit)
+            literal = cond.lhs;
+        if (literal) {
+            auto decoded = decoded_expression_string(literal->str_value, mod, literal->span);
+            if (!decoded) return core::make_unexpected(decoded.error());
+            WsLenGuard g{};
+            g.accessor = WsLenGuard::Accessor::TextEqual;
+            g.pattern = decoded.value();
+            g.negate = negate;
+            g.verdict = verdict;
+            return g;
+        }
+    }
+    if (cond.kind == AstExprKind::Field && cond.name.eq({"isEmpty", 7}) && cond.lhs &&
+        ws_is_frame_field(*cond.lhs, {"text", 4})) {
+        WsLenGuard g{};
+        g.accessor = WsLenGuard::Accessor::Len;
+        g.cmp = WsLenGuard::Cmp::Eq;
+        g.negate = negate;
+        g.verdict = verdict;
+        return g;
+    }
     const Str text_pattern = ws_frame_text_match_pattern(cond);
     if (text_pattern.len != 0) {
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
@@ -7139,6 +7172,7 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
 static FrontendResult<u32> analyze_frame_condition(const AstExpr& cond,
                                                    WsVerdict verdict,
                                                    HirWsHandler& handler,
+                                                   const HirModule& mod,
                                                    bool is_operand = false,
                                                    bool negate = false,
                                                    u32 depth = 0) {
@@ -7147,15 +7181,18 @@ static FrontendResult<u32> analyze_frame_condition(const AstExpr& cond,
     // The ordinary parser desugars !x, !=, <= and >= to (predicate == false).
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs &&
         cond.rhs->kind == AstExprKind::BoolLit && !cond.rhs->bool_value) {
-        return analyze_frame_condition(*cond.lhs, verdict, handler, is_operand, !negate, depth + 1);
+        return analyze_frame_condition(
+            *cond.lhs, verdict, handler, mod, is_operand, !negate, depth + 1);
     }
     WsLenGuard node{};
     if (cond.kind == AstExprKind::And || cond.kind == AstExprKind::Or) {
         if (!cond.lhs || !cond.rhs)
             return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
-        auto lhs = analyze_frame_condition(*cond.lhs, verdict, handler, true, false, depth + 1);
+        auto lhs =
+            analyze_frame_condition(*cond.lhs, verdict, handler, mod, true, false, depth + 1);
         if (!lhs) return core::make_unexpected(lhs.error());
-        auto rhs = analyze_frame_condition(*cond.rhs, verdict, handler, true, false, depth + 1);
+        auto rhs =
+            analyze_frame_condition(*cond.rhs, verdict, handler, mod, true, false, depth + 1);
         if (!rhs) return core::make_unexpected(rhs.error());
         node.accessor =
             cond.kind == AstExprKind::And ? WsLenGuard::Accessor::And : WsLenGuard::Accessor::Or;
@@ -7164,7 +7201,7 @@ static FrontendResult<u32> analyze_frame_condition(const AstExpr& cond,
         node.negate = negate;
         node.verdict = verdict;
     } else {
-        auto leaf = analyze_frame_guard_cond(cond, verdict, negate);
+        auto leaf = analyze_frame_guard_cond(cond, verdict, negate, mod);
         if (!leaf) return core::make_unexpected(leaf.error());
         node = leaf.value();
     }
@@ -12903,7 +12940,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                           gs ? gs->span : body->span);
                 auto gv = analyze_bare_frame_verdict(gs->else_stmt->expr);
                 if (!gv) return core::make_unexpected(gv.error());
-                auto g = analyze_frame_condition(gs->expr, gv.value(), route->ws_handler);
+                auto g = analyze_frame_condition(gs->expr, gv.value(), route->ws_handler, mod);
                 if (!g) return core::make_unexpected(g.error());
             }
             const AstStatement* last = body->block_stmts[stmt_count - 1];

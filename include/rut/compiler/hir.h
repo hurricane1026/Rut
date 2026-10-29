@@ -1076,16 +1076,16 @@ enum class WsVerdict : u8 {
 };
 
 // Frame-handler condition nodes. Leaf nodes inspect message length, opcode,
-// direction or payload regex; And/Or nodes combine earlier child nodes. Only roots
+// direction or payload predicates; And/Or nodes combine earlier child nodes. Only roots
 // are source guards and yield their else verdict when false.
 struct WsLenGuard {
-    enum class Accessor : u8 { Len, Opcode, FromClient, TextMatch, And, Or };
+    enum class Accessor : u8 { Len, Opcode, FromClient, TextMatch, And, Or, TextEqual };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
     Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
     u32 bound = 0;  // Len: the byte literal frame.len is compared to. Opcode: the WsOpcode value.
-    // TextMatch only: source/intern memory, valid through codegen.
+    // TextMatch/TextEqual: regex or decoded literal, valid through codegen.
     Str pattern{};
     bool negate = false;  // invert this node's condition, including an entire subtree
     // Compound conditions reference earlier nodes in the handler's postorder array.

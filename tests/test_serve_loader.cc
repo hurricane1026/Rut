@@ -4645,6 +4645,88 @@ route GET "/and" { return websocket(backend) { frame in
     program.destroy();
 }
 
+TEST(serve_loader, websocket_terminate_text_literal_conditions) {
+    const char* conditions[] = {
+        "frame.text == \"ping\"",
+        "\"ping\" != frame.text",
+        "frame.text == \"a\\0b\\n\"",
+        "frame.text == \"\"",
+        "frame.text.isEmpty",
+        "!frame.text.isEmpty",
+        "(frame.text == \"ping\" || frame.text == \"pong\") && !frame.text.isEmpty",
+        "frame.text == \"\\u{20ac}\""};
+    const u8 embedded[] = {'a', 0, 'b', '\n'};
+    const u8 other[] = {'a', 0, 'x', '\n'};
+    const u8 unicode[] = {0xe2, 0x82, 0xac};
+    const u8* payloads[] = {nullptr,
+                            reinterpret_cast<const u8*>("ping"),
+                            reinterpret_cast<const u8*>("pings"),
+                            embedded,
+                            other,
+                            unicode};
+    const u64 lengths[] = {0, 4, 5, 4, 4, 3};
+    for (u32 c = 0; c < 8; c++) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\n"
+            "route GET \"/ws\" { return websocket(backend) { frame in\n guard ";
+        source += conditions[c];
+        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        const auto path = write_file("/tmp/rut_serve_loader_ws_literal", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler != nullptr);
+        for (u32 p = 0; p < 6; p++) {
+            const bool pass = c == 0 || c == 6 ? p == 1
+                              : c == 1         ? p != 1
+                              : c == 2         ? p == 3
+                              : c == 5         ? p != 0
+                              : c == 7         ? p == 5
+                                               : p == 0;
+            // Like text.matches(), raw payload predicates do not imply opcode gating.
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                CHECK(handler(nullptr, op, payloads[p], lengths[p], true) ==
+                      (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+        // No u64 -> u32 truncation may turn a huge length into a matching literal.
+        CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0x100000004ULL, false) ==
+              ((c == 1 || c == 5) ? WsFrameAction::Forward : WsFrameAction::Drop));
+        program.destroy();
+    }
+}
+
+TEST(serve_loader, websocket_terminate_text_literal_short_circuit) {
+    const auto path =
+        write_file("/tmp/rut_serve_loader_ws_literal_short_circuit",
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                   " guard !frame.fromClient || !frame.isText || frame.text != \"ping\" else { "
+                   "frame.drop() }\n"
+                   " guard frame.len < 10 else { frame.close() }\n frame.forward()\n} }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler != nullptr);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    REQUIRE(page_size > 0);
+    void* unreadable = mmap(nullptr, page_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(unreadable != MAP_FAILED);
+    CHECK(handler(nullptr, WsOpcode::Text, static_cast<const u8*>(unreadable), 4, false) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, static_cast<const u8*>(unreadable), 4, true) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("ping"), 4, true) ==
+          WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Text, static_cast<const u8*>(unreadable), 11, true) ==
+          WsFrameAction::Close);
+    CHECK_EQ(munmap(unreadable, page_size), 0);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_terminate_close_code_reaches_route) {
     // close(code) end-to-end: `frame.close(1008)` must publish the route with ws_close_code
     // == 1008 (the runtime puts that on the wire), and the JIT'd handler still returns Close.

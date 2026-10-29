@@ -5622,6 +5622,63 @@ route GET "/ws" { return websocket(ws) { frame in
     CHECK_EQ(nodes[4].rhs, 3u);
 }
 
+TEST(frontend, analyze_websocket_text_literal_conditions) {
+    const char* conditions[] = {"frame.text == \"ping\"",
+                                "\"ping\" != frame.text",
+                                "frame.text.isEmpty",
+                                "!frame.text.isEmpty",
+                                "frame.isText && frame.text == \"a\\0b\\n\""};
+    for (u32 i = 0; i < 5; i++) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+        source += conditions[i];
+        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& nodes = hir->routes[0].ws_handler.len_guards;
+        if (i < 2) {
+            REQUIRE_EQ(nodes.len, 1u);
+            CHECK(nodes[0].accessor == WsLenGuard::Accessor::TextEqual);
+            CHECK(nodes[0].pattern.eq(lit("ping")));
+            CHECK_EQ(nodes[0].negate, i == 1);
+        } else if (i < 4) {
+            CHECK(nodes[0].accessor == WsLenGuard::Accessor::Len);
+            CHECK(nodes[0].cmp == WsLenGuard::Cmp::Eq);
+            CHECK_EQ(nodes[0].bound, 0u);
+            CHECK_EQ(nodes[0].negate, i == 3);
+        } else {
+            REQUIRE_EQ(nodes.len, 3u);
+            CHECK(nodes[1].accessor == WsLenGuard::Accessor::TextEqual);
+            REQUIRE_EQ(nodes[1].pattern.len, 4u);
+            CHECK_EQ(nodes[1].pattern.ptr[1], '\0');
+            CHECK_EQ(nodes[1].pattern.ptr[3], '\n');
+        }
+    }
+}
+
+TEST(frontend, analyze_websocket_text_literal_rejects_invalid_shapes) {
+    for (const char* condition : {"frame.text == 1",
+                                  "frame.text == frame.text",
+                                  "frame.text < \"ping\"",
+                                  "frame.text.isEmpty()",
+                                  "frame.binary.isEmpty",
+                                  "frame.text == \"\\q\""}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+        source += condition;
+        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+
 TEST(frontend, analyze_websocket_condition_limits) {
     // Sixteen leaves + fifteen binary nodes fit; the next leaf exceeds the budget.
     for (u32 leaves : {16u, 17u}) {

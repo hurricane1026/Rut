@@ -2554,7 +2554,13 @@ post /api/orders {
 
 Current terminate handlers support `guard` conditions over `frame.fromClient`,
 `frame.isText`, `frame.isBinary`, `frame.len` comparisons, and
-`frame.text.matches(re"…")`. Conditions compose with `&&`, `||`, `!`, and parentheses;
+`frame.text.matches(re"…")`, `frame.text == "literal"` (or `!=`, with the
+literal on either side), and `frame.text.isEmpty`. Text equality compares exact
+payload bytes and uses the ordinary string-literal escape decoder; empty literals
+and embedded NUL bytes are supported. Like `text.matches`, these predicates do
+not implicitly filter the opcode: combine them with `frame.isText` when needed.
+`isEmpty` tests the reassembled byte length without reading the payload.
+Conditions compose with `&&`, `||`, `!`, and parentheses;
 `!` binds tighter than comparisons, `&&` tighter than `||`, with left-to-right
 short-circuit evaluation. Length comparisons accept `<`, `>`, `==`, `<=`, `>=`,
 and `!=` against an integer literal on either side. A handler accepts up to four
