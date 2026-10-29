@@ -2,6 +2,65 @@
 #include "rut/runtime/crypto_c.h"
 
 #include <openssl/bn.h>
+#include <openssl/evp.h>
+#include <openssl/rsa.h>
+
+void rut_crypto_rsa_workspace_reset_internal(EVP_PKEY** key,
+                                             const BIGNUM** modulus,
+                                             const BIGNUM** exponent,
+                                             BIGNUM** input,
+                                             BIGNUM** output,
+                                             BN_CTX** scratch,
+                                             BN_MONT_CTX** mont,
+                                             uint32_t* bytes) {
+    BN_free(*input);
+    BN_free(*output);
+    BN_CTX_free(*scratch);
+    BN_MONT_CTX_free(*mont);
+    EVP_PKEY_free(*key);
+    *key = 0;
+    *modulus = 0;
+    *exponent = 0;
+    *input = 0;
+    *output = 0;
+    *scratch = 0;
+    *mont = 0;
+    *bytes = 0;
+}
+
+uint32_t rut_crypto_rsa_workspace_init_internal(EVP_PKEY* source,
+                                                EVP_PKEY** key,
+                                                const BIGNUM** modulus,
+                                                const BIGNUM** exponent,
+                                                BIGNUM** input,
+                                                BIGNUM** output,
+                                                BN_CTX** scratch,
+                                                BN_MONT_CTX** mont,
+                                                uint32_t* bytes) {
+    if (!source || *key || !EVP_PKEY_up_ref(source)) return 0;
+    *key = source;
+    const RSA* rsa = EVP_PKEY_get0_RSA(source);
+    RSA_get0_key(rsa, modulus, exponent, 0);
+    *input = BN_new();
+    *output = BN_new();
+    *scratch = BN_CTX_new();
+    *mont = BN_MONT_CTX_new();
+    if (!*input || !*output || !*scratch || !*mont || !BN_MONT_CTX_set(*mont, *modulus, *scratch))
+        goto fail;
+    const int bits = BN_num_bits(*modulus);
+    if (!BN_set_bit(*input, bits + 64) || !BN_set_bit(*output, bits + 64) ||
+        !BN_copy(*input, *modulus) || !BN_sub_word(*input, 1) ||
+        !BN_mod_exp_mont(*output, *input, *exponent, *modulus, *scratch, *mont))
+        goto fail;
+    BN_zero(*input);
+    BN_zero(*output);
+    *bytes = (uint32_t)((bits + 7) / 8);
+    return 1;
+fail:
+    rut_crypto_rsa_workspace_reset_internal(
+        key, modulus, exponent, input, output, scratch, mont, bytes);
+    return 0;
+}
 
 uint32_t rut_crypto_rsa_verify_internal(const BIGNUM* modulus,
                                         const BIGNUM* exponent,

@@ -237,49 +237,22 @@ RsaSha256Verifier::~RsaSha256Verifier() {
 }
 
 void RsaSha256Verifier::reset() {
-    BN_free(input_);
-    BN_free(output_);
-    BN_CTX_free(scratch_);
-    BN_MONT_CTX_free(mont_);
-    EVP_PKEY_free(key_);
-    key_ = nullptr;
-    modulus_ = nullptr;
-    exponent_ = nullptr;
-    input_ = nullptr;
-    output_ = nullptr;
-    scratch_ = nullptr;
-    mont_ = nullptr;
-    bytes_ = 0;
+    rut_crypto_rsa_workspace_reset_internal(
+        &key_, &modulus_, &exponent_, &input_, &output_, &scratch_, &mont_, &bytes_);
 }
 
 bool RsaSha256Verifier::init(const RsaPublicKey& key) {
     if (key_ || !key.key_) return false;
     ErrorScope errors;
-    if (!EVP_PKEY_up_ref(key.key_)) return false;
-    key_ = key.key_;
-    const RSA* rsa = EVP_PKEY_get0_RSA(key_);
-    RSA_get0_key(rsa, &modulus_, &exponent_, nullptr);
-    input_ = BN_new();
-    output_ = BN_new();
-    scratch_ = BN_CTX_new();
-    mont_ = BN_MONT_CTX_new();
-    if (!input_ || !output_ || !scratch_ || !mont_ || !BN_MONT_CTX_set(mont_, modulus_, scratch_)) {
-        reset();
-        return false;
-    }
-    // Reserve operands and warm the public-exponent BN workspace at full key
-    // width during activation. No attacker-controlled key or exponent is used.
-    const int bits = BN_num_bits(modulus_);
-    if (!BN_set_bit(input_, bits + 64) || !BN_set_bit(output_, bits + 64) ||
-        !BN_copy(input_, modulus_) || !BN_sub_word(input_, 1) ||
-        !BN_mod_exp_mont(output_, input_, exponent_, modulus_, scratch_, mont_)) {
-        reset();
-        return false;
-    }
-    BN_zero(input_);
-    BN_zero(output_);
-    bytes_ = static_cast<u32>((bits + 7) / 8);
-    return true;
+    return rut_crypto_rsa_workspace_init_internal(key.key_,
+                                                  &key_,
+                                                  &modulus_,
+                                                  &exponent_,
+                                                  &input_,
+                                                  &output_,
+                                                  &scratch_,
+                                                  &mont_,
+                                                  &bytes_) != 0;
 }
 
 bool RsaSha256Verifier::verify(Str message, Str signature) {
