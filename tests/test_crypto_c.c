@@ -130,5 +130,18 @@ int main(void) {
     rut_crypto_rsa_key_v1* rsa_key = rut_crypto_rsa_key_init_v1(key_storage, sizeof(key_storage));
     if (!rsa_key || rut_crypto_rsa_key_load_der_v1(rsa_key, NULL, 1)) return 19;
     rut_crypto_rsa_key_destroy_v1(rsa_key);
+    if (!rut_crypto_equal_v1(input, input, sizeof(input)) ||
+        rut_crypto_equal_v1(input, out, sizeof(input)) || !rut_crypto_equal_v1(NULL, NULL, 0) ||
+        rut_crypto_equal_v1(NULL, input, 1))
+        return 20;
+    out[0] = 0xa5;
+    if (rut_crypto_base64_encode_v1(input, sizeof(input), out, 4, &len) || len || out[0] != 0xa5)
+        return 21;
+    if (!rut_crypto_base64_encode_v1(input, sizeof(input), out, sizeof(out), &len) || len != 4 ||
+        out[0] != 'Y' || out[1] != 'W' || out[2] != 'J' || out[3] != 'j' || out[4] != 0)
+        return 22;
+    rut_crypto_clear_v1(out, sizeof(out));
+    for (uint32_t i = 0; i < sizeof(out); ++i)
+        if (out[i] != 0) return 23;
     return 0;
 }

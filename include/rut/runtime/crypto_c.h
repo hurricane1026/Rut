@@ -65,6 +65,20 @@ uint32_t rut_crypto_hmac_long_key_v1(uint32_t algorithm,
                                      uint32_t capacity,
                                      uint32_t* output_len);
 
+/* Compare equally sized byte strings without content-dependent timing. A null
+ * pointer is valid only for zero length. Length itself is public. */
+uint32_t rut_crypto_equal_v1(const uint8_t* a, const uint8_t* b, uint32_t length);
+/* Wipe caller-owned bytes; null is valid only for zero length. */
+void rut_crypto_clear_v1(void* data, uint32_t length);
+/* Padded Base64. Output includes a trailing NUL, excluded from output_len.
+ * Input is limited to 1 MiB; buffers and output_len must not overlap.
+ * On failure output_len is zero and output bytes are unchanged. */
+uint32_t rut_crypto_base64_encode_v1(const uint8_t* input,
+                                     uint32_t length,
+                                     uint8_t* output,
+                                     uint32_t capacity,
+                                     uint32_t* output_len);
+
 /* RSA objects are constructed in caller-owned, correctly aligned storage.
  * Query size and alignment before reserving storage. Each successful init must
  * be paired with destroy before reusing storage. Do not copy initialized

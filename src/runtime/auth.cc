@@ -2,11 +2,8 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
-
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-#include <stddef.h>
 
 namespace rut {
 namespace {
@@ -57,7 +54,9 @@ bool bearer_matches(Str authorization, Str key) {
     if (!bearer_key_valid(key)) return false;
     const Str kToken = auth_payload(authorization, lit_str("Bearer"));
     return kToken.len == key.len && kToken.ptr != nullptr &&
-           CRYPTO_memcmp(kToken.ptr, key.ptr, key.len) == 0;
+           rut_crypto_equal_v1(reinterpret_cast<const u8*>(kToken.ptr),
+                               reinterpret_cast<const u8*>(key.ptr),
+                               key.len);
 }
 
 bool basic_credentials_valid(Str credentials) {
@@ -81,11 +80,17 @@ bool basic_matches(Str authorization, Str credentials) {
     // Encode the trusted credential instead of decoding attacker-controlled data.
     // Exact comparison also rejects malformed/noncanonical padding and pad bits.
     u8 encoded[((kMaxBasicCredentialBytes + 2) / 3) * 4 + 1];
-    const size_t kWritten = EVP_EncodeBlock(
-        encoded, reinterpret_cast<const u8*>(credentials.ptr), static_cast<int>(credentials.len));
+    u32 written = 0;
+    const bool encoded_ok =
+        rut_crypto_base64_encode_v1(reinterpret_cast<const u8*>(credentials.ptr),
+                                    credentials.len,
+                                    encoded,
+                                    sizeof(encoded),
+                                    &written);
     const bool kMatches =
-        kWritten == kExpectedLen && CRYPTO_memcmp(kToken.ptr, encoded, kExpectedLen) == 0;
-    OPENSSL_cleanse(encoded, sizeof(encoded));
+        encoded_ok && written == kExpectedLen &&
+        rut_crypto_equal_v1(reinterpret_cast<const u8*>(kToken.ptr), encoded, kExpectedLen);
+    rut_crypto_clear_v1(encoded, sizeof(encoded));
     return kMatches;
 }
 
@@ -101,9 +106,12 @@ bool hmac_sha256_matches(Str message, Str key, Str signature, Str prefix) {
     char encoded[kMaxHashHexBytes];
     u32 length = 0;
     const bool kComputed = hash_hex(HashAlgorithm::Sha256, message, key, true, encoded, length);
-    const bool kMatches = kComputed && length == 64 &&
-                          CRYPTO_memcmp(encoded, signature.ptr + prefix.len, length) == 0;
-    OPENSSL_cleanse(encoded, sizeof(encoded));
+    const bool kMatches =
+        kComputed && length == 64 &&
+        rut_crypto_equal_v1(reinterpret_cast<const u8*>(encoded),
+                            reinterpret_cast<const u8*>(signature.ptr + prefix.len),
+                            length);
+    rut_crypto_clear_v1(encoded, sizeof(encoded));
     return kMatches;
 }
 

@@ -25,8 +25,6 @@
 #include <unistd.h>
 #endif
 #include <hs.h>
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1046,7 +1044,7 @@ extern "C" void rut_helper_hash(void* conn,
             *has_value = 1;
         }
     }
-    OPENSSL_cleanse(text, sizeof(text));
+    rut_crypto_clear_v1(text, sizeof(text));
 }
 
 extern "C" void rut_helper_uuid(
@@ -1157,7 +1155,8 @@ u8 rut_helper_str_constant_time_equal(const char* a, u32 a_len, const char* b, u
     if (a_len != b_len || a_len > kMaxConstantTimeEqualBytes) return 0;
     if (a_len == 0) return 1;
     if (a == nullptr || b == nullptr) return 0;
-    return CRYPTO_memcmp(a, b, a_len) == 0;
+    return rut_crypto_equal_v1(
+        reinterpret_cast<const u8*>(a), reinterpret_cast<const u8*>(b), a_len);
 }
 
 u8 rut_helper_str_eq(const char* a, u32 a_len, const char* b, u32 b_len) {
@@ -1865,13 +1864,13 @@ bool jwt_decode_claims(Str token,
                                                                       : 64u;
     if (secret.len < min_secret_len) return false;
 
-    char signature[EVP_MAX_MD_SIZE];
+    char signature[kMaxHashDigestBytes];
     u32 signature_len = 0;
     if (!b64url_decode(
             {second + 1, signature_b64_len}, signature, sizeof(signature), signature_len))
         return false;
 
-    unsigned char expected[EVP_MAX_MD_SIZE];
+    unsigned char expected[kMaxHashDigestBytes];
     u32 expected_len = 0;
     if (secret.len > 0x7fffffffu || token.len > 0x7fffffffu) return false;
     const u32 signing_len = static_cast<u32>(second - token.ptr);
@@ -1884,7 +1883,8 @@ bool jwt_decode_claims(Str token,
                                      sizeof(expected),
                                      &expected_len))
         return false;
-    if (signature_len != expected_len || CRYPTO_memcmp(signature, expected, expected_len) != 0)
+    if (signature_len != expected_len ||
+        !rut_crypto_equal_v1(reinterpret_cast<const u8*>(signature), expected, expected_len))
         return false;
 
     if (!b64url_decode({first + 1, payload_b64_len}, payload_out, json::kMaxBytes, payload_len))

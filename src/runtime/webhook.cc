@@ -4,9 +4,6 @@
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
 
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-
 namespace rut {
 namespace {
 int base64_value(char c) {
@@ -66,10 +63,12 @@ bool standard_webhook_valid(Str id,
                                     &length))
         return false;
     u8 encoded[45];
-    const int kWritten = EVP_EncodeBlock(encoded, digest, sizeof(digest));
-    OPENSSL_cleanse(digest, sizeof(digest));
+    u32 written = 0;
+    const bool encoded_ok =
+        rut_crypto_base64_encode_v1(digest, sizeof(digest), encoded, sizeof(encoded), &written);
+    rut_crypto_clear_v1(digest, sizeof(digest));
     bool matches = false;
-    bool valid = kWritten == 44;
+    bool valid = encoded_ok && written == 44;
     u32 begin = 0;
     u32 count = 0;
     while (valid && begin < signature.len) {
@@ -102,13 +101,13 @@ bool standard_webhook_valid(Str id,
             for (u32 i = 0; i < 43; ++i)
                 if (base64_value(kValue.ptr[i]) < 0) valid = false;
             if ((base64_value(kValue.ptr[42]) & 3) != 0) valid = false;
-            matches |= CRYPTO_memcmp(kValue.ptr, encoded, 44) == 0;
+            matches |= rut_crypto_equal_v1(reinterpret_cast<const u8*>(kValue.ptr), encoded, 44);
         }
         if (end == signature.len) break;
         begin = end + 1;
         if (begin == signature.len) valid = false;
     }
-    OPENSSL_cleanse(encoded, sizeof(encoded));
+    rut_crypto_clear_v1(encoded, sizeof(encoded));
     return valid && matches;
 }
 }  // namespace rut
