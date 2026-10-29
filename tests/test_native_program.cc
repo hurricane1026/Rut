@@ -490,10 +490,12 @@ TEST(native_program, uuid_is_available_after_compiler_exit_with_request_arena) {
 
 TEST(native_program, hmac_uses_c_crypto_after_compiler_exit) {
     Source source;
-    REQUIRE(source.append(
-        "route GET \"/\" { "
-        "guard hmacSha256Matches(\"abc\", \"key\", req.uniqueHeader(\"X-Signature\").or(\"\"), "
-        "\"sha256=\") else { return 401 } return 200 }\n"));
+    REQUIRE(
+        source.append("import Crypto\n"
+                      "route GET \"/\" { "
+                      "guard Crypto.hmacSha256Valid(\"abc\", \"key\", "
+                      "req.uniqueHeader(\"X-Signature\").or(\"\"), "
+                      "\"sha256=\") else { return 401 } return 200 }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
@@ -512,7 +514,8 @@ TEST(native_program, hmac_uses_c_crypto_after_compiler_exit) {
 TEST(native_program, digest_uses_c_crypto_after_compiler_exit) {
     Source source;
     REQUIRE(source.append(
-        "route GET \"/\" { guard let digest = sha256(\"abc\") else { return 503 } "
+        "import Crypto\n"
+        "route GET \"/\" { guard let digest = Crypto.digestSha256(\"abc\") else { return 503 } "
         "guard digest == \"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\" "
         "else { return 500 } return 200 }\n"));
     Program owner;
@@ -587,8 +590,9 @@ TEST(native_program, rs256_policy_survives_compiler_exit_source_removal_and_shar
     REQUIRE(fixture.init());
     char source_bytes[8192];
     json::Writer source_text{source_bytes, sizeof(source_bytes) - 1};
-    source_text.text(lit_str(R"rut(route GET "/" {
-    guard let claims = jwtVerifyRs256(bearerToken(req.authorization.or("")).or(""), )rut"));
+    source_text.text(lit_str(R"rut(import Crypto
+route GET "/" {
+    guard let claims = Crypto.jwtRs256(bearerToken(req.authorization.or("")).or(""), )rut"));
     REQUIRE(json::quote(fixture.policy, source_text));
     source_text.text(lit_str(R"rut() else { return 401 }
     guard jwtHasScope(claims, "read") else { return 403 }

@@ -19,8 +19,11 @@ A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 ```swift
 // PR #184 adds standalone examples; no tokenBucket helper is importable yet.
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
+import Crypto                                      // built-in, statically linked crypto module
 // Imports nest at most 2 levels deep (main → a → b, kMaxImportNestingDepth);
 // a deeper chain is a compile error at the offending `import`, never a crash.
+// The built-in Crypto module is not a filesystem import and does not consume
+// an import nesting level.
 
 listen :8080                      // one cleartext IPv4 wildcard listener
 tls "api.example.com", cert: env("CERT"), key: env("KEY")
@@ -1366,6 +1369,23 @@ separately; an empty required token always returns false.
 Literal `response(..., headers: {...})` values decode string escapes like
 ordinary expressions, including quoted challenge parameters. Decoded values
 are validated again; escaped CR/LF/NUL cannot introduce header fields.
+
+## Crypto system module (implemented)
+
+`import Crypto` exposes bounded operations backed by Rut's statically linked C
+crypto ABI. It does not allow arbitrary foreign symbols or dynamic libraries.
+Functions can be called as `Crypto.digestSha256(data)` or by their unqualified
+names. A local declaration with the same name takes precedence unqualified;
+the qualified form still selects the module function. Digest and MAC functions
+return optional lowercase hex strings with request-owned storage:
+
+- `digestMd5`, `digestSha1`, `digestSha224`, `digestSha256`, `digestSha384`, `digestSha512` take one `str`.
+- `macMd5`, `macSha1`, `macSha224`, `macSha256`, `macSha384`, `macSha512` take key and data `str` values.
+- `equal(a, b)` compares bounded strings in constant time; `hmacSha256Valid(message, key, signature, prefix)` and `webhookValid(id, timestamp, signature, body, rawKey)` verify the profiles below.
+- `jwtAny(token, secret)`, `jwtHs256`, `jwtHs384`, `jwtHs512`, and `jwtRs256(token, policy)` retain the existing JWT verification profiles and return optional `Json`.
+
+The existing global operations remain available for compatibility. The module
+is compiler-owned and does not depend on a source file in the deployment.
 
 ## HMAC-SHA256 and webhook authentication (implemented)
 

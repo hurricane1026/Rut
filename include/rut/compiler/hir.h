@@ -87,6 +87,7 @@ struct HirAccessLogDecl {
 struct HirImport {
     Span span{};
     Str path{};
+    bool is_system_crypto = false;
     bool selective = false;
     bool has_namespace_alias = false;
     Str namespace_alias{};
@@ -571,6 +572,7 @@ struct HirFunction {
 
     Span span{};
     Str name{};
+    bool is_system_crypto = false;
     HirTypeKind return_type = HirTypeKind::Unknown;
     u32 return_generic_index = 0xffffffffu;
     Str return_associated_name{};
@@ -613,6 +615,7 @@ struct HirFunction {
     HirFunction(const HirFunction& other)
         : span(other.span),
           name(other.name),
+          is_system_crypto(other.is_system_crypto),
           return_type(other.return_type),
           return_generic_index(other.return_generic_index),
           return_associated_name(other.return_associated_name),
@@ -643,6 +646,7 @@ struct HirFunction {
         if (this == &other) return *this;
         span = other.span;
         name = other.name;
+        is_system_crypto = other.is_system_crypto;
         return_type = other.return_type;
         return_generic_index = other.return_generic_index;
         return_associated_name = other.return_associated_name;
@@ -673,6 +677,7 @@ struct HirFunction {
     HirFunction(HirFunction&& other) noexcept
         : span(other.span),
           name(other.name),
+          is_system_crypto(other.is_system_crypto),
           return_type(other.return_type),
           return_generic_index(other.return_generic_index),
           return_associated_name(other.return_associated_name),
@@ -703,6 +708,7 @@ struct HirFunction {
         if (this == &other) return *this;
         span = other.span;
         name = other.name;
+        is_system_crypto = other.is_system_crypto;
         return_type = other.return_type;
         return_generic_index = other.return_generic_index;
         return_associated_name = other.return_associated_name;

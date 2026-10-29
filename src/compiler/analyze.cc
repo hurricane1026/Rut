@@ -378,6 +378,7 @@ struct ImportedModuleInfo {
     Span span{};
     Str path{};
     HirModule* module = nullptr;
+    bool is_system_crypto = false;
     bool selective = false;
     bool has_namespace_alias = false;
     Str namespace_alias{};
@@ -1503,7 +1504,9 @@ static FrontendResult<void> validate_import_namespaces(
             if (imports[j].selective) continue;
             const auto rhs = import_namespace_name(
                 imports[j].path, imports[j].has_namespace_alias, imports[j].namespace_alias);
-            if (!imports[i].path.eq(imports[j].path) && lhs.eq(rhs))
+            if ((!imports[i].path.eq(imports[j].path) ||
+                 imports[i].is_system_crypto != imports[j].is_system_crypto) &&
+                lhs.eq(rhs))
                 return frontend_error(FrontendError::UnsupportedSyntax, imports[j].span, rhs);
         }
     }
@@ -1604,6 +1607,20 @@ static FrontendResult<void> validate_import_namespace_bindings(
     return {};
 }
 
+static bool is_crypto_system_export(Str value) {
+    const Str exports[] = {
+        lit_str("digestMd5"),    lit_str("digestSha1"),      lit_str("digestSha224"),
+        lit_str("digestSha256"), lit_str("digestSha384"),    lit_str("digestSha512"),
+        lit_str("macMd5"),       lit_str("macSha1"),         lit_str("macSha224"),
+        lit_str("macSha256"),    lit_str("macSha384"),       lit_str("macSha512"),
+        lit_str("equal"),        lit_str("hmacSha256Valid"), lit_str("webhookValid"),
+        lit_str("jwtAny"),       lit_str("jwtHs256"),        lit_str("jwtHs384"),
+        lit_str("jwtHs512"),     lit_str("jwtRs256")};
+    for (Str name : exports)
+        if (name.eq(value)) return true;
+    return false;
+}
+
 static bool resolve_import_namespace_member(const HirModule& mod,
                                             const AstExpr& expr,
                                             Str& out_member) {
@@ -1617,6 +1634,7 @@ static bool resolve_import_namespace_member(const HirModule& mod,
                                       imported.namespace_alias,
                                       expr.lhs->name))
             continue;
+        if (imported.is_system_crypto && !is_crypto_system_export(expr.name)) return false;
         if (imported.has_namespace_alias)
             out_member = intern_generated_name(str_to_std_string(imported.namespace_alias) + "__" +
                                                str_to_std_string(expr.name));
@@ -10067,7 +10085,17 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
 
     const Str callee_name = resolve_alias_target_leaf(mod, expr.name);
-    const u32 fn_index = find_function_index(mod, callee_name);
+    u32 fn_index = find_function_index(mod, callee_name);
+    if (fn_index == mod.functions.len && is_crypto_system_export(callee_name) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, callee_name)) {
+        for (u32 i = 0; i < mod.imports.len; ++i) {
+            if (!mod.imports[i].is_system_crypto) continue;
+            const Str generated =
+                intern_generated_name("Crypto__" + str_to_std_string(callee_name));
+            fn_index = find_function_index(mod, generated);
+            break;
+        }
+    }
     const auto fail_call =
         [&](Span span, const char* reason, const Str* detail) -> FrontendResult<HirExpr> {
         if (detail) return frontend_error(FrontendError::UnsupportedSyntax, span, *detail);
@@ -13225,6 +13253,9 @@ static FrontendResult<void> merge_imported_functions(
         const auto& imported = imports[ii];
         for (u32 fi = 0; fi < imported.module->functions.len; fi++) {
             const auto& fn = imported.module->functions[fi];
+            // Calls in imported functions are already instantiated in HIR.
+            // Do not re-export their private system-module dependencies.
+            if (fn.is_system_crypto && !imported.is_system_crypto) continue;
             if (is_hidden_import_runtime_function(fn.name)) {
                 if (find_function_index(*mod, fn.name) != mod->functions.len)
                     // fn.name is a generated name owned by the analysis store,
@@ -13257,6 +13288,7 @@ static FrontendResult<void> merge_imported_functions(
             }
             if (imported.has_namespace_alias) {
                 HirFunction imported_fn = fn;
+                imported_fn.is_system_crypto = imported.is_system_crypto || fn.is_system_crypto;
                 if (!imported_fn.exprs.ok())
                     return frontend_error(FrontendError::OutOfMemory, imported.span);
                 imported_fn.name = import_visible_name(imported, fn.name);
@@ -14059,6 +14091,34 @@ static FrontendResult<void> merge_imported_impls(
     return {};
 }
 
+// Fixed, compiler-owned system module. Its ordinary Rut wrappers preserve
+// existing typed/bounded operations; the generated calls use the C crypto ABI.
+static constexpr Str kCryptoSystemPath = lit_str("@rut/Crypto.rut");
+static constexpr char kCryptoSystemSource[] = R"rut(
+func digestMd5(_ data: str) -> str => md5(data)
+func digestSha1(_ data: str) -> str => sha1(data)
+func digestSha224(_ data: str) -> str => sha224(data)
+func digestSha256(_ data: str) -> str => sha256(data)
+func digestSha384(_ data: str) -> str => sha384(data)
+func digestSha512(_ data: str) -> str => sha512(data)
+func macMd5(_ key: str, _ data: str) -> str => hmacMd5(key, data)
+func macSha1(_ key: str, _ data: str) -> str => hmacSha1(key, data)
+func macSha224(_ key: str, _ data: str) -> str => hmacSha224(key, data)
+func macSha256(_ key: str, _ data: str) -> str => hmacSha256(key, data)
+func macSha384(_ key: str, _ data: str) -> str => hmacSha384(key, data)
+func macSha512(_ key: str, _ data: str) -> str => hmacSha512(key, data)
+func equal(_ a: str, _ b: str) -> bool => constantTimeEqual(a, b)
+func hmacSha256Valid(_ message: str, _ key: str, _ signature: str, _ prefix: str) -> bool =>
+    hmacSha256Matches(message, key, signature, prefix)
+func webhookValid(_ id: str, _ time: str, _ signature: str, _ body: str, _ key: str) -> bool =>
+    standardWebhookValid(id, time, signature, body, key)
+func jwtAny(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret)
+func jwtHs256(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "HS256")
+func jwtHs384(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "HS384")
+func jwtHs512(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "HS512")
+func jwtRs256(_ token: str, _ policy: str) -> Json => jwtVerifyRs256(token, policy)
+)rut";
+
 static FrontendResult<void> load_imported_modules(
     FixedVec<ImportedModuleInfo, AstFile::kMaxItems>& out,
     const AstFile& file,
@@ -14070,15 +14130,16 @@ static FrontendResult<void> load_imported_modules(
     const std::vector<Str>& route_decorator_names,
     SourceBudget* source_budget,
     bool internal_strict_local_response_propagation) {
-    if (source_path.len == 0) return {};
     const auto base_dir = std::filesystem::path(str_to_std_string(source_path)).parent_path();
     auto collect_imported_decorator_names =
         [&](const AstImportDecl& target_decl,
             const std::string& target_normalized) -> std::vector<Str> {
         std::vector<Str> imported_decorator_names;
+        if (target_decl.is_system_crypto) return imported_decorator_names;
         for (u32 ii = 0; ii < file.items.len; ii++) {
             const auto& other_item = file.items[ii];
-            if (other_item.kind != AstItemKind::Import) continue;
+            if (other_item.kind != AstItemKind::Import || other_item.import_decl.is_system_crypto)
+                continue;
             const auto other_normalized =
                 (base_dir / str_to_std_string(other_item.import_decl.path))
                     .lexically_normal()
@@ -14109,8 +14170,12 @@ static FrontendResult<void> load_imported_modules(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Import) continue;
+        const bool kSystemCrypto = item.import_decl.is_system_crypto;
+        if (source_path.len == 0 && !kSystemCrypto) continue;
         const auto normalized =
-            (base_dir / str_to_std_string(item.import_decl.path)).lexically_normal().string();
+            kSystemCrypto
+                ? str_to_std_string(kCryptoSystemPath)
+                : (base_dir / str_to_std_string(item.import_decl.path)).lexically_normal().string();
         for (const auto& active_import : import_stack) {
             // A failed top-level analysis releases the shared imported-source
             // storage. Keep the cycle detail independent of those source views;
@@ -14122,7 +14187,8 @@ static FrontendResult<void> load_imported_modules(
         }
         ImportedModuleInfo* existing_info = nullptr;
         for (u32 ii = 0; ii < out.len; ii++) {
-            if (out[ii].path.eq({normalized.c_str(), static_cast<u32>(normalized.size())}) &&
+            if (out[ii].is_system_crypto == kSystemCrypto &&
+                out[ii].path.eq({normalized.c_str(), static_cast<u32>(normalized.size())}) &&
                 out[ii].has_namespace_alias == item.import_decl.has_namespace_alias &&
                 (!out[ii].has_namespace_alias ||
                  out[ii].namespace_alias.eq(item.import_decl.namespace_alias))) {
@@ -14160,12 +14226,14 @@ static FrontendResult<void> load_imported_modules(
         // analyzed, so its size is the nesting depth the new import would get.
         // The span is the `import` in this (importing) file and the detail is
         // static, so neither dangles once the failed modules are released.
-        if (import_stack.size() > kMaxImportNestingDepth)
+        if (!kSystemCrypto && import_stack.size() > kMaxImportNestingDepth)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.import_decl.span,
                                   lit_str("import nesting depth limit reached"));
         std::string content;
-        const TextFileReadStatus read_status = read_text_file(normalized, content, source_budget);
+        const TextFileReadStatus read_status =
+            kSystemCrypto ? (content = kCryptoSystemSource, TextFileReadStatus::Ok)
+                          : read_text_file(normalized, content, source_budget);
         if (read_status == TextFileReadStatus::SourceLimit)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.import_decl.span,
@@ -14223,6 +14291,7 @@ static FrontendResult<void> load_imported_modules(
         info.span = item.import_decl.span;
         info.path = kept_path;
         info.module = imported_storage.back().get();
+        info.is_system_crypto = kSystemCrypto;
         info.selective = item.import_decl.selective;
         info.has_namespace_alias = item.import_decl.has_namespace_alias;
         info.namespace_alias = item.import_decl.namespace_alias;
@@ -16496,7 +16565,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (item.kind != AstItemKind::Import) continue;
         bool exists = false;
         for (u32 ii = 0; ii < mod.imports.len; ii++) {
-            if (mod.imports[ii].path.eq(item.import_decl.path) &&
+            if (mod.imports[ii].is_system_crypto == item.import_decl.is_system_crypto &&
+                mod.imports[ii].path.eq(item.import_decl.path) &&
                 mod.imports[ii].has_namespace_alias == item.import_decl.has_namespace_alias &&
                 (!mod.imports[ii].has_namespace_alias ||
                  mod.imports[ii].namespace_alias.eq(item.import_decl.namespace_alias))) {
@@ -16508,11 +16578,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
             HirImport imp{};
             imp.span = item.import_decl.span;
             imp.path = item.import_decl.path;
+            imp.is_system_crypto = item.import_decl.is_system_crypto;
             imp.selective = item.import_decl.selective;
             imp.has_namespace_alias = item.import_decl.has_namespace_alias;
             imp.namespace_alias = item.import_decl.namespace_alias;
             std::string normalized_import_path;
-            if (source_path.len != 0) {
+            if (item.import_decl.is_system_crypto) {
+                normalized_import_path = str_to_std_string(kCryptoSystemPath);
+            } else if (source_path.len != 0) {
                 normalized_import_path =
                     (std::filesystem::path(str_to_std_string(source_path)).parent_path() /
                      str_to_std_string(item.import_decl.path))
@@ -16520,6 +16593,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         .string();
             }
             for (u32 ii = 0; ii < imported_modules.len; ii++) {
+                if (imported_modules[ii].is_system_crypto != item.import_decl.is_system_crypto)
+                    continue;
                 if (!normalized_import_path.empty() &&
                     !imported_modules[ii].path.eq(
                         {normalized_import_path.c_str(),
