@@ -1,5 +1,6 @@
 #include "public_key_fixtures.h"
 #include "rsa_verify_fixtures.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/public_key.h"
 #include "test.h"
@@ -27,6 +28,39 @@ static void counted_free(void* p, const char*, int) {
 template <size_t N>
 static Str span(const unsigned char (&b)[N]) {
     return {reinterpret_cast<const char*>(b), static_cast<u32>(N)};
+}
+TEST(rsa_verify, c_abi_borrows_caller_storage_and_keeps_key_reference) {
+    alignas(64) unsigned char key_storage[256]{};
+    alignas(64) unsigned char verifier_storage[1024]{};
+    REQUIRE(rut_crypto_rsa_key_size_v1() <= sizeof(key_storage));
+    REQUIRE(rut_crypto_rsa_key_align_v1() <= 64);
+    REQUIRE(rut_crypto_rsa_verifier_size_v1() <= sizeof(verifier_storage));
+    REQUIRE(rut_crypto_rsa_verifier_align_v1() <= 64);
+    CHECK(rut_crypto_rsa_key_init_v1(key_storage, 0) == nullptr);
+    CHECK(rut_crypto_rsa_key_init_v1(key_storage + 1, sizeof(key_storage) - 1) == nullptr);
+    auto* key = rut_crypto_rsa_key_init_v1(key_storage, sizeof(key_storage));
+    REQUIRE(key);
+    CHECK(!rut_crypto_rsa_key_load_der_v1(key, nullptr, 1));
+    REQUIRE(rut_crypto_rsa_key_load_der_v1(key, kRfcRsaSpki, sizeof(kRfcRsaSpki)));
+    auto* verifier =
+        rut_crypto_rsa_verifier_init_v1(verifier_storage, sizeof(verifier_storage), key);
+    REQUIRE(verifier);
+    rut_crypto_rsa_key_destroy_v1(key);
+    allocations = 0;
+    tracking = true;
+    bool ok = rut_crypto_rsa_verify_sha256_v1(verifier,
+                                              reinterpret_cast<const u8*>(kMessage),
+                                              sizeof(kMessage) - 1,
+                                              kSignature,
+                                              sizeof(kSignature));
+    bool bad = rut_crypto_rsa_verify_sha256_v1(
+        verifier, reinterpret_cast<const u8*>("wrong"), 5, kSignature, sizeof(kSignature));
+    tracking = false;
+    CHECK(ok);
+    CHECK(!bad);
+    CHECK_EQ(allocations, 0u);
+    CHECK(!rut_crypto_rsa_verify_sha256_v1(verifier, nullptr, 1, kSignature, sizeof(kSignature)));
+    rut_crypto_rsa_verifier_destroy_v1(verifier);
 }
 TEST(rsa_verify, published_vector_lifetime_and_request_allocations) {
     RsaPublicKey key;

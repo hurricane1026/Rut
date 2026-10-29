@@ -1,5 +1,6 @@
 #include "public_key_fixtures.h"
 #include "rsa_verify_fixtures.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/public_key.h"
 #include "test.h"
@@ -116,6 +117,33 @@ static Str jwk(char (&buffer)[2048],
         for (u32 i = 0; i < part.len; ++i) buffer[length++] = part.ptr[i];
     }
     return {buffer, length};
+}
+
+TEST(public_key, c_abi_imports_trusted_jwk_and_jwks) {
+    alignas(64) unsigned char storage[256];
+    REQUIRE(rut_crypto_rsa_key_size_v1() <= sizeof(storage));
+    REQUIRE(rut_crypto_rsa_key_align_v1() <= 64);
+    char buffer[2048];
+    auto* key = rut_crypto_rsa_key_init_v1(storage, sizeof(storage));
+    REQUIRE(key);
+    auto input =
+        jwk(buffer, lit_str(R"({"kty":"RSA","alg":"RS256","n":")"), lit_str(R"(","e":"AQAB"})"));
+    CHECK(!rut_crypto_rsa_key_load_jwk_v1(key, nullptr, 1));
+    REQUIRE(rut_crypto_rsa_key_load_jwk_v1(
+        key, reinterpret_cast<const uint8_t*>(input.ptr), input.len));
+    rut_crypto_rsa_key_destroy_v1(key);
+    key = rut_crypto_rsa_key_init_v1(storage, sizeof(storage));
+    REQUIRE(key);
+    input = jwk(buffer,
+                lit_str(R"({"keys":[{"kid":"fixed","kty":"RSA","alg":"RS256","n":")"),
+                lit_str(R"(","e":"AQAB"}]})"));
+    auto* bytes = reinterpret_cast<const uint8_t*>(input.ptr);
+    CHECK(!rut_crypto_rsa_key_load_jwks_v1(
+        key, bytes, input.len, reinterpret_cast<const uint8_t*>("other"), 5));
+    CHECK(!rut_crypto_rsa_key_load_jwks_v1(key, bytes, input.len, nullptr, 1));
+    REQUIRE(rut_crypto_rsa_key_load_jwks_v1(
+        key, bytes, input.len, reinterpret_cast<const uint8_t*>("fixed"), 5));
+    rut_crypto_rsa_key_destroy_v1(key);
 }
 
 TEST(public_key, public_jwk_owns_key_and_verifies_published_signature) {

@@ -65,6 +65,43 @@ uint32_t rut_crypto_hmac_long_key_v1(uint32_t algorithm,
                                      uint32_t capacity,
                                      uint32_t* output_len);
 
+/* RSA objects are constructed in caller-owned, correctly aligned storage.
+ * Query size and alignment before reserving storage. Each successful init must
+ * be paired with destroy before reusing storage. Do not copy initialized
+ * objects; do not call init twice on live storage. A verifier is shard-owned,
+ * retains a key reference and may outlive its key owner; it must not be used
+ * concurrently. Key and verifier storage must not overlap. OpenSSL may allocate while
+ * loading/initializing, never rely on these calls being allocation-free. Verify borrows inputs
+ * synchronously. */
+typedef struct rut_crypto_rsa_key_v1 rut_crypto_rsa_key_v1;
+typedef struct rut_crypto_rsa_verifier_v1 rut_crypto_rsa_verifier_v1;
+uint32_t rut_crypto_rsa_key_size_v1(void);
+uint32_t rut_crypto_rsa_key_align_v1(void);
+rut_crypto_rsa_key_v1* rut_crypto_rsa_key_init_v1(void* storage, uint32_t capacity);
+void rut_crypto_rsa_key_destroy_v1(rut_crypto_rsa_key_v1* key);
+uint32_t rut_crypto_rsa_key_load_der_v1(rut_crypto_rsa_key_v1* key,
+                                        const uint8_t* der,
+                                        uint32_t der_len);
+uint32_t rut_crypto_rsa_key_load_jwk_v1(rut_crypto_rsa_key_v1* key,
+                                        const uint8_t* jwk,
+                                        uint32_t jwk_len);
+uint32_t rut_crypto_rsa_key_load_jwks_v1(rut_crypto_rsa_key_v1* key,
+                                         const uint8_t* jwks,
+                                         uint32_t jwks_len,
+                                         const uint8_t* kid,
+                                         uint32_t kid_len);
+uint32_t rut_crypto_rsa_verifier_size_v1(void);
+uint32_t rut_crypto_rsa_verifier_align_v1(void);
+rut_crypto_rsa_verifier_v1* rut_crypto_rsa_verifier_init_v1(void* storage,
+                                                            uint32_t capacity,
+                                                            const rut_crypto_rsa_key_v1* key);
+void rut_crypto_rsa_verifier_destroy_v1(rut_crypto_rsa_verifier_v1* verifier);
+uint32_t rut_crypto_rsa_verify_sha256_v1(rut_crypto_rsa_verifier_v1* verifier,
+                                         const uint8_t* message,
+                                         uint32_t message_len,
+                                         const uint8_t* signature,
+                                         uint32_t signature_len);
+
 #ifdef __cplusplus
 }
 #endif

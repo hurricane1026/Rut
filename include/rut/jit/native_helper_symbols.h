@@ -40,6 +40,18 @@
     X(rut_crypto_digest_v1)                \
     X(rut_crypto_digest_parts_v1)          \
     X(rut_crypto_hmac_long_key_v1)         \
+    X(rut_crypto_rsa_key_size_v1)          \
+    X(rut_crypto_rsa_key_align_v1)         \
+    X(rut_crypto_rsa_key_init_v1)          \
+    X(rut_crypto_rsa_key_destroy_v1)       \
+    X(rut_crypto_rsa_key_load_der_v1)      \
+    X(rut_crypto_rsa_key_load_jwk_v1)      \
+    X(rut_crypto_rsa_key_load_jwks_v1)     \
+    X(rut_crypto_rsa_verifier_size_v1)     \
+    X(rut_crypto_rsa_verifier_align_v1)    \
+    X(rut_crypto_rsa_verifier_init_v1)     \
+    X(rut_crypto_rsa_verifier_destroy_v1)  \
+    X(rut_crypto_rsa_verify_sha256_v1)     \
     X(rut_helper_uuid)                     \
     X(rut_helper_str_has_prefix)           \
     X(rut_helper_http_origin_list_allows)  \

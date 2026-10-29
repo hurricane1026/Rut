@@ -123,5 +123,12 @@ int main(void) {
                                     &len) ||
         len != 0 || out[0] != 0xa5)
         return 17;
+    _Alignas(max_align_t) unsigned char key_storage[256];
+    if (rut_crypto_rsa_key_size_v1() > sizeof(key_storage) ||
+        rut_crypto_rsa_key_align_v1() > _Alignof(max_align_t))
+        return 18;
+    rut_crypto_rsa_key_v1* rsa_key = rut_crypto_rsa_key_init_v1(key_storage, sizeof(key_storage));
+    if (!rsa_key || rut_crypto_rsa_key_load_der_v1(rsa_key, NULL, 1)) return 19;
+    rut_crypto_rsa_key_destroy_v1(rsa_key);
     return 0;
 }
