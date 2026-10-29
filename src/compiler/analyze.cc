@@ -12962,14 +12962,18 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
             route->ws_handler.default_verdict = WsVerdict::Forward;
             if (call.args.len == 1) {
-                // Modify form: the payload must be a definite Str (text-frame content). Binary
-                // payloads + opcode matching are a follow-up; runtime emit is Phase 4b.
+                // Fixed text replacement only. Dynamic expressions need a separate
+                // bounded per-message evaluation path; never silently forward unchanged.
                 if (call.args[0] == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, call.span);
                 auto payload = analyze_expr(
                     *call.args[0], route, mod, route->locals.data, route->locals.len, nullptr);
                 if (!payload) return core::make_unexpected(payload.error());
-                if (payload->type != HirTypeKind::Str || payload->may_nil || payload->may_error)
+                if (payload->kind != HirExprKind::StrLit || payload->type != HirTypeKind::Str ||
+                    payload->may_nil || payload->may_error ||
+                    payload->str_value.len > kWsTerminateMessageCapacity ||
+                    (stmt.ws_max_message_size != 0 &&
+                     payload->str_value.len > stmt.ws_max_message_size))
                     return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
                 if (!route->exprs.push(payload.value()))
                     return frontend_error(FrontendError::OutOfMemory, call.span);

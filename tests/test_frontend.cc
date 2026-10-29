@@ -5789,8 +5789,7 @@ TEST(frontend, analyze_accepts_websocket_forward_payload) {
     // `frame.forward(payload)` is the modify-and-send form. It must PARSE as a MethodCall on
     // `frame` named "forward" with ONE arg — NOT get mis-routed into the `forward(upstream)`
     // proxy terminator by the contextual-keyword rule — and analyze accepts it when the arg is
-    // a Str payload, recording has_forward_payload. (Runtime emit is Phase 4b; build_mir
-    // still rejects.)
+    // a fixed Str literal payload, recording has_forward_payload for the loader.
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(\"hi\") } "
         "}\n";
@@ -5826,6 +5825,21 @@ TEST(frontend, analyze_rejects_websocket_forward_nonstring_payload) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     CHECK(!hir);  // payload is not Str
+}
+
+TEST(frontend, analyze_websocket_rewrite_rejects_dynamic_and_oversize_text) {
+    const char* sources[] = {
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(req.path) "
+        "} }\n",
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4b) { frame in "
+        "frame.forward(\"12345\") } }\n"};
+    for (const char* source : sources) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
 }
 
 TEST(frontend, analyze_rejects_websocket_forward_two_args) {

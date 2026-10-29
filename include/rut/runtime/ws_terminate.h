@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/runtime/slice_pool.h"
 #include "rut/runtime/ws_frame.h"
 
 // WebSocket terminate-mode inspection engine. Sits one layer above the frame codec
@@ -17,6 +18,11 @@
 // ws_inspect at the forward boundary and sends the produced bytes.
 namespace rut {
 
+inline constexpr u32 kWsTerminateMessageCapacity = SlicePool::kSliceSize - kWsMaxHeaderSize;
+
+// Valid UTF-8 for a text message; an empty view is valid.
+bool ws_valid_text_payload(Str text);
+
 // RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close frame.
 // Accepts 1000–1003, 1007–1014, and 3000–4999; rejects the unassigned ranges (<1000,
 // 1016–2999, >4999) and the local-only/reserved codes (1004/1005/1006/1015). Single source
@@ -29,16 +35,17 @@ constexpr bool ws_valid_close_code(u32 code) {
 
 // What the gateway should do with a fully-reassembled data message.
 enum class WsFrameAction : u8 {
-    Forward,  // re-serialize the message and send it on
-    Drop,     // silently discard it
-    Close,    // tear the tunnel down (a Close frame is emitted first)
+    Forward,      // re-serialize the message and send it on
+    Drop,         // silently discard it
+    Close,        // tear the tunnel down (a Close frame is emitted first)
+    ForwardText,  // replace with the route's fixed text, then forward as Text
 };
 
 // Invoked once per complete data message. `opcode` is Text or Binary; `payload` is the
-// reassembled, unmasked message of `len` bytes (read-only this slice — modify/inject
-// comes later). `from_client` is the leg the message travels on: true for client->upstream,
-// false for upstream->client — so one handler can police a single direction (`frame.fromClient`).
-// Returns the action.
+// reassembled, unmasked message of `len` bytes. ForwardText selects a fixed
+// route-owned replacement; the input view remains read-only. `from_client` is the leg the message
+// travels on: true for client->upstream, false for upstream->client — so one handler can police a
+// single direction (`frame.fromClient`). Returns the action.
 using WsMessageHandlerFn =
     WsFrameAction (*)(void* ctx, WsOpcode opcode, const u8* payload, u64 len, bool from_client);
 
@@ -63,6 +70,9 @@ struct WsInspector {
     // client leg, but masking is a wire-format property and direction is a routing one —
     // conflating them would break the day they diverge. The caller sets it at arm time.
     bool from_client = false;
+    // Immutable route-owned text; only ForwardText uses it. The pinned route
+    // configuration must remain alive until this connection retires.
+    Str forward_text{};
     u64 mask_rng = 0;          // Reserved for compatibility; masking keys use RAND_bytes.
     u64 max_message_size = 0;  // 0 = unbounded
     // `frame.close(code)` support. close_code (INPUT) is the RFC 6455 status the handler's

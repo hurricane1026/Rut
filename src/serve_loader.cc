@@ -302,7 +302,9 @@ bool load_rut_program(const char* path,
             }
             if (!jit::emit_ws_handler(cg.mod,
                                       cg.ctx,
-                                      static_cast<u8>(h.default_verdict),
+                                      h.has_forward_payload
+                                          ? static_cast<u8>(WsFrameAction::ForwardText)
+                                          : static_cast<u8>(h.default_verdict),
                                       guards,
                                       h.len_guards.len,
                                       ws_n))
@@ -349,7 +351,7 @@ bool load_rut_program(const char* path,
     // frame-handler route. The `maxMessageSize:` kwarg sets the cap when given; otherwise it
     // defaults to the engine's single-slice cap. The runtime arm-time clamps either way.
     {
-        constexpr u32 kWsDefaultMaxMessageSize = SlicePool::kSliceSize - kWsMaxHeaderSize;
+        constexpr u32 kWsDefaultMaxMessageSize = kWsTerminateMessageCapacity;
         u32 ws_n = 0;
         for (u32 i = 0; i < ir.hir->routes.len; i++) {
             const auto& route = ir.hir->routes[i];
@@ -366,12 +368,26 @@ bool load_rut_program(const char* path,
             const u32 max_msg = route.ws_handler.max_message_size != 0
                                     ? route.ws_handler.max_message_size
                                     : kWsDefaultMaxMessageSize;
+            Str forward_text{};
+            if (route.ws_handler.has_forward_payload) {
+                if (route.ws_handler.forward_payload_expr >= route.exprs.len) return false;
+                const auto& expr = route.exprs[route.ws_handler.forward_payload_expr];
+                if (expr.kind != HirExprKind::StrLit) return false;
+                // HIR is temporary, including decoded/imported strings. Copy into
+                // the retained program arena before publishing a route view.
+                char* bytes = out.rir.arena.alloc_array<char>(expr.str_value.len + 1);
+                if (!bytes) return false;
+                for (u32 j = 0; j < expr.str_value.len; j++) bytes[j] = expr.str_value.ptr[j];
+                bytes[expr.str_value.len] = '\0';
+                forward_text = {bytes, expr.str_value.len};
+            }
             if (!out.config.add_ws_terminate(path,
                                              route.method,
                                              static_cast<u16>(route.ws_handler.upstream_index),
                                              handler,
                                              max_msg,
-                                             route.ws_handler.close_code))
+                                             route.ws_handler.close_code,
+                                             forward_text))
                 return false;
             ws_n++;
         }

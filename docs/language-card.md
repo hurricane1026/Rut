@@ -838,8 +838,17 @@ return websocket(chat) { frame in
     frame.forward()
 }
 
+// Fixed text replacement (final verdict only). An empty literal emits an empty
+// Text message; binary input becomes Text. The literal must fit maxMessageSize
+// and the single-slice cap. Dynamic expressions/interpolation remain unsupported.
+return websocket(chat, maxMessageSize: 4kb) { frame in
+    guard frame.fromClient && frame.isText else { frame.forward() }
+    frame.forward("message replaced")
+}
+
 // WebSocket proxy. The inspection sketch below is a target API; current terminate
-// handlers use `return websocket(chat) { frame in ... }` and forward/drop/close.
+// handlers use `return websocket(chat) { frame in ... }`, forward/drop/close,
+// and final frame.forward("fixed text").
 // Reassembled messages are currently limited to approximately one 16 KB slice.
 guard req.upgrade == .websocket else { return 400 }
 return websocket(chat)                          // transparent

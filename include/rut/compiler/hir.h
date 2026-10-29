@@ -1103,9 +1103,9 @@ struct HirWsHandler {
     static constexpr u32 kMaxConditionNodes = 32;
     FixedVec<WsLenGuard, kMaxConditionNodes> len_guards;
     // `frame.forward(payload)` modify form: forward a rewritten message instead of the
-    // original. The payload expression (Str-typed) is stored in HirRoute.exprs;
+    // original. The fixed text literal is stored in HirRoute.exprs;
     // forward_payload_expr is its index there (0xffffffffu when has_forward_payload is false).
-    // Lowering the modify path (the bounded output buffer) is Phase 4b; build_mir still rejects.
+    // The loader retains its bytes and emits a ForwardText default verdict.
     bool has_forward_payload = false;
     u32 forward_payload_expr = 0xffffffffu;
     // `frame.close(code)` status code (default 1000 = normal closure). Only meaningful when

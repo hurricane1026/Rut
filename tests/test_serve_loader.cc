@@ -4645,6 +4645,78 @@ route GET "/and" { return websocket(backend) { frame in
     program.destroy();
 }
 
+TEST(serve_loader, websocket_terminate_rewrites_fixed_text) {
+    const auto path = write_file("/tmp/rut_serve_loader_ws_rewrite",
+                                 "app.rut",
+                                 "upstream backend at \"127.0.0.1:9999\"\n"
+                                 "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                                 " guard frame.fromClient else { frame.forward() }\n"
+                                 " guard frame.isText else { frame.drop() }\n"
+                                 " frame.forward(\"rewritten\\0text\")\n} }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    REQUIRE_EQ(route.ws_forward_text.len, 14u);
+    CHECK(memcmp(route.ws_forward_text.ptr, "rewritten\0text", 14) == 0);
+    const auto handler = route.ws_frame_handler;
+    REQUIRE(handler != nullptr);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, true) == WsFrameAction::ForwardText);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, false) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, nullptr, 0, true) == WsFrameAction::Drop);
+    // Go through actual frame serialization using the route's retained view.
+    WsInspector st;
+    st.forward_text = route.ws_forward_text;
+    st.from_client = true;
+    st.max_message_size = route.ws_max_message_size;
+    const u8 input[] = {0x81, 0};
+    u8 out[64], msg[64];
+    u32 used = 0, produced = 0;
+    REQUIRE(ws_inspect(st,
+                       input,
+                       sizeof(input),
+                       out,
+                       sizeof(out),
+                       msg,
+                       sizeof(msg),
+                       handler,
+                       nullptr,
+                       &used,
+                       &produced) == WsInspectStatus::Ok);
+    CHECK_EQ(used, 2u);
+    REQUIRE_EQ(produced, 16u);
+    CHECK_EQ(out[0], 0x81);
+    CHECK(memcmp(out + 2, "rewritten\0text", 14) == 0);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_terminate_empty_rewrite_and_invalid_config) {
+    const auto path = write_file(
+        "/tmp/rut_serve_loader_ws_empty_rewrite",
+        "app.rut",
+        "upstream backend at \"127.0.0.1:9999\"\n"
+        "route GET \"/ws\" { return websocket(backend) { frame in frame.forward(\"\") } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    CHECK_EQ(route.ws_forward_text.len, 0u);
+    CHECK(route.ws_frame_handler(nullptr, WsOpcode::Text, nullptr, 0, true) ==
+          WsFrameAction::ForwardText);
+    RouteConfig config;
+    const auto id = config.add_upstream("b", 0x7f000001, 9999);
+    REQUIRE(id.has_value());
+    CHECK_FALSE(config.add_ws_terminate(
+        "/a", 0, id.value(), route.ws_frame_handler, 4, 1000, {"too long", 8}));
+    const char invalid[] = {static_cast<char>(0xff)};
+    CHECK_FALSE(config.add_ws_terminate(
+        "/b", 0, id.value(), route.ws_frame_handler, 4, 1000, {invalid, 1}));
+    CHECK_FALSE(config.add_ws_terminate(
+        "/c", 0, id.value(), route.ws_frame_handler, 4, 1000, {nullptr, 1}));
+    CHECK_EQ(config.route_count, 0u);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_terminate_text_literal_conditions) {
     const char* conditions[] = {
         "frame.text == \"ping\"",

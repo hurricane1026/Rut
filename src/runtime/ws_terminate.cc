@@ -74,6 +74,11 @@ bool emit_frame(u8* out,
 }
 }  // namespace
 
+bool ws_valid_text_payload(Str text) {
+    return (text.ptr || text.len == 0) &&
+           utf8_valid(reinterpret_cast<const u8*>(text.ptr), text.len);
+}
+
 WsInspectStatus ws_inspect(WsInspector& st,
                            const u8* in,
                            u32 in_len,
@@ -135,10 +140,12 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // already-produced frames first when the next output might not fit; leave this
         // frame and the assembler state untouched for the next call.
         if (*produced != 0) {
-            const u64 needed =
-                ws_opcode_is_control(h.opcode)
-                    ? frame_total
-                    : (h.fin ? st.message_len + h.payload_len + kWsMaxHeaderSize : 0);
+            const u64 original_size = st.message_len + h.payload_len;
+            const u64 data_size =
+                original_size > st.forward_text.len ? original_size : st.forward_text.len;
+            const u64 needed = ws_opcode_is_control(h.opcode)
+                                   ? frame_total
+                                   : (h.fin ? data_size + kWsMaxHeaderSize : 0);
             if (needed > out_cap - *produced) break;
         }
         const u8* payload = p + header_len;
@@ -220,6 +227,20 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     out, out_cap, produced, msg_op, msg_buf, total, st.masked, st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
+        } else if (action == WsFrameAction::ForwardText) {
+            // Input has already been reassembled and validated. Output owns a
+            // separate slice, so replacement may grow without overwriting input.
+            if ((st.max_message_size != 0 && st.forward_text.len > st.max_message_size) ||
+                !ws_valid_text_payload(st.forward_text) ||
+                !emit_frame(out,
+                            out_cap,
+                            produced,
+                            WsOpcode::Text,
+                            reinterpret_cast<const u8*>(st.forward_text.ptr),
+                            st.forward_text.len,
+                            st.masked,
+                            st.mask_rng))
+                return WsInspectStatus::Error;
         } else if (action == WsFrameAction::Close) {
             // Include the configured code when it fits. Standalone callers may provide a
             // smaller output buffer than the tunnel's dedicated slice, so retain the
@@ -235,7 +256,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             st.message_len = 0;
             return WsInspectStatus::Close;
         }
-        // Drop: emit nothing. Forward/Drop both reset for the next message.
+        // Drop: emit nothing. All continuing verdicts reset for the next message.
         st.message_len = 0;
     }
 

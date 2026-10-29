@@ -2585,9 +2585,27 @@ without scanning their payloads. Regex `matches` tests the whole message, so the
 explicit `.*` enables substring filtering here. Control frames are relayed without
 invoking the handler.
 
+Fixed text replacement is implemented as `frame.forward("replacement")` in the
+handler's final verdict. It replaces any accepted Text or Binary message with a
+Text message, including an empty string; guard verdicts still forward the original,
+drop, or close before replacement is selected. Control frames retain their existing
+relay behavior. Use direction/opcode guards to choose which messages are rewritten.
+The replacement must be a string literal, uses ordinary string escape decoding,
+and must fit both `maxMessageSize` and the single-slice terminate cap. Dynamic
+expressions, interpolation, binary replacement, and injection remain unsupported.
+
+The runtime reassembles and validates the original message before invoking the
+handler, writes replacement frames to the existing separate output slice, and
+pauses input while output drains. Both directions apply their normal WebSocket
+masking roles. Fixed nonempty rewrites use the existing bounded one-shot upstream
+receive on io_uring, so multiple CQEs cannot overflow receive storage before the
+inspection callback drains it. Literal bytes are copied into the loaded program's retained arena;
+native artifacts relocate that view, so neither mode retains temporary HIR views.
+The native artifact format version is 7 following the route layout change.
+
 The examples in this section include planned syntax and actions. The current
 terminate implementation supports bounded reassembled text/binary messages,
-forward/drop/close verdicts, and relays control frames; modification, injection,
+forward/drop/close verdicts, fixed literal text replacement, and relays control frames; dynamic modification, injection,
 extension negotiation, and the options shown below are not all implemented.
 
 Transparent WebSocket proxy with optional per-frame inspection and modification.

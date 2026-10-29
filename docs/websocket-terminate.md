@@ -234,7 +234,18 @@ separate per-direction output buffer that modify/fragmentation also want (§8).
 
 ---
 
-## 6. Frame modify (Phase 4b — designed, gated)
+## 6. Frame modify (fixed text implemented; dynamic expressions deferred)
+
+Current implementation: the final `frame.forward("literal")` verdict replaces a
+reassembled data message with a Text message. Literal escape decoding is shared
+with ordinary expressions; empty strings and embedded NUL are supported. The
+literal must fit `maxMessageSize` and the terminate single-slice cap. Earlier
+guard verdicts retain their original behavior, and control frames bypass rewriting.
+The output slices now support payload growth and backpressure in both directions.
+Replacement bytes are retained by the loaded program and relocated in native
+artifacts. Dynamic payload expressions, interpolation, binary rewrite, and
+injection remain deferred. The rest of this section records the original design.
+
 
 Kong's `set_frame_data` (rewrite the in-flight frame before forwarding) is the natural next
 capability and Rut's mutation idiom already exists for requests (`req.bodyRaw = newBody`). The
