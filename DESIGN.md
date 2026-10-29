@@ -2552,6 +2552,11 @@ post /api/orders {
 
 #### 3.4.8 WebSocket Proxying
 
+Current terminate handlers accept boolean guards on `frame.fromClient`,
+`frame.isText`, and `frame.isBinary`, including `!` negation. For example,
+`guard !frame.fromClient else { frame.forward() }` applies subsequent guards only
+to upstream messages. Control frames are relayed without invoking the handler.
+
 The examples in this section include planned syntax and actions. The current
 terminate implementation supports bounded reassembled text/binary messages,
 forward/drop/close verdicts, and relays control frames; modification, injection,

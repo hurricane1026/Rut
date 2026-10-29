@@ -7084,7 +7084,7 @@ static Str ws_frame_text_match_pattern(const AstExpr& cond) {
 }
 
 // Match a guard condition for the frame handler. `negate` is a leading `not`/`!`, accepted
-// ONLY on a `frame.text.matches(re)` condition (the blocklist form). Otherwise: direction is a
+// on boolean frame properties or `frame.text.matches(re)` (the blocklist form). Direction is a
 // bare `frame.fromClient` (true on the client→upstream leg); opcode discrimination is a bare
 // `frame.isText` / `frame.isBinary` (== the WsOpcode value); content is
 // `frame.text.matches(re"…")` (a regex over the payload); else a `frame.len <cmp> N`
@@ -7111,13 +7111,11 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
         g.verdict = verdict;
         return g;
     }
-    // `not` only negates a regex content guard; on any other condition it's unsupported.
-    if (negate) return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
     if (ws_is_frame_field(cond, {"fromClient", 10})) {
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::FromClient;
         g.cmp = WsLenGuard::Cmp::Eq;
-        g.bound = 1u;  // the bool param is 1 on the client→upstream leg, 0 otherwise
+        g.bound = negate ? 0u : 1u;  // true on the selected tunnel leg
         g.verdict = verdict;
         return g;
     }
@@ -7126,10 +7124,12 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::Opcode;
         g.cmp = WsLenGuard::Cmp::Eq;
-        g.bound = is_text ? 0x1u : 0x2u;  // WsOpcode: Text=0x1, Binary=0x2
+        // Handlers receive only Text/Binary, so negation selects the other opcode.
+        g.bound = (is_text != negate) ? 0x1u : 0x2u;
         g.verdict = verdict;
         return g;
     }
+    if (negate) return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
     return analyze_frame_len_cond(cond, verdict);
 }
 #endif
