@@ -1075,38 +1075,33 @@ enum class WsVerdict : u8 {
     Close,
 };
 
-// HIR of a `websocket(<upstream>) { <frame-handler> }` terminate route. A frame
-// handler is a pure verdict function `(opcode, payload, len) -> WsVerdict`, not
-// an HTTP terminator, so it lives beside HirRoute.control rather than in it.
-// Slice B: forward-only, so just the default verdict + the resolved upstream.
-// One guard in a terminate handler — a condition on a frame accessor that, when FALSE for a
-// message, yields `verdict` (the else branch). Two accessors so far:
-//   Len        — `guard frame.len <cmp> N`            : the reassembled message length (len param)
-//   Opcode     — `guard frame.isText`/`isBinary`      : the message opcode (== Text / == Binary)
-//   FromClient — `guard frame.fromClient`             : the direction (== 1 on the client leg)
-//   TextMatch  — `guard [not] frame.text.matches(re)` : a regex scan over the message payload
+// Frame-handler condition nodes. Leaf nodes inspect message length, opcode,
+// direction or payload regex; And/Or nodes combine earlier child nodes. Only roots
+// are source guards and yield their else verdict when false.
 struct WsLenGuard {
-    enum class Accessor : u8 { Len, Opcode, FromClient, TextMatch };
-    // Rut's comparison operators are only `<` `>` `==` (no `<=`/`>=`/`!=`), so these three
-    // cover every guard condition analyze can produce. Opcode guards always use Eq.
+    enum class Accessor : u8 { Len, Opcode, FromClient, TextMatch, And, Or };
+    // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
     Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
     u32 bound = 0;  // Len: the byte literal frame.len is compared to. Opcode: the WsOpcode value.
-    // TextMatch only: the regex pattern (points into source/intern memory; valid through
-    // codegen) and whether a leading `not` inverts the match.
+    // TextMatch only: source/intern memory, valid through codegen.
     Str pattern{};
-    bool negate = false;
+    bool negate = false;  // invert this node's condition, including an entire subtree
+    // Compound conditions reference earlier nodes in the handler's postorder array.
+    u32 lhs = 0;
+    u32 rhs = 0;
+    bool is_operand = false;              // only roots execute as source-level guards
     WsVerdict verdict = WsVerdict::Drop;  // yielded when the guard fails
 };
 
 struct HirWsHandler {
     WsVerdict default_verdict = WsVerdict::Forward;
-    // `guard frame.len <cmp> N else { <verdict> }` checks, in source order, evaluated before the
-    // default verdict; the first failing guard's verdict wins. (frame.len maps to the message
-    // length the engine passes; richer accessors — text/payload/opcode — are a follow-up.)
+    // Postorder condition forest. Guard roots execute in source order before the
+    // default verdict; the first failing guard's else verdict wins.
     static constexpr u32 kMaxLenGuards = 4;
-    FixedVec<WsLenGuard, kMaxLenGuards> len_guards;
+    static constexpr u32 kMaxConditionNodes = 32;
+    FixedVec<WsLenGuard, kMaxConditionNodes> len_guards;
     // `frame.forward(payload)` modify form: forward a rewritten message instead of the
     // original. The payload expression (Str-typed) is stored in HirRoute.exprs;
     // forward_payload_expr is its index there (0xffffffffu when has_forward_payload is false).

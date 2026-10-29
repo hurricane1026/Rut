@@ -4555,6 +4555,96 @@ TEST(serve_loader, websocket_terminate_negated_boolean_guards) {
     }
 }
 
+TEST(serve_loader, websocket_terminate_compound_guard_truth_tables) {
+    const char* conditions[] = {
+        "frame.fromClient || frame.isText && frame.len < 4",
+        "!(frame.fromClient || frame.isBinary) && frame.len >= 3",
+        "!frame.fromClient && frame.isText",
+        "!(frame.len < 3)",
+        "frame.len != 3",
+        "3 <= frame.len && frame.len <= 4",
+    };
+    const u64 lengths[] = {0, 2, 3, 4, 5, 0xffffffffULL, 0x100000000ULL};
+    for (u32 c = 0; c < 6; c++) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\n"
+            "route GET \"/ws\" { return websocket(backend) { frame in\n guard ";
+        source += conditions[c];
+        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        const auto path =
+            write_file("/tmp/rut_serve_loader_ws_compound", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        REQUIRE_EQ(program.config.route_count, 1u);
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler != nullptr);
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                for (u64 len : lengths) {
+                    const bool text = op == WsOpcode::Text;
+                    const bool expected[] = {client || (text && len < 4),
+                                             !client && text && len >= 3,
+                                             !client && text,
+                                             len >= 3,
+                                             len != 3,
+                                             3 <= len && len <= 4};
+                    CHECK(handler(nullptr, op, nullptr, len, client) ==
+                          (expected[c] ? WsFrameAction::Forward : WsFrameAction::Drop));
+                }
+            }
+        }
+        program.destroy();
+    }
+}
+
+TEST(serve_loader, websocket_terminate_compound_regex_short_circuits) {
+    const auto path = write_file("/tmp/rut_serve_loader_ws_short_circuit", "app.rut", R"(
+upstream backend at "127.0.0.1:9999"
+route GET "/or" { return websocket(backend) { frame in
+    guard !frame.fromClient || !frame.isText || !frame.text.matches(re".*spam.*") else { frame.drop() }
+    guard frame.len <= 16 else { frame.close() }
+    frame.forward()
+} }
+route GET "/and" { return websocket(backend) { frame in
+    guard frame.fromClient && frame.isText && frame.text.matches(re".*spam.*") else { frame.forward() }
+    frame.drop()
+} }
+)");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 2u);
+    const auto or_handler = program.config.routes[0].ws_frame_handler;
+    const auto and_handler = program.config.routes[1].ws_frame_handler;
+    REQUIRE(or_handler != nullptr);
+    REQUIRE(and_handler != nullptr);
+    // An unreadable payload detects an accidental RHS regex scan on bypassed branches.
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void* unreadable = mmap(nullptr, page_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(unreadable != MAP_FAILED);
+    for (auto handler : {or_handler, and_handler}) {
+        CHECK(handler(nullptr, WsOpcode::Text, static_cast<const u8*>(unreadable), 4, false) ==
+              WsFrameAction::Forward);
+        CHECK(handler(nullptr, WsOpcode::Binary, static_cast<const u8*>(unreadable), 4, true) ==
+              WsFrameAction::Forward);
+        const char* clean = "hello";
+        const char* spam = "spam";
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(clean), 5, true) ==
+              WsFrameAction::Forward);
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(spam), 4, true) ==
+              WsFrameAction::Drop);
+    }
+    // Source guard order: blocklisted text drops before the length guard can close.
+    const char* long_spam = "spam spam spam spam";
+    CHECK(or_handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(long_spam), 19, true) ==
+          WsFrameAction::Drop);
+    CHECK(or_handler(nullptr, WsOpcode::Text, static_cast<const u8*>(unreadable), 19, false) ==
+          WsFrameAction::Close);
+    CHECK_EQ(munmap(unreadable, page_size), 0);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_terminate_close_code_reaches_route) {
     // close(code) end-to-end: `frame.close(1008)` must publish the route with ws_close_code
     // == 1008 (the runtime puts that on the wire), and the JIT'd handler still returns Close.

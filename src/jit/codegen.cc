@@ -2753,7 +2753,26 @@ bool emit_ws_handler(LLVMModuleRef mod,
                      const WsLenGuardSpec* guards,
                      u32 guard_count,
                      u32 id) {
-    if (!mod || !ctx) return false;
+    if (!mod || !ctx || guard_count > WsLenGuardSpec::kMaxConditions ||
+        (guard_count != 0 && !guards))
+        return false;
+    // A bounded forest, in postorder: every operand has exactly one parent. Validate
+    // before recursive emission so malformed specs cannot create cycles or code expansion.
+    u8 parents[WsLenGuardSpec::kMaxConditions]{};
+    u32 roots = 0;
+    for (u32 i = 0; i < guard_count; i++) {
+        if (guards[i].accessor > 5 || guards[i].cmp > 2 || guards[i].verdict > 2) return false;
+        if (guards[i].accessor == 4 || guards[i].accessor == 5) {
+            const u32 children[2] = {guards[i].lhs, guards[i].rhs};
+            for (u32 child : children) {
+                if (child >= i || !guards[child].is_operand || ++parents[child] != 1) return false;
+            }
+        }
+        if (!guards[i].is_operand && ++roots > WsLenGuardSpec::kMaxGuards) return false;
+    }
+    for (u32 i = 0; i < guard_count; i++) {
+        if (guards[i].is_operand && parents[i] != 1) return false;
+    }
     LLVMTypeRef i8_ty = LLVMInt8TypeInContext(ctx);
     LLVMTypeRef i64_ty = LLVMInt64TypeInContext(ctx);
     LLVMTypeRef ptr_ty = LLVMPointerTypeInContext(ctx, 0);
@@ -2766,7 +2785,6 @@ bool emit_ws_handler(LLVMModuleRef mod,
     LLVMValueRef fn = LLVMAddFunction(mod, sym, fn_ty);
     if (!fn) return false;
     LLVMTypeRef i32_ty = LLVMInt32TypeInContext(ctx);
-    LLVMTypeRef i1_ty = LLVMInt1TypeInContext(ctx);
     LLVMValueRef len = LLVMGetParam(fn, 3);          // i64 message length == frame.len
     LLVMValueRef opcode = LLVMGetParam(fn, 1);       // i8 WsOpcode == frame opcode
     LLVMValueRef payload = LLVMGetParam(fn, 2);      // i8* reassembled message bytes
@@ -2783,9 +2801,25 @@ bool emit_ws_handler(LLVMModuleRef mod,
     LLVMTypeRef rx_fn_ty = LLVMFunctionType(i8_ty, rx_params, 3, 0);
     u32 regex_seq = 0;
 
-    // Each guard: if its condition holds, fall through to the next; otherwise return the guard's
-    // verdict. After all guards, return the default verdict.
-    for (u32 i = 0; i < guard_count; i++) {
+    // Emit branches rather than eager boolean operations: RHS regex scans must not run
+    // when the left operand already determines the result.
+    auto emit_condition =
+        [&](auto&& self, u32 i, LLVMBasicBlockRef yes, LLVMBasicBlockRef no) -> void {
+        if (guards[i].negate) {
+            LLVMBasicBlockRef tmp = yes;
+            yes = no;
+            no = tmp;
+        }
+        if (guards[i].accessor == 4 || guards[i].accessor == 5) {
+            LLVMBasicBlockRef rhs = LLVMAppendBasicBlockInContext(ctx, fn, "guard.rhs");
+            if (guards[i].accessor == 4)
+                self(self, guards[i].lhs, rhs, no);
+            else
+                self(self, guards[i].lhs, yes, rhs);
+            LLVMPositionBuilderAtEnd(builder, rhs);
+            self(self, guards[i].rhs, yes, no);
+            return;
+        }
         LLVMValueRef cond;
         if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
             // Emit the pattern + db globals JIT finalization compiles & back-patches. The `ws<id>`
@@ -2813,12 +2847,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
             LLVMValueRef r = LLVMBuildCall2(builder, rx_fn_ty, rx_fn, rx_args, 3, "rx");
             LLVMValueRef is_match =
                 LLVMBuildICmp(builder, LLVMIntNE, r, LLVMConstInt(i8_ty, 0, 0), "rx.m");
-            // guard semantics fire the verdict when cond is FALSE: `matches` continues on a match
-            // (drops a non-match → allowlist); `not matches` continues on a non-match (drops a
-            // match → blocklist).
-            cond = guards[i].negate
-                       ? LLVMBuildXor(builder, is_match, LLVMConstInt(i1_ty, 1, 0), "rx.neg")
-                       : is_match;
+            cond = is_match;
         } else {
             LLVMIntPredicate pred = LLVMIntEQ;
             switch (guards[i].cmp) {  // WsLenGuard::Cmp ordinals: 0=Lt, 1=Gt, 2=Eq
@@ -2844,9 +2873,14 @@ bool emit_ws_handler(LLVMModuleRef mod,
             cond = LLVMBuildICmp(
                 builder, pred, operand, LLVMConstInt(bound_ty, guards[i].bound, 0), "g");
         }
+        LLVMBuildCondBr(builder, cond, yes, no);
+    };
+    // Only roots are source guards. Preserve first-failing-guard verdict order.
+    for (u32 i = 0; i < guard_count; i++) {
+        if (guards[i].is_operand) continue;
         LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(ctx, fn, "cont");
         LLVMBasicBlockRef els = LLVMAppendBasicBlockInContext(ctx, fn, "else");
-        LLVMBuildCondBr(builder, cond, cont, els);  // cond true -> continue; false -> verdict
+        emit_condition(emit_condition, i, cont, els);
         LLVMPositionBuilderAtEnd(builder, els);
         LLVMBuildRet(builder, LLVMConstInt(i8_ty, guards[i].verdict, /*SignExtend=*/0));
         LLVMPositionBuilderAtEnd(builder, cont);

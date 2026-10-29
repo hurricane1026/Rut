@@ -20589,6 +20589,29 @@ TEST(jit_dispatch, null_handler_returns_error_outcome) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
+    WsLenGuardSpec nodes[3]{};
+    nodes[0].accessor = 2;
+    nodes[0].is_operand = true;
+    nodes[1].accessor = 1;
+    nodes[1].is_operand = true;
+    nodes[2].accessor = 4;
+    nodes[2].lhs = 0;
+    nodes[2].rhs = 1;
+    auto valid = codegen_ws_handler(0, nodes, 3, 0);
+    REQUIRE(valid.ok);
+    dispose_module(valid.mod, valid.ctx);
+    nodes[2].rhs = 2;  // self-reference
+    CHECK_FALSE(codegen_ws_handler(0, nodes, 3, 0).ok);
+    nodes[2].rhs = 0;  // shared child would expand code; also leaves an orphan
+    CHECK_FALSE(codegen_ws_handler(0, nodes, 3, 0).ok);
+    nodes[2].rhs = 1;
+    nodes[1].is_operand = false;  // child is another source guard
+    CHECK_FALSE(codegen_ws_handler(0, nodes, 3, 0).ok);
+    CHECK_FALSE(codegen_ws_handler(0, nullptr, 1, 0).ok);
+    CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
+}
+
 // Compile a `websocket(x){ frame in frame.<verdict>() }` program end-to-end through the
 // constant-verdict frame-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup -> CALL),
 // and return the verdict the compiled function actually produces. Returns 255 on any failure.

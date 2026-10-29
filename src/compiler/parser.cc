@@ -635,14 +635,11 @@ struct Parser {
     }
 
     // Parse a frame-handler guard: `guard <cond> else { <verdict> }`. The condition is an
-    // expression (analyze accepts only `frame.len <cmp> N` for now); the else body is a single
+    // ordinary boolean expression over frame properties; the else body is a single
     // bare frame verdict (frame.drop()/forward()/close()). Reuses AstStmtKind::Guard with
     // expr=cond and else_stmt=the verdict Expr — the WsTerminate analyze path interprets it.
     FrontendResult<AstStatement> parse_ws_frame_guard(const Token& guard_tok) {
-        // A leading `!` negates the condition (e.g. `guard !frame.text.matches(re"…")`).
-        // It's consumed here, scoped to the frame guard, and carried on cond_negated for
-        // the WsTerminate analyze path (which pattern-matches the bare condition shape).
-        const bool negated = take(TokenType::Bang) != nullptr;
+        // Ordinary expression precedence includes unary ! and short-circuit &&/||.
         auto cond = parse_expr();
         if (!cond) return core::make_unexpected(cond.error());
         auto kw_else = expect(TokenType::KwElse);
@@ -663,7 +660,6 @@ struct Parser {
         stmt.kind = AstStmtKind::Guard;
         stmt.expr = cond.value();
         stmt.else_stmt = vptr.value();
-        stmt.cond_negated = negated;
         stmt.span = Span{guard_tok.start, rbrace.value()->end, guard_tok.line, guard_tok.col};
         return stmt;
     }
