@@ -50,5 +50,24 @@ int main(void) {
                                           prefix,
                                           sizeof(prefix) - 1))
         return 5;
+    static const uint8_t id[] = "msg_p5jXN8AQM9LWM0D4loKWxJek";
+    static const uint8_t timestamp[] = "1700000000";
+    static const uint8_t body[] = "{\"test\": 2432232314}";
+    static const uint8_t webhook_signature[] = "v1,hw6D+jquXiPwVQiZTwb2ek9FSrOofldv7tv4JVMsFUY=";
+    static const uint8_t webhook_key[] = {0x31, 0xf2, 0x90, 0xf6, 0xbf, 0x06, 0x29, 0x8a,
+                                          0xab, 0x4f, 0x08, 0xd4, 0x3c, 0x3f, 0x08, 0x2c,
+                                          0xf6, 0x48, 0xa3, 0x62, 0xda, 0x2d, 0xa4, 0xb0};
+    const rut_crypto_span_v1 id_span = {id, sizeof(id) - 1};
+    const rut_crypto_span_v1 time_span = {timestamp, sizeof(timestamp) - 1};
+    const rut_crypto_span_v1 body_span = {body, sizeof(body) - 1};
+    const rut_crypto_span_v1 signature_span = {webhook_signature, sizeof(webhook_signature) - 1};
+    const rut_crypto_span_v1 key_span = {webhook_key, sizeof(webhook_key)};
+    if (!rut_crypto_standard_webhook_valid_v1(
+            &id_span, &time_span, &signature_span, &body_span, &key_span, 1700000000, 300) ||
+        rut_crypto_standard_webhook_valid_v1(
+            &id_span, &time_span, &signature_span, &body_span, &key_span, 1700000301, 300) ||
+        rut_crypto_standard_webhook_valid_v1(
+            0, &time_span, &signature_span, &body_span, &key_span, 1700000000, 300))
+        return 7;
     return 0;
 }

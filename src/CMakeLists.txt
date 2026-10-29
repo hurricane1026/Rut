@@ -107,6 +107,7 @@ endif()
 add_library(rut_crypto_digest STATIC
     runtime/crypto_hash.c
     runtime/crypto_util.c
+    runtime/crypto_webhook.c
 )
 target_include_directories(rut_crypto_digest PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(rut_crypto_digest PUBLIC crypto)
