@@ -4594,6 +4594,16 @@ struct Parser {
         if (!kw) return core::make_unexpected(kw.error());
         AstItem item{};
         item.kind = AstItemKind::Import;
+        if (cur().type == TokenType::Ident && cur().text.eq(lit_str("Crypto"))) {
+            const Token& module = toks->tokens[pos++];
+            item.import_decl.path = lit_str("@rut/Crypto.rut");
+            item.import_decl.is_system_crypto = true;
+            item.import_decl.has_namespace_alias = true;
+            item.import_decl.namespace_alias = lit_str("Crypto");
+            item.span = Span{kw.value()->start, module.end, kw.value()->line, kw.value()->col};
+            item.import_decl.span = item.span;
+            return item;
+        }
         if (take(TokenType::LBrace)) {
             item.import_decl.selective = true;
             while (true) {

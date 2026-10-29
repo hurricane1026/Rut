@@ -1639,6 +1639,70 @@ TEST(frontend, nested_import_source_budget_is_diagnosed_on_default_linux_stack) 
     std::filesystem::remove_all(dir);
 }
 
+static FrontendResult<HirModule*> analyze_source_with_budget(const char* source,
+                                                             SourceBudget& budget) {
+    auto tokens = lex(lit(source));
+    if (!tokens) return core::make_unexpected(tokens.error());
+    auto ast = parse_file(tokens.value());
+    if (!ast) return core::make_unexpected(ast.error());
+    std::unique_ptr<AstFile> owned_ast(ast.value());
+    return analyze_file(*owned_ast, {}, &budget);
+}
+
+static FrontendResult<HirModule*> analyze_source_with_path_and_budget(const char* source,
+                                                                      const std::string& path,
+                                                                      SourceBudget& budget) {
+    auto tokens = lex(lit(source));
+    if (!tokens) return core::make_unexpected(tokens.error());
+    auto ast = parse_file(tokens.value());
+    if (!ast) return core::make_unexpected(ast.error());
+    std::unique_ptr<AstFile> owned_ast(ast.value());
+    return analyze_file(*owned_ast, {path.c_str(), static_cast<u32>(path.size())}, &budget);
+}
+
+TEST(frontend, crypto_system_import_charges_source_budget_once) {
+    SourceBudget exhausted{};
+    exhausted.max_bytes = 0;
+    auto rejected = analyze_source_with_budget("import Crypto\n", exhausted);
+    REQUIRE_FALSE(rejected);
+    CHECK(exhausted.exceeded);
+    CHECK_EQ(exhausted.used_bytes, 0u);
+    CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(rejected.error().detail.eq(lit("source-bytes limit reached")));
+
+    SourceBudget single_budget{};
+    auto single = analyze_source_with_budget("import Crypto\n", single_budget);
+    REQUIRE(single);
+    CHECK(single_budget.used_bytes > 0u);
+    const u64 crypto_source_bytes = single_budget.used_bytes;
+    delete single.value();
+
+    SourceBudget duplicate_budget{};
+    auto duplicate = analyze_source_with_budget("import Crypto\nimport Crypto\n", duplicate_budget);
+    REQUIRE(duplicate);
+    CHECK_EQ(duplicate_budget.used_bytes, crypto_source_bytes);
+    delete duplicate.value();
+
+    const std::string dir = std::filesystem::temp_directory_path().string() +
+                            "/rut_frontend_crypto_budget_" +
+                            std::to_string(static_cast<unsigned long long>(::getpid()));
+    std::filesystem::create_directories(dir);
+    constexpr char kImportedSource[] = "import Crypto\n";
+    for (const char* name : {"a.rut", "b.rut"}) {
+        std::ofstream imported_file(dir + "/" + name, std::ios::binary);
+        imported_file << kImportedSource;
+    }
+    SourceBudget distinct_budget{};
+    distinct_budget.max_bytes = 2u * (sizeof(kImportedSource) - 1u) + crypto_source_bytes;
+    auto distinct = analyze_source_with_path_and_budget(
+        "import \"a.rut\"\nimport \"b.rut\"\n", dir + "/main.rut", distinct_budget);
+    REQUIRE_FALSE(distinct);
+    CHECK(distinct_budget.exceeded);
+    CHECK_EQ(distinct_budget.used_bytes, distinct_budget.max_bytes);
+    CHECK(distinct.error().detail.eq(lit("source-bytes limit reached")));
+    std::filesystem::remove_all(dir);
+}
+
 TEST(frontend, nested_import_depth_limit_is_diagnosed_not_crashed) {
     // One level deeper than the limit: m<limit> imports m<limit + 1>. That
     // import is refused before m<limit + 1> is read or analyzed, with a static

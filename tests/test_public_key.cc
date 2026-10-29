@@ -1,5 +1,6 @@
 #include "public_key_fixtures.h"
 #include "rsa_verify_fixtures.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/public_key.h"
 #include "test.h"
@@ -116,6 +117,78 @@ static Str jwk(char (&buffer)[2048],
         for (u32 i = 0; i < part.len; ++i) buffer[length++] = part.ptr[i];
     }
     return {buffer, length};
+}
+
+TEST(public_key, c_abi_imports_trusted_jwk_and_jwks) {
+    alignas(64) unsigned char storage[256];
+    REQUIRE(rut_crypto_rsa_key_size_v1() <= sizeof(storage));
+    REQUIRE(rut_crypto_rsa_key_align_v1() <= 64);
+    char buffer[2048];
+    auto* key = rut_crypto_rsa_key_init_v1(storage, sizeof(storage));
+    REQUIRE(key);
+    auto input =
+        jwk(buffer, lit_str(R"({"kty":"RSA","alg":"RS256","n":")"), lit_str(R"(","e":"AQAB"})"));
+    CHECK(!rut_crypto_rsa_key_load_jwk_v1(key, nullptr, 1));
+    REQUIRE(rut_crypto_rsa_key_load_jwk_v1(
+        key, reinterpret_cast<const uint8_t*>(input.ptr), input.len));
+    rut_crypto_rsa_key_destroy_v1(key);
+    key = rut_crypto_rsa_key_init_v1(storage, sizeof(storage));
+    REQUIRE(key);
+    input = jwk(buffer,
+                lit_str(R"({"keys":[{"kid":"fixed","kty":"RSA","alg":"RS256","n":")"),
+                lit_str(R"(","e":"AQAB"}]})"));
+    auto* bytes = reinterpret_cast<const uint8_t*>(input.ptr);
+    CHECK(!rut_crypto_rsa_key_load_jwks_v1(
+        key, bytes, input.len, reinterpret_cast<const uint8_t*>("other"), 5));
+    CHECK(!rut_crypto_rsa_key_load_jwks_v1(key, bytes, input.len, nullptr, 1));
+    REQUIRE(rut_crypto_rsa_key_load_jwks_v1(
+        key, bytes, input.len, reinterpret_cast<const uint8_t*>("fixed"), 5));
+    rut_crypto_rsa_key_destroy_v1(key);
+}
+
+TEST(public_key, c_abi_key_set_keeps_shard_verifier_alive) {
+    alignas(64) unsigned char key_storage[8192];
+    alignas(64) unsigned char verifier_storage[8192];
+    REQUIRE(rut_crypto_rsa_key_set_size_v1() <= sizeof(key_storage));
+    REQUIRE(rut_crypto_rsa_key_set_align_v1() <= 64);
+    REQUIRE(rut_crypto_rsa_verifier_set_size_v1() <= sizeof(verifier_storage));
+    REQUIRE(rut_crypto_rsa_verifier_set_align_v1() <= 64);
+    auto* keys = rut_crypto_rsa_key_set_init_v1(key_storage, sizeof(key_storage));
+    REQUIRE(keys);
+    char buffer[2048];
+    Str input = jwk(buffer,
+                    lit_str(R"({"keys":[{"kid":"fixed","kty":"RSA","alg":"RS256","n":")"),
+                    lit_str(R"(","e":"AQAB"}]})"));
+    const rut_crypto_span_v1 ids[] = {{reinterpret_cast<const uint8_t*>("fixed"), 5}};
+    CHECK(!rut_crypto_rsa_key_set_load_v1(
+        keys, reinterpret_cast<const uint8_t*>(input.ptr), input.len, ids, 17));
+    REQUIRE(rut_crypto_rsa_key_set_load_v1(
+        keys, reinterpret_cast<const uint8_t*>(input.ptr), input.len, ids, 1));
+    auto* set =
+        rut_crypto_rsa_verifier_set_init_v1(verifier_storage, sizeof(verifier_storage), keys);
+    REQUIRE(set);
+    rut_crypto_rsa_key_set_destroy_v1(keys);
+    for (char& c : buffer) c = 0;
+    CHECK(
+        !rut_crypto_rsa_verifier_set_select_v1(set, reinterpret_cast<const uint8_t*>("other"), 5));
+    const uint8_t* canonical_id = reinterpret_cast<const uint8_t*>("stale");
+    u32 canonical_len = 123;
+    CHECK(!rut_crypto_rsa_verifier_set_select_id_v1(
+        set, reinterpret_cast<const uint8_t*>("other"), 5, &canonical_id, &canonical_len));
+    CHECK(canonical_id == nullptr);
+    CHECK_EQ(canonical_len, 0u);
+    REQUIRE(rut_crypto_rsa_verifier_set_select_id_v1(
+        set, reinterpret_cast<const uint8_t*>("fixed"), 5, &canonical_id, &canonical_len));
+    CHECK((Str{reinterpret_cast<const char*>(canonical_id), canonical_len}.eq(lit_str("fixed"))));
+    auto* verifier =
+        rut_crypto_rsa_verifier_set_select_v1(set, reinterpret_cast<const uint8_t*>("fixed"), 5);
+    REQUIRE(verifier);
+    CHECK(rut_crypto_rsa_verify_sha256_v1(verifier,
+                                          reinterpret_cast<const uint8_t*>(kMessage),
+                                          sizeof(kMessage) - 1,
+                                          kSignature,
+                                          sizeof(kSignature)));
+    rut_crypto_rsa_verifier_set_destroy_v1(set);
 }
 
 TEST(public_key, public_jwk_owns_key_and_verifies_published_signature) {

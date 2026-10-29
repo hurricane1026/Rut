@@ -2,6 +2,7 @@
 
 #include "rut/jit/native_helper_symbols.h"
 #include "rut/jit/runtime_helpers.h"
+#include "rut/runtime/crypto_c.h"
 
 #include <llvm-c/Analysis.h>
 #include <llvm-c/BitReader.h>

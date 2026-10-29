@@ -10,13 +10,13 @@
 #include "rut/runtime/auth.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/uuid.h"
-#include "rut/runtime/webhook.h"
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/random.h>
@@ -24,8 +24,6 @@
 #include <unistd.h>
 #endif
 #include <hs.h>
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1006,6 +1004,39 @@ void rut_helper_cache_reset_local_state() {
     for (auto& shard : state->shards) shard.reset();
 }
 
+extern "C" u8 rut_helper_hash_available(void* conn, void* arena) {
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (storage == nullptr && conn != nullptr)
+        storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    return storage != nullptr && storage->backend.pool != nullptr;
+}
+
+extern "C" void rut_helper_hash_publish(void* conn,
+                                        void* arena,
+                                        const char* text,
+                                        u32 length,
+                                        u32 computed,
+                                        u8* has_value,
+                                        const char** out_ptr,
+                                        u32* out_len) {
+    *has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    if (!computed || !text || length == 0 || length > kMaxHashHexBytes) return;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (storage == nullptr && conn != nullptr)
+        storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    if (!storage || !storage->backend.pool || storage->space_used() > kHashRequestBudget - length ||
+        (storage->current == nullptr && !storage->init(storage->backend.pool)))
+        return;
+    auto* result = static_cast<char*>(storage->alloc(length));
+    if (!result) return;
+    __builtin_memcpy(result, text, length);
+    *out_ptr = result;
+    *out_len = length;
+    *has_value = 1;
+}
+
 extern "C" void rut_helper_hash(void* conn,
                                 void* arena,
                                 u32 operation,
@@ -1028,12 +1059,15 @@ extern "C" void rut_helper_hash(void* conn,
     if (storage == nullptr || storage->backend.pool == nullptr) return;
     char text[kMaxHashHexBytes];
     u32 length = 0;
-    if (!hash_hex(static_cast<HashAlgorithm>(kAlgorithm),
-                  kKeyed ? Str{b, b_len} : Str{a, a_len},
-                  kKeyed ? Str{a, a_len} : Str{},
-                  kKeyed,
-                  text,
-                  length))
+    if (!rut_crypto_digest_hex_v1(kAlgorithm,
+                                  reinterpret_cast<const u8*>(kKeyed ? b : a),
+                                  kKeyed ? b_len : a_len,
+                                  reinterpret_cast<const u8*>(kKeyed ? a : nullptr),
+                                  kKeyed ? a_len : 0,
+                                  kKeyed ? 1u : 0u,
+                                  reinterpret_cast<u8*>(text),
+                                  sizeof(text),
+                                  &length))
         return;
     if (storage->space_used() <= kHashRequestBudget - length &&
         (storage->current != nullptr || storage->init(storage->backend.pool))) {
@@ -1045,7 +1079,7 @@ extern "C" void rut_helper_hash(void* conn,
             *has_value = 1;
         }
     }
-    OPENSSL_cleanse(text, sizeof(text));
+    rut_crypto_clear_v1(text, sizeof(text));
 }
 
 extern "C" void rut_helper_uuid(
@@ -1121,16 +1155,16 @@ rut::u8 rut_helper_standard_webhook_valid(const char* id,
                                           rut::u32 body_len,
                                           const char* raw_key,
                                           rut::u32 raw_key_len) {
-    timespec now{};
-    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
-        now.tv_nsec >= 1000000000)
-        return 0;
-    return standard_webhook_valid({id, id_len},
-                                  {timestamp, timestamp_len},
-                                  {signature, signature_len},
-                                  {body, body_len},
-                                  {raw_key, raw_key_len},
-                                  static_cast<i64>(now.tv_sec));
+    return rut_crypto_standard_webhook_now_v1(reinterpret_cast<const u8*>(id),
+                                              id_len,
+                                              reinterpret_cast<const u8*>(timestamp),
+                                              timestamp_len,
+                                              reinterpret_cast<const u8*>(signature),
+                                              signature_len,
+                                              reinterpret_cast<const u8*>(body),
+                                              body_len,
+                                              reinterpret_cast<const u8*>(raw_key),
+                                              raw_key_len);
 }
 
 u8 rut_helper_hmac_sha256_matches(const char* message,
@@ -1153,10 +1187,9 @@ u8 rut_helper_basic_matches(const char* authorization,
 }
 
 u8 rut_helper_str_constant_time_equal(const char* a, u32 a_len, const char* b, u32 b_len) {
-    if (a_len != b_len || a_len > kMaxConstantTimeEqualBytes) return 0;
-    if (a_len == 0) return 1;
-    if (a == nullptr || b == nullptr) return 0;
-    return CRYPTO_memcmp(a, b, a_len) == 0;
+    static_assert(kMaxConstantTimeEqualBytes == 16u * 1024u);
+    return rut_crypto_equal_bounded_v1(
+        reinterpret_cast<const u8*>(a), a_len, reinterpret_cast<const u8*>(b), b_len);
 }
 
 u8 rut_helper_str_eq(const char* a, u32 a_len, const char* b, u32 b_len) {
@@ -1864,25 +1897,27 @@ bool jwt_decode_claims(Str token,
                                                                       : 64u;
     if (secret.len < min_secret_len) return false;
 
-    char signature[EVP_MAX_MD_SIZE];
+    char signature[kMaxHashDigestBytes];
     u32 signature_len = 0;
     if (!b64url_decode(
             {second + 1, signature_b64_len}, signature, sizeof(signature), signature_len))
         return false;
 
-    unsigned char expected[EVP_MAX_MD_SIZE];
+    unsigned char expected[kMaxHashDigestBytes];
     u32 expected_len = 0;
     if (secret.len > 0x7fffffffu || token.len > 0x7fffffffu) return false;
     const u32 signing_len = static_cast<u32>(second - token.ptr);
-    if (!hash_digest(digest_kind,
-                     {token.ptr, signing_len},
-                     secret,
-                     true,
-                     expected,
-                     sizeof(expected),
-                     expected_len))
+    if (!rut_crypto_hmac_long_key_v1(static_cast<u32>(digest_kind),
+                                     reinterpret_cast<const u8*>(token.ptr),
+                                     signing_len,
+                                     reinterpret_cast<const u8*>(secret.ptr),
+                                     secret.len,
+                                     expected,
+                                     sizeof(expected),
+                                     &expected_len))
         return false;
-    if (signature_len != expected_len || CRYPTO_memcmp(signature, expected, expected_len) != 0)
+    if (signature_len != expected_len ||
+        !rut_crypto_equal_v1(reinterpret_cast<const u8*>(signature), expected, expected_len))
         return false;
 
     if (!b64url_decode({first + 1, payload_b64_len}, payload_out, json::kMaxBytes, payload_len))

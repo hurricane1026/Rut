@@ -471,6 +471,7 @@ struct AstImportDecl {
     };
     Span span{};
     Str path{};
+    bool is_system_crypto = false;
     bool selective = false;
     bool has_namespace_alias = false;
     Str namespace_alias{};

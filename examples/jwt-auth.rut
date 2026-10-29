@@ -1,10 +1,12 @@
 // JWT authentication with the runtime signature primitive and Rut-owned policy.
 //
-// jwtDecode verifies HS256/384/512 and returns the claims object as Json?.
+// Crypto.jwtAny verifies HS256/384/512 and returns the claims object as Json?.
 // Role checks stay in Rut so deployments can choose their own policy. Expiry
 // requires an epoch clock, while time.nowMicros() is monotonic. This slice takes the raw token from X-JWT; Bearer-prefix parsing
 // needs the string prefix/slice builtins, which are still roadmap. The HMAC
 // secret is resolved from the environment when the program is compiled/loaded.
+
+import Crypto
 
 listen :8080
 upstream api at "127.0.0.1:9000"
@@ -16,7 +18,7 @@ struct Claims {
 
 route GET "/admin" {
     let token = req.header("X-JWT").or("")
-    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
+    guard let document = Crypto.jwtAny(token, env("JWT_SECRET")) else {
         return 401
     }
     guard let claims = json.decode(Claims, document) else { return 401 }

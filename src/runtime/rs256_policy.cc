@@ -2,6 +2,7 @@
 
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/jwt_rs256.h"
 #include <new>
@@ -12,7 +13,16 @@ bool Rs256Policy::load_jwks(
     if (keys_.valid() || !issuer.ptr || issuer.len == 0 || issuer.len > kMaxName || !audience.ptr ||
         audience.len == 0 || audience.len > kMaxName)
         return false;
-    if (!keys_.load(jwks, approved_ids, count)) return false;
+    if (!approved_ids || count == 0 || count > Rs256KeySet::kMaxKeys) return false;
+    rut_crypto_span_v1 ids[Rs256KeySet::kMaxKeys]{};
+    for (u32 i = 0; i < count; ++i)
+        ids[i] = {reinterpret_cast<const uint8_t*>(approved_ids[i].ptr), approved_ids[i].len};
+    if (!rut_crypto_rsa_key_set_load_v1(reinterpret_cast<rut_crypto_rsa_key_set_v1*>(&keys_),
+                                        reinterpret_cast<const uint8_t*>(jwks.ptr),
+                                        jwks.len,
+                                        ids,
+                                        count))
+        return false;
     char issuer_copy[kMaxName];
     char audience_copy[kMaxName];
     __builtin_memcpy(issuer_copy, issuer.ptr, issuer.len);

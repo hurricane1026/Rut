@@ -1,6 +1,7 @@
 #include "rut/runtime/jwt_rs256.h"
 
 #include "rut/common/types.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/public_key.h"
@@ -108,17 +109,28 @@ bool decode_with_key(RsaSha256Verifier* verifier,
     Str candidate_id{};
     if (keys) {
         if (!has_kid) return false;
-        const auto kSelected = keys->select({kid, kid_length});
-        if (!kSelected.verifier) return false;
-        verifier = kSelected.verifier;
-        candidate_id = kSelected.kid;
+        const uint8_t* canonical_id = nullptr;
+        u32 canonical_len = 0;
+        auto* selected = rut_crypto_rsa_verifier_set_select_id_v1(
+            reinterpret_cast<rut_crypto_rsa_verifier_set_v1*>(keys),
+            reinterpret_cast<const uint8_t*>(kid),
+            kid_length,
+            &canonical_id,
+            &canonical_len);
+        if (!selected) return false;
+        verifier = reinterpret_cast<RsaSha256Verifier*>(selected);
+        candidate_id = {reinterpret_cast<const char*>(canonical_id), canonical_len};
     }
     char signature[512];
     if (!decode({token.ptr + second + 1, token.len - second - 1},
                 signature,
                 sizeof(signature),
                 length) ||
-        !verifier->verify({token.ptr, second}, {signature, length}))
+        !rut_crypto_rsa_verify_sha256_v1(reinterpret_cast<rut_crypto_rsa_verifier_v1*>(verifier),
+                                         reinterpret_cast<const uint8_t*>(token.ptr),
+                                         second,
+                                         reinterpret_cast<const uint8_t*>(signature),
+                                         length))
         return false;
     const u32 limit = capacity < json::kMaxBytes ? capacity : json::kMaxBytes;
     if (!decode({token.ptr + first + 1, second - first - 1}, payload_out, limit, length) ||

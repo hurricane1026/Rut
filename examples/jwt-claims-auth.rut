@@ -1,5 +1,6 @@
 // Set JWT_SECRET (at least 32 bytes), JWT_ISSUER and JWT_AUDIENCE at load time.
 // Serve behind TLS. Signature verification and claims policy are separate steps.
+import Crypto
 import "middleware/auth.rut"
 listen :8080
 
@@ -21,7 +22,7 @@ route GET "/orders" {
 // Optional static revocation: these IDs belong to JWT_ISSUER only. Replace the
 // snapshot and reload configuration to add or remove revoked tokens.
 route GET "/revocation-example" {
-    guard let document = jwtDecode(bearerToken(req.authorization.or("")).or(""), env("JWT_SECRET"), "HS256") else { return 401 }
+    guard let document = Crypto.jwtHs256(bearerToken(req.authorization.or("")).or(""), env("JWT_SECRET")) else { return 401 }
     guard jwtClaimsValid(document, env("JWT_ISSUER"), env("JWT_AUDIENCE")) else { return 401 }
     let checked = auth.requireUnrevokedJwt(document, "revoked-token-1", "revoked-token-2")
     guard jwtHasScope(checked, "orders:read") else { return 403 }

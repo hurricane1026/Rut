@@ -2,6 +2,7 @@
 
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 #include <atomic>
 #include <cstddef>
@@ -558,13 +559,13 @@ struct Ctx {
         return fn_req_content_length;
     }
 
-    // u8 rut_helper_str_constant_time_equal(ptr, i32, ptr, i32)
+    // u32 rut_crypto_equal_bounded_v1(ptr, i32, ptr, i32)
     LLVMValueRef get_str_constant_time_equal() {
         if (!fn_str_constant_time_equal) {
             LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
-            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 4, 0);
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, params, 4, 0);
             fn_str_constant_time_equal =
-                LLVMAddFunction(llvm_mod, "rut_helper_str_constant_time_equal", ft);
+                LLVMAddFunction(llvm_mod, "rut_crypto_equal_bounded_v1", ft);
         }
         return fn_str_constant_time_equal;
     }
@@ -598,9 +599,9 @@ struct Ctx {
     LLVMValueRef get_hmac_sha256_matches() {
         if (!fn_hmac_sha256_matches) {
             LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
-            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 8, 0);
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, params, 8, 0);
             fn_hmac_sha256_matches =
-                LLVMAddFunction(llvm_mod, "rut_helper_hmac_sha256_matches", ft);
+                LLVMAddFunction(llvm_mod, "rut_crypto_hmac_sha256_matches_v1", ft);
         }
         return fn_hmac_sha256_matches;
     }
@@ -608,9 +609,9 @@ struct Ctx {
         if (!fn_standard_webhook_valid) {
             LLVMTypeRef params[] = {
                 ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
-            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 10, 0);
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, params, 10, 0);
             fn_standard_webhook_valid =
-                LLVMAddFunction(llvm_mod, "rut_helper_standard_webhook_valid", ft);
+                LLVMAddFunction(llvm_mod, "rut_crypto_standard_webhook_now_v1", ft);
         }
         return fn_standard_webhook_valid;
     }
@@ -1473,7 +1474,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(
                 inst.result,
                 LLVMBuildICmp(
-                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "hmac.bool"));
+                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i32_ty, 0, 0), "hmac.bool"));
             break;
         }
         case rir::Opcode::StandardWebhookValid: {
@@ -1491,7 +1492,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(
                 inst.result,
                 LLVMBuildICmp(
-                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "hmac.bool"));
+                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i32_ty, 0, 0), "hmac.bool"));
             break;
         }
         // ── String operations ──
@@ -1511,9 +1512,10 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                                   : c.get_str_constant_time_equal();
             LLVMValueRef r =
                 LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 4, "cte");
-            // Convert u8 result to i1 for branch usage
+            const auto return_type =
+                inst.op == rir::Opcode::StrConstantTimeEqual ? c.i32_ty : c.i8_ty;
             LLVMValueRef b =
-                LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "cte.bool");
+                LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(return_type, 0, 0), "cte.bool");
             c.set_value(inst.result, b);
             break;
         }
@@ -1791,22 +1793,12 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::HashDigest: {
-            LLVMTypeRef params[] = {c.ptr_ty,
-                                    c.ptr_ty,
-                                    c.i32_ty,
-                                    c.ptr_ty,
-                                    c.i32_ty,
-                                    c.ptr_ty,
-                                    c.i32_ty,
-                                    c.ptr_ty,
-                                    c.ptr_ty,
-                                    c.ptr_ty};
-            LLVMTypeRef ft = LLVMFunctionType(c.void_ty, params, 10, 0);
-            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_hash");
-            if (!fn) fn = LLVMAddFunction(c.llvm_mod, "rut_helper_hash", ft);
             LLVMValueRef has = LLVMBuildAlloca(c.builder, c.i8_ty, "hash.has");
             LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "hash.ptr");
             LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "hash.len");
+            LLVMBuildStore(c.builder, LLVMConstInt(c.i8_ty, 0, 0), has);
+            LLVMBuildStore(c.builder, LLVMConstNull(c.ptr_ty), ptr);
+            LLVMBuildStore(c.builder, LLVMConstInt(c.i32_ty, 0, 0), len);
             LLVMValueRef input[4] = {LLVMConstNull(c.ptr_ty),
                                      LLVMConstInt(c.i32_ty, 0, 0),
                                      LLVMConstNull(c.ptr_ty),
@@ -1817,17 +1809,92 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 input[kOffset] = LLVMBuildExtractValue(c.builder, value, 0, "hash.input.ptr");
                 input[kOffset + 1] = LLVMBuildExtractValue(c.builder, value, 1, "hash.input.len");
             }
-            LLVMValueRef args[] = {c.param_conn,
-                                   c.param_arena,
-                                   LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0),
-                                   input[0],
-                                   input[1],
-                                   input[2],
-                                   input[3],
-                                   has,
-                                   ptr,
-                                   len};
-            LLVMBuildCall2(c.builder, ft, fn, args, 10, "");
+            LLVMTypeRef available_params[] = {c.ptr_ty, c.ptr_ty};
+            LLVMTypeRef available_type = LLVMFunctionType(c.i8_ty, available_params, 2, 0);
+            LLVMValueRef available_fn =
+                LLVMGetNamedFunction(c.llvm_mod, "rut_helper_hash_available");
+            if (!available_fn)
+                available_fn =
+                    LLVMAddFunction(c.llvm_mod, "rut_helper_hash_available", available_type);
+            LLVMValueRef available_args[] = {c.param_conn, c.param_arena};
+            LLVMValueRef available = LLVMBuildCall2(
+                c.builder, available_type, available_fn, available_args, 2, "hash.available");
+            LLVMValueRef llvm_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+            LLVMBasicBlockRef compute =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, llvm_fn, "hash.compute");
+            LLVMBasicBlockRef done =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, llvm_fn, "hash.done");
+            LLVMBuildCondBr(
+                c.builder,
+                LLVMBuildICmp(
+                    c.builder, LLVMIntNE, available, LLVMConstInt(c.i8_ty, 0, 0), "hash.ready"),
+                compute,
+                done);
+            // Place scratch in the entry block so a bounded loop cannot accumulate stack
+            // allocations.
+            LLVMBuilderRef entry_builder = LLVMCreateBuilderInContext(c.llvm_ctx);
+            LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(llvm_fn);
+            LLVMValueRef first = LLVMGetFirstInstruction(entry);
+            if (first)
+                LLVMPositionBuilderBefore(entry_builder, first);
+            else
+                LLVMPositionBuilderAtEnd(entry_builder, entry);
+            LLVMValueRef scratch = LLVMBuildAlloca(
+                entry_builder, LLVMArrayType(c.i8_ty, kMaxHashHexBytes), "hash.scratch");
+            LLVMValueRef digest_len = LLVMBuildAlloca(entry_builder, c.i32_ty, "hash.digest.len");
+            LLVMDisposeBuilder(entry_builder);
+            LLVMPositionBuilderAtEnd(c.builder, compute);
+            const u32 kOperation = static_cast<u32>(inst.imm.i32_val);
+            const bool kKeyed = (kOperation & kHashHmacFlag) != 0;
+            LLVMTypeRef digest_params[] = {c.i32_ty,
+                                           c.ptr_ty,
+                                           c.i32_ty,
+                                           c.ptr_ty,
+                                           c.i32_ty,
+                                           c.i32_ty,
+                                           c.ptr_ty,
+                                           c.i32_ty,
+                                           c.ptr_ty};
+            LLVMTypeRef digest_type = LLVMFunctionType(c.i32_ty, digest_params, 9, 0);
+            LLVMValueRef digest_fn = LLVMGetNamedFunction(c.llvm_mod, "rut_crypto_digest_hex_v1");
+            if (!digest_fn)
+                digest_fn = LLVMAddFunction(c.llvm_mod, "rut_crypto_digest_hex_v1", digest_type);
+            LLVMValueRef digest_args[] = {LLVMConstInt(c.i32_ty, kOperation & ~kHashHmacFlag, 0),
+                                          kKeyed ? input[2] : input[0],
+                                          kKeyed ? input[3] : input[1],
+                                          kKeyed ? input[0] : LLVMConstNull(c.ptr_ty),
+                                          kKeyed ? input[1] : LLVMConstInt(c.i32_ty, 0, 0),
+                                          LLVMConstInt(c.i32_ty, kKeyed ? 1 : 0, 0),
+                                          scratch,
+                                          LLVMConstInt(c.i32_ty, kMaxHashHexBytes, 0),
+                                          digest_len};
+            LLVMValueRef computed =
+                LLVMBuildCall2(c.builder, digest_type, digest_fn, digest_args, 9, "hash.computed");
+            LLVMTypeRef publish_params[] = {
+                c.ptr_ty, c.ptr_ty, c.ptr_ty, c.i32_ty, c.i32_ty, c.ptr_ty, c.ptr_ty, c.ptr_ty};
+            LLVMTypeRef publish_type = LLVMFunctionType(c.void_ty, publish_params, 8, 0);
+            LLVMValueRef publish_fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_hash_publish");
+            if (!publish_fn)
+                publish_fn = LLVMAddFunction(c.llvm_mod, "rut_helper_hash_publish", publish_type);
+            LLVMValueRef publish_args[] = {
+                c.param_conn,
+                c.param_arena,
+                scratch,
+                LLVMBuildLoad2(c.builder, c.i32_ty, digest_len, "hash.digest.length"),
+                computed,
+                has,
+                ptr,
+                len};
+            LLVMBuildCall2(c.builder, publish_type, publish_fn, publish_args, 8, "");
+            LLVMTypeRef clear_params[] = {c.ptr_ty, c.i32_ty};
+            LLVMTypeRef clear_type = LLVMFunctionType(c.void_ty, clear_params, 2, 0);
+            LLVMValueRef clear_fn = LLVMGetNamedFunction(c.llvm_mod, "rut_crypto_clear_v1");
+            if (!clear_fn)
+                clear_fn = LLVMAddFunction(c.llvm_mod, "rut_crypto_clear_v1", clear_type);
+            LLVMValueRef clear_args[] = {scratch, LLVMConstInt(c.i32_ty, kMaxHashHexBytes, 0)};
+            LLVMBuildCall2(c.builder, clear_type, clear_fn, clear_args, 2, "");
+            LLVMBuildBr(c.builder, done);
+            LLVMPositionBuilderAtEnd(c.builder, done);
             LLVMValueRef result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
             result =
                 LLVMBuildInsertValue(c.builder,

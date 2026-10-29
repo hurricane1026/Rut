@@ -3361,9 +3361,15 @@ import { cors, securityHeaders } from "stdlib/security.rut"
 
 #### 3.4.21 No FFI
 
-Rutlang has no `extern func` or FFI mechanism. The gateway only communicates via
+Rutlang has no general `extern func` or user-defined FFI mechanism. The gateway only communicates via
 HTTP. External systems (Redis, databases, LDAP, HSM) are accessed through HTTP
 calls to proxy services.
+
+The bounded `import Crypto` system module is provided by the compiler and binds
+to the statically linked C crypto ABI. Its Rut functions retain the same bounds,
+failure behavior and request-owned result lifetimes as the existing crypto
+operations. It cannot load arbitrary symbols or libraries, and imports no file
+at runtime. Existing global operations remain available for compatibility.
 
 Rationale: FFI breaks all compile-time guarantees — bounded execution, memory
 safety, share-nothing isolation. A single C++ function call could block, malloc,

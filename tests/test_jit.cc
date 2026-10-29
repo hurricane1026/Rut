@@ -17,6 +17,7 @@
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/rate_limit_key.h"
@@ -39,6 +40,32 @@
 
 using namespace rut;
 using namespace rut::rir;
+
+TEST(jit, crypto_c_abi_symbol_resolves_in_jit) {
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    auto* symbol = engine.lookup("rut_crypto_digest_v1");
+    REQUIRE(symbol != nullptr);
+    using DigestFn = decltype(&rut_crypto_digest_v1);
+    auto digest = reinterpret_cast<DigestFn>(symbol);
+    const u8 input[] = {'a', 'b', 'c'};
+    u8 output[32]{};
+    u32 length = 0;
+    CHECK_EQ(digest(RUT_CRYPTO_SHA256_V1,
+                    input,
+                    sizeof(input),
+                    nullptr,
+                    0,
+                    0,
+                    output,
+                    sizeof(output),
+                    &length),
+             1u);
+    CHECK_EQ(length, 32u);
+    CHECK_EQ(output[0], 0xbau);
+    CHECK_EQ(output[31], 0xadu);
+    engine.shutdown();
+}
 using namespace rut::jit;
 
 TEST(jit, native_helper_allowlist_matches_orc_symbol_bindings) {
@@ -23346,6 +23373,155 @@ TEST(jit, codegen_grows_block_map_beyond_stack_scratch) {
     CHECK(result.action == HandlerAction::ReturnStatus);
     CHECK(result.status_code == 204);
     engine.shutdown();
+}
+
+TEST(jit, crypto_system_import_checks_namespace_and_argument_types) {
+    const char* valid = R"rut(
+import Crypto
+func equal(_ a: str, _ b: str) -> bool => false
+route GET "/" {
+    guard Crypto.equal("same", "same") else { return 401 }
+    guard !equal("same", "same") else { return 402 }
+    guard let digest = digestSha256("abc") else { return 503 }
+    guard digest == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" else { return 500 }
+    return 200
+}
+
+)rut";
+    auto tokens = lex(lit(valid));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const auto result = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+    const char* invalid[] = {
+        "route GET \"/\" { guard Crypto.equal(\"a\", \"a\") else { return 401 } return 200 }",
+        "import Crypto\nroute GET \"/\" { guard Crypto.equal(\"a\", 1) else { return 401 } return "
+        "200 }",
+        "import Crypto\nroute GET \"/\" { guard Crypto.unknown(\"a\") else { return 401 } return "
+        "200 }",
+        "import Crypto\nfunc unknown(_ value: str) -> bool => true\n"
+        "route GET \"/\" { guard Crypto.unknown(\"a\") else { return 401 } return 200 }",
+    };
+    for (const char* source : invalid) {
+        auto parsed_tokens = lex(lit(source));
+        REQUIRE(parsed_tokens);
+        auto parsed = parse_file_heap(parsed_tokens.value());
+        REQUIRE(parsed);
+        CHECK(!analyze_file_heap(parsed.value()));
+    }
+}
+
+TEST(jit, crypto_system_import_works_at_file_import_depth_limit) {
+    char directory[] = "/tmp/rut_crypto_module_XXXXXX";
+    REQUIRE(mkdtemp(directory));
+    const std::string dir = directory;
+    {
+        std::ofstream file(dir + "/a.rut");
+        file << "import \"b.rut\"\nfunc outer() -> bool => b.inner()\n";
+    }
+    {
+        std::ofstream file(dir + "/b.rut");
+        file << "import Crypto\nfunc inner() -> bool => Crypto.equal(\"a\", \"a\")\n";
+    }
+    const auto source = R"rut(
+import "a.rut"
+route GET "/" { guard a.outer() else { return 401 } return 200 }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    const auto result = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    engine.shutdown();
+    rir.destroy();
+    std::filesystem::create_directories(dir + "/@rut");
+    {
+        std::ofstream file(dir + "/@rut/Crypto.rut");
+        file << "func equal(_ a: str, _ b: str) -> bool => true\n";
+    }
+    const auto collision = R"rut(
+import Crypto
+import "@rut/Crypto.rut"
+route GET "/" { return 200 }
+)rut";
+    auto collision_tokens = lex(lit(collision));
+    REQUIRE(collision_tokens);
+    auto collision_ast = parse_file_heap(collision_tokens.value());
+    REQUIRE(collision_ast);
+    CHECK(!analyze_file_heap_with_path(collision_ast.value(), dir + "/main.rut"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(jit, crypto_system_import_coexists_with_auth_module) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    const auto source = R"rut(
+import Crypto
+import "middleware/auth.rut"
+route GET "/" {
+    guard Crypto.equal("same", "same") else { return 500 }
+    let identity = auth.hmac("abc", "9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab", "key", "user", "key-id")
+    guard identity.consumerId == "user" else { return 500 }
+    return 200
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    const auto result = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    engine.shutdown();
+    rir.destroy();
 }
 
 TEST(jit, hmac_webhook_authentication_and_rotation) {

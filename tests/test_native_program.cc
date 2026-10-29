@@ -523,6 +523,72 @@ TEST(native_program, uuid_is_available_after_compiler_exit_with_request_arena) {
     pool.destroy();
 }
 
+TEST(native_program, hmac_uses_c_crypto_after_compiler_exit) {
+    Source source;
+    REQUIRE(
+        source.append("import Crypto\n"
+                      "route GET \"/\" { "
+                      "guard Crypto.hmacSha256Valid(\"abc\", \"key\", "
+                      "req.uniqueHeader(\"X-Signature\").or(\"\"), "
+                      "\"sha256=\") else { return 401 } return 200 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    CHECK_EQ(
+        invoke(route,
+               "GET / HTTP/1.1\r\nX-Signature: "
+               "sha256=9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab\r\n\r\n")
+            .status_code,
+        200u);
+    CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Signature: sha256=wrong\r\n\r\n").status_code,
+             401u);
+}
+
+TEST(native_program, digest_uses_c_crypto_after_compiler_exit) {
+    Source source;
+    REQUIRE(source.append(
+        "import Crypto\n"
+        "route GET \"/\" { guard let digest = Crypto.digestSha256(\"abc\") else { return 503 } "
+        "guard digest == \"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\" "
+        "else { return 500 } return 200 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p, 3));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\n\r\n").status_code, 503u);
+    SlicePool pool;
+    REQUIRE(pool.init(24));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    jit::HandlerCtx ctx{};
+    const char req[] = "GET / HTTP/1.1\r\n\r\n";
+    const auto result = jit::HandlerResult::unpack(
+        route.fn(nullptr, &ctx, reinterpret_cast<const u8*>(req), sizeof(req) - 1, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK(arena.space_used() >= 64u);
+    arena.destroy();
+    REQUIRE(arena.init(&pool));
+    char* preserved = nullptr;
+    for (u32 i = 0; i < 16; ++i) {
+        auto* bytes = static_cast<char*>(arena.alloc(16000));
+        REQUIRE(bytes);
+        if (i == 0) {
+            preserved = bytes;
+            preserved[0] = 'x';
+        }
+    }
+    REQUIRE(arena.alloc(6104));
+    const auto exhausted = jit::HandlerResult::unpack(
+        route.fn(nullptr, &ctx, reinterpret_cast<const u8*>(req), sizeof(req) - 1, &arena));
+    CHECK_EQ(exhausted.status_code, 503u);
+    CHECK_EQ(preserved[0], 'x');
+    arena.destroy();
+    pool.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
@@ -559,8 +625,9 @@ TEST(native_program, rs256_policy_survives_compiler_exit_source_removal_and_shar
     REQUIRE(fixture.init());
     char source_bytes[8192];
     json::Writer source_text{source_bytes, sizeof(source_bytes) - 1};
-    source_text.text(lit_str(R"rut(route GET "/" {
-    guard let claims = jwtVerifyRs256(bearerToken(req.authorization.or("")).or(""), )rut"));
+    source_text.text(lit_str(R"rut(import Crypto
+route GET "/" {
+    guard let claims = Crypto.jwtRs256(bearerToken(req.authorization.or("")).or(""), )rut"));
     REQUIRE(json::quote(fixture.policy, source_text));
     source_text.text(lit_str(R"rut() else { return 401 }
     guard jwtHasScope(claims, "read") else { return 403 }
