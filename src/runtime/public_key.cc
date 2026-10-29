@@ -1,5 +1,6 @@
 #include "rut/runtime/public_key.h"
 
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 
@@ -326,8 +327,15 @@ bool RsaSha256Verifier::verify(Str message, Str signature) {
     expected[padding_end] = 0;
     for (u32 i = 0; i < sizeof(kDigestInfo); ++i) expected[padding_end + 1 + i] = kDigestInfo[i];
     u32 digest_len = 0;
-    if (!hash_digest(
-            HashAlgorithm::Sha256, message, {}, false, expected + bytes_ - 32, 32, digest_len) ||
+    if (!rut_crypto_digest_v1(RUT_CRYPTO_SHA256_V1,
+                              reinterpret_cast<const u8*>(message.ptr),
+                              message.len,
+                              nullptr,
+                              0,
+                              0,
+                              expected + bytes_ - 32,
+                              32,
+                              &digest_len) ||
         digest_len != 32)
         return false;
     return CRYPTO_memcmp(actual, expected, bytes_) == 0;
