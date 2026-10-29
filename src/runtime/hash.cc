@@ -1,10 +1,18 @@
 #include "rut/runtime/hash.h"
 
+#include "rut/runtime/crypto_c.h"
+
 #include <openssl/crypto.h>
 #include <openssl/md5.h>
 #include <openssl/sha.h>
 
 namespace rut {
+static_assert(static_cast<u32>(HashAlgorithm::Md5) == RUT_CRYPTO_MD5_V1);
+static_assert(static_cast<u32>(HashAlgorithm::Sha1) == RUT_CRYPTO_SHA1_V1);
+static_assert(static_cast<u32>(HashAlgorithm::Sha224) == RUT_CRYPTO_SHA224_V1);
+static_assert(static_cast<u32>(HashAlgorithm::Sha256) == RUT_CRYPTO_SHA256_V1);
+static_assert(static_cast<u32>(HashAlgorithm::Sha384) == RUT_CRYPTO_SHA384_V1);
+static_assert(static_cast<u32>(HashAlgorithm::Sha512) == RUT_CRYPTO_SHA512_V1);
 namespace {
 
 union HashContext {
@@ -174,7 +182,16 @@ bool hash_hex(HashAlgorithm algorithm,
     if (data.len > kMaxHashInputBytes || (keyed && key.len > kMaxHashKeyBytes)) return false;
     u8 bytes[kMaxHashDigestBytes]{};
     u32 length = 0;
-    if (!hash_digest(algorithm, data, key, keyed, bytes, sizeof(bytes), length)) return false;
+    if (!rut_crypto_digest_v1(static_cast<u32>(algorithm),
+                              reinterpret_cast<const u8*>(data.ptr),
+                              data.len,
+                              keyed ? reinterpret_cast<const u8*>(key.ptr) : nullptr,
+                              keyed ? key.len : 0,
+                              keyed ? 1u : 0u,
+                              bytes,
+                              sizeof(bytes),
+                              &length))
+        return false;
     constexpr char kHex[] = "0123456789abcdef";
     for (u32 i = 0; i < length; ++i) {
         const u32 kOffset = 2 * i;
@@ -187,3 +204,29 @@ bool hash_hex(HashAlgorithm algorithm,
 }
 
 }  // namespace rut
+
+extern "C" uint32_t rut_crypto_digest_v1(uint32_t algorithm,
+                                         const uint8_t* data,
+                                         uint32_t data_len,
+                                         const uint8_t* key,
+                                         uint32_t key_len,
+                                         uint32_t keyed,
+                                         uint8_t* output,
+                                         uint32_t capacity,
+                                         uint32_t* output_len) {
+    if (!output_len) return 0;
+    *output_len = 0;
+    if (algorithm > RUT_CRYPTO_SHA512_V1 || keyed > 1 || data_len > rut::kMaxHashInputBytes ||
+        key_len > rut::kMaxHashKeyBytes || (!data && data_len) || (!key && key_len))
+        return 0;
+    rut::u32 length = 0;
+    const bool ok = rut::hash_digest(static_cast<rut::HashAlgorithm>(algorithm),
+                                     {reinterpret_cast<const char*>(data), data_len},
+                                     {reinterpret_cast<const char*>(key), key_len},
+                                     keyed != 0,
+                                     output,
+                                     capacity,
+                                     length);
+    *output_len = length;
+    return ok ? 1u : 0u;
+}

@@ -17,6 +17,7 @@
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/rate_limit_key.h"
@@ -39,6 +40,32 @@
 
 using namespace rut;
 using namespace rut::rir;
+
+TEST(jit, crypto_c_abi_symbol_resolves_in_jit) {
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    auto* symbol = engine.lookup("rut_crypto_digest_v1");
+    REQUIRE(symbol != nullptr);
+    using DigestFn = decltype(&rut_crypto_digest_v1);
+    auto digest = reinterpret_cast<DigestFn>(symbol);
+    const u8 input[] = {'a', 'b', 'c'};
+    u8 output[32]{};
+    u32 length = 0;
+    CHECK_EQ(digest(RUT_CRYPTO_SHA256_V1,
+                    input,
+                    sizeof(input),
+                    nullptr,
+                    0,
+                    0,
+                    output,
+                    sizeof(output),
+                    &length),
+             1u);
+    CHECK_EQ(length, 32u);
+    CHECK_EQ(output[0], 0xbau);
+    CHECK_EQ(output[31], 0xadu);
+    engine.shutdown();
+}
 using namespace rut::jit;
 
 TEST(jit, native_helper_allowlist_matches_orc_symbol_bindings) {
