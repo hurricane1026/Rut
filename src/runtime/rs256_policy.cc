@@ -7,6 +7,23 @@
 #include <new>
 
 namespace rut {
+bool Rs256Policy::load_jwks(
+    Str jwks, Str issuer, Str audience, const Str* approved_ids, u32 count) {
+    if (keys_.valid() || !issuer.ptr || issuer.len == 0 || issuer.len > kMaxName || !audience.ptr ||
+        audience.len == 0 || audience.len > kMaxName)
+        return false;
+    if (!keys_.load(jwks, approved_ids, count)) return false;
+    char issuer_copy[kMaxName];
+    char audience_copy[kMaxName];
+    __builtin_memcpy(issuer_copy, issuer.ptr, issuer.len);
+    __builtin_memcpy(audience_copy, audience.ptr, audience.len);
+    __builtin_memcpy(issuer_, issuer_copy, issuer.len);
+    __builtin_memcpy(audience_, audience_copy, audience.len);
+    issuer_len_ = issuer.len;
+    audience_len_ = audience.len;
+    return true;
+}
+
 bool Rs256Policy::load(Str configuration) {
     if (keys_.valid() || !configuration.ptr || configuration.len > kMaxText) return false;
     json::Document document;
@@ -47,7 +64,7 @@ bool Rs256Policy::load(Str configuration) {
         approved[count] = {ids[count], id.len};
         ++count;
     }
-    return keys_.load(document.raw(jwks), approved, count);
+    return load_jwks(document.raw(jwks), issuer(), audience(), approved, count);
 }
 
 bool Rs256Policies::load(const Str* configurations, u32 count) {
