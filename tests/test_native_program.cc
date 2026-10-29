@@ -509,6 +509,48 @@ TEST(native_program, hmac_uses_c_crypto_after_compiler_exit) {
              401u);
 }
 
+TEST(native_program, digest_uses_c_crypto_after_compiler_exit) {
+    Source source;
+    REQUIRE(source.append(
+        "route GET \"/\" { guard let digest = sha256(\"abc\") else { return 503 } "
+        "guard digest == \"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\" "
+        "else { return 500 } return 200 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p, 3));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\n\r\n").status_code, 503u);
+    SlicePool pool;
+    REQUIRE(pool.init(24));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    jit::HandlerCtx ctx{};
+    const char req[] = "GET / HTTP/1.1\r\n\r\n";
+    const auto result = jit::HandlerResult::unpack(
+        route.fn(nullptr, &ctx, reinterpret_cast<const u8*>(req), sizeof(req) - 1, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK(arena.space_used() >= 64u);
+    arena.destroy();
+    REQUIRE(arena.init(&pool));
+    char* preserved = nullptr;
+    for (u32 i = 0; i < 16; ++i) {
+        auto* bytes = static_cast<char*>(arena.alloc(16000));
+        REQUIRE(bytes);
+        if (i == 0) {
+            preserved = bytes;
+            preserved[0] = 'x';
+        }
+    }
+    REQUIRE(arena.alloc(6104));
+    const auto exhausted = jit::HandlerResult::unpack(
+        route.fn(nullptr, &ctx, reinterpret_cast<const u8*>(req), sizeof(req) - 1, &arena));
+    CHECK_EQ(exhausted.status_code, 503u);
+    CHECK_EQ(preserved[0], 'x');
+    arena.destroy();
+    pool.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -1004,6 +1004,39 @@ void rut_helper_cache_reset_local_state() {
     for (auto& shard : state->shards) shard.reset();
 }
 
+extern "C" u8 rut_helper_hash_available(void* conn, void* arena) {
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (storage == nullptr && conn != nullptr)
+        storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    return storage != nullptr && storage->backend.pool != nullptr;
+}
+
+extern "C" void rut_helper_hash_publish(void* conn,
+                                        void* arena,
+                                        const char* text,
+                                        u32 length,
+                                        u32 computed,
+                                        u8* has_value,
+                                        const char** out_ptr,
+                                        u32* out_len) {
+    *has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    if (!computed || !text || length == 0 || length > kMaxHashHexBytes) return;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (storage == nullptr && conn != nullptr)
+        storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    if (!storage || !storage->backend.pool || storage->space_used() > kHashRequestBudget - length ||
+        (storage->current == nullptr && !storage->init(storage->backend.pool)))
+        return;
+    auto* result = static_cast<char*>(storage->alloc(length));
+    if (!result) return;
+    __builtin_memcpy(result, text, length);
+    *out_ptr = result;
+    *out_len = length;
+    *has_value = 1;
+}
+
 extern "C" void rut_helper_hash(void* conn,
                                 void* arena,
                                 u32 operation,

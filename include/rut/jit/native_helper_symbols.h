@@ -37,6 +37,8 @@
     X(rut_helper_parse_prime)                   \
     X(rut_helper_parse_unprime)                 \
     X(rut_helper_hash)                          \
+    X(rut_helper_hash_available)                \
+    X(rut_helper_hash_publish)                  \
     X(rut_crypto_digest_v1)                     \
     X(rut_crypto_digest_hex_v1)                 \
     X(rut_crypto_digest_parts_v1)               \
