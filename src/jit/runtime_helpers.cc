@@ -10,6 +10,7 @@
 #include "rut/runtime/auth.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/http_tokens.h"
@@ -1874,13 +1875,14 @@ bool jwt_decode_claims(Str token,
     u32 expected_len = 0;
     if (secret.len > 0x7fffffffu || token.len > 0x7fffffffu) return false;
     const u32 signing_len = static_cast<u32>(second - token.ptr);
-    if (!hash_digest(digest_kind,
-                     {token.ptr, signing_len},
-                     secret,
-                     true,
-                     expected,
-                     sizeof(expected),
-                     expected_len))
+    if (!rut_crypto_hmac_long_key_v1(static_cast<u32>(digest_kind),
+                                     reinterpret_cast<const u8*>(token.ptr),
+                                     signing_len,
+                                     reinterpret_cast<const u8*>(secret.ptr),
+                                     secret.len,
+                                     expected,
+                                     sizeof(expected),
+                                     &expected_len))
         return false;
     if (signature_len != expected_len || CRYPTO_memcmp(signature, expected, expected_len) != 0)
         return false;

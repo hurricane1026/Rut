@@ -93,5 +93,35 @@ int main(void) {
                                    &len) ||
         len != 0 || out[0] != 0xa5)
         return 14;
+    uint8_t long_key[4097];
+    for (uint32_t i = 0; i < sizeof(long_key); ++i) long_key[i] = 'k';
+    static const uint8_t jwt[] = {'j', 'w', 't'};
+    static const uint8_t long_expected[32] = {0xce, 0xae, 0x45, 0xc6, 0xee, 0xa0, 0x33, 0x30,
+                                              0x44, 0xd2, 0xfd, 0x01, 0x48, 0x68, 0xf8, 0x18,
+                                              0x7b, 0x44, 0x69, 0x1f, 0x97, 0x3c, 0xbb, 0xaa,
+                                              0x07, 0x07, 0x4e, 0x55, 0x25, 0x2f, 0x7b, 0xaf};
+    if (!rut_crypto_hmac_long_key_v1(RUT_CRYPTO_SHA256_V1,
+                                     jwt,
+                                     sizeof(jwt),
+                                     long_key,
+                                     sizeof(long_key),
+                                     out,
+                                     sizeof(out),
+                                     &len) ||
+        len != 32)
+        return 15;
+    for (uint32_t i = 0; i < sizeof(long_expected); ++i)
+        if (out[i] != long_expected[i]) return 16;
+    out[0] = 0xa5;
+    if (rut_crypto_hmac_long_key_v1(RUT_CRYPTO_SHA256_V1,
+                                    jwt,
+                                    sizeof(jwt),
+                                    long_key,
+                                    0x80000000u,
+                                    out,
+                                    sizeof(out),
+                                    &len) ||
+        len != 0 || out[0] != 0xa5)
+        return 17;
     return 0;
 }

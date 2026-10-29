@@ -265,3 +265,28 @@ extern "C" uint32_t rut_crypto_digest_parts_v1(uint32_t algorithm,
     *output_len = length;
     return ok ? 1u : 0u;
 }
+
+extern "C" uint32_t rut_crypto_hmac_long_key_v1(uint32_t algorithm,
+                                                const uint8_t* data,
+                                                uint32_t data_len,
+                                                const uint8_t* key,
+                                                uint32_t key_len,
+                                                uint8_t* output,
+                                                uint32_t capacity,
+                                                uint32_t* output_len) {
+    if (!output_len) return 0;
+    *output_len = 0;
+    if (algorithm > RUT_CRYPTO_SHA512_V1 || data_len > rut::kMaxHashInputBytes ||
+        key_len > 0x7fffffffu || (!data && data_len) || (!key && key_len))
+        return 0;
+    rut::u32 length = 0;
+    const bool ok = rut::hash_digest(static_cast<rut::HashAlgorithm>(algorithm),
+                                     {reinterpret_cast<const char*>(data), data_len},
+                                     {reinterpret_cast<const char*>(key), key_len},
+                                     true,
+                                     output,
+                                     capacity,
+                                     length);
+    *output_len = length;
+    return ok ? 1u : 0u;
+}

@@ -52,6 +52,19 @@ uint32_t rut_crypto_digest_parts_v1(uint32_t algorithm,
                                     uint32_t capacity,
                                     uint32_t* output_len);
 
+/* HMAC with a legacy-compatible key length up to INT32_MAX bytes. Input data
+ * remains limited to 1 MiB. The caller owns and must bound the key storage;
+ * processing time grows with key length. Buffer and failure rules match
+ * rut_crypto_digest_v1. */
+uint32_t rut_crypto_hmac_long_key_v1(uint32_t algorithm,
+                                     const uint8_t* data,
+                                     uint32_t data_len,
+                                     const uint8_t* key,
+                                     uint32_t key_len,
+                                     uint8_t* output,
+                                     uint32_t capacity,
+                                     uint32_t* output_len);
+
 #ifdef __cplusplus
 }
 #endif
