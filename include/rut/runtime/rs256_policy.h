@@ -13,6 +13,11 @@ public:
     static constexpr u32 kMaxText = 8192;
     static constexpr u32 kMaxName = 1024;
     bool load(Str configuration);
+    // Configuration-time import of a separately obtained JWKS. Issuer,
+    // audience and approved key IDs must come from trusted configuration.
+    // Failed imports leave the policy unactivated; successful imports own all
+    // key material and metadata independently of the input buffers.
+    bool load_jwks(Str jwks, Str issuer, Str audience, const Str* approved_ids, u32 count);
     const Rs256KeySet& keys() const { return keys_; }
     Str issuer() const { return {issuer_, issuer_len_}; }
     Str audience() const { return {audience_, audience_len_}; }

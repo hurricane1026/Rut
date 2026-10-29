@@ -886,6 +886,79 @@ TEST(jwt_rs256, configured_policies_activate_each_shard_and_keep_generations_ind
         0, {lookup, updated.len}, document, fixture.first, 100, payload, sizeof(payload), length));
 }
 
+TEST(jwt_rs256, separately_supplied_jwks_respects_trusted_policy_and_owns_inputs) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    const Str approved[] = {lit_str("current"), lit_str("previous")};
+    const Str duplicate[] = {lit_str("current"), lit_str("current")};
+    const Str unknown[] = {lit_str("not-present")};
+    Rs256Policy policy;
+    CHECK(!policy.load_jwks(fixture.configuration_view, {}, lit_str("gateway"), approved, 2));
+    CHECK(!policy.load_jwks(fixture.configuration_view, lit_str("issuer"), {}, approved, 2));
+    CHECK(!policy.load_jwks(
+        fixture.configuration_view, lit_str("issuer"), lit_str("gateway"), duplicate, 2));
+    CHECK(!policy.load_jwks(
+        fixture.configuration_view, lit_str("issuer"), lit_str("gateway"), unknown, 1));
+    CHECK(!policy.load_jwks(lit_str("{}"), lit_str("issuer"), lit_str("gateway"), approved, 2));
+    CHECK(!policy.keys().valid());
+    char issuer[] = "issuer";
+    char audience[] = "gateway";
+    REQUIRE(policy.load_jwks(fixture.configuration_view, {issuer, 6}, {audience, 7}, approved, 2));
+    CHECK(!policy.load_jwks(
+        fixture.configuration_view, lit_str("other"), lit_str("gateway"), approved, 2));
+    issuer[0] = 'X';
+    audience[0] = 'X';
+    fixture.configuration[0] = 'X';
+    CHECK(policy.issuer().eq(lit_str("issuer")));
+    CHECK(policy.audience().eq(lit_str("gateway")));
+    Rs256VerifierSet verifier;
+    REQUIRE(verifier.init(policy.keys()));
+    json::Document document;
+    char payload[8192];
+    u32 length = 0;
+    Str kid;
+    CHECK(jwt_rs256_validate_set(verifier,
+                                 document,
+                                 fixture.first,
+                                 policy.issuer(),
+                                 policy.audience(),
+                                 100,
+                                 payload,
+                                 sizeof(payload),
+                                 length,
+                                 kid));
+    CHECK(kid.eq(lit_str("current")));
+    CHECK(jwt_rs256_validate_set(verifier,
+                                 document,
+                                 fixture.second,
+                                 policy.issuer(),
+                                 policy.audience(),
+                                 100,
+                                 payload,
+                                 sizeof(payload),
+                                 length,
+                                 kid));
+    CHECK(kid.eq(lit_str("previous")));
+    char unapproved_bytes[2048];
+    const Str unapproved = token_for(fixture.current.rsa,
+                                     lit_str(R"({"alg":"RS256","kid":"not-approved"})"),
+                                     kSelectedClaims,
+                                     unapproved_bytes);
+    REQUIRE(unapproved.len != 0);
+    CHECK(!jwt_rs256_validate_set(verifier,
+                                  document,
+                                  unapproved,
+                                  policy.issuer(),
+                                  policy.audience(),
+                                  100,
+                                  payload,
+                                  sizeof(payload),
+                                  length,
+                                  kid));
+    CHECK_EQ(length, 0u);
+    CHECK(!document.valid);
+}
+
 TEST(jwt_rs256, policy_rejects_missing_ambiguous_or_unapproved_trust_configuration) {
     const Str bad[] = {
         lit_str("{}"),

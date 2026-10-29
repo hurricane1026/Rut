@@ -393,6 +393,15 @@ explicit, and callers choose the identity fields they trust and forward.
 
 ## Configured RS256 end-to-end integration
 
+The native configuration-time `Rs256Policy::load_jwks` additionally accepts
+JWKS bytes separately from trusted issuer, audience and approved key IDs. It
+reuses the bounded key importer, rejects malformed or ambiguous key sets, and
+owns the selected keys and trust metadata after a successful load. Failed
+preparation leaves the key set invalid; a loaded policy is not overwritten.
+This is an import boundary for a future refresh path: it does not fetch a URL,
+authenticate a server, schedule refresh, publish an RCU generation, or expose
+remote JWKS to Rut programs.
+
 `jwtVerifyRs256(token, policy)` now connects approved public JWK Sets to Rut,
 JIT handlers and exported native programs. The static policy binds issuer,
 audience, approved kids and public JWKS. Invalid policies fail at compilation or
