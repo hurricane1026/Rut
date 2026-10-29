@@ -821,6 +821,9 @@ return forward(users, load_balance: .roundRobin, streaming: true)         // ⏳
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
+// Terminate handlers support boolean guards and ! on frame.fromClient,
+// frame.isText, and frame.isBinary, e.g.:
+// guard !frame.fromClient else { frame.forward() }
 // WebSocket proxy. The inspection sketch below is a target API; current terminate
 // handlers use `return websocket(chat) { frame in ... }` and forward/drop/close.
 // Reassembled messages are currently limited to approximately one 16 KB slice.

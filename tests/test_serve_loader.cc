@@ -4523,6 +4523,38 @@ TEST(serve_loader, websocket_terminate_direction_guard_polices_client_leg) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_terminate_negated_boolean_guards) {
+    const char* conditions[] = {"!frame.fromClient", "!frame.isText", "!frame.isBinary"};
+    for (u32 c = 0; c < 3; c++) {
+        const std::string source =
+            std::string(
+                "upstream backend at \"127.0.0.1:9999\"\n"
+                "route GET \"/ws\" { return websocket(backend) { frame in\n  guard ") +
+            conditions[c] + " else { frame.drop() }\n  frame.forward()\n} }\n";
+        const std::string path =
+            write_file("/tmp/rut_serve_loader_ws_negated", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        WsMessageHandlerFn handler = nullptr;
+        for (u32 i = 0; i < program.config.route_count; i++) {
+            if (program.config.routes[i].ws_terminate)
+                handler = program.config.routes[i].ws_frame_handler;
+        }
+        REQUIRE(handler != nullptr);
+        for (bool from_client : {false, true}) {
+            for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+                const bool passes =
+                    c == 0 ? !from_client
+                           : (c == 1 ? opcode == WsOpcode::Binary : opcode == WsOpcode::Text);
+                CHECK(handler(nullptr, opcode, nullptr, 0, from_client) ==
+                      (passes ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+        program.destroy();
+    }
+}
+
 TEST(serve_loader, websocket_terminate_close_code_reaches_route) {
     // close(code) end-to-end: `frame.close(1008)` must publish the route with ws_close_code
     // == 1008 (the runtime puts that on the wire), and the JIT'd handler still returns Close.
