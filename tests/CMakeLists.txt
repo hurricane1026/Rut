@@ -533,6 +533,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT RUT_SANITIZE)
             -DRUT_BINARY=$<TARGET_FILE:rut>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_cxx_deps.cmake)
     set_tests_properties(test_runtime_no_cxx_dependencies PROPERTIES LABELS "unit;cli")
+    if(RUT_STATIC_RUNTIME)
+        add_test(NAME test_runtime_no_dynamic_dependencies
+            COMMAND ${CMAKE_COMMAND}
+                -DREADELF=${CMAKE_READELF}
+                -DRUT_BINARY=$<TARGET_FILE:rut>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_static.cmake)
+        set_tests_properties(test_runtime_no_dynamic_dependencies PROPERTIES LABELS "unit;cli")
+        add_test(NAME test_static_runtime_smoke
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_static_runtime.py
+                $<TARGET_FILE:rut> ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/localhost_cert.pem
+                ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/localhost_key.pem
+                ${PROJECT_SOURCE_DIR}/examples/authentication.rut)
+        set_tests_properties(test_static_runtime_smoke PROPERTIES LABELS "integration;cli" TIMEOUT 60)
+    endif()
 endif()
 
 # /proc-based check that the process ignores SIGPIPE (Linux only).

@@ -40,6 +40,25 @@ The stream carries a protocol version and source/build-configuration fingerprint
 
 ## 1. Build the `rut` binary
 
+### Experimental static Linux runtime without `.rut` loading
+
+With a Linux musl C/C++ toolchain, `-DRUT_STATIC_RUNTIME=ON` and
+`-DRUT_ENABLE_JIT=OFF` build the `rut` executable with static linkage. Run
+`ctest --test-dir build -R '^test_runtime_no_dynamic_dependencies$'` to verify
+that the executable has neither an ELF interpreter nor `DT_NEEDED` entries.
+This profile cannot load `.rut` programs: the existing native program loader
+uses `dlopen`, which does not work with a statically linked musl runtime. It
+serves the existing default routes only and is not a replacement for the
+ordinary `.rut`-enabled runtime. JIT and sanitizer builds reject this option.
+
+For example, configure with the musl compiler from an Alpine build environment:
+
+```bash
+cmake -B build-static -G Ninja -DRUT_ENABLE_JIT=OFF -DRUT_STATIC_RUNTIME=ON
+ninja -C build-static rut
+ctest --test-dir build-static -R '^test_runtime_no_dynamic_dependencies$' --output-on-failure
+```
+
 Prerequisites: `clang++`, `cmake`, `ninja`. LLVM and Vectorscan are
 required for the JIT (enabled by default via `RUT_ENABLE_JIT=ON`); the
 zstd is vendored under `third_party/`; TLS uses checksum-pinned static OpenSSL built by CMake.

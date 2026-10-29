@@ -487,6 +487,9 @@ add_executable(rut main.cc)
 target_link_libraries(rut
     rut_runtime
 )
+if(RUT_STATIC_RUNTIME)
+    target_link_options(rut PRIVATE -static)
+endif()
 
 # Keep the shipped server independent of the C++ standard/ABI runtime.
 # LLVM tools and test executables keep their normal C++ link environment.
