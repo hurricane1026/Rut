@@ -78,10 +78,15 @@ struct WsInspector {
     bool reject_fragmented = false;
     WsMessageAssembler assembler;  // fragmentation state across frames
     u64 message_len = 0;           // bytes accumulated into the message buffer so far
+    bool partial_data_frame = false;
+    WsFrameHeader partial_header{};
+    u64 partial_payload_len = 0;
 
     void reset() {
         assembler.reset();
         message_len = 0;
+        partial_data_frame = false;
+        partial_payload_len = 0;
     }
 };
 
@@ -92,8 +97,9 @@ struct WsInspector {
 //     Text messages are rejected (Error) unless the reassembled payload is valid UTF-8.
 //   - control frames (Ping/Pong/Close): passed through verbatim into `out`; a Close
 //     additionally ends the stream.
-// A partial trailing frame, or a complete frame that cannot fit after earlier output,
-// is left unconsumed for the next call; an oversized frame
+// A partial data payload is consumed incrementally into the stable message buffer;
+// partial headers and control frames remain unconsumed. A complete frame that cannot
+// fit after earlier output is left unconsumed for the next call; an oversized frame
 // (advertised length exceeds msg_cap or max_message_size) fails closed immediately rather
 // than waiting for its payload. Sets *consumed (input bytes processed) and *produced
 // (output bytes written). Returns Error on any framing violation, an over-cap message,
