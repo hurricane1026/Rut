@@ -1,11 +1,10 @@
 #include "rut/runtime/public_key.h"
 
-#include "rut/runtime/crypto_c.h"
+#include "crypto_rsa_math_internal.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 
 #include <openssl/bn.h>
-#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
@@ -288,57 +287,17 @@ bool RsaSha256Verifier::verify(Str message, Str signature) {
         message.len > kMaxHashInputBytes || (!message.ptr && message.len != 0))
         return false;
     ErrorScope errors;
-    if (!BN_bin2bn(reinterpret_cast<const unsigned char*>(signature.ptr),
-                   static_cast<int>(bytes_),
-                   input_) ||
-        BN_cmp(input_, modulus_) >= 0 ||
-        !BN_mod_exp_mont(output_, input_, exponent_, modulus_, scratch_, mont_))
-        return false;
-    u8 actual[512];
-    if (BN_bn2binpad(output_, actual, static_cast<int>(bytes_)) != static_cast<int>(bytes_))
-        return false;
-
-    // RFC 8017 9.2: encode a fixed SHA-256 DigestInfo and compare the COMPLETE
-    // EM, avoiding permissive ASN.1 or padding parsing of attacker input.
-    static constexpr u8 kDigestInfo[] = {0x30,
-                                         0x31,
-                                         0x30,
-                                         0x0d,
-                                         0x06,
-                                         0x09,
-                                         0x60,
-                                         0x86,
-                                         0x48,
-                                         0x01,
-                                         0x65,
-                                         0x03,
-                                         0x04,
-                                         0x02,
-                                         0x01,
-                                         0x05,
-                                         0x00,
-                                         0x04,
-                                         0x20};
-    u8 expected[512];
-    const u32 padding_end = bytes_ - sizeof(kDigestInfo) - 32 - 1;
-    expected[0] = 0;
-    expected[1] = 1;
-    for (u32 i = 2; i < padding_end; ++i) expected[i] = 0xff;
-    expected[padding_end] = 0;
-    for (u32 i = 0; i < sizeof(kDigestInfo); ++i) expected[padding_end + 1 + i] = kDigestInfo[i];
-    u32 digest_len = 0;
-    if (!rut_crypto_digest_v1(RUT_CRYPTO_SHA256_V1,
-                              reinterpret_cast<const u8*>(message.ptr),
-                              message.len,
-                              nullptr,
-                              0,
-                              0,
-                              expected + bytes_ - 32,
-                              32,
-                              &digest_len) ||
-        digest_len != 32)
-        return false;
-    return CRYPTO_memcmp(actual, expected, bytes_) == 0;
+    return rut_crypto_rsa_verify_internal(modulus_,
+                                          exponent_,
+                                          input_,
+                                          output_,
+                                          scratch_,
+                                          mont_,
+                                          bytes_,
+                                          reinterpret_cast<const u8*>(message.ptr),
+                                          message.len,
+                                          reinterpret_cast<const u8*>(signature.ptr),
+                                          signature.len) != 0;
 }
 
 bool Rs256KeySet::load(Str jwks, const Str* approved_ids, u32 count) {

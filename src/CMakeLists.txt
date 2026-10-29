@@ -115,6 +115,7 @@ add_library(rut_crypto STATIC
     placement_new.cc
     runtime/public_key.cc
     runtime/crypto_rsa_c.cc
+    runtime/crypto_rsa_math.c
 )
 target_include_directories(rut_crypto PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(rut_crypto PUBLIC rut_crypto_digest)
