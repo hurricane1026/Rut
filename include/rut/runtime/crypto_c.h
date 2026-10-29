@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /* Version 1 algorithm identifiers; numeric values are part of the C ABI. */
-enum rut_crypto_digest_algorithm_v1 {
+enum rut_crypto_digest_algorithm_v1 { /* NOLINT(performance-enum-size): C-compatible ABI. */
     RUT_CRYPTO_MD5_V1 = 0,
     RUT_CRYPTO_SHA1_V1 = 1,
     RUT_CRYPTO_SHA224_V1 = 2,
