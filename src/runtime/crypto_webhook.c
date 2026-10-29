@@ -1,4 +1,7 @@
+#define _POSIX_C_SOURCE 200809L  // NOLINT(bugprone-reserved-identifier): POSIX feature-test macro.
 #include "rut/runtime/crypto_c.h"
+
+#include <time.h>
 
 static int base64_value(uint8_t c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -7,6 +10,29 @@ static int base64_value(uint8_t c) {
     if (c == '+') return 62;
     if (c == '/') return 63;
     return -1;
+}
+
+uint32_t rut_crypto_standard_webhook_now_v1(const uint8_t* id,
+                                            uint32_t id_len,
+                                            const uint8_t* timestamp,
+                                            uint32_t timestamp_len,
+                                            const uint8_t* signature,
+                                            uint32_t signature_len,
+                                            const uint8_t* body,
+                                            uint32_t body_len,
+                                            const uint8_t* raw_key,
+                                            uint32_t raw_key_len) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+        now.tv_nsec >= 1000000000)
+        return 0;
+    const rut_crypto_span_v1 id_span = {id, id_len};
+    const rut_crypto_span_v1 time_span = {timestamp, timestamp_len};
+    const rut_crypto_span_v1 signature_span = {signature, signature_len};
+    const rut_crypto_span_v1 body_span = {body, body_len};
+    const rut_crypto_span_v1 key_span = {raw_key, raw_key_len};
+    return rut_crypto_standard_webhook_valid_v1(
+        &id_span, &time_span, &signature_span, &body_span, &key_span, (int64_t)now.tv_sec, 300);
 }
 
 uint32_t rut_crypto_standard_webhook_valid_v1(const rut_crypto_span_v1* id,
