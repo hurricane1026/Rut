@@ -56,6 +56,16 @@
     X(rut_crypto_rsa_verifier_init_v1)     \
     X(rut_crypto_rsa_verifier_destroy_v1)  \
     X(rut_crypto_rsa_verify_sha256_v1)     \
+    X(rut_crypto_rsa_key_set_size_v1)      \
+    X(rut_crypto_rsa_key_set_align_v1)     \
+    X(rut_crypto_rsa_key_set_init_v1)      \
+    X(rut_crypto_rsa_key_set_destroy_v1)   \
+    X(rut_crypto_rsa_key_set_load_v1)      \
+    X(rut_crypto_rsa_verifier_set_size_v1) \
+    X(rut_crypto_rsa_verifier_set_align_v1) \
+    X(rut_crypto_rsa_verifier_set_init_v1) \
+    X(rut_crypto_rsa_verifier_set_destroy_v1) \
+    X(rut_crypto_rsa_verifier_set_select_v1) \
     X(rut_helper_uuid)                     \
     X(rut_helper_str_has_prefix)           \
     X(rut_helper_http_origin_list_allows)  \

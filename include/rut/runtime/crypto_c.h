@@ -129,6 +129,31 @@ uint32_t rut_crypto_rsa_verify_sha256_v1(rut_crypto_rsa_verifier_v1* verifier,
                                          const uint8_t* signature,
                                          uint32_t signature_len);
 
+/* Configuration key sets own copied IDs and keys. Verifier sets retain their
+ * own key references and copied IDs and are shard-local. Their caller-owned
+ * storage follows the same size, alignment and lifetime rules as RSA objects
+ * above; no initialized storage may overlap any other live object. A selected
+ * verifier is borrowed, must not be destroyed directly and expires when its
+ * verifier set is destroyed. Input spans are borrowed only during each call. */
+typedef struct rut_crypto_rsa_key_set_v1 rut_crypto_rsa_key_set_v1;
+typedef struct rut_crypto_rsa_verifier_set_v1 rut_crypto_rsa_verifier_set_v1;
+uint32_t rut_crypto_rsa_key_set_size_v1(void);
+uint32_t rut_crypto_rsa_key_set_align_v1(void);
+rut_crypto_rsa_key_set_v1* rut_crypto_rsa_key_set_init_v1(void* storage, uint32_t capacity);
+void rut_crypto_rsa_key_set_destroy_v1(rut_crypto_rsa_key_set_v1* keys);
+uint32_t rut_crypto_rsa_key_set_load_v1(rut_crypto_rsa_key_set_v1* keys,
+                                        const uint8_t* jwks,
+                                        uint32_t jwks_len,
+                                        const rut_crypto_span_v1* approved_ids,
+                                        uint32_t count);
+uint32_t rut_crypto_rsa_verifier_set_size_v1(void);
+uint32_t rut_crypto_rsa_verifier_set_align_v1(void);
+rut_crypto_rsa_verifier_set_v1* rut_crypto_rsa_verifier_set_init_v1(
+    void* storage, uint32_t capacity, const rut_crypto_rsa_key_set_v1* keys);
+void rut_crypto_rsa_verifier_set_destroy_v1(rut_crypto_rsa_verifier_set_v1* verifiers);
+rut_crypto_rsa_verifier_v1* rut_crypto_rsa_verifier_set_select_v1(
+    rut_crypto_rsa_verifier_set_v1* verifiers, const uint8_t* kid, uint32_t kid_len);
+
 #ifdef __cplusplus
 }
 #endif
