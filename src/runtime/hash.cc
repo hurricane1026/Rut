@@ -50,29 +50,15 @@ bool hash_hex(HashAlgorithm algorithm,
               bool keyed,
               char (&output)[kMaxHashHexBytes],
               u32& output_len) {
-    output_len = 0;
-    if (data.len > kMaxHashInputBytes || (keyed && key.len > kMaxHashKeyBytes)) return false;
-    u8 bytes[kMaxHashDigestBytes]{};
-    u32 length = 0;
-    if (!rut_crypto_digest_v1(static_cast<u32>(algorithm),
-                              reinterpret_cast<const u8*>(data.ptr),
-                              data.len,
-                              keyed ? reinterpret_cast<const u8*>(key.ptr) : nullptr,
-                              keyed ? key.len : 0,
-                              keyed ? 1u : 0u,
-                              bytes,
-                              sizeof(bytes),
-                              &length))
-        return false;
-    constexpr char kHex[] = "0123456789abcdef";
-    for (u32 i = 0; i < length; ++i) {
-        const u32 kOffset = 2 * i;
-        output[kOffset] = kHex[bytes[i] >> 4];
-        output[kOffset + 1] = kHex[bytes[i] & 15];
-    }
-    output_len = length * 2;
-    rut_crypto_clear_v1(bytes, sizeof(bytes));
-    return true;
+    return rut_crypto_digest_hex_v1(static_cast<u32>(algorithm),
+                                    reinterpret_cast<const u8*>(data.ptr),
+                                    data.len,
+                                    keyed ? reinterpret_cast<const u8*>(key.ptr) : nullptr,
+                                    keyed ? key.len : 0,
+                                    keyed ? 1u : 0u,
+                                    reinterpret_cast<u8*>(output),
+                                    sizeof(output),
+                                    &output_len);
 }
 
 }  // namespace rut

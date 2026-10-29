@@ -106,7 +106,6 @@ endif()
 # own all buffers; OpenSSL is the pinned static dependency above.
 add_library(rut_crypto STATIC
     placement_new.cc
-    runtime/hash.cc
     runtime/public_key.cc
     runtime/crypto_rsa_c.cc
     runtime/crypto_hash.c
@@ -116,6 +115,7 @@ target_include_directories(rut_crypto PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(rut_crypto PUBLIC crypto)
 
 add_library(rut_runtime STATIC
+    runtime/hash.cc
     runtime/auth.cc
     runtime/webhook.cc
     runtime/memory_http_cache_store.cc
