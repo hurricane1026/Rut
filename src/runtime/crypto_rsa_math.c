@@ -4,6 +4,70 @@
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
+#include <openssl/x509.h>
+
+void rut_crypto_rsa_key_free_internal(EVP_PKEY* key) {
+    EVP_PKEY_free(key);
+}
+uint32_t rut_crypto_rsa_key_bits_internal(const EVP_PKEY* key) {
+    return key ? (uint32_t)EVP_PKEY_bits(key) : 0;
+}
+
+EVP_PKEY* rut_crypto_rsa_load_der_internal(const uint8_t* der, uint32_t length) {
+    if (!der || !length || length > 8192) return 0;
+    const uint8_t* cursor = der;
+    EVP_PKEY* candidate = d2i_PUBKEY(0, &cursor, length);
+    if (!candidate) return 0;
+    if (cursor != der + length || EVP_PKEY_id(candidate) != EVP_PKEY_RSA) goto fail;
+    const int bits = EVP_PKEY_bits(candidate);
+    if (bits < 2048 || bits > 4096) goto fail;
+    const RSA* rsa = EVP_PKEY_get0_RSA(candidate);
+    if (!rsa) goto fail;
+    const BIGNUM* modulus = 0;
+    const BIGNUM* exponent = 0;
+    RSA_get0_key(rsa, &modulus, &exponent, 0);
+    if (!modulus || !exponent || !BN_is_odd(modulus) || !BN_is_word(exponent, 65537)) goto fail;
+    const int canonical_size = i2d_PUBKEY(candidate, 0);
+    if (canonical_size <= 0 || (uint32_t)canonical_size != length) goto fail;
+    uint8_t canonical[8192];
+    uint8_t* output = canonical;
+    if (i2d_PUBKEY(candidate, &output) != canonical_size) goto fail;
+    uint32_t identical = 1;
+    for (uint32_t i = 0; i < length; ++i)
+        if (canonical[i] != der[i]) identical = 0;
+    if (!identical) goto fail;
+    return candidate;
+fail:
+    EVP_PKEY_free(candidate);
+    return 0;
+}
+
+EVP_PKEY* rut_crypto_rsa_from_modulus_internal(const uint8_t* modulus, uint32_t length) {
+    if (!modulus || length < 256 || length > 512) return 0;
+    RSA* rsa = RSA_new();
+    BIGNUM* n = BN_bin2bn(modulus, (int)length, 0);
+    BIGNUM* e = BN_new();
+    EVP_PKEY* owner = EVP_PKEY_new();
+    EVP_PKEY* accepted = 0;
+    if (rsa && n && e && owner && BN_set_word(e, 65537) && RSA_set0_key(rsa, n, e, 0)) {
+        n = 0;
+        e = 0;
+        if (EVP_PKEY_set1_RSA(owner, rsa)) {
+            uint8_t der[8192];
+            const int size = i2d_PUBKEY(owner, 0);
+            if (size > 0 && (uint32_t)size <= sizeof(der)) {
+                uint8_t* cursor = der;
+                if (i2d_PUBKEY(owner, &cursor) == size)
+                    accepted = rut_crypto_rsa_load_der_internal(der, (uint32_t)size);
+            }
+        }
+    }
+    BN_free(n);
+    BN_free(e);
+    RSA_free(rsa);
+    EVP_PKEY_free(owner);
+    return accepted;
+}
 
 void rut_crypto_rsa_workspace_reset_internal(EVP_PKEY** key,
                                              const BIGNUM** modulus,
