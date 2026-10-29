@@ -609,9 +609,9 @@ struct Ctx {
         if (!fn_standard_webhook_valid) {
             LLVMTypeRef params[] = {
                 ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
-            LLVMTypeRef ft = LLVMFunctionType(i32_ty, params, 10, 0);
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 10, 0);
             fn_standard_webhook_valid =
-                LLVMAddFunction(llvm_mod, "rut_crypto_standard_webhook_now_v1", ft);
+                LLVMAddFunction(llvm_mod, "rut_helper_standard_webhook_valid", ft);
         }
         return fn_standard_webhook_valid;
     }
@@ -1492,7 +1492,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(
                 inst.result,
                 LLVMBuildICmp(
-                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i32_ty, 0, 0), "hmac.bool"));
+                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "hmac.bool"));
             break;
         }
         // ── String operations ──

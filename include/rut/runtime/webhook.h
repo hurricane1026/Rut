@@ -22,4 +22,6 @@ bool standard_webhook_valid(Str id,
                             Str raw_key,
                             i64 unix_seconds,
                             u32 tolerance_seconds = 300);
+// Runtime-clock variant used by Crypto.webhookValid in both native and JIT code.
+bool standard_webhook_valid_now(Str id, Str timestamp, Str signature, Str body, Str raw_key);
 }  // namespace rut

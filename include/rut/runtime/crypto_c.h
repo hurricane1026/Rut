@@ -52,32 +52,6 @@ typedef struct rut_crypto_span_v1 {
     uint32_t len;
 } rut_crypto_span_v1;
 
-/* Standard Webhooks v1 integrity and freshness validation over exact borrowed
- * bytes. All span pointers are required; a null data pointer is allowed only
- * for an empty body. IDs, timestamp, signature and decoded key are required.
- * The caller supplies a positive trusted Unix time and tolerance <=300 seconds.
- * This does not provide replay deduplication. Returns 0 on malformed input,
- * stale timestamp or invalid signature and retains no pointers. */
-uint32_t rut_crypto_standard_webhook_valid_v1(const rut_crypto_span_v1* id,
-                                              const rut_crypto_span_v1* timestamp,
-                                              const rut_crypto_span_v1* signature,
-                                              const rut_crypto_span_v1* body,
-                                              const rut_crypto_span_v1* raw_key,
-                                              int64_t unix_seconds,
-                                              uint32_t tolerance_seconds);
-/* Same profile with CLOCK_REALTIME and the fixed 300-second tolerance; fails
- * closed on clock errors. All pointer/length inputs are borrowed. */
-uint32_t rut_crypto_standard_webhook_now_v1(const uint8_t* id,
-                                            uint32_t id_len,
-                                            const uint8_t* timestamp,
-                                            uint32_t timestamp_len,
-                                            const uint8_t* signature,
-                                            uint32_t signature_len,
-                                            const uint8_t* body,
-                                            uint32_t body_len,
-                                            const uint8_t* raw_key,
-                                            uint32_t raw_key_len);
-
 /* Hash up to 16 borrowed spans as one byte sequence without concatenation.
  * The aggregate input is bounded to 1 MiB + 4096 bytes; key and output rules
  * are identical to rut_crypto_digest_v1. No pointer is retained. */
