@@ -14231,9 +14231,24 @@ static FrontendResult<void> load_imported_modules(
                                   item.import_decl.span,
                                   lit_str("import nesting depth limit reached"));
         std::string content;
-        const TextFileReadStatus read_status =
-            kSystemCrypto ? (content = kCryptoSystemSource, TextFileReadStatus::Ok)
-                          : read_text_file(normalized, content, source_budget);
+        TextFileReadStatus read_status = TextFileReadStatus::Ok;
+        if (kSystemCrypto) {
+            // Account for the compiler-owned source just as we do for a file.
+            // This check is after duplicate-import coalescing, so the budget is
+            // charged once per actual system-module analysis.
+            constexpr u64 kCryptoSourceBytes = sizeof(kCryptoSystemSource) - 1;
+            if (source_budget != nullptr &&
+                (source_budget->used_bytes > source_budget->max_bytes ||
+                 kCryptoSourceBytes > source_budget->max_bytes - source_budget->used_bytes)) {
+                source_budget->exceeded = true;
+                read_status = TextFileReadStatus::SourceLimit;
+            } else {
+                if (source_budget != nullptr) source_budget->used_bytes += kCryptoSourceBytes;
+                content = kCryptoSystemSource;
+            }
+        } else {
+            read_status = read_text_file(normalized, content, source_budget);
+        }
         if (read_status == TextFileReadStatus::SourceLimit)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.import_decl.span,
