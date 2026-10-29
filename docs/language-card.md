@@ -821,9 +821,19 @@ return forward(users, load_balance: .roundRobin, streaming: true)         // ⏳
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
-// Terminate handlers support boolean guards and ! on frame.fromClient,
-// frame.isText, and frame.isBinary, e.g.:
-// guard !frame.fromClient else { frame.forward() }
+// Current terminate handlers: up to 4 guards over direction, text/binary opcode,
+// frame.len (< > == <= >= != integer literal, either side), and text.matches(re).
+// Conditions support !, &&, ||, parentheses and left-to-right short-circuiting.
+// ! binds tighter than comparisons; && binds tighter than ||.
+// At most 32 condition nodes (leaf predicates + binary operators); nesting is bounded.
+return websocket(chat) { frame in
+    guard !frame.fromClient || !frame.isText || !frame.text.matches(re".*spam.*") else {
+        frame.drop()
+    }
+    guard frame.len <= 4096 else { frame.close() }
+    frame.forward()
+}
+
 // WebSocket proxy. The inspection sketch below is a target API; current terminate
 // handlers use `return websocket(chat) { frame in ... }` and forward/drop/close.
 // Reassembled messages are currently limited to approximately one 16 KB slice.

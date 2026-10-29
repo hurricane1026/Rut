@@ -5595,6 +5595,106 @@ TEST(frontend, analyze_accepts_websocket_text_match_guard_positive) {
     CHECK(!h.len_guards[0].negate);
 }
 
+TEST(frontend, analyze_websocket_compound_conditions) {
+    const char* src = R"(upstream ws
+route GET "/ws" { return websocket(ws) { frame in
+    guard (frame.fromClient && !frame.isBinary) || frame.len <= 4 else { frame.drop() }
+    frame.forward()
+} }
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& nodes = hir->routes[0].ws_handler.len_guards;
+    REQUIRE_EQ(nodes.len, 5u);
+    CHECK(nodes[0].is_operand);
+    CHECK(nodes[1].is_operand);
+    CHECK(nodes[2].accessor == WsLenGuard::Accessor::And);
+    CHECK_EQ(nodes[2].lhs, 0u);
+    CHECK_EQ(nodes[2].rhs, 1u);
+    CHECK(nodes[3].negate);  // <= desugars to !(len > 4)
+    CHECK(nodes[4].accessor == WsLenGuard::Accessor::Or);
+    CHECK_FALSE(nodes[4].is_operand);
+    CHECK_EQ(nodes[4].lhs, 2u);
+    CHECK_EQ(nodes[4].rhs, 3u);
+}
+
+TEST(frontend, analyze_websocket_condition_limits) {
+    // Sixteen leaves + fifteen binary nodes fit; the next leaf exceeds the budget.
+    for (u32 leaves : {16u, 17u}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n";
+        source += "guard frame.isText";
+        for (u32 i = 1; i < leaves; i++) source += " || frame.isBinary";
+        source += " else { frame.drop() }\nframe.forward()\n} }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (leaves == 16) {
+            REQUIRE(hir);
+            CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 31u);
+        } else {
+            REQUIRE(!hir);
+            CHECK(hir.error().code == FrontendError::TooManyItems);
+        }
+    }
+    // The node budget is shared across source guards: 31 + 1 fits, 31 + 2 does not.
+    for (u32 extra : {1u, 2u}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n";
+        source += "guard frame.isText";
+        for (u32 i = 1; i < 16; i++) source += " || frame.isBinary";
+        source += " else { frame.drop() }\n";
+        for (u32 i = 0; i < extra; i++) source += "guard frame.fromClient else { frame.drop() }\n";
+        source += "frame.forward()\n} }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (extra == 1) {
+            REQUIRE(hir);
+            CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 32u);
+        } else {
+            REQUIRE(!hir);
+            CHECK(hir.error().code == FrontendError::TooManyItems);
+        }
+    }
+    // Four source guards remain the limit regardless of their condition sizes.
+    std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n";
+    for (u32 i = 0; i < 5; i++) source += "guard frame.isText else { frame.drop() }\n";
+    source += "frame.forward()\n} }\n";
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK(hir.error().code == FrontendError::TooManyItems);
+}
+
+TEST(frontend, analyze_websocket_compound_rejects_invalid_operands) {
+    for (const char* cond : {"frame.isText && 1",
+                             "frame.fromClient || frame.unknown",
+                             "!(frame.len)",
+                             "frame.len == false",
+                             "frame.isText && req.path"}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+        source += cond;
+        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(!hir);
+    }
+}
+
 TEST(frontend, analyze_rejects_websocket_non_len_guard) {
     // Only `frame.len <cmp> N` guard conditions are supported for now; other accessors are a
     // follow-up, so a non-frame.len guard condition is rejected.

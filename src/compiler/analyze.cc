@@ -7083,7 +7083,7 @@ static Str ws_frame_text_match_pattern(const AstExpr& cond) {
     return cond.args[0]->str_value;
 }
 
-// Match a guard condition for the frame handler. `negate` is a leading `not`/`!`, accepted
+// Match a leaf condition for the frame handler. `negate` is logical !, accepted
 // on boolean frame properties or `frame.text.matches(re)` (the blocklist form). Direction is a
 // bare `frame.fromClient` (true on the client→upstream leg); opcode discrimination is a bare
 // `frame.isText` / `frame.isBinary` (== the WsOpcode value); content is
@@ -7129,8 +7129,49 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
         g.verdict = verdict;
         return g;
     }
-    if (negate) return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
-    return analyze_frame_len_cond(cond, verdict);
+    auto g = analyze_frame_len_cond(cond, verdict);
+    if (!g) return core::make_unexpected(g.error());
+    g->negate = negate;
+    return g;
+}
+// Store a bounded condition tree in postorder. Only roots are source guards; children
+// are evaluated by short-circuit branches in the frame-handler JIT.
+static FrontendResult<u32> analyze_frame_condition(const AstExpr& cond,
+                                                   WsVerdict verdict,
+                                                   HirWsHandler& handler,
+                                                   bool is_operand = false,
+                                                   bool negate = false,
+                                                   u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::TooManyItems, cond.span);
+    // The ordinary parser desugars !x, !=, <= and >= to (predicate == false).
+    if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs &&
+        cond.rhs->kind == AstExprKind::BoolLit && !cond.rhs->bool_value) {
+        return analyze_frame_condition(*cond.lhs, verdict, handler, is_operand, !negate, depth + 1);
+    }
+    WsLenGuard node{};
+    if (cond.kind == AstExprKind::And || cond.kind == AstExprKind::Or) {
+        if (!cond.lhs || !cond.rhs)
+            return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
+        auto lhs = analyze_frame_condition(*cond.lhs, verdict, handler, true, false, depth + 1);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = analyze_frame_condition(*cond.rhs, verdict, handler, true, false, depth + 1);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        node.accessor =
+            cond.kind == AstExprKind::And ? WsLenGuard::Accessor::And : WsLenGuard::Accessor::Or;
+        node.lhs = lhs.value();
+        node.rhs = rhs.value();
+        node.negate = negate;
+        node.verdict = verdict;
+    } else {
+        auto leaf = analyze_frame_guard_cond(cond, verdict, negate);
+        if (!leaf) return core::make_unexpected(leaf.error());
+        node = leaf.value();
+    }
+    node.is_operand = is_operand;
+    if (!handler.len_guards.push(node))
+        return frontend_error(FrontendError::TooManyItems, cond.span);
+    return handler.len_guards.len - 1;
 }
 #endif
 
@@ -12852,6 +12893,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             const u32 stmt_count = body->block_stmts.len;
             if (stmt_count == 0)
                 return frontend_error(FrontendError::UnsupportedSyntax, body->span);
+            if (stmt_count - 1 > HirWsHandler::kMaxLenGuards)
+                return frontend_error(FrontendError::TooManyItems, body->span);
             for (u32 i = 0; i + 1 < stmt_count; i++) {  // all but the last are guards
                 const AstStatement* gs = body->block_stmts[i];
                 if (gs == nullptr || gs->kind != AstStmtKind::Guard || gs->else_stmt == nullptr ||
@@ -12860,10 +12903,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                           gs ? gs->span : body->span);
                 auto gv = analyze_bare_frame_verdict(gs->else_stmt->expr);
                 if (!gv) return core::make_unexpected(gv.error());
-                auto g = analyze_frame_guard_cond(gs->expr, gv.value(), gs->cond_negated);
+                auto g = analyze_frame_condition(gs->expr, gv.value(), route->ws_handler);
                 if (!g) return core::make_unexpected(g.error());
-                if (!route->ws_handler.len_guards.push(g.value()))
-                    return frontend_error(FrontendError::TooManyItems, gs->span);
             }
             const AstStatement* last = body->block_stmts[stmt_count - 1];
             if (last == nullptr || last->kind != AstStmtKind::Expr)

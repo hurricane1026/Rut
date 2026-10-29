@@ -2552,10 +2552,32 @@ post /api/orders {
 
 #### 3.4.8 WebSocket Proxying
 
-Current terminate handlers accept boolean guards on `frame.fromClient`,
-`frame.isText`, and `frame.isBinary`, including `!` negation. For example,
-`guard !frame.fromClient else { frame.forward() }` applies subsequent guards only
-to upstream messages. Control frames are relayed without invoking the handler.
+Current terminate handlers support `guard` conditions over `frame.fromClient`,
+`frame.isText`, `frame.isBinary`, `frame.len` comparisons, and
+`frame.text.matches(re"…")`. Conditions compose with `&&`, `||`, `!`, and parentheses;
+`!` binds tighter than comparisons, `&&` tighter than `||`, with left-to-right
+short-circuit evaluation. Length comparisons accept `<`, `>`, `==`, `<=`, `>=`,
+and `!=` against an integer literal on either side. A handler accepts up to four
+source guards and 32 condition nodes across their trees (leaf predicates and
+binary operators); nesting is bounded as well. The first failing guard executes
+its else verdict; otherwise the final verdict runs. For example:
+
+```swift
+upstream chat at "127.0.0.1:9000"
+route GET "/chat" {
+    return websocket(chat) { frame in
+        guard !frame.fromClient || !frame.isText || !frame.text.matches(re".*spam.*") else {
+            frame.drop()
+        }
+        frame.forward()
+    }
+}
+```
+
+This drops matching client text messages and forwards upstream/binary messages
+without scanning their payloads. Regex `matches` tests the whole message, so the
+explicit `.*` enables substring filtering here. Control frames are relayed without
+invoking the handler.
 
 The examples in this section include planned syntax and actions. The current
 terminate implementation supports bounded reassembled text/binary messages,

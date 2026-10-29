@@ -285,7 +285,9 @@ bool load_rut_program(const char* path,
         for (u32 i = 0; i < ir.hir->routes.len; i++) {
             const HirWsHandler& h = ir.hir->routes[i].ws_handler;
             if (!ir.hir->routes[i].is_ws_terminate) continue;
-            jit::WsLenGuardSpec guards[HirWsHandler::kMaxLenGuards];
+            static_assert(HirWsHandler::kMaxConditionNodes == jit::WsLenGuardSpec::kMaxConditions);
+            static_assert(HirWsHandler::kMaxLenGuards == jit::WsLenGuardSpec::kMaxGuards);
+            jit::WsLenGuardSpec guards[HirWsHandler::kMaxConditionNodes];
             for (u32 g = 0; g < h.len_guards.len; g++) {
                 guards[g].accessor = static_cast<u8>(h.len_guards[g].accessor);
                 guards[g].cmp = static_cast<u8>(h.len_guards[g].cmp);
@@ -294,6 +296,9 @@ bool load_rut_program(const char* path,
                 guards[g].pattern = h.len_guards[g].pattern.ptr;
                 guards[g].pattern_len = h.len_guards[g].pattern.len;
                 guards[g].negate = h.len_guards[g].negate ? 1u : 0u;
+                guards[g].lhs = h.len_guards[g].lhs;
+                guards[g].rhs = h.len_guards[g].rhs;
+                guards[g].is_operand = h.len_guards[g].is_operand;
             }
             if (!jit::emit_ws_handler(cg.mod,
                                       cg.ctx,

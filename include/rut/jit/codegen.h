@@ -39,29 +39,33 @@ CodegenResult codegen(const rir::Module& rir_mod);
 // Returns the output length excluding the trailing '\0'.
 u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size);
 
-// A `guard frame.len <cmp> bound else { <verdict> }` check for the frame-handler codegen.
-// Mirrors HirWsHandler::WsLenGuard but stays hir-free so the serve loader can build it.
+// Postorder frame-condition forest, mirroring WsLenGuard without a HIR dependency.
 struct WsLenGuardSpec {
+    static constexpr u32 kMaxConditions = 32;
+    static constexpr u32 kMaxGuards = 4;
     u8 accessor;  // WsLenGuard::Accessor ordinal: 0=Len (frame.len, i64 param 3),
                   //                                1=Opcode (frame opcode, i8 param 1),
                   //                                2=FromClient (direction, i8 param 4),
                   //                                3=TextMatch (regex over payload, params 2+3)
+                  //                                4=And, 5=Or (short-circuit child conditions)
     u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
     u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
                   // FromClient: 1 (client→upstream leg)
     u8 verdict;   // WsFrameAction yielded when the guard CONDITION is false
-    // TextMatch only: the regex pattern to scan the payload with (NUL-terminated not required;
-    // pattern_len is authoritative) and whether a leading `not` inverts the match result.
+    // TextMatch only: the regex pattern (pattern_len is authoritative).
     const char* pattern;
     u32 pattern_len;
-    u8 negate;
+    u8 negate;    // invert this condition, including a compound subtree
+    u32 lhs = 0;  // And/Or child indices, strictly less than the parent index
+    u32 rhs = 0;
+    bool is_operand = false;
 };
 
 // Emit a WebSocket terminate-mode frame handler into `mod`:
 //   i8 ws_handler_<id>(i8* ctx, i8 opcode, i8* payload, i64 len, i8 from_client)
 // matching WsMessageHandlerFn (WsFrameAction(*)(void*, WsOpcode, const u8*, u64, bool)). It checks
-// each guard against `len` (= frame.len) in order — the first whose condition is FALSE returns
-// that guard's verdict — then returns `default_verdict`. Verdicts are WsFrameAction values
+// each guard root in order, with short-circuit &&/|| — the first FALSE root returns
+// its verdict — then returns `default_verdict`. Verdicts are WsFrameAction values
 // (Forward=0/Drop=1/Close=2). This bypasses the RIR/MIR HTTP pipeline. Returns false on error.
 bool emit_ws_handler(LLVMModuleRef mod,
                      LLVMContextRef ctx,
