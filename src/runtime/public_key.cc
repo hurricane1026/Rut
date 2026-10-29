@@ -4,18 +4,11 @@
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 
-#include <openssl/err.h>
-
 namespace rut {
 namespace {
 struct ErrorScope {
-    bool marked = ERR_set_mark() != 0;
-    ~ErrorScope() {
-        if (marked)
-            (void)ERR_pop_to_mark();
-        else
-            ERR_clear_error();
-    }
+    u32 marked = rut_crypto_error_scope_begin_internal();
+    ~ErrorScope() { rut_crypto_error_scope_end_internal(marked); }
 };
 }  // namespace
 

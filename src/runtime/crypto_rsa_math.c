@@ -2,9 +2,20 @@
 #include "rut/runtime/crypto_c.h"
 
 #include <openssl/bn.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
+
+uint32_t rut_crypto_error_scope_begin_internal(void) {
+    return ERR_set_mark() != 0;
+}
+void rut_crypto_error_scope_end_internal(uint32_t marked) {
+    if (marked)
+        (void)ERR_pop_to_mark();
+    else
+        ERR_clear_error();
+}
 
 void rut_crypto_rsa_key_free_internal(EVP_PKEY* key) {
     EVP_PKEY_free(key);

@@ -7,6 +7,8 @@
 extern "C" {
 #endif
 /* Internal shard-owned workspace; no pointers are retained by this call. */
+uint32_t rut_crypto_error_scope_begin_internal(void);
+void rut_crypto_error_scope_end_internal(uint32_t marked);
 EVP_PKEY* rut_crypto_rsa_load_der_internal(const uint8_t* der, uint32_t length);
 EVP_PKEY* rut_crypto_rsa_from_modulus_internal(const uint8_t* modulus, uint32_t length);
 void rut_crypto_rsa_key_free_internal(EVP_PKEY* key);
