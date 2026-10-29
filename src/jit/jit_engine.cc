@@ -1,5 +1,6 @@
 #include "rut/jit/jit_engine.h"
 
+#include "rut/jit/native_helper_symbols.h"
 #include "rut/jit/runtime_helpers.h"
 
 #include <llvm-c/Analysis.h>
@@ -46,63 +47,10 @@ struct HelperEntry {
 
 // Null-terminated table of runtime helper symbols.
 static const HelperEntry kHelpers[] = {
-    {"rut_helper_req_path", reinterpret_cast<void*>(&rut_helper_req_path)},
-    {"rut_helper_req_path_only", reinterpret_cast<void*>(&rut_helper_req_path_only)},
-    {"rut_helper_req_body", reinterpret_cast<void*>(&rut_helper_req_body)},
-    {"rut_helper_req_http_version", reinterpret_cast<void*>(&rut_helper_req_http_version)},
-    {"rut_helper_req_flag", reinterpret_cast<void*>(&rut_helper_req_flag)},
-    {"rut_helper_req_method", reinterpret_cast<void*>(&rut_helper_req_method)},
-    {"rut_helper_req_header_count", reinterpret_cast<void*>(&rut_helper_req_header_count)},
-    {"rut_helper_req_unique_header", reinterpret_cast<void*>(&rut_helper_req_unique_header)},
-    {"rut_helper_req_header", reinterpret_cast<void*>(&rut_helper_req_header)},
-    {"rut_helper_req_set_path", reinterpret_cast<void*>(&rut_helper_req_set_path)},
-    {"rut_helper_req_set_load_balance", reinterpret_cast<void*>(&rut_helper_req_set_load_balance)},
-    {"rut_helper_req_set_target_transform",
-     reinterpret_cast<void*>(&rut_helper_req_set_target_transform)},
-    {"rut_helper_req_set_header", reinterpret_cast<void*>(&rut_helper_req_set_header)},
-    {"rut_helper_req_set_owned_header", reinterpret_cast<void*>(&rut_helper_req_set_owned_header)},
-    {"rut_helper_req_add_header", reinterpret_cast<void*>(&rut_helper_req_add_header)},
-    {"rut_helper_req_remove_header", reinterpret_cast<void*>(&rut_helper_req_remove_header)},
-    {"rut_helper_resp_set_header", reinterpret_cast<void*>(&rut_helper_resp_set_header)},
-    {"rut_helper_resp_set_optional_header",
-     reinterpret_cast<void*>(&rut_helper_resp_set_optional_header)},
-    {"rut_helper_resp_add_header", reinterpret_cast<void*>(&rut_helper_resp_add_header)},
-    {"rut_helper_resp_remove_header", reinterpret_cast<void*>(&rut_helper_resp_remove_header)},
-    {"rut_helper_resp_commit_headers", reinterpret_cast<void*>(&rut_helper_resp_commit_headers)},
-    {"rut_helper_resp_header", reinterpret_cast<void*>(&rut_helper_resp_header)},
-    {"rut_helper_req_cookie", reinterpret_cast<void*>(&rut_helper_req_cookie)},
-    {"rut_helper_req_query", reinterpret_cast<void*>(&rut_helper_req_query)},
-    {"rut_helper_req_query_string", reinterpret_cast<void*>(&rut_helper_req_query_string)},
-    {"rut_helper_req_param", reinterpret_cast<void*>(&rut_helper_req_param)},
-    {"rut_helper_req_remote_addr", reinterpret_cast<void*>(&rut_helper_req_remote_addr)},
-    {"rut_helper_req_content_length", reinterpret_cast<void*>(&rut_helper_req_content_length)},
-    {"rut_helper_parse_prime", reinterpret_cast<void*>(&rut_helper_parse_prime)},
-    {"rut_helper_parse_unprime", reinterpret_cast<void*>(&rut_helper_parse_unprime)},
-    {"rut_helper_hash", reinterpret_cast<void*>(&rut_helper_hash)},
-    {"rut_helper_uuid", reinterpret_cast<void*>(&rut_helper_uuid)},
-    {"rut_helper_str_has_prefix", reinterpret_cast<void*>(&rut_helper_str_has_prefix)},
-    {"rut_helper_http_origin_list_allows",
-     reinterpret_cast<void*>(&rut_helper_http_origin_list_allows)},
-    {"rut_helper_http_token_list_allows",
-     reinterpret_cast<void*>(&rut_helper_http_token_list_allows)},
-    {"rut_helper_bearer_matches", reinterpret_cast<void*>(&rut_helper_bearer_matches)},
-    {"rut_helper_standard_webhook_valid",
-     reinterpret_cast<void*>(&rut_helper_standard_webhook_valid)},
-    {"rut_helper_hmac_sha256_matches", reinterpret_cast<void*>(&rut_helper_hmac_sha256_matches)},
-    {"rut_helper_basic_matches", reinterpret_cast<void*>(&rut_helper_basic_matches)},
-    {"rut_helper_str_constant_time_equal",
-     reinterpret_cast<void*>(&rut_helper_str_constant_time_equal)},
-    {"rut_helper_str_eq", reinterpret_cast<void*>(&rut_helper_str_eq)},
-    {"rut_helper_str_cmp", reinterpret_cast<void*>(&rut_helper_str_cmp)},
-    {"rut_helper_str_regex_match", reinterpret_cast<void*>(&rut_helper_str_regex_match)},
-    {"rut_helper_str_trim_prefix", reinterpret_cast<void*>(&rut_helper_str_trim_prefix)},
-    {"rut_helper_resp_body", reinterpret_cast<void*>(&rut_helper_resp_body)},
-    {"rut_helper_json", reinterpret_cast<void*>(&rut_helper_json)},
-    {"rut_helper_cache_get", reinterpret_cast<void*>(&rut_helper_cache_get)},
-    {"rut_helper_cache_set", reinterpret_cast<void*>(&rut_helper_cache_set)},
-    {"rut_helper_time_now_micros", reinterpret_cast<void*>(&rut_helper_time_now_micros)},
-    {"rut_helper_time_unlatch", reinterpret_cast<void*>(&rut_helper_time_unlatch)},
-    {nullptr, nullptr},
+#define RUT_NATIVE_HELPER_ENTRY(name) {#name, reinterpret_cast<void*>(&(name))},
+    RUT_NATIVE_HELPER_SYMBOLS(RUT_NATIVE_HELPER_ENTRY)
+#undef RUT_NATIVE_HELPER_ENTRY
+        {nullptr, nullptr},
 };
 
 // ── JitEngine ──────────────────────────────────────────────────────

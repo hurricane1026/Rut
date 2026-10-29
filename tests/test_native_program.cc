@@ -1,6 +1,7 @@
 #include "deferred_preflight_fixture.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
+#include "rut/jit/native_helper_symbols.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_program.h"
 #include "rut/runtime/cache_table.h"
@@ -18,6 +19,19 @@
 #include <unistd.h>
 
 using namespace rut;
+TEST(native_program, helper_resolver_rejects_unlisted_symbols) {
+    u32 count = 0;
+    const auto* symbols = native_helper_symbols(count);
+    REQUIRE(symbols);
+    REQUIRE(count > 0);
+    for (u32 i = 0; i < count; ++i) {
+        const Str name{symbols[i].name, static_cast<u32>(strlen(symbols[i].name))};
+        CHECK(find_native_helper(name) == symbols[i].address);
+    }
+    CHECK(find_native_helper(lit_str("malloc")) == nullptr);
+    CHECK(find_native_helper(lit_str("rut_helper_hash_extra")) == nullptr);
+    CHECK(find_native_helper({nullptr, 1}) == nullptr);
+}
 namespace {
 struct Source {
     char path[4096] = "/tmp/rut native source-XXXXXX";

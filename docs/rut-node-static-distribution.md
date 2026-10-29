@@ -191,6 +191,11 @@ distro/distroless 基础层)。
 
 ## 6. 剩余工程
 
+当前 JIT 与无 LLVM 的 native helper resolver 共用同一份静态符号白名单。
+resolver 只返回精确列出的 helper，未知符号不会回退到进程全局查找。这为
+不使用 `dlsym` 的加载器提供符号绑定基础；它本身不装载 ELF、不执行重定位，
+也不使静态 musl runtime 能加载 `.rut` 产物。
+
 | # | 工作 | 规模 | 耦合 |
 |---|---|---|---|
 | ① | 产物格式 + 无 LLVM 加载器 | 净新增(最大) | 产物格式要同时装 handler PIC 码 + 序列化的 Vectorscan DB |
