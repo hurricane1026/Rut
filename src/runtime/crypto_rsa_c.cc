@@ -157,3 +157,21 @@ extern "C" rut_crypto_rsa_verifier_v1* rut_crypto_rsa_verifier_set_select_v1(
         {reinterpret_cast<const char*>(kid), kid_len});
     return reinterpret_cast<rut_crypto_rsa_verifier_v1*>(selected.verifier);
 }
+
+extern "C" rut_crypto_rsa_verifier_v1* rut_crypto_rsa_verifier_set_select_id_v1(
+    rut_crypto_rsa_verifier_set_v1* verifiers,
+    const uint8_t* kid,
+    uint32_t kid_len,
+    const uint8_t** canonical_id,
+    uint32_t* canonical_id_len) {
+    if (!canonical_id || !canonical_id_len) return nullptr;
+    *canonical_id = nullptr;
+    *canonical_id_len = 0;
+    if (!verifiers || (!kid && kid_len)) return nullptr;
+    auto selected = reinterpret_cast<rut::Rs256VerifierSet*>(verifiers)->select(
+        {reinterpret_cast<const char*>(kid), kid_len});
+    if (!selected.verifier) return nullptr;
+    *canonical_id = reinterpret_cast<const uint8_t*>(selected.kid.ptr);
+    *canonical_id_len = selected.kid.len;
+    return reinterpret_cast<rut_crypto_rsa_verifier_v1*>(selected.verifier);
+}

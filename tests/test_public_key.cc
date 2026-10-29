@@ -171,6 +171,15 @@ TEST(public_key, c_abi_key_set_keeps_shard_verifier_alive) {
     for (char& c : buffer) c = 0;
     CHECK(
         !rut_crypto_rsa_verifier_set_select_v1(set, reinterpret_cast<const uint8_t*>("other"), 5));
+    const uint8_t* canonical_id = reinterpret_cast<const uint8_t*>("stale");
+    u32 canonical_len = 123;
+    CHECK(!rut_crypto_rsa_verifier_set_select_id_v1(
+        set, reinterpret_cast<const uint8_t*>("other"), 5, &canonical_id, &canonical_len));
+    CHECK(canonical_id == nullptr);
+    CHECK_EQ(canonical_len, 0u);
+    REQUIRE(rut_crypto_rsa_verifier_set_select_id_v1(
+        set, reinterpret_cast<const uint8_t*>("fixed"), 5, &canonical_id, &canonical_len));
+    CHECK((Str{reinterpret_cast<const char*>(canonical_id), canonical_len}.eq(lit_str("fixed"))));
     auto* verifier =
         rut_crypto_rsa_verifier_set_select_v1(set, reinterpret_cast<const uint8_t*>("fixed"), 5);
     REQUIRE(verifier);

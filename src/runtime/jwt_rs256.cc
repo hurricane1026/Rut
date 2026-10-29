@@ -109,10 +109,17 @@ bool decode_with_key(RsaSha256Verifier* verifier,
     Str candidate_id{};
     if (keys) {
         if (!has_kid) return false;
-        const auto kSelected = keys->select({kid, kid_length});
-        if (!kSelected.verifier) return false;
-        verifier = kSelected.verifier;
-        candidate_id = kSelected.kid;
+        const uint8_t* canonical_id = nullptr;
+        u32 canonical_len = 0;
+        auto* selected = rut_crypto_rsa_verifier_set_select_id_v1(
+            reinterpret_cast<rut_crypto_rsa_verifier_set_v1*>(keys),
+            reinterpret_cast<const uint8_t*>(kid),
+            kid_length,
+            &canonical_id,
+            &canonical_len);
+        if (!selected) return false;
+        verifier = reinterpret_cast<RsaSha256Verifier*>(selected);
+        candidate_id = {reinterpret_cast<const char*>(canonical_id), canonical_len};
     }
     char signature[512];
     if (!decode({token.ptr + second + 1, token.len - second - 1},

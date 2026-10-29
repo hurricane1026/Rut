@@ -153,6 +153,16 @@ rut_crypto_rsa_verifier_set_v1* rut_crypto_rsa_verifier_set_init_v1(
 void rut_crypto_rsa_verifier_set_destroy_v1(rut_crypto_rsa_verifier_set_v1* verifiers);
 rut_crypto_rsa_verifier_v1* rut_crypto_rsa_verifier_set_select_v1(
     rut_crypto_rsa_verifier_set_v1* verifiers, const uint8_t* kid, uint32_t kid_len);
+/* On success, canonical_id borrows the stored trusted ID until set destruction.
+ * Both output parameters are required and must not alias inputs or each other.
+ * On failure they are set to null and zero. This selection is not proof that
+ * a signature is valid. */
+rut_crypto_rsa_verifier_v1* rut_crypto_rsa_verifier_set_select_id_v1(
+    rut_crypto_rsa_verifier_set_v1* verifiers,
+    const uint8_t* kid,
+    uint32_t kid_len,
+    const uint8_t** canonical_id,
+    uint32_t* canonical_id_len);
 
 #ifdef __cplusplus
 }
