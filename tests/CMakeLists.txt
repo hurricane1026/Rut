@@ -916,13 +916,21 @@ add_test(NAME test_frontend.shard_0_of_2
     COMMAND test_frontend --shard-index=0 --shard-count=2)
 add_test(NAME test_frontend.shard_1_of_2
     COMMAND test_frontend --shard-index=1 --shard-count=2)
+if(RUT_SANITIZE)
+    # Recent sanitizer CI runs completed shard 0 in 112.5s once and exceeded
+    # 120s twice. The test-level timeout overrides the workflow timeout, so
+    # allow headroom on slower sanitizer runners.
+    set(_RUT_FRONTEND_TEST_TIMEOUT 300)
+else()
+    set(_RUT_FRONTEND_TEST_TIMEOUT 120)
+endif()
 set_tests_properties(
     test_frontend.shard_0_of_2
     test_frontend.shard_1_of_2
     PROPERTIES
         LABELS "unit;compiler"
         RUN_SERIAL TRUE
-        TIMEOUT 120)
+        TIMEOUT ${_RUT_FRONTEND_TEST_TIMEOUT})
 
 add_executable(test_hir_generated_names_lifetime test_hir_generated_names_lifetime.cc)
 target_include_directories(test_hir_generated_names_lifetime PRIVATE

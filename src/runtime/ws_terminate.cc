@@ -111,6 +111,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // the bytes already accumulated for an in-progress fragmented message (0 for a
         // fresh one); the sum is also the exact msg_buf write bound below.
         if (!ws_opcode_is_control(h.opcode)) {
+            // The header alone proves an invalid fragment sequence. Reject it
+            // before waiting for the advertised payload.
+            if ((h.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented)
+                return WsInspectStatus::Error;
             if (st.message_len + h.payload_len > msg_cap) return WsInspectStatus::Error;
             if (st.max_message_size != 0 && st.message_len + h.payload_len > st.max_message_size) {
                 return WsInspectStatus::Error;

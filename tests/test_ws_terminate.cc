@@ -65,6 +65,33 @@ WsInspector make_state(bool masked) {
 
 }  // namespace
 
+TEST(ws_terminate, rejects_invalid_fragment_sequence_on_header) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 out[128], msg[256], hdr[kWsMaxHeaderSize];
+    const u8 key[4] = {};
+    u32 consumed = 0, produced = 0;
+    u32 n = ws_write_header(hdr, WsOpcode::Continuation, true, false, key, 125);
+    CHECK(ws_inspect(
+              st, hdr, n, out, sizeof(out), msg, sizeof(msg), record, &r, &consumed, &produced) ==
+          WsInspectStatus::Error);
+    CHECK_EQ(consumed, 0u);
+    CHECK_EQ(r.calls, 0);
+    const u8 payload[] = {'a'};
+    u8 frame[16];
+    n = build(frame, WsOpcode::Text, false, false, payload, sizeof(payload));
+    REQUIRE(
+        ws_inspect(
+            st, frame, n, out, sizeof(out), msg, sizeof(msg), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Ok);
+    n = ws_write_header(hdr, WsOpcode::Binary, true, false, key, 125);
+    CHECK(ws_inspect(
+              st, hdr, n, out, sizeof(out), msg, sizeof(msg), record, &r, &consumed, &produced) ==
+          WsInspectStatus::Error);
+    CHECK_EQ(consumed, 0u);
+    CHECK_EQ(r.calls, 0);
+}
+
 // === Forward (server->client, unmasked) ===
 
 TEST(ws_terminate, forward_unmasked_text) {
