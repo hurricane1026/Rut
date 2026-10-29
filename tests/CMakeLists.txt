@@ -839,7 +839,7 @@ add_test(NAME test_hash COMMAND test_hash)
 set_tests_properties(test_hash PROPERTIES LABELS "unit")
 
 add_executable(test_crypto_c test_crypto_c.c)
-target_link_libraries(test_crypto_c rut_runtime)
+target_link_libraries(test_crypto_c rut_crypto)
 add_test(NAME test_crypto_c COMMAND test_crypto_c)
 set_tests_properties(test_crypto_c PROPERTIES LABELS "unit")
 

@@ -102,11 +102,16 @@ else()
 endif()
 
 # Runtime library
+# Keep the crypto ABI in a separately linkable static library.  Its callers
+# own all buffers; OpenSSL is the pinned static dependency above.
+add_library(rut_crypto STATIC runtime/hash.cc)
+target_include_directories(rut_crypto PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(rut_crypto PUBLIC crypto)
+
 add_library(rut_runtime STATIC
     placement_new.cc
     runtime/auth.cc
     runtime/webhook.cc
-    runtime/hash.cc
     runtime/memory_http_cache_store.cc
     runtime/http_tokens.cc
     runtime/http_cache.cc
@@ -157,6 +162,7 @@ target_include_directories(rut_runtime PUBLIC
 # runtime itself is warn_unused_result-clean.
 target_compile_options(rut_runtime PRIVATE -Werror=unused-result)
 target_link_libraries(rut_runtime
+    rut_crypto
     zstd_compress
     ssl
     crypto
