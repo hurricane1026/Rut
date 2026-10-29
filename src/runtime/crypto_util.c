@@ -39,6 +39,14 @@ uint32_t rut_crypto_equal_v1(const uint8_t* a, const uint8_t* b, uint32_t length
     return CRYPTO_memcmp(a, b, length) == 0;
 }
 
+uint32_t rut_crypto_equal_bounded_v1(const uint8_t* a,
+                                     uint32_t a_len,
+                                     const uint8_t* b,
+                                     uint32_t b_len) {
+    if (a_len != b_len || a_len > 16u * 1024u) return 0;
+    return rut_crypto_equal_v1(a, b, a_len);
+}
+
 uint32_t rut_crypto_hmac_sha256_matches_v1(const uint8_t* message,
                                            uint32_t message_len,
                                            const uint8_t* key,

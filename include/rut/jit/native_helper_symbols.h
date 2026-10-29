@@ -42,6 +42,7 @@
     X(rut_crypto_digest_parts_v1)               \
     X(rut_crypto_hmac_long_key_v1)              \
     X(rut_crypto_equal_v1)                      \
+    X(rut_crypto_equal_bounded_v1)              \
     X(rut_crypto_hmac_sha256_matches_v1)        \
     X(rut_crypto_clear_v1)                      \
     X(rut_crypto_base64_encode_v1)              \

@@ -13,6 +13,10 @@ int main(void) {
         length != sizeof(output))
         return 1;
     if (!rut_crypto_equal_v1(output, expected, sizeof(output))) return 2;
+    if (!rut_crypto_equal_bounded_v1(0, 0, 0, 0) ||
+        rut_crypto_equal_bounded_v1(input, sizeof(input), output, 0) ||
+        rut_crypto_equal_bounded_v1(input, 16385, input, 16385))
+        return 6;
     rut_crypto_clear_v1(output, sizeof(output));
     for (uint32_t i = 0; i < sizeof(output); ++i)
         if (output[i]) return 3;

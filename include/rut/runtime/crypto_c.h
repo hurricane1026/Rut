@@ -81,6 +81,12 @@ uint32_t rut_crypto_hmac_long_key_v1(uint32_t algorithm,
 /* Compare equally sized byte strings without content-dependent timing. A null
  * pointer is valid only for zero length. Length itself is public. */
 uint32_t rut_crypto_equal_v1(const uint8_t* a, const uint8_t* b, uint32_t length);
+/* Compare public lengths and at most 16 KiB of secret content. Empty inputs
+ * compare equal, including null/zero spans; other null pointers fail closed. */
+uint32_t rut_crypto_equal_bounded_v1(const uint8_t* a,
+                                     uint32_t a_len,
+                                     const uint8_t* b,
+                                     uint32_t b_len);
 /* Verify a canonical lowercase hexadecimal HMAC-SHA256 signature with an
  * optional exact public prefix (at most 64 bytes). The message is bounded to
  * 1 MiB and the nonempty key to 4096 bytes. Inputs are borrowed synchronously;

@@ -1155,11 +1155,9 @@ u8 rut_helper_basic_matches(const char* authorization,
 }
 
 u8 rut_helper_str_constant_time_equal(const char* a, u32 a_len, const char* b, u32 b_len) {
-    if (a_len != b_len || a_len > kMaxConstantTimeEqualBytes) return 0;
-    if (a_len == 0) return 1;
-    if (a == nullptr || b == nullptr) return 0;
-    return rut_crypto_equal_v1(
-        reinterpret_cast<const u8*>(a), reinterpret_cast<const u8*>(b), a_len);
+    static_assert(kMaxConstantTimeEqualBytes == 16u * 1024u);
+    return rut_crypto_equal_bounded_v1(
+        reinterpret_cast<const u8*>(a), a_len, reinterpret_cast<const u8*>(b), b_len);
 }
 
 u8 rut_helper_str_eq(const char* a, u32 a_len, const char* b, u32 b_len) {

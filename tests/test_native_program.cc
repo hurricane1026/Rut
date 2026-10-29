@@ -488,6 +488,27 @@ TEST(native_program, uuid_is_available_after_compiler_exit_with_request_arena) {
     pool.destroy();
 }
 
+TEST(native_program, hmac_uses_c_crypto_after_compiler_exit) {
+    Source source;
+    REQUIRE(source.append(
+        "route GET \"/\" { "
+        "guard hmacSha256Matches(\"abc\", \"key\", req.uniqueHeader(\"X-Signature\").or(\"\"), "
+        "\"sha256=\") else { return 401 } return 200 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    CHECK_EQ(
+        invoke(route,
+               "GET / HTTP/1.1\r\nX-Signature: "
+               "sha256=9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab\r\n\r\n")
+            .status_code,
+        200u);
+    CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Signature: sha256=wrong\r\n\r\n").status_code,
+             401u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

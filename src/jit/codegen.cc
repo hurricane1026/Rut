@@ -558,13 +558,13 @@ struct Ctx {
         return fn_req_content_length;
     }
 
-    // u8 rut_helper_str_constant_time_equal(ptr, i32, ptr, i32)
+    // u32 rut_crypto_equal_bounded_v1(ptr, i32, ptr, i32)
     LLVMValueRef get_str_constant_time_equal() {
         if (!fn_str_constant_time_equal) {
             LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
-            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 4, 0);
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, params, 4, 0);
             fn_str_constant_time_equal =
-                LLVMAddFunction(llvm_mod, "rut_helper_str_constant_time_equal", ft);
+                LLVMAddFunction(llvm_mod, "rut_crypto_equal_bounded_v1", ft);
         }
         return fn_str_constant_time_equal;
     }
@@ -598,9 +598,9 @@ struct Ctx {
     LLVMValueRef get_hmac_sha256_matches() {
         if (!fn_hmac_sha256_matches) {
             LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
-            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 8, 0);
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, params, 8, 0);
             fn_hmac_sha256_matches =
-                LLVMAddFunction(llvm_mod, "rut_helper_hmac_sha256_matches", ft);
+                LLVMAddFunction(llvm_mod, "rut_crypto_hmac_sha256_matches_v1", ft);
         }
         return fn_hmac_sha256_matches;
     }
@@ -1473,7 +1473,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(
                 inst.result,
                 LLVMBuildICmp(
-                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "hmac.bool"));
+                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i32_ty, 0, 0), "hmac.bool"));
             break;
         }
         case rir::Opcode::StandardWebhookValid: {
@@ -1511,9 +1511,10 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                                   : c.get_str_constant_time_equal();
             LLVMValueRef r =
                 LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 4, "cte");
-            // Convert u8 result to i1 for branch usage
+            const auto return_type =
+                inst.op == rir::Opcode::StrConstantTimeEqual ? c.i32_ty : c.i8_ty;
             LLVMValueRef b =
-                LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "cte.bool");
+                LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(return_type, 0, 0), "cte.bool");
             c.set_value(inst.result, b);
             break;
         }
