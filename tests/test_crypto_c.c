@@ -143,5 +143,18 @@ int main(void) {
     rut_crypto_clear_v1(out, sizeof(out));
     for (uint32_t i = 0; i < sizeof(out); ++i)
         if (out[i] != 0) return 23;
+    out[0] = 0xa5;
+    if (rut_crypto_digest_hex_v1(
+            RUT_CRYPTO_SHA256_V1, input, sizeof(input), NULL, 0, 0, out, 63, &len) ||
+        len || out[0] != 0xa5)
+        return 24;
+    static const char hex_expected[] =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    if (!rut_crypto_digest_hex_v1(
+            RUT_CRYPTO_SHA256_V1, input, sizeof(input), NULL, 0, 0, out, sizeof(out), &len) ||
+        len != 64)
+        return 25;
+    for (uint32_t i = 0; i < len; ++i)
+        if (out[i] != (uint8_t)hex_expected[i]) return 26;
     return 0;
 }

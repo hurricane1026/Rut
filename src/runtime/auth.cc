@@ -105,7 +105,15 @@ bool hmac_sha256_matches(Str message, Str key, Str signature, Str prefix) {
         if (signature.ptr[i] != prefix.ptr[i]) return false;
     char encoded[kMaxHashHexBytes];
     u32 length = 0;
-    const bool kComputed = hash_hex(HashAlgorithm::Sha256, message, key, true, encoded, length);
+    const bool kComputed = rut_crypto_digest_hex_v1(RUT_CRYPTO_SHA256_V1,
+                                                    reinterpret_cast<const u8*>(message.ptr),
+                                                    message.len,
+                                                    reinterpret_cast<const u8*>(key.ptr),
+                                                    key.len,
+                                                    1,
+                                                    reinterpret_cast<u8*>(encoded),
+                                                    sizeof(encoded),
+                                                    &length);
     const bool kMatches =
         kComputed && length == 64 &&
         rut_crypto_equal_v1(reinterpret_cast<const u8*>(encoded),

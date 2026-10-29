@@ -1027,12 +1027,15 @@ extern "C" void rut_helper_hash(void* conn,
     if (storage == nullptr || storage->backend.pool == nullptr) return;
     char text[kMaxHashHexBytes];
     u32 length = 0;
-    if (!hash_hex(static_cast<HashAlgorithm>(kAlgorithm),
-                  kKeyed ? Str{b, b_len} : Str{a, a_len},
-                  kKeyed ? Str{a, a_len} : Str{},
-                  kKeyed,
-                  text,
-                  length))
+    if (!rut_crypto_digest_hex_v1(kAlgorithm,
+                                  reinterpret_cast<const u8*>(kKeyed ? b : a),
+                                  kKeyed ? b_len : a_len,
+                                  reinterpret_cast<const u8*>(kKeyed ? a : nullptr),
+                                  kKeyed ? a_len : 0,
+                                  kKeyed ? 1u : 0u,
+                                  reinterpret_cast<u8*>(text),
+                                  sizeof(text),
+                                  &length))
         return;
     if (storage->space_used() <= kHashRequestBudget - length &&
         (storage->current != nullptr || storage->init(storage->backend.pool))) {

@@ -8,7 +8,8 @@ extern "C" {
 #endif
 
 /* Version 1 algorithm identifiers; numeric values are part of the C ABI. */
-enum rut_crypto_digest_algorithm_v1 { /* NOLINT(performance-enum-size): C-compatible ABI. */
+/* NOLINTNEXTLINE(performance-enum-size): C-compatible ABI. */
+enum rut_crypto_digest_algorithm_v1 {
     RUT_CRYPTO_MD5_V1 = 0,
     RUT_CRYPTO_SHA1_V1 = 1,
     RUT_CRYPTO_SHA224_V1 = 2,
@@ -33,6 +34,18 @@ uint32_t rut_crypto_digest_v1(uint32_t algorithm,
                               uint8_t* output,
                               uint32_t capacity,
                               uint32_t* output_len);
+
+/* Lowercase hexadecimal digest, with no terminating NUL. Input, key, failure
+ * and aliasing rules match rut_crypto_digest_v1. */
+uint32_t rut_crypto_digest_hex_v1(uint32_t algorithm,
+                                  const uint8_t* data,
+                                  uint32_t data_len,
+                                  const uint8_t* key,
+                                  uint32_t key_len,
+                                  uint32_t keyed,
+                                  uint8_t* output,
+                                  uint32_t capacity,
+                                  uint32_t* output_len);
 
 typedef struct rut_crypto_span_v1 {
     const uint8_t* data;

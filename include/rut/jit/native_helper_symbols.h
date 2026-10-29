@@ -38,6 +38,7 @@
     X(rut_helper_parse_unprime)            \
     X(rut_helper_hash)                     \
     X(rut_crypto_digest_v1)                \
+    X(rut_crypto_digest_hex_v1)            \
     X(rut_crypto_digest_parts_v1)          \
     X(rut_crypto_hmac_long_key_v1)         \
     X(rut_crypto_equal_v1)                 \
