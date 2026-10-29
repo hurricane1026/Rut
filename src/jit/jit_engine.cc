@@ -47,7 +47,7 @@ struct HelperEntry {
 
 // Null-terminated table of runtime helper symbols.
 static const HelperEntry kHelpers[] = {
-#define RUT_NATIVE_HELPER_ENTRY(name) {#name, reinterpret_cast<void*>(&name)},
+#define RUT_NATIVE_HELPER_ENTRY(name) {#name, reinterpret_cast<void*>(&(name))},
     RUT_NATIVE_HELPER_SYMBOLS(RUT_NATIVE_HELPER_ENTRY)
 #undef RUT_NATIVE_HELPER_ENTRY
         {nullptr, nullptr},
