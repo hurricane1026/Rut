@@ -111,14 +111,19 @@ add_library(rut_crypto_digest STATIC
 target_include_directories(rut_crypto_digest PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(rut_crypto_digest PUBLIC crypto)
 
+add_library(rut_crypto_rsa_core STATIC
+    runtime/crypto_rsa_math.c
+)
+target_include_directories(rut_crypto_rsa_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(rut_crypto_rsa_core PUBLIC rut_crypto_digest)
+
 add_library(rut_crypto STATIC
     placement_new.cc
     runtime/public_key.cc
     runtime/crypto_rsa_c.cc
-    runtime/crypto_rsa_math.c
 )
 target_include_directories(rut_crypto PUBLIC ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(rut_crypto PUBLIC rut_crypto_digest)
+target_link_libraries(rut_crypto PUBLIC rut_crypto_rsa_core)
 
 add_library(rut_runtime STATIC
     runtime/hash.cc
