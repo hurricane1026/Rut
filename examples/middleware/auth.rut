@@ -169,6 +169,7 @@ func jwtDocumentHs512(_ authorization: str, _ secret: str) -> Json {
 }
 
 struct JwtSubject { sub: str }
+struct JwtTokenId { jti: str }
 
 // Pass only a document already verified by jwtDecode; this helper applies claims
 // policy and maps the verified subject, keeping signature verification explicit.
@@ -179,6 +180,18 @@ func jwtIdentity(_ document: Json, _ issuer: str, _ audience: str, _ credentialI
     guard jwtClaimsValid(document, issuer, audience) else { respond denied }
     guard let subject = json.decode(JwtSubject, document) else { respond denied }
     Identity(consumerId: subject.sub, credentialId: credentialId, method: "jwt")
+}
+
+// Use only after signature and issuer/audience/time validation. Each configured
+// ID belongs to the same trusted issuer as the verified claims; empty slots are
+// disabled. Changing this static snapshot requires a configuration reload.
+func requireUnrevokedJwt(_ document: Json, _ first: str, _ second: str) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard let token = json.decode(JwtTokenId, document) else { respond denied }
+    guard token.jti != "" && (first == "" || token.jti != first) &&
+          (second == "" || token.jti != second) else { respond denied }
+    document
 }
 
 // OR composition for one consumer during a migration between Bearer and Basic.

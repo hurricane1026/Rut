@@ -1331,6 +1331,15 @@ example first calls `auth.jwtDocument(authorization, secret)`, which composes
 Then it calls the separate identity helper. Existing HS256/384/512 support is unchanged.
 See [examples/jwt-claims-auth.rut](../examples/jwt-claims-auth.rut).
 
+`auth.requireUnrevokedJwt(document, first, second)` rejects a verified JWT with
+an absent, non-string or empty `jti`, or an exact case-sensitive match to either
+nonempty configured revoked ID, with a Bearer `invalid_token` 401. Empty slots
+are disabled. Call it only after signature and issuer/audience/time validation,
+and keep each static revoked-ID snapshot scoped to that trusted issuer. Updating
+the snapshot requires configuration replacement; it is limited to two IDs and
+does not provide live, durable, cross-node revocation. [RFC 7519 §4.1.7](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.7)
+defines `jti` as a JWT identifier, but does not itself provide a revocation store.
+
 ## JWT scope authorization (implemented)
 
 `jwtHasScope(claims: Json, required: str) -> bool` checks one complete,
