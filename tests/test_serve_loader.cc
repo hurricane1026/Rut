@@ -4717,6 +4717,101 @@ TEST(serve_loader, websocket_terminate_empty_rewrite_and_invalid_config) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_opcode_comparisons_execute_for_both_directions) {
+    const char* conditions[] = {"frame.opcode == .text",
+                                ".text == frame.opcode",
+                                "frame.opcode != .binary",
+                                ".binary != frame.opcode",
+                                "!(frame.opcode == .binary)",
+                                "!(frame.opcode != .text)",
+                                "frame.opcode == .binary",
+                                "frame.opcode != .text",
+                                ".binary == frame.opcode",
+                                ".text != frame.opcode"};
+    for (u32 i = 0; i < 10; i++) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\n"
+            "route GET \"/ws\" { return websocket(backend) { frame in\n guard ";
+        source += conditions[i];
+        source += " else { frame.drop() }\n frame.forward() } }\n";
+        const auto path = write_file("/tmp/rut_ws_opcode_guards", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler != nullptr);
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                const bool pass = (op == WsOpcode::Text) == (i < 6);
+                CHECK(handler(nullptr, op, nullptr, 0, client) ==
+                      (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+        program.destroy();
+    }
+}
+
+TEST(serve_loader, websocket_compound_opcode_guards_reach_wire_after_reassembly) {
+    const auto path =
+        write_file("/tmp/rut_ws_opcode_compound",
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                   "guard !frame.fromClient || (frame.opcode == .text && frame.text == \"ok\") "
+                   "else { frame.close(1008, \"text only\") }\nframe.forward() } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    for (bool client : {false, true}) {
+        for (bool text : {false, true}) {
+            WsInspector st;
+            st.from_client = client;
+            st.close_policies = route.ws_close_policies;
+            st.close_policy_count = route.ws_close_policy_count;
+            st.max_message_size = route.ws_max_message_size;
+            const u8 first[] = {static_cast<u8>(text ? 0x01 : 0x02), 1, 'o'};
+            const u8 last[] = {0x80, 1, 'k'};
+            u8 out[128], msg[32];
+            u32 used = 0, produced = 0;
+            REQUIRE(ws_inspect(st,
+                               first,
+                               sizeof(first),
+                               out,
+                               sizeof(out),
+                               msg,
+                               sizeof(msg),
+                               route.ws_frame_handler,
+                               nullptr,
+                               &used,
+                               &produced) == WsInspectStatus::Ok);
+            CHECK_EQ(produced, 0u);
+            const bool rejected = client && !text;
+            REQUIRE(ws_inspect(st,
+                               last,
+                               sizeof(last),
+                               out,
+                               sizeof(out),
+                               msg,
+                               sizeof(msg),
+                               route.ws_frame_handler,
+                               nullptr,
+                               &used,
+                               &produced) ==
+                    (rejected ? WsInspectStatus::Close : WsInspectStatus::Ok));
+            if (rejected) {
+                CHECK_EQ(st.echo_close_code, 1008u);
+                CHECK(st.echo_close_reason.eq({"text only", 9}));
+            } else {
+                REQUIRE_EQ(produced, 4u);
+                CHECK_EQ(out[0], text ? 0x81u : 0x82u);
+                CHECK(memcmp(out + 2, "ok", 2) == 0);
+            }
+        }
+    }
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_terminate_text_literal_conditions) {
     const char* conditions[] = {
         "frame.text == \"ping\"",

@@ -129,6 +129,13 @@ and turns Rut's strong typing + bounded execution into the product differentiato
 
 ## 3. Surface syntax
 
+Current opcode conditions support `frame.opcode == .text`, `!= .binary`, either
+operand order, and composition with `!`, `&&`, and `||`. They select the complete
+Text/Binary message opcode after reassembly, including fragmented messages. Only
+`.text` and `.binary` are accepted; control frames bypass handlers. The sketches
+below remain historical where they use statement forms outside current bounded
+guard handlers.
+
 A `websocket(<upstream>)` call with **no trailing block** is passthrough (today's behavior,
 unchanged). A **trailing block** turns it into terminate mode — the block is the per-message
 handler. Per DESIGN.md §3.6, the block is a *compile-time construct*, not a closure; it

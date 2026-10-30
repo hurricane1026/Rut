@@ -5399,6 +5399,59 @@ TEST(frontend, parse_return_forward_name) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_opcode_comparisons_lower_to_existing_opcode_guards) {
+    const char* cases[] = {"frame.opcode == .text",
+                           ".text == frame.opcode",
+                           "frame.opcode != .text",
+                           ".binary != frame.opcode",
+                           "!(frame.opcode == .binary)",
+                           "!!(frame.opcode != .binary)"};
+    const u32 opcodes[] = {1, 1, 1, 2, 2, 2};
+    const bool negations[] = {false, false, true, true, true, true};
+    for (u32 i = 0; i < 6; i++) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+        source += cases[i];
+        source += " else { frame.drop() }\n frame.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& nodes = hir->routes[0].ws_handler.len_guards;
+        REQUIRE_EQ(nodes.len, 1u);
+        CHECK(nodes[0].accessor == WsLenGuard::Accessor::Opcode);
+        CHECK_EQ(nodes[0].bound, opcodes[i]);
+        CHECK_EQ(nodes[0].negate, negations[i]);
+    }
+}
+
+TEST(frontend, websocket_opcode_comparisons_reject_non_data_cases_and_other_types) {
+    for (const char* condition : {"frame.opcode == .ping",
+                                  "frame.opcode != .pong",
+                                  ".close == frame.opcode",
+                                  "frame.opcode == .continuation",
+                                  "frame.opcode == .Text",
+                                  "frame.opcode == .text(1)",
+                                  "frame.opcode == 1",
+                                  "frame.opcode == \"text\"",
+                                  "frame.opcode == frame.text",
+                                  "frame.opcode == frame.opcode",
+                                  "frame.opcode < .binary",
+                                  "frame.opcode"}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+        source += condition;
+        source += " else { frame.drop() }\n frame.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
 TEST(frontend, parse_return_websocket_bare_is_passthrough) {
     // A bare `websocket(<upstream>)` (no trailing block) stays the passthrough tunnel —
     // the same ForwardUpstream terminator as `forward`, unchanged from Phase 0.

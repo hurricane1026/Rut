@@ -410,6 +410,33 @@ TEST(native_program, websocket_guard_close_policies_survive_source_removal) {
     }
 }
 
+TEST(native_program, websocket_opcode_guards_survive_compiler_exit) {
+    Source source;
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\n"
+                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                      "guard !frame.fromClient || (.text == frame.opcode && frame.text == \"ok\") "
+                      "else { frame.drop() }\nframe.forward() } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    REQUIRE(handler != nullptr);
+    const bool flags[] = {false, true};
+    const WsOpcode opcodes[] = {WsOpcode::Text, WsOpcode::Binary};
+    for (bool client : flags) {
+        for (WsOpcode op : opcodes) {
+            for (bool matches : flags) {
+                const auto* payload = reinterpret_cast<const u8*>(matches ? "ok" : "no");
+                const bool pass = !client || (op == WsOpcode::Text && matches);
+                CHECK(handler(nullptr, op, payload, 2, client) ==
+                      (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+    }
+}
+
 TEST(native_program, websocket_regex_handler_survives_compiler_exit) {
     Source source;
     REQUIRE(

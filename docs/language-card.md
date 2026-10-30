@@ -827,6 +827,7 @@ return read(root: "/var/www")                  // zero-copy (uses *catch-all cap
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
 // Current terminate handlers: up to 4 guards over direction, text/binary opcode,
+// frame.opcode ==/!= .text/.binary (either side),
 // frame.len (< > == <= >= != integer literal, either side), text.matches(re),
 // text ==/!= string literal (either side), text.isEmpty, and
 // text.hasPrefix("literal"), text.hasSuffix("literal"), text.contains("literal").
@@ -842,6 +843,7 @@ return websocket(chat) { frame in
         frame.drop()
     }
     guard !frame.fromClient || frame.text != "ping" else { frame.drop() }
+    guard frame.opcode != .binary else { frame.close(1008, "text only") }
     guard frame.len <= 4096 else { frame.close() }
     frame.forward()
 }

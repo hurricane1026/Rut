@@ -2568,7 +2568,8 @@ The echo uses its direction's idle output slice, retained until send completion;
 no extra slices or enlarged inline close-frame buffers are needed.
 
 Current terminate handlers support `guard` conditions over `frame.fromClient`,
-`frame.isText`, `frame.isBinary`, `frame.len` comparisons, and
+`frame.isText`, `frame.isBinary`, `frame.opcode == .text` / `!= .binary`
+(with either operand order), `frame.len` comparisons, and
 `frame.text.matches(re"…")`, `frame.text == "literal"` (or `!=`, with the
 literal on either side), `frame.text.isEmpty`, `frame.text.hasPrefix("literal")`,
 `frame.text.hasSuffix("literal")`, and `frame.text.contains("literal")`.
@@ -2582,6 +2583,12 @@ payload access. `contains` searches for a contiguous byte substring, including
 embedded NUL; an empty substring matches every message. It does not interpret
 regex metacharacters or normalize Unicode. Dynamic arguments and interpolation
 remain unsupported.
+`frame.opcode` comparisons accept only the payload-free enum cases `.text` and
+`.binary`, because handlers receive complete data messages. Control cases such as
+`.ping`, numeric/string operands, payload-bearing cases, and ordered comparisons
+are rejected. Equality and inequality reuse the existing opcode condition node;
+this adds no runtime state or ABI changes. Negation and compound conditions retain
+the same precedence and short-circuit rules as the other predicates.
 Conditions compose with `&&`, `||`, `!`, and parentheses;
 `!` binds tighter than comparisons, `&&` tighter than `||`, with left-to-right
 short-circuit evaluation. Length comparisons accept `<`, `>`, `==`, `<=`, `>=`,
