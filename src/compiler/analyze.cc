@@ -7194,7 +7194,7 @@ static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& m
 // Match a leaf condition for the frame handler. `negate` is logical !, accepted
 // on boolean frame properties or `frame.text.matches(re)` (the blocklist form). Direction is a
 // bare `frame.fromClient` (true on the client→upstream leg); opcode discrimination is a bare
-// `frame.isText` / `frame.isBinary` (== the WsOpcode value); content is
+// `frame.isText` / `frame.isBinary`, or frame.opcode ==/!= .text/.binary; content is
 // `frame.text.matches(re"…")` (a regex over the payload); else a `frame.len <cmp> N`
 // comparison. Literal text equality, prefix/suffix/substring checks and text.isEmpty are also
 // supported. Anything else → UnsupportedSyntax.
@@ -7203,6 +7203,27 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
                                                            WsVerdict verdict,
                                                            bool negate,
                                                            const HirModule& mod) {
+    // Only data messages reach handlers; control opcodes are not cases of this surface.
+    // Reuse the existing Opcode leaf and the parser's != / ! normalization.
+    if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
+        const AstExpr* value = nullptr;
+        if (ws_is_frame_field(*cond.lhs, {"opcode", 6}))
+            value = cond.rhs;
+        else if (ws_is_frame_field(*cond.rhs, {"opcode", 6}))
+            value = cond.lhs;
+        if (value) {
+            if (value->kind != AstExprKind::VariantCase || value->lhs ||
+                (!value->str_value.eq({"text", 4}) && !value->str_value.eq({"binary", 6})))
+                return frontend_error(FrontendError::UnsupportedSyntax, value->span);
+            WsLenGuard g{};
+            g.accessor = WsLenGuard::Accessor::Opcode;
+            g.cmp = WsLenGuard::Cmp::Eq;
+            g.bound = value->str_value.eq({"text", 4}) ? 0x1u : 0x2u;
+            g.negate = negate;
+            g.verdict = verdict;
+            return g;
+        }
+    }
     // Literal comparison is byte-exact, like ordinary string equality. Reuse the
     // expression decoder so escapes and embedded NULs have the same semantics.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
