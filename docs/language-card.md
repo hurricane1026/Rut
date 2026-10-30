@@ -850,10 +850,21 @@ return websocket(chat) { frame in
 
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
-// and the single-slice cap. Dynamic expressions/interpolation remain unsupported.
+// and the single-slice cap. General expressions/interpolation remain unsupported.
 return websocket(chat, maxMessageSize: 4kb) { frame in
     guard frame.fromClient && frame.isText else { frame.forward() }
     frame.forward("message replaced")
+}
+
+// Add fixed UTF-8 affixes around one complete Text message, using String +.
+// Parentheses and concatenated literals are accepted, with at most 32 expression nodes.
+// At most one frame.text reference may appear; repeated references/interpolation reject.
+// Binary messages selected for this operation fail the tunnel; guard the opcode first.
+// The complete rewritten output must fit maxMessageSize and the single-slice cap.
+return websocket(chat, maxMessageSize: 4kb) { frame in
+    guard frame.isText else { frame.forward() }
+    guard !frame.text.hasPrefix("audit:") else { frame.forward("[" + frame.text + "]") }
+    frame.forward("audit:" + frame.text)
 }
 
 // Each guard may choose its own replacement; the first failing guard wins.
@@ -882,7 +893,7 @@ return websocket(chat) { frame in
 
 // WebSocket proxy. The inspection sketch below is a target API; current terminate
 // handlers use `return websocket(chat) { frame in ... }`, forward/drop/close,
-// and final frame.forward("fixed text").
+// fixed replacements, and bounded prefix/suffix text rewrites.
 // Reassembled messages are currently limited to approximately one 16 KB slice.
 guard req.upgrade == .websocket else { return 400 }
 return websocket(chat)                          // transparent

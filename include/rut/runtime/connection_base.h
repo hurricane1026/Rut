@@ -667,16 +667,17 @@ struct ConnectionBase {
     bool is_ws_terminate;           // active: 101 seen + inspection buffers acquired
     WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
-    const Str* ws_forward_texts = nullptr;
+    const WsTextRewrite* ws_forward_texts = nullptr;
     u32 ws_forward_text_count = 0;
-    Str ws_forward_text{};  // route-owned replacement view, pinned with the route config
+    WsTextRewrite ws_forward_text{};  // route-owned replacement view, pinned with the route config
     bool ws_has_nonempty_rewrite() const {
-        if (ws_forward_text.len != 0) return true;
+        if (ws_forward_text.prefix.len != 0 || ws_forward_text.suffix.len != 0) return true;
         if (ws_forward_text_count > kWsMaxForwardTexts ||
             (ws_forward_text_count != 0 && !ws_forward_texts))
             return true;
         for (u32 i = 0; i < ws_forward_text_count; i++)
-            if (ws_forward_texts[i].len != 0) return true;
+            if (ws_forward_texts[i].prefix.len != 0 || ws_forward_texts[i].suffix.len != 0)
+                return true;
         return false;
     }
     Str ws_close_reason{};  // pinned route-owned close reason

@@ -59,9 +59,18 @@ struct WsClosePolicy {
     Str reason{};  // immutable route-owned UTF-8, at most 123 bytes
 };
 
+// Immutable text output recipe. Literal replacement omits the input; affix recipes
+// include one complete Text message between route-owned UTF-8 prefix/suffix views.
+struct WsTextRewrite {
+    Str prefix{};
+    Str suffix{};
+    bool include_payload = false;
+};
+bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size);
+
 // Invoked once per complete data message. `opcode` is Text or Binary; `payload` is the
-// reassembled, unmasked message of `len` bytes. ForwardText selects a fixed
-// route-owned replacement; the input view remains read-only. `from_client` is the leg the message
+// reassembled, unmasked message of `len` bytes. ForwardText selects a route-owned
+// text recipe; the input view remains read-only. `from_client` is the leg the message
 // travels on: true for client->upstream, false for upstream->client — so one handler can police a
 // single direction (`frame.fromClient`). Returns the action.
 using WsMessageHandlerFn =
@@ -90,8 +99,8 @@ struct WsInspector {
     bool from_client = false;
     // Immutable route-owned default and branch texts. The pinned route
     // configuration must remain alive until this connection retires.
-    Str forward_text{};
-    const Str* forward_texts = nullptr;
+    WsTextRewrite forward_text{};
+    const WsTextRewrite* forward_texts = nullptr;
     u32 forward_text_count = 0;
     u64 mask_rng = 0;          // Reserved for compatibility; masking keys use RAND_bytes.
     u64 max_message_size = 0;  // 0 = unbounded

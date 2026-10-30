@@ -2641,18 +2641,30 @@ four guards may select an independent literal; the first failing guard wins. Bar
 `frame.forward()` retains the original message even when the final verdict has a
 replacement. Close policies and text replacements use independent route tables.
 Control frames retain their existing relay behavior.
-The replacement must be a string literal, uses ordinary string escape decoding,
-and must fit both `maxMessageSize` and the single-slice terminate cap. Dynamic
-expressions, interpolation, binary replacement, and injection remain unsupported.
+A fixed replacement uses ordinary string escape decoding and must fit both
+`maxMessageSize` and the single-slice terminate cap. Bounded text concatenation is
+also supported: `frame.forward("prefix" + frame.text + "suffix")`, including either
+affix alone or an identity `frame.text`. The expression contains at most 32 nodes
+(literals, `+`, and at most one `frame.text`); parentheses preserve concatenation order.
+Constant fragments are folded into immutable prefix/suffix views. Other fields,
+functions, repeated payload references, interpolation, binary replacement, and
+injection remain unsupported. Affix recipes require a Text message; selecting one
+for Binary input fails the tunnel, so opcode guards should retain or drop Binary
+messages first. Empty Text messages, embedded NUL, and Unicode are preserved.
+The final payload, including both affixes, must fit both bounds; overflow fails
+before a rewritten frame is emitted.
 
 The runtime reassembles and validates the original message before invoking the
 handler, writes replacement frames to the existing separate output slice, and
 pauses input while output drains. Both directions apply their normal WebSocket
-masking roles. Default and branch nonempty rewrites use the existing bounded one-shot upstream
+masking roles. Default and branch nonempty prefixes/suffixes use the existing bounded one-shot upstream
 receive on io_uring, so multiple CQEs cannot overflow receive storage before the
 inspection callback drains it. Literal bytes are copied into the loaded program's retained arena;
 native artifacts relocate that view, so neither mode retains temporary HIR views.
-The native artifact format version is 10 following the guard text-replacement route layout change.
+The native artifact format version is 11 following the text-affix recipe layout change.
+Both prefix and suffix views are relocated. Encoding copies the prefix, original
+message, and suffix directly into the existing output slice, then masks that frame;
+no concatenation buffer or message-time allocation is introduced.
 
 The examples in this section include planned syntax and actions. The current
 terminate implementation supports bounded reassembled text/binary messages,

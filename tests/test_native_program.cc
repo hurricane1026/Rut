@@ -257,8 +257,8 @@ TEST(native_program, websocket_rewrite_survives_compiler_exit_and_source_removal
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     const auto& route = owner.p->config.routes[0];
-    REQUIRE_EQ(route.ws_forward_text.len, 11u);
-    CHECK(memcmp(route.ws_forward_text.ptr, "native\0text", 11) == 0);
+    REQUIRE_EQ(route.ws_forward_text.prefix.len, 11u);
+    CHECK(memcmp(route.ws_forward_text.prefix.ptr, "native\0text", 11) == 0);
     WsInspector st;
     st.forward_text = route.ws_forward_text;
     st.max_message_size = route.ws_max_message_size;
@@ -279,6 +279,52 @@ TEST(native_program, websocket_rewrite_survives_compiler_exit_and_source_removal
     REQUIRE_EQ(produced, 13u);
     CHECK_EQ(output[0], 0x81);
     CHECK(memcmp(output + 2, "native\0text", 11) == 0);
+}
+
+TEST(native_program, websocket_affix_rewrites_survive_source_removal) {
+    Source source;
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\n"
+                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                      " guard frame.text != \"a\" else { frame.forward(\"one\\0\" + frame.text + "
+                      "\"\\u{20ac}\") }\n"
+                      " guard frame.text != \"b\" else { frame.forward(frame.text + \"end\") }\n"
+                      " guard frame.text != \"c\" else { frame.forward(\"pre\" + frame.text) }\n"
+                      " guard frame.text != \"d\" else { frame.forward(\"fixed\") }\n"
+                      " frame.forward(\"[\" + frame.text + \"]\") } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+
+    REQUIRE_EQ(route.ws_forward_text_count, 4u);
+    const Str expected[] = {
+        {"one\0a\xe2\x82\xac", 8}, {"bend", 4}, {"prec", 4}, {"fixed", 5}, {"[e]", 3}};
+    for (u32 i = 0; i < 5; i++) {
+        WsInspector st;
+        st.forward_text = route.ws_forward_text;
+        st.forward_texts = route.ws_forward_texts;
+        st.forward_text_count = route.ws_forward_text_count;
+        st.max_message_size = route.ws_max_message_size;
+        const u8 input[] = {0x81, 1, static_cast<u8>('a' + i)};
+        u8 out[128], msg[32];
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           sizeof(input),
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           route.ws_frame_handler,
+                           nullptr,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        REQUIRE_EQ(produced, 2u + expected[i].len);
+        CHECK_EQ(out[0], 0x81u);
+        CHECK(memcmp(out + 2, expected[i].ptr, expected[i].len) == 0);
+    }
 }
 
 TEST(native_program, websocket_affixes_survive_source_removal) {
