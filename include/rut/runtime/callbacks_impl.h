@@ -3001,7 +3001,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_close_reason = ws_term ? route->ws_close_reason : Str{};
     conn.ws_close_policies = ws_term ? route->ws_close_policies : nullptr;
     conn.ws_close_policy_count = ws_term ? route->ws_close_policy_count : 0;
-    conn.ws_forward_text = ws_term ? route->ws_forward_text : Str{};
+    conn.ws_forward_text = ws_term ? route->ws_forward_text : WsTextRewrite{};
     conn.ws_forward_texts = ws_term ? route->ws_forward_texts : nullptr;
     conn.ws_forward_text_count = ws_term ? route->ws_forward_text_count : 0;
 #endif

@@ -1126,6 +1126,12 @@ struct HirWsClosePolicy {
     u32 reason_expr = 0xffffffffu;
 };
 
+struct HirWsTextRewrite {
+    u32 prefix_expr = 0xffffffffu;
+    u32 suffix_expr = 0xffffffffu;
+    bool include_payload = false;
+};
+
 struct HirWsHandler {
     WsVerdict default_verdict = WsVerdict::Forward;
     // Postorder condition forest. Guard roots execute in source order before the
@@ -1134,13 +1140,12 @@ struct HirWsHandler {
     static constexpr u32 kMaxConditionNodes = 32;
     FixedVec<WsLenGuard, kMaxConditionNodes> len_guards;
     FixedVec<HirWsClosePolicy, kMaxLenGuards> close_policies;
-    FixedVec<u32, kMaxLenGuards> forward_payloads;  // decoded literal indices in HirRoute.exprs
+    FixedVec<HirWsTextRewrite, kMaxLenGuards> forward_payloads;
     // `frame.forward(payload)` modify form: forward a rewritten message instead of the
-    // original. The fixed text literal is stored in HirRoute.exprs;
-    // forward_payload_expr is its index there (0xffffffffu when has_forward_payload is false).
+    // original. Prefix/suffix literals are stored in HirRoute.exprs.
     // The loader retains its bytes and emits a ForwardText default verdict.
     bool has_forward_payload = false;
-    u32 forward_payload_expr = 0xffffffffu;
+    HirWsTextRewrite forward_payload{};
     // `frame.close(code)` status code (default 1000 = normal closure). Only meaningful when
     // default_verdict == Close. Validated to RFC 6455 application close codes in analyze.
     u16 close_code = 1000;

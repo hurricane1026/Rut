@@ -108,7 +108,22 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not pid_file.exists():
             time.sleep(0.01)
-        assert pid_file.exists(), f"producer did not start: {mode}"
+        if not pid_file.exists():
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+            os.set_blocking(process.stderr.fileno(), False)
+            try:
+                diagnostic = os.read(process.stderr.fileno(), 4096).decode(errors="replace")
+            except BlockingIOError:
+                diagnostic = ""
+            raise AssertionError(
+                f"producer did not start: {mode}; server return code: {process.returncode}; "
+                f"server stderr (first 4096 bytes): {diagnostic!r}")
         producer_pid, grandchild_pid = map(int, pid_file.read_text().split(','))
         pid_file.unlink(missing_ok=True)
         if grandchild:

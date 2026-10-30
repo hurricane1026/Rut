@@ -382,19 +382,25 @@ bool load_rut_program(const char* path,
                 result = {bytes, expr.str_value.len};
                 return true;
             };
-            Str forward_text{};
+            auto retain_rewrite = [&](const HirWsTextRewrite& source, WsTextRewrite& result) {
+                result.include_payload = source.include_payload;
+                return retain_forward_text(source.prefix_expr, result.prefix) &&
+                       retain_forward_text(source.suffix_expr, result.suffix) &&
+                       ws_valid_text_rewrite(result, max_msg);
+            };
+            WsTextRewrite forward_text{};
             if (route.ws_handler.has_forward_payload &&
-                !retain_forward_text(route.ws_handler.forward_payload_expr, forward_text))
+                !retain_rewrite(route.ws_handler.forward_payload, forward_text))
                 return false;
             static_assert(HirWsHandler::kMaxLenGuards == kWsMaxForwardTexts);
             static_assert(static_cast<u8>(WsVerdict::ForwardTextPolicy0) ==
                           static_cast<u8>(WsFrameAction::ForwardTextPolicy0));
             static_assert(static_cast<u8>(WsVerdict::ForwardTextPolicy3) ==
                           static_cast<u8>(WsFrameAction::ForwardTextPolicy3));
-            Str forward_texts[kWsMaxForwardTexts]{};
+            WsTextRewrite forward_texts[kWsMaxForwardTexts]{};
             const u32 forward_text_count = route.ws_handler.forward_payloads.len;
             for (u32 i = 0; i < forward_text_count; i++)
-                if (!retain_forward_text(route.ws_handler.forward_payloads[i], forward_texts[i]))
+                if (!retain_rewrite(route.ws_handler.forward_payloads[i], forward_texts[i]))
                     return false;
             auto retain_close_reason = [&](u32 index, Str& result) {
                 result = {};

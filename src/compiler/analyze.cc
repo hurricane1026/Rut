@@ -7087,26 +7087,79 @@ static FrontendResult<HirWsClosePolicy> analyze_frame_close_policy(const AstExpr
     return policy;
 }
 
-static FrontendResult<u32> analyze_frame_forward_payload(const AstExpr& call,
-                                                         HirRoute& route,
-                                                         const HirModule& mod) {
+static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& mod, Span span);
+
+// Flatten bounded String concatenation around at most one frame.text reference.
+// No arbitrary expression evaluation or message-time allocation is needed.
+static FrontendResult<void> analyze_frame_text_parts(const AstExpr& expr,
+                                                     const HirModule& mod,
+                                                     std::string& prefix,
+                                                     std::string& suffix,
+                                                     bool& include_payload,
+                                                     u32& nodes,
+                                                     u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes || nodes++ >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::TooManyItems, expr.span);
+    if (expr.kind == AstExprKind::Add && expr.lhs && expr.rhs) {
+        auto left = analyze_frame_text_parts(
+            *expr.lhs, mod, prefix, suffix, include_payload, nodes, depth + 1);
+        if (!left) return left;
+        return analyze_frame_text_parts(
+            *expr.rhs, mod, prefix, suffix, include_payload, nodes, depth + 1);
+    }
+    if (ws_is_frame_field(expr, {"text", 4})) {
+        if (include_payload) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        include_payload = true;
+        return {};
+    }
+    if (expr.kind != AstExprKind::StrLit)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    auto decoded = decoded_expression_string(expr.str_value, mod, expr.span);
+    if (!decoded) return core::make_unexpected(decoded.error());
+    if (decoded->len > kWsTerminateMessageCapacity ||
+        prefix.size() + suffix.size() + decoded->len > kWsTerminateMessageCapacity)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    auto& part = include_payload ? suffix : prefix;
+    if (decoded->len != 0) part.append(decoded->ptr, decoded->len);
+    return {};
+}
+
+static FrontendResult<HirWsTextRewrite> analyze_frame_forward_payload(const AstExpr& call,
+                                                                      HirRoute& route,
+                                                                      const HirModule& mod) {
     if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
         !call.lhs->name.eq({"frame", 5}) || !call.name.eq({"forward", 7}) || call.args.len != 1 ||
-        !call.args[0] || call.args[0]->kind != AstExprKind::StrLit)
+        !call.args[0])
         return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-    auto payload =
-        analyze_expr(*call.args[0], &route, mod, route.locals.data, route.locals.len, nullptr);
-    if (!payload) return core::make_unexpected(payload.error());
-    if (payload->kind != HirExprKind::StrLit || payload->type != HirTypeKind::Str ||
-        payload->may_nil || payload->may_error ||
-        payload->str_value.len > kWsTerminateMessageCapacity ||
-        (route.ws_handler.max_message_size != 0 &&
-         payload->str_value.len > route.ws_handler.max_message_size) ||
-        !utf8_valid(reinterpret_cast<const u8*>(payload->str_value.ptr), payload->str_value.len))
+    std::string prefix, suffix;
+    HirWsTextRewrite result;
+    u32 nodes = 0;
+    auto parts =
+        analyze_frame_text_parts(*call.args[0], mod, prefix, suffix, result.include_payload, nodes);
+    if (!parts) return core::make_unexpected(parts.error());
+    if ((route.ws_handler.max_message_size != 0 &&
+         prefix.size() + suffix.size() > route.ws_handler.max_message_size) ||
+        !utf8_valid(reinterpret_cast<const u8*>(prefix.data()), prefix.size()) ||
+        !utf8_valid(reinterpret_cast<const u8*>(suffix.data()), suffix.size()))
         return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
-    if (!route.exprs.push(payload.value()))
-        return frontend_error(FrontendError::OutOfMemory, call.span);
-    return route.exprs.len - 1;
+    auto retain = [&](std::string text) -> FrontendResult<u32> {
+        auto owned = intern_analysis_string(mod, std::move(text));
+        if (!owned) return core::make_unexpected(owned.error());
+        HirExpr literal{};
+        literal.kind = HirExprKind::StrLit;
+        literal.type = HirTypeKind::Str;
+        literal.str_value = owned.value();
+        if (!route.exprs.push(literal))
+            return frontend_error(FrontendError::OutOfMemory, call.span);
+        return route.exprs.len - 1;
+    };
+    auto first = retain(std::move(prefix));
+    if (!first) return core::make_unexpected(first.error());
+    auto last = retain(std::move(suffix));
+    if (!last) return core::make_unexpected(last.error());
+    result.prefix_expr = first.value();
+    result.suffix_expr = last.value();
+    return result;
 }
 
 static FrontendResult<WsVerdict> analyze_frame_guard_verdict(const AstExpr& call,
@@ -7188,8 +7241,6 @@ static Str ws_frame_text_match_pattern(const AstExpr& cond) {
     if (!ws_is_frame_field(*cond.lhs, {"text", 4})) return Str{};
     return cond.args[0]->str_value;
 }
-
-static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& mod, Span span);
 
 // Match a leaf condition for the frame handler. `negate` is logical !, accepted
 // on boolean frame properties or `frame.text.matches(re)` (the blocklist form). Direction is a
@@ -13089,7 +13140,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 auto payload = analyze_frame_forward_payload(call, *route, mod);
                 if (!payload) return core::make_unexpected(payload.error());
                 route->ws_handler.has_forward_payload = true;
-                route->ws_handler.forward_payload_expr = payload.value();
+                route->ws_handler.forward_payload = payload.value();
             }
         } else if (call.name.eq({"drop", 4})) {
             if (call.args.len != 0)
