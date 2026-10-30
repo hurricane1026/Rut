@@ -857,14 +857,17 @@ return websocket(chat, maxMessageSize: 4kb) { frame in
 }
 
 // Add fixed UTF-8 affixes around one complete Text message, using String +.
-// Parentheses and concatenated literals are accepted, with at most 32 expression nodes.
+// Parentheses, concatenated literals, and compile-time-known route let strings
+// (including aliases) are accepted, with at most 32 expression nodes.
+// Request-derived strings, optional values, and calls are rejected.
 // At most one frame.text reference may appear; repeated references/interpolation reject.
 // Binary messages selected for this operation fail the tunnel; guard the opcode first.
 // The complete rewritten output must fit maxMessageSize and the single-slice cap.
+let label = "audit:"
 return websocket(chat, maxMessageSize: 4kb) { frame in
     guard frame.isText else { frame.forward() }
     guard !frame.text.hasPrefix("audit:") else { frame.forward("[" + frame.text + "]") }
-    frame.forward("audit:" + frame.text)
+    frame.forward(label + frame.text)
 }
 
 // Each guard may choose its own replacement; the first failing guard wins.

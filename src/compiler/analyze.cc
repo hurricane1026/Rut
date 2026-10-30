@@ -7092,6 +7092,7 @@ static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& m
 // Flatten bounded String concatenation around at most one frame.text reference.
 // No arbitrary expression evaluation or message-time allocation is needed.
 static FrontendResult<void> analyze_frame_text_parts(const AstExpr& expr,
+                                                     HirRoute& route,
                                                      const HirModule& mod,
                                                      std::string& prefix,
                                                      std::string& suffix,
@@ -7102,25 +7103,38 @@ static FrontendResult<void> analyze_frame_text_parts(const AstExpr& expr,
         return frontend_error(FrontendError::TooManyItems, expr.span);
     if (expr.kind == AstExprKind::Add && expr.lhs && expr.rhs) {
         auto left = analyze_frame_text_parts(
-            *expr.lhs, mod, prefix, suffix, include_payload, nodes, depth + 1);
+            *expr.lhs, route, mod, prefix, suffix, include_payload, nodes, depth + 1);
         if (!left) return left;
         return analyze_frame_text_parts(
-            *expr.rhs, mod, prefix, suffix, include_payload, nodes, depth + 1);
+            *expr.rhs, route, mod, prefix, suffix, include_payload, nodes, depth + 1);
     }
     if (ws_is_frame_field(expr, {"text", 4})) {
         if (include_payload) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         include_payload = true;
         return {};
     }
-    if (expr.kind != AstExprKind::StrLit)
+    Str text{};
+    if (expr.kind == AstExprKind::StrLit) {
+        auto decoded = decoded_expression_string(expr.str_value, mod, expr.span);
+        if (!decoded) return core::make_unexpected(decoded.error());
+        text = decoded.value();
+    } else if (expr.kind == AstExprKind::Ident) {
+        auto value = analyze_expr(expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+        if (!value) return core::make_unexpected(value.error());
+        ConstValue known{};
+        if (value->type != HirTypeKind::Str || value->may_nil || value->may_error ||
+            !const_eval_expr(value.value(), route.locals.data, route.locals.len, &known, 0) ||
+            known.type != HirTypeKind::Str)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        text = known.str_value;
+    } else {
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-    auto decoded = decoded_expression_string(expr.str_value, mod, expr.span);
-    if (!decoded) return core::make_unexpected(decoded.error());
-    if (decoded->len > kWsTerminateMessageCapacity ||
-        prefix.size() + suffix.size() + decoded->len > kWsTerminateMessageCapacity)
+    }
+    if (text.len > kWsTerminateMessageCapacity ||
+        prefix.size() + suffix.size() + text.len > kWsTerminateMessageCapacity)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     auto& part = include_payload ? suffix : prefix;
-    if (decoded->len != 0) part.append(decoded->ptr, decoded->len);
+    if (text.len != 0) part.append(text.ptr, text.len);
     return {};
 }
 
@@ -7134,8 +7148,8 @@ static FrontendResult<HirWsTextRewrite> analyze_frame_forward_payload(const AstE
     std::string prefix, suffix;
     HirWsTextRewrite result;
     u32 nodes = 0;
-    auto parts =
-        analyze_frame_text_parts(*call.args[0], mod, prefix, suffix, result.include_payload, nodes);
+    auto parts = analyze_frame_text_parts(
+        *call.args[0], route, mod, prefix, suffix, result.include_payload, nodes);
     if (!parts) return core::make_unexpected(parts.error());
     if ((route.ws_handler.max_message_size != 0 &&
          prefix.size() + suffix.size() > route.ws_handler.max_message_size) ||

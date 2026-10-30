@@ -6197,6 +6197,80 @@ TEST(frontend, websocket_text_affix_rewrite_analyzes_bounded_concatenation) {
     }
 }
 
+TEST(frontend, websocket_text_rewrite_accepts_constant_local_aliases) {
+    const char* source = R"rut(
+upstream ws
+route GET "/ws" {
+    let prefix = "a\0b"
+    let alias = prefix
+    let suffix = "\né"
+    return websocket(ws) { frame in
+        guard frame.isText else { frame.forward(alias) }
+        frame.forward("[" + alias + frame.text + suffix + "]")
+    }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    const auto& handler = route.ws_handler;
+    REQUIRE_EQ(handler.forward_payloads.len, 1u);
+    const auto& branch = handler.forward_payloads[0];
+    CHECK_FALSE(branch.include_payload);
+    CHECK(route.exprs[branch.prefix_expr].str_value.eq({"a\0b", 3}));
+    CHECK(handler.forward_payload.include_payload);
+    CHECK(route.exprs[handler.forward_payload.prefix_expr].str_value.eq({"[a\0b", 4}));
+    CHECK(route.exprs[handler.forward_payload.suffix_expr].str_value.eq(lit("\né]")));
+}
+
+TEST(frontend, websocket_text_rewrite_constant_locals_preserve_validation) {
+    const char* invalid[] = {
+        "let text = req.path\n",
+        "let text = 42\n",
+        "let text = req.header(\"X-Text\")\n",
+        "let text = \"12345\"\n",
+    };
+    for (const char* binding : invalid) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { ";
+        source += binding;
+        source += "return websocket(ws, maxMessageSize: 4b) { frame in frame.forward(text) } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    for (const char* expression : {"text", "text + frame.text", "text + frame.text + text"}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { let text = \"1234\"\n";
+        source += "return websocket(ws, maxMessageSize: 4b) { frame in frame.forward(";
+        source += expression;
+        source += ") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())),
+                 strcmp(expression, "text + frame.text + text") != 0);
+    }
+}
+
+TEST(frontend, websocket_text_rewrite_constant_locals_obey_capacity_and_utf8) {
+    for (const std::string& value :
+         {std::string(16371, 'a'), std::string(1, static_cast<char>(0xff))}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { let text = \"" + value +
+                             "\"\nreturn websocket(ws) { frame in frame.forward(text) } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
 TEST(frontend, websocket_text_affix_rewrite_rejects_unbounded_or_unsupported_expressions) {
     for (const char* expression : {"frame.text + frame.text",
                                    "frame.text + frame.len",

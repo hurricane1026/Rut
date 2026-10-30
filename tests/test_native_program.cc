@@ -285,9 +285,11 @@ TEST(native_program, websocket_affix_rewrites_survive_source_removal) {
     Source source;
     REQUIRE(
         source.append("upstream backend at \"127.0.0.1:9999\"\n"
-                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                      " guard frame.text != \"a\" else { frame.forward(\"one\\0\" + frame.text + "
-                      "\"\\u{20ac}\") }\n"
+                      "route GET \"/ws\" { let prefix = \"one\\0\"\n"
+                      " let alias = prefix\n let suffix = \"\\u{20ac}\"\n"
+                      " return websocket(backend) { frame in\n"
+                      " guard frame.text != \"a\" else { frame.forward(alias + frame.text + "
+                      "suffix) }\n"
                       " guard frame.text != \"b\" else { frame.forward(frame.text + \"end\") }\n"
                       " guard frame.text != \"c\" else { frame.forward(\"pre\" + frame.text) }\n"
                       " guard frame.text != \"d\" else { frame.forward(\"fixed\") }\n"
