@@ -6591,6 +6591,7 @@ int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
 
+#if RUT_ENABLE_WEBSOCKET
 TEST(serve_loader, websocket_guard_text_policies_reach_wire) {
     const auto path =
         write_file("/tmp/rut_ws_guard_text",
@@ -6679,3 +6680,5 @@ TEST(serve_loader, websocket_mixed_guard_text_and_close_policies) {
           WsFrameAction::ForwardText);
     program.destroy();
 }
+
+#endif

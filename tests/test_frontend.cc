@@ -41691,6 +41691,7 @@ TEST(frontend, rs256_requires_static_valid_trust_policy_and_unwrapped_token) {
     CHECK(analyze_file_heap(ast.value()));
 }
 
+#if RUT_ENABLE_WEBSOCKET
 TEST(frontend, websocket_guard_text_replacements_validate_literals_and_limits) {
     for (const char* verdict : {"frame.forward(\"\")",
                                 "frame.forward(\"a\\0b\")",
@@ -41747,3 +41748,5 @@ TEST(frontend, websocket_guard_replacement_respects_max_message_size) {
         CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())), strlen(text) == 4);
     }
 }
+
+#endif
