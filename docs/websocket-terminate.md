@@ -12,12 +12,15 @@ through the C++ `add_ws_terminate(...)` API.
 
 Current literal predicates: `frame.text == "literal"`, its reversed form, `!=`,
 `frame.text.isEmpty`, `frame.text.hasPrefix("literal")`, and
-`frame.text.hasSuffix("literal")` are supported in guards and compose with `!`, `&&`,
+`frame.text.hasSuffix("literal")`, and `frame.text.contains("literal")` are
+supported in guards and compose with `!`, `&&`,
 and `||`. Equality compares exact raw payload bytes, with normal string escape
 decoding (including NUL), and does not imply a Text opcode check. Pair it with
 `frame.isText` for text-only policy. Empty checks inspect only message length.
 Prefix/suffix checks accept a single string literal with ordinary escape decoding;
 empty literals match every message and shorter messages fail without reading payload.
+`contains` searches for the exact contiguous bytes of a literal, including NUL,
+without regex interpretation or Unicode normalization.
 
 Related: DESIGN.md §3.4.8 (passthrough/terminate runtime semantics),
 `include/rut/runtime/ws_terminate.h` (engine), `route_table.h` (`add_ws_terminate`).

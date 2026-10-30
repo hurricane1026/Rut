@@ -49,13 +49,13 @@ struct WsLenGuardSpec {
                   //                                3=TextMatch (regex over payload, params 2+3)
                   //                                4=And, 5=Or (short-circuit child conditions)
                   //                                6=TextEqual (byte-exact literal equality)
-                  //                                7=TextPrefix, 8=TextSuffix
+                  //                                7=TextPrefix, 8=TextSuffix, 9=TextContains
     u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
     u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
                   // FromClient: 1 (client→upstream leg)
     u8 verdict;   // WsFrameAction yielded when the guard CONDITION is false
-    // TextMatch/TextEqual/TextPrefix/TextSuffix: regex or decoded literal (pattern_len is
-    // authoritative).
+    // TextMatch/TextEqual/TextPrefix/TextSuffix/TextContains: regex or decoded literal (pattern_len
+    // is authoritative).
     const char* pattern;
     u32 pattern_len;
     u8 negate;    // invert this condition, including a compound subtree

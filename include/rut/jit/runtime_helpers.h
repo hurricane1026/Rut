@@ -216,6 +216,11 @@ rut::u8 rut_helper_str_constant_time_equal(const char* a,
 
 // Check if two strings are equal. Returns 1 (true) or 0 (false).
 rut::u8 rut_helper_str_eq(const char* a, rut::u32 a_len, const char* b, rut::u32 b_len);
+// Byte substring search; empty needles match without accessing either buffer.
+rut::u8 rut_helper_str_contains(const char* text,
+                                rut::u32 text_len,
+                                const char* needle,
+                                rut::u32 needle_len);
 
 // Lexicographic string comparison. Returns <0, 0, >0 like strcmp.
 rut::i32 rut_helper_str_cmp(const char* a, rut::u32 a_len, const char* b, rut::u32 b_len);

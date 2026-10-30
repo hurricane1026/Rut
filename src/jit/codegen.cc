@@ -2828,7 +2828,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 8 || guards[i].cmp > 2 || guards[i].verdict > 2) return false;
+        if (guards[i].accessor > 9 || guards[i].cmp > 2 || guards[i].verdict > 2) return false;
         if ((guards[i].accessor == 3 || guards[i].accessor >= 6) && guards[i].pattern_len != 0 &&
             !guards[i].pattern)
             return false;
@@ -2918,7 +2918,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
             LLVMValueRef is_match =
                 LLVMBuildICmp(builder, LLVMIntNE, r, LLVMConstInt(i8_ty, 0, 0), "rx.m");
             cond = is_match;
-        } else if (guards[i].accessor >= 6) {  // TextEqual / TextPrefix / TextSuffix
+        } else if (guards[i].accessor >= 6) {  // TextEqual / TextPrefix / TextSuffix / TextContains
             // Check the full 64-bit length before reading a literal-sized view.
             // Prefix/suffix comparisons never read beyond a short message.
             LLVMBasicBlockRef compare = LLVMAppendBasicBlockInContext(ctx, fn, "text.equal");
@@ -2928,6 +2928,12 @@ bool emit_ws_handler(LLVMModuleRef mod,
                               len,
                               LLVMConstInt(i64_ty, guards[i].pattern_len, 0),
                               "text.len");
+            if (guards[i].accessor == 9) {
+                // The substring helper accepts u32 lengths; reject before narrowing.
+                LLVMValueRef fits = LLVMBuildICmp(
+                    builder, LLVMIntULE, len, LLVMConstInt(i64_ty, 0xffffffffULL, 0), "text.fits");
+                length_matches = LLVMBuildAnd(builder, length_matches, fits, "text.valid.length");
+            }
             LLVMBuildCondBr(builder, length_matches, compare, no);
             LLVMPositionBuilderAtEnd(builder, compare);
             LLVMValueRef literal = LLVMBuildGlobalStringPtr(builder, "", "text.empty");
@@ -2942,8 +2948,10 @@ bool emit_ws_handler(LLVMModuleRef mod,
             }
             LLVMTypeRef eq_params[4] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
             LLVMTypeRef eq_ty = LLVMFunctionType(i8_ty, eq_params, 4, 0);
-            LLVMValueRef eq_fn = LLVMGetNamedFunction(mod, "rut_helper_str_eq");
-            if (!eq_fn) eq_fn = LLVMAddFunction(mod, "rut_helper_str_eq", eq_ty);
+            const char* helper =
+                guards[i].accessor == 9 ? "rut_helper_str_contains" : "rut_helper_str_eq";
+            LLVMValueRef eq_fn = LLVMGetNamedFunction(mod, helper);
+            if (!eq_fn) eq_fn = LLVMAddFunction(mod, helper, eq_ty);
             LLVMValueRef size = LLVMConstInt(i32_ty, guards[i].pattern_len, 0);
             LLVMValueRef compared_payload = payload;
             if (guards[i].pattern_len != 0 && guards[i].accessor == 8) {
@@ -2952,7 +2960,9 @@ bool emit_ws_handler(LLVMModuleRef mod,
                     builder, len, LLVMConstInt(i64_ty, guards[i].pattern_len, 0), "suffix.offset");
                 compared_payload = LLVMBuildGEP2(builder, i8_ty, payload, &offset, 1, "suffix");
             }
-            LLVMValueRef args[4] = {compared_payload, size, literal, size};
+            LLVMValueRef text_size =
+                guards[i].accessor == 9 ? LLVMBuildTrunc(builder, len, i32_ty, "text.size") : size;
+            LLVMValueRef args[4] = {compared_payload, text_size, literal, size};
             LLVMValueRef equal = LLVMBuildCall2(builder, eq_ty, eq_fn, args, 4, "text.eq");
             cond =
                 LLVMBuildICmp(builder, LLVMIntNE, equal, LLVMConstInt(i8_ty, 0, 0), "text.match");

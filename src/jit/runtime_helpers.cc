@@ -1196,6 +1196,12 @@ u8 rut_helper_str_eq(const char* a, u32 a_len, const char* b, u32 b_len) {
     return 1;
 }
 
+u8 rut_helper_str_contains(const char* text, u32 text_len, const char* needle, u32 needle_len) {
+    if (needle_len == 0) return 1;
+    if (needle_len > text_len || !text || !needle) return 0;
+    return memmem(text, text_len, needle, needle_len) != nullptr;
+}
+
 i32 rut_helper_str_cmp(const char* a, u32 a_len, const char* b, u32 b_len) {
     u32 n = a_len < b_len ? a_len : b_len;
     for (u32 i = 0; i < n; i++) {

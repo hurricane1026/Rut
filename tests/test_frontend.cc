@@ -5732,6 +5732,9 @@ TEST(frontend, analyze_websocket_text_literal_rejects_invalid_shapes) {
                                   "frame.text.hasPrefix",
                                   "frame.binary.hasSuffix(\"x\")",
                                   "frame.text.hasPrefix(\"\\(frame.len)\")",
+                                  "frame.text.contains",
+                                  "frame.binary.contains(\"x\")",
+                                  "frame.text.contains(\"\\(frame.len)\")",
                                   "frame.binary.isEmpty",
                                   "frame.text == \"\\q\""}) {
         std::string source =
@@ -5747,7 +5750,7 @@ TEST(frontend, analyze_websocket_text_literal_rejects_invalid_shapes) {
 }
 
 TEST(frontend, analyze_websocket_text_prefix_suffix_conditions) {
-    for (const char* method : {"hasPrefix", "hasSuffix"}) {
+    for (const char* method : {"hasPrefix", "hasSuffix", "contains"}) {
         for (const char* argument :
              {"\"a\\0b\"", "", "1", "frame.text", "\"a\", \"b\"", "\"\\q\""}) {
             std::string source =
@@ -5766,8 +5769,9 @@ TEST(frontend, analyze_websocket_text_prefix_suffix_conditions) {
                 REQUIRE(hir);
                 const auto& nodes = hir->routes[0].ws_handler.len_guards;
                 REQUIRE_EQ(nodes.len, 1u);
-                CHECK(nodes[0].accessor == (method[3] == 'P' ? WsLenGuard::Accessor::TextPrefix
-                                                             : WsLenGuard::Accessor::TextSuffix));
+                CHECK(nodes[0].accessor == (method[0] == 'c'   ? WsLenGuard::Accessor::TextContains
+                                            : method[3] == 'P' ? WsLenGuard::Accessor::TextPrefix
+                                                               : WsLenGuard::Accessor::TextSuffix));
                 CHECK(nodes[0].negate);
                 REQUIRE_EQ(nodes[0].pattern.len, 3u);
                 CHECK_EQ(nodes[0].pattern.ptr[1], '\0');

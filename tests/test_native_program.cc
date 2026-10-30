@@ -308,6 +308,28 @@ TEST(native_program, websocket_affixes_survive_source_removal) {
     CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, true) == WsFrameAction::Drop);
 }
 
+TEST(native_program, websocket_contains_survives_source_removal) {
+    Source source;
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\n"
+                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                      "guard !frame.fromClient || (frame.text.contains(\"a\\0\") && "
+                      "!frame.text.contains(\"\\u{20ac}\")) else { frame.drop() }\n"
+                      "frame.forward() } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const u8 payload[] = {'x', 'a', 0, 'x', 0xe2, 0x82, 0xac};
+    CHECK(handler(nullptr, WsOpcode::Text, payload, 4, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, payload, 4, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, payload, sizeof(payload), true) == WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 123, false) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, true) == WsFrameAction::Drop);
+}
+
 TEST(native_program, websocket_regex_handler_survives_compiler_exit) {
     Source source;
     REQUIRE(

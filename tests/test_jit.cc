@@ -20639,6 +20639,31 @@ TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
 }
 
+TEST(jit, byte_substring_helper_boundaries) {
+    const char payload[] = {'x', 'a', 0, 'b', 'y', 'a', 0, 'b'};
+    const char needle[] = {'a', 0, 'b'};
+    CHECK(rut_helper_str_contains(payload, sizeof(payload), needle, sizeof(needle)));
+    CHECK(rut_helper_str_contains(payload, 4, needle, sizeof(needle)));
+    CHECK_FALSE(rut_helper_str_contains(payload, 3, needle, sizeof(needle)));
+    CHECK_FALSE(rut_helper_str_contains(payload, sizeof(payload), "aby", 3));
+    CHECK(rut_helper_str_contains(nullptr, 0, nullptr, 0));
+    CHECK(rut_helper_str_contains(payload, sizeof(payload), nullptr, 0));
+    CHECK_FALSE(rut_helper_str_contains(nullptr, 10, needle, sizeof(needle)));
+    CHECK_FALSE(rut_helper_str_contains(payload, sizeof(payload), nullptr, 1));
+    // Repeated prefixes exercise the search's overlap/fallback behavior.
+    char repeated[16370];
+    memset(repeated, 'a', sizeof(repeated));
+    repeated[sizeof(repeated) - 1] = 'b';
+    CHECK(rut_helper_str_contains(repeated, sizeof(repeated), "aaaaab", 6));
+    CHECK_FALSE(rut_helper_str_contains(repeated, sizeof(repeated) - 1, "aaaaab", 6));
+    CHECK(rut_helper_str_contains(
+        repeated, sizeof(repeated), repeated + 8000, sizeof(repeated) - 8000));
+    CHECK_FALSE(rut_helper_str_contains(
+        repeated, sizeof(repeated) - 1, repeated + 8000, sizeof(repeated) - 8000));
+    CHECK(rut_helper_str_contains("a.b", 3, ".", 1));
+    CHECK_FALSE(rut_helper_str_contains("axb", 3, ".", 1));
+}
+
 TEST(jit, websocket_text_literal_rejects_missing_storage) {
     WsLenGuardSpec node{};
     node.accessor = 6;
@@ -20648,7 +20673,7 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     auto empty = codegen_ws_handler(0, &node, 1, 0);
     REQUIRE(empty.ok);
     dispose_module(empty.mod, empty.ctx);
-    for (u8 accessor : {7, 8}) {
+    for (u8 accessor : {7, 8, 9}) {
         node.accessor = accessor;
         node.pattern_len = 4;
         CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
@@ -20657,7 +20682,7 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
         REQUIRE(affix.ok);
         dispose_module(affix.mod, affix.ctx);
     }
-    node.accessor = 9;
+    node.accessor = 10;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 
