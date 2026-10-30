@@ -344,6 +344,22 @@ func requireGroup(_ identity: Identity, _ required: str,
     identity
 }
 
+// Union of two exact groups. Authenticate before calling this helper; a valid
+// identity is allowed when its configured Consumer belongs to either group.
+func requireAnyGroup(_ identity: Identity, _ firstRequired: str, _ secondRequired: str,
+                     _ first: ConsumerGroups, _ second: ConsumerGroups) -> Identity {
+    guard firstRequired != "" && secondRequired != "" && validGroupMember(first) &&
+        validGroupMember(second) && first.consumerId != second.consumerId else { respond 503 }
+    let firstConsumerMatches = identity.consumerId == first.consumerId &&
+        (firstRequired == first.first || firstRequired == first.second ||
+         secondRequired == first.first || secondRequired == first.second)
+    let secondConsumerMatches = identity.consumerId == second.consumerId &&
+        (firstRequired == second.first || firstRequired == second.second ||
+         secondRequired == second.first || secondRequired == second.second)
+    guard firstConsumerMatches || secondConsumerMatches else { respond 403 }
+    identity
+}
+
 // policy is trusted compile-time JSON (literal, constant, or env snapshot):
 // {"issuer":"...","audience":"...","kids":["..."],"jwks":{"keys":[...]}}.
 // Unlike jwtDocumentHs*, this verifies issuer/audience/time/sub before returning.

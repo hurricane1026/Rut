@@ -165,16 +165,20 @@ Standard Webhooks middleware still has a separate main integration tracked by
 
 `auth.ConsumerGroups` binds one verified Consumer ID to up to two exact,
 case-sensitive group names. `auth.requireGroup(identity, group, first, second)`
-preserves the verified identity only when the Consumer is configured for the
-requested group; empty group slots are disabled. An empty required group is a
-503 configuration failure. Missing, malformed, duplicate or invalid credentials
-remain authentication failures, while a valid identity outside the group is
-denied with 403. Empty Consumer IDs are configuration failures. Group membership comes only from trusted configuration,
-not client identity or group headers, and is compiled in until restart.
+checks one group, while `auth.requireAnyGroup(identity, first, second, member1,
+member2)` allows either exact group. Both preserve the full verified identity
+only when its Consumer is configured for the required membership; empty
+membership slots are disabled. Empty required group names or invalid membership
+configuration return 503. Missing, malformed, duplicate or invalid credentials
+remain authentication failures, while a valid identity outside the requested
+groups is denied with 403. Empty or duplicate Consumer IDs are configuration
+failures. Group membership comes only from trusted configuration, not client
+identity or group headers, and is compiled in until restart.
 
-The JIT matrix covers successful membership, default deny, invalid and duplicate
-credentials, empty slots, duplicate groups, Consumer ID case mismatches and
-spoofed identity headers. See `examples/consumer-group-auth.rut`.
+The JIT matrix covers successful single and either-group membership, default
+deny, invalid and duplicate credentials, empty slots and required names,
+duplicate groups or Consumer IDs, Consumer ID case mismatches and spoofed
+identity/group headers. See `examples/consumer-group-auth.rut`.
 
 ## Implementation order and gates
 

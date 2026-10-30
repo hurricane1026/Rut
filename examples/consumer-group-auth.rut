@@ -15,4 +15,15 @@ route GET "/reports" {
         auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
     return allowed.consumerId
 }
+route GET "/reports-or-operators" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "alice-key", credentials: "",
+            keyId: "alice-key-id", passwordId: "alice-password-id"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "bob-key", credentials: "",
+            keyId: "bob-key-id", passwordId: "bob-password-id"))
+    let allowed = auth.requireAnyGroup(identity, "reports", "operators",
+        auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "operators"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    return allowed.consumerId
+}
 route "/" { return 404 }
