@@ -1105,13 +1105,17 @@ The call must directly initialize a top-level route `let`, as above. Calls in `g
 Import the ordinary source library relative to your file. From `examples/`:
 
 ```swift
-import "../lib/math.rut"
+import * as math from "../lib/math.rut"
 
 // All arguments to each helper must have the same type conforming to Ord.
 let low = math.min(3, 5)
 let high = math.max(3, 5)
 let bounded = math.clamp(9, 2, 6)  // 6
 ```
+
+Use a namespace alias to keep the global integer `min` and `max` builtins
+available alongside the generic helpers. Ordinary or selective imports named
+`min`/`max` shadow those unqualified builtins.
 
 The library exports `min<T: Ord>`, `max<T: Ord>` and `clamp<T: Ord>` through
 the existing file namespace and selective-import mechanisms. Helpers inline

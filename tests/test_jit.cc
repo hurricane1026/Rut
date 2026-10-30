@@ -1051,11 +1051,13 @@ TEST(jit, frontend_bitwise_i64_pack_unpack_executes) {
 
 TEST(jit, math_library_import_executes_with_runtime_bounds_and_ordered_types) {
     const auto source = R"rut(
-import "../lib/math.rut"
+import * as math from "../lib/math.rut"
 route GET "/math" {
     let count = req.headerCount("X-Tag")
     let signed = count - 4
-    if math.min(count, 4) == min(count, 4) &&
+    let now = time.nowMicros()
+    if max(now, 0) >= now && min(now, 0) == 0 &&
+       math.min(count, 4) == min(count, 4) &&
        math.max(count, 4) == max(count, 4) &&
        math.clamp(count, 2, 6) == req.headerCount("X-Expected") &&
        math.clamp(4, count, count + 2) == max(count, min(4, count + 2)) &&

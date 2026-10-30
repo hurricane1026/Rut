@@ -1,4 +1,4 @@
-import "../lib/math.rut"
+import * as math from "../lib/math.rut"
 
 listen :8080
 

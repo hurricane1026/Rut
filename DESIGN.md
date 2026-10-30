@@ -279,8 +279,11 @@ surface.
 
 The shipped `lib/math.rut` source library groups generic `min<T: Ord>`,
 `max<T: Ord>` and `clamp<T: Ord>` helpers under the ordinary file namespace.
-For example, `examples/math.rut` imports `"../lib/math.rut"` and calls
-`math.clamp(value, 2, 6)`. These are normal inlined functions using existing
+For example, `examples/math.rut` imports it with
+`import * as math from "../lib/math.rut"` and calls `math.clamp(value, 2, 6)`.
+Ordinary or selective imports named `min`/`max` shadow the unqualified global
+integer builtins, so use a namespace alias when both APIs are needed. These are
+normal inlined functions using existing
 comparisons, not runtime C ABI calls. Generic arguments have the same type.
 Current generic type binding rejects i64, so i64 callers continue to use the
 global integer `min/max` builtins (and compose them for clamping). Existing
