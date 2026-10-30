@@ -5654,7 +5654,7 @@ TEST(frontend, analyze_websocket_guard_close_rejects_invalid_arguments) {
                                 "frame.close(frame.len)",
                                 "frame.close(1008, frame.text)",
                                 "frame.close(1008, \"\\(frame.len)\")",
-                                "frame.forward(\"text\")"}) {
+                                "frame.forward(frame.text)"}) {
         std::string source =
             "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard frame.isText "
             "else { ";
@@ -41689,4 +41689,61 @@ TEST(frontend, rs256_requires_static_valid_trust_policy_and_unwrapped_token) {
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     CHECK(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, websocket_guard_text_replacements_validate_literals_and_limits) {
+    for (const char* verdict : {"frame.forward(\"\")",
+                                "frame.forward(\"a\\0b\")",
+                                "frame.forward(\"\\u{20ac}\")",
+                                "frame.forward(frame.text)",
+                                "frame.forward(1)",
+                                "frame.forward(\"a\", \"b\")",
+                                "frame.forward(\"\\(frame.len)\")"}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
+            "guard frame.isText else { ";
+        source += verdict;
+        source += " }\nframe.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        const bool valid = strstr(verdict, "frame.text") == nullptr &&
+                           strstr(verdict, "(1)") == nullptr && strstr(verdict, ",") == nullptr &&
+                           strstr(verdict, "\\(") == nullptr;
+        CHECK_EQ(static_cast<bool>(hir), valid);
+        if (hir) {
+            const auto& handler = hir->routes[0].ws_handler;
+            REQUIRE_EQ(handler.forward_payloads.len, 1u);
+            CHECK_EQ(static_cast<u8>(handler.len_guards[0].verdict), 8u);
+        }
+    }
+    for (u32 length : {16370u, 16371u}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
+            "guard frame.isText else { frame.forward(\"";
+        source.append(length, 'x');
+        source += "\") }\nframe.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())), length == 16370);
+    }
+}
+
+TEST(frontend, websocket_guard_replacement_respects_max_message_size) {
+    for (const char* text : {"four", "five!"}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4b) { frame in\n"
+            "guard frame.isText else { frame.forward(\"";
+        source += text;
+        source += "\") }\nframe.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())), strlen(text) == 4);
+    }
 }

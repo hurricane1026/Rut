@@ -46,9 +46,14 @@ enum class WsFrameAction : u8 {
     ClosePolicy1,
     ClosePolicy2,
     ClosePolicy3,
+    ForwardTextPolicy0,  // select a route-owned guard replacement, then forward as Text
+    ForwardTextPolicy1,
+    ForwardTextPolicy2,
+    ForwardTextPolicy3,
 };
 
 inline constexpr u32 kWsMaxClosePolicies = 4;
+inline constexpr u32 kWsMaxForwardTexts = 4;
 struct WsClosePolicy {
     u16 code = 1000;
     Str reason{};  // immutable route-owned UTF-8, at most 123 bytes
@@ -83,9 +88,11 @@ struct WsInspector {
     // client leg, but masking is a wire-format property and direction is a routing one —
     // conflating them would break the day they diverge. The caller sets it at arm time.
     bool from_client = false;
-    // Immutable route-owned text; only ForwardText uses it. The pinned route
+    // Immutable route-owned default and branch texts. The pinned route
     // configuration must remain alive until this connection retires.
     Str forward_text{};
+    const Str* forward_texts = nullptr;
+    u32 forward_text_count = 0;
     u64 mask_rng = 0;          // Reserved for compatibility; masking keys use RAND_bytes.
     u64 max_message_size = 0;  // 0 = unbounded
     // `frame.close(code)` support. close_code (INPUT) is the RFC 6455 status the handler's

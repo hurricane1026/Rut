@@ -4517,7 +4517,7 @@ public:
         // A fixed rewrite can expand several tiny inputs into multiple full
         // output batches. Bound each upstream read by available receive space:
         // multishot CQEs otherwise append before callbacks can drain that space.
-        if (c.is_ws_tunnel && c.is_ws_terminate && c.ws_forward_text.len != 0 && !c.ws_closing &&
+        if (c.is_ws_tunnel && c.is_ws_terminate && c.ws_has_nonempty_rewrite() && !c.ws_closing &&
             c.fd >= 0 && c.upstream_fd >= 0 && c.on_upstream_recv == &on_ws_upstream_recv<Self> &&
             valid_upstream_episode(c.upstream_episode) && !c.upstream_episode_quarantined &&
             !c.upstream_abandoned)

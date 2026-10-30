@@ -20639,20 +20639,20 @@ TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
 }
 
-TEST(jit, websocket_branch_close_policy_verdict_validation) {
+TEST(jit, websocket_branch_policy_verdict_validation) {
     WsLenGuardSpec node{};
     node.accessor = 0;
     node.cmp = 0;
     node.bound = 10;
-    for (u8 verdict = 4; verdict <= 7; verdict++) {
+    for (u8 verdict = 4; verdict <= 11; verdict++) {
         node.verdict = verdict;
         auto cg = codegen_ws_handler(0, &node, 1, 0);
         REQUIRE(cg.ok);
         dispose_module(cg.mod, cg.ctx);
     }
-    node.verdict = 3;  // payload-bearing forwards remain default-only
+    node.verdict = 3;  // the default payload selector cannot select a guard payload
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
-    node.verdict = 8;
+    node.verdict = 12;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 

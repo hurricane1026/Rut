@@ -2829,7 +2829,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
         if (guards[i].accessor > 9 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
-            guards[i].verdict > 7)
+            guards[i].verdict > 11)
             return false;
         if ((guards[i].accessor == 3 || guards[i].accessor >= 6) && guards[i].pattern_len != 0 &&
             !guards[i].pattern)

@@ -69,9 +69,9 @@ struct WsLenGuardSpec {
 // matching WsMessageHandlerFn (WsFrameAction(*)(void*, WsOpcode, const u8*, u64, bool)). It checks
 // each guard root in order, with short-circuit &&/|| — the first FALSE root returns
 // its verdict — then returns `default_verdict`. Verdicts are WsFrameAction values
-// (Forward=0/Drop=1/Close=2/ForwardText=3/ClosePolicy0..3=4..7).
-// ForwardText is default-only; branch close policies use route-owned metadata. This bypasses
-// the RIR/MIR HTTP pipeline. Returns false on error.
+// (Forward=0/Drop=1/Close=2/ForwardText=3/ClosePolicy0..3=4..7/ForwardTextPolicy0..3=8..11).
+// ForwardText is the default replacement; indexed branch policies use route-owned metadata. This
+// bypasses the RIR/MIR HTTP pipeline. Returns false on error.
 bool emit_ws_handler(LLVMModuleRef mod,
                      LLVMContextRef ctx,
                      u8 default_verdict,

@@ -368,19 +368,34 @@ bool load_rut_program(const char* path,
             const u32 max_msg = route.ws_handler.max_message_size != 0
                                     ? route.ws_handler.max_message_size
                                     : kWsDefaultMaxMessageSize;
-            Str forward_text{};
-            if (route.ws_handler.has_forward_payload) {
-                if (route.ws_handler.forward_payload_expr >= route.exprs.len) return false;
-                const auto& expr = route.exprs[route.ws_handler.forward_payload_expr];
-                if (expr.kind != HirExprKind::StrLit) return false;
-                // HIR is temporary, including decoded/imported strings. Copy into
-                // the retained program arena before publishing a route view.
+            auto retain_forward_text = [&](u32 index, Str& result) {
+                if (index >= route.exprs.len) return false;
+                const auto& expr = route.exprs[index];
+                if (expr.kind != HirExprKind::StrLit || expr.str_value.len > max_msg ||
+                    expr.str_value.len > kWsTerminateMessageCapacity ||
+                    !ws_valid_text_payload(expr.str_value))
+                    return false;
                 char* bytes = out.rir.arena.alloc_array<char>(expr.str_value.len + 1);
                 if (!bytes) return false;
                 for (u32 j = 0; j < expr.str_value.len; j++) bytes[j] = expr.str_value.ptr[j];
                 bytes[expr.str_value.len] = '\0';
-                forward_text = {bytes, expr.str_value.len};
-            }
+                result = {bytes, expr.str_value.len};
+                return true;
+            };
+            Str forward_text{};
+            if (route.ws_handler.has_forward_payload &&
+                !retain_forward_text(route.ws_handler.forward_payload_expr, forward_text))
+                return false;
+            static_assert(HirWsHandler::kMaxLenGuards == kWsMaxForwardTexts);
+            static_assert(static_cast<u8>(WsVerdict::ForwardTextPolicy0) ==
+                          static_cast<u8>(WsFrameAction::ForwardTextPolicy0));
+            static_assert(static_cast<u8>(WsVerdict::ForwardTextPolicy3) ==
+                          static_cast<u8>(WsFrameAction::ForwardTextPolicy3));
+            Str forward_texts[kWsMaxForwardTexts]{};
+            const u32 forward_text_count = route.ws_handler.forward_payloads.len;
+            for (u32 i = 0; i < forward_text_count; i++)
+                if (!retain_forward_text(route.ws_handler.forward_payloads[i], forward_texts[i]))
+                    return false;
             auto retain_close_reason = [&](u32 index, Str& result) {
                 result = {};
                 if (index == 0xffffffffu) return true;
@@ -420,7 +435,9 @@ bool load_rut_program(const char* path,
                                              forward_text,
                                              close_reason,
                                              close_policies,
-                                             policy_count))
+                                             policy_count,
+                                             forward_texts,
+                                             forward_text_count))
                 return false;
             ws_n++;
         }

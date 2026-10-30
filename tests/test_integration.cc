@@ -19966,7 +19966,7 @@ TEST(websocket_e2e, branch_close_policy_reaches_both_peers_iouring) {
 
 // Fragments arriving in separate reads are reassembled before inspection and forwarding.
 template <typename Loop>
-static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc) {
+static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc, bool branch = false) {
     using namespace rut;
     for (bool rewrite_client : {false, true}) {
         WsFrameEchoServer backend;
@@ -19983,8 +19983,34 @@ static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc) {
             : +[](void*, WsOpcode, const u8*, u64, bool client) {
                 return client ? WsFrameAction::Forward : WsFrameAction::ForwardText;
               };
-        REQUIRE(cfg.add_ws_terminate(
-            "/ws", 0, id.value(), handler, 16370, 1000, {replacement, sizeof(replacement)}));
+        char second[8000];
+        memset(second, 'S', sizeof(second));
+        const Str texts[] = {{replacement, sizeof(replacement)}, {second, sizeof(second)}};
+        if (branch) {
+            handler = rewrite_client
+                ? +[](void*, WsOpcode, const u8*, u64 len, bool client) {
+                    return client ? (len == 2 ? WsFrameAction::ForwardTextPolicy0
+                                              : WsFrameAction::ForwardTextPolicy1)
+                                  : WsFrameAction::Forward;
+                  }
+                : +[](void*, WsOpcode, const u8*, u64 len, bool client) {
+                    return client ? WsFrameAction::Forward
+                                  : (len == 2 ? WsFrameAction::ForwardTextPolicy0
+                                              : WsFrameAction::ForwardTextPolicy1);
+                  };
+        }
+        REQUIRE(cfg.add_ws_terminate("/ws",
+                                     0,
+                                     id.value(),
+                                     handler,
+                                     16370,
+                                     1000,
+                                     branch ? Str{} : texts[0],
+                                     {},
+                                     nullptr,
+                                     0,
+                                     branch ? texts : nullptr,
+                                     branch ? 2 : 0));
         const RouteConfig* active = &cfg;
         Shard<Loop> shard;
         i32 listener = -1, client = -1;
@@ -20078,7 +20104,9 @@ static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc) {
             }
             CHECK(h.opcode == WsOpcode::Text);
             REQUIRE_EQ(h.payload_len, sizeof(replacement));
-            CHECK(memcmp(received + h.header_len, replacement, sizeof(replacement)) == 0);
+            CHECK(memcmp(received + h.header_len,
+                         branch && message != 0 ? second : replacement,
+                         sizeof(replacement)) == 0);
             const u32 consumed = h.header_len + static_cast<u32>(h.payload_len);
             memmove(received, received + consumed, have - consumed);
             have -= consumed;
@@ -20093,6 +20121,15 @@ TEST(websocket_e2e, fixed_text_rewrite_grows_and_drains) {
 TEST(websocket_e2e, fixed_text_rewrite_grows_and_drains_iouring) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     check_fixed_ws_rewrite_round_trip<rut::IoUringEventLoop>(_tc);
+}
+
+TEST(websocket_e2e, branch_text_rewrite_grows_and_drains) {
+    check_fixed_ws_rewrite_round_trip<RealLoop>(_tc, true);
+}
+
+TEST(websocket_e2e, branch_text_rewrite_grows_and_drains_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    check_fixed_ws_rewrite_round_trip<rut::IoUringEventLoop>(_tc, true);
 }
 
 TEST(websocket_e2e, terminate_forwards_fragmented) {

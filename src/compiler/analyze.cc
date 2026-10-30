@@ -7035,7 +7035,7 @@ static bool ws_is_frame_len(const AstExpr& e) {
 
 // A bare frame verdict `frame.drop()/close()/forward()` (no args) → WsVerdict, for guard
 // else-branches. Argument-bearing closes are handled by analyze_frame_guard_verdict;
-// payload-bearing forwards remain default-verdict only.
+// payload-bearing forwards are handled by analyze_frame_guard_verdict.
 static FrontendResult<WsVerdict> analyze_bare_frame_verdict(const AstExpr& call) {
     const bool is_frame = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
                           call.lhs->kind == AstExprKind::Ident && call.lhs->name.eq({"frame", 5});
@@ -7087,12 +7087,43 @@ static FrontendResult<HirWsClosePolicy> analyze_frame_close_policy(const AstExpr
     return policy;
 }
 
+static FrontendResult<u32> analyze_frame_forward_payload(const AstExpr& call,
+                                                         HirRoute& route,
+                                                         const HirModule& mod) {
+    if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
+        !call.lhs->name.eq({"frame", 5}) || !call.name.eq({"forward", 7}) || call.args.len != 1 ||
+        !call.args[0] || call.args[0]->kind != AstExprKind::StrLit)
+        return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+    auto payload =
+        analyze_expr(*call.args[0], &route, mod, route.locals.data, route.locals.len, nullptr);
+    if (!payload) return core::make_unexpected(payload.error());
+    if (payload->kind != HirExprKind::StrLit || payload->type != HirTypeKind::Str ||
+        payload->may_nil || payload->may_error ||
+        payload->str_value.len > kWsTerminateMessageCapacity ||
+        (route.ws_handler.max_message_size != 0 &&
+         payload->str_value.len > route.ws_handler.max_message_size) ||
+        !utf8_valid(reinterpret_cast<const u8*>(payload->str_value.ptr), payload->str_value.len))
+        return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
+    if (!route.exprs.push(payload.value()))
+        return frontend_error(FrontendError::OutOfMemory, call.span);
+    return route.exprs.len - 1;
+}
+
 static FrontendResult<WsVerdict> analyze_frame_guard_verdict(const AstExpr& call,
                                                              HirRoute& route,
                                                              const HirModule& mod) {
     // Bare close retains its existing route-default policy. Explicit arguments
     // select a distinct policy, including an empty reason for close(code).
     if (call.args.len == 0) return analyze_bare_frame_verdict(call);
+    if (call.name.eq({"forward", 7})) {
+        auto payload = analyze_frame_forward_payload(call, route, mod);
+        if (!payload) return core::make_unexpected(payload.error());
+        auto& texts = route.ws_handler.forward_payloads;
+        const u32 index = texts.len;
+        if (!texts.push(payload.value()))
+            return frontend_error(FrontendError::TooManyItems, call.span);
+        return static_cast<WsVerdict>(static_cast<u8>(WsVerdict::ForwardTextPolicy0) + index);
+    }
     auto policy = analyze_frame_close_policy(call, route, mod);
     if (!policy) return core::make_unexpected(policy.error());
     auto& policies = route.ws_handler.close_policies;
@@ -13005,8 +13036,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
 #if RUT_ENABLE_WEBSOCKET
     if (stmt.kind == AstStmtKind::WsTerminate) {
         // A bounded guard sequence followed by a final frame verdict. Argument-bearing
-        // guard closes select independent fixed policies; bare closes keep the route's
-        // default code/reason. Payload-bearing forward remains a final verdict only.
+        // guard closes and forwards select independent fixed payloads; bare closes
+        // keep the route's default code/reason.
         auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
         if (!upstream_index) return core::make_unexpected(upstream_index.error());
         route->is_ws_terminate = true;
@@ -13055,23 +13086,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
             route->ws_handler.default_verdict = WsVerdict::Forward;
             if (call.args.len == 1) {
-                // Fixed text replacement only. Dynamic expressions need a separate
-                // bounded per-message evaluation path; never silently forward unchanged.
-                if (call.args[0] == nullptr)
-                    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-                auto payload = analyze_expr(
-                    *call.args[0], route, mod, route->locals.data, route->locals.len, nullptr);
+                auto payload = analyze_frame_forward_payload(call, *route, mod);
                 if (!payload) return core::make_unexpected(payload.error());
-                if (payload->kind != HirExprKind::StrLit || payload->type != HirTypeKind::Str ||
-                    payload->may_nil || payload->may_error ||
-                    payload->str_value.len > kWsTerminateMessageCapacity ||
-                    (stmt.ws_max_message_size != 0 &&
-                     payload->str_value.len > stmt.ws_max_message_size))
-                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
-                if (!route->exprs.push(payload.value()))
-                    return frontend_error(FrontendError::OutOfMemory, call.span);
                 route->ws_handler.has_forward_payload = true;
-                route->ws_handler.forward_payload_expr = route->exprs.len - 1;
+                route->ws_handler.forward_payload_expr = payload.value();
             }
         } else if (call.name.eq({"drop", 4})) {
             if (call.args.len != 0)

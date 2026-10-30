@@ -60,6 +60,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
         (st.close_policy_count != 0 && !st.close_policies))
         return WsInspectStatus::Error;
 
+    if (st.forward_text_count > kWsMaxForwardTexts ||
+        (st.forward_text_count != 0 && !st.forward_texts))
+        return WsInspectStatus::Error;
+
     for (;;) {
         const u32 avail = in_len - *consumed;
         const u8* p = in + *consumed;
@@ -110,6 +114,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
             const u64 original_size = st.message_len + h.payload_len;
             u64 data_size =
                 original_size > st.forward_text.len ? original_size : st.forward_text.len;
+            for (u32 i = 0; i < st.forward_text_count; i++)
+                if (st.forward_texts[i].len > data_size) data_size = st.forward_texts[i].len;
             u32 reason_size = st.close_reason.len;
             for (u32 i = 0; i < st.close_policy_count; i++)
                 if (st.close_policies[i].reason.len > reason_size)
@@ -201,23 +207,31 @@ WsInspectStatus ws_inspect(WsInspector& st,
             action_value >= first_policy && action_value < first_policy + kWsMaxClosePolicies;
         if (policy_close && action_value - first_policy >= st.close_policy_count)
             return WsInspectStatus::Error;
+        const u8 first_text_policy = static_cast<u8>(WsFrameAction::ForwardTextPolicy0);
+        const bool policy_forward = action_value >= first_text_policy &&
+                                    action_value < first_text_policy + kWsMaxForwardTexts;
+        if (policy_forward && action_value - first_text_policy >= st.forward_text_count)
+            return WsInspectStatus::Error;
         if (action == WsFrameAction::Forward) {
             // Re-serialize the whole message as a single (unfragmented) frame.
             if (!emit_frame(
                     out, out_cap, produced, msg_op, msg_buf, total, st.masked, st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
-        } else if (action == WsFrameAction::ForwardText) {
+        } else if (action == WsFrameAction::ForwardText || policy_forward) {
             // Input has already been reassembled and validated. Output owns a
             // separate slice, so replacement may grow without overwriting input.
-            if ((st.max_message_size != 0 && st.forward_text.len > st.max_message_size) ||
-                !ws_valid_text_payload(st.forward_text) ||
+            const Str replacement = policy_forward
+                                        ? st.forward_texts[action_value - first_text_policy]
+                                        : st.forward_text;
+            if ((st.max_message_size != 0 && replacement.len > st.max_message_size) ||
+                !ws_valid_text_payload(replacement) ||
                 !emit_frame(out,
                             out_cap,
                             produced,
                             WsOpcode::Text,
-                            reinterpret_cast<const u8*>(st.forward_text.ptr),
-                            st.forward_text.len,
+                            reinterpret_cast<const u8*>(replacement.ptr),
+                            replacement.len,
                             st.masked,
                             st.mask_rng))
                 return WsInspectStatus::Error;

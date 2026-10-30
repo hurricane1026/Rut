@@ -251,11 +251,13 @@ separate per-direction output buffer that modify/fragmentation also want (§8).
 
 ## 6. Frame modify (fixed text implemented; dynamic expressions deferred)
 
-Current implementation: the final `frame.forward("literal")` verdict replaces a
-reassembled data message with a Text message. Literal escape decoding is shared
+Current implementation: `frame.forward("literal")` in the final verdict or a guard
+else-branch replaces a reassembled data message with a Text message. Literal escape
+decoding is shared
 with ordinary expressions; empty strings and embedded NUL are supported. The
-literal must fit `maxMessageSize` and the terminate single-slice cap. Earlier
-guard verdicts retain their original behavior, and control frames bypass rewriting.
+literal must fit `maxMessageSize` and the terminate single-slice cap. Up to four
+guards select independent literals, with the first failing guard taking precedence.
+Bare `frame.forward()` keeps the original message; control frames bypass rewriting.
 The output slices now support payload growth and backpressure in both directions.
 Replacement bytes are retained by the loaded program and relocated in native
 artifacts. Dynamic payload expressions, interpolation, binary rewrite, and
