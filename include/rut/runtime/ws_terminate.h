@@ -18,10 +18,13 @@
 // ws_inspect at the forward boundary and sends the produced bytes.
 namespace rut {
 
+inline constexpr u32 kWsMaxCloseReasonBytes = kWsMaxControlPayload - 2;
+
 inline constexpr u32 kWsTerminateMessageCapacity = SlicePool::kSliceSize - kWsMaxHeaderSize;
 
 // Valid UTF-8 for a text message; an empty view is valid.
 bool ws_valid_text_payload(Str text);
+bool ws_valid_close_reason(Str reason);
 
 // RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close frame.
 // Accepts 1000–1003, 1007–1014, and 3000–4999; rejects the unassigned ranges (<1000,
@@ -81,6 +84,8 @@ struct WsInspector {
     // returns Close: the code the OPPOSITE leg's echo Close should carry. For a handler Close
     // it mirrors close_code; for a peer-sent Close it stays 1000 (the echo behavior is
     // unchanged — the peer's own code is already relayed verbatim on the forward leg).
+    Str close_reason{};                  // immutable route-owned UTF-8, at most 123 bytes
+    bool echo_close_has_reason = false;  // handler close only; peer closes keep the normal echo
     u16 close_code = 1000;
     u16 echo_close_code = 1000;
     // Reject fragmented messages when a caller cannot provide a separate output buffer.
@@ -93,6 +98,7 @@ struct WsInspector {
     u64 partial_payload_len = 0;
 
     void reset() {
+        echo_close_has_reason = false;
         assembler.reset();
         message_len = 0;
         partial_data_frame = false;
@@ -133,6 +139,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
 // Serialize a Close frame carrying RFC 6455 status `code` into out for the terminate close
 // handshake. `masked` true for the gateway→backend (client-role) leg, false for
 // gateway→client. Returns bytes written, 0 on overflow or random generator failure.
-u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code = 1000);
+u32 ws_emit_close_frame(
+    u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code = 1000, Str reason = {});
 
 }  // namespace rut

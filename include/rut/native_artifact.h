@@ -7,7 +7,7 @@ namespace rut::native {
 // Private, same-build ABI. Artifacts contain executable code and are trusted
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
-constexpr u32 kVersion = 7;
+constexpr u32 kVersion = 8;
 struct StreamHeader {
     u64 magic;
     u32 version;
@@ -65,7 +65,7 @@ bool visit_views(RouteConfig& c, F f) {
     }
     auto str = [&](Str& s) { return f(s.ptr, s.len); };
     for (u32 i = 0; i < c.route_count; i++)
-        if (!str(c.routes[i].ws_forward_text)) return false;
+        if (!str(c.routes[i].ws_forward_text) || !str(c.routes[i].ws_close_reason)) return false;
     for (u32 i = 0; i < c.response_policy_count; i++) {
         auto& p = c.response_policies[i];
         if (!str(p.server)) return false;

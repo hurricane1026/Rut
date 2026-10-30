@@ -668,10 +668,12 @@ struct ConnectionBase {
     WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
     Str ws_forward_text{};          // route-owned replacement view, pinned with the route config
-    u16 ws_close_code;              // route's frame.close(code) status (seeds both inspectors)
-    u16 ws_echo_close_code;         // code for the echo Close (set from the inspector on close)
-    WsInspector ws_c2u;             // client->upstream inspection state (masked)
-    WsInspector ws_u2c;             // upstream->client inspection state (unmasked)
+    Str ws_close_reason{};          // pinned route-owned close reason
+    bool ws_echo_close_has_reason;
+    u16 ws_close_code;       // route's frame.close(code) status (seeds both inspectors)
+    u16 ws_echo_close_code;  // code for the echo Close (set from the inspector on close)
+    WsInspector ws_c2u;      // client->upstream inspection state (masked)
+    WsInspector ws_u2c;      // upstream->client inspection state (unmasked)
     // Separate reassembly and output slices per direction. Output remains stable while
     // an asynchronous send is in flight; consumed input is compacted on completion.
     u8* ws_c2u_msg = nullptr;  // client->upstream reassembly slice
@@ -2033,6 +2035,8 @@ struct ConnectionBase {
         is_ws_terminate = false;
         ws_handler = nullptr;
         ws_max_message_size = 0;
+        ws_close_reason = {};
+        ws_echo_close_has_reason = false;
         ws_close_code = 1000;
         ws_forward_text = {};
         ws_echo_close_code = 1000;

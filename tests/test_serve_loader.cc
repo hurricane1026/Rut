@@ -4910,6 +4910,53 @@ TEST(serve_loader, websocket_terminate_close_code_reaches_route) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_close_reason_is_owned_and_validated) {
+    const auto path = write_file("/tmp/rut_ws_close_reason",
+                                 "app.rut",
+                                 "upstream backend at \"127.0.0.1:9999\"\n"
+                                 "route GET \"/ws\" { return websocket(backend) { frame in "
+                                 "frame.close(1008, \"policy\\0\\u{20ac}\") } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    const char expected[] = "policy\0\xe2\x82\xac";
+    REQUIRE_EQ(route.ws_close_reason.len, sizeof(expected) - 1);
+    CHECK(memcmp(route.ws_close_reason.ptr, expected, sizeof(expected) - 1) == 0);
+    CHECK_EQ(route.ws_close_code, 1008u);
+    WsInspector st;
+    st.close_code = route.ws_close_code;
+    st.close_reason = route.ws_close_reason;
+    const u8 input[] = {0x81, 0};
+    u8 out[128], msg[32];
+    u32 used = 0, produced = 0;
+    REQUIRE(ws_inspect(st,
+                       input,
+                       sizeof(input),
+                       out,
+                       sizeof(out),
+                       msg,
+                       sizeof(msg),
+                       route.ws_frame_handler,
+                       nullptr,
+                       &used,
+                       &produced) == WsInspectStatus::Close);
+    CHECK_EQ(produced, 4u + route.ws_close_reason.len);
+    CHECK(memcmp(out + 4, expected, sizeof(expected) - 1) == 0);
+    RouteConfig cfg;
+    const auto id = cfg.add_upstream("b", 0x7f000001, 9999);
+    REQUIRE(id.has_value());
+    char long_reason[124];
+    memset(long_reason, 'x', sizeof(long_reason));
+    const char bad[] = {static_cast<char>(0xff)};
+    for (Str reason : {Str{long_reason, sizeof(long_reason)}, Str{bad, 1}, Str{nullptr, 1}}) {
+        CHECK_FALSE(cfg.add_ws_terminate(
+            "/bad", 0, id.value(), route.ws_frame_handler, 4, 1008, {}, reason));
+    }
+    CHECK_EQ(cfg.route_count, 0u);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_terminate_default_close_code_is_1000) {
     // A bare frame.close() (or any non-close default) leaves ws_close_code at the 1000 default.
     const std::string dir = "/tmp/rut_serve_loader_ws_close_default";

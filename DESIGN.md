@@ -2552,6 +2552,18 @@ post /api/orders {
 
 #### 3.4.8 WebSocket Proxying
 
+The final `frame.close(code, "reason")` verdict sends a fixed reason to both
+peers during the handler-initiated close handshake. The code follows the existing
+RFC 6455 validation; the reason must be a string literal containing valid UTF-8,
+at most 123 decoded bytes. Empty reasons and embedded NUL are allowed. Reasons
+are immutable route-owned views retained by the loaded program and relocated in
+native artifacts (format version 8). Guard else-branches still accept bare verdicts;
+configured code/reason apply to any handler Close on that route, just as the code
+already does. A peer Close retains its original payload on the forward leg and
+receives the existing normal-closure echo without the configured reason.
+The echo uses its direction's idle output slice, retained until send completion;
+no extra slices or enlarged inline close-frame buffers are needed.
+
 Current terminate handlers support `guard` conditions over `frame.fromClient`,
 `frame.isText`, `frame.isBinary`, `frame.len` comparisons, and
 `frame.text.matches(re"…")`, `frame.text == "literal"` (or `!=`, with the
@@ -2608,7 +2620,7 @@ masking roles. Fixed nonempty rewrites use the existing bounded one-shot upstrea
 receive on io_uring, so multiple CQEs cannot overflow receive storage before the
 inspection callback drains it. Literal bytes are copied into the loaded program's retained arena;
 native artifacts relocate that view, so neither mode retains temporary HIR views.
-The native artifact format version is 7 following the route layout change.
+The native artifact format version is 8 following the close-reason route layout change.
 
 The examples in this section include planned syntax and actions. The current
 terminate implementation supports bounded reassembled text/binary messages,

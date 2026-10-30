@@ -19156,6 +19156,8 @@ struct WsFrameEchoServer {
     // Per-frame echo delay: holds each echo back so the gateway's c2u send /
     // u2c receive interleave with later client frames (flake repro harness).
     u32 echo_delay_us = 0;
+    u8 close_payload[125]{};
+    std::atomic<u32> close_length{0};
     std::atomic<bool> running{false};
     bool started = false;
     pthread_t thread{};
@@ -19216,6 +19218,12 @@ struct WsFrameEchoServer {
                     for (rut::u64 i = 0; i < h.payload_len; i++)
                         pl[i] = acc[off + h.header_len + i];
                     rut::ws_unmask(pl, h.payload_len, h.mask_key);
+                    if (h.opcode == rut::WsOpcode::Close &&
+                        h.payload_len <= sizeof(s->close_payload)) {
+                        for (u32 i = 0; i < h.payload_len; i++) s->close_payload[i] = pl[i];
+                        s->close_length.store(static_cast<u32>(h.payload_len),
+                                              std::memory_order_release);
+                    }
                     rut::u8 out[8192];
                     rut::u8 key[4] = {0, 0, 0, 0};
                     rut::u32 hl =
@@ -19821,6 +19829,109 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     loop->shutdown();
     close(listen_fd);
     destroy_real_loop(loop);
+}
+
+template <typename Loop>
+static void check_ws_close_reason_round_trip(rut::test::TestCase* _tc) {
+    using namespace rut;
+    for (bool close_client_direction : {false, true}) {
+        WsFrameEchoServer backend;
+        REQUIRE(backend.setup());
+        RouteConfig cfg{};
+        auto id = cfg.add_upstream("b", 0x7f000001, backend.port);
+        REQUIRE(id.has_value());
+        char reason[123];
+        memset(reason, 'r', sizeof(reason));
+        reason[1] = 0;
+        reason[120] = static_cast<char>(0xe2);
+        reason[121] = static_cast<char>(0x82);
+        reason[122] = static_cast<char>(0xac);
+        WsMessageHandlerFn handler =
+            close_client_direction
+                ? +[](void*,
+                      WsOpcode,
+                      const u8*,
+                      u64,
+                      bool
+                          client) { return client ? WsFrameAction::Close : WsFrameAction::Forward; }
+                : +[](void*, WsOpcode, const u8*, u64, bool client) {
+                      return client ? WsFrameAction::Forward : WsFrameAction::Close;
+                  };
+        REQUIRE(cfg.add_ws_terminate(
+            "/ws", 0, id.value(), handler, 16370, 1008, {}, {reason, sizeof(reason)}));
+        const RouteConfig* active = &cfg;
+        Shard<Loop> shard;
+        i32 listener = -1, client = -1;
+        struct Cleanup {
+            Shard<Loop>& shard;
+            WsFrameEchoServer& backend;
+            i32& listener;
+            i32& client;
+            ~Cleanup() {
+                if (client >= 0) close(client);
+                backend.teardown();
+                shard.shutdown();
+                if (listener >= 0) close(listener);
+            }
+        } cleanup{shard, backend, listener, client};
+        listener = create_listen_socket(0).value_or(-1);
+        REQUIRE(listener >= 0);
+        const u16 port = get_port(listener);
+        REQUIRE(shard.init(0, listener).has_value());
+        shard.loop->config_ptr = &active;
+        REQUIRE(shard.spawn(-1).has_value());
+        client = connect_to(port);
+        REQUIRE(client >= 0);
+        set_socket_timeouts(client, 5);
+        const char upgrade[] =
+            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: "
+            "Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        REQUIRE(send_all(client, upgrade, sizeof(upgrade) - 1));
+        char response[1024];
+        const u32 headers = recv_http_headers(client, response, sizeof(response));
+        REQUIRE(headers > 0 && buf_contains(response, headers, "101", 3));
+        const u8 key[4] = {1, 2, 3, 4};
+        u8 input[16];
+        const u32 hlen = ws_write_header(input, WsOpcode::Text, true, true, key, 1);
+        input[hlen] = 'x';
+        ws_unmask(input + hlen, 1, key);
+        REQUIRE(send_all(client, reinterpret_cast<char*>(input), hlen + 1));
+        u8 output[256];
+        u32 have = 0;
+        WsFrameHeader h;
+        for (;;) {
+            if (ws_parse_header(output, have, false, &h) == ParseStatus::Complete &&
+                have >= h.header_len + h.payload_len)
+                break;
+            REQUIRE(have < sizeof(output));
+            const i32 n = recv_timeout(
+                client, reinterpret_cast<char*>(output + have), sizeof(output) - have, 5000);
+            REQUIRE(n > 0);
+            have += static_cast<u32>(n);
+        }
+        CHECK(h.opcode == WsOpcode::Close);
+        REQUIRE_EQ(h.payload_len, 125u);
+        CHECK_EQ(output[h.header_len], 3u);
+        CHECK_EQ(output[h.header_len + 1], 240u);
+        CHECK(memcmp(output + h.header_len + 2, reason, sizeof(reason)) == 0);
+        for (u32 i = 0; i < 500 && backend.close_length.load(std::memory_order_acquire) == 0; i++)
+            usleep(1000);
+        REQUIRE_EQ(backend.close_length.load(std::memory_order_acquire), 125u);
+        CHECK_EQ(backend.close_payload[0], 3u);
+        CHECK_EQ(backend.close_payload[1], 240u);
+        CHECK(memcmp(backend.close_payload + 2, reason, sizeof(reason)) == 0);
+        char tail[16];
+        CHECK(recv_timeout(client, tail, sizeof(tail), 5000) <= 0);
+    }
+}
+
+TEST(websocket_e2e, close_reason_reaches_both_peers) {
+    check_ws_close_reason_round_trip<RealLoop>(_tc);
+}
+TEST(websocket_e2e, close_reason_reaches_both_peers_iouring) {
+#if defined(__linux__)
+    check_ws_close_reason_round_trip<rut::IoUringEventLoop>(_tc);
+#endif
 }
 
 // Fragments arriving in separate reads are reassembled before inspection and forwarding.
