@@ -266,6 +266,28 @@ func standardWebhook(_ id: str, _ timestamp: str, _ signature: str, _ body: str,
     Identity(consumerId: consumerId, credentialId: credentialId, method: "standardWebhook")
 }
 
+struct WebhookRotation {
+    currentKey: str
+    previousKey: str
+    consumerId: str
+    currentId: str
+    previousId: str
+}
+
+// Evaluate both configured slots; removing the previous key revokes that slot.
+func rotatingStandardWebhook(_ id: str, _ timestamp: str, _ signature: str, _ body: str,
+                             _ config: WebhookRotation) -> Identity {
+    guard config.consumerId != "" && config.currentId != "" && config.previousId != "" else { respond 503 }
+    guard config.currentKey != "" || config.previousKey != "" else { respond 503 }
+    let current = Crypto.webhookValid(id, timestamp, signature, body, config.currentKey)
+    let previous = Crypto.webhookValid(id, timestamp, signature, body, config.previousKey)
+    guard current || previous else { respond 401 }
+    match current {
+        true => Identity(consumerId: config.consumerId, credentialId: config.currentId, method: "standardWebhook")
+        _ => Identity(consumerId: config.consumerId, credentialId: config.previousId, method: "standardWebhook")
+    }
+}
+
 // Both slots are evaluated. Current wins if configured secrets are identical.
 func rotatingHmac(_ message: str, _ signature: str, _ currentKey: str, _ previousKey: str,
                   _ consumerId: str, _ currentId: str, _ previousId: str) -> Identity {

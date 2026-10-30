@@ -17,7 +17,7 @@ whether a competing open-source edition includes them.
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection | Dynamic Consumer registry, anonymous only for absent credentials, no invalid-credential downgrade |
 | JWT verification | HS256/384/512 policy helpers; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper | ES keys, remote JWKS refresh/cache, live and durable token revocation |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks HTTP/Rut wiring and replay persistence |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks durable replay persistence |
 | ACL / Consumer restriction | Exact single-consumer allow/deny and two-consumer allow union after verification | Multiple groups, membership lifecycle, registry-backed default deny, no client identity spoofing |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
@@ -358,10 +358,17 @@ suffixes after an otherwise valid signature. Multiple valid-format signatures
 support sender key rotation. Callers may independently try another trusted key
 within their configured rotation window.
 
+`auth.rotatingStandardWebhook` accepts current and previous decoded keys and
+their configured credential IDs. Both slots are checked; the current slot wins
+when both match. Empty keys disable slots, and removing the previous key revokes
+that slot. Empty identity metadata or two disabled slots returns 503; invalid
+signatures and malformed or duplicate headers return 401. Freshness is not
+replay protection: verified IDs still need durable deduplication.
+
 `hash_digest_parts` reuses existing stack digest/HMAC contexts over at most 16
 borrowed spans, avoiding a body-sized concatenation buffer or request allocation.
-Inputs are borrowed synchronously; no HTTP parser, body JSON parsing, network
-operation or Rut/JIT surface is added. Callers must obtain singleton
+Inputs are borrowed synchronously; no body JSON parsing or network operation
+is needed. Rut callers must obtain singleton
 `webhook-id`, `webhook-timestamp` and `webhook-signature` fields and reject
 ambiguous HTTP fields before invoking the primitive.
 
@@ -370,8 +377,8 @@ the time window. Applications must durably deduplicate authenticated IDs before
 side effects, including cross-shard/node coordination. This slice adds no replay
 store. Tests use fixed Python HMAC/Base64 oracle outputs with upstream Python
 fixture inputs, tampering and malformed lists, rotation, size/clock boundaries,
-and zero observed crypto allocations after warmup. HTTP/Rut end-to-end evidence
-and persisted replay handling remain pending.
+and zero observed crypto allocations after warmup. HTTP/Rut end-to-end tests
+exercise the identity helpers; persisted replay handling remains pending.
 
 ## Request-owned identity header storage foundation
 
