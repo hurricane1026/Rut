@@ -156,6 +156,8 @@ struct RouteEntry {
     WsMessageHandlerFn ws_frame_handler = nullptr;
     u32 ws_max_message_size = 0;
     // RFC 6455 status the handler's `frame.close(code)` verdict puts on the wire (1000 default).
+    WsClosePolicy ws_close_policies[kWsMaxClosePolicies]{};
+    u32 ws_close_policy_count = 0;
     Str ws_close_reason{};
     u16 ws_close_code = 1000;
     Str ws_forward_text{};  // immutable replacement for ForwardText verdicts
@@ -1509,7 +1511,9 @@ public:
                           u32 max_message_size,
                           u16 close_code = 1000,
                           Str forward_text = {},
-                          Str close_reason = {}) {
+                          Str close_reason = {},
+                          const WsClosePolicy* close_policies = nullptr,
+                          u32 close_policy_count = 0) {
 #if !RUT_ENABLE_WEBSOCKET
         // The 101/tunnel path is compiled out in this build — a terminate route could
         // never enter terminate mode, so fail loud instead of publishing an unusable route.
@@ -1521,6 +1525,8 @@ public:
         (void)close_code;
         (void)forward_text;
         (void)close_reason;
+        (void)close_policies;
+        (void)close_policy_count;
         return false;
 #else
         if (handler == nullptr || max_message_size == 0 || forward_text.len > max_message_size ||
@@ -1531,6 +1537,13 @@ public:
         // — including the reserved 1016–2999 range — so this C++ surface can't publish a route
         // whose handler Close serializes a code the runtime itself considers invalid.
         if (!ws_valid_close_code(close_code) || !ws_valid_close_reason(close_reason)) return false;
+        if (close_policy_count > kWsMaxClosePolicies ||
+            (close_policy_count != 0 && !close_policies))
+            return false;
+        for (u32 i = 0; i < close_policy_count; i++)
+            if (!ws_valid_close_code(close_policies[i].code) ||
+                !ws_valid_close_reason(close_policies[i].reason))
+                return false;
         if (!add_proxy(path, method, upstream_id)) return false;
         auto& r = routes[route_count - 1];
         r.ws_terminate = true;
@@ -1538,6 +1551,8 @@ public:
         r.ws_max_message_size = max_message_size;
         r.ws_close_code = close_code;
         r.ws_close_reason = close_reason;
+        r.ws_close_policy_count = close_policy_count;
+        for (u32 i = 0; i < close_policy_count; i++) r.ws_close_policies[i] = close_policies[i];
         r.ws_forward_text = forward_text;
         return true;
 #endif

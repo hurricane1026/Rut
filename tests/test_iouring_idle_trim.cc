@@ -1153,9 +1153,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     CHECK(!c->idle_trim_examined);
     // RelayOwner, BufferedSendVector, and the four WebSocket inspection slices
     // are part of the hot connection slot. Fixed-text rewriting and close reasons
-    // each add one route view on the connection and one view per direction.
+    // each add one route view on the connection and one view per direction. Branch
+    // close policies add bounded table views and the selected echo reason.
     // Keep the bounded layout explicit so future owner fields cannot grow it unnoticed.
-    CHECK_EQ(sizeof(Connection), 4288u);
+    CHECK_EQ(sizeof(Connection), 4384u);
 }
 
 TEST(iouring_idle_trim,

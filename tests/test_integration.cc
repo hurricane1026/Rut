@@ -19832,7 +19832,7 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
 }
 
 template <typename Loop>
-static void check_ws_close_reason_round_trip(rut::test::TestCase* _tc) {
+static void check_ws_close_reason_round_trip(rut::test::TestCase* _tc, bool branch_policy = false) {
     using namespace rut;
     for (bool close_client_direction : {false, true}) {
         WsFrameEchoServer backend;
@@ -19857,8 +19857,29 @@ static void check_ws_close_reason_round_trip(rut::test::TestCase* _tc) {
                 : +[](void*, WsOpcode, const u8*, u64, bool client) {
                       return client ? WsFrameAction::Forward : WsFrameAction::Close;
                   };
-        REQUIRE(cfg.add_ws_terminate(
-            "/ws", 0, id.value(), handler, 16370, 1008, {}, {reason, sizeof(reason)}));
+        const WsClosePolicy policies[] = {{1008, {reason, sizeof(reason)}},
+                                          {4001, {reason, sizeof(reason)}}};
+        if (branch_policy) {
+            handler = close_client_direction
+                ? +[](void*, WsOpcode, const u8*, u64, bool client) {
+                    return client ? WsFrameAction::ClosePolicy0 : WsFrameAction::Forward;
+                  }
+                : +[](void*, WsOpcode, const u8*, u64, bool client) {
+                    return client ? WsFrameAction::Forward : WsFrameAction::ClosePolicy1;
+                  };
+        }
+        REQUIRE(
+            cfg.add_ws_terminate("/ws",
+                                 0,
+                                 id.value(),
+                                 handler,
+                                 16370,
+                                 branch_policy ? 1000 : 1008,
+                                 {},
+                                 branch_policy ? Str{"default", 7} : Str{reason, sizeof(reason)},
+                                 policies,
+                                 branch_policy ? 2 : 0));
+        const u16 expected_code = branch_policy && !close_client_direction ? 4001 : 1008;
         const RouteConfig* active = &cfg;
         Shard<Loop> shard;
         i32 listener = -1, client = -1;
@@ -19911,14 +19932,14 @@ static void check_ws_close_reason_round_trip(rut::test::TestCase* _tc) {
         }
         CHECK(h.opcode == WsOpcode::Close);
         REQUIRE_EQ(h.payload_len, 125u);
-        CHECK_EQ(output[h.header_len], 3u);
-        CHECK_EQ(output[h.header_len + 1], 240u);
+        CHECK_EQ(output[h.header_len], expected_code >> 8);
+        CHECK_EQ(output[h.header_len + 1], expected_code & 0xffu);
         CHECK(memcmp(output + h.header_len + 2, reason, sizeof(reason)) == 0);
         for (u32 i = 0; i < 500 && backend.close_length.load(std::memory_order_acquire) == 0; i++)
             usleep(1000);
         REQUIRE_EQ(backend.close_length.load(std::memory_order_acquire), 125u);
-        CHECK_EQ(backend.close_payload[0], 3u);
-        CHECK_EQ(backend.close_payload[1], 240u);
+        CHECK_EQ(backend.close_payload[0], expected_code >> 8);
+        CHECK_EQ(backend.close_payload[1], expected_code & 0xffu);
         CHECK(memcmp(backend.close_payload + 2, reason, sizeof(reason)) == 0);
         char tail[16];
         CHECK(recv_timeout(client, tail, sizeof(tail), 5000) <= 0);
@@ -19931,6 +19952,15 @@ TEST(websocket_e2e, close_reason_reaches_both_peers) {
 TEST(websocket_e2e, close_reason_reaches_both_peers_iouring) {
 #if defined(__linux__)
     check_ws_close_reason_round_trip<rut::IoUringEventLoop>(_tc);
+#endif
+}
+
+TEST(websocket_e2e, branch_close_policy_reaches_both_peers) {
+    check_ws_close_reason_round_trip<RealLoop>(_tc, true);
+}
+TEST(websocket_e2e, branch_close_policy_reaches_both_peers_iouring) {
+#if defined(__linux__)
+    check_ws_close_reason_round_trip<rut::IoUringEventLoop>(_tc, true);
 #endif
 }
 

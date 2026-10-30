@@ -381,17 +381,35 @@ bool load_rut_program(const char* path,
                 bytes[expr.str_value.len] = '\0';
                 forward_text = {bytes, expr.str_value.len};
             }
-            Str close_reason{};
-            if (route.ws_handler.close_reason_expr != 0xffffffffu) {
-                if (route.ws_handler.close_reason_expr >= route.exprs.len) return false;
-                const auto& expr = route.exprs[route.ws_handler.close_reason_expr];
+            auto retain_close_reason = [&](u32 index, Str& result) {
+                result = {};
+                if (index == 0xffffffffu) return true;
+                if (index >= route.exprs.len) return false;
+                const auto& expr = route.exprs[index];
                 if (expr.kind != HirExprKind::StrLit || !ws_valid_close_reason(expr.str_value))
                     return false;
                 char* bytes = out.rir.arena.alloc_array<char>(expr.str_value.len + 1);
                 if (!bytes) return false;
                 for (u32 j = 0; j < expr.str_value.len; j++) bytes[j] = expr.str_value.ptr[j];
                 bytes[expr.str_value.len] = '\0';
-                close_reason = {bytes, expr.str_value.len};
+                result = {bytes, expr.str_value.len};
+                return true;
+            };
+            Str close_reason{};
+            if (!retain_close_reason(route.ws_handler.close_reason_expr, close_reason))
+                return false;
+            static_assert(HirWsHandler::kMaxLenGuards == kWsMaxClosePolicies);
+            static_assert(static_cast<u8>(WsVerdict::ClosePolicy0) ==
+                          static_cast<u8>(WsFrameAction::ClosePolicy0));
+            static_assert(static_cast<u8>(WsVerdict::ClosePolicy3) ==
+                          static_cast<u8>(WsFrameAction::ClosePolicy3));
+            WsClosePolicy close_policies[kWsMaxClosePolicies]{};
+            const u32 policy_count = route.ws_handler.close_policies.len;
+            for (u32 i = 0; i < policy_count; i++) {
+                close_policies[i].code = route.ws_handler.close_policies[i].code;
+                if (!retain_close_reason(route.ws_handler.close_policies[i].reason_expr,
+                                         close_policies[i].reason))
+                    return false;
             }
             if (!out.config.add_ws_terminate(path,
                                              route.method,
@@ -400,7 +418,9 @@ bool load_rut_program(const char* path,
                                              max_msg,
                                              route.ws_handler.close_code,
                                              forward_text,
-                                             close_reason))
+                                             close_reason,
+                                             close_policies,
+                                             policy_count))
                 return false;
             ws_n++;
         }

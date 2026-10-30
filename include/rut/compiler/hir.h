@@ -1073,12 +1073,16 @@ struct HirForLoop {
 
 // WebSocket terminate-mode frame-handler verdict. Mirrors the runtime
 // `WsFrameAction` (ws_terminate.h): the per-message disposition the JIT'd
-// handler returns. Slice B only produces `Forward` (forward-only / empty
-// body); Drop/Close are follow-up slices.
+// handler returns. Values 4–7 select branch-specific close policies; value 3
+// is reserved for the runtime's default-only fixed text replacement.
 enum class WsVerdict : u8 {
     Forward,
     Drop,
     Close,
+    ClosePolicy0 = 4,
+    ClosePolicy1,
+    ClosePolicy2,
+    ClosePolicy3,
 };
 
 // Frame-handler condition nodes. Leaf nodes inspect message length, opcode,
@@ -1113,6 +1117,11 @@ struct WsLenGuard {
     WsVerdict verdict = WsVerdict::Drop;  // yielded when the guard fails
 };
 
+struct HirWsClosePolicy {
+    u16 code = 1000;
+    u32 reason_expr = 0xffffffffu;
+};
+
 struct HirWsHandler {
     WsVerdict default_verdict = WsVerdict::Forward;
     // Postorder condition forest. Guard roots execute in source order before the
@@ -1120,6 +1129,7 @@ struct HirWsHandler {
     static constexpr u32 kMaxLenGuards = 4;
     static constexpr u32 kMaxConditionNodes = 32;
     FixedVec<WsLenGuard, kMaxConditionNodes> len_guards;
+    FixedVec<HirWsClosePolicy, kMaxLenGuards> close_policies;
     // `frame.forward(payload)` modify form: forward a rewritten message instead of the
     // original. The fixed text literal is stored in HirRoute.exprs;
     // forward_payload_expr is its index there (0xffffffffu when has_forward_payload is false).

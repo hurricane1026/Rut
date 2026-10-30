@@ -56,6 +56,9 @@ WsInspectStatus ws_inspect(WsInspector& st,
                            u32* produced) {
     *consumed = 0;
     *produced = 0;
+    if (st.close_policy_count > kWsMaxClosePolicies ||
+        (st.close_policy_count != 0 && !st.close_policies))
+        return WsInspectStatus::Error;
 
     for (;;) {
         const u32 avail = in_len - *consumed;
@@ -107,8 +110,12 @@ WsInspectStatus ws_inspect(WsInspector& st,
             const u64 original_size = st.message_len + h.payload_len;
             u64 data_size =
                 original_size > st.forward_text.len ? original_size : st.forward_text.len;
-            const u64 close_size = 2u + static_cast<u64>(st.close_reason.len);
-            if (st.close_reason.len != 0 && close_size > data_size) data_size = close_size;
+            u32 reason_size = st.close_reason.len;
+            for (u32 i = 0; i < st.close_policy_count; i++)
+                if (st.close_policies[i].reason.len > reason_size)
+                    reason_size = st.close_policies[i].reason.len;
+            const u64 close_size = 2u + static_cast<u64>(reason_size);
+            if (reason_size != 0 && close_size > data_size) data_size = close_size;
             const u64 needed = ws_opcode_is_control(h.opcode)
                                    ? frame_total
                                    : (h.fin ? data_size + kWsMaxHeaderSize : 0);
@@ -147,7 +154,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 // Peer-initiated close: the peer's own code was relayed verbatim above; keep
                 // the echo to the other side at 1000 (unchanged behavior — see header).
                 st.echo_close_code = 1000;
-                st.echo_close_has_reason = false;
+                st.echo_close_reason = {};
                 return WsInspectStatus::Close;
             }
             continue;
@@ -188,6 +195,12 @@ WsInspectStatus ws_inspect(WsInspector& st,
 
         // Message complete — invoke the handler and act on its verdict.
         const WsFrameAction action = handler(ctx, msg_op, msg_buf, total, st.from_client);
+        const u8 action_value = static_cast<u8>(action);
+        const u8 first_policy = static_cast<u8>(WsFrameAction::ClosePolicy0);
+        const bool policy_close =
+            action_value >= first_policy && action_value < first_policy + kWsMaxClosePolicies;
+        if (policy_close && action_value - first_policy >= st.close_policy_count)
+            return WsInspectStatus::Error;
         if (action == WsFrameAction::Forward) {
             // Re-serialize the whole message as a single (unfragmented) frame.
             if (!emit_frame(
@@ -208,29 +221,34 @@ WsInspectStatus ws_inspect(WsInspector& st,
                             st.masked,
                             st.mask_rng))
                 return WsInspectStatus::Error;
-        } else if (action == WsFrameAction::Close) {
-            if (!ws_valid_close_code(st.close_code) || !ws_valid_close_reason(st.close_reason))
+        } else if (action == WsFrameAction::Close || policy_close) {
+            const WsClosePolicy selected = policy_close
+                                               ? st.close_policies[action_value - first_policy]
+                                               : WsClosePolicy{st.close_code, st.close_reason};
+            if (!ws_valid_close_code(selected.code) || !ws_valid_close_reason(selected.reason))
                 return WsInspectStatus::Error;
             u8 cc[kWsMaxControlPayload];
-            cc[0] = static_cast<u8>(st.close_code >> 8);
-            cc[1] = static_cast<u8>(st.close_code);
-            for (u32 i = 0; i < st.close_reason.len; i++)
-                cc[i + 2] = static_cast<u8>(st.close_reason.ptr[i]);
+            cc[0] = static_cast<u8>(selected.code >> 8);
+            cc[1] = static_cast<u8>(selected.code);
+            for (u32 i = 0; i < selected.reason.len; i++)
+                cc[i + 2] = static_cast<u8>(selected.reason.ptr[i]);
             const u32 hdr = 2u + (st.masked ? 4u : 0u);
-            u32 body = 2u + st.close_reason.len;
+            u32 body = 2u + selected.reason.len;
             // Preserve the legacy empty-status fallback only for code-only closes.
             // A configured reason must fit whole; never truncate UTF-8 or silently discard it.
             if (static_cast<u64>(*produced) + hdr + body > out_cap) {
-                if (st.close_reason.len != 0) return WsInspectStatus::Error;
+                if (selected.reason.len != 0) return WsInspectStatus::Error;
                 body = 0;
             }
             if (!emit_frame(
                     out, out_cap, produced, WsOpcode::Close, cc, body, st.masked, st.mask_rng))
                 return WsInspectStatus::Error;
-            st.echo_close_has_reason = true;
-            st.echo_close_code = st.close_code;
+            st.echo_close_reason = selected.reason;
+            st.echo_close_code = selected.code;
             st.message_len = 0;
             return WsInspectStatus::Close;
+        } else if (action != WsFrameAction::Drop) {
+            return WsInspectStatus::Error;
         }
         // Drop: emit nothing. All continuing verdicts reset for the next message.
         st.message_len = 0;

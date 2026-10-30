@@ -365,6 +365,51 @@ TEST(native_program, websocket_close_reason_survives_source_removal) {
     CHECK(memcmp(out + 4, expected, sizeof(expected) - 1) == 0);
 }
 
+TEST(native_program, websocket_guard_close_policies_survive_source_removal) {
+    Source source;
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+                      "websocket(backend) { frame in\n"
+                      "guard frame.text != \"a\" else { frame.close(1008, \"a\\0\\u{20ac}\") }\n"
+                      "guard frame.text != \"b\" else { frame.close(1009) }\n"
+                      "guard frame.text != \"c\" else { frame.close(1011, \"third\") }\n"
+                      "guard frame.text != \"d\" else { frame.close(4001, \"fourth\") }\n"
+                      "frame.close(1000, \"default\") } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    REQUIRE_EQ(route.ws_close_policy_count, 4u);
+    const u16 codes[] = {1008, 1009, 1011, 4001, 1000};
+    const Str reasons[] = {{"a\0\xe2\x82\xac", 5}, {}, {"third", 5}, {"fourth", 6}, {"default", 7}};
+    for (u32 i = 0; i < 5; i++) {
+        WsInspector st;
+        st.close_code = route.ws_close_code;
+        st.close_reason = route.ws_close_reason;
+        st.close_policies = route.ws_close_policies;
+        st.close_policy_count = route.ws_close_policy_count;
+        const u8 input[] = {0x81, 1, static_cast<u8>('a' + i)};
+        u8 out[128], msg[32];
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           sizeof(input),
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           route.ws_frame_handler,
+                           nullptr,
+                           &used,
+                           &produced) == WsInspectStatus::Close);
+        CHECK_EQ(st.echo_close_code, codes[i]);
+        CHECK(st.echo_close_reason.eq(reasons[i]));
+        CHECK_EQ(produced, 4u + reasons[i].len);
+        if (!reasons[i].empty()) CHECK(memcmp(out + 4, reasons[i].ptr, reasons[i].len) == 0);
+    }
+}
+
 TEST(native_program, websocket_regex_handler_survives_compiler_exit) {
     Source source;
     REQUIRE(

@@ -38,10 +38,20 @@ constexpr bool ws_valid_close_code(u32 code) {
 
 // What the gateway should do with a fully-reassembled data message.
 enum class WsFrameAction : u8 {
-    Forward,      // re-serialize the message and send it on
-    Drop,         // silently discard it
-    Close,        // tear the tunnel down (a Close frame is emitted first)
-    ForwardText,  // replace with the route's fixed text, then forward as Text
+    Forward,       // re-serialize the message and send it on
+    Drop,          // silently discard it
+    Close,         // tear the tunnel down (a Close frame is emitted first)
+    ForwardText,   // replace with the route's fixed text, then forward as Text
+    ClosePolicy0,  // close using one of the route's bounded branch-specific policies
+    ClosePolicy1,
+    ClosePolicy2,
+    ClosePolicy3,
+};
+
+inline constexpr u32 kWsMaxClosePolicies = 4;
+struct WsClosePolicy {
+    u16 code = 1000;
+    Str reason{};  // immutable route-owned UTF-8, at most 123 bytes
 };
 
 // Invoked once per complete data message. `opcode` is Text or Binary; `payload` is the
@@ -84,8 +94,10 @@ struct WsInspector {
     // returns Close: the code the OPPOSITE leg's echo Close should carry. For a handler Close
     // it mirrors close_code; for a peer-sent Close it stays 1000 (the echo behavior is
     // unchanged — the peer's own code is already relayed verbatim on the forward leg).
-    Str close_reason{};                  // immutable route-owned UTF-8, at most 123 bytes
-    bool echo_close_has_reason = false;  // handler close only; peer closes keep the normal echo
+    Str close_reason{};  // immutable route-owned UTF-8, at most 123 bytes
+    const WsClosePolicy* close_policies = nullptr;
+    u32 close_policy_count = 0;
+    Str echo_close_reason{};  // selected handler reason, empty for a peer-initiated close
     u16 close_code = 1000;
     u16 echo_close_code = 1000;
     // Reject fragmented messages when a caller cannot provide a separate output buffer.
@@ -98,7 +110,7 @@ struct WsInspector {
     u64 partial_payload_len = 0;
 
     void reset() {
-        echo_close_has_reason = false;
+        echo_close_reason = {};
         assembler.reset();
         message_len = 0;
         partial_data_frame = false;

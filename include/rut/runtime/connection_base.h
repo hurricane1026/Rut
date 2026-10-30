@@ -669,7 +669,9 @@ struct ConnectionBase {
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
     Str ws_forward_text{};          // route-owned replacement view, pinned with the route config
     Str ws_close_reason{};          // pinned route-owned close reason
-    bool ws_echo_close_has_reason;
+    const WsClosePolicy* ws_close_policies = nullptr;
+    u32 ws_close_policy_count = 0;
+    Str ws_echo_close_reason{};
     u16 ws_close_code;       // route's frame.close(code) status (seeds both inspectors)
     u16 ws_echo_close_code;  // code for the echo Close (set from the inspector on close)
     WsInspector ws_c2u;      // client->upstream inspection state (masked)
@@ -2036,7 +2038,9 @@ struct ConnectionBase {
         ws_handler = nullptr;
         ws_max_message_size = 0;
         ws_close_reason = {};
-        ws_echo_close_has_reason = false;
+        ws_close_policies = nullptr;
+        ws_close_policy_count = 0;
+        ws_echo_close_reason = {};
         ws_close_code = 1000;
         ws_forward_text = {};
         ws_echo_close_code = 1000;

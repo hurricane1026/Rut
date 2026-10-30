@@ -4957,6 +4957,150 @@ TEST(serve_loader, websocket_close_reason_is_owned_and_validated) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_guard_close_policies_reach_wire) {
+    const auto path = write_file(
+        "/tmp/rut_ws_guard_close",
+        "app.rut",
+        "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(backend) { "
+        "frame in\n"
+        "guard !frame.fromClient || !frame.text.hasPrefix(\"a\") else { frame.close(1008, "
+        "\"one\\0\\u{20ac}\") }\n"
+        "guard !frame.fromClient || !frame.text.hasPrefix(\"b\") else { frame.close(1009) }\n"
+        "guard !frame.fromClient || !frame.text.hasPrefix(\"c\") else { frame.close(1011, "
+        "\"third\") }\n"
+        "guard !frame.fromClient || !frame.text.hasPrefix(\"d\") else { frame.close(4001, "
+        "\"fourth\") }\n"
+        "frame.close(1000, \"default\") } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    REQUIRE_EQ(route.ws_close_policy_count, 4u);
+    const u16 codes[] = {1008, 1009, 1011, 4001, 1000};
+    const Str reasons[] = {
+        {"one\0\xe2\x82\xac", 7}, {}, {"third", 5}, {"fourth", 6}, {"default", 7}};
+    for (bool from_client : {false, true}) {
+        for (u32 i = 0; i < 5; i++) {
+            WsInspector st;
+            st.from_client = from_client;
+            st.close_code = route.ws_close_code;
+            st.close_reason = route.ws_close_reason;
+            st.close_policies = route.ws_close_policies;
+            st.close_policy_count = route.ws_close_policy_count;
+            const u8 input[] = {0x81, 1, static_cast<u8>('a' + i)};
+            u8 out[128], msg[32];
+            u32 used = 0, produced = 0;
+            REQUIRE(ws_inspect(st,
+                               input,
+                               sizeof(input),
+                               out,
+                               sizeof(out),
+                               msg,
+                               sizeof(msg),
+                               route.ws_frame_handler,
+                               nullptr,
+                               &used,
+                               &produced) == WsInspectStatus::Close);
+            const u32 policy = from_client ? i : 4;
+            CHECK_EQ(st.echo_close_code, codes[policy]);
+            CHECK(st.echo_close_reason.eq(reasons[policy]));
+            CHECK_EQ(produced, 4u + reasons[policy].len);
+            CHECK_EQ((static_cast<u16>(out[2]) << 8) | out[3], codes[policy]);
+            if (!reasons[policy].empty())
+                CHECK(memcmp(out + 4, reasons[policy].ptr, reasons[policy].len) == 0);
+        }
+    }
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7f000001, 9999);
+    REQUIRE(id.has_value());
+    WsClosePolicy invalid[] = {{1006, {}}};
+    CHECK_FALSE(cfg.add_ws_terminate(
+        "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, invalid, 1));
+    invalid[0].code = 1008;
+    invalid[0].reason = {nullptr, 1};
+    CHECK_FALSE(cfg.add_ws_terminate(
+        "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, invalid, 1));
+    CHECK_FALSE(cfg.add_ws_terminate(
+        "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, nullptr, 1));
+    CHECK_FALSE(cfg.add_ws_terminate(
+        "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, invalid, 5));
+    CHECK_EQ(cfg.route_count, 0u);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_guard_close_first_failure_and_bare_default) {
+    const auto path = write_file("/tmp/rut_ws_guard_close_order",
+                                 "app.rut",
+                                 "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { "
+                                 "return websocket(backend) { frame in\n"
+                                 "guard frame.len < 1 else { frame.close(1008, \"first\") }\n"
+                                 "guard frame.isText else { frame.close(1011, \"second\") }\n"
+                                 "guard frame.fromClient else { frame.close() }\n"
+                                 "frame.close(4001, \"default\") } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    REQUIRE_EQ(route.ws_close_policy_count, 2u);
+    const u8 payload[] = {'x'};
+    CHECK(route.ws_frame_handler(nullptr, WsOpcode::Binary, payload, 1, true) ==
+          WsFrameAction::ClosePolicy0);
+    CHECK(route.ws_frame_handler(nullptr, WsOpcode::Binary, nullptr, 0, true) ==
+          WsFrameAction::ClosePolicy1);
+    CHECK(route.ws_frame_handler(nullptr, WsOpcode::Text, nullptr, 0, false) ==
+          WsFrameAction::Close);
+    CHECK_EQ(route.ws_close_code, 4001u);
+    CHECK(route.ws_close_reason.eq({"default", 7}));
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_guard_close_coexists_with_default_text_rewrite) {
+    const auto path =
+        write_file("/tmp/rut_ws_guard_close_rewrite",
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+                   "websocket(backend) { frame in\n"
+                   "guard !frame.text.contains(\"bad\") else { frame.close(1008, \"blocked\") }\n"
+                   "frame.forward(\"safe\") } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    for (bool blocked : {false, true}) {
+        WsInspector st;
+        st.forward_text = route.ws_forward_text;
+        st.close_policies = route.ws_close_policies;
+        st.close_policy_count = route.ws_close_policy_count;
+        const u8 input[] = {
+            0x81, 3, 'b', 'a', blocked ? static_cast<u8>('d') : static_cast<u8>('r')};
+        u8 out[128], msg[32];
+        u32 used = 0, produced = 0;
+        const auto status = ws_inspect(st,
+                                       input,
+                                       sizeof(input),
+                                       out,
+                                       sizeof(out),
+                                       msg,
+                                       sizeof(msg),
+                                       route.ws_frame_handler,
+                                       nullptr,
+                                       &used,
+                                       &produced);
+        if (blocked) {
+            CHECK(status == WsInspectStatus::Close);
+            CHECK_EQ(out[0], 0x88u);
+            CHECK_EQ(st.echo_close_code, 1008u);
+            CHECK(st.echo_close_reason.eq({"blocked", 7}));
+        } else {
+            CHECK(status == WsInspectStatus::Ok);
+            CHECK_EQ(out[0], 0x81u);
+            REQUIRE_EQ(produced, 6u);
+            CHECK(memcmp(out + 2, "safe", 4) == 0);
+        }
+    }
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_terminate_default_close_code_is_1000) {
     // A bare frame.close() (or any non-close default) leaves ws_close_code at the 1000 default.
     const std::string dir = "/tmp/rut_serve_loader_ws_close_default";
