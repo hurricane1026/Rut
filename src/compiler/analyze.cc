@@ -20,6 +20,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <stdlib.h>
@@ -14191,10 +14192,17 @@ static FrontendResult<void> merge_imported_impls(
 // Fixed, compiler-owned system module. Its ordinary Rut wrappers preserve
 // existing typed/bounded operations; the generated calls use the C crypto ABI.
 static constexpr Str kCryptoSystemPath = lit_str("@rut/Crypto.rut");
-// Resolve both spellings to one path before cycle and duplicate checks.
+// Prefer a .rut sibling while preserving imports of existing suffixless files.
 static std::string resolve_file_import(const std::filesystem::path& base_dir, Str path) {
     auto resolved = (base_dir / str_to_std_string(path)).lexically_normal();
-    if (!resolved.has_extension()) resolved += ".rut";
+    if (!resolved.has_extension()) {
+        auto with_extension = resolved;
+        with_extension += ".rut";
+        std::error_code error;
+        if (std::filesystem::exists(with_extension, error) || error) return with_extension.string();
+        if (std::filesystem::exists(resolved, error)) return resolved.string();
+        return with_extension.string();
+    }
     return resolved.string();
 }
 static constexpr char kCryptoSystemSource[] = R"rut(

@@ -3114,8 +3114,8 @@ All top-level `func` and `struct` in a file can be imported by other files.
 File name automatically becomes the namespace.
 
 ```swift
-// Import — file name becomes namespace; an omitted extension resolves to .rut
-import "middleware/auth"                // resolves middleware/auth.rut
+// Import — file name becomes namespace; .rut is preferred for extensionless paths
+import "middleware/auth"                // prefers middleware/auth.rut; falls back to middleware/auth
 import "middleware/auth.rut"            // auth.jwtAuth, auth.basicAuth
 import "middleware/security.rut"        // security.cors, security.waf
 

@@ -1703,14 +1703,19 @@ TEST(frontend, crypto_system_import_charges_source_budget_once) {
     std::filesystem::remove_all(dir);
 }
 
-TEST(frontend, extensionless_import_resolves_and_coalesces_with_explicit_suffix) {
+TEST(frontend, extensionless_import_prefers_rut_then_falls_back_to_existing_path) {
     const std::string dir = std::filesystem::temp_directory_path().string() +
                             "/rut_import_extensionless_" + std::to_string(::getpid());
     std::filesystem::create_directories(dir + "/middleware");
     constexpr char kSource[] = "func jwtAuth() -> i32 => 200\n";
+    constexpr char kConflictingSource[] = "func jwtAuth() -> i32 => 500 // legacy file\n";
     {
         std::ofstream out(dir + "/middleware/auth.rut", std::ios::binary);
         out << kSource;
+    }
+    {
+        std::ofstream out(dir + "/middleware/auth", std::ios::binary);
+        out << kConflictingSource;
     }
     SourceBudget budget{};
     auto result = analyze_source_with_path_and_budget(
@@ -1721,6 +1726,18 @@ TEST(frontend, extensionless_import_resolves_and_coalesces_with_explicit_suffix)
     REQUIRE(result);
     CHECK_EQ(budget.used_bytes, sizeof(kSource) - 1u);
     delete result.value();
+    {
+        std::ofstream out(dir + "/middleware/legacy", std::ios::binary);
+        out << "func legacyValue() -> i32 => 777\n";
+    }
+    SourceBudget legacy_budget{};
+    auto legacy = analyze_source_with_path_and_budget(
+        "import \"middleware/legacy\"\n"
+        "route GET \"/\" { if legacy.legacyValue() == 777 { return 200 } else { return 500 } }\n",
+        dir + "/main.rut",
+        legacy_budget);
+    REQUIRE(legacy);
+    delete legacy.value();
     {
         std::ofstream out(dir + "/middleware/cycle.rut", std::ios::binary);
         out << "import \"cycle\"\n";

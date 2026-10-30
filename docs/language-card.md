@@ -18,8 +18,9 @@ A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
 ```swift
 // PR #184 adds standalone examples; no tokenBucket helper is importable yet.
-import "middleware/auth"                            // resolves middleware/auth.rut; namespace: auth
-// Explicit .rut suffixes remain supported: import "middleware/auth.rut"
+import "middleware/auth"                            // prefers .rut; falls back to an existing suffixless file
+// Explicit .rut suffixes remain supported; if both files exist, .rut wins.
+import "middleware/auth.rut"                        // namespace: auth
 import Crypto                                      // built-in, statically linked crypto module
 // Imports nest at most 2 levels deep (main → a → b, kMaxImportNestingDepth);
 // a deeper chain is a compile error at the offending `import`, never a crash.
