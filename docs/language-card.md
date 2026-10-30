@@ -1705,13 +1705,16 @@ duplicates when empty is allowed; the policy module checks uniqueness explicitly
 ### Static Consumer groups
 
 The imported `auth` module provides `ConsumerGroups(consumerId: ..., first: ...,
-second: ...)` and `requireGroup(identity, required, first, second)`. Supply a
+second: ...)`, `requireGroup(identity, required, first, second)`, and
+`requireAnyGroup(identity, firstRequired, secondRequired, first, second)`. Supply a
 verified `auth.Identity` and trusted static membership records. This bounded
 policy maps two distinct Consumers to up to two exact, case-sensitive groups
 each. Empty slots disable membership. Unknown Consumers and missing membership
 receive 403; invalid configuration receives 503. Replacing the trusted snapshot
 revokes membership. Client identity/group headers never populate the registry.
-See `examples/consumer-group-auth.rut` (relative to the repository root).
+`requireAnyGroup` allows membership in either of its two required groups;
+`requireGroup` checks one group. See `examples/consumer-group-auth.rut` (relative
+to the repository root).
 
 
 ### RS256 with a configured trust policy

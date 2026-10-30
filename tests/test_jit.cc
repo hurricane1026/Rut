@@ -24553,6 +24553,54 @@ TEST(jit, consumer_groups_bind_verified_identity_and_default_deny) {
             ")\n guard (allowed.credentialId == \"ak\" || allowed.credentialId == \"bk\") && "
             "allowed.method == \"apiKey\" else { return 500 }\n return 204\n}\n";
     }
+    const char* any_group_policies[] = {
+        "auth.requireAnyGroup(identity, \"reports\", \"security\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"security\", \"ops\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"reports\", \"ops\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"security\", \"billing\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"\", \"ops\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"reports\", \"security\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"reports\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"reports\", \"security\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"ops\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"reports\", \"reports\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"security\", \"billing\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"security\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"reports\", \"\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\"))",
+        "auth.requireAnyGroup(identity, \"Reports\", \"report\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"ops\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"ops\", second: \"\"))",
+    };
+    for (u32 i = 0; i < sizeof(any_group_policies) / sizeof(any_group_policies[0]); ++i) {
+        source += "route GET \"/any-" + std::to_string(i) + "\" {\n";
+        source += R"rut(
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "a", credentials: "", keyId: "ak", passwordId: "ap"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "b", credentials: "", keyId: "bk", passwordId: "bp"))
+    let allowed = )rut";
+        source += any_group_policies[i];
+        source +=
+            "\n guard allowed.consumerId == identity.consumerId && "
+            "allowed.credentialId == identity.credentialId && allowed.method == \"apiKey\" "
+            "else { return 500 }\n return 204\n}\n";
+    }
     auto tokens = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(tokens);
     auto ast = parse_file_heap(tokens.value());
@@ -24597,6 +24645,19 @@ TEST(jit, consumer_groups_bind_verified_identity_and_default_deny) {
         {5, "Authorization: Bearer a\r\n", 403},
         {6, "Authorization: Bearer a\r\n", 403},
         {7, "Authorization: Bearer a\r\n", 503},
+        {8, "Authorization: Bearer a\r\n", 204},
+        {9, "Authorization: Bearer a\r\n", 204},
+        {10, "Authorization: Bearer b\r\n", 204},
+        {11, "Authorization: Bearer a\r\nX-Consumer-Groups: security,billing\r\n", 403},
+        {12, "Authorization: Bearer a\r\n", 503},
+        {13, "Authorization: Bearer a\r\n", 503},
+        {14, "Authorization: Bearer a\r\n", 503},
+        {15, "Authorization: Bearer a\r\n", 204},
+        {16, "Authorization: Bearer a\r\n", 403},
+        {17, "Authorization: Bearer a\r\n", 503},
+        {18, "Authorization: Bearer a\r\n", 403},
+        {11, "Authorization: Bearer wrong\r\n", 401},
+        {11, "Authorization: Bearer a\r\nauthorization: Bearer a\r\n", 401},
     };
     for (const auto& tc : cases) {
         char name[32];
