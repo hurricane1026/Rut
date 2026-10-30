@@ -23433,6 +23433,58 @@ route GET "/" {
     }
 }
 
+TEST(jit, crypto_system_webhook_valid_routes_through_native_runtime) {
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    REQUIRE(now.tv_sec > 1000);
+    const std::string timestamp = std::to_string(now.tv_sec);
+    const std::string message = "msg_1." + timestamp + ".hello";
+    unsigned char digest[32];
+    unsigned int digest_len = 0;
+    REQUIRE(HMAC(EVP_sha256(),
+                 "secret",
+                 6,
+                 reinterpret_cast<const unsigned char*>(message.data()),
+                 message.size(),
+                 digest,
+                 &digest_len) != nullptr);
+    REQUIRE(digest_len == sizeof(digest));
+    unsigned char encoded[45];
+    REQUIRE(EVP_EncodeBlock(encoded, digest, sizeof(digest)) == 44);
+    const std::string signature = "v1," + std::string(reinterpret_cast<const char*>(encoded), 44);
+    const std::string source =
+        "import Crypto\n"
+        "route GET \"/valid\" { guard Crypto.webhookValid(\"msg_1\", \"" +
+        timestamp + "\", \"" + signature +
+        "\", \"hello\", \"secret\") else { return 401 } return 204 }\n" +
+        "route GET \"/invalid\" { guard Crypto.webhookValid(\"msg_1\", \"" + timestamp + "\", \"" +
+        signature + "\", \"Hello\", \"secret\") else { return 401 } return 204 }\n";
+    auto tokens = lex(lit(source.c_str()));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    for (u32 i = 0; i < 2; ++i) {
+        const std::string name = "handler_route_" + std::to_string(i);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+        REQUIRE(handler);
+        const auto result = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+        CHECK_EQ(result.status_code, i == 0 ? 204u : 401u);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, crypto_system_import_works_at_file_import_depth_limit) {
     char directory[] = "/tmp/rut_crypto_module_XXXXXX";
     REQUIRE(mkdtemp(directory));

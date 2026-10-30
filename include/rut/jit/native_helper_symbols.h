@@ -42,8 +42,6 @@
     X(rut_crypto_digest_v1)                     \
     X(rut_crypto_digest_hex_v1)                 \
     X(rut_crypto_digest_parts_v1)               \
-    X(rut_crypto_standard_webhook_valid_v1)     \
-    X(rut_crypto_standard_webhook_now_v1)       \
     X(rut_crypto_hmac_long_key_v1)              \
     X(rut_crypto_equal_v1)                      \
     X(rut_crypto_equal_bounded_v1)              \
