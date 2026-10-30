@@ -1703,6 +1703,35 @@ TEST(frontend, crypto_system_import_charges_source_budget_once) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(frontend, extensionless_import_resolves_and_coalesces_with_explicit_suffix) {
+    const std::string dir = std::filesystem::temp_directory_path().string() +
+                            "/rut_import_extensionless_" + std::to_string(::getpid());
+    std::filesystem::create_directories(dir + "/middleware");
+    constexpr char kSource[] = "func jwtAuth() -> i32 => 200\n";
+    {
+        std::ofstream out(dir + "/middleware/auth.rut", std::ios::binary);
+        out << kSource;
+    }
+    SourceBudget budget{};
+    auto result = analyze_source_with_path_and_budget(
+        "import \"middleware/auth\"\nimport \"middleware/auth.rut\"\n"
+        "route GET \"/\" { if auth.jwtAuth() == 200 { return 200 } else { return 500 } }\n",
+        dir + "/main.rut", budget);
+    REQUIRE(result);
+    CHECK_EQ(budget.used_bytes, sizeof(kSource) - 1u);
+    delete result.value();
+    {
+        std::ofstream out(dir + "/middleware/cycle.rut", std::ios::binary);
+        out << "import \"cycle\"\n";
+    }
+    SourceBudget cycle_budget{};
+    auto cycle = analyze_source_with_path_and_budget(
+        "import \"middleware/cycle.rut\"\n", dir + "/main.rut", cycle_budget);
+    REQUIRE_FALSE(cycle);
+    CHECK(cycle.error().detail.eq(lit("import cycle detected")));
+    std::filesystem::remove_all(dir);
+}
+
 TEST(frontend, nested_import_depth_limit_is_diagnosed_not_crashed) {
     // One level deeper than the limit: m<limit> imports m<limit + 1>. That
     // import is refused before m<limit + 1> is read or analyzed, with a static

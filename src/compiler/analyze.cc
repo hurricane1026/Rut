@@ -14191,6 +14191,12 @@ static FrontendResult<void> merge_imported_impls(
 // Fixed, compiler-owned system module. Its ordinary Rut wrappers preserve
 // existing typed/bounded operations; the generated calls use the C crypto ABI.
 static constexpr Str kCryptoSystemPath = lit_str("@rut/Crypto.rut");
+// Resolve both spellings to one path before cycle and duplicate checks.
+static std::string resolve_file_import(const std::filesystem::path& base_dir, Str path) {
+    auto resolved = (base_dir / str_to_std_string(path)).lexically_normal();
+    if (!resolved.has_extension()) resolved += ".rut";
+    return resolved.string();
+}
 static constexpr char kCryptoSystemSource[] = R"rut(
 func digestMd5(_ data: str) -> str => md5(data)
 func digestSha1(_ data: str) -> str => sha1(data)
@@ -14237,10 +14243,7 @@ static FrontendResult<void> load_imported_modules(
             const auto& other_item = file.items[ii];
             if (other_item.kind != AstItemKind::Import || other_item.import_decl.is_system_crypto)
                 continue;
-            const auto other_normalized =
-                (base_dir / str_to_std_string(other_item.import_decl.path))
-                    .lexically_normal()
-                    .string();
+            const auto other_normalized = resolve_file_import(base_dir, other_item.import_decl.path);
             if (other_normalized != target_normalized ||
                 other_item.import_decl.has_namespace_alias != target_decl.has_namespace_alias ||
                 (other_item.import_decl.has_namespace_alias &&
@@ -14272,7 +14275,7 @@ static FrontendResult<void> load_imported_modules(
         const auto normalized =
             kSystemCrypto
                 ? str_to_std_string(kCryptoSystemPath)
-                : (base_dir / str_to_std_string(item.import_decl.path)).lexically_normal().string();
+                : resolve_file_import(base_dir, item.import_decl.path);
         for (const auto& active_import : import_stack) {
             // A failed top-level analysis releases the shared imported-source
             // storage. Keep the cycle detail independent of those source views;
@@ -16698,11 +16701,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (item.import_decl.is_system_crypto) {
                 normalized_import_path = str_to_std_string(kCryptoSystemPath);
             } else if (source_path.len != 0) {
-                normalized_import_path =
-                    (std::filesystem::path(str_to_std_string(source_path)).parent_path() /
-                     str_to_std_string(item.import_decl.path))
-                        .lexically_normal()
-                        .string();
+                normalized_import_path = resolve_file_import(
+                    std::filesystem::path(str_to_std_string(source_path)).parent_path(),
+                    item.import_decl.path);
             }
             for (u32 ii = 0; ii < imported_modules.len; ii++) {
                 if (imported_modules[ii].is_system_crypto != item.import_decl.is_system_crypto)
