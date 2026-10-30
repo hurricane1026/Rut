@@ -1454,6 +1454,11 @@ deduplicate verified IDs durably across shards and nodes before side effects.
 returns a configured `Identity` after verification; empty key configuration or
 empty identity metadata returns 503, while malformed input, an oversized key,
 or invalid signatures return 401.
+`auth.rotatingStandardWebhook(id, timestamp, signature, body, config)` with an
+`auth.WebhookRotation` configuration checks both configured key
+slots and reports the matching configured credential ID; current wins a tie.
+Empty keys disable individual slots, and two disabled slots or empty identity
+metadata return 503. Removing the previous key revokes that slot.
 See [standard-webhook-auth.rut](../examples/standard-webhook-auth.rut). The builtin
 uses dedicated HIR/MIR/RIR lowering and adds no keyword or dependency.
 

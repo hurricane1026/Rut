@@ -24591,6 +24591,28 @@ route POST "/empty-credential" {
     let identity = auth.standardWebhook("", "", "", req.body, "trusted-raw-key", "configured-consumer", "")
     return 204
 }
+route POST "/rotating" {
+    let identity = auth.rotatingStandardWebhook(req.uniqueHeader("webhook-id").or(""),
+        req.uniqueHeader("webhook-timestamp").or(""), req.uniqueHeader("webhook-signature").or(""),
+        req.body, auth.WebhookRotation(currentKey: "trusted-raw-key", previousKey: "previous-key", consumerId: "configured-consumer", currentId: "current", previousId: "previous"))
+    if identity.credentialId == "current" { return 204 } else { return 202 }
+}
+route POST "/revoked" {
+    let identity = auth.rotatingStandardWebhook(req.uniqueHeader("webhook-id").or(""),
+        req.uniqueHeader("webhook-timestamp").or(""), req.uniqueHeader("webhook-signature").or(""),
+        req.body, auth.WebhookRotation(currentKey: "trusted-raw-key", previousKey: "", consumerId: "configured-consumer", currentId: "current", previousId: "previous"))
+    return 204
+}
+route POST "/disabled" {
+    let identity = auth.rotatingStandardWebhook("", "", "", req.body, auth.WebhookRotation(currentKey: "", previousKey: "", consumerId: "configured-consumer", currentId: "current", previousId: "previous"))
+    return 204
+}
+route POST "/same" {
+    let identity = auth.rotatingStandardWebhook(req.uniqueHeader("webhook-id").or(""),
+        req.uniqueHeader("webhook-timestamp").or(""), req.uniqueHeader("webhook-signature").or(""),
+        req.body, auth.WebhookRotation(currentKey: "trusted-raw-key", previousKey: "trusted-raw-key", consumerId: "configured-consumer", currentId: "current", previousId: "previous"))
+    if identity.credentialId == "current" { return 204 } else { return 500 }
+}
 )rut";
     const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
                              "examples/standard-webhook-auth.rut";
@@ -24619,22 +24641,23 @@ route POST "/empty-credential" {
 
     const std::string id = "evt_standard_1";
     const std::string timestamp = std::to_string(static_cast<i64>(time(nullptr)));
-    const auto signature_for = [&](const std::string& body, std::string& signature) {
-        const std::string message = id + "." + timestamp + "." + body;
-        unsigned char digest[32];
-        unsigned int digest_len = 0;
-        REQUIRE(HMAC(EVP_sha256(),
-                     "trusted-raw-key",
-                     15,
-                     reinterpret_cast<const unsigned char*>(message.data()),
-                     message.size(),
-                     digest,
-                     &digest_len) != nullptr);
-        REQUIRE_EQ(digest_len, 32u);
-        unsigned char encoded[45];
-        REQUIRE_EQ(EVP_EncodeBlock(encoded, digest, digest_len), 44);
-        signature = std::string("v1,") + reinterpret_cast<const char*>(encoded);
-    };
+    const auto signature_for =
+        [&](const std::string& body, std::string& signature, const char* key = "trusted-raw-key") {
+            const std::string message = id + "." + timestamp + "." + body;
+            unsigned char digest[32];
+            unsigned int digest_len = 0;
+            REQUIRE(HMAC(EVP_sha256(),
+                         key,
+                         strlen(key),
+                         reinterpret_cast<const unsigned char*>(message.data()),
+                         message.size(),
+                         digest,
+                         &digest_len) != nullptr);
+            REQUIRE_EQ(digest_len, 32u);
+            unsigned char encoded[45];
+            REQUIRE_EQ(EVP_EncodeBlock(encoded, digest, digest_len), 44);
+            signature = std::string("v1,") + reinterpret_cast<const char*>(encoded);
+        };
     const std::string body = "{\"event\":\"paid\"}";
     std::string signature;
     signature_for(body, signature);
@@ -24649,6 +24672,11 @@ route POST "/empty-credential" {
     signature_for(binary_body, binary_signature);
     std::string empty_signature;
     signature_for("", empty_signature);
+    std::string previous_signature;
+    signature_for(body, previous_signature, "previous-key");
+    const std::string previous_headers = "webhook-id: " + id +
+                                         "\r\nwebhook-timestamp: " + timestamp +
+                                         "\r\nwebhook-signature: " + previous_signature + "\r\n";
     struct Case {
         u32 route;
         const char* path;
@@ -24729,6 +24757,13 @@ route POST "/empty-credential" {
         {1, "/empty-key", "", "", 503},
         {2, "/empty-consumer", "", "", 503},
         {3, "/empty-credential", "", "", 503},
+        {4, "/rotating", valid, body, 204},
+        {4, "/rotating", previous_headers, body, 202},
+        {4, "/rotating", previous_headers, body + "!", 401},
+        {4, "/rotating", previous_headers + "Webhook-ID: " + id + "\r\n", body, 401},
+        {5, "/revoked", previous_headers, body, 401},
+        {6, "/disabled", "", "", 503},
+        {7, "/same", valid, body, 204},
     };
     for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         char handler_name[32];
