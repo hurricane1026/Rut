@@ -7108,8 +7108,8 @@ static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& m
 // bare `frame.fromClient` (true on the client→upstream leg); opcode discrimination is a bare
 // `frame.isText` / `frame.isBinary` (== the WsOpcode value); content is
 // `frame.text.matches(re"…")` (a regex over the payload); else a `frame.len <cmp> N`
-// comparison. Literal text equality, prefix/suffix checks and text.isEmpty are also supported.
-// Anything else → UnsupportedSyntax.
+// comparison. Literal text equality, prefix/suffix/substring checks and text.isEmpty are also
+// supported. Anything else → UnsupportedSyntax.
 
 static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
                                                            WsVerdict verdict,
@@ -7136,14 +7136,16 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
     }
     if (cond.kind == AstExprKind::MethodCall && cond.lhs &&
         ws_is_frame_field(*cond.lhs, {"text", 4}) &&
-        (cond.name.eq({"hasPrefix", 9}) || cond.name.eq({"hasSuffix", 9}))) {
+        (cond.name.eq({"hasPrefix", 9}) || cond.name.eq({"hasSuffix", 9}) ||
+         cond.name.eq({"contains", 8}))) {
         if (cond.args.len != 1 || !cond.args[0] || cond.args[0]->kind != AstExprKind::StrLit)
             return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
         auto decoded = decoded_expression_string(cond.args[0]->str_value, mod, cond.args[0]->span);
         if (!decoded) return core::make_unexpected(decoded.error());
         WsLenGuard g{};
-        g.accessor = cond.name.eq({"hasPrefix", 9}) ? WsLenGuard::Accessor::TextPrefix
-                                                    : WsLenGuard::Accessor::TextSuffix;
+        g.accessor = cond.name.eq({"hasPrefix", 9})   ? WsLenGuard::Accessor::TextPrefix
+                     : cond.name.eq({"hasSuffix", 9}) ? WsLenGuard::Accessor::TextSuffix
+                                                      : WsLenGuard::Accessor::TextContains;
         g.pattern = decoded.value();
         g.negate = negate;
         g.verdict = verdict;

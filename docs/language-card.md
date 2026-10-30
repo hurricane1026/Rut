@@ -827,10 +827,11 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // Current terminate handlers: up to 4 guards over direction, text/binary opcode,
 // frame.len (< > == <= >= != integer literal, either side), text.matches(re),
 // text ==/!= string literal (either side), text.isEmpty, and
-// text.hasPrefix("literal") / text.hasSuffix("literal"). Text predicates
+// text.hasPrefix("literal"), text.hasSuffix("literal"), text.contains("literal").
+// Text predicates
 // compare raw payload bytes; use frame.isText for text-only filtering.
 // Literal predicates decode ordinary escapes, including embedded NUL.
-// Empty prefixes/suffixes match every message; arguments must be string literals.
+// Empty prefixes/suffixes/substrings match every message; arguments must be literals.
 // Conditions support !, &&, ||, parentheses and left-to-right short-circuiting.
 // ! binds tighter than comparisons; && binds tighter than ||.
 // At most 32 condition nodes (leaf predicates + binary operators); nesting is bounded.

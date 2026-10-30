@@ -1094,14 +1094,16 @@ struct WsLenGuard {
         Or,
         TextEqual,
         TextPrefix,
-        TextSuffix
+        TextSuffix,
+        TextContains
     };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
     Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
     u32 bound = 0;  // Len: the byte literal frame.len is compared to. Opcode: the WsOpcode value.
-    // TextMatch/TextEqual/TextPrefix/TextSuffix: regex or decoded literal, valid through codegen.
+    // TextMatch/TextEqual/TextPrefix/TextSuffix/TextContains: regex or decoded literal, valid
+    // through codegen.
     Str pattern{};
     bool negate = false;  // invert this node's condition, including an entire subtree
     // Compound conditions reference earlier nodes in the handler's postorder array.

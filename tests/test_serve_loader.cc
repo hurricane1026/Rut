@@ -4812,6 +4812,44 @@ TEST(serve_loader, websocket_terminate_text_prefix_suffix) {
     }
 }
 
+TEST(serve_loader, websocket_terminate_text_contains) {
+    const u8 needle[] = {'a', 0, 'b'};
+    const u8 middle[] = {'x', 'a', 0, 'b', 'y'};
+    const u8 mismatch[] = {'a', 0, 'x', 'b'};
+    const u8* payloads[] = {nullptr, needle, middle, middle + 1, middle + 2, mismatch};
+    const u64 lengths[] = {0, 3, 5, 4, 3, 4};
+    for (bool empty : {false, true}) {
+        for (bool negate : {false, true}) {
+            std::string source =
+                "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+                "websocket(backend) { frame in\n guard ";
+            if (negate) source += "!";
+            source += empty ? "frame.text.contains(\"\")" : "frame.text.contains(\"a\\0b\")";
+            source += " else { frame.drop() }\n frame.forward()\n} }\n";
+            const auto path = write_file("/tmp/rut_ws_contains", "app.rut", source.c_str());
+            LoadedProgram program;
+            LoadError err;
+            REQUIRE(load_rut_program(path.c_str(), program, err));
+            const auto handler = program.config.routes[0].ws_frame_handler;
+            REQUIRE(handler);
+            for (u32 i = 0; i < 6; i++) {
+                const bool matches = empty || (i >= 1 && i <= 3);
+                for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                    for (bool from_client : {false, true}) {
+                        CHECK(handler(nullptr, op, payloads[i], lengths[i], from_client) ==
+                              ((matches != negate) ? WsFrameAction::Forward : WsFrameAction::Drop));
+                    }
+                }
+            }
+            CHECK(handler(nullptr, WsOpcode::Text, nullptr, 2, true) ==
+                  ((empty != negate) ? WsFrameAction::Forward : WsFrameAction::Drop));
+            CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0x100000003ULL, true) ==
+                  (negate ? WsFrameAction::Forward : WsFrameAction::Drop));
+            program.destroy();
+        }
+    }
+}
+
 TEST(serve_loader, websocket_terminate_text_literal_short_circuit) {
     const auto path =
         write_file("/tmp/rut_serve_loader_ws_literal_short_circuit",
