@@ -1049,6 +1049,79 @@ TEST(jit, frontend_bitwise_i64_pack_unpack_executes) {
     rir.destroy();
 }
 
+TEST(jit, math_library_import_executes_with_runtime_bounds_and_ordered_types) {
+    const auto source = R"rut(
+import "../lib/math.rut"
+route GET "/math" {
+    let count = req.headerCount("X-Tag")
+    let signed = count - 4
+    if math.min(count, 4) == min(count, 4) &&
+       math.max(count, 4) == max(count, 4) &&
+       math.clamp(count, 2, 6) == req.headerCount("X-Expected") &&
+       math.clamp(4, count, count + 2) == max(count, min(4, count + 2)) &&
+       math.clamp(4, count + 2, count) == count + 2 &&
+       math.clamp(signed, -2, 2) == req.headerCount("X-Expected") - 4 &&
+       math.clamp(count, 4, 4) == 4 &&
+       math.clamp(count, 6, 2) == 6 &&
+       math.min(-2147483648, 2147483647) == -2147483648 &&
+       math.max(-2147483648, 2147483647) == 2147483647 &&
+       math.clamp(-2147483648, -2147483648, 2147483647) == -2147483648 &&
+       math.min("alpha", "beta") == "alpha" &&
+       math.max("alpha", "beta") == "beta" &&
+       math.clamp("gamma", "alpha", "beta") == "beta" {
+        return 200
+    } else { return 500 }
+}
+)rut";
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/math.rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        fprintf(stderr,
+                "math analysis failed at %u:%u: %.*s\n",
+                hir.error().span.line,
+                hir.error().span.col,
+                hir.error().detail.len,
+                hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    struct Case {
+        u32 count;
+        u32 expected;
+    };
+    const Case cases[] = {{0, 2}, {1, 2}, {2, 2}, {3, 3}, {6, 6}, {7, 6}, {10, 6}};
+    for (const auto& test : cases) {
+        std::string request = "GET /math HTTP/1.1\r\nHost: localhost\r\n";
+        for (u32 i = 0; i < test.count; ++i) request += "X-Tag: tag\r\n";
+        for (u32 i = 0; i < test.expected; ++i) request += "X-Expected: tag\r\n";
+        request += "\r\n";
+        auto result = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(request.data()),
+                                                    request.size(),
+                                                    nullptr));
+        CHECK_EQ(result.action, HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, 200);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_time_minmax_gcra_shape_executes) {
     // The full GCRA expression shape at runtime: latched now, i64
     // arithmetic, max() over (stored tat, now). Pins the per-invocation

@@ -1,0 +1,14 @@
+import "../lib/math.rut"
+
+listen :8080
+
+route GET "/math" {
+    let requested = req.headerCount("X-Tag")
+    let bounded = math.clamp(requested, 2, 6)
+    // Admit requests with between two and six X-Tag fields.
+    if requested == bounded {
+        return 200
+    } else {
+        return 400
+    }
+}
