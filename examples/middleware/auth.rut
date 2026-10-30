@@ -57,6 +57,29 @@ func multiAuth(_ authorization: str, _ first: ConsumerCredentials,
     }
 }
 
+// Optional two-consumer Bearer/Basic authentication. Check configuration before
+// absence; invalid presented credentials never downgrade to the guest identity.
+func multiAuthOrAnonymous(_ authorizationCount: i32, _ authorization: str,
+                          _ first: ConsumerCredentials, _ second: ConsumerCredentials,
+                          _ anonymousId: str) -> Identity {
+    let denied = response(401)
+    denied.add("WWW-Authenticate", "Bearer")
+    denied.add("WWW-Authenticate", "Basic realm=\"rut\"")
+    guard validConsumerPair(first, second) && anonymousId != "" &&
+          anonymousId != first.consumerId && anonymousId != second.consumerId else { respond 503 }
+    let firstMatches = consumerCredentialsMatch(authorization, first)
+    let secondMatches = consumerCredentialsMatch(authorization, second)
+    guard (authorizationCount == 0 && authorization == "") ||
+          (authorizationCount == 1 && (firstMatches || secondMatches)) else { respond denied }
+    match authorizationCount {
+        0 => Identity(consumerId: anonymousId, credentialId: "", method: "anonymous")
+        _ => match firstMatches {
+            true => matchedConsumerIdentity(authorization, first)
+            _ => matchedConsumerIdentity(authorization, second)
+        }
+    }
+}
+
 // All arguments are positional. key is the opaque key WITHOUT the Bearer prefix.
 // Configuration is a snapshot: replace/remove credentials and redeploy to rotate/revoke.
 func apiKey(_ authorization: str, _ key: str, _ consumerId: str, _ credentialId: str) -> Identity {

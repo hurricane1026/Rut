@@ -1,0 +1,30 @@
+import "middleware/auth.rut"
+listen :8080
+
+// Compile-time configuration. Empty secrets disable slots; use TLS for credentials.
+func alice() -> auth.ConsumerCredentials {
+    auth.ConsumerCredentials(consumerId: "alice", key: env("ALICE_API_KEY"),
+        credentials: env("ALICE_BASIC_CREDENTIALS"), keyId: "alice-key", passwordId: "alice-password")
+}
+func bob() -> auth.ConsumerCredentials {
+    auth.ConsumerCredentials(consumerId: "bob", key: env("BOB_API_KEY"),
+        credentials: env("BOB_BASIC_CREDENTIALS"), keyId: "bob-key", passwordId: "bob-password")
+}
+
+// Only a genuinely absent Authorization field permits guest access.
+route GET "/optional" {
+    let identity = auth.multiAuthOrAnonymous(req.headerCount("Authorization"),
+        req.authorization.or(""), alice(), bob(), "guest")
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
+
+// Authentication and authorization remain separate: guests receive 403 here.
+route GET "/private" {
+    let identity = auth.multiAuthOrAnonymous(req.headerCount("Authorization"),
+        req.authorization.or(""), alice(), bob(), "guest")
+    let permitted = auth.requireAnyConsumer(identity, "alice", "bob")
+    let consumerId = permitted.consumerId
+    return response(200, body: consumerId)
+}
+route "/" { return 404 }

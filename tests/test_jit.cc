@@ -25172,6 +25172,224 @@ route GET "/inconsistent-absent" {
     rir.destroy();
 }
 
+TEST(jit, optional_multi_authentication_never_downgrades_presented_credentials) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/optional-multi-auth.rut";
+    std::string source = R"rut(
+import "middleware/auth.rut"
+func alice() -> auth.ConsumerCredentials {
+    auth.ConsumerCredentials(consumerId: "alice", key: "a", credentials: "alice:pass",
+        keyId: "alice-key", passwordId: "alice-password")
+}
+func bob() -> auth.ConsumerCredentials {
+    auth.ConsumerCredentials(consumerId: "bob", key: "b", credentials: "bob:pass",
+        keyId: "bob-key", passwordId: "bob-password")
+}
+route GET "/optional" {
+    let identity = auth.multiAuthOrAnonymous(req.headerCount("Authorization"),
+        req.authorization.or(""), alice(), bob(), "guest")
+    guard identity.consumerId == req.header("X-Expected-Consumer").or("") &&
+          identity.credentialId == req.header("X-Expected-Credential").or("") &&
+          identity.method == req.header("X-Expected-Method").or("") else { return 500 }
+    return 200
+}
+route GET "/private" {
+    let identity = auth.multiAuthOrAnonymous(req.headerCount("Authorization"),
+        req.authorization.or(""), alice(), bob(), "guest")
+    let permitted = auth.requireAnyConsumer(identity, "alice", "bob")
+    return 204
+}
+route GET "/removed" {
+    req.remove("Authorization")
+    let identity = auth.multiAuthOrAnonymous(req.headerCount("Authorization"),
+        req.authorization.or(""), alice(), bob(), "guest")
+    let permitted = auth.requireAnyConsumer(identity, "alice", "bob")
+    return 204
+}
+)rut";
+    // Exercise all configuration gates before both anonymous and authenticated paths.
+    const char* configurations[] = {
+        "alice(), bob(), \"\"",
+        "alice(), bob(), \"alice\"",
+        "alice(), bob(), \"bob\"",
+        "alice(), alice(), \"guest\"",
+        "auth.ConsumerCredentials(consumerId: \"\", key: \"a\", credentials: \"\", keyId: \"k\", "
+        "passwordId: \"p\"), bob(), \"guest\"",
+        "auth.ConsumerCredentials(consumerId: \"alice\", key: \"b\", credentials: \"\", keyId: "
+        "\"k\", passwordId: \"p\"), bob(), \"guest\"",
+        "auth.ConsumerCredentials(consumerId: \"alice\", key: \"\", credentials: \"bob:pass\", "
+        "keyId: \"k\", passwordId: \"p\"), bob(), \"guest\"",
+        "auth.ConsumerCredentials(consumerId: \"alice\", key: \"\", credentials: \"\", keyId: "
+        "\"\", passwordId: \"p\"), bob(), \"guest\"",
+        "alice(), auth.ConsumerCredentials(consumerId: \"bob\", key: \"\", credentials: \"\", "
+        "keyId: \"k\", passwordId: \"\"), \"guest\"",
+        "auth.ConsumerCredentials(consumerId: \"alice\", key: \"\", credentials: \"\", keyId: "
+        "\"k\", passwordId: \"p\"), auth.ConsumerCredentials(consumerId: \"bob\", key: \"\", "
+        "credentials: \"\", keyId: \"k\", passwordId: \"p\"), \"guest\"",
+    };
+    for (u32 i = 0; i < sizeof(configurations) / sizeof(configurations[0]); ++i)
+        source += "route GET \"/bad-" + std::to_string(i) +
+                  "\" { let identity = "
+                  "auth.multiAuthOrAnonymous(req.headerCount(\"Authorization\"), "
+                  "req.authorization.or(\"\"), " +
+                  configurations[i] + ") return 204 }\n";
+    source += R"rut(
+route GET "/parse-error" {
+    let identity = auth.multiAuthOrAnonymous(-1, "", alice(), bob(), "guest")
+    return 204
+}
+route GET "/inconsistent-absent" {
+    let identity = auth.multiAuthOrAnonymous(0, "Bearer a", alice(), bob(), "guest")
+    return 204
+}
+route GET "/inconsistent-duplicate" {
+    let identity = auth.multiAuthOrAnonymous(2, "Bearer a", alice(), bob(), "guest")
+    return 204
+}
+route GET "/disabled-alice" {
+    let identity = auth.multiAuthOrAnonymous(req.headerCount("Authorization"), req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "", credentials: "", keyId: "alice-key", passwordId: "alice-password"), bob(), "guest")
+    guard identity.consumerId != "alice" else { return 500 }
+    return 200
+}
+)rut";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        fprintf(stderr,
+                "optional multi-auth: %.*s at %u:%u\n",
+                hir.error().detail.len,
+                hir.error().detail.ptr,
+                hir.error().span.line,
+                hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        const char* body;
+        u16 status;
+        const char* consumer = "guest";
+        const char* credential = "";
+        const char* method = "anonymous";
+    };
+    const Case cases[] = {
+        {0, "", "", 200},
+        {0, "X-Consumer-ID: alice\r\nX-Credential-ID: alice-key\r\n", "", 200},
+        {0, "X-API-Key: a\r\n", "Authorization: Bearer a", 200},
+        {0, "Authorization: Bearer a\r\n", "", 200, "alice", "alice-key", "apiKey"},
+        {0,
+         "aUtHoRiZaTiOn: bEaReR   b\r\nX-Consumer-ID: guest\r\n",
+         "",
+         200,
+         "bob",
+         "bob-key",
+         "apiKey"},
+        {0,
+         "Authorization: Basic YWxpY2U6cGFzcw==\r\n",
+         "",
+         200,
+         "alice",
+         "alice-password",
+         "basic"},
+        {0,
+         "Authorization: Basic Ym9iOnBhc3M=\r\nX-Consumer-ID: alice\r\n",
+         "",
+         200,
+         "bob",
+         "bob-password",
+         "basic"},
+        {0, "Authorization:\r\n", "", 401},
+        {0, "Authorization: \t \r\n", "", 401},
+        {0, "Authorization: Bearer\r\n", "", 401},
+        {0, "Authorization: Bearer wrong\r\nX-API-Key: a\r\n", "", 401},
+        {0, "Authorization: Basic YWxpY2U6d3Jvbmc=\r\n", "", 401},
+        {0, "Authorization: Basic !!!\r\n", "", 401},
+        {0, "Authorization: Digest a\r\n", "", 401},
+        {0, "Authorization: Bearer a,b\r\n", "", 401},
+        {0, "Authorization: Bearer a\r\nauthorization: Basic Ym9iOnBhc3M=\r\n", "", 401},
+        {0, "Authorization: wrong\r\nAuthorization: Bearer a\r\n", "", 401},
+        {0, "Authorization:\r\nauthorization:\r\n", "", 401},
+        {0, "Bad Name: x\r\n", "", 401},
+        {1, "", "", 403},
+        {1, "Authorization: Bearer a\r\n", "", 204},
+        {1, "Authorization: Basic Ym9iOnBhc3M=\r\n", "", 204},
+        {1, "Authorization: Bearer wrong\r\n", "", 401},
+        {2, "", "", 403},
+        {2, "Authorization: Bearer a\r\n", "", 204},
+        {2, "Authorization: Bearer wrong\r\n", "", 401},
+        {2, "Authorization: Bearer a\r\nAuthorization: Bearer b\r\n", "", 401},
+        {13, "", "", 401},
+        {14, "", "", 401},
+        {15, "", "", 401},
+        {16, "", "", 200},
+        {16, "Authorization: Bearer b\r\n", "", 200},
+        {16, "Authorization: Bearer a\r\n", "", 401},
+        {16, "Authorization: Basic YWxpY2U6cGFzcw==\r\n", "", 401},
+    };
+    Connection conn;
+    const auto check = [&](const Case& tc, const char* version) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        conn.reset();
+        const std::string body(tc.body);
+        const std::string request =
+            std::string("GET / ") + version +
+            "\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) + "\r\n" +
+            tc.headers + "X-Expected-Consumer: " + tc.consumer + "\r\n" +
+            "X-Expected-Credential: " + tc.credential + "\r\n" + "X-Expected-Method: " + tc.method +
+            "\r\n\r\n" + body;
+        const auto result =
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != tc.status)
+            fprintf(stderr,
+                    "optional multi-auth route %u: got %u expected %u\n",
+                    tc.route,
+                    result.status_code,
+                    tc.status);
+        CHECK_EQ(result.status_code, tc.status);
+        if (tc.status == 401) {
+            REQUIRE(result.next_state != 0 && result.next_state <= rir.module.header_set_count);
+            const auto& headers = rir.module.header_sets[result.next_state - 1];
+            REQUIRE_EQ(headers.count, 2u);
+            CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+            CHECK(rir.module.header_keys[headers.offset + 1].eq(lit("WWW-Authenticate")));
+            CHECK(rir.module.header_values[headers.offset].eq(lit("Bearer")));
+            CHECK(rir.module.header_values[headers.offset + 1].eq(lit("Basic realm=\"rut\"")));
+        } else {
+            CHECK_EQ(result.next_state, 0u);
+        }
+    };
+    for (const char* version : {"HTTP/1.0", "HTTP/1.1"}) {
+        for (const auto& tc : cases) check(tc, version);
+        for (u32 i = 3; i < 13; ++i) {
+            check({i, "", "", 503}, version);
+            check({i, "Authorization: Bearer a\r\n", "", 503}, version);
+        }
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, owned_request_headers_copy_borrowed_inputs_and_fail_closed) {
     SlicePool pool;
     REQUIRE(pool.init(32));
