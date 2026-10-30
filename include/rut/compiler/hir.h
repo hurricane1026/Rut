@@ -1071,7 +1071,7 @@ struct HirForLoop {
     HirForLoopBody body{};
 };
 
-// WebSocket terminate-mode frame-handler verdict. Mirrors the runtime
+// WebSocket terminate-mode message-handler verdict. Mirrors the runtime
 // `WsFrameAction` (ws_terminate.h): the per-message disposition the JIT'd
 // handler returns. Values 4–7 select branch close policies and 8–11 select
 // branch text replacements; value 3 selects the runtime default replacement.
@@ -1089,7 +1089,7 @@ enum class WsVerdict : u8 {
     ForwardTextPolicy3,
 };
 
-// Frame-handler condition nodes. Leaf nodes inspect message length, opcode,
+// Message-handler condition nodes. Leaf nodes inspect message length, opcode,
 // direction or payload predicates; And/Or nodes combine earlier child nodes. Only roots
 // are source guards and yield their else verdict when false.
 struct WsLenGuard {
@@ -1109,7 +1109,7 @@ struct WsLenGuard {
     enum class Cmp : u8 { Lt, Gt, Eq };
     Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
-    u32 bound = 0;  // Len: the byte literal frame.len is compared to. Opcode: the WsOpcode value.
+    u32 bound = 0;  // Len: the byte literal message.len is compared to. Opcode: the WsOpcode value.
     // TextMatch/TextEqual/TextPrefix/TextSuffix/TextContains: regex or decoded literal, valid
     // through codegen.
     Str pattern{};
@@ -1141,12 +1141,12 @@ struct HirWsHandler {
     FixedVec<WsLenGuard, kMaxConditionNodes> len_guards;
     FixedVec<HirWsClosePolicy, kMaxLenGuards> close_policies;
     FixedVec<HirWsTextRewrite, kMaxLenGuards> forward_payloads;
-    // `frame.forward(payload)` modify form: forward a rewritten message instead of the
+    // `message.forward(payload)` modify form: forward a rewritten message instead of the
     // original. Prefix/suffix literals are stored in HirRoute.exprs.
     // The loader retains its bytes and emits a ForwardText default verdict.
     bool has_forward_payload = false;
     HirWsTextRewrite forward_payload{};
-    // `frame.close(code)` status code (default 1000 = normal closure). Only meaningful when
+    // `message.close(code)` status code (default 1000 = normal closure). Only meaningful when
     // default_verdict == Close. Validated to RFC 6455 application close codes in analyze.
     u16 close_code = 1000;
     u32 close_reason_expr = 0xffffffffu;  // decoded literal in HirRoute.exprs, or absent
@@ -1229,7 +1229,7 @@ struct HirRoute {
     u32 throttle_down_bps = 0;
     u32 http_cache_ttl = 0;
     // WebSocket terminate mode: when the route body is `websocket(x){...}`, this
-    // route has no HTTP terminator — `ws_handler` carries the frame-handler
+    // route has no HTTP terminator — `ws_handler` carries the message-handler
     // verdict instead and `control` is unused. (Slice B; lowering rejects it
     // until the JIT path lands.)
     bool is_ws_terminate = false;

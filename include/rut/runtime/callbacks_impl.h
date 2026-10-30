@@ -10762,7 +10762,7 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_c2u.forward_text = conn.ws_forward_text;
         conn.ws_c2u.forward_texts = conn.ws_forward_texts;
         conn.ws_c2u.forward_text_count = conn.ws_forward_text_count;
-        conn.ws_c2u.close_code = conn.ws_close_code;  // frame.close(code) status for this route
+        conn.ws_c2u.close_code = conn.ws_close_code;  // message.close(code) status for this route
         conn.ws_c2u.close_reason = conn.ws_close_reason;
         conn.ws_c2u.close_policies = conn.ws_close_policies;
         conn.ws_c2u.close_policy_count = conn.ws_close_policy_count;
@@ -10950,7 +10950,7 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                 // The produced send carries the Close to the upstream; the client must get a
                 // Close back too (handshake). Start the upstream slot in-flight + queue the
                 // client echo, then close once both drain. The echo carries the code the
-                // inspector resolved (handler frame.close(code), or 1000 for a peer close).
+                // inspector resolved (handler message.close(code), or 1000 for a peer close).
                 conn.ws_closing = true;
                 conn.ws_close_upstream_inflight = true;
                 conn.ws_close_client_need = true;
@@ -11028,7 +11028,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
             if (st == WsInspectStatus::Close) {
                 // The produced send carries the Close to the client; the upstream must get a
                 // Close back too. Start the client slot in-flight + queue the upstream echo,
-                // carrying the code the inspector resolved (frame.close(code), or 1000).
+                // carrying the code the inspector resolved (message.close(code), or 1000).
                 conn.ws_closing = true;
                 conn.ws_close_client_inflight = true;
                 conn.ws_close_upstream_need = true;

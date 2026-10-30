@@ -7023,23 +7023,24 @@ static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
-// A `frame.<field>` access (lhs ident `frame`).
-static bool ws_is_frame_field(const AstExpr& e, Str field) {
+// A `message.<field>` access (lhs ident `message`).
+static bool ws_is_message_field(const AstExpr& e, Str field) {
     return e.kind == AstExprKind::Field && e.lhs != nullptr && e.lhs->kind == AstExprKind::Ident &&
-           e.lhs->name.eq({"frame", 5}) && e.name.eq(field);
+           e.lhs->name.eq({"message", 7}) && e.name.eq(field);
 }
-// `frame.len` — the reassembled message length.
-static bool ws_is_frame_len(const AstExpr& e) {
-    return ws_is_frame_field(e, {"len", 3});
+// `message.len` — the reassembled message length.
+static bool ws_is_message_len(const AstExpr& e) {
+    return ws_is_message_field(e, {"len", 3});
 }
 
-// A bare frame verdict `frame.drop()/close()/forward()` (no args) → WsVerdict, for guard
-// else-branches. Argument-bearing closes are handled by analyze_frame_guard_verdict;
-// payload-bearing forwards are handled by analyze_frame_guard_verdict.
-static FrontendResult<WsVerdict> analyze_bare_frame_verdict(const AstExpr& call) {
-    const bool is_frame = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
-                          call.lhs->kind == AstExprKind::Ident && call.lhs->name.eq({"frame", 5});
-    if (!is_frame || call.args.len != 0)
+// A bare message verdict `message.drop()/close()/forward()` (no args) → WsVerdict, for guard
+// else-branches. Argument-bearing closes are handled by analyze_message_guard_verdict;
+// payload-bearing forwards are handled by analyze_message_guard_verdict.
+static FrontendResult<WsVerdict> analyze_bare_message_verdict(const AstExpr& call) {
+    const bool is_message = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
+                            call.lhs->kind == AstExprKind::Ident &&
+                            call.lhs->name.eq({"message", 7});
+    if (!is_message || call.args.len != 0)
         return frontend_error(FrontendError::UnsupportedSyntax, call.span);
     if (call.name.eq({"forward", 7})) return WsVerdict::Forward;
     if (call.name.eq({"drop", 4})) return WsVerdict::Drop;
@@ -7048,11 +7049,11 @@ static FrontendResult<WsVerdict> analyze_bare_frame_verdict(const AstExpr& call)
 }
 
 // Share status/reason validation between default and guard-branch closes.
-static FrontendResult<HirWsClosePolicy> analyze_frame_close_policy(const AstExpr& call,
-                                                                   HirRoute& route,
-                                                                   const HirModule& mod) {
+static FrontendResult<HirWsClosePolicy> analyze_message_close_policy(const AstExpr& call,
+                                                                     HirRoute& route,
+                                                                     const HirModule& mod) {
     if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
-        !call.lhs->name.eq({"frame", 5}) || !call.name.eq({"close", 5}) || call.args.len > 2)
+        !call.lhs->name.eq({"message", 7}) || !call.name.eq({"close", 5}) || call.args.len > 2)
         return frontend_error(FrontendError::UnsupportedSyntax, call.span);
     HirWsClosePolicy policy{};
     if (call.args.len >= 1) {
@@ -7089,26 +7090,26 @@ static FrontendResult<HirWsClosePolicy> analyze_frame_close_policy(const AstExpr
 
 static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& mod, Span span);
 
-// Flatten bounded String concatenation around at most one frame.text reference.
+// Flatten bounded String concatenation around at most one message.text reference.
 // No arbitrary expression evaluation or message-time allocation is needed.
-static FrontendResult<void> analyze_frame_text_parts(const AstExpr& expr,
-                                                     HirRoute& route,
-                                                     const HirModule& mod,
-                                                     std::string& prefix,
-                                                     std::string& suffix,
-                                                     bool& include_payload,
-                                                     u32& nodes,
-                                                     u32 depth = 0) {
+static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
+                                                       HirRoute& route,
+                                                       const HirModule& mod,
+                                                       std::string& prefix,
+                                                       std::string& suffix,
+                                                       bool& include_payload,
+                                                       u32& nodes,
+                                                       u32 depth = 0) {
     if (depth >= HirWsHandler::kMaxConditionNodes || nodes++ >= HirWsHandler::kMaxConditionNodes)
         return frontend_error(FrontendError::TooManyItems, expr.span);
     if (expr.kind == AstExprKind::Add && expr.lhs && expr.rhs) {
-        auto left = analyze_frame_text_parts(
+        auto left = analyze_message_text_parts(
             *expr.lhs, route, mod, prefix, suffix, include_payload, nodes, depth + 1);
         if (!left) return left;
-        return analyze_frame_text_parts(
+        return analyze_message_text_parts(
             *expr.rhs, route, mod, prefix, suffix, include_payload, nodes, depth + 1);
     }
-    if (ws_is_frame_field(expr, {"text", 4})) {
+    if (ws_is_message_field(expr, {"text", 4})) {
         if (include_payload) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         include_payload = true;
         return {};
@@ -7138,17 +7139,17 @@ static FrontendResult<void> analyze_frame_text_parts(const AstExpr& expr,
     return {};
 }
 
-static FrontendResult<HirWsTextRewrite> analyze_frame_forward_payload(const AstExpr& call,
-                                                                      HirRoute& route,
-                                                                      const HirModule& mod) {
+static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(const AstExpr& call,
+                                                                        HirRoute& route,
+                                                                        const HirModule& mod) {
     if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
-        !call.lhs->name.eq({"frame", 5}) || !call.name.eq({"forward", 7}) || call.args.len != 1 ||
+        !call.lhs->name.eq({"message", 7}) || !call.name.eq({"forward", 7}) || call.args.len != 1 ||
         !call.args[0])
         return frontend_error(FrontendError::UnsupportedSyntax, call.span);
     std::string prefix, suffix;
     HirWsTextRewrite result;
     u32 nodes = 0;
-    auto parts = analyze_frame_text_parts(
+    auto parts = analyze_message_text_parts(
         *call.args[0], route, mod, prefix, suffix, result.include_payload, nodes);
     if (!parts) return core::make_unexpected(parts.error());
     if ((route.ws_handler.max_message_size != 0 &&
@@ -7176,14 +7177,14 @@ static FrontendResult<HirWsTextRewrite> analyze_frame_forward_payload(const AstE
     return result;
 }
 
-static FrontendResult<WsVerdict> analyze_frame_guard_verdict(const AstExpr& call,
-                                                             HirRoute& route,
-                                                             const HirModule& mod) {
+static FrontendResult<WsVerdict> analyze_message_guard_verdict(const AstExpr& call,
+                                                               HirRoute& route,
+                                                               const HirModule& mod) {
     // Bare close retains its existing route-default policy. Explicit arguments
     // select a distinct policy, including an empty reason for close(code).
-    if (call.args.len == 0) return analyze_bare_frame_verdict(call);
+    if (call.args.len == 0) return analyze_bare_message_verdict(call);
     if (call.name.eq({"forward", 7})) {
-        auto payload = analyze_frame_forward_payload(call, route, mod);
+        auto payload = analyze_message_forward_payload(call, route, mod);
         if (!payload) return core::make_unexpected(payload.error());
         auto& texts = route.ws_handler.forward_payloads;
         const u32 index = texts.len;
@@ -7191,7 +7192,7 @@ static FrontendResult<WsVerdict> analyze_frame_guard_verdict(const AstExpr& call
             return frontend_error(FrontendError::TooManyItems, call.span);
         return static_cast<WsVerdict>(static_cast<u8>(WsVerdict::ForwardTextPolicy0) + index);
     }
-    auto policy = analyze_frame_close_policy(call, route, mod);
+    auto policy = analyze_message_close_policy(call, route, mod);
     if (!policy) return core::make_unexpected(policy.error());
     auto& policies = route.ws_handler.close_policies;
     const u32 index = policies.len;
@@ -7200,19 +7201,19 @@ static FrontendResult<WsVerdict> analyze_frame_guard_verdict(const AstExpr& call
     return static_cast<WsVerdict>(static_cast<u8>(WsVerdict::ClosePolicy0) + index);
 }
 
-// Match a guard condition `frame.len <cmp> <int-literal>` (or its mirror `N <cmp> frame.len`),
+// Match a guard condition `message.len <cmp> <int-literal>` (or its mirror `N <cmp> message.len`),
 // normalized so cmp reads `len <cmp> bound`. Any other shape → UnsupportedSyntax.
-static FrontendResult<WsLenGuard> analyze_frame_len_cond(const AstExpr& cond, WsVerdict verdict) {
+static FrontendResult<WsLenGuard> analyze_message_len_cond(const AstExpr& cond, WsVerdict verdict) {
     if (cond.lhs == nullptr || cond.rhs == nullptr)
         return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
     const AstExpr& lhs = *cond.lhs;
     const AstExpr& rhs = *cond.rhs;
     bool len_left = false;
     const AstExpr* num = nullptr;
-    if (ws_is_frame_len(lhs) && rhs.kind == AstExprKind::IntLit) {
+    if (ws_is_message_len(lhs) && rhs.kind == AstExprKind::IntLit) {
         len_left = true;
         num = &rhs;
-    } else if (ws_is_frame_len(rhs) && lhs.kind == AstExprKind::IntLit) {
+    } else if (ws_is_message_len(rhs) && lhs.kind == AstExprKind::IntLit) {
         len_left = false;
         num = &lhs;
     } else {
@@ -7223,7 +7224,7 @@ static FrontendResult<WsLenGuard> analyze_frame_len_cond(const AstExpr& cond, Ws
         return frontend_error(FrontendError::UnsupportedSyntax, num->span);
     using Cmp = WsLenGuard::Cmp;
     Cmp cmp;
-    switch (cond.kind) {  // mirror the operator when frame.len is on the right
+    switch (cond.kind) {  // mirror the operator when message.len is on the right
         case AstExprKind::Lt:
             cmp = len_left ? Cmp::Lt : Cmp::Gt;
             break;
@@ -7244,58 +7245,38 @@ static FrontendResult<WsLenGuard> analyze_frame_len_cond(const AstExpr& cond, Ws
     return g;
 }
 
-// `frame.text.matches(re"…")` — a regex scan over the message payload. Returns the pattern
+// `message.text.matches(re"…")` — a regex scan over the message payload. Returns the pattern
 // when the shape matches, else an empty Str (len 0 means "not a text-match condition"); a
 // genuinely empty regex isn't expressible (re"" needs at least the delimiters → never 0 here).
-static Str ws_frame_text_match_pattern(const AstExpr& cond) {
+static Str ws_message_text_match_pattern(const AstExpr& cond) {
     if (cond.kind != AstExprKind::MethodCall || cond.lhs == nullptr ||
         !cond.name.eq({"matches", 7}) || cond.args.len != 1 || cond.args[0] == nullptr ||
         cond.args[0]->kind != AstExprKind::RegexLit)
         return Str{};
-    if (!ws_is_frame_field(*cond.lhs, {"text", 4})) return Str{};
+    if (!ws_is_message_field(*cond.lhs, {"text", 4})) return Str{};
     return cond.args[0]->str_value;
 }
 
-// Match a leaf condition for the frame handler. `negate` is logical !, accepted
-// on boolean frame properties or `frame.text.matches(re)` (the blocklist form). Direction is a
-// bare `frame.fromClient` (true on the client→upstream leg); opcode discrimination is a bare
-// `frame.isText` / `frame.isBinary`, or frame.opcode ==/!= .text/.binary; content is
-// `frame.text.matches(re"…")` (a regex over the payload); else a `frame.len <cmp> N`
+// Match a leaf condition for the message handler. `negate` is logical !, accepted
+// on boolean message properties or `message.text.matches(re)` (the blocklist form). Direction is a
+// bare `message.fromClient` (true on the client→upstream leg); opcode discrimination is a bare
+// `message.isText` / `message.isBinary`, or message.opcode ==/!= .text/.binary; content is
+// `message.text.matches(re"…")` (a regex over the payload); else a `message.len <cmp> N`
 // comparison. Literal text equality, prefix/suffix/substring checks and text.isEmpty are also
 // supported. Anything else → UnsupportedSyntax.
 
-static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
-                                                           WsVerdict verdict,
-                                                           bool negate,
-                                                           const HirModule& mod) {
-    // Only data messages reach handlers; control opcodes are not cases of this surface.
-    // Reuse the existing Opcode leaf and the parser's != / ! normalization.
-    if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
-        const AstExpr* value = nullptr;
-        if (ws_is_frame_field(*cond.lhs, {"opcode", 6}))
-            value = cond.rhs;
-        else if (ws_is_frame_field(*cond.rhs, {"opcode", 6}))
-            value = cond.lhs;
-        if (value) {
-            if (value->kind != AstExprKind::VariantCase || value->lhs ||
-                (!value->str_value.eq({"text", 4}) && !value->str_value.eq({"binary", 6})))
-                return frontend_error(FrontendError::UnsupportedSyntax, value->span);
-            WsLenGuard g{};
-            g.accessor = WsLenGuard::Accessor::Opcode;
-            g.cmp = WsLenGuard::Cmp::Eq;
-            g.bound = value->str_value.eq({"text", 4}) ? 0x1u : 0x2u;
-            g.negate = negate;
-            g.verdict = verdict;
-            return g;
-        }
-    }
+static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond,
+                                                             WsVerdict verdict,
+                                                             bool negate,
+                                                             const HirModule& mod) {
     // Literal comparison is byte-exact, like ordinary string equality. Reuse the
     // expression decoder so escapes and embedded NULs have the same semantics.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
         const AstExpr* literal = nullptr;
-        if (ws_is_frame_field(*cond.lhs, {"text", 4}) && cond.rhs->kind == AstExprKind::StrLit)
+        if (ws_is_message_field(*cond.lhs, {"text", 4}) && cond.rhs->kind == AstExprKind::StrLit)
             literal = cond.rhs;
-        else if (ws_is_frame_field(*cond.rhs, {"text", 4}) && cond.lhs->kind == AstExprKind::StrLit)
+        else if (ws_is_message_field(*cond.rhs, {"text", 4}) &&
+                 cond.lhs->kind == AstExprKind::StrLit)
             literal = cond.lhs;
         if (literal) {
             auto decoded = decoded_expression_string(literal->str_value, mod, literal->span);
@@ -7309,7 +7290,7 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
         }
     }
     if (cond.kind == AstExprKind::MethodCall && cond.lhs &&
-        ws_is_frame_field(*cond.lhs, {"text", 4}) &&
+        ws_is_message_field(*cond.lhs, {"text", 4}) &&
         (cond.name.eq({"hasPrefix", 9}) || cond.name.eq({"hasSuffix", 9}) ||
          cond.name.eq({"contains", 8}))) {
         if (cond.args.len != 1 || !cond.args[0] || cond.args[0]->kind != AstExprKind::StrLit)
@@ -7326,7 +7307,7 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
         return g;
     }
     if (cond.kind == AstExprKind::Field && cond.name.eq({"isEmpty", 7}) && cond.lhs &&
-        ws_is_frame_field(*cond.lhs, {"text", 4})) {
+        ws_is_message_field(*cond.lhs, {"text", 4})) {
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::Len;
         g.cmp = WsLenGuard::Cmp::Eq;
@@ -7334,7 +7315,7 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
         g.verdict = verdict;
         return g;
     }
-    const Str text_pattern = ws_frame_text_match_pattern(cond);
+    const Str text_pattern = ws_message_text_match_pattern(cond);
     if (text_pattern.len != 0) {
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
         // Same compile-time regex check the HTTP `matches()` path runs, so an invalid pattern
@@ -7353,7 +7334,7 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
         g.verdict = verdict;
         return g;
     }
-    if (ws_is_frame_field(cond, {"fromClient", 10})) {
+    if (ws_is_message_field(cond, {"fromClient", 10})) {
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::FromClient;
         g.cmp = WsLenGuard::Cmp::Eq;
@@ -7361,8 +7342,8 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
         g.verdict = verdict;
         return g;
     }
-    const bool is_text = ws_is_frame_field(cond, {"isText", 6});
-    if (is_text || ws_is_frame_field(cond, {"isBinary", 8})) {
+    const bool is_text = ws_is_message_field(cond, {"isText", 6});
+    if (is_text || ws_is_message_field(cond, {"isBinary", 8})) {
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::Opcode;
         g.cmp = WsLenGuard::Cmp::Eq;
@@ -7371,26 +7352,26 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
         g.verdict = verdict;
         return g;
     }
-    auto g = analyze_frame_len_cond(cond, verdict);
+    auto g = analyze_message_len_cond(cond, verdict);
     if (!g) return core::make_unexpected(g.error());
     g->negate = negate;
     return g;
 }
 // Store a bounded condition tree in postorder. Only roots are source guards; children
-// are evaluated by short-circuit branches in the frame-handler JIT.
-static FrontendResult<u32> analyze_frame_condition(const AstExpr& cond,
-                                                   WsVerdict verdict,
-                                                   HirWsHandler& handler,
-                                                   const HirModule& mod,
-                                                   bool is_operand = false,
-                                                   bool negate = false,
-                                                   u32 depth = 0) {
+// are evaluated by short-circuit branches in the message-handler JIT.
+static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
+                                                     WsVerdict verdict,
+                                                     HirWsHandler& handler,
+                                                     const HirModule& mod,
+                                                     bool is_operand = false,
+                                                     bool negate = false,
+                                                     u32 depth = 0) {
     if (depth >= HirWsHandler::kMaxConditionNodes)
         return frontend_error(FrontendError::TooManyItems, cond.span);
     // The ordinary parser desugars !x, !=, <= and >= to (predicate == false).
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs &&
         cond.rhs->kind == AstExprKind::BoolLit && !cond.rhs->bool_value) {
-        return analyze_frame_condition(
+        return analyze_message_condition(
             *cond.lhs, verdict, handler, mod, is_operand, !negate, depth + 1);
     }
     WsLenGuard node{};
@@ -7398,10 +7379,10 @@ static FrontendResult<u32> analyze_frame_condition(const AstExpr& cond,
         if (!cond.lhs || !cond.rhs)
             return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
         auto lhs =
-            analyze_frame_condition(*cond.lhs, verdict, handler, mod, true, false, depth + 1);
+            analyze_message_condition(*cond.lhs, verdict, handler, mod, true, false, depth + 1);
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs =
-            analyze_frame_condition(*cond.rhs, verdict, handler, mod, true, false, depth + 1);
+            analyze_message_condition(*cond.rhs, verdict, handler, mod, true, false, depth + 1);
         if (!rhs) return core::make_unexpected(rhs.error());
         node.accessor =
             cond.kind == AstExprKind::And ? WsLenGuard::Accessor::And : WsLenGuard::Accessor::Or;
@@ -7410,7 +7391,7 @@ static FrontendResult<u32> analyze_frame_condition(const AstExpr& cond,
         node.negate = negate;
         node.verdict = verdict;
     } else {
-        auto leaf = analyze_frame_guard_cond(cond, verdict, negate, mod);
+        auto leaf = analyze_message_guard_cond(cond, verdict, negate, mod);
         if (!leaf) return core::make_unexpected(leaf.error());
         node = leaf.value();
     }
@@ -13121,7 +13102,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
 
 #if RUT_ENABLE_WEBSOCKET
     if (stmt.kind == AstStmtKind::WsTerminate) {
-        // A bounded guard sequence followed by a final frame verdict. Argument-bearing
+        // A bounded guard sequence followed by a final message verdict. Argument-bearing
         // guard closes and forwards select independent fixed payloads; bare closes
         // keep the route's default code/reason.
         auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
@@ -13148,9 +13129,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     gs->else_stmt->kind != AstStmtKind::Expr)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           gs ? gs->span : body->span);
-                auto gv = analyze_frame_guard_verdict(gs->else_stmt->expr, *route, mod);
+                auto gv = analyze_message_guard_verdict(gs->else_stmt->expr, *route, mod);
                 if (!gv) return core::make_unexpected(gv.error());
-                auto g = analyze_frame_condition(gs->expr, gv.value(), route->ws_handler, mod);
+                auto g = analyze_message_condition(gs->expr, gv.value(), route->ws_handler, mod);
                 if (!g) return core::make_unexpected(g.error());
             }
             const AstStatement* last = body->block_stmts[stmt_count - 1];
@@ -13162,17 +13143,17 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             return frontend_error(FrontendError::UnsupportedSyntax, body->span);
         }
         const AstExpr& call = *default_call;
-        const bool is_frame_method = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
-                                     call.lhs->kind == AstExprKind::Ident &&
-                                     call.lhs->name.eq({"frame", 5});
-        if (!is_frame_method) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        const bool is_message_method =
+            call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
+            call.lhs->kind == AstExprKind::Ident && call.lhs->name.eq({"message", 7});
+        if (!is_message_method) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
 
         if (call.name.eq({"forward", 7})) {
             if (call.args.len > 1)  // forward() or forward(payload, load_balance: .roundRobin)
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
             route->ws_handler.default_verdict = WsVerdict::Forward;
             if (call.args.len == 1) {
-                auto payload = analyze_frame_forward_payload(call, *route, mod);
+                auto payload = analyze_message_forward_payload(call, *route, mod);
                 if (!payload) return core::make_unexpected(payload.error());
                 route->ws_handler.has_forward_payload = true;
                 route->ws_handler.forward_payload = payload.value();
@@ -13182,7 +13163,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
             route->ws_handler.default_verdict = WsVerdict::Drop;
         } else if (call.name.eq({"close", 5})) {
-            auto policy = analyze_frame_close_policy(call, *route, mod);
+            auto policy = analyze_message_close_policy(call, *route, mod);
             if (!policy) return core::make_unexpected(policy.error());
             route->ws_handler.default_verdict = WsVerdict::Close;
             route->ws_handler.close_code = policy->code;

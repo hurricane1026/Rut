@@ -16,7 +16,7 @@ constexpr Str kEmptyBlockDetail = lit_str("empty block is not supported");
 constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `pattern => ...`");
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
 constexpr Str kWsTrailingBlockDetail =
-    lit_str("websocket trailing blocks require `{ frame in ... }`");
+    lit_str("websocket trailing blocks require `{ message in ... }`");
 constexpr Str kObjectCallArgDetail = lit_str("object literals are only allowed as call arguments");
 // The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
 // member names work); the parser rejects them in operator/operand positions.
@@ -592,14 +592,14 @@ struct Parser {
     }
 
 #if RUT_ENABLE_WEBSOCKET
-    // Parse a WebSocket terminate-mode frame-handler body after `{ frame in`. Distinct from
-    // parse_braced_stmt_body because frame verdicts are **bare method-call statements**
-    // (`frame.forward()`), which the general statement parser (parse_stmt) deliberately
+    // Parse a WebSocket terminate-mode message-handler body after `{ message in`. Distinct from
+    // parse_braced_stmt_body because message verdicts are **bare method-call statements**
+    // (`message.forward()`), which the general statement parser (parse_stmt) deliberately
     // rejects — its only statements are keyword-led (let/guard/return/if/match/...). Slice B
-    // accepts only bare expression statements; guards/match over `frame` are follow-up slices.
+    // accepts only bare expression statements; guards/match over `message` are follow-up slices.
     // Mirrors parse_braced_stmt_body's empty-block rejection and one-statement unwrap so analyze
     // sees the same body shape.
-    FrontendResult<AstStatement> parse_ws_frame_body(const Token& lbrace_tok) {
+    FrontendResult<AstStatement> parse_ws_message_body(const Token& lbrace_tok) {
         AstStatement block{};
         block.kind = AstStmtKind::Block;
         block.span = span_from(lbrace_tok);
@@ -609,7 +609,7 @@ struct Parser {
                 // `guard <cond> else { <verdict> }` — a conditional verdict.
                 const Token gt = cur();
                 pos++;
-                auto g = parse_ws_frame_guard(gt);
+                auto g = parse_ws_message_guard(gt);
                 if (!g) return core::make_unexpected(g.error());
                 st = g.value();
             } else {
@@ -634,11 +634,11 @@ struct Parser {
         return block;
     }
 
-    // Parse a frame-handler guard: `guard <cond> else { <verdict> }`. The condition is an
-    // ordinary boolean expression over frame properties; the else body is a single
-    // bare frame verdict (frame.drop()/forward()/close()). Reuses AstStmtKind::Guard with
+    // Parse a message-handler guard: `guard <cond> else { <verdict> }`. The condition is an
+    // ordinary boolean expression over message properties; the else body is a single
+    // bare message verdict (message.drop()/forward()/close()). Reuses AstStmtKind::Guard with
     // expr=cond and else_stmt=the verdict Expr — the WsTerminate analyze path interprets it.
-    FrontendResult<AstStatement> parse_ws_frame_guard(const Token& guard_tok) {
+    FrontendResult<AstStatement> parse_ws_message_guard(const Token& guard_tok) {
         // Ordinary expression precedence includes unary ! and short-circuit &&/||.
         auto cond = parse_expr();
         if (!cond) return core::make_unexpected(cond.error());
@@ -1216,8 +1216,8 @@ struct Parser {
             const Token* field_name = nullptr;
             // After `.` the token is a member name, not a statement keyword, so a reserved
             // word there is unambiguous. `func` is already allowed; `forward` is allowed too
-            // so the WebSocket frame verdict can be spelled `frame.forward()` even though
-            // `forward` is the proxy-terminator keyword (the `frame.` receiver disambiguates).
+            // so the WebSocket message verdict can be spelled `message.forward()` even though
+            // `forward` is the proxy-terminator keyword (the `message.` receiver disambiguates).
             if (cur().type == TokenType::Ident || cur().type == TokenType::KwFunc ||
                 cur().type == TokenType::KwForward || cur().type == TokenType::KwGet) {
                 // KwGet: `get` doubles as the HTTP-method keyword, but after
@@ -2878,7 +2878,7 @@ struct Parser {
             // full-duplex passthrough tunnel when the client requested an Upgrade and the
             // upstream answers 101 (a non-upgrade request just proxies normally, so the
             // route is safe with no edge guard). Terminate mode uses the contextual
-            // `{ frame in ... }` trailing block parsed below.
+            // `{ message in ... }` trailing block parsed below.
             // NOTE: for now `websocket(x)` is indistinguishable from `forward(x)` after
             // parse — the keyword is intent/documentation only. A distinct WS-only route
             // marker is a later phase if "a forward that must NOT tunnel" is ever needed.
@@ -2892,7 +2892,7 @@ struct Parser {
                 if (!name) return core::make_unexpected(name.error());
                 // Optional `, maxMessageSize: <IntLit><b|kb|mb|gb>` — the per-message reassembly
                 // cap for terminate mode. ByteSize lexes as IntLit + a separate unit Ident
-                // (mirrors @throttle's bandwidth parse). Only meaningful with a frame-handler
+                // (mirrors @throttle's bandwidth parse). Only meaningful with a message-handler
                 // block (terminate); rejected on the bare passthrough form below.
                 u32 ws_max_size = 0;
                 if (cur().type == TokenType::Comma) {
@@ -2935,25 +2935,25 @@ struct Parser {
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.name = name.value()->text;
                 stmt.ws_max_message_size = ws_max_size;
-                // A trailing `{ frame in ... }` block makes this TERMINATE mode (the gateway
+                // A trailing `{ message in ... }` block makes this TERMINATE mode (the gateway
                 // parses/inspects each message); a bare `websocket(x)` stays the passthrough
-                // ForwardUpstream tunnel. The block is the per-message frame handler; its
+                // ForwardUpstream tunnel. The block is the per-message handler; its
                 // body is stored on then_stmt (reused like For), parsed by the general
                 // statement parser (per-message verdicts are a follow-up slice).
                 if (cur().type == TokenType::LBrace) {
                     auto lbrace = expect(TokenType::LBrace);
                     if (!lbrace) return core::make_unexpected(lbrace.error());
-                    if (cur().type != TokenType::Ident || !cur().text.eq({"frame", 5}))
+                    if (cur().type != TokenType::Ident || !cur().text.eq({"message", 7}))
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(cur()),
                                               kWsTrailingBlockDetail);
-                    pos++;  // consume the fixed frame-handler binding
+                    pos++;  // consume the fixed message-handler binding
                     if (cur().type != TokenType::KwIn)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(cur()),
                                               kWsTrailingBlockDetail);
                     pos++;  // consume `in`
-                    auto body = parse_ws_frame_body(*lbrace.value());
+                    auto body = parse_ws_message_body(*lbrace.value());
                     if (!body) return core::make_unexpected(body.error());
                     auto body_ptr = alloc_stmt(body.value());
                     if (!body_ptr) return core::make_unexpected(body_ptr.error());

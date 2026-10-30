@@ -20778,9 +20778,10 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 
-// Compile a `websocket(x){ frame in frame.<verdict>() }` program end-to-end through the
-// constant-verdict frame-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup -> CALL),
-// and return the verdict the compiled function actually produces. Returns 255 on any failure.
+// Compile a `websocket(x){ message in message.<verdict>() }` program end-to-end through the
+// constant-verdict message-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup ->
+// CALL), and return the verdict the compiled function actually produces. Returns 255 on any
+// failure.
 static WsFrameAction jit_ws_verdict(const char* src) {
     constexpr auto kFail = static_cast<WsFrameAction>(255);
     auto lexed = lex(lit(src));
@@ -20803,19 +20804,19 @@ static WsFrameAction jit_ws_verdict(const char* src) {
 }
 
 TEST(jit, ws_handler_forward_returns_forward) {
-    // frame.forward() compiles to a verdict function that, when called, returns Forward.
-    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
-                         "frame.forward() } }\n") == WsFrameAction::Forward);
+    // message.forward() compiles to a verdict function that, when called, returns Forward.
+    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+                         "message.forward() } }\n") == WsFrameAction::Forward);
 }
 
 TEST(jit, ws_handler_drop_returns_drop) {
-    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
-                         "frame.drop() } }\n") == WsFrameAction::Drop);
+    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+                         "message.drop() } }\n") == WsFrameAction::Drop);
 }
 
 TEST(jit, ws_handler_close_returns_close) {
-    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
-                         "frame.close() } }\n") == WsFrameAction::Close);
+    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+                         "message.close() } }\n") == WsFrameAction::Close);
 }
 #endif  // RUT_ENABLE_WEBSOCKET
 

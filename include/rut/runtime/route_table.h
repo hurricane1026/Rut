@@ -155,7 +155,7 @@ struct RouteEntry {
     bool ws_terminate = false;
     WsMessageHandlerFn ws_frame_handler = nullptr;
     u32 ws_max_message_size = 0;
-    // RFC 6455 status the handler's `frame.close(code)` verdict puts on the wire (1000 default).
+    // RFC 6455 status the handler's `message.close(code)` verdict puts on the wire (1000 default).
     WsClosePolicy ws_close_policies[kWsMaxClosePolicies]{};
     u32 ws_close_policy_count = 0;
     Str ws_close_reason{};

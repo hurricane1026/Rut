@@ -4397,15 +4397,15 @@ TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific
 
 #if RUT_ENABLE_WEBSOCKET
 TEST(serve_loader, websocket_terminate_route_registers_and_runs) {
-    // End-to-end (Phase 4 D/E): a `websocket(x){ frame in frame.drop() }` route compiles, its
+    // End-to-end (Phase 4 D/E): a `websocket(x){ message in message.drop() }` route compiles, its
     // constant verdict is JIT'd, and it's published as a terminate route whose frame handler — when
     // called — returns the compiled verdict.
     const std::string dir = "/tmp/rut_serve_loader_ws";
-    const std::string path =
-        write_file(dir,
-                   "app.rut",
-                   "upstream backend at \"127.0.0.1:9999\"\n"
-                   "route GET \"/ws\" { return websocket(backend) { frame in frame.drop() } }\n");
+    const std::string path = write_file(
+        dir,
+        "app.rut",
+        "upstream backend at \"127.0.0.1:9999\"\n"
+        "route GET \"/ws\" { return websocket(backend) { message in message.drop() } }\n");
 
     LoadedProgram program;
     LoadError err;
@@ -4425,19 +4425,20 @@ TEST(serve_loader, websocket_terminate_route_registers_and_runs) {
 }
 
 TEST(serve_loader, websocket_terminate_len_guard_branches_on_length) {
-    // Conditional verdict end-to-end: `guard frame.len < 4096 else { frame.drop() }` then
+    // Conditional verdict end-to-end: `guard message.len < 4096 else { message.drop() }` then
     // forward. The JIT'd handler must branch on the message length — drop at/over the cap,
     // forward under it. Proves parser -> analyze -> HIR guards -> branching codegen -> serve all
     // wire up and the compiled function actually computes the right verdict per length. (Rut has
     // no <= operator, so the cap is exclusive: len < 4096.)
     const std::string dir = "/tmp/rut_serve_loader_ws_guard";
-    const std::string path = write_file(dir,
-                                        "app.rut",
-                                        "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                                        "  guard frame.len < 4096 else { frame.drop() }\n"
-                                        "  frame.forward()\n"
-                                        "} }\n");
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   "  guard message.len < 4096 else { message.drop() }\n"
+                   "  message.forward()\n"
+                   "} }\n");
 
     LoadedProgram program;
     LoadError err;
@@ -4461,17 +4462,18 @@ TEST(serve_loader, websocket_terminate_len_guard_branches_on_length) {
 }
 
 TEST(serve_loader, websocket_terminate_opcode_guard_drops_binary) {
-    // Opcode discrimination end-to-end: `guard frame.isText else { frame.drop() }` then forward
+    // Opcode discrimination end-to-end: `guard message.isText else { message.drop() }` then forward
     // — a text-only handler. The JIT'd handler must branch on the opcode param: forward Text,
     // drop Binary.
     const std::string dir = "/tmp/rut_serve_loader_ws_opcode";
-    const std::string path = write_file(dir,
-                                        "app.rut",
-                                        "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                                        "  guard frame.isText else { frame.drop() }\n"
-                                        "  frame.forward()\n"
-                                        "} }\n");
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   "  guard message.isText else { message.drop() }\n"
+                   "  message.forward()\n"
+                   "} }\n");
 
     LoadedProgram program;
     LoadError err;
@@ -4491,18 +4493,19 @@ TEST(serve_loader, websocket_terminate_opcode_guard_drops_binary) {
 }
 
 TEST(serve_loader, websocket_terminate_direction_guard_polices_client_leg) {
-    // Direction discrimination end-to-end: `guard frame.fromClient else { frame.forward() }`
-    // then `frame.drop()`. The handler should drop only the client→upstream leg and forward the
+    // Direction discrimination end-to-end: `guard message.fromClient else { message.forward() }`
+    // then `message.drop()`. The handler should drop only the client→upstream leg and forward the
     // upstream→client leg. Proves the from_client param threads through analyze -> HIR -> codegen
     // ABI (param 4) -> serve.
     const std::string dir = "/tmp/rut_serve_loader_ws_dir";
-    const std::string path = write_file(dir,
-                                        "app.rut",
-                                        "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                                        "  guard frame.fromClient else { frame.forward() }\n"
-                                        "  frame.drop()\n"
-                                        "} }\n");
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   "  guard message.fromClient else { message.forward() }\n"
+                   "  message.drop()\n"
+                   "} }\n");
 
     LoadedProgram program;
     LoadError err;
@@ -4524,13 +4527,13 @@ TEST(serve_loader, websocket_terminate_direction_guard_polices_client_leg) {
 }
 
 TEST(serve_loader, websocket_terminate_negated_boolean_guards) {
-    const char* conditions[] = {"!frame.fromClient", "!frame.isText", "!frame.isBinary"};
+    const char* conditions[] = {"!message.fromClient", "!message.isText", "!message.isBinary"};
     for (u32 c = 0; c < 3; c++) {
         const std::string source =
             std::string(
                 "upstream backend at \"127.0.0.1:9999\"\n"
-                "route GET \"/ws\" { return websocket(backend) { frame in\n  guard ") +
-            conditions[c] + " else { frame.drop() }\n  frame.forward()\n} }\n";
+                "route GET \"/ws\" { return websocket(backend) { message in\n  guard ") +
+            conditions[c] + " else { message.drop() }\n  message.forward()\n} }\n";
         const std::string path =
             write_file("/tmp/rut_serve_loader_ws_negated", "app.rut", source.c_str());
         LoadedProgram program;
@@ -4557,20 +4560,20 @@ TEST(serve_loader, websocket_terminate_negated_boolean_guards) {
 
 TEST(serve_loader, websocket_terminate_compound_guard_truth_tables) {
     const char* conditions[] = {
-        "frame.fromClient || frame.isText && frame.len < 4",
-        "!(frame.fromClient || frame.isBinary) && frame.len >= 3",
-        "!frame.fromClient && frame.isText",
-        "!(frame.len < 3)",
-        "frame.len != 3",
-        "3 <= frame.len && frame.len <= 4",
+        "message.fromClient || message.isText && message.len < 4",
+        "!(message.fromClient || message.isBinary) && message.len >= 3",
+        "!message.fromClient && message.isText",
+        "!(message.len < 3)",
+        "message.len != 3",
+        "3 <= message.len && message.len <= 4",
     };
     const u64 lengths[] = {0, 2, 3, 4, 5, 0xffffffffULL, 0x100000000ULL};
     for (u32 c = 0; c < 6; c++) {
         std::string source =
             "upstream backend at \"127.0.0.1:9999\"\n"
-            "route GET \"/ws\" { return websocket(backend) { frame in\n guard ";
+            "route GET \"/ws\" { return websocket(backend) { message in\n guard ";
         source += conditions[c];
-        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        source += " else { message.drop() }\n message.forward()\n} }\n";
         const auto path =
             write_file("/tmp/rut_serve_loader_ws_compound", "app.rut", source.c_str());
         LoadedProgram program;
@@ -4601,14 +4604,14 @@ TEST(serve_loader, websocket_terminate_compound_guard_truth_tables) {
 TEST(serve_loader, websocket_terminate_compound_regex_short_circuits) {
     const auto path = write_file("/tmp/rut_serve_loader_ws_short_circuit", "app.rut", R"(
 upstream backend at "127.0.0.1:9999"
-route GET "/or" { return websocket(backend) { frame in
-    guard !frame.fromClient || !frame.isText || !frame.text.matches(re".*spam.*") else { frame.drop() }
-    guard frame.len <= 16 else { frame.close() }
-    frame.forward()
+route GET "/or" { return websocket(backend) { message in
+    guard !message.fromClient || !message.isText || !message.text.matches(re".*spam.*") else { message.drop() }
+    guard message.len <= 16 else { message.close() }
+    message.forward()
 } }
-route GET "/and" { return websocket(backend) { frame in
-    guard frame.fromClient && frame.isText && frame.text.matches(re".*spam.*") else { frame.forward() }
-    frame.drop()
+route GET "/and" { return websocket(backend) { message in
+    guard message.fromClient && message.isText && message.text.matches(re".*spam.*") else { message.forward() }
+    message.drop()
 } }
 )");
     LoadedProgram program;
@@ -4649,10 +4652,10 @@ TEST(serve_loader, websocket_terminate_rewrites_fixed_text) {
     const auto path = write_file("/tmp/rut_serve_loader_ws_rewrite",
                                  "app.rut",
                                  "upstream backend at \"127.0.0.1:9999\"\n"
-                                 "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                                 " guard frame.fromClient else { frame.forward() }\n"
-                                 " guard frame.isText else { frame.drop() }\n"
-                                 " frame.forward(\"rewritten\\0text\")\n} }\n");
+                                 "route GET \"/ws\" { return websocket(backend) { message in\n"
+                                 " guard message.fromClient else { message.forward() }\n"
+                                 " guard message.isText else { message.drop() }\n"
+                                 " message.forward(\"rewritten\\0text\")\n} }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -4697,13 +4700,13 @@ TEST(serve_loader, websocket_affix_rewrites_retain_independent_branch_and_defaul
                    "upstream backend at \"127.0.0.1:9999\"\n"
                    "route GET \"/ws\" { let prefix = \"one\\0\"\n"
                    " let alias = prefix\n let suffix = \"\\u{20ac}\"\n"
-                   " return websocket(backend) { frame in\n"
-                   " guard frame.text != \"a\" else { frame.forward(alias + frame.text + "
+                   " return websocket(backend) { message in\n"
+                   " guard message.text != \"a\" else { message.forward(alias + message.text + "
                    "suffix) }\n"
-                   " guard frame.text != \"b\" else { frame.forward(frame.text + \"end\") }\n"
-                   " guard frame.text != \"c\" else { frame.forward(\"pre\" + frame.text) }\n"
-                   " guard frame.text != \"d\" else { frame.forward(\"fixed\") }\n"
-                   " frame.forward(\"[\" + frame.text + \"]\") } }\n");
+                   " guard message.text != \"b\" else { message.forward(message.text + \"end\") }\n"
+                   " guard message.text != \"c\" else { message.forward(\"pre\" + message.text) }\n"
+                   " guard message.text != \"d\" else { message.forward(\"fixed\") }\n"
+                   " message.forward(\"[\" + message.text + \"]\") } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -4768,7 +4771,7 @@ TEST(serve_loader, websocket_terminate_empty_rewrite_and_invalid_config) {
         "/tmp/rut_serve_loader_ws_empty_rewrite",
         "app.rut",
         "upstream backend at \"127.0.0.1:9999\"\n"
-        "route GET \"/ws\" { return websocket(backend) { frame in frame.forward(\"\") } }\n");
+        "route GET \"/ws\" { return websocket(backend) { message in message.forward(\"\") } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -4790,23 +4793,23 @@ TEST(serve_loader, websocket_terminate_empty_rewrite_and_invalid_config) {
     program.destroy();
 }
 
-TEST(serve_loader, websocket_opcode_comparisons_execute_for_both_directions) {
-    const char* conditions[] = {"frame.opcode == .text",
-                                ".text == frame.opcode",
-                                "frame.opcode != .binary",
-                                ".binary != frame.opcode",
-                                "!(frame.opcode == .binary)",
-                                "!(frame.opcode != .text)",
-                                "frame.opcode == .binary",
-                                "frame.opcode != .text",
-                                ".binary == frame.opcode",
-                                ".text != frame.opcode"};
+TEST(serve_loader, websocket_message_type_comparisons_execute_for_both_directions) {
+    const char* conditions[] = {"message.isText",
+                                "message.isText",
+                                "!message.isBinary",
+                                "!message.isBinary",
+                                "!(message.isBinary)",
+                                "!(!message.isText)",
+                                "message.isBinary",
+                                "!message.isText",
+                                "message.isBinary",
+                                "!message.isText"};
     for (u32 i = 0; i < 10; i++) {
         std::string source =
             "upstream backend at \"127.0.0.1:9999\"\n"
-            "route GET \"/ws\" { return websocket(backend) { frame in\n guard ";
+            "route GET \"/ws\" { return websocket(backend) { message in\n guard ";
         source += conditions[i];
-        source += " else { frame.drop() }\n frame.forward() } }\n";
+        source += " else { message.drop() }\n message.forward() } }\n";
         const auto path = write_file("/tmp/rut_ws_opcode_guards", "app.rut", source.c_str());
         LoadedProgram program;
         LoadError err;
@@ -4829,9 +4832,9 @@ TEST(serve_loader, websocket_compound_opcode_guards_reach_wire_after_reassembly)
         write_file("/tmp/rut_ws_opcode_compound",
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
-                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                   "guard !frame.fromClient || (frame.opcode == .text && frame.text == \"ok\") "
-                   "else { frame.close(1008, \"text only\") }\nframe.forward() } }\n");
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   "guard !message.fromClient || (message.isText && message.text == \"ok\") "
+                   "else { message.close(1008, \"text only\") }\nmessage.forward() } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -4887,14 +4890,14 @@ TEST(serve_loader, websocket_compound_opcode_guards_reach_wire_after_reassembly)
 
 TEST(serve_loader, websocket_terminate_text_literal_conditions) {
     const char* conditions[] = {
-        "frame.text == \"ping\"",
-        "\"ping\" != frame.text",
-        "frame.text == \"a\\0b\\n\"",
-        "frame.text == \"\"",
-        "frame.text.isEmpty",
-        "!frame.text.isEmpty",
-        "(frame.text == \"ping\" || frame.text == \"pong\") && !frame.text.isEmpty",
-        "frame.text == \"\\u{20ac}\""};
+        "message.text == \"ping\"",
+        "\"ping\" != message.text",
+        "message.text == \"a\\0b\\n\"",
+        "message.text == \"\"",
+        "message.text.isEmpty",
+        "!message.text.isEmpty",
+        "(message.text == \"ping\" || message.text == \"pong\") && !message.text.isEmpty",
+        "message.text == \"\\u{20ac}\""};
     const u8 embedded[] = {'a', 0, 'b', '\n'};
     const u8 other[] = {'a', 0, 'x', '\n'};
     const u8 unicode[] = {0xe2, 0x82, 0xac};
@@ -4908,9 +4911,9 @@ TEST(serve_loader, websocket_terminate_text_literal_conditions) {
     for (u32 c = 0; c < 8; c++) {
         std::string source =
             "upstream backend at \"127.0.0.1:9999\"\n"
-            "route GET \"/ws\" { return websocket(backend) { frame in\n guard ";
+            "route GET \"/ws\" { return websocket(backend) { message in\n guard ";
         source += conditions[c];
-        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        source += " else { message.drop() }\n message.forward()\n} }\n";
         const auto path = write_file("/tmp/rut_serve_loader_ws_literal", "app.rut", source.c_str());
         LoadedProgram program;
         LoadError err;
@@ -4949,12 +4952,12 @@ TEST(serve_loader, websocket_terminate_text_prefix_suffix) {
             for (bool negate : {false, true}) {
                 std::string source =
                     "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
-                    "websocket(backend) { frame in\n guard ";
+                    "websocket(backend) { message in\n guard ";
                 if (negate) source += "!";
-                source += "frame.text.";
+                source += "message.text.";
                 source += method;
                 source += empty ? "(\"\")" : "(\"a\\0b\")";
-                source += " else { frame.drop() }\n frame.forward()\n} }\n";
+                source += " else { message.drop() }\n message.forward()\n} }\n";
                 const auto path = write_file("/tmp/rut_ws_affix", "app.rut", source.c_str());
                 LoadedProgram program;
                 LoadError err;
@@ -4990,10 +4993,10 @@ TEST(serve_loader, websocket_terminate_text_contains) {
         for (bool negate : {false, true}) {
             std::string source =
                 "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
-                "websocket(backend) { frame in\n guard ";
+                "websocket(backend) { message in\n guard ";
             if (negate) source += "!";
-            source += empty ? "frame.text.contains(\"\")" : "frame.text.contains(\"a\\0b\")";
-            source += " else { frame.drop() }\n frame.forward()\n} }\n";
+            source += empty ? "message.text.contains(\"\")" : "message.text.contains(\"a\\0b\")";
+            source += " else { message.drop() }\n message.forward()\n} }\n";
             const auto path = write_file("/tmp/rut_ws_contains", "app.rut", source.c_str());
             LoadedProgram program;
             LoadError err;
@@ -5019,14 +5022,14 @@ TEST(serve_loader, websocket_terminate_text_contains) {
 }
 
 TEST(serve_loader, websocket_terminate_text_literal_short_circuit) {
-    const auto path =
-        write_file("/tmp/rut_serve_loader_ws_literal_short_circuit",
-                   "app.rut",
-                   "upstream backend at \"127.0.0.1:9999\"\n"
-                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                   " guard !frame.fromClient || !frame.isText || frame.text != \"ping\" else { "
-                   "frame.drop() }\n"
-                   " guard frame.len < 10 else { frame.close() }\n frame.forward()\n} }\n");
+    const auto path = write_file(
+        "/tmp/rut_serve_loader_ws_literal_short_circuit",
+        "app.rut",
+        "upstream backend at \"127.0.0.1:9999\"\n"
+        "route GET \"/ws\" { return websocket(backend) { message in\n"
+        " guard !message.fromClient || !message.isText || message.text != \"ping\" else { "
+        "message.drop() }\n"
+        " guard message.len < 10 else { message.close() }\n message.forward()\n} }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5049,16 +5052,17 @@ TEST(serve_loader, websocket_terminate_text_literal_short_circuit) {
 }
 
 TEST(serve_loader, websocket_terminate_close_code_reaches_route) {
-    // close(code) end-to-end: `frame.close(1008)` must publish the route with ws_close_code
+    // close(code) end-to-end: `message.close(1008)` must publish the route with ws_close_code
     // == 1008 (the runtime puts that on the wire), and the JIT'd handler still returns Close.
     // Proves close_code threads analyze -> HIR -> add_ws_terminate -> RouteEntry.
     const std::string dir = "/tmp/rut_serve_loader_ws_close_code";
-    const std::string path = write_file(dir,
-                                        "app.rut",
-                                        "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                                        "  frame.close(1008)\n"
-                                        "} }\n");
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   "  message.close(1008)\n"
+                   "} }\n");
 
     LoadedProgram program;
     LoadError err;
@@ -5082,8 +5086,8 @@ TEST(serve_loader, websocket_close_reason_is_owned_and_validated) {
     const auto path = write_file("/tmp/rut_ws_close_reason",
                                  "app.rut",
                                  "upstream backend at \"127.0.0.1:9999\"\n"
-                                 "route GET \"/ws\" { return websocket(backend) { frame in "
-                                 "frame.close(1008, \"policy\\0\\u{20ac}\") } }\n");
+                                 "route GET \"/ws\" { return websocket(backend) { message in "
+                                 "message.close(1008, \"policy\\0\\u{20ac}\") } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5130,15 +5134,15 @@ TEST(serve_loader, websocket_guard_close_policies_reach_wire) {
         "/tmp/rut_ws_guard_close",
         "app.rut",
         "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(backend) { "
-        "frame in\n"
-        "guard !frame.fromClient || !frame.text.hasPrefix(\"a\") else { frame.close(1008, "
+        "message in\n"
+        "guard !message.fromClient || !message.text.hasPrefix(\"a\") else { message.close(1008, "
         "\"one\\0\\u{20ac}\") }\n"
-        "guard !frame.fromClient || !frame.text.hasPrefix(\"b\") else { frame.close(1009) }\n"
-        "guard !frame.fromClient || !frame.text.hasPrefix(\"c\") else { frame.close(1011, "
+        "guard !message.fromClient || !message.text.hasPrefix(\"b\") else { message.close(1009) }\n"
+        "guard !message.fromClient || !message.text.hasPrefix(\"c\") else { message.close(1011, "
         "\"third\") }\n"
-        "guard !frame.fromClient || !frame.text.hasPrefix(\"d\") else { frame.close(4001, "
+        "guard !message.fromClient || !message.text.hasPrefix(\"d\") else { message.close(4001, "
         "\"fourth\") }\n"
-        "frame.close(1000, \"default\") } }\n");
+        "message.close(1000, \"default\") } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5200,11 +5204,11 @@ TEST(serve_loader, websocket_guard_close_first_failure_and_bare_default) {
     const auto path = write_file("/tmp/rut_ws_guard_close_order",
                                  "app.rut",
                                  "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { "
-                                 "return websocket(backend) { frame in\n"
-                                 "guard frame.len < 1 else { frame.close(1008, \"first\") }\n"
-                                 "guard frame.isText else { frame.close(1011, \"second\") }\n"
-                                 "guard frame.fromClient else { frame.close() }\n"
-                                 "frame.close(4001, \"default\") } }\n");
+                                 "return websocket(backend) { message in\n"
+                                 "guard message.len < 1 else { message.close(1008, \"first\") }\n"
+                                 "guard message.isText else { message.close(1011, \"second\") }\n"
+                                 "guard message.fromClient else { message.close() }\n"
+                                 "message.close(4001, \"default\") } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5223,13 +5227,13 @@ TEST(serve_loader, websocket_guard_close_first_failure_and_bare_default) {
 }
 
 TEST(serve_loader, websocket_guard_close_coexists_with_default_text_rewrite) {
-    const auto path =
-        write_file("/tmp/rut_ws_guard_close_rewrite",
-                   "app.rut",
-                   "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
-                   "websocket(backend) { frame in\n"
-                   "guard !frame.text.contains(\"bad\") else { frame.close(1008, \"blocked\") }\n"
-                   "frame.forward(\"safe\") } }\n");
+    const auto path = write_file(
+        "/tmp/rut_ws_guard_close_rewrite",
+        "app.rut",
+        "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+        "websocket(backend) { message in\n"
+        "guard !message.text.contains(\"bad\") else { message.close(1008, \"blocked\") }\n"
+        "message.forward(\"safe\") } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5270,14 +5274,15 @@ TEST(serve_loader, websocket_guard_close_coexists_with_default_text_rewrite) {
 }
 
 TEST(serve_loader, websocket_terminate_default_close_code_is_1000) {
-    // A bare frame.close() (or any non-close default) leaves ws_close_code at the 1000 default.
+    // A bare message.close() (or any non-close default) leaves ws_close_code at the 1000 default.
     const std::string dir = "/tmp/rut_serve_loader_ws_close_default";
-    const std::string path = write_file(dir,
-                                        "app.rut",
-                                        "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                                        "  frame.close()\n"
-                                        "} }\n");
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   "  message.close()\n"
+                   "} }\n");
 
     LoadedProgram program;
     LoadError err;
@@ -5302,8 +5307,8 @@ TEST(serve_loader, websocket_terminate_max_message_size_kwarg_reaches_route) {
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
                                         "route GET \"/ws\" { return websocket(backend, "
-                                        "maxMessageSize: 4kb) { frame in\n"
-                                        "  frame.forward()\n"
+                                        "maxMessageSize: 4kb) { message in\n"
+                                        "  message.forward()\n"
                                         "} }\n");
     LoadedProgram program;
     LoadError err;
@@ -5321,12 +5326,13 @@ TEST(serve_loader, websocket_terminate_max_message_size_kwarg_reaches_route) {
 TEST(serve_loader, websocket_terminate_default_max_message_size) {
     // No kwarg → the route gets the engine's single-slice default cap (nonzero, ~16 KB).
     const std::string dir = "/tmp/rut_serve_loader_ws_maxmsg_default";
-    const std::string path = write_file(dir,
-                                        "app.rut",
-                                        "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                                        "  frame.forward()\n"
-                                        "} }\n");
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   "  message.forward()\n"
+                   "} }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5363,7 +5369,7 @@ TEST(serve_loader, add_ws_terminate_rejects_invalid_close_code) {
 
 #if RUT_ENABLE_WEBSOCKET
 TEST(serve_loader, websocket_terminate_text_match_guard_filters_content) {
-    // Content blocklist end-to-end: `guard !frame.text.matches(re".*badword.*") else { drop }`
+    // Content blocklist end-to-end: `guard !message.text.matches(re".*badword.*") else { drop }`
     // then forward. The JIT'd handler runs the compiled regex over the payload — drop a message
     // that matches, forward one that doesn't. Proves the regex pattern/db globals emitted by
     // emit_ws_handler are compiled + back-patched by JIT finalization and called at runtime.
@@ -5374,9 +5380,9 @@ TEST(serve_loader, websocket_terminate_text_match_guard_filters_content) {
         write_file(dir,
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
-                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                   "  guard !frame.text.matches(re\".*badword.*\") else { frame.drop() }\n"
-                   "  frame.forward()\n"
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   "  guard !message.text.matches(re\".*badword.*\") else { message.drop() }\n"
+                   "  message.forward()\n"
                    "} }\n");
 
     LoadedProgram program;
@@ -6765,12 +6771,12 @@ TEST(serve_loader, websocket_guard_text_policies_reach_wire) {
         write_file("/tmp/rut_ws_guard_text",
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
-                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                   " guard frame.text != \"a\" else { frame.forward(\"one\\0\\u{20ac}\") }\n"
-                   " guard frame.text != \"b\" else { frame.forward(\"\") }\n"
-                   " guard frame.text != \"c\" else { frame.forward(\"third\") }\n"
-                   " guard frame.text != \"d\" else { frame.forward(\"fourth\") }\n"
-                   " frame.forward(\"default\") } }\n");
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   " guard message.text != \"a\" else { message.forward(\"one\\0\\u{20ac}\") }\n"
+                   " guard message.text != \"b\" else { message.forward(\"\") }\n"
+                   " guard message.text != \"c\" else { message.forward(\"third\") }\n"
+                   " guard message.text != \"d\" else { message.forward(\"fourth\") }\n"
+                   " message.forward(\"default\") } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -6836,12 +6842,12 @@ TEST(serve_loader, websocket_mixed_guard_text_and_close_policies) {
         write_file("/tmp/rut_ws_guard_text_mixed",
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
-                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                   "guard !frame.text.hasPrefix(\"a\") else { frame.forward(\"first\") }\n"
-                   "guard frame.text != \"b\" else { frame.close(1008, \"blocked\") }\n"
-                   "guard frame.text != \"aa\" else { frame.forward(\"unreachable\") }\n"
-                   "guard frame.text != \"c\" else { frame.forward() }\n"
-                   "frame.forward(\"default\") } }\n");
+                   "route GET \"/ws\" { return websocket(backend) { message in\n"
+                   "guard !message.text.hasPrefix(\"a\") else { message.forward(\"first\") }\n"
+                   "guard message.text != \"b\" else { message.close(1008, \"blocked\") }\n"
+                   "guard message.text != \"aa\" else { message.forward(\"unreachable\") }\n"
+                   "guard message.text != \"c\" else { message.forward() }\n"
+                   "message.forward(\"default\") } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));

@@ -277,9 +277,9 @@ bool load_rut_program(const char* path,
     if (!cg.ok) return false;
 
 #if RUT_ENABLE_WEBSOCKET
-    // Emit a frame handler into the SAME module for each terminate route, before compile() takes
+    // Emit a message handler into the SAME module for each terminate route, before compile() takes
     // ownership of cg.mod. Symbols ws_handler_<n>, dense in HIR order. Each handler checks its
-    // frame.len guards then returns the default verdict.
+    // message.len guards then returns the default verdict.
     {
         u32 ws_n = 0;
         for (u32 i = 0; i < ir.hir->routes.len; i++) {
@@ -348,7 +348,7 @@ bool load_rut_program(const char* path,
 
 #if RUT_ENABLE_WEBSOCKET
     // Register each terminate route: look up its compiled verdict fn and publish a proxy +
-    // frame-handler route. The `maxMessageSize:` kwarg sets the cap when given; otherwise it
+    // message-handler route. The `maxMessageSize:` kwarg sets the cap when given; otherwise it
     // defaults to the engine's single-slice cap. The runtime arm-time clamps either way.
     {
         constexpr u32 kWsDefaultMaxMessageSize = kWsTerminateMessageCapacity;

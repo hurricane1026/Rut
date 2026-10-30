@@ -684,7 +684,7 @@ struct ConnectionBase {
     const WsClosePolicy* ws_close_policies = nullptr;
     u32 ws_close_policy_count = 0;
     Str ws_echo_close_reason{};
-    u16 ws_close_code;       // route's frame.close(code) status (seeds both inspectors)
+    u16 ws_close_code;       // route's message.close(code) status (seeds both inspectors)
     u16 ws_echo_close_code;  // code for the echo Close (set from the inspector on close)
     WsInspector ws_c2u;      // client->upstream inspection state (masked)
     WsInspector ws_u2c;      // upstream->client inspection state (unmasked)

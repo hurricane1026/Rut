@@ -818,7 +818,7 @@ TEST(ws_terminate, handler_close_emits_close_and_stops) {
     CHECK_EQ(st.echo_close_code, 1000u);
 }
 
-// frame.close(code): the handler's configured close_code is put on the wire — both the
+// message.close(code): the handler's configured close_code is put on the wire — both the
 // forward Close (emitted here) and the echo code the caller reads back for the other peer.
 TEST(ws_terminate, handler_close_reason_and_echo_serialize_both_roles) {
     char reason[kWsMaxCloseReasonBytes];
@@ -1009,7 +1009,7 @@ TEST(ws_terminate, branch_close_reason_waits_for_prior_output_drain) {
 
 TEST(ws_terminate, handler_close_emits_configured_code) {
     WsInspector st = make_state(false);
-    st.close_code = 1008;  // Policy Violation — what frame.close(1008) lowers to
+    st.close_code = 1008;  // Policy Violation — what message.close(1008) lowers to
     Recorder r;
     r.close_now = true;
     u8 in[64];
@@ -1078,7 +1078,7 @@ TEST(ws_terminate, handler_close_tiny_message_keeps_code_when_room) {
 }
 
 // A peer-sent Close leaves the echo at 1000 (unchanged) even when the route configured a
-// different frame.close(code) — the peer's own code is relayed verbatim on the forward leg.
+// different message.close(code) — the peer's own code is relayed verbatim on the forward leg.
 TEST(ws_terminate, peer_close_echo_stays_1000) {
     WsInspector st = make_state(false);
     st.close_code = 1008;

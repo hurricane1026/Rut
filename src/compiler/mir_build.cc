@@ -1375,7 +1375,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
     bool invalid_redirect_policy = false;
     for (u32 i = 0; i < module.routes.len; i++) {
 #if RUT_ENABLE_WEBSOCKET
-        // WebSocket terminate-mode frame handlers don't go through the HTTP MIR/RIR pipeline —
+        // WebSocket terminate-mode message handlers don't go through the HTTP MIR/RIR pipeline —
         // a constant verdict needs no request parsing / response building / state machine. The
         // serve loader emits them directly (jit::emit_ws_handler) and registers them via
         // RouteConfig::add_ws_terminate. Skip them here so the HTTP routes still build.

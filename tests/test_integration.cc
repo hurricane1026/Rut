@@ -1466,7 +1466,7 @@ TEST(timer_dsl, rejects_websocket_terminate_in_body) {
     using namespace rut;
     const char* src =
         "upstream ws at \"10.0.0.1:8080\"\n"
-        "timer t, every: 1s { return websocket(ws) { frame in frame.forward() } }\n";
+        "timer t, every: 1s { return websocket(ws) { message in message.forward() } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());

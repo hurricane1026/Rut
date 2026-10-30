@@ -26,10 +26,10 @@ inline constexpr u32 kWsTerminateMessageCapacity = SlicePool::kSliceSize - kWsMa
 bool ws_valid_text_payload(Str text);
 bool ws_valid_close_reason(Str reason);
 
-// RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close frame.
+// RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close message.
 // Accepts 1000–1003, 1007–1014, and 3000–4999; rejects the unassigned ranges (<1000,
 // 1016–2999, >4999) and the local-only/reserved codes (1004/1005/1006/1015). Single source
-// of truth shared by the receive-side validator (ws_inspect), the `frame.close(code)` analyze
+// of truth shared by the receive-side validator (ws_inspect), the `message.close(code)` analyze
 // check, and the add_ws_terminate registration guard, so all three agree on what is sendable.
 constexpr bool ws_valid_close_code(u32 code) {
     return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
@@ -72,7 +72,7 @@ bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size);
 // reassembled, unmasked message of `len` bytes. ForwardText selects a route-owned
 // text recipe; the input view remains read-only. `from_client` is the leg the message
 // travels on: true for client->upstream, false for upstream->client — so one handler can police a
-// single direction (`frame.fromClient`). Returns the action.
+// single direction (`message.fromClient`). Returns the action.
 using WsMessageHandlerFn =
     WsFrameAction (*)(void* ctx, WsOpcode opcode, const u8* payload, u64 len, bool from_client);
 
@@ -92,7 +92,7 @@ enum class WsInspectStatus : u8 {
 // negotiate one — otherwise valid compressed frames carry RSV1 and are failed here.
 struct WsInspector {
     bool masked = false;  // this direction's frames are masked (client->upstream)
-    // The leg this inspector handles, passed to the handler as `frame.fromClient`. Kept
+    // The leg this inspector handles, passed to the handler as `message.fromClient`. Kept
     // separate from `masked` on purpose: today client->upstream is both masked AND the
     // client leg, but masking is a wire-format property and direction is a routing one —
     // conflating them would break the day they diverge. The caller sets it at arm time.
@@ -104,7 +104,7 @@ struct WsInspector {
     u32 forward_text_count = 0;
     u64 mask_rng = 0;          // Reserved for compatibility; masking keys use RAND_bytes.
     u64 max_message_size = 0;  // 0 = unbounded
-    // `frame.close(code)` support. close_code (INPUT) is the RFC 6455 status the handler's
+    // `message.close(code)` support. close_code (INPUT) is the RFC 6455 status the handler's
     // Close verdict should put on the wire — set by the caller from the route config (1000 =
     // Normal Closure default). echo_close_code (OUTPUT) is written by ws_inspect whenever it
     // returns Close: the code the OPPOSITE leg's echo Close should carry. For a handler Close
@@ -134,7 +134,7 @@ struct WsInspector {
     }
 };
 
-// Process every COMPLETE frame in `in[0..in_len)`:
+// Process every COMPLETE message in `in[0..in_len)`:
 //   - data frames: unmask, accumulate into `msg_buf[0..msg_cap)`, and on message
 //     completion invoke `handler`; on Forward, re-serialize the message into
 //     `out[0..out_cap)`; on Drop, emit nothing; on Close, emit a Close frame and stop.

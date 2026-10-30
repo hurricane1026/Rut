@@ -1189,7 +1189,7 @@ at compile time. This prevents a buggy handler from stalling a shard.
 - **`break` / `continue` allowed** — Swift-identical loop control. They only
   shorten iteration, so the compile-time execution bound is unaffected.
 - **No recursion** — all functions inline at compile time. A function calling itself is a compile error.
-- **No closures** — no first-class functions, no callbacks. Keyword-specific trailing blocks (e.g., `websocket { frame in }`) borrow Swift's trailing-closure surface but are compile-time constructs, not runtime closures.
+- **No closures** — no first-class functions, no callbacks. Keyword-specific trailing blocks (e.g., `websocket { message in }`) borrow Swift's trailing-closure surface but are compile-time constructs, not runtime closures.
 
 ```swift
 // var — handler-local mutable variable
@@ -2572,7 +2572,7 @@ post /api/orders {
 
 #### 3.4.8 WebSocket Proxying
 
-The `frame.close(code, "reason")` verdict, final or in a guard else-branch, sends a fixed reason to both
+The `message.close(code, "reason")` verdict, final or in a guard else-branch, sends a fixed reason to both
 peers during the handler-initiated close handshake. The code follows the existing
 RFC 6455 validation; the reason must be a string literal containing valid UTF-8,
 at most 123 decoded bytes. Empty reasons and embedded NUL are allowed. Reasons
@@ -2587,15 +2587,14 @@ receives the existing normal-closure echo without the configured reason.
 The echo uses its direction's idle output slice, retained until send completion;
 no extra slices or enlarged inline close-frame buffers are needed.
 
-Current terminate handlers support `guard` conditions over `frame.fromClient`,
-`frame.isText`, `frame.isBinary`, `frame.opcode == .text` / `!= .binary`
-(with either operand order), `frame.len` comparisons, and
-`frame.text.matches(re"…")`, `frame.text == "literal"` (or `!=`, with the
-literal on either side), `frame.text.isEmpty`, `frame.text.hasPrefix("literal")`,
-`frame.text.hasSuffix("literal")`, and `frame.text.contains("literal")`.
+Current terminate handlers support `guard` conditions over `message.fromClient`,
+`message.isText`, `message.isBinary`, `message.len` comparisons, and
+`message.text.matches(re"…")`, `message.text == "literal"` (or `!=`, with the
+literal on either side), `message.text.isEmpty`, `message.text.hasPrefix("literal")`,
+`message.text.hasSuffix("literal")`, and `message.text.contains("literal")`.
 Literal predicates compare exact payload bytes and use the ordinary string-literal escape decoder; empty literals
 and embedded NUL bytes are supported. Like `text.matches`, these predicates do
-not implicitly filter the opcode: combine them with `frame.isText` when needed.
+not implicitly filter the opcode: combine them with `message.isText` when needed.
 `isEmpty` tests the reassembled byte length without reading the payload.
 Prefix/suffix predicates accept one string literal, compare only the selected byte
 range, and match empty literals on every message. Short messages fail before any
@@ -2603,28 +2602,19 @@ payload access. `contains` searches for a contiguous byte substring, including
 embedded NUL; an empty substring matches every message. It does not interpret
 regex metacharacters or normalize Unicode. Dynamic arguments and interpolation
 remain unsupported.
-`frame.opcode` comparisons accept only the payload-free enum cases `.text` and
-`.binary`, because handlers receive complete data messages. Control cases such as
-`.ping`, numeric/string operands, payload-bearing cases, and ordered comparisons
-are rejected. Equality and inequality reuse the existing opcode condition node;
-this adds no runtime state or ABI changes. Negation and compound conditions retain
-the same precedence and short-circuit rules as the other predicates.
-Conditions compose with `&&`, `||`, `!`, and parentheses;
-`!` binds tighter than comparisons, `&&` tighter than `||`, with left-to-right
-short-circuit evaluation. Length comparisons accept `<`, `>`, `==`, `<=`, `>=`,
-and `!=` against an integer literal on either side. A handler accepts up to four
-source guards and 32 condition nodes across their trees (leaf predicates and
-binary operators); nesting is bounded as well. The first failing guard executes
-its else verdict; otherwise the final verdict runs. For example:
+The DSL exposes complete Text/Binary messages. Wire opcodes, FIN, masking,
+continuation frames and Ping/Pong/Close frames are runtime-internal details.
+The legacy `frame` binding and `.opcode` access are rejected; message type
+selection uses `message.isText` / `message.isBinary`.
 
 ```swift
 upstream chat at "127.0.0.1:9000"
 route GET "/chat" {
-    return websocket(chat) { frame in
-        guard !frame.fromClient || !frame.isText || !frame.text.matches(re".*spam.*") else {
-            frame.drop()
+    return websocket(chat) { message in
+        guard !message.fromClient || !message.isText || !message.text.matches(re".*spam.*") else {
+            message.drop()
         }
-        frame.forward()
+        message.forward()
     }
 }
 ```
@@ -2634,24 +2624,24 @@ without scanning their payloads. Regex `matches` tests the whole message, so the
 explicit `.*` enables substring filtering here. Control frames are relayed without
 invoking the handler.
 
-Fixed text replacement is implemented as `frame.forward("replacement")` in the
+Fixed text replacement is implemented as `message.forward("replacement")` in the
 handler's final verdict or a guard else-branch. It replaces the selected Text or
 Binary message with a Text message, including an empty string. Each of the up to
 four guards may select an independent literal; the first failing guard wins. Bare
-`frame.forward()` retains the original message even when the final verdict has a
+`message.forward()` retains the original message even when the final verdict has a
 replacement. Close policies and text replacements use independent route tables.
 Control frames retain their existing relay behavior.
 A fixed replacement uses ordinary string escape decoding and must fit both
 `maxMessageSize` and the single-slice terminate cap. Bounded text concatenation is
-also supported: `frame.forward("prefix" + frame.text + "suffix")`, including either
-affix alone or an identity `frame.text`. Route-local `let` strings whose values
+also supported: `message.forward("prefix" + message.text + "suffix")`, including either
+affix alone or an identity `message.text`. Route-local `let` strings whose values
 are known at compile time, including aliases of such strings, may supply fixed
 replacements or affix leaves. Their decoded bytes are copied into the same
 route-owned recipe as literals; request-derived, optional, and non-string values
 are rejected. Calls remain unsupported. Constant strings obey the same UTF-8,
 combined fixed-byte limit, and expression-node limits as literal leaves. The
 expression contains at most 32 nodes (literals or constant references, `+`, and at
-most one `frame.text`); parentheses preserve concatenation order.
+most one `message.text`); parentheses preserve concatenation order.
 Constant fragments are folded into immutable prefix/suffix views. Other fields,
 functions, repeated payload references, interpolation, binary replacement, and
 injection remain unsupported. Affix recipes require a Text message; selecting one
@@ -2677,7 +2667,7 @@ terminate implementation supports bounded reassembled text/binary messages,
 forward/drop/close verdicts, fixed literal text replacement, and relays control frames; dynamic modification, injection,
 extension negotiation, and the options shown below are not all implemented.
 
-Transparent WebSocket proxy with optional per-frame inspection and modification.
+Transparent WebSocket proxy with optional per-message inspection and modification.
 Ping/pong handled automatically by runtime (RFC 6455).
 
 **Basic — transparent proxy:**
@@ -2697,65 +2687,33 @@ get /ws/graphql {
     guard req.upgrade == .websocket else { return 400 }
     return websocket(graphqlService,
         subprotocol: "graphql-ws",     // Sec-WebSocket-Protocol negotiation
-        maxMessageSize: 1mb             // reject frames larger than this
+        maxMessageSize: 1mb             // reject complete messages larger than this
     )
 }
 ```
 
-**Frame inspection and modification:**
+**Message inspection and modification:**
 
-The trailing block runs per frame and declares its parameter explicitly,
-Swift-trailing-closure style: `{ frame in ... }`. It is compiled into the
-route's state machine — not a runtime closure.
+The trailing block uses `{ message in ... }` and runs once for each complete
+reassembled Text/Binary message. Its length is the complete payload byte count,
+and `fromClient` identifies the sender. Fragmentation and control frames are
+handled by the runtime; application policies do not observe wire frame boundaries.
 
 ```swift
-get /ws/events {
-    guard req.upgrade == .websocket else { return 400 }
-    websocket(eventService, maxMessageSize: 64kb) { frame in
-        // --- frame properties ---
-        // frame.isText       bool
-        // frame.isBinary     bool
-        // frame.isPing       bool
-        // frame.isPong       bool
-        // frame.text         string (for text frames)
-        // frame.bytes        [u8] (for binary frames)
-        // frame.direction    .client or .upstream
-
-        // --- actions ---
-        // return .forward                   pass through unchanged
-        // return .drop                      silently discard this frame
-        // return .close(reason: "...")       close the connection
-        // return .send("modified text")     replace content, then forward
-        // return .sendBytes(bytes)          replace with binary, then forward
-        // return .inject("extra message")   forward original + inject extra frame
-
-        // Example: filter profanity from client messages
-        if frame.direction == .client && frame.isText {
-            guard !frame.text.matches(re"(?i)badword|profanity") else {
-                return .drop
-            }
-        }
-
-        // Example: inject metadata into upstream messages
-        if frame.direction == .upstream && frame.isText {
-            return .send("\(frame.text)\n<!-- gateway: \(now()) -->")
-        }
-
-        return .forward
+return websocket(eventService, maxMessageSize: 4kb) { message in
+    guard message.len <= 2048 else { message.close(1009, "message too large") }
+    guard !message.fromClient || !message.isText || message.text != "blocked" else {
+        message.drop()
     }
+    message.forward()
 }
 ```
 
-**Frame action summary:**
-
-| Action | Effect |
-|--------|--------|
-| `.forward` | Pass frame unchanged to other side |
-| `.drop` | Silently discard, other side sees nothing |
-| `.close(reason:)` | Close WebSocket connection with reason |
-| `.send(text)` | Replace frame content with text, then forward |
-| `.sendBytes(bytes)` | Replace frame content with binary, then forward |
-| `.inject(text)` | Forward original frame AND send an additional text frame |
+`forward()` forwards a complete message, `forward(text)` replaces it using a
+bounded text recipe, and `drop()` discards the complete message. `close()` is a
+connection policy action: the runtime performs the Close handshake with both
+peers. No action exposes raw control-frame construction. Text rewrite recipes
+and text predicates follow the constraints described above.
 
 **Runtime semantics (passthrough tunnel).**
 
@@ -3922,7 +3880,7 @@ removed from the language instead of documented as a variation.
 | `let` / `var` | `let x = ...` (immutable), `var x = ...` (mutable) | `var` only inside func/handler, not at top level |
 | String interpolation | `"\(req.method)\n\(req.path)"` | Cleaner than concatenation |
 | `.enumCase` | `forward(api, load_balance: .leastRequests)` | Concise enum values |
-| Trailing block | `websocket(x) { frame in ... }` | Swift trailing-closure surface; compiled to a state machine, not a closure |
+| Trailing block | `websocket(x) { message in ... }` | Swift trailing-closure surface; compiled to a state machine, not a closure |
 | No commas in blocks | Multi-line blocks don't need commas | Cleaner, less noise |
 
 ### 3.9 Complete Example

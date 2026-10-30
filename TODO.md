@@ -61,7 +61,7 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   shapes are structurally identical to a single-continuation walk; only
   exit-dominance separates them). Until then: conservative over-keep.
 - [x] WebSocket terminate trailing blocks require the explicit
-  `{ frame in ... }` binding; the legacy implicit-frame block is rejected.
+  `{ message in ... }` binding; legacy `frame` bindings and implicit blocks are rejected.
 - [x] Object literal syntax is accepted only in call-argument position and
   represented explicitly in the AST; bare/general-expression use is rejected.
   Still pending: `json()` lowering and runtime serialization.
