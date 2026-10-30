@@ -160,6 +160,8 @@ struct RouteEntry {
     u32 ws_close_policy_count = 0;
     Str ws_close_reason{};
     u16 ws_close_code = 1000;
+    Str ws_forward_texts[kWsMaxForwardTexts]{};
+    u32 ws_forward_text_count = 0;
     Str ws_forward_text{};  // immutable replacement for ForwardText verdicts
     // Nonzero only for the bounded static direct-forward timeout preflight.
     // Resolves through the same pinned RouteConfig as this RouteEntry.
@@ -1502,8 +1504,8 @@ public:
     // Add a Proxy route that TERMINATES WebSocket upgrades: on a 101 the data phase is
     // frame-inspected and each message handed to `handler` (forward/drop/close), bounded
     // by `max_message_size` (clamped to one buffer slice). Same failure modes as
-    // add_proxy() plus a null-handler / zero-size check. The C++ surface for terminate
-    // routes; the .rut compiler emits this in a later slice.
+    // add_proxy() plus handler, size, UTF-8, and bounded-table validation. Policy
+    // arrays are copied, but their text views must outlive the route configuration.
     bool add_ws_terminate(const char* path,
                           u8 method,
                           u16 upstream_id,
@@ -1513,7 +1515,9 @@ public:
                           Str forward_text = {},
                           Str close_reason = {},
                           const WsClosePolicy* close_policies = nullptr,
-                          u32 close_policy_count = 0) {
+                          u32 close_policy_count = 0,
+                          const Str* forward_texts = nullptr,
+                          u32 forward_text_count = 0) {
 #if !RUT_ENABLE_WEBSOCKET
         // The 101/tunnel path is compiled out in this build — a terminate route could
         // never enter terminate mode, so fail loud instead of publishing an unusable route.
@@ -1527,6 +1531,8 @@ public:
         (void)close_reason;
         (void)close_policies;
         (void)close_policy_count;
+        (void)forward_texts;
+        (void)forward_text_count;
         return false;
 #else
         if (handler == nullptr || max_message_size == 0 || forward_text.len > max_message_size ||
@@ -1544,6 +1550,13 @@ public:
             if (!ws_valid_close_code(close_policies[i].code) ||
                 !ws_valid_close_reason(close_policies[i].reason))
                 return false;
+        if (forward_text_count > kWsMaxForwardTexts || (forward_text_count != 0 && !forward_texts))
+            return false;
+        for (u32 i = 0; i < forward_text_count; i++)
+            if (forward_texts[i].len > max_message_size ||
+                forward_texts[i].len > kWsTerminateMessageCapacity ||
+                !ws_valid_text_payload(forward_texts[i]))
+                return false;
         if (!add_proxy(path, method, upstream_id)) return false;
         auto& r = routes[route_count - 1];
         r.ws_terminate = true;
@@ -1554,6 +1567,8 @@ public:
         r.ws_close_policy_count = close_policy_count;
         for (u32 i = 0; i < close_policy_count; i++) r.ws_close_policies[i] = close_policies[i];
         r.ws_forward_text = forward_text;
+        r.ws_forward_text_count = forward_text_count;
+        for (u32 i = 0; i < forward_text_count; i++) r.ws_forward_texts[i] = forward_texts[i];
         return true;
 #endif
     }

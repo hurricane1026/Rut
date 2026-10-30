@@ -812,3 +812,48 @@ route GET "/" {
     connection->json_arena.destroy();
     pool.destroy();
 }
+
+TEST(native_program, websocket_guard_text_policies_survive_source_removal) {
+    Source source;
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\n"
+                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                      " guard frame.text != \"a\" else { frame.forward(\"one\\0\\u{20ac}\") }\n"
+                      " guard frame.text != \"b\" else { frame.forward(\"\") }\n"
+                      " guard frame.text != \"c\" else { frame.forward(\"third\") }\n"
+                      " guard frame.text != \"d\" else { frame.forward(\"fourth\") }\n"
+                      " frame.forward(\"default\") } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+
+    REQUIRE_EQ(route.ws_forward_text_count, 4u);
+    const Str texts[] = {{"one\0\xe2\x82\xac", 7}, {}, {"third", 5}, {"fourth", 6}, {"default", 7}};
+    for (u32 i = 0; i < 5; i++) {
+        WsInspector st;
+        st.forward_text = route.ws_forward_text;
+        st.forward_texts = route.ws_forward_texts;
+        st.forward_text_count = route.ws_forward_text_count;
+        st.max_message_size = route.ws_max_message_size;
+        const u8 input[] = {0x82, 1, static_cast<u8>('a' + i)};
+        u8 out[128], msg[32];
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           sizeof(input),
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           route.ws_frame_handler,
+                           nullptr,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, sizeof(input));
+        REQUIRE_EQ(produced, 2u + texts[i].len);
+        CHECK_EQ(out[0], 0x81u);
+        if (texts[i].len) CHECK(memcmp(out + 2, texts[i].ptr, texts[i].len) == 0);
+    }
+}

@@ -667,8 +667,19 @@ struct ConnectionBase {
     bool is_ws_terminate;           // active: 101 seen + inspection buffers acquired
     WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
-    Str ws_forward_text{};          // route-owned replacement view, pinned with the route config
-    Str ws_close_reason{};          // pinned route-owned close reason
+    const Str* ws_forward_texts = nullptr;
+    u32 ws_forward_text_count = 0;
+    Str ws_forward_text{};  // route-owned replacement view, pinned with the route config
+    bool ws_has_nonempty_rewrite() const {
+        if (ws_forward_text.len != 0) return true;
+        if (ws_forward_text_count > kWsMaxForwardTexts ||
+            (ws_forward_text_count != 0 && !ws_forward_texts))
+            return true;
+        for (u32 i = 0; i < ws_forward_text_count; i++)
+            if (ws_forward_texts[i].len != 0) return true;
+        return false;
+    }
+    Str ws_close_reason{};  // pinned route-owned close reason
     const WsClosePolicy* ws_close_policies = nullptr;
     u32 ws_close_policy_count = 0;
     Str ws_echo_close_reason{};
@@ -2043,6 +2054,8 @@ struct ConnectionBase {
         ws_echo_close_reason = {};
         ws_close_code = 1000;
         ws_forward_text = {};
+        ws_forward_texts = nullptr;
+        ws_forward_text_count = 0;
         ws_echo_close_code = 1000;
         ws_c2u.reset();
         ws_u2c.reset();

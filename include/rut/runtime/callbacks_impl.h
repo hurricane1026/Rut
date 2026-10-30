@@ -3002,6 +3002,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_close_policies = ws_term ? route->ws_close_policies : nullptr;
     conn.ws_close_policy_count = ws_term ? route->ws_close_policy_count : 0;
     conn.ws_forward_text = ws_term ? route->ws_forward_text : Str{};
+    conn.ws_forward_texts = ws_term ? route->ws_forward_texts : nullptr;
+    conn.ws_forward_text_count = ws_term ? route->ws_forward_text_count : 0;
 #endif
 
     if (route && route->action == RouteAction::Proxy) {
@@ -10758,6 +10760,8 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_c2u.from_client = true;  // this leg is the client→upstream direction
         conn.ws_c2u.max_message_size = cap;
         conn.ws_c2u.forward_text = conn.ws_forward_text;
+        conn.ws_c2u.forward_texts = conn.ws_forward_texts;
+        conn.ws_c2u.forward_text_count = conn.ws_forward_text_count;
         conn.ws_c2u.close_code = conn.ws_close_code;  // frame.close(code) status for this route
         conn.ws_c2u.close_reason = conn.ws_close_reason;
         conn.ws_c2u.close_policies = conn.ws_close_policies;
@@ -10768,6 +10772,8 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_u2c.from_client = false;  // this leg is the upstream→client direction
         conn.ws_u2c.max_message_size = cap;
         conn.ws_u2c.forward_text = conn.ws_forward_text;
+        conn.ws_u2c.forward_texts = conn.ws_forward_texts;
+        conn.ws_u2c.forward_text_count = conn.ws_forward_text_count;
         conn.ws_u2c.close_code = conn.ws_close_code;
         conn.ws_u2c.close_reason = conn.ws_close_reason;
         conn.ws_u2c.close_policies = conn.ws_close_policies;

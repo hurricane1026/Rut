@@ -6590,3 +6590,95 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_guard_text_policies_reach_wire) {
+    const auto path =
+        write_file("/tmp/rut_ws_guard_text",
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                   " guard frame.text != \"a\" else { frame.forward(\"one\\0\\u{20ac}\") }\n"
+                   " guard frame.text != \"b\" else { frame.forward(\"\") }\n"
+                   " guard frame.text != \"c\" else { frame.forward(\"third\") }\n"
+                   " guard frame.text != \"d\" else { frame.forward(\"fourth\") }\n"
+                   " frame.forward(\"default\") } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+
+    REQUIRE_EQ(route.ws_forward_text_count, 4u);
+    const Str texts[] = {{"one\0\xe2\x82\xac", 7}, {}, {"third", 5}, {"fourth", 6}, {"default", 7}};
+    for (u32 i = 0; i < 5; i++) {
+        WsInspector st;
+        st.forward_text = route.ws_forward_text;
+        st.forward_texts = route.ws_forward_texts;
+        st.forward_text_count = route.ws_forward_text_count;
+        st.max_message_size = route.ws_max_message_size;
+        const u8 input[] = {0x82, 1, static_cast<u8>('a' + i)};
+        u8 out[128], msg[32];
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           sizeof(input),
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           route.ws_frame_handler,
+                           nullptr,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, sizeof(input));
+        REQUIRE_EQ(produced, 2u + texts[i].len);
+        CHECK_EQ(out[0], 0x81u);
+        if (texts[i].len) CHECK(memcmp(out + 2, texts[i].ptr, texts[i].len) == 0);
+    }
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7f000001, 9999);
+    REQUIRE(id.has_value());
+    const char bad[] = {static_cast<char>(0xff)};
+    for (Str text : {Str{bad, 1}, Str{nullptr, 1}, Str{"large", 5}}) {
+        CHECK_FALSE(cfg.add_ws_terminate(
+            "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, nullptr, 0, &text, 1));
+    }
+    CHECK_FALSE(cfg.add_ws_terminate(
+        "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, nullptr, 0, nullptr, 1));
+    CHECK_FALSE(cfg.add_ws_terminate(
+        "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, nullptr, 0, texts, 5));
+    CHECK_EQ(cfg.route_count, 0u);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_mixed_guard_text_and_close_policies) {
+    const auto path =
+        write_file("/tmp/rut_ws_guard_text_mixed",
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                   "guard !frame.text.hasPrefix(\"a\") else { frame.forward(\"first\") }\n"
+                   "guard frame.text != \"b\" else { frame.close(1008, \"blocked\") }\n"
+                   "guard frame.text != \"aa\" else { frame.forward(\"unreachable\") }\n"
+                   "guard frame.text != \"c\" else { frame.forward() }\n"
+                   "frame.forward(\"default\") } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    REQUIRE_EQ(route.ws_forward_text_count, 2u);
+    REQUIRE_EQ(route.ws_close_policy_count, 1u);
+    const auto handler = route.ws_frame_handler;
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("aa"), 2, true) ==
+          WsFrameAction::ForwardTextPolicy0);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("b"), 1, true) ==
+          WsFrameAction::ClosePolicy0);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("c"), 1, true) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("d"), 1, true) ==
+          WsFrameAction::ForwardText);
+    program.destroy();
+}
+
+#endif

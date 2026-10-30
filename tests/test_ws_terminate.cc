@@ -919,7 +919,7 @@ TEST(ws_terminate, invalid_branch_close_policy_fails_without_output) {
             policies[0].code = 1008;
             policies[0].reason = {nullptr, 1};
         }
-        if (invalid == 5) r.verdict = static_cast<WsFrameAction>(8);
+        if (invalid == 5) r.verdict = static_cast<WsFrameAction>(12);
         const u8 msg[] = {'x'};
         u8 in[16], out[256], mbuf[64];
         const u32 n = build(in, WsOpcode::Text, true, false, msg, 1);
@@ -1275,4 +1275,97 @@ TEST(ws_terminate, output_capacity_exceeded_errors) {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(ws_terminate, branch_text_policies_select_independent_payloads) {
+    const Str texts[] = {{"", 0}, {"one\0two", 7}, {"\xe2\x82\xac", 3}, {"fourth", 6}};
+    for (bool masked : kMaskDirections) {
+        for (u32 i = 0; i < kWsMaxForwardTexts; i++) {
+            auto st = make_state(masked);
+            st.forward_text = {"default", 7};
+            st.forward_texts = texts;
+            st.forward_text_count = kWsMaxForwardTexts;
+            Recorder r;
+            r.verdict = static_cast<WsFrameAction>(8 + i);
+            const u8 data[] = {'x'};
+            u8 in[32], out[128], msg[32], payload[64];
+            const u32 n = build(in, WsOpcode::Binary, true, masked, data, 1);
+            u32 used = 0, produced = 0;
+            REQUIRE(
+                ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+            CHECK_EQ(used, n);
+            WsFrameHeader h;
+            REQUIRE_EQ(parse_one(out, produced, masked, &h, payload), produced);
+            CHECK(h.opcode == WsOpcode::Text);
+            CHECK_EQ(h.payload_len, texts[i].len);
+            if (texts[i].len) CHECK(memcmp(payload, texts[i].ptr, texts[i].len) == 0);
+        }
+    }
+}
+
+TEST(ws_terminate, invalid_branch_text_policy_fails_without_output) {
+    const char bad[] = {static_cast<char>(0xff)};
+    for (u32 invalid = 0; invalid < 7; invalid++) {
+        Str texts[] = {{"replacement", 11}};
+        auto st = make_state(false);
+        st.forward_texts = texts;
+        st.forward_text_count = 1;
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardTextPolicy0;
+        u32 capacity = 128;
+        if (invalid == 0) r.verdict = WsFrameAction::ForwardTextPolicy1;
+        if (invalid == 1) st.forward_texts = nullptr;
+        if (invalid == 2) st.forward_text_count = kWsMaxForwardTexts + 1;
+        if (invalid == 3) texts[0] = {bad, 1};
+        if (invalid == 4) texts[0] = {nullptr, 1};
+        if (invalid == 5) st.max_message_size = 4;
+        if (invalid == 6) capacity = 4;
+        const u8 data[] = {'x'};
+        u8 in[32], out[128], msg[32];
+        const u32 n = build(in, WsOpcode::Text, true, false, data, 1);
+        u32 used = 0, produced = 0;
+        CHECK(
+            ws_inspect(st, in, n, out, capacity, msg, sizeof(msg), record, &r, &used, &produced) ==
+            WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
+    }
+}
+
+TEST(ws_terminate, branch_text_waits_for_prior_output_drain) {
+    auto st = make_state(false);
+    char replacement[80];
+    memset(replacement, 'r', sizeof(replacement));
+    const Str texts[] = {{replacement, sizeof(replacement)}};
+    st.forward_texts = texts;
+    st.forward_text_count = 1;
+    auto handler = +[](void*, WsOpcode, const u8* p, u64, bool) {
+        return p[0] == 'b' ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::Forward;
+    };
+    const u8 a[] = {'a'}, b[] = {'b'};
+    u8 in[32], out[82], msg[32];
+    const u32 first = build(in, WsOpcode::Text, true, false, a, 1);
+    const u32 n = first + build(in + first, WsOpcode::Text, true, false, b, 1);
+    u32 used = 0, produced = 0;
+    REQUIRE(
+        ws_inspect(
+            st, in, n, out, sizeof(out), msg, sizeof(msg), handler, nullptr, &used, &produced) ==
+        WsInspectStatus::Ok);
+    CHECK_EQ(used, first);
+    CHECK_EQ(produced, 3u);
+    REQUIRE(ws_inspect(st,
+                       in + first,
+                       n - first,
+                       out,
+                       sizeof(out),
+                       msg,
+                       sizeof(msg),
+                       handler,
+                       nullptr,
+                       &used,
+                       &produced) == WsInspectStatus::Ok);
+    CHECK_EQ(used, n - first);
+    CHECK_EQ(produced, 82u);
+    CHECK(memcmp(out + 2, replacement, sizeof(replacement)) == 0);
 }

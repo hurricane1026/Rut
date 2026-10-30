@@ -2557,7 +2557,7 @@ peers during the handler-initiated close handshake. The code follows the existin
 RFC 6455 validation; the reason must be a string literal containing valid UTF-8,
 at most 123 decoded bytes. Empty reasons and embedded NUL are allowed. Reasons
 are immutable route-owned views retained by the loaded program and relocated in
-native artifacts (format version 9). Each argument-bearing guard close selects
+native artifacts. Each argument-bearing guard close selects
 its own immutable policy, up to the existing four-guard limit. `close(code)` has
 an empty reason, even when a default close has a reason. Bare `close()` preserves
 its existing use of the route's default code/reason. Guard policies are indexed
@@ -2608,10 +2608,12 @@ explicit `.*` enables substring filtering here. Control frames are relayed witho
 invoking the handler.
 
 Fixed text replacement is implemented as `frame.forward("replacement")` in the
-handler's final verdict. It replaces any accepted Text or Binary message with a
-Text message, including an empty string; guard verdicts still forward the original,
-drop, or close before replacement is selected. Control frames retain their existing
-relay behavior. Use direction/opcode guards to choose which messages are rewritten.
+handler's final verdict or a guard else-branch. It replaces the selected Text or
+Binary message with a Text message, including an empty string. Each of the up to
+four guards may select an independent literal; the first failing guard wins. Bare
+`frame.forward()` retains the original message even when the final verdict has a
+replacement. Close policies and text replacements use independent route tables.
+Control frames retain their existing relay behavior.
 The replacement must be a string literal, uses ordinary string escape decoding,
 and must fit both `maxMessageSize` and the single-slice terminate cap. Dynamic
 expressions, interpolation, binary replacement, and injection remain unsupported.
@@ -2619,11 +2621,11 @@ expressions, interpolation, binary replacement, and injection remain unsupported
 The runtime reassembles and validates the original message before invoking the
 handler, writes replacement frames to the existing separate output slice, and
 pauses input while output drains. Both directions apply their normal WebSocket
-masking roles. Fixed nonempty rewrites use the existing bounded one-shot upstream
+masking roles. Default and branch nonempty rewrites use the existing bounded one-shot upstream
 receive on io_uring, so multiple CQEs cannot overflow receive storage before the
 inspection callback drains it. Literal bytes are copied into the loaded program's retained arena;
 native artifacts relocate that view, so neither mode retains temporary HIR views.
-The native artifact format version is 9 following the guard close-policy route layout change.
+The native artifact format version is 10 following the guard text-replacement route layout change.
 
 The examples in this section include planned syntax and actions. The current
 terminate implementation supports bounded reassembled text/binary messages,

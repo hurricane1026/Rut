@@ -846,12 +846,19 @@ return websocket(chat) { frame in
     frame.forward()
 }
 
-// Fixed text replacement (final verdict only). An empty literal emits an empty
-// Text message; binary input becomes Text. The literal must fit maxMessageSize
+// Fixed text replacement in the final verdict or a guard branch. Empty literals
+// emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
 // and the single-slice cap. Dynamic expressions/interpolation remain unsupported.
 return websocket(chat, maxMessageSize: 4kb) { frame in
     guard frame.fromClient && frame.isText else { frame.forward() }
     frame.forward("message replaced")
+}
+
+// Each guard may choose its own replacement; the first failing guard wins.
+return websocket(chat) { frame in
+    guard frame.text != "ping" else { frame.forward("pong") }
+    guard frame.text != "hello" else { frame.forward("welcome") }
+    frame.forward()
 }
 
 // Guard branches can choose independent close codes and fixed UTF-8 reasons.
