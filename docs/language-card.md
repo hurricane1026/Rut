@@ -1246,6 +1246,10 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   verifies a custom header key. Do not replace uniqueHeader with first-field reads.
 - `auth.basic(authorization, credentials, consumerId, credentialId)` takes configured
   `user:password` bytes; password may contain colons or be explicitly empty.
+- `auth.rotatingBasic(authorization, currentCredentials, previousCredentials, consumerId, currentId, previousId)`
+  checks both configured `user:password` slots. Empty slots are disabled; both
+  IDs must be nonempty. Current wins a tie; removing the previous slot revokes it.
+  Invalid credentials receive a Basic challenge; invalid configuration returns 503.
 - `auth.rotatingApiKey(authorization, currentKey, previousKey, consumerId, currentId, previousId)`
   supports two credential slots. Empty keys disable slots; both IDs must be nonempty.
   Current wins if both keys match. Clear the old key and activate new configuration

@@ -33,6 +33,12 @@ whether a competing open-source edition includes them.
 | Casbin / Wolf RBAC | Pending | Named access model, trusted identity/policy mapping, policy update semantics and deny/error behavior |
 | Shared identity / sessions | Pending | Session lifecycle, fixation/CSRF defenses, rotation/revocation, shard ownership and explicit cross-node consistency |
 
+`auth.rotatingBasic` provides a static current/previous Basic credential window
+for one configured Consumer. Both slots are evaluated, current wins a tie, and
+removing the previous credential revokes it. Empty slots are disabled; empty
+metadata or two disabled slots are configuration errors. Authentication still
+uses singleton Authorization headers and rejects malformed or duplicate fields.
+
 ## Audit of executable gaps
 
 The 2026-10-27 audit separates these layers:

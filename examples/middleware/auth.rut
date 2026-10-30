@@ -78,6 +78,22 @@ func basic(_ authorization: str, _ credentials: str, _ consumerId: str, _ creden
     Identity(consumerId: consumerId, credentialId: credentialId, method: "basic")
 }
 
+// Both Basic credential slots are checked; removing the previous slot revokes it.
+func rotatingBasic(_ authorization: str, _ currentCredentials: str, _ previousCredentials: str,
+                   _ consumerId: str, _ currentId: str, _ previousId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Basic realm=\"rut\"")
+    guard consumerId != "" && currentId != "" && previousId != "" else { respond 503 }
+    guard currentCredentials != "" || previousCredentials != "" else { respond 503 }
+    let current = basicMatches(authorization, currentCredentials)
+    let previous = basicMatches(authorization, previousCredentials)
+    guard current || previous else { respond denied }
+    match current {
+        true => Identity(consumerId: consumerId, credentialId: currentId, method: "basic")
+        _ => Identity(consumerId: consumerId, credentialId: previousId, method: "basic")
+    }
+}
+
 // AND policy: both an opaque singleton header key and singleton Basic field
 // must verify. policyId identifies this configured pair, not a single factor.
 func headerKeyAndBasic(_ presentedKey: str, _ authorization: str, _ key: str,

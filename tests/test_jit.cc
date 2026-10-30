@@ -23072,6 +23072,31 @@ route GET "/bearer-token" {
     guard let token = bearerToken(req.authorization.or("")) else { return 401 }
     if constantTimeEqual(token, "new-key") { return 200 } else { return 401 }
 }
+route GET "/basic-rotation" {
+    let identity = auth.rotatingBasic(req.authorization.or(""), "user:new", "user:old", "customer-a", "new", "old")
+    guard identity.method == "basic" && identity.consumerId == "customer-a" else { return 500 }
+    if identity.credentialId == "new" { return 201 } else { return 202 }
+}
+route GET "/basic-revoked" {
+    let identity = auth.rotatingBasic(req.authorization.or(""), "user:new", "", "customer-a", "new", "old")
+    return 201
+}
+route GET "/basic-disabled" {
+    let identity = auth.rotatingBasic(req.authorization.or(""), "", "", "customer-a", "new", "old")
+    return 201
+}
+route GET "/basic-same" {
+    let identity = auth.rotatingBasic(req.authorization.or(""), "user:new", "user:new", "customer-a", "new", "old")
+    if identity.credentialId == "new" { return 201 } else { return 500 }
+}
+route GET "/basic-old-only" {
+    let identity = auth.rotatingBasic(req.authorization.or(""), "", "user:old", "customer-a", "new", "old")
+    if identity.credentialId == "old" { return 202 } else { return 500 }
+}
+route GET "/basic-missing-id" {
+    let identity = auth.rotatingBasic(req.authorization.or(""), "user:new", "user:old", "customer-a", "", "old")
+    return 201
+}
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23140,6 +23165,18 @@ route GET "/bearer-token" {
         {9, "Authorization: Bearer new-key,other\r\n", 401},
         {9, "Authorization: Basic new-key\r\n", 401},
         {9, "", 401},
+        {10, "Authorization: Basic dXNlcjpuZXc=\r\n", 201},
+        {10, "Authorization: Basic dXNlcjpvbGQ=\r\n", 202},
+        {10, "Authorization: Basic dXNlcjpiYWQ=\r\n", 401},
+        {10, "", 401},
+        {10, "Authorization: Basic dXNlcjpuZXc=\r\nauthorization: Basic dXNlcjpvbGQ=\r\n", 401},
+        {11, "Authorization: Basic dXNlcjpvbGQ=\r\n", 401},
+        {11, "Authorization: Basic dXNlcjpuZXc=\r\n", 201},
+        {12, "", 503},
+        {13, "Authorization: Basic dXNlcjpuZXc=\r\n", 201},
+        {14, "Authorization: Basic dXNlcjpvbGQ=\r\n", 202},
+        {14, "Authorization: Basic dXNlcjpuZXc=\r\n", 401},
+        {15, "Authorization: Basic dXNlcjpuZXc=\r\n", 503},
     };
     for (const auto& tc : cases) {
         char name[32];
