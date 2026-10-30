@@ -14243,7 +14243,8 @@ static FrontendResult<void> load_imported_modules(
             const auto& other_item = file.items[ii];
             if (other_item.kind != AstItemKind::Import || other_item.import_decl.is_system_crypto)
                 continue;
-            const auto other_normalized = resolve_file_import(base_dir, other_item.import_decl.path);
+            const auto other_normalized =
+                resolve_file_import(base_dir, other_item.import_decl.path);
             if (other_normalized != target_normalized ||
                 other_item.import_decl.has_namespace_alias != target_decl.has_namespace_alias ||
                 (other_item.import_decl.has_namespace_alias &&
@@ -14272,10 +14273,9 @@ static FrontendResult<void> load_imported_modules(
         if (item.kind != AstItemKind::Import) continue;
         const bool kSystemCrypto = item.import_decl.is_system_crypto;
         if (source_path.len == 0 && !kSystemCrypto) continue;
-        const auto normalized =
-            kSystemCrypto
-                ? str_to_std_string(kCryptoSystemPath)
-                : resolve_file_import(base_dir, item.import_decl.path);
+        const auto normalized = kSystemCrypto
+                                    ? str_to_std_string(kCryptoSystemPath)
+                                    : resolve_file_import(base_dir, item.import_decl.path);
         for (const auto& active_import : import_stack) {
             // A failed top-level analysis releases the shared imported-source
             // storage. Keep the cycle detail independent of those source views;

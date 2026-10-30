@@ -1716,7 +1716,8 @@ TEST(frontend, extensionless_import_resolves_and_coalesces_with_explicit_suffix)
     auto result = analyze_source_with_path_and_budget(
         "import \"middleware/auth\"\nimport \"middleware/auth.rut\"\n"
         "route GET \"/\" { if auth.jwtAuth() == 200 { return 200 } else { return 500 } }\n",
-        dir + "/main.rut", budget);
+        dir + "/main.rut",
+        budget);
     REQUIRE(result);
     CHECK_EQ(budget.used_bytes, sizeof(kSource) - 1u);
     delete result.value();
