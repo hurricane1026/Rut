@@ -7034,8 +7034,8 @@ static bool ws_is_frame_len(const AstExpr& e) {
 }
 
 // A bare frame verdict `frame.drop()/close()/forward()` (no args) → WsVerdict, for guard
-// else-branches. The payload/close-code forms (frame.forward(x), frame.close(code)) are
-// default-verdict only, so they are rejected here.
+// else-branches. Argument-bearing closes are handled by analyze_frame_guard_verdict;
+// payload-bearing forwards remain default-verdict only.
 static FrontendResult<WsVerdict> analyze_bare_frame_verdict(const AstExpr& call) {
     const bool is_frame = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
                           call.lhs->kind == AstExprKind::Ident && call.lhs->name.eq({"frame", 5});
@@ -7045,6 +7045,61 @@ static FrontendResult<WsVerdict> analyze_bare_frame_verdict(const AstExpr& call)
     if (call.name.eq({"drop", 4})) return WsVerdict::Drop;
     if (call.name.eq({"close", 5})) return WsVerdict::Close;
     return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+}
+
+// Share status/reason validation between default and guard-branch closes.
+static FrontendResult<HirWsClosePolicy> analyze_frame_close_policy(const AstExpr& call,
+                                                                   HirRoute& route,
+                                                                   const HirModule& mod) {
+    if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
+        !call.lhs->name.eq({"frame", 5}) || !call.name.eq({"close", 5}) || call.args.len > 2)
+        return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+    HirWsClosePolicy policy{};
+    if (call.args.len >= 1) {
+        if (!call.args[0]) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        auto code =
+            analyze_expr(*call.args[0], &route, mod, route.locals.data, route.locals.len, nullptr);
+        if (!code) return core::make_unexpected(code.error());
+        ConstValue cv{};
+        if (code->type != HirTypeKind::I32 ||
+            !const_eval_expr(code.value(), route.locals.data, route.locals.len, &cv, 0) ||
+            cv.type != HirTypeKind::I32)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
+        const i32 value = static_cast<i32>(cv.int_value);
+        if (value < 0 || !ws_valid_close_code(static_cast<u32>(value)))
+            return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
+        policy.code = static_cast<u16>(value);
+    }
+    if (call.args.len == 2) {
+        if (!call.args[1] || call.args[1]->kind != AstExprKind::StrLit)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        auto reason =
+            analyze_expr(*call.args[1], &route, mod, route.locals.data, route.locals.len, nullptr);
+        if (!reason) return core::make_unexpected(reason.error());
+        if (reason->kind != HirExprKind::StrLit || reason->type != HirTypeKind::Str ||
+            reason->str_value.len > kWsMaxCloseReasonBytes ||
+            !utf8_valid(reinterpret_cast<const u8*>(reason->str_value.ptr), reason->str_value.len))
+            return frontend_error(FrontendError::UnsupportedSyntax, call.args[1]->span);
+        if (!route.exprs.push(reason.value()))
+            return frontend_error(FrontendError::OutOfMemory, call.span);
+        policy.reason_expr = route.exprs.len - 1;
+    }
+    return policy;
+}
+
+static FrontendResult<WsVerdict> analyze_frame_guard_verdict(const AstExpr& call,
+                                                             HirRoute& route,
+                                                             const HirModule& mod) {
+    // Bare close retains its existing route-default policy. Explicit arguments
+    // select a distinct policy, including an empty reason for close(code).
+    if (call.args.len == 0) return analyze_bare_frame_verdict(call);
+    auto policy = analyze_frame_close_policy(call, route, mod);
+    if (!policy) return core::make_unexpected(policy.error());
+    auto& policies = route.ws_handler.close_policies;
+    const u32 index = policies.len;
+    if (!policies.push(policy.value()))
+        return frontend_error(FrontendError::TooManyItems, call.span);
+    return static_cast<WsVerdict>(static_cast<u8>(WsVerdict::ClosePolicy0) + index);
 }
 
 // Match a guard condition `frame.len <cmp> <int-literal>` (or its mirror `N <cmp> frame.len`),
@@ -12949,20 +13004,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
 
 #if RUT_ENABLE_WEBSOCKET
     if (stmt.kind == AstStmtKind::WsTerminate) {
-        // Terminate-mode frame handler `websocket(x) { ... }`. Resolve the upstream, then
-        // accept a single per-message verdict statement; the route carries a HirWsHandler
-        // instead of an HTTP terminator and `control` stays unused. Lowering rejects it
-        // until the frame-handler JIT path lands (Slices C–E).
+        // A bounded guard sequence followed by a final frame verdict. Argument-bearing
+        // guard closes select independent fixed policies; bare closes keep the route's
+        // default code/reason. Payload-bearing forward remains a final verdict only.
         auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
         if (!upstream_index) return core::make_unexpected(upstream_index.error());
-        // The body is either a single verdict Expr statement, or a Block of
-        // `guard frame.len <cmp> N else { <verdict> }` statements followed by a final (default)
-        // verdict Expr:
-        //   frame.forward()        forward unchanged      frame.drop()  drop the message
-        //   frame.forward(payload) rewrite a Str payload  frame.close() / (code)  close
-        // (`forward` is the proxy-terminator keyword, but the parser accepts it as a method name
-        // after `.`.) Guard else-verdicts are bare frame.drop()/close()/forward(); richer frame
-        // accessors and conditions are follow-up slices.
         route->is_ws_terminate = true;
         route->ws_handler.upstream_index = upstream_index.value();
         route->ws_handler.max_message_size = stmt.ws_max_message_size;  // 0 = loader default
@@ -12985,7 +13031,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     gs->else_stmt->kind != AstStmtKind::Expr)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           gs ? gs->span : body->span);
-                auto gv = analyze_bare_frame_verdict(gs->else_stmt->expr);
+                auto gv = analyze_frame_guard_verdict(gs->else_stmt->expr, *route, mod);
                 if (!gv) return core::make_unexpected(gv.error());
                 auto g = analyze_frame_condition(gs->expr, gv.value(), route->ws_handler, mod);
                 if (!g) return core::make_unexpected(g.error());
@@ -13032,44 +13078,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
             route->ws_handler.default_verdict = WsVerdict::Drop;
         } else if (call.name.eq({"close", 5})) {
-            if (call.args.len > 2)  // close(), close(code), or close(code, "reason")
-                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+            auto policy = analyze_frame_close_policy(call, *route, mod);
+            if (!policy) return core::make_unexpected(policy.error());
             route->ws_handler.default_verdict = WsVerdict::Close;
-            if (call.args.len >= 1) {
-                if (call.args[0] == nullptr)
-                    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-                auto code = analyze_expr(
-                    *call.args[0], route, mod, route->locals.data, route->locals.len, nullptr);
-                if (!code) return core::make_unexpected(code.error());
-                ConstValue cv{};
-                if (code->type != HirTypeKind::I32 ||
-                    !const_eval_expr(code.value(), route->locals.data, route->locals.len, &cv, 0) ||
-                    cv.type != HirTypeKind::I32)
-                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
-                // Sendable RFC 6455 §7.4.1 close codes — the SAME predicate the runtime uses
-                // (ws_valid_close_code): 1000–1003, 1007–1014, 3000–4999; rejects the reserved
-                // 1016–2999 range and the local-only codes too. (c<0 wraps to a huge u32 →
-                // rejected.)
-                const i32 c = static_cast<i32>(cv.int_value);
-                if (c < 0 || !ws_valid_close_code(static_cast<u32>(c)))
-                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
-                route->ws_handler.close_code = static_cast<u16>(c);
-            }
-            if (call.args.len == 2) {
-                if (!call.args[1] || call.args[1]->kind != AstExprKind::StrLit)
-                    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-                auto reason = analyze_expr(
-                    *call.args[1], route, mod, route->locals.data, route->locals.len, nullptr);
-                if (!reason) return core::make_unexpected(reason.error());
-                if (reason->kind != HirExprKind::StrLit || reason->type != HirTypeKind::Str ||
-                    reason->str_value.len > kWsMaxCloseReasonBytes ||
-                    !utf8_valid(reinterpret_cast<const u8*>(reason->str_value.ptr),
-                                reason->str_value.len))
-                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[1]->span);
-                if (!route->exprs.push(reason.value()))
-                    return frontend_error(FrontendError::OutOfMemory, call.span);
-                route->ws_handler.close_reason_expr = route->exprs.len - 1;
-            }
+            route->ws_handler.close_code = policy->code;
+            route->ws_handler.close_reason_expr = policy->reason_expr;
         } else {
             return frontend_error(FrontendError::UnsupportedSyntax, call.span);
         }

@@ -5622,6 +5622,64 @@ TEST(frontend, analyze_websocket_close_reason_literal_and_byte_limit) {
     }
 }
 
+TEST(frontend, analyze_websocket_guard_close_policies) {
+    const char* source =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
+        "guard frame.fromClient else { frame.close(1008, \"one\\0\") }\n"
+        "guard frame.isText else { frame.close(1009) }\n"
+        "guard frame.len < 10 else { frame.close(1011, \"third\") }\n"
+        "guard frame.text.isEmpty else { frame.close(4001, \"fourth\") }\n"
+        "frame.close(1000, \"default\") } }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.ws_handler.close_policies.len, 4u);
+    REQUIRE_EQ(route.ws_handler.len_guards.len, 4u);
+    for (u32 i = 0; i < 4; i++)
+        CHECK_EQ(static_cast<u8>(route.ws_handler.len_guards[i].verdict), 4u + i);
+    CHECK_EQ(route.ws_handler.close_policies[0].code, 1008u);
+    CHECK_EQ(route.ws_handler.close_policies[1].code, 1009u);
+    CHECK_EQ(route.ws_handler.close_policies[1].reason_expr, 0xffffffffu);
+    REQUIRE_EQ(route.exprs[route.ws_handler.close_policies[0].reason_expr].str_value.len, 4u);
+    CHECK_EQ(route.ws_handler.close_code, 1000u);
+}
+
+TEST(frontend, analyze_websocket_guard_close_rejects_invalid_arguments) {
+    for (const char* verdict : {"frame.close(1006)",
+                                "frame.close(1008, 1)",
+                                "frame.close(frame.len)",
+                                "frame.close(1008, frame.text)",
+                                "frame.close(1008, \"\\(frame.len)\")",
+                                "frame.forward(\"text\")"}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard frame.isText "
+            "else { ";
+        source += verdict;
+        source += " }\nframe.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    for (u32 length : {123u, 124u}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard frame.isText "
+            "else { frame.close(1008, \"";
+        source.append(length, 'x');
+        source += "\") }\nframe.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())), length == 123);
+    }
+}
+
 TEST(frontend, analyze_rejects_websocket_close_reserved_code) {
     // 1006 (abnormal closure) must never be sent on the wire → rejected.
     const char* src =

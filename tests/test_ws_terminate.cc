@@ -851,7 +851,7 @@ TEST(ws_terminate, handler_close_reason_and_echo_serialize_both_roles) {
         CHECK_EQ(payload[0], 3u);
         CHECK_EQ(payload[1], 240u);
         CHECK(memcmp(payload + 2, reason, sizeof(reason)) == 0);
-        CHECK(st.echo_close_has_reason);
+        CHECK(st.echo_close_reason.eq(st.close_reason));
         u64 rng = 0;
         produced = ws_emit_close_frame(
             out, sizeof(out), !masked, rng, st.echo_close_code, st.close_reason);
@@ -859,6 +859,83 @@ TEST(ws_terminate, handler_close_reason_and_echo_serialize_both_roles) {
         REQUIRE_EQ(parse_one(out, produced, !masked, &h, payload), produced);
         CHECK_EQ(h.payload_len, 125u);
         CHECK(memcmp(payload + 2, reason, sizeof(reason)) == 0);
+    }
+}
+
+TEST(ws_terminate, branch_close_policies_select_code_reason_and_echo) {
+    const WsClosePolicy policies[] = {
+        {1008, {"policy\0one", 10}}, {1009, {}}, {1011, {"third", 5}}, {4001, {"fourth", 6}}};
+    for (bool masked : kMaskDirections) {
+        for (u32 index = 0; index < kWsMaxClosePolicies; index++) {
+            WsInspector st = make_state(masked);
+            st.close_code = 1000;
+            st.close_reason = {"default", 7};
+            st.close_policies = policies;
+            st.close_policy_count = kWsMaxClosePolicies;
+            Recorder r;
+            r.verdict =
+                static_cast<WsFrameAction>(static_cast<u8>(WsFrameAction::ClosePolicy0) + index);
+            const u8 msg[] = {'x'};
+            u8 in[16], out[256], mbuf[64], payload[128];
+            const u32 n = build(in, WsOpcode::Text, true, masked, msg, 1);
+            u32 consumed = 0, produced = 0;
+            REQUIRE(ws_inspect(st,
+                               in,
+                               n,
+                               out,
+                               sizeof(out),
+                               mbuf,
+                               sizeof(mbuf),
+                               record,
+                               &r,
+                               &consumed,
+                               &produced) == WsInspectStatus::Close);
+            WsFrameHeader h;
+            REQUIRE_EQ(parse_one(out, produced, masked, &h, payload), produced);
+            CHECK_EQ(h.payload_len, 2u + policies[index].reason.len);
+            CHECK_EQ((static_cast<u16>(payload[0]) << 8) | payload[1], policies[index].code);
+            if (!policies[index].reason.empty())
+                CHECK(memcmp(payload + 2, policies[index].reason.ptr, policies[index].reason.len) ==
+                      0);
+            CHECK_EQ(st.echo_close_code, policies[index].code);
+            CHECK(st.echo_close_reason.eq(policies[index].reason));
+        }
+    }
+}
+
+TEST(ws_terminate, invalid_branch_close_policy_fails_without_output) {
+    WsClosePolicy policies[] = {{1008, {"reason", 6}}};
+    for (u32 invalid = 0; invalid < 6; invalid++) {
+        WsInspector st = make_state(false);
+        st.close_policies = policies;
+        st.close_policy_count = 1;
+        Recorder r;
+        r.verdict = WsFrameAction::ClosePolicy0;
+        if (invalid == 0) r.verdict = WsFrameAction::ClosePolicy1;
+        if (invalid == 1) st.close_policies = nullptr;
+        if (invalid == 2) st.close_policy_count = kWsMaxClosePolicies + 1;
+        if (invalid == 3) policies[0].code = 1006;
+        if (invalid == 4) {
+            policies[0].code = 1008;
+            policies[0].reason = {nullptr, 1};
+        }
+        if (invalid == 5) r.verdict = static_cast<WsFrameAction>(8);
+        const u8 msg[] = {'x'};
+        u8 in[16], out[256], mbuf[64];
+        const u32 n = build(in, WsOpcode::Text, true, false, msg, 1);
+        u32 consumed = 0, produced = 0;
+        CHECK(ws_inspect(st,
+                         in,
+                         n,
+                         out,
+                         sizeof(out),
+                         mbuf,
+                         sizeof(mbuf),
+                         record,
+                         &r,
+                         &consumed,
+                         &produced) == WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
     }
 }
 
@@ -888,13 +965,15 @@ TEST(ws_terminate, close_reason_invalid_or_truncated_output_fails_closed) {
     CHECK_EQ(produced, 0u);
 }
 
-TEST(ws_terminate, close_reason_waits_for_prior_output_drain) {
+TEST(ws_terminate, branch_close_reason_waits_for_prior_output_drain) {
     WsInspector st = make_state(false);
     char reason[123];
     memset(reason, 'r', sizeof(reason));
-    st.close_reason = {reason, sizeof(reason)};
+    const WsClosePolicy policies[] = {{1008, {reason, sizeof(reason)}}};
+    st.close_policies = policies;
+    st.close_policy_count = 1;
     auto handler = +[](void*, WsOpcode, const u8* p, u64, bool) {
-        return p[0] == 'b' ? WsFrameAction::Close : WsFrameAction::Forward;
+        return p[0] == 'b' ? WsFrameAction::ClosePolicy0 : WsFrameAction::Forward;
     };
     u8 in[32], out[127], mbuf[64];
     const u8 a[] = {'a'}, b[] = {'b'};
@@ -1004,7 +1083,8 @@ TEST(ws_terminate, peer_close_echo_stays_1000) {
     WsInspector st = make_state(false);
     st.close_code = 1008;
     st.close_reason = {"policy", 6};
-    st.echo_close_has_reason = true;  // would only apply to a HANDLER close, not this peer close
+    st.echo_close_reason =
+        st.close_reason;  // would only apply to a HANDLER close, not this peer close
     Recorder r;
     u8 in[64];
     const u8 body[] = {0x03, 0xF1};  // 1009 Too Big, from the peer
@@ -1016,7 +1096,7 @@ TEST(ws_terminate, peer_close_echo_stays_1000) {
         st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
     CHECK(s == WsInspectStatus::Close);
     CHECK_EQ(r.calls, 0);  // control frames never reach the handler
-    CHECK_FALSE(st.echo_close_has_reason);
+    CHECK(st.echo_close_reason.empty());
     CHECK_EQ(st.echo_close_code, 1000u);  // echo unchanged by the route's close_code
     // The peer's 1009 was forwarded verbatim.
     WsFrameHeader h;

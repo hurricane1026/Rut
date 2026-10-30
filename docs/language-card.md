@@ -854,7 +854,15 @@ return websocket(chat, maxMessageSize: 4kb) { frame in
     frame.forward("message replaced")
 }
 
-// Close with a status and fixed UTF-8 reason (final verdict only).
+// Guard branches can choose independent close codes and fixed UTF-8 reasons.
+// close(code) uses an empty reason; a bare close() keeps the route's default policy.
+return websocket(chat) { frame in
+    guard frame.len <= 4096 else { frame.close(1009, "message too large") }
+    guard !frame.text.contains("secret") else { frame.close(1008, "policy violation") }
+    frame.forward()
+}
+
+// Close with a status and fixed UTF-8 reason (also accepted in guard branches).
 // Reason length is at most 123 UTF-8 bytes; empty reasons and NUL are supported.
 // Handler closes send the configured code/reason to both peers. Peer closes
 // retain their original forwarding and normal-closure echo behavior.

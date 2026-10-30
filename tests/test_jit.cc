@@ -20639,6 +20639,23 @@ TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
 }
 
+TEST(jit, websocket_branch_close_policy_verdict_validation) {
+    WsLenGuardSpec node{};
+    node.accessor = 0;
+    node.cmp = 0;
+    node.bound = 10;
+    for (u8 verdict = 4; verdict <= 7; verdict++) {
+        node.verdict = verdict;
+        auto cg = codegen_ws_handler(0, &node, 1, 0);
+        REQUIRE(cg.ok);
+        dispose_module(cg.mod, cg.ctx);
+    }
+    node.verdict = 3;  // payload-bearing forwards remain default-only
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.verdict = 8;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+}
+
 TEST(jit, byte_substring_helper_boundaries) {
     const char payload[] = {'x', 'a', 0, 'b', 'y', 'a', 0, 'b'};
     const char needle[] = {'a', 0, 'b'};
