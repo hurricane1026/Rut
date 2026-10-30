@@ -2998,6 +2998,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_handler = ws_term ? route->ws_frame_handler : nullptr;
     conn.ws_max_message_size = ws_term ? route->ws_max_message_size : 0;
     conn.ws_close_code = ws_term ? route->ws_close_code : 1000;
+    conn.ws_close_reason = ws_term ? route->ws_close_reason : Str{};
     conn.ws_forward_text = ws_term ? route->ws_forward_text : Str{};
 #endif
 
@@ -10756,6 +10757,7 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_c2u.max_message_size = cap;
         conn.ws_c2u.forward_text = conn.ws_forward_text;
         conn.ws_c2u.close_code = conn.ws_close_code;  // frame.close(code) status for this route
+        conn.ws_c2u.close_reason = conn.ws_close_reason;
         conn.ws_c2u.reject_fragmented = false;
         conn.ws_u2c.reset();
         conn.ws_u2c.masked = false;       // upstream->client is server-role on both ends → unmasked
@@ -10763,6 +10765,7 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_u2c.max_message_size = cap;
         conn.ws_u2c.forward_text = conn.ws_forward_text;
         conn.ws_u2c.close_code = conn.ws_close_code;
+        conn.ws_u2c.close_reason = conn.ws_close_reason;
         conn.ws_u2c.reject_fragmented = false;
         conn.is_ws_terminate = true;
         return true;
@@ -10863,25 +10866,36 @@ bool ws_drive_close(Loop* loop, Connection& conn) {
     if (conn.ws_upstream_eof) conn.ws_close_upstream_need = false;
     // Client slot (upstream->client, unmasked): send the echo Close if idle.
     if (conn.ws_close_client_need && !conn.ws_upstream_send_pending) {
-        const u32 n = ws_emit_close_frame(conn.ws_close_frame_client,
-                                          sizeof(conn.ws_close_frame_client),
+        const Str reason = conn.ws_echo_close_has_reason ? conn.ws_close_reason : Str{};
+        // The slot is idle: its dedicated output slice is stable until this send completes.
+        u8* frame = reason.empty() ? conn.ws_close_frame_client : conn.ws_u2c_out;
+        const u32 cap = reason.empty() ? sizeof(conn.ws_close_frame_client) : SlicePool::kSliceSize;
+        if (!frame) return false;
+        const u32 n = ws_emit_close_frame(frame,
+                                          cap,
                                           /*masked=*/false,
                                           conn.ws_u2c.mask_rng,
-                                          conn.ws_echo_close_code);
-        if (n == 0 || !client_send(loop, conn, conn.ws_close_frame_client, n)) return false;
+                                          conn.ws_echo_close_code,
+                                          reason);
+        if (n == 0 || !client_send(loop, conn, frame, n)) return false;
         conn.ws_upstream_send_pending = true;
         conn.ws_close_client_need = false;
         conn.ws_close_client_inflight = true;
     }
     // Upstream slot (client->upstream, masked): send the echo Close if idle.
     if (conn.ws_close_upstream_need && !conn.ws_client_send_pending) {
-        const u32 n = ws_emit_close_frame(conn.ws_close_frame_upstream,
-                                          sizeof(conn.ws_close_frame_upstream),
+        const Str reason = conn.ws_echo_close_has_reason ? conn.ws_close_reason : Str{};
+        u8* frame = reason.empty() ? conn.ws_close_frame_upstream : conn.ws_c2u_out;
+        const u32 cap =
+            reason.empty() ? sizeof(conn.ws_close_frame_upstream) : SlicePool::kSliceSize;
+        if (!frame) return false;
+        const u32 n = ws_emit_close_frame(frame,
+                                          cap,
                                           /*masked=*/true,
                                           conn.ws_c2u.mask_rng,
-                                          conn.ws_echo_close_code);
-        if (n == 0 || !loop->submit_send_upstream(conn, conn.ws_close_frame_upstream, n))
-            return false;
+                                          conn.ws_echo_close_code,
+                                          reason);
+        if (n == 0 || !loop->submit_send_upstream(conn, frame, n)) return false;
         conn.ws_client_send_pending = true;
         conn.ws_close_upstream_need = false;
         conn.ws_close_upstream_inflight = true;
@@ -10929,6 +10943,7 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                 conn.ws_close_upstream_inflight = true;
                 conn.ws_close_client_need = true;
                 conn.ws_echo_close_code = conn.ws_c2u.echo_close_code;
+                conn.ws_echo_close_has_reason = conn.ws_c2u.echo_close_has_reason;
             }
             if (!loop->submit_send_upstream(conn, conn.ws_c2u_out, produced)) return false;
             conn.ws_client_send_pending = true;
@@ -11006,6 +11021,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
                 conn.ws_close_client_inflight = true;
                 conn.ws_close_upstream_need = true;
                 conn.ws_echo_close_code = conn.ws_u2c.echo_close_code;
+                conn.ws_echo_close_has_reason = conn.ws_u2c.echo_close_has_reason;
             }
             if (!client_send(loop, conn, conn.ws_u2c_out, produced)) return false;
             conn.ws_upstream_send_pending = true;

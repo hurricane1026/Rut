@@ -156,6 +156,7 @@ struct RouteEntry {
     WsMessageHandlerFn ws_frame_handler = nullptr;
     u32 ws_max_message_size = 0;
     // RFC 6455 status the handler's `frame.close(code)` verdict puts on the wire (1000 default).
+    Str ws_close_reason{};
     u16 ws_close_code = 1000;
     Str ws_forward_text{};  // immutable replacement for ForwardText verdicts
     // Nonzero only for the bounded static direct-forward timeout preflight.
@@ -1507,7 +1508,8 @@ public:
                           WsMessageHandlerFn handler,
                           u32 max_message_size,
                           u16 close_code = 1000,
-                          Str forward_text = {}) {
+                          Str forward_text = {},
+                          Str close_reason = {}) {
 #if !RUT_ENABLE_WEBSOCKET
         // The 101/tunnel path is compiled out in this build — a terminate route could
         // never enter terminate mode, so fail loud instead of publishing an unusable route.
@@ -1518,6 +1520,7 @@ public:
         (void)max_message_size;
         (void)close_code;
         (void)forward_text;
+        (void)close_reason;
         return false;
 #else
         if (handler == nullptr || max_message_size == 0 || forward_text.len > max_message_size ||
@@ -1527,13 +1530,14 @@ public:
         // SAME predicate as the receive-side validator (ws_inspect) and the .rut analyze check
         // — including the reserved 1016–2999 range — so this C++ surface can't publish a route
         // whose handler Close serializes a code the runtime itself considers invalid.
-        if (!ws_valid_close_code(close_code)) return false;
+        if (!ws_valid_close_code(close_code) || !ws_valid_close_reason(close_reason)) return false;
         if (!add_proxy(path, method, upstream_id)) return false;
         auto& r = routes[route_count - 1];
         r.ws_terminate = true;
         r.ws_frame_handler = handler;
         r.ws_max_message_size = max_message_size;
         r.ws_close_code = close_code;
+        r.ws_close_reason = close_reason;
         r.ws_forward_text = forward_text;
         return true;
 #endif

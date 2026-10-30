@@ -381,13 +381,26 @@ bool load_rut_program(const char* path,
                 bytes[expr.str_value.len] = '\0';
                 forward_text = {bytes, expr.str_value.len};
             }
+            Str close_reason{};
+            if (route.ws_handler.close_reason_expr != 0xffffffffu) {
+                if (route.ws_handler.close_reason_expr >= route.exprs.len) return false;
+                const auto& expr = route.exprs[route.ws_handler.close_reason_expr];
+                if (expr.kind != HirExprKind::StrLit || !ws_valid_close_reason(expr.str_value))
+                    return false;
+                char* bytes = out.rir.arena.alloc_array<char>(expr.str_value.len + 1);
+                if (!bytes) return false;
+                for (u32 j = 0; j < expr.str_value.len; j++) bytes[j] = expr.str_value.ptr[j];
+                bytes[expr.str_value.len] = '\0';
+                close_reason = {bytes, expr.str_value.len};
+            }
             if (!out.config.add_ws_terminate(path,
                                              route.method,
                                              static_cast<u16>(route.ws_handler.upstream_index),
                                              handler,
                                              max_msg,
                                              route.ws_handler.close_code,
-                                             forward_text))
+                                             forward_text,
+                                             close_reason))
                 return false;
             ws_n++;
         }

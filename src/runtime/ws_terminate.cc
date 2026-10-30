@@ -1,52 +1,12 @@
 #include "rut/runtime/ws_terminate.h"
 
+#include "rut/common/utf8.h"
+
 #include <openssl/rand.h>
 
 namespace rut {
 
 namespace {
-// RFC 6455 §8.1: a Text message's payload MUST be valid UTF-8. Validate the whole
-// reassembled message (rejecting overlong forms, surrogates, and out-of-range code
-// points), so a terminating gateway fails the connection instead of forwarding or
-// handing malformed text to a DSL filter.
-bool utf8_valid(const u8* s, u64 n) {
-    for (u64 i = 0; i < n;) {
-        const u8 c = s[i];
-        u64 extra;
-        u32 cp;
-        u32 min_cp;
-        if (c < 0x80) {
-            i++;
-            continue;
-        } else if ((c & 0xE0) == 0xC0) {
-            extra = 1;
-            cp = c & 0x1F;
-            min_cp = 0x80;
-        } else if ((c & 0xF0) == 0xE0) {
-            extra = 2;
-            cp = c & 0x0F;
-            min_cp = 0x800;
-        } else if ((c & 0xF8) == 0xF0) {
-            extra = 3;
-            cp = c & 0x07;
-            min_cp = 0x10000;
-        } else {
-            return false;  // 0x80-0xBF lead, or 0xF8+ (5/6-byte forms)
-        }
-        if (i + extra >= n) return false;  // truncated multibyte sequence
-        for (u64 k = 1; k <= extra; k++) {
-            const u8 cc = s[i + k];
-            if ((cc & 0xC0) != 0x80) return false;  // not a continuation byte
-            cp = (cp << 6) | (cc & 0x3F);
-        }
-        if (cp < min_cp) return false;                   // overlong encoding
-        if (cp > 0x10FFFF) return false;                 // beyond Unicode
-        if (cp >= 0xD800 && cp <= 0xDFFF) return false;  // UTF-16 surrogate half
-        i += extra + 1;
-    }
-    return true;
-}
-
 // Re-serialize one frame (header + `len`-byte cleartext payload) into out[*produced..],
 // masking the payload with a fresh key when `masked`. Returns false if it won't fit or the
 // header is refused.
@@ -77,6 +37,10 @@ bool emit_frame(u8* out,
 bool ws_valid_text_payload(Str text) {
     return (text.ptr || text.len == 0) &&
            utf8_valid(reinterpret_cast<const u8*>(text.ptr), text.len);
+}
+
+bool ws_valid_close_reason(Str reason) {
+    return reason.len <= kWsMaxCloseReasonBytes && ws_valid_text_payload(reason);
 }
 
 WsInspectStatus ws_inspect(WsInspector& st,
@@ -141,8 +105,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // frame and the assembler state untouched for the next call.
         if (*produced != 0) {
             const u64 original_size = st.message_len + h.payload_len;
-            const u64 data_size =
+            u64 data_size =
                 original_size > st.forward_text.len ? original_size : st.forward_text.len;
+            const u64 close_size = 2u + static_cast<u64>(st.close_reason.len);
+            if (st.close_reason.len != 0 && close_size > data_size) data_size = close_size;
             const u64 needed = ws_opcode_is_control(h.opcode)
                                    ? frame_total
                                    : (h.fin ? data_size + kWsMaxHeaderSize : 0);
@@ -181,6 +147,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 // Peer-initiated close: the peer's own code was relayed verbatim above; keep
                 // the echo to the other side at 1000 (unchanged behavior — see header).
                 st.echo_close_code = 1000;
+                st.echo_close_has_reason = false;
                 return WsInspectStatus::Close;
             }
             continue;
@@ -242,16 +209,25 @@ WsInspectStatus ws_inspect(WsInspector& st,
                             st.mask_rng))
                 return WsInspectStatus::Error;
         } else if (action == WsFrameAction::Close) {
-            // Include the configured code when it fits. Standalone callers may provide a
-            // smaller output buffer than the tunnel's dedicated slice, so retain the
-            // no-status fallback for them.
-            const u8 cc[2] = {static_cast<u8>(st.close_code >> 8), static_cast<u8>(st.close_code)};
-            const u32 hdr = 2u + (st.masked ? 4u : 0u);  // base header + optional mask key
-            const u64 body = (*produced + hdr + 2u <= out_cap) ? 2u : 0u;
-            if (!emit_frame(
-                    out, out_cap, produced, WsOpcode::Close, cc, body, st.masked, st.mask_rng)) {
+            if (!ws_valid_close_code(st.close_code) || !ws_valid_close_reason(st.close_reason))
                 return WsInspectStatus::Error;
+            u8 cc[kWsMaxControlPayload];
+            cc[0] = static_cast<u8>(st.close_code >> 8);
+            cc[1] = static_cast<u8>(st.close_code);
+            for (u32 i = 0; i < st.close_reason.len; i++)
+                cc[i + 2] = static_cast<u8>(st.close_reason.ptr[i]);
+            const u32 hdr = 2u + (st.masked ? 4u : 0u);
+            u32 body = 2u + st.close_reason.len;
+            // Preserve the legacy empty-status fallback only for code-only closes.
+            // A configured reason must fit whole; never truncate UTF-8 or silently discard it.
+            if (static_cast<u64>(*produced) + hdr + body > out_cap) {
+                if (st.close_reason.len != 0) return WsInspectStatus::Error;
+                body = 0;
             }
+            if (!emit_frame(
+                    out, out_cap, produced, WsOpcode::Close, cc, body, st.masked, st.mask_rng))
+                return WsInspectStatus::Error;
+            st.echo_close_has_reason = true;
             st.echo_close_code = st.close_code;
             st.message_len = 0;
             return WsInspectStatus::Close;
@@ -263,10 +239,16 @@ WsInspectStatus ws_inspect(WsInspector& st,
     return WsInspectStatus::Ok;
 }
 
-u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code) {
-    const u8 body[2] = {static_cast<u8>(code >> 8), static_cast<u8>(code)};
+u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code, Str reason) {
+    if (!ws_valid_close_code(code) || !ws_valid_close_reason(reason)) return 0;
+    u8 body[kWsMaxControlPayload];
+    body[0] = static_cast<u8>(code >> 8);
+    body[1] = static_cast<u8>(code);
+    for (u32 i = 0; i < reason.len; i++) body[i + 2] = static_cast<u8>(reason.ptr[i]);
     u32 produced = 0;
-    if (!emit_frame(out, out_cap, &produced, WsOpcode::Close, body, 2, masked, mask_rng)) return 0;
+    if (!emit_frame(
+            out, out_cap, &produced, WsOpcode::Close, body, 2u + reason.len, masked, mask_rng))
+        return 0;
     return produced;
 }
 

@@ -330,6 +330,41 @@ TEST(native_program, websocket_contains_survives_source_removal) {
     CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, true) == WsFrameAction::Drop);
 }
 
+TEST(native_program, websocket_close_reason_survives_source_removal) {
+    Source source;
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\n"
+                      "route GET \"/ws\" { return websocket(backend) { frame in frame.close(1008, "
+                      "\"native\\0\\u{20ac}\") } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    const char expected[] = "native\0\xe2\x82\xac";
+    REQUIRE_EQ(route.ws_close_reason.len, sizeof(expected) - 1);
+    CHECK(memcmp(route.ws_close_reason.ptr, expected, sizeof(expected) - 1) == 0);
+    WsInspector st;
+    st.close_code = route.ws_close_code;
+    st.close_reason = route.ws_close_reason;
+    const u8 input[] = {0x81, 0};
+    u8 out[128], msg[32];
+    u32 used = 0, produced = 0;
+    REQUIRE(ws_inspect(st,
+                       input,
+                       sizeof(input),
+                       out,
+                       sizeof(out),
+                       msg,
+                       sizeof(msg),
+                       route.ws_frame_handler,
+                       nullptr,
+                       &used,
+                       &produced) == WsInspectStatus::Close);
+    CHECK_EQ(produced, 4u + route.ws_close_reason.len);
+    CHECK(memcmp(out + 4, expected, sizeof(expected) - 1) == 0);
+}
+
 TEST(native_program, websocket_regex_handler_survives_compiler_exit) {
     Source source;
     REQUIRE(

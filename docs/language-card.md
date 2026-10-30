@@ -854,6 +854,15 @@ return websocket(chat, maxMessageSize: 4kb) { frame in
     frame.forward("message replaced")
 }
 
+// Close with a status and fixed UTF-8 reason (final verdict only).
+// Reason length is at most 123 UTF-8 bytes; empty reasons and NUL are supported.
+// Handler closes send the configured code/reason to both peers. Peer closes
+// retain their original forwarding and normal-closure echo behavior.
+return websocket(chat) { frame in
+    guard frame.fromClient && frame.text.contains("secret") else { frame.forward() }
+    frame.close(1008, "policy violation")
+}
+
 // WebSocket proxy. The inspection sketch below is a target API; current terminate
 // handlers use `return websocket(chat) { frame in ... }`, forward/drop/close,
 // and final frame.forward("fixed text").

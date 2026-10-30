@@ -820,6 +820,114 @@ TEST(ws_terminate, handler_close_emits_close_and_stops) {
 
 // frame.close(code): the handler's configured close_code is put on the wire — both the
 // forward Close (emitted here) and the echo code the caller reads back for the other peer.
+TEST(ws_terminate, handler_close_reason_and_echo_serialize_both_roles) {
+    char reason[kWsMaxCloseReasonBytes];
+    for (u32 i = 0; i < sizeof(reason); i++) reason[i] = 'r';
+    reason[1] = 0;
+    for (bool masked : kMaskDirections) {
+        WsInspector st = make_state(masked);
+        st.close_code = 1008;
+        st.close_reason = {reason, sizeof(reason)};
+        Recorder r;
+        r.close_now = true;
+        const u8 msg[] = {'x'};
+        u8 in[16], out[256], mbuf[64], payload[128];
+        const u32 in_len = build(in, WsOpcode::Text, true, masked, msg, 1);
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           in_len,
+                           out,
+                           sizeof(out),
+                           mbuf,
+                           sizeof(mbuf),
+                           record,
+                           &r,
+                           &consumed,
+                           &produced) == WsInspectStatus::Close);
+        WsFrameHeader h;
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, payload), produced);
+        CHECK_EQ(h.payload_len, 125u);
+        CHECK_EQ(payload[0], 3u);
+        CHECK_EQ(payload[1], 240u);
+        CHECK(memcmp(payload + 2, reason, sizeof(reason)) == 0);
+        CHECK(st.echo_close_has_reason);
+        u64 rng = 0;
+        produced = ws_emit_close_frame(
+            out, sizeof(out), !masked, rng, st.echo_close_code, st.close_reason);
+        REQUIRE(produced > 0);
+        REQUIRE_EQ(parse_one(out, produced, !masked, &h, payload), produced);
+        CHECK_EQ(h.payload_len, 125u);
+        CHECK(memcmp(payload + 2, reason, sizeof(reason)) == 0);
+    }
+}
+
+TEST(ws_terminate, close_reason_invalid_or_truncated_output_fails_closed) {
+    char oversized[124];
+    memset(oversized, 'x', sizeof(oversized));
+    const char bad[] = {static_cast<char>(0xff)};
+    u8 out[256];
+    u64 rng = 0;
+    const Str invalid_reasons[] = {{oversized, sizeof(oversized)}, {bad, 1}, {nullptr, 1}};
+    for (Str reason : invalid_reasons) {
+        CHECK_FALSE(ws_valid_close_reason(reason));
+        CHECK_EQ(ws_emit_close_frame(out, sizeof(out), false, rng, 1008, reason), 0u);
+    }
+    CHECK_EQ(ws_emit_close_frame(out, 5, false, rng, 1008, {"why", 3}), 0u);
+    WsInspector st = make_state(false);
+    st.close_reason = {"why", 3};
+    Recorder r;
+    r.close_now = true;
+    u8 in[16], mbuf[64];
+    const u8 msg[] = {'x'};
+    const u32 in_len = build(in, WsOpcode::Text, true, false, msg, 1);
+    u32 consumed = 0, produced = 0;
+    CHECK(
+        ws_inspect(st, in, in_len, out, 5, mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Error);
+    CHECK_EQ(produced, 0u);
+}
+
+TEST(ws_terminate, close_reason_waits_for_prior_output_drain) {
+    WsInspector st = make_state(false);
+    char reason[123];
+    memset(reason, 'r', sizeof(reason));
+    st.close_reason = {reason, sizeof(reason)};
+    auto handler = +[](void*, WsOpcode, const u8* p, u64, bool) {
+        return p[0] == 'b' ? WsFrameAction::Close : WsFrameAction::Forward;
+    };
+    u8 in[32], out[127], mbuf[64];
+    const u8 a[] = {'a'}, b[] = {'b'};
+    u32 n = build(in, WsOpcode::Text, true, false, a, 1);
+    n += build(in + n, WsOpcode::Text, true, false, b, 1);
+    u32 consumed = 0, produced = 0;
+    REQUIRE(ws_inspect(st,
+                       in,
+                       n,
+                       out,
+                       sizeof(out),
+                       mbuf,
+                       sizeof(mbuf),
+                       handler,
+                       nullptr,
+                       &consumed,
+                       &produced) == WsInspectStatus::Ok);
+    CHECK_EQ(consumed, 3u);
+    CHECK_EQ(produced, 3u);
+    REQUIRE(ws_inspect(st,
+                       in + consumed,
+                       n - consumed,
+                       out,
+                       sizeof(out),
+                       mbuf,
+                       sizeof(mbuf),
+                       handler,
+                       nullptr,
+                       &consumed,
+                       &produced) == WsInspectStatus::Close);
+    CHECK_EQ(produced, 127u);
+}
+
 TEST(ws_terminate, handler_close_emits_configured_code) {
     WsInspector st = make_state(false);
     st.close_code = 1008;  // Policy Violation — what frame.close(1008) lowers to
@@ -894,7 +1002,9 @@ TEST(ws_terminate, handler_close_tiny_message_keeps_code_when_room) {
 // different frame.close(code) — the peer's own code is relayed verbatim on the forward leg.
 TEST(ws_terminate, peer_close_echo_stays_1000) {
     WsInspector st = make_state(false);
-    st.close_code = 1008;  // would only apply to a HANDLER close, not this peer close
+    st.close_code = 1008;
+    st.close_reason = {"policy", 6};
+    st.echo_close_has_reason = true;  // would only apply to a HANDLER close, not this peer close
     Recorder r;
     u8 in[64];
     const u8 body[] = {0x03, 0xF1};  // 1009 Too Big, from the peer
@@ -905,7 +1015,8 @@ TEST(ws_terminate, peer_close_echo_stays_1000) {
     WsInspectStatus s = ws_inspect(
         st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
     CHECK(s == WsInspectStatus::Close);
-    CHECK_EQ(r.calls, 0);                 // control frames never reach the handler
+    CHECK_EQ(r.calls, 0);  // control frames never reach the handler
+    CHECK_FALSE(st.echo_close_has_reason);
     CHECK_EQ(st.echo_close_code, 1000u);  // echo unchanged by the route's close_code
     // The peer's 1009 was forwarded verbatim.
     WsFrameHeader h;

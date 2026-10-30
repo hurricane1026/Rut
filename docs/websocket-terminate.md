@@ -22,6 +22,14 @@ empty literals match every message and shorter messages fail without reading pay
 `contains` searches for the exact contiguous bytes of a literal, including NUL,
 without regex interpretation or Unicode normalization.
 
+Current close reasons: the final `frame.close(code, "reason")` accepts a fixed
+UTF-8 string literal of at most 123 decoded bytes, including empty strings and NUL.
+The configured code/reason are used for every handler Close on the route and sent
+to both peers. Guard else-branches remain bare verdicts. Peer-initiated closes
+retain their forwarded payload and the normal-closure echo without this reason.
+Dynamic reasons and interpolation remain unsupported. Native format version 8
+relocates the reason alongside other route-owned strings.
+
 Related: DESIGN.md §3.4.8 (passthrough/terminate runtime semantics),
 `include/rut/runtime/ws_terminate.h` (engine), `route_table.h` (`add_ws_terminate`).
 

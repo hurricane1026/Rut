@@ -3,6 +3,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
+#include "rut/common/utf8.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/hash.h"
@@ -13031,10 +13032,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
             route->ws_handler.default_verdict = WsVerdict::Drop;
         } else if (call.name.eq({"close", 5})) {
-            if (call.args.len > 1)  // close() or close(code)
+            if (call.args.len > 2)  // close(), close(code), or close(code, "reason")
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
             route->ws_handler.default_verdict = WsVerdict::Close;
-            if (call.args.len == 1) {
+            if (call.args.len >= 1) {
                 if (call.args[0] == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, call.span);
                 auto code = analyze_expr(
@@ -13053,6 +13054,21 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 if (c < 0 || !ws_valid_close_code(static_cast<u32>(c)))
                     return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
                 route->ws_handler.close_code = static_cast<u16>(c);
+            }
+            if (call.args.len == 2) {
+                if (!call.args[1] || call.args[1]->kind != AstExprKind::StrLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+                auto reason = analyze_expr(
+                    *call.args[1], route, mod, route->locals.data, route->locals.len, nullptr);
+                if (!reason) return core::make_unexpected(reason.error());
+                if (reason->kind != HirExprKind::StrLit || reason->type != HirTypeKind::Str ||
+                    reason->str_value.len > kWsMaxCloseReasonBytes ||
+                    !utf8_valid(reinterpret_cast<const u8*>(reason->str_value.ptr),
+                                reason->str_value.len))
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[1]->span);
+                if (!route->exprs.push(reason.value()))
+                    return frontend_error(FrontendError::OutOfMemory, call.span);
+                route->ws_handler.close_reason_expr = route->exprs.len - 1;
             }
         } else {
             return frontend_error(FrontendError::UnsupportedSyntax, call.span);

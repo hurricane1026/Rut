@@ -5555,6 +5555,73 @@ TEST(frontend, analyze_accepts_websocket_close_with_code) {
     CHECK_EQ(hir->routes[0].ws_handler.close_code, static_cast<u16>(1008));
 }
 
+TEST(frontend, analyze_websocket_close_reason_literal_and_byte_limit) {
+    for (u32 length : {0u, 123u, 124u}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008, \"";
+        source.append(length, 'x');
+        source += "\") } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (length > 123) {
+            CHECK(!hir);
+            continue;
+        }
+        REQUIRE(hir);
+        const auto& route = hir->routes[0];
+        REQUIRE(route.ws_handler.close_reason_expr < route.exprs.len);
+        CHECK_EQ(route.exprs[route.ws_handler.close_reason_expr].str_value.len, length);
+        CHECK_EQ(route.ws_handler.close_code, 1008u);
+    }
+    for (u32 count : {41u, 42u}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008, \"";
+        for (u32 i = 0; i < count; i++) source += "\\u{20ac}";
+        source += "\") } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_EQ(static_cast<bool>(hir), count == 41);
+    }
+    for (const char* arg : {"1", "frame.text", "\"\\(frame.len)\"", "\"a\", \"b\""}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008, ";
+        source += arg;
+        source += ") } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    for (bool invalid : {false, true}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008, \"";
+        if (invalid)
+            source += static_cast<char>(0xff);
+        else
+            source += "a\\0\\u{20ac}";
+        source += "\") } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (invalid) {
+            CHECK(!hir);
+            continue;
+        }
+        REQUIRE(hir);
+        const auto& route = hir->routes[0];
+        REQUIRE_EQ(route.exprs[route.ws_handler.close_reason_expr].str_value.len, 5u);
+    }
+}
+
 TEST(frontend, analyze_rejects_websocket_close_reserved_code) {
     // 1006 (abnormal closure) must never be sent on the wire → rejected.
     const char* src =
