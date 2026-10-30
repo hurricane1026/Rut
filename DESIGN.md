@@ -8259,6 +8259,27 @@ mutations do not create absence, because both reads use the original buffer.
 Configuration and key rotation still require compile/load and restart. The
 helper uses ordinary existing Rut guards, match and Identity construction.
 
+### Absence-only anonymous multi-Consumer policy
+
+`auth.multiAuthOrAnonymous(count, authorization, first, second, anonymousId)`
+composes optional authentication with the existing bounded two-Consumer
+Bearer/Basic policy. It validates `validConsumerPair` and a nonempty guest ID
+distinct from both configured Consumer IDs before considering absence. Invalid
+configuration returns 503 on every path, including requests without credentials.
+
+Only original Authorization count 0 with an empty singleton value publishes the
+guest Identity (`method: "anonymous"`, empty credential ID). Count 1 uses the
+same verifiers and trusted ownership/credential mapping as `multiAuth`.
+Other counts, parse failures and inconsistent count/value inputs reject with
+401 and ordered Bearer/Basic challenges. Wrong or disabled credentials never
+downgrade to anonymous. Reads still use original headers after request removal.
+
+This ordinary Rut helper adds no runtime primitive or keyword. The returned
+identity still needs explicit API authorization: `requireAnyConsumer` can deny
+the guest with 403 while preserving 401 for invalid credentials. Configuration
+is static; this adds neither a Consumer registry nor session or replay state.
+See `examples/optional-multi-auth.rut` for public/private route composition.
+
 ### Explicit credential header stripping
 
 `req.remove("Name")` extends the existing statement-only request mutation surface

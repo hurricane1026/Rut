@@ -1294,6 +1294,19 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   503. The anonymous ID must be explicitly allowed by downstream policy; an
   existing `requireConsumer` check can reject it with 403.
   See [anonymous-auth.rut](../examples/anonymous-auth.rut).
+- `auth.multiAuthOrAnonymous(count, authorization, first, second, anonymousId)`
+  combines the two-Consumer Bearer/Basic policy below with absence-only anonymous
+  access. Read count and singleton value from the same original Authorization
+  field. Count 0 and an empty value returns the configured guest with empty
+  credential ID and method `anonymous`; count 1 must pass `multiAuth`.
+  Empty, malformed, wrong or duplicate credentials, parse failures and
+  inconsistent count/value inputs return 401 with both Bearer and Basic
+  challenges. Invalid Consumer configuration, an empty guest ID, or a guest ID
+  equal to either configured Consumer ID returns 503 even without credentials.
+  Disabled slots cannot authenticate and never trigger guest fallback.
+  Authorization remains explicit: `requireAnyConsumer(identity, firstId, secondId)`
+  can reject guests with 403. Request credential removal does not change the
+  original presence evidence. See [optional-multi-auth.rut](../examples/optional-multi-auth.rut).
 - `auth.headerKey(req.uniqueHeader("X-API-Key").or(""), key, consumerId, credentialId)`
   verifies a custom header key. Do not replace uniqueHeader with first-field reads.
 - `auth.basic(authorization, credentials, consumerId, credentialId)` takes configured

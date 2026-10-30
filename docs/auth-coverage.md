@@ -15,7 +15,7 @@ whether a competing open-source edition includes them.
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
-| Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection | Dynamic Consumer registry, anonymous only for absent credentials, no invalid-credential downgrade |
+| Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification | HS256/384/512 policy helpers; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper | ES keys, remote JWKS refresh/cache, live and durable token revocation |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks durable replay persistence |
 | ACL / Consumer restriction | Exact single-consumer allow/deny and two-consumer allow union after verification | Multiple groups, membership lifecycle, registry-backed default deny, no client identity spoofing |
@@ -161,6 +161,31 @@ and the exact Consumer allow union from
 primitive from [#926](https://github.com/hurricane1026/Rut/pull/926). The
 Standard Webhooks middleware still has a separate main integration tracked by
 [#934](https://github.com/hurricane1026/Rut/pull/934), which is not included here.
+## Optional multi-Consumer authentication
+
+`auth.multiAuthOrAnonymous(count, authorization, first, second, anonymousId)`
+extends absence-only optional access to both Bearer and Basic across the two
+configured Consumers. Count and singleton value must come from the same original
+Authorization field. Only count 0 with an empty value returns the configured
+guest, with no credential ID and method `anonymous`. A presented field must
+verify through `multiAuth`: empty/wrong/malformed input, duplicates, parse
+failures and inconsistent count/value combinations return 401 with ordered
+Bearer and Basic challenges. Disabled credentials cannot fall back to guests.
+
+Consumer-pair validation applies even to absent credentials. An empty or colliding
+guest ID, ambiguous secret ownership, duplicate/empty Consumer IDs, missing
+credential IDs or all methods disabled returns 503. Identities and credential
+metadata come only from configuration; client identity headers have no authority.
+Private routes still authorize explicitly and can deny a valid guest with 403.
+Removing Authorization before calling the helper cannot manufacture absence.
+
+The JIT request matrix covers both methods for both Consumers, guest metadata,
+spoofed identity, duplicates, malformed input, body/header separation, disabled
+Consumer slots, configuration failure before fallback, challenge fields and
+public/private authorization on HTTP/1.0 and HTTP/1.1 request buffers. This is
+handler-level coverage; the existing network backends are unchanged. See
+[optional-multi-auth.rut](../examples/optional-multi-auth.rut).
+
 ## Static Consumer groups
 
 `auth.ConsumerGroups` binds one verified Consumer ID to up to two exact,
