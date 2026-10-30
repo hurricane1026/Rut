@@ -2617,8 +2617,14 @@ Control frames retain their existing relay behavior.
 A fixed replacement uses ordinary string escape decoding and must fit both
 `maxMessageSize` and the single-slice terminate cap. Bounded text concatenation is
 also supported: `frame.forward("prefix" + frame.text + "suffix")`, including either
-affix alone or an identity `frame.text`. The expression contains at most 32 nodes
-(literals, `+`, and at most one `frame.text`); parentheses preserve concatenation order.
+affix alone or an identity `frame.text`. Route-local `let` strings whose values
+are known at compile time, including aliases of such strings, may supply fixed
+replacements or affix leaves. Their decoded bytes are copied into the same
+route-owned recipe as literals; request-derived, optional, and non-string values
+are rejected. Calls remain unsupported. Constant strings obey the same UTF-8,
+combined fixed-byte limit, and expression-node limits as literal leaves. The
+expression contains at most 32 nodes (literals or constant references, `+`, and at
+most one `frame.text`); parentheses preserve concatenation order.
 Constant fragments are folded into immutable prefix/suffix views. Other fields,
 functions, repeated payload references, interpolation, binary replacement, and
 injection remain unsupported. Affix recipes require a Text message; selecting one
