@@ -1,0 +1,14 @@
+// Ordinary, inlined helpers over the existing Ord protocol.
+func min<T: Ord>(_ a: T, _ b: T) -> T {
+    if a < b { a } else { b }
+}
+
+func max<T: Ord>(_ a: T, _ b: T) -> T {
+    if a < b { b } else { a }
+}
+
+// Equivalent to max(lower, min(value, upper)). Equal or reversed bounds
+// return lower. Check lower <= upper separately if bounds are untrusted.
+func clamp<T: Ord>(_ value: T, _ lower: T, _ upper: T) -> T {
+    max(lower, min(value, upper))
+}

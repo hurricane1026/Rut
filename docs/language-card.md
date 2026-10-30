@@ -1109,6 +1109,39 @@ Linux makes one nonblocking `getrandom` call; macOS uses `getentropy`. Failures,
 
 The call must directly initialize a top-level route `let`, as above. Calls in `guard let`/`if let` expressions, inside helpers, and nested in larger expressions are rejected until single evaluation of fresh values is supported there. ID values already generated may be passed to ordinary helpers. No arguments or implicit pipe stage are accepted. User functions/bindings named `uuid` shadow it. `wait` routes reject UUID calls; timers and randomness inside `chain after` header effects are unsupported. Request set/add still require literal values, so UUID generation does not yet provide complete request-ID forwarding middleware. Random UUIDs do not promise absolute uniqueness or ordered IDs. `randomBytes(n)` remains a target API, not an alias for `uuid()`.
 
+## Math library (implemented)
+
+Import the ordinary source library relative to your file. From `examples/`:
+
+```swift
+import * as math from "../lib/math.rut"
+
+// All arguments to each helper must have the same type conforming to Ord.
+let low = math.min(3, 5)
+let high = math.max(3, 5)
+let bounded = math.clamp(9, 2, 6)  // 6
+```
+
+Use a namespace alias to keep the global integer `min` and `max` builtins
+available alongside the generic helpers. Ordinary or selective imports named
+`min`/`max` shadow those unqualified builtins.
+
+The library exports `min<T: Ord>`, `max<T: Ord>` and `clamp<T: Ord>` through
+the existing file namespace and selective-import mechanisms. Helpers inline
+through the normal compiler pipeline; no runtime math ABI or dependency is
+added. Current generic type binding supports i32 and other ordered types such
+as strings, but rejects i64. For i64, use the existing global integer `min/max`
+builtins and compose clamping as `max(lower, min(value, upper))`.
+
+`clamp(value, lower, upper)` is `max(lower, min(value, upper))`. The interval
+is closed; equal or reversed bounds return `lower`. Validate `lower <= upper`
+separately when configuration requires rejection of reversed bounds.
+
+Existing global integer `min/max` builtins remain available with their literal
+width adoption and single-evaluation behavior. The source library uses ordinary
+helper inlining and its existing evaluation rules. `abs`, `sqrt` and `pow` are
+not provided. Runnable example: [math.rut](../examples/math.rut).
+
 ## Built-ins (call them, never reimplement)
 
 ```
@@ -1124,8 +1157,10 @@ jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
 time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
-         uses in one request see the same value)  max(a, b)  min(a, b)
+         uses in one request see the same value)
          — now()/time(s)/Duration arithmetic still ⏳
+math:    max(a, b) min(a, b) (integer builtins; imported lib/math.rut also
+         provides generic math.min/max/clamp)
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
 admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats()
 ```
