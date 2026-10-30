@@ -5729,6 +5729,9 @@ TEST(frontend, analyze_websocket_text_literal_rejects_invalid_shapes) {
                                   "frame.text == frame.text",
                                   "frame.text < \"ping\"",
                                   "frame.text.isEmpty()",
+                                  "frame.text.hasPrefix",
+                                  "frame.binary.hasSuffix(\"x\")",
+                                  "frame.text.hasPrefix(\"\\(frame.len)\")",
                                   "frame.binary.isEmpty",
                                   "frame.text == \"\\q\""}) {
         std::string source =
@@ -5740,6 +5743,38 @@ TEST(frontend, analyze_websocket_text_literal_rejects_invalid_shapes) {
         auto ast = parse_file_heap(lexed.value());
         REQUIRE(ast);
         CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, analyze_websocket_text_prefix_suffix_conditions) {
+    for (const char* method : {"hasPrefix", "hasSuffix"}) {
+        for (const char* argument :
+             {"\"a\\0b\"", "", "1", "frame.text", "\"a\", \"b\"", "\"\\q\""}) {
+            std::string source =
+                "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard "
+                "!frame.text.";
+            source += method;
+            source += "(";
+            source += argument;
+            source += ") else { frame.drop() }\n frame.forward()\n} }\n";
+            auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+            REQUIRE(lexed);
+            auto ast = parse_file_heap(lexed.value());
+            REQUIRE(ast);
+            auto hir = analyze_file_heap(ast.value());
+            if (strcmp(argument, "\"a\\0b\"") == 0) {
+                REQUIRE(hir);
+                const auto& nodes = hir->routes[0].ws_handler.len_guards;
+                REQUIRE_EQ(nodes.len, 1u);
+                CHECK(nodes[0].accessor == (method[3] == 'P' ? WsLenGuard::Accessor::TextPrefix
+                                                             : WsLenGuard::Accessor::TextSuffix));
+                CHECK(nodes[0].negate);
+                REQUIRE_EQ(nodes[0].pattern.len, 3u);
+                CHECK_EQ(nodes[0].pattern.ptr[1], '\0');
+            } else {
+                CHECK(!hir);
+            }
+        }
     }
 }
 

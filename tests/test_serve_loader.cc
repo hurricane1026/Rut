@@ -4769,6 +4769,49 @@ TEST(serve_loader, websocket_terminate_text_literal_conditions) {
     }
 }
 
+TEST(serve_loader, websocket_terminate_text_prefix_suffix) {
+    const u8 embedded[] = {'a', 0, 'b'};
+    const u8 middle[] = {'x', 'a', 0, 'b', 'y'};
+    const u8 prefix[] = {'a', 0, 'b', 'x'};
+    const u8 suffix[] = {'x', 'a', 0, 'b'};
+    const u8* payloads[] = {nullptr, embedded, middle, prefix, suffix, embedded};
+    const u64 lengths[] = {0, 3, 5, 4, 4, 2};
+    for (const char* method : {"hasPrefix", "hasSuffix"}) {
+        for (bool empty : {false, true}) {
+            for (bool negate : {false, true}) {
+                std::string source =
+                    "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+                    "websocket(backend) { frame in\n guard ";
+                if (negate) source += "!";
+                source += "frame.text.";
+                source += method;
+                source += empty ? "(\"\")" : "(\"a\\0b\")";
+                source += " else { frame.drop() }\n frame.forward()\n} }\n";
+                const auto path = write_file("/tmp/rut_ws_affix", "app.rut", source.c_str());
+                LoadedProgram program;
+                LoadError err;
+                REQUIRE(load_rut_program(path.c_str(), program, err));
+                const auto handler = program.config.routes[0].ws_frame_handler;
+                REQUIRE(handler);
+                for (u32 i = 0; i < 6; i++) {
+                    const bool matches = empty || i == 1 || (method[3] == 'P' ? i == 3 : i == 4);
+                    for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                        for (bool from_client : {false, true}) {
+                            CHECK(handler(nullptr, op, payloads[i], lengths[i], from_client) ==
+                                  ((matches != negate) ? WsFrameAction::Forward
+                                                       : WsFrameAction::Drop));
+                        }
+                    }
+                }
+                // Short messages must fail before dereferencing payload, including suffix offsets.
+                CHECK(handler(nullptr, WsOpcode::Text, nullptr, 2, true) ==
+                      ((empty != negate) ? WsFrameAction::Forward : WsFrameAction::Drop));
+                program.destroy();
+            }
+        }
+    }
+}
+
 TEST(serve_loader, websocket_terminate_text_literal_short_circuit) {
     const auto path =
         write_file("/tmp/rut_serve_loader_ws_literal_short_circuit",

@@ -2828,8 +2828,8 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 6 || guards[i].cmp > 2 || guards[i].verdict > 2) return false;
-        if ((guards[i].accessor == 3 || guards[i].accessor == 6) && guards[i].pattern_len != 0 &&
+        if (guards[i].accessor > 8 || guards[i].cmp > 2 || guards[i].verdict > 2) return false;
+        if ((guards[i].accessor == 3 || guards[i].accessor >= 6) && guards[i].pattern_len != 0 &&
             !guards[i].pattern)
             return false;
         if (guards[i].accessor == 4 || guards[i].accessor == 5) {
@@ -2918,16 +2918,17 @@ bool emit_ws_handler(LLVMModuleRef mod,
             LLVMValueRef is_match =
                 LLVMBuildICmp(builder, LLVMIntNE, r, LLVMConstInt(i8_ty, 0, 0), "rx.m");
             cond = is_match;
-        } else if (guards[i].accessor == 6) {  // TextEqual
-            // Check the full 64-bit length before narrowing for the shared string
-            // helper. A forged large length must not alias a small literal length.
+        } else if (guards[i].accessor >= 6) {  // TextEqual / TextPrefix / TextSuffix
+            // Check the full 64-bit length before reading a literal-sized view.
+            // Prefix/suffix comparisons never read beyond a short message.
             LLVMBasicBlockRef compare = LLVMAppendBasicBlockInContext(ctx, fn, "text.equal");
-            LLVMValueRef same_len = LLVMBuildICmp(builder,
-                                                  LLVMIntEQ,
-                                                  len,
-                                                  LLVMConstInt(i64_ty, guards[i].pattern_len, 0),
-                                                  "text.len");
-            LLVMBuildCondBr(builder, same_len, compare, no);
+            LLVMValueRef length_matches =
+                LLVMBuildICmp(builder,
+                              guards[i].accessor == 6 ? LLVMIntEQ : LLVMIntUGE,
+                              len,
+                              LLVMConstInt(i64_ty, guards[i].pattern_len, 0),
+                              "text.len");
+            LLVMBuildCondBr(builder, length_matches, compare, no);
             LLVMPositionBuilderAtEnd(builder, compare);
             LLVMValueRef literal = LLVMBuildGlobalStringPtr(builder, "", "text.empty");
             if (guards[i].pattern_len != 0) {
@@ -2944,7 +2945,14 @@ bool emit_ws_handler(LLVMModuleRef mod,
             LLVMValueRef eq_fn = LLVMGetNamedFunction(mod, "rut_helper_str_eq");
             if (!eq_fn) eq_fn = LLVMAddFunction(mod, "rut_helper_str_eq", eq_ty);
             LLVMValueRef size = LLVMConstInt(i32_ty, guards[i].pattern_len, 0);
-            LLVMValueRef args[4] = {payload, size, literal, size};
+            LLVMValueRef compared_payload = payload;
+            if (guards[i].pattern_len != 0 && guards[i].accessor == 8) {
+                // Only form the suffix view after the full-width length check.
+                LLVMValueRef offset = LLVMBuildSub(
+                    builder, len, LLVMConstInt(i64_ty, guards[i].pattern_len, 0), "suffix.offset");
+                compared_payload = LLVMBuildGEP2(builder, i8_ty, payload, &offset, 1, "suffix");
+            }
+            LLVMValueRef args[4] = {compared_payload, size, literal, size};
             LLVMValueRef equal = LLVMBuildCall2(builder, eq_ty, eq_fn, args, 4, "text.eq");
             cond =
                 LLVMBuildICmp(builder, LLVMIntNE, equal, LLVMConstInt(i8_ty, 0, 0), "text.match");

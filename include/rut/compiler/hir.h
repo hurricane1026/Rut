@@ -1085,13 +1085,23 @@ enum class WsVerdict : u8 {
 // direction or payload predicates; And/Or nodes combine earlier child nodes. Only roots
 // are source guards and yield their else verdict when false.
 struct WsLenGuard {
-    enum class Accessor : u8 { Len, Opcode, FromClient, TextMatch, And, Or, TextEqual };
+    enum class Accessor : u8 {
+        Len,
+        Opcode,
+        FromClient,
+        TextMatch,
+        And,
+        Or,
+        TextEqual,
+        TextPrefix,
+        TextSuffix
+    };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
     Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
     u32 bound = 0;  // Len: the byte literal frame.len is compared to. Opcode: the WsOpcode value.
-    // TextMatch/TextEqual: regex or decoded literal, valid through codegen.
+    // TextMatch/TextEqual/TextPrefix/TextSuffix: regex or decoded literal, valid through codegen.
     Str pattern{};
     bool negate = false;  // invert this node's condition, including an entire subtree
     // Compound conditions reference earlier nodes in the handler's postorder array.
