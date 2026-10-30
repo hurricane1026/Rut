@@ -5654,7 +5654,7 @@ TEST(frontend, analyze_websocket_guard_close_rejects_invalid_arguments) {
                                 "frame.close(frame.len)",
                                 "frame.close(1008, frame.text)",
                                 "frame.close(1008, \"\\(frame.len)\")",
-                                "frame.forward(frame.text)"}) {
+                                "frame.forward(frame.text + frame.text)"}) {
         std::string source =
             "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard frame.isText "
             "else { ";
@@ -6115,6 +6115,99 @@ TEST(frontend, analyze_websocket_rewrite_rejects_dynamic_and_oversize_text) {
         REQUIRE(ast);
         CHECK_FALSE(analyze_file_heap(ast.value()));
     }
+}
+
+TEST(frontend, websocket_text_affix_rewrite_analyzes_bounded_concatenation) {
+    const char* expressions[] = {"frame.text",
+                                 "\"pre\" + frame.text",
+                                 "frame.text + \"end\"",
+                                 "\"a\" + (\"b\" + frame.text) + (\"c\" + \"d\")",
+                                 "\"a\" + \"b\""};
+    const Str prefixes[] = {{}, {"pre", 3}, {}, {"ab", 2}, {"ab", 2}};
+    const Str suffixes[] = {{}, {}, {"end", 3}, {"cd", 2}, {}};
+    for (u32 i = 0; i < 5; i++) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\nframe.forward(";
+        source += expressions[i];
+        source += ") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& route = hir->routes[0];
+        const auto& recipe = route.ws_handler.forward_payload;
+        CHECK_EQ(recipe.include_payload, i != 4);
+        CHECK(route.exprs[recipe.prefix_expr].str_value.eq(prefixes[i]));
+        CHECK(route.exprs[recipe.suffix_expr].str_value.eq(suffixes[i]));
+    }
+}
+
+TEST(frontend, websocket_text_affix_rewrite_rejects_unbounded_or_unsupported_expressions) {
+    for (const char* expression : {"frame.text + frame.text",
+                                   "frame.text + frame.len",
+                                   "req.path + frame.text",
+                                   "frame.text.lowercased()",
+                                   "frame.text - \"x\"",
+                                   "\"\\(frame.text)\""}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\nframe.forward(";
+        source += expression;
+        source += ") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    for (u32 length : {4u, 5u}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4b) { frame "
+            "in\nframe.forward(\"";
+        source.append(length, 'x');
+        source += "\" + frame.text) } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())), length == 4);
+    }
+    std::string deep =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(frame.text";
+    for (u32 i = 0; i < 40; i++) deep += " + \"\"";
+    deep += ") } }\n";
+    auto tokens = lex({deep.data(), static_cast<u32>(deep.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, websocket_text_affix_node_budget_and_utf8_validation) {
+    for (u32 levels : {4u, 5u}) {
+        std::string expr = "\"\"";
+        for (u32 i = 0; i < levels; i++) expr = "(" + expr + " + " + expr + ")";
+        expr.replace(expr.find("\"\""), 2, "frame.text");
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(" +
+            expr + ") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())), levels == 4);
+    }
+    std::string source =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(frame.text "
+        "+ \"";
+    source += static_cast<char>(0xff);
+    source += "\") } }\n";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
 }
 
 TEST(frontend, analyze_rejects_websocket_forward_two_args) {
@@ -41696,7 +41789,7 @@ TEST(frontend, websocket_guard_text_replacements_validate_literals_and_limits) {
     for (const char* verdict : {"frame.forward(\"\")",
                                 "frame.forward(\"a\\0b\")",
                                 "frame.forward(\"\\u{20ac}\")",
-                                "frame.forward(frame.text)",
+                                "frame.forward(frame.text + frame.text)",
                                 "frame.forward(1)",
                                 "frame.forward(\"a\", \"b\")",
                                 "frame.forward(\"\\(frame.len)\")"}) {

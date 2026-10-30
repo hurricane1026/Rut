@@ -4657,8 +4657,8 @@ TEST(serve_loader, websocket_terminate_rewrites_fixed_text) {
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
     const auto& route = program.config.routes[0];
-    REQUIRE_EQ(route.ws_forward_text.len, 14u);
-    CHECK(memcmp(route.ws_forward_text.ptr, "rewritten\0text", 14) == 0);
+    REQUIRE_EQ(route.ws_forward_text.prefix.len, 14u);
+    CHECK(memcmp(route.ws_forward_text.prefix.ptr, "rewritten\0text", 14) == 0);
     const auto handler = route.ws_frame_handler;
     REQUIRE(handler != nullptr);
     CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, true) == WsFrameAction::ForwardText);
@@ -4690,6 +4690,77 @@ TEST(serve_loader, websocket_terminate_rewrites_fixed_text) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_affix_rewrites_retain_independent_branch_and_default_views) {
+    const auto path =
+        write_file("/tmp/rut_ws_affix",
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
+                   " guard frame.text != \"a\" else { frame.forward(\"one\\0\" + frame.text + "
+                   "\"\\u{20ac}\") }\n"
+                   " guard frame.text != \"b\" else { frame.forward(frame.text + \"end\") }\n"
+                   " guard frame.text != \"c\" else { frame.forward(\"pre\" + frame.text) }\n"
+                   " guard frame.text != \"d\" else { frame.forward(\"fixed\") }\n"
+                   " frame.forward(\"[\" + frame.text + \"]\") } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+
+    REQUIRE_EQ(route.ws_forward_text_count, 4u);
+    const Str expected[] = {
+        {"one\0a\xe2\x82\xac", 8}, {"bend", 4}, {"prec", 4}, {"fixed", 5}, {"[e]", 3}};
+    for (u32 i = 0; i < 5; i++) {
+        WsInspector st;
+        st.forward_text = route.ws_forward_text;
+        st.forward_texts = route.ws_forward_texts;
+        st.forward_text_count = route.ws_forward_text_count;
+        st.max_message_size = route.ws_max_message_size;
+        const u8 input[] = {0x81, 1, static_cast<u8>('a' + i)};
+        u8 out[128], msg[32];
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           sizeof(input),
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           route.ws_frame_handler,
+                           nullptr,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        REQUIRE_EQ(produced, 2u + expected[i].len);
+        CHECK_EQ(out[0], 0x81u);
+        CHECK(memcmp(out + 2, expected[i].ptr, expected[i].len) == 0);
+    }
+
+    RouteConfig config;
+    const auto id = config.add_upstream("b", 0x7f000001, 9999);
+    REQUIRE(id.has_value());
+    const char bad[] = {static_cast<char>(0xff)};
+    const WsTextRewrite invalid[] = {
+        {{"abc", 3}, {"de", 2}, true}, {{}, {bad, 1}, true}, {{}, {nullptr, 1}, true}};
+    for (auto rewrite : invalid) {
+        CHECK_FALSE(config.add_ws_terminate(
+            "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, rewrite));
+        CHECK_FALSE(config.add_ws_terminate("/bad",
+                                            0,
+                                            id.value(),
+                                            route.ws_frame_handler,
+                                            4,
+                                            1000,
+                                            {},
+                                            {},
+                                            nullptr,
+                                            0,
+                                            &rewrite,
+                                            1));
+    }
+    CHECK_EQ(config.route_count, 0u);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_terminate_empty_rewrite_and_invalid_config) {
     const auto path = write_file(
         "/tmp/rut_serve_loader_ws_empty_rewrite",
@@ -4700,7 +4771,7 @@ TEST(serve_loader, websocket_terminate_empty_rewrite_and_invalid_config) {
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
     const auto& route = program.config.routes[0];
-    CHECK_EQ(route.ws_forward_text.len, 0u);
+    CHECK_EQ(route.ws_forward_text.prefix.len, 0u);
     CHECK(route.ws_frame_handler(nullptr, WsOpcode::Text, nullptr, 0, true) ==
           WsFrameAction::ForwardText);
     RouteConfig config;
@@ -6641,13 +6712,24 @@ TEST(serve_loader, websocket_guard_text_policies_reach_wire) {
     REQUIRE(id.has_value());
     const char bad[] = {static_cast<char>(0xff)};
     for (Str text : {Str{bad, 1}, Str{nullptr, 1}, Str{"large", 5}}) {
-        CHECK_FALSE(cfg.add_ws_terminate(
-            "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, nullptr, 0, &text, 1));
+        const WsTextRewrite rewrite{text};
+        CHECK_FALSE(cfg.add_ws_terminate("/bad",
+                                         0,
+                                         id.value(),
+                                         route.ws_frame_handler,
+                                         4,
+                                         1000,
+                                         {},
+                                         {},
+                                         nullptr,
+                                         0,
+                                         &rewrite,
+                                         1));
     }
     CHECK_FALSE(cfg.add_ws_terminate(
         "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, nullptr, 0, nullptr, 1));
     CHECK_FALSE(cfg.add_ws_terminate(
-        "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, nullptr, 0, texts, 5));
+        "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, {}, {}, nullptr, 0, nullptr, 5));
     CHECK_EQ(cfg.route_count, 0u);
     program.destroy();
 }

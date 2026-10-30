@@ -249,7 +249,7 @@ separate per-direction output buffer that modify/fragmentation also want (§8).
 
 ---
 
-## 6. Frame modify (fixed text implemented; dynamic expressions deferred)
+## 6. Frame modify (fixed replacements and bounded text affixes implemented)
 
 Current implementation: `frame.forward("literal")` in the final verdict or a guard
 else-branch replaces a reassembled data message with a Text message. Literal escape
@@ -260,7 +260,14 @@ guards select independent literals, with the first failing guard taking preceden
 Bare `frame.forward()` keeps the original message; control frames bypass rewriting.
 The output slices now support payload growth and backpressure in both directions.
 Replacement bytes are retained by the loaded program and relocated in native
-artifacts. Dynamic payload expressions, interpolation, binary rewrite, and
+artifacts. Bounded String concatenation such as
+`frame.forward("prefix" + frame.text + "suffix")` retains the original Text payload
+between fixed UTF-8 affixes. A recipe accepts at most 32 expression nodes and one
+payload reference. Repeated payload references, other dynamic expressions, and
+interpolation reject. Selected Binary messages fail the tunnel; use an opcode
+guard first. The output must fit both message and single-slice limits. Both views
+are pinned with the route and relocated by native artifacts (version 11); the
+runtime writes directly into the existing output slice. Binary rewrite and
 injection remain deferred. The rest of this section records the original design.
 
 

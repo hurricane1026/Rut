@@ -17,19 +17,24 @@ bool emit_frame(u8* out,
                 const u8* payload,
                 u64 len,
                 bool masked,
-                u64& mask_rng) {
+                u64& mask_rng,
+                Str prefix = {},
+                Str suffix = {}) {
     u8 key[4] = {0, 0, 0, 0};
     (void)mask_rng;  // Retained for compatibility with the existing inspector API.
     if (masked && RAND_bytes(key, sizeof(key)) != 1) return false;
     u8 hdr[kWsMaxHeaderSize];
-    const u32 hdr_len = ws_write_header(hdr, op, /*fin=*/true, masked, key, len);
+    const u64 output_len = len + prefix.len + suffix.len;
+    const u32 hdr_len = ws_write_header(hdr, op, /*fin=*/true, masked, key, output_len);
     if (hdr_len == 0) return false;
-    if (*produced + hdr_len + len > out_cap) return false;
+    if (*produced + hdr_len + output_len > out_cap) return false;
     for (u32 i = 0; i < hdr_len; i++) out[*produced + i] = hdr[i];
     u8* dst = out + *produced + hdr_len;
-    for (u64 i = 0; i < len; i++) dst[i] = payload[i];
-    if (masked) ws_unmask(dst, len, key);
-    *produced += hdr_len + static_cast<u32>(len);
+    for (u32 i = 0; i < prefix.len; i++) dst[i] = static_cast<u8>(prefix.ptr[i]);
+    for (u64 i = 0; i < len; i++) dst[prefix.len + i] = payload[i];
+    for (u32 i = 0; i < suffix.len; i++) dst[prefix.len + len + i] = static_cast<u8>(suffix.ptr[i]);
+    if (masked) ws_unmask(dst, output_len, key);
+    *produced += hdr_len + static_cast<u32>(output_len);
     return true;
 }
 }  // namespace
@@ -37,6 +42,13 @@ bool emit_frame(u8* out,
 bool ws_valid_text_payload(Str text) {
     return (text.ptr || text.len == 0) &&
            utf8_valid(reinterpret_cast<const u8*>(text.ptr), text.len);
+}
+
+bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
+    const u64 literal_size = static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len;
+    return literal_size <= kWsTerminateMessageCapacity &&
+           (max_size == 0 || literal_size <= max_size) && ws_valid_text_payload(rewrite.prefix) &&
+           ws_valid_text_payload(rewrite.suffix);
 }
 
 bool ws_valid_close_reason(Str reason) {
@@ -112,10 +124,16 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // frame and the assembler state untouched for the next call.
         if (*produced != 0) {
             const u64 original_size = st.message_len + h.payload_len;
-            u64 data_size =
-                original_size > st.forward_text.len ? original_size : st.forward_text.len;
-            for (u32 i = 0; i < st.forward_text_count; i++)
-                if (st.forward_texts[i].len > data_size) data_size = st.forward_texts[i].len;
+            auto rewritten_size = [original_size](const WsTextRewrite& rewrite) {
+                return static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len +
+                       (rewrite.include_payload ? original_size : 0);
+            };
+            u64 data_size = rewritten_size(st.forward_text);
+            if (original_size > data_size) data_size = original_size;
+            for (u32 i = 0; i < st.forward_text_count; i++) {
+                const u64 size = rewritten_size(st.forward_texts[i]);
+                if (size > data_size) data_size = size;
+            }
             u32 reason_size = st.close_reason.len;
             for (u32 i = 0; i < st.close_policy_count; i++)
                 if (st.close_policies[i].reason.len > reason_size)
@@ -221,19 +239,25 @@ WsInspectStatus ws_inspect(WsInspector& st,
         } else if (action == WsFrameAction::ForwardText || policy_forward) {
             // Input has already been reassembled and validated. Output owns a
             // separate slice, so replacement may grow without overwriting input.
-            const Str replacement = policy_forward
-                                        ? st.forward_texts[action_value - first_text_policy]
-                                        : st.forward_text;
-            if ((st.max_message_size != 0 && replacement.len > st.max_message_size) ||
-                !ws_valid_text_payload(replacement) ||
+            const WsTextRewrite& rewrite = policy_forward
+                                               ? st.forward_texts[action_value - first_text_policy]
+                                               : st.forward_text;
+            const u64 payload_size = rewrite.include_payload ? total : 0;
+            const u64 output_size = payload_size + rewrite.prefix.len + rewrite.suffix.len;
+            if (!ws_valid_text_rewrite(rewrite, st.max_message_size) ||
+                (rewrite.include_payload && msg_op != WsOpcode::Text) ||
+                output_size > kWsTerminateMessageCapacity ||
+                (st.max_message_size != 0 && output_size > st.max_message_size) ||
                 !emit_frame(out,
                             out_cap,
                             produced,
                             WsOpcode::Text,
-                            reinterpret_cast<const u8*>(replacement.ptr),
-                            replacement.len,
+                            msg_buf,
+                            payload_size,
                             st.masked,
-                            st.mask_rng))
+                            st.mask_rng,
+                            rewrite.prefix,
+                            rewrite.suffix))
                 return WsInspectStatus::Error;
         } else if (action == WsFrameAction::Close || policy_close) {
             const WsClosePolicy selected = policy_close
