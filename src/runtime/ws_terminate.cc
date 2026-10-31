@@ -1,10 +1,22 @@
 #include "rut/runtime/ws_terminate.h"
 
+#include "rut/common/types.h"
 #include "rut/common/utf8.h"
+#include "rut/runtime/json.h"
 
 #include <openssl/rand.h>
 
 namespace rut {
+
+bool ws_valid_json_payload(const u8* payload, u64 len) {
+    // One bounded workspace per worker thread. Never narrow an unchecked message length.
+    if (!payload || len > json::kMaxBytes) return false;
+    thread_local json::Document document;
+    const bool kValid =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    document.source = {};  // do not retain a borrowed message view between callbacks
+    return kValid;
+}
 
 namespace {
 // Re-serialize one frame (header + `len`-byte cleartext payload) into out[*produced..],

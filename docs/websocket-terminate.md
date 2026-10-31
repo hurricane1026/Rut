@@ -41,6 +41,19 @@ The binding is `{ message in ... }`. The former `{ frame in ... }` syntax and
 `.opcode` comparisons are rejected. Use `isText` / `isBinary` for message types.
 There is no public FIN, mask, continuation, Ping or Pong accessor.
 
+## Bounded JSON validation
+
+`guard json.parse(message.text) != nil else { message.close(1007) }` rejects
+messages whose payload fails the existing JSON parser. `== nil`, mirrored operand
+order and logical conditions are supported. A JSON `null` document is valid and
+is distinct from a parse failure. The handler does not gain a bound `Json` value.
+
+The parser limits remain 8 KiB input, 2048 nodes and depth 64; exceeding any limit
+fails validation. Duplicate decoded object keys are rejected. For Text-only
+validation, combine the condition with `message.isText`; ordinary payload text
+predicates continue to operate on raw bytes. Validation happens after reassembly,
+so fragmentation cannot turn a malformed complete JSON message into valid pieces.
+
 ## Runtime boundary
 
 The engine unmasks and reassembles data frames before calling the message

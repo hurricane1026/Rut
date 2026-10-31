@@ -2828,11 +2828,11 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 9 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 10 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
-        if ((guards[i].accessor == 3 || guards[i].accessor >= 6) && guards[i].pattern_len != 0 &&
-            !guards[i].pattern)
+        if ((guards[i].accessor == 3 || (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
+            guards[i].pattern_len != 0 && !guards[i].pattern)
             return false;
         if (guards[i].accessor == 4 || guards[i].accessor == 5) {
             const u32 children[2] = {guards[i].lhs, guards[i].rhs};
@@ -2893,7 +2893,15 @@ bool emit_ws_handler(LLVMModuleRef mod,
             return;
         }
         LLVMValueRef cond;
-        if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
+        if (guards[i].accessor == 10) {  // JsonValid: bounded syntax validation only.
+            LLVMTypeRef json_params[2] = {ptr_ty, i64_ty};
+            LLVMTypeRef json_ty = LLVMFunctionType(i8_ty, json_params, 2, 0);
+            LLVMValueRef json_fn = LLVMGetNamedFunction(mod, "rut_helper_ws_json_valid");
+            if (!json_fn) json_fn = LLVMAddFunction(mod, "rut_helper_ws_json_valid", json_ty);
+            LLVMValueRef args[2] = {payload, len};
+            LLVMValueRef valid = LLVMBuildCall2(builder, json_ty, json_fn, args, 2, "json.valid");
+            cond = LLVMBuildICmp(builder, LLVMIntNE, valid, LLVMConstInt(i8_ty, 0, 0), "json.ok");
+        } else if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
             // Emit the pattern + db globals JIT finalization compiles & back-patches. The `ws<id>`
             // suffix keeps these distinct from the HTTP regex globals already in this module.
             char pat_name[96];

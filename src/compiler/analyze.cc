@@ -7268,7 +7268,26 @@ static Str ws_message_text_match_pattern(const AstExpr& cond) {
 static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond,
                                                              WsVerdict verdict,
                                                              bool negate,
-                                                             const HirModule& mod) {
+                                                             const HirModule& mod,
+                                                             const HirRoute& route) {
+    // Reuse the ordinary optional-JSON syntax without materializing a document value.
+    if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
+        const AstExpr* call = cond.rhs->kind == AstExprKind::Nil   ? cond.lhs
+                              : cond.lhs->kind == AstExprKind::Nil ? cond.rhs
+                                                                   : nullptr;
+        if (call && call->kind == AstExprKind::MethodCall && call->lhs &&
+            call->lhs->kind == AstExprKind::Ident && call->lhs->name.eq(lit_str("json")) &&
+            call->name.eq(lit_str("parse")) && call->args.len == 1 && call->args[0] &&
+            ws_is_message_field(*call->args[0], lit_str("text")) &&
+            !user_bound_ident_name(
+                mod, route.locals.data, route.locals.len, nullptr, lit_str("json"))) {
+            WsLenGuard g{};
+            g.accessor = WsLenGuard::Accessor::JsonValid;
+            g.negate = !negate;  // parse(...) == nil is the inverse of valid JSON.
+            g.verdict = verdict;
+            return g;
+        }
+    }
     // Literal comparison is byte-exact, like ordinary string equality. Reuse the
     // expression decoder so escapes and embedded NULs have the same semantics.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
@@ -7361,28 +7380,29 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
 // are evaluated by short-circuit branches in the message-handler JIT.
 static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
                                                      WsVerdict verdict,
-                                                     HirWsHandler& handler,
+                                                     HirRoute& route,
                                                      const HirModule& mod,
                                                      bool is_operand = false,
                                                      bool negate = false,
                                                      u32 depth = 0) {
+    auto& handler = route.ws_handler;
     if (depth >= HirWsHandler::kMaxConditionNodes)
         return frontend_error(FrontendError::TooManyItems, cond.span);
     // The ordinary parser desugars !x, !=, <= and >= to (predicate == false).
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs &&
         cond.rhs->kind == AstExprKind::BoolLit && !cond.rhs->bool_value) {
         return analyze_message_condition(
-            *cond.lhs, verdict, handler, mod, is_operand, !negate, depth + 1);
+            *cond.lhs, verdict, route, mod, is_operand, !negate, depth + 1);
     }
     WsLenGuard node{};
     if (cond.kind == AstExprKind::And || cond.kind == AstExprKind::Or) {
         if (!cond.lhs || !cond.rhs)
             return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
         auto lhs =
-            analyze_message_condition(*cond.lhs, verdict, handler, mod, true, false, depth + 1);
+            analyze_message_condition(*cond.lhs, verdict, route, mod, true, false, depth + 1);
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs =
-            analyze_message_condition(*cond.rhs, verdict, handler, mod, true, false, depth + 1);
+            analyze_message_condition(*cond.rhs, verdict, route, mod, true, false, depth + 1);
         if (!rhs) return core::make_unexpected(rhs.error());
         node.accessor =
             cond.kind == AstExprKind::And ? WsLenGuard::Accessor::And : WsLenGuard::Accessor::Or;
@@ -7391,7 +7411,7 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
         node.negate = negate;
         node.verdict = verdict;
     } else {
-        auto leaf = analyze_message_guard_cond(cond, verdict, negate, mod);
+        auto leaf = analyze_message_guard_cond(cond, verdict, negate, mod, route);
         if (!leaf) return core::make_unexpected(leaf.error());
         node = leaf.value();
     }
@@ -13131,7 +13151,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                           gs ? gs->span : body->span);
                 auto gv = analyze_message_guard_verdict(gs->else_stmt->expr, *route, mod);
                 if (!gv) return core::make_unexpected(gv.error());
-                auto g = analyze_message_condition(gs->expr, gv.value(), route->ws_handler, mod);
+                auto g = analyze_message_condition(gs->expr, gv.value(), *route, mod);
                 if (!g) return core::make_unexpected(g.error());
             }
             const AstStatement* last = body->block_stmts[stmt_count - 1];

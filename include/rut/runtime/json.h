@@ -254,6 +254,7 @@ struct Document {
     }
     Str raw(u32 i) const { return source.slice(nodes[i].start, nodes[i].end); }
     bool string(u32 i, Writer& w) const {
+        if (i >= count || i >= kMaxNodes) return false;
         u32 start = nodes[i].start;
         return nodes[i].kind == Kind::String && decode(source, start, w);
     }

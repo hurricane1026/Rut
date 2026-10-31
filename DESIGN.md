@@ -2715,6 +2715,24 @@ connection policy action: the runtime performs the Close handshake with both
 peers. No action exposes raw control-frame construction. Text rewrite recipes
 and text predicates follow the constraints described above.
 
+**Message JSON validation.** A handler condition may compare
+`json.parse(message.text)` with `nil`, in either operand order, using `==` or `!=`.
+This reuses the ordinary optional-JSON syntax; JSON null remains a successful
+parse. The condition composes with message type/direction guards and the existing
+short-circuit condition forest. It does not materialize or bind a JSON value in
+handler scope, and calls shadowing the `json` namespace are rejected.
+
+The native/JIT helper validates the complete unmasked, reassembled payload with
+the existing JSON parser and a bounded workspace per worker thread. It accepts
+at most 8192 bytes, 2048 nodes and depth 64, rejects duplicate decoded object
+keys, and clears its borrowed payload view before returning. Over-limit input
+is a parse failure; `maxMessageSize` does not raise the JSON parser limits. Raw
+binary payloads follow the same byte-oriented text-access semantics; policies
+that validate only Text messages should explicitly check `message.isText`.
+The full 64-bit message length is checked before narrowing. No message-time heap
+allocation, new dependency, runtime layout, or native artifact version change
+is needed; native artifacts reference the exported validation helper.
+
 **Runtime semantics (passthrough tunnel).**
 
 The runtime implements transparent **passthrough** and a bounded terminate mode

@@ -246,6 +246,35 @@ TEST(native_program, timer_cache_activation_and_fail_closed) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_json_validation_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard !message.fromClient || !message.isText || json.parse(message.text) != nil else {
+  message.close(1007, "invalid JSON")
+ }
+ message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    const auto handler = route.ws_frame_handler;
+    REQUIRE(handler);
+    const u8 valid[] = {'n', 'u', 'l', 'l'};
+    const u8 invalid[] = {'{'};
+    CHECK(handler(nullptr, WsOpcode::Text, valid, sizeof(valid), true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, invalid, sizeof(invalid), true) ==
+          WsFrameAction::ClosePolicy0);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0x100000000ULL, false) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, invalid, sizeof(invalid), true) ==
+          WsFrameAction::Forward);
+    REQUIRE_EQ(route.ws_close_policy_count, 1u);
+    CHECK_EQ(route.ws_close_policies[0].code, 1007u);
+}
+
 TEST(native_program, websocket_rewrite_survives_compiler_exit_and_source_removal) {
     Source source;
     REQUIRE(

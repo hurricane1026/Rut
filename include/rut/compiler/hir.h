@@ -1103,7 +1103,8 @@ struct WsLenGuard {
         TextEqual,
         TextPrefix,
         TextSuffix,
-        TextContains
+        TextContains,
+        JsonValid
     };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
