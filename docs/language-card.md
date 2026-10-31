@@ -1773,6 +1773,22 @@ revokes membership. Client identity/group headers never populate the registry.
 `requireGroup` checks one group. See `examples/consumer-group-auth.rut` (relative
 to the repository root).
 
+`denyGroup(identity, denied, first, second)` rejects one exact group;
+`denyAnyGroup(identity, firstDenied, secondDenied, first, second)` rejects either
+of two exact groups. Both preserve the full verified identity on success. The
+Consumer must exist in the same trusted two-Consumer snapshot: an unregistered
+Consumer receives 403 even when neither denied group matches. A registered
+Consumer with no memberships may pass a deny check. Empty denied names, empty
+or duplicate Consumer IDs, and duplicate nonempty memberships within a record
+are configuration errors (503); repeating a denied name is valid and idempotent.
+Authenticate first, then chain deny checks before allow checks: a Consumer in
+both an allowed and denied group still receives 403. Missing, malformed or
+duplicate credentials remain 401, and an anonymous identity is not implicitly
+registered. Membership names are case-sensitive exact bytes, not prefixes.
+See [the deny-policy example](../examples/consumer-group-deny-auth.rut). These
+ordinary functions require a verified identity; they do not establish its origin
+or provide dynamic membership storage.
+
 
 ### RS256 with a configured trust policy
 

@@ -383,6 +383,30 @@ func requireAnyGroup(_ identity: Identity, _ firstRequired: str, _ secondRequire
     identity
 }
 
+// Deny either exact group, but only after finding the verified Consumer in
+// the trusted snapshot. Unknown Consumers fail closed even for a deny policy.
+// A known Consumer with both membership slots disabled may pass this check.
+func denyAnyGroup(_ identity: Identity, _ firstDenied: str, _ secondDenied: str,
+                  _ first: ConsumerGroups, _ second: ConsumerGroups) -> Identity {
+    guard firstDenied != "" && secondDenied != "" && validGroupMember(first) &&
+        validGroupMember(second) && first.consumerId != second.consumerId else { respond 503 }
+    let firstDeniedMember = identity.consumerId == first.consumerId &&
+        (firstDenied == first.first || firstDenied == first.second ||
+         secondDenied == first.first || secondDenied == first.second)
+    let secondDeniedMember = identity.consumerId == second.consumerId &&
+        (firstDenied == second.first || firstDenied == second.second ||
+         secondDenied == second.first || secondDenied == second.second)
+    guard (identity.consumerId == first.consumerId || identity.consumerId == second.consumerId) &&
+        !firstDeniedMember && !secondDeniedMember else { respond 403 }
+    identity
+}
+
+// Chain before allow policies so a denied membership cannot be overridden.
+func denyGroup(_ identity: Identity, _ denied: str,
+               _ first: ConsumerGroups, _ second: ConsumerGroups) -> Identity {
+    denyAnyGroup(identity, denied, denied, first, second)
+}
+
 // policy is trusted compile-time JSON (literal, constant, or env snapshot):
 // {"issuer":"...","audience":"...","kids":["..."],"jwks":{"keys":[...]}}.
 // Unlike jwtDocumentHs*, this verifies issuer/audience/time/sub before returning.

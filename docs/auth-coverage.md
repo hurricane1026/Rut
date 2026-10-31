@@ -18,7 +18,7 @@ whether a competing open-source edition includes them.
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification | HS256/384/512 policy helpers; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper | ES keys, remote JWKS refresh/cache, live and durable token revocation |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks durable replay persistence |
-| ACL / Consumer restriction | Exact single-consumer allow/deny and two-consumer allow union after verification | Multiple groups, membership lifecycle, registry-backed default deny, no client identity spoofing |
+| ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either-group allow and deny with deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
 | Forward auth / OPA | Pending | Consume bounded external response, identity allowlist, strip spoofed identity, deny vs unavailable, timeout/cancellation/close in both backends |
@@ -204,6 +204,30 @@ The JIT matrix covers successful single and either-group membership, default
 deny, invalid and duplicate credentials, empty slots and required names,
 duplicate groups or Consumer IDs, Consumer ID case mismatches and spoofed
 identity/group headers. See `examples/consumer-group-auth.rut`.
+
+### Explicit group denial and precedence
+
+`auth.denyGroup(identity, denied, first, second)` rejects a single exact group;
+`auth.denyAnyGroup(identity, firstDenied, secondDenied, first, second)` rejects
+either group. Both use the same trusted membership snapshot and preserve the
+verified Consumer, credential ID and method on success. Unknown Consumers deny
+with 403 rather than bypassing the policy; a registered Consumer with no groups
+can pass. Empty denied names and invalid membership records return 503, even if
+the invalid record belongs to a different Consumer. Repeated denied names are
+idempotent; names remain case-sensitive with no prefix or wildcard matching.
+
+Run authentication first and denial before an allow check. A Consumer belonging
+to both a denied and allowed group receives 403; missing, malformed or duplicate
+credentials still receive 401. Anonymous identities are not implicitly added to
+the membership registry. Removing a denied membership can permit a registered
+Consumer again; removing the Consumer record does not grant access. This remains
+a compiled-in, bounded policy, not a dynamic registry or membership lifecycle.
+
+The JIT request matrix covers Bearer/Basic metadata preservation, both Consumer
+positions and membership slots, case/prefix distinctions, empty slots, malformed
+configuration, spoofed identity/group headers, deny-before-allow composition,
+unknown verified Consumers and optional-auth guests. See
+[the runnable example](../examples/consumer-group-deny-auth.rut).
 
 ## Implementation order and gates
 

@@ -24757,6 +24757,213 @@ TEST(jit, consumer_groups_bind_verified_identity_and_default_deny) {
     rir.destroy();
 }
 
+TEST(jit, consumer_group_denials_preserve_identity_and_take_precedence) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/consumer-group-deny-auth.rut";
+    const auto member = [](const char* id, const char* first, const char* second) {
+        return std::string("auth.ConsumerGroups(consumerId: \"") + id + "\", first: \"" + first +
+               "\", second: \"" + second + "\")";
+    };
+    const std::string alice = member("alice", "ops", "suspended");
+    const std::string bob = member("bob", "ops", "");
+    const std::string members = alice + ", " + bob;
+    struct Policy {
+        std::string expression;
+        u16 alice_status;
+        u16 bob_status;
+    };
+    const Policy policies[] = {
+        {"auth.denyGroup(identity, \"suspended\", " + members + ")", 403, 204},
+        {"auth.denyGroup(identity, \"ops\", " + members + ")", 403, 403},
+        {"auth.denyGroup(identity, \"Suspended\", " + members + ")", 204, 204},
+        {"auth.denyGroup(identity, \"suspend\", " + members + ")", 204, 204},
+        {"auth.denyGroup(identity, \"\", " + members + ")", 503, 503},
+        {"auth.denyAnyGroup(identity, \"quarantined\", \"suspended\", " + members + ")", 403, 204},
+        {"auth.denyAnyGroup(identity, \"suspended\", \"quarantined\", " + members + ")", 403, 204},
+        {"auth.denyAnyGroup(identity, \"suspended\", \"ops\", " + members + ")", 403, 403},
+        {"auth.denyAnyGroup(identity, \"other\", \"other\", " + members + ")", 204, 204},
+        {"auth.denyAnyGroup(identity, \"\", \"suspended\", " + members + ")", 503, 503},
+        {"auth.denyAnyGroup(identity, \"suspended\", \"\", " + members + ")", 503, 503},
+        {"auth.denyGroup(identity, \"other\", " + alice + ", " + alice + ")", 503, 503},
+        {"auth.denyGroup(identity, \"other\", " + member("alice", "ops", "ops") + ", " + bob + ")",
+         503,
+         503},
+        {"auth.denyAnyGroup(identity, \"other\", \"absent\", " + alice + ", " +
+             member("bob", "ops", "ops") + ")",
+         503,
+         503},
+        {"auth.denyGroup(identity, \"other\", " + member("", "ops", "") + ", " + bob + ")",
+         503,
+         503},
+        {"auth.denyAnyGroup(identity, \"other\", \"absent\", " + alice + ", " +
+             member("", "ops", "") + ")",
+         503,
+         503},
+        {"auth.denyGroup(identity, \"other\", " + member("Alice", "ops", "") + ", " + bob + ")",
+         403,
+         204},
+        {"auth.denyGroup(identity, \"suspended\", " + member("alice", "", "") + ", " +
+             member("bob", "", "") + ")",
+         204,
+         204},
+        {"auth.denyGroup(identity, \"suspended\", " + member("bob", "suspended", "ops") + ", " +
+             member("alice", "ops", "") + ")",
+         204,
+         403},
+        {"auth.requireAnyGroup(auth.denyGroup(identity, \"suspended\", " + members +
+             "), \"ops\", \"suspended\", " + members + ")",
+         403,
+         204},
+        {"auth.requireGroup(auth.denyAnyGroup(identity, \"quarantined\", \"ops\", " + members +
+             "), \"ops\", " + members + ")",
+         403,
+         403},
+        {"auth.denyAnyGroup(identity, \"quarantined\", \"suspended\", " +
+             member("alice", "ops", "") + ", " + member("bob", "ops", "suspended") + ")",
+         204,
+         403},
+    };
+    const std::string credentials = R"rut(
+        auth.ConsumerCredentials(consumerId: "alice", key: "a", credentials: "alice:pw", keyId: "ak", passwordId: "ap"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "b", credentials: "bob:pw", keyId: "bk", passwordId: "bp"))rut";
+    std::string source = "import \"middleware/auth.rut\"\n";
+    for (u32 i = 0; i < sizeof(policies) / sizeof(policies[0]); ++i) {
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        source +=
+            "let identity = auth.multiAuth(req.authorization.or(\"\"), " + credentials + ")\n";
+        source += "let allowed = " + policies[i].expression + "\n";
+        source +=
+            "guard allowed.consumerId == identity.consumerId && "
+            "allowed.credentialId == identity.credentialId && allowed.method == identity.method "
+            "else { return 500 }\n return 204\n}\n";
+    }
+    source +=
+        "route GET \"/unregistered\" {\n"
+        "let identity = auth.apiKey(req.authorization.or(\"\"), \"c\", \"carol\", \"ck\")\n"
+        "let allowed = auth.denyAnyGroup(identity, \"suspended\", \"quarantined\", " +
+        members + ")\n return 204\n}\n";
+    source +=
+        "route GET \"/anonymous\" {\n"
+        "let identity = auth.multiAuthOrAnonymous(req.headerCount(\"Authorization\"), "
+        "req.authorization.or(\"\"), " +
+        credentials +
+        ", \"guest\")\n"
+        "let allowed = auth.denyGroup(identity, \"suspended\", " +
+        members + ")\n return 204\n}\n";
+    source +=
+        "route GET \"/registered-guest\" {\n"
+        "let identity = auth.multiAuthOrAnonymous(req.headerCount(\"Authorization\"), "
+        "req.authorization.or(\"\"), " +
+        credentials +
+        ", \"guest\")\n"
+        "let allowed = auth.denyAnyGroup(identity, \"suspended\", \"quarantined\", " +
+        member("guest", "", "") + ", " + bob +
+        ")\n guard allowed.consumerId == identity.consumerId && "
+        "allowed.credentialId == identity.credentialId && allowed.method == identity.method "
+        "else { return 500 }\n return 204\n}\n";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr, "group deny: %.*s\n", hir.error().detail.len, hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    if (!mir)
+        std::fprintf(stderr,
+                     "group deny MIR code %d: %.*s at %u:%u\n",
+                     static_cast<int>(mir.error().code),
+                     mir.error().detail.len,
+                     mir.error().detail.ptr,
+                     mir.error().span.line,
+                     mir.error().span.col);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const auto check = [&](u32 route, const char* headers, u16 status) {
+        const std::string name = "handler_route_" + std::to_string(route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+        REQUIRE(handler != nullptr);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != status)
+            std::fprintf(stderr,
+                         "group deny route %u got %u expected %u\n",
+                         route,
+                         result.status_code,
+                         status);
+        CHECK_EQ(result.status_code, status);
+    };
+    for (u32 i = 0; i < sizeof(policies) / sizeof(policies[0]); ++i) {
+        check(i, "Authorization: Bearer a\r\n", policies[i].alice_status);
+        check(i, "Authorization: Basic YWxpY2U6cHc=\r\n", policies[i].alice_status);
+        check(i, "Authorization: Bearer b\r\n", policies[i].bob_status);
+        check(i, "Authorization: Basic Ym9iOnB3\r\n", policies[i].bob_status);
+        check(i,
+              "Authorization: Bearer a\r\nX-Consumer-ID: bob\r\nX-Consumer-Groups: ops\r\n",
+              policies[i].alice_status);
+        check(i, "", 401);
+        check(i, "Authorization:\r\n", 401);
+        check(i, "Authorization: Bearer wrong\r\n", 401);
+        check(i, "Authorization: Bearer a\r\nauthorization: Bearer b\r\n", 401);
+    }
+    const auto count = static_cast<u32>(sizeof(policies) / sizeof(policies[0]));
+    check(count, "Authorization: Bearer c\r\nX-Consumer-ID: bob\r\n", 403);
+    check(count, "Authorization: Bearer a\r\n", 401);
+    check(count + 1, "", 403);
+    check(count + 1, "Authorization: Bearer a\r\n", 403);
+    check(count + 1, "Authorization: Bearer b\r\n", 204);
+    check(count + 1, "Authorization:\r\n", 401);
+    check(count + 1, "Authorization: Bearer wrong\r\n", 401);
+    check(count + 1, "Authorization: Bearer b\r\nauthorization: Bearer b\r\n", 401);
+    check(count + 2, "", 204);
+    check(count + 2, "Authorization: Bearer a\r\n", 403);
+    check(count + 2, "Authorization: Bearer b\r\n", 204);
+    check(count + 2, "Authorization: Bearer wrong\r\n", 401);
+    check(count + 2, "Authorization: Bearer b\r\nauthorization: Bearer b\r\n", 401);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, consumer_group_deny_example_compiles) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/consumer-group-deny-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    const std::string source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, standard_webhook_identity_helper_rejects_ambiguous_headers_and_bad_config) {
     const char* source = R"rut(
 import "middleware/auth.rut"

@@ -8732,6 +8732,23 @@ receive 403; invalid configuration receives 503. Replacing the trusted snapshot
 revokes membership. Client identity/group headers never populate the registry.
 See `examples/consumer-group-auth.rut` (relative to the repository root).
 
+The same bounded registry supports explicit group denials:
+`denyGroup(identity, denied, first, second)` rejects one group, and
+`denyAnyGroup(identity, firstDenied, secondDenied, first, second)` rejects either
+group. Both return the original verified identity only when its Consumer is
+registered and none of its configured memberships matches a denied name.
+Unknown Consumers fail closed with 403; registered Consumers with empty
+membership slots may pass the deny policy. Matching remains exact and
+case-sensitive. Empty denied names, empty/duplicate Consumer IDs and duplicate
+nonempty memberships in either record fail configuration validation with 503,
+including records unrelated to the presented Consumer. Repeating a denied name
+is valid. Authenticate before applying these functions, then chain deny before
+allow: membership in an allowed group cannot override a preceding denial.
+Anonymous Consumers must be explicitly registered to pass a deny policy. This
+uses ordinary Rut functions and the existing snapshot; it adds no registry,
+client-header-derived membership or new language syntax. See
+`examples/consumer-group-deny-auth.rut` and the JIT negative matrix.
+
 
 ### Configured RS256 resource-server verification
 
