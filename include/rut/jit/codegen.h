@@ -50,7 +50,7 @@ struct WsLenGuardSpec {
                   //                                4=And, 5=Or (short-circuit child conditions)
                   //                                6=TextEqual (byte-exact literal equality)
                   //                                7=TextPrefix, 8=TextSuffix, 9=TextContains,
-                  //                                10=JsonValid
+                  //                                10=JsonValid, 11=JsonHasPath
     u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
     u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
                   // FromClient: 1 (client→upstream leg)

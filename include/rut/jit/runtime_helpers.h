@@ -224,6 +224,10 @@ rut::u8 rut_helper_str_contains(const char* text,
 
 // Validate a bounded complete JSON payload without publishing a document or allocating.
 rut::u8 rut_helper_ws_json_valid(const char* payload, rut::u64 len);
+rut::u8 rut_helper_ws_json_has_path(const char* payload,
+                                    rut::u64 len,
+                                    const char* path,
+                                    rut::u32 path_len);
 
 // Lexicographic string comparison. Returns <0, 0, >0 like strcmp.
 rut::i32 rut_helper_str_cmp(const char* a, rut::u32 a_len, const char* b, rut::u32 b_len);

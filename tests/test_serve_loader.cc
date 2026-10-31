@@ -4793,6 +4793,106 @@ TEST(serve_loader, websocket_terminate_empty_rewrite_and_invalid_config) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_json_fields_use_bound_document_and_pointer) {
+    const char* conditions[] = {"json.get(document, \"/name\") != nil",
+                                "nil != json.get(document, \"/name\")",
+                                "!(json.get(document, \"/name\") == nil)",
+                                "json.get(document, \"/name\") == nil",
+                                "json.get(document, \"/a~1b/~0/0\") != nil",
+                                "json.get(document, \"\") != nil",
+                                "!message.fromClient || (json.get(document, \"/name\") != nil && "
+                                "json.get(document, \"/a~1b/~0/0\") != nil)",
+                                "json.get(document, \"/\\0\") != nil"};
+    const char* payloads[] = {"{\"name\":null,\"a/b\":{\"~\":[false]},\"\\u0000\":0}",
+                              "{\"name\":false}",
+                              "{\"name\":0}",
+                              "{}",
+                              "null",
+                              "[]",
+                              "{",
+                              "{}x"};
+    for (u32 c = 0; c < 8; ++c) {
+        std::string source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard )rut";
+        source += conditions[c];
+        source += " else { message.close(1008) }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_json_fields", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto& route = program.config.routes[0];
+        const auto handler = route.ws_frame_handler;
+        REQUIRE(handler);
+        for (u32 i = 0; i < 8; ++i) {
+            for (bool client : {false, true}) {
+                for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+                    const bool present = c < 3              ? i < 3
+                                         : c == 3           ? i >= 3
+                                         : c == 4 || c == 7 ? i == 0
+                                         : c == 5           ? true
+                                                            : !client || i == 0;
+                    const auto expected = i >= 6    ? WsFrameAction::ClosePolicy0
+                                          : present ? WsFrameAction::Forward
+                                                    : WsFrameAction::ClosePolicy1;
+                    CHECK(handler(nullptr,
+                                  opcode,
+                                  reinterpret_cast<const u8*>(payloads[i]),
+                                  strlen(payloads[i]),
+                                  client) == expected);
+                }
+            }
+        }
+        CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0x100000002ULL, true) ==
+              WsFrameAction::ClosePolicy0);
+        REQUIRE_EQ(route.ws_close_policy_count, 2u);
+        CHECK_EQ(route.ws_close_policies[0].code, 1007u);
+        CHECK_EQ(route.ws_close_policies[1].code, 1008u);
+        if (c == 0) {
+            for (const char* payload : {"{\"name\":null}", "{}"}) {
+                WsInspector st;
+                st.close_policies = route.ws_close_policies;
+                st.close_policy_count = route.ws_close_policy_count;
+                u8 frames[64], out[64], message[64];
+                const u32 size = static_cast<u32>(strlen(payload));
+                frames[0] = 0x01;
+                frames[1] = 1;
+                frames[2] = static_cast<u8>(payload[0]);
+                frames[3] = 0x89;
+                frames[4] = 1;
+                frames[5] = 'p';
+                frames[6] = 0x80;
+                frames[7] = static_cast<u8>(size - 1);
+                memcpy(frames + 8, payload + 1, size - 1);
+                u32 consumed = 0, produced = 0;
+                const auto status = ws_inspect(st,
+                                               frames,
+                                               size + 7,
+                                               out,
+                                               sizeof(out),
+                                               message,
+                                               sizeof(message),
+                                               handler,
+                                               nullptr,
+                                               &consumed,
+                                               &produced);
+                CHECK_EQ(consumed, size + 7);
+                CHECK(out[0] == 0x89 && out[2] == 'p');
+                if (size > 2) {
+                    CHECK(status == WsInspectStatus::Ok);
+                    CHECK_EQ(produced, size + 5);
+                    CHECK(memcmp(out + 5, payload, size) == 0);
+                } else {
+                    CHECK(status == WsInspectStatus::Close);
+                    CHECK_EQ(st.echo_close_code, 1008u);
+                }
+            }
+        }
+        program.destroy();
+    }
+}
+
 TEST(serve_loader, websocket_json_validation_uses_complete_payloads) {
     const char* conditions[] = {"json.parse(message.text) != nil",
                                 "nil != json.parse(message.text)",

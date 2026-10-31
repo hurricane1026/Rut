@@ -45,6 +45,50 @@ TEST(ws_terminate, json_payload_validation_bounds_and_recovery) {
     CHECK(valid("true", 4));
 }
 
+TEST(ws_terminate, json_field_presence_is_bounded_and_message_scoped) {
+    auto present = [](Str payload, Str path) {
+        return ws_json_has_path(reinterpret_cast<const u8*>(payload.ptr), payload.len, path);
+    };
+    const Str payload = lit_str(R"({"name":null,"a/b":{"~":[false,0,""]},"":{}})");
+    const Str present_paths[] = {lit_str(""),
+                                 lit_str("/name"),
+                                 lit_str("/a~1b/~0/0"),
+                                 lit_str("/a~1b/~0/1"),
+                                 lit_str("/a~1b/~0/2"),
+                                 lit_str("/")};
+    for (Str path : present_paths) CHECK(present(payload, path));
+    const Str absent_paths[] = {lit_str("/missing"),
+                                lit_str("/name/child"),
+                                lit_str("/a~1b/~0/3"),
+                                lit_str("/a~1b/~0/01"),
+                                lit_str("/a~1b/~0/-"),
+                                lit_str("#"),
+                                lit_str("/a~2b"),
+                                lit_str("/a~"),
+                                Str{nullptr, 1}};
+    for (Str path : absent_paths) CHECK_FALSE(present(payload, path));
+    CHECK(present(lit_str("null"), lit_str("")));
+    CHECK_FALSE(present(lit_str("null"), lit_str("/name")));
+    CHECK_FALSE(present(lit_str("{\"name\":"), lit_str("/name")));
+    CHECK_FALSE(present(lit_str("{\"name\":1,\"name\":2}"), lit_str("/name")));
+    char reused[] = "{\"name\":null}";
+    const Str reused_view{reused, sizeof(reused) - 1};
+    CHECK(present(reused_view, lit_str("/name")));
+    memcpy(reused + 2, "gone", 4);
+    CHECK_FALSE(present(reused_view, lit_str("/name")));
+    CHECK(present(reused_view, lit_str("/gone")));
+    CHECK(present(lit_str("{\"\\u0000\":1}"), Str{"/\0", 2}));
+    CHECK_FALSE(ws_json_has_path(nullptr, 0x100000000ULL, lit_str("")));
+    CHECK_FALSE(ws_json_has_path(
+        reinterpret_cast<const u8*>(payload.ptr), payload.len, {nullptr, json::kMaxBytes + 1}));
+    char boundary[json::kMaxBytes + 1];
+    memset(boundary, ' ', sizeof(boundary));
+    memcpy(boundary, "{\"name\":0}", 10);
+    CHECK(present({boundary, json::kMaxBytes}, lit_str("/name")));
+    CHECK_FALSE(present({boundary, sizeof(boundary)}, lit_str("/name")));
+    CHECK(present(payload, lit_str("/name")));
+}
+
 namespace {
 constexpr bool kMaskDirections[] = {false, true};
 

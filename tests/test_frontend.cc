@@ -5508,6 +5508,97 @@ TEST(frontend, parse_rejects_legacy_websocket_frame_binding) {
     CHECK_EQ(ast.error().span.start, binding_start);
 }
 
+TEST(frontend, websocket_json_document_field_presence) {
+    for (const char* condition : {"json.get(document, \"/name\") != nil",
+                                  "nil != json.get(document, \"/name\")",
+                                  "json.get(document, \"/name\") == nil",
+                                  "!(nil == json.get(document, \"/name\"))",
+                                  "!message.fromClient || (json.get(document, \"/a~1b/0\") != nil "
+                                  "&& json.get(document, \"\") != nil)",
+                                  "json.get(document, \"/\\u{540d}\\0\") != nil"}) {
+        std::string source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard )rut";
+        source += condition;
+        source += " else { message.close(1008) }\nmessage.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& nodes = hir->routes[0].ws_handler.len_guards;
+        REQUIRE(nodes.len >= 2);
+        CHECK(nodes[0].accessor == WsLenGuard::Accessor::JsonValid);
+        CHECK_FALSE(nodes[0].negate);
+        bool found = false;
+        for (u32 i = 0; i < nodes.len; ++i) {
+            if (nodes[i].accessor == WsLenGuard::Accessor::JsonHasPath) found = true;
+        }
+        CHECK(found);
+        if (strstr(condition, "u{540d}")) {
+            const char expected[] = {'/', char(0xe5), char(0x90), char(0x8d), '\0'};
+            CHECK(nodes[1].pattern.len == sizeof(expected));
+            CHECK(memcmp(nodes[1].pattern.ptr, expected, sizeof(expected)) == 0);
+        }
+    }
+}
+
+TEST(frontend, websocket_json_binding_scope_and_rejections) {
+    for (const char* guards :
+         {"guard json.get(document, \"/a\") != nil else { message.drop() }",
+          "guard json.get(json.parse(message.text), \"/a\") != nil else { message.drop() }",
+          "guard let document = json.parse(req.body) else { message.drop() }",
+          "guard let document = message.text else { message.drop() }",
+          "guard let json = json.parse(message.text) else { message.drop() }",
+          "guard let message = json.parse(message.text) else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let document = json.parse(message.text) else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard json.get(other, \"/a\") != nil else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard json.get(document, message.text) != nil else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard json.get(document, \"/a\", 1) != nil else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard json.get(document, \"/a\") == 1 else { message.drop() }"}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        source += guards;
+        source += "\nmessage.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    for (const char* binding : {"document", "json"}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { let ";
+        source += binding;
+        source +=
+            " = \"outer\"\nreturn websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.drop() }\n"
+            "message.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    const char* aliases = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let first = json.parse(message.text) else { message.drop() }
+ guard let second = json.parse(message.text) else { message.drop() }
+ guard json.get(first, "/a") != nil && json.get(second, "/b") != nil else { message.drop() }
+ message.forward()
+} })rut";
+    auto tokens = lex(lit(aliases));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}
+
 TEST(frontend, websocket_json_parse_presence_conditions) {
     for (const char* condition : {"json.parse(message.text) != nil",
                                   "nil != json.parse(message.text)",

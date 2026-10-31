@@ -634,11 +634,22 @@ struct Parser {
         return block;
     }
 
-    // Parse a message-handler guard: `guard <cond> else { <verdict> }`. The condition is an
+    // Parse a message-handler guard, including `guard let name = json.parse(message.text)`.
+    // The condition is an
     // ordinary boolean expression over message properties; the else body is a single
     // bare message verdict (message.drop()/forward()/close()). Reuses AstStmtKind::Guard with
     // expr=cond and else_stmt=the verdict Expr — the WsTerminate analyze path interprets it.
     FrontendResult<AstStatement> parse_ws_message_guard(const Token& guard_tok) {
+        AstStatement stmt{};
+        stmt.kind = AstStmtKind::Guard;
+        if (take(TokenType::KwLet)) {
+            auto name = expect(TokenType::Ident);
+            if (!name) return core::make_unexpected(name.error());
+            stmt.name = name.value()->text;
+            stmt.bind_value = true;
+            auto eq = expect(TokenType::Eq);
+            if (!eq) return core::make_unexpected(eq.error());
+        }
         // Ordinary expression precedence includes unary ! and short-circuit &&/||.
         auto cond = parse_expr();
         if (!cond) return core::make_unexpected(cond.error());
@@ -656,8 +667,6 @@ struct Parser {
         if (!vptr) return core::make_unexpected(vptr.error());
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
-        AstStatement stmt{};
-        stmt.kind = AstStmtKind::Guard;
         stmt.expr = cond.value();
         stmt.else_stmt = vptr.value();
         stmt.span = Span{guard_tok.start, rbrace.value()->end, guard_tok.line, guard_tok.col};

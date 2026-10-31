@@ -7257,10 +7257,21 @@ static Str ws_message_text_match_pattern(const AstExpr& cond) {
     return cond.args[0]->str_value;
 }
 
+using WsJsonBindings = FixedVec<Str, HirWsHandler::kMaxLenGuards>;
+
+static bool ws_is_json_parse(const AstExpr& call, const HirModule& mod, const HirRoute& route) {
+    return call.kind == AstExprKind::MethodCall && call.lhs &&
+           call.lhs->kind == AstExprKind::Ident && call.lhs->name.eq(lit_str("json")) &&
+           call.name.eq(lit_str("parse")) && call.args.len == 1 && call.args[0] &&
+           ws_is_message_field(*call.args[0], lit_str("text")) &&
+           !user_bound_ident_name(
+               mod, route.locals.data, route.locals.len, nullptr, lit_str("json"));
+}
+
 // Match a leaf condition for the message handler. `negate` is logical !, accepted
 // on boolean message properties or `message.text.matches(re)` (the blocklist form). Direction is a
 // bare `message.fromClient` (true on the client→upstream leg); opcode discrimination is a bare
-// `message.isText` / `message.isBinary`, or message.opcode ==/!= .text/.binary; content is
+// `message.isText` / `message.isBinary`; content is
 // `message.text.matches(re"…")` (a regex over the payload); else a `message.len <cmp> N`
 // comparison. Literal text equality, prefix/suffix/substring checks and text.isEmpty are also
 // supported. Anything else → UnsupportedSyntax.
@@ -7269,23 +7280,37 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
                                                              WsVerdict verdict,
                                                              bool negate,
                                                              const HirModule& mod,
-                                                             const HirRoute& route) {
+                                                             const HirRoute& route,
+                                                             const WsJsonBindings& documents) {
     // Reuse the ordinary optional-JSON syntax without materializing a document value.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
         const AstExpr* call = cond.rhs->kind == AstExprKind::Nil   ? cond.lhs
                               : cond.lhs->kind == AstExprKind::Nil ? cond.rhs
                                                                    : nullptr;
-        if (call && call->kind == AstExprKind::MethodCall && call->lhs &&
-            call->lhs->kind == AstExprKind::Ident && call->lhs->name.eq(lit_str("json")) &&
-            call->name.eq(lit_str("parse")) && call->args.len == 1 && call->args[0] &&
-            ws_is_message_field(*call->args[0], lit_str("text")) &&
-            !user_bound_ident_name(
-                mod, route.locals.data, route.locals.len, nullptr, lit_str("json"))) {
+        if (call && ws_is_json_parse(*call, mod, route)) {
             WsLenGuard g{};
             g.accessor = WsLenGuard::Accessor::JsonValid;
             g.negate = !negate;  // parse(...) == nil is the inverse of valid JSON.
             g.verdict = verdict;
             return g;
+        }
+        if (call && call->kind == AstExprKind::MethodCall && call->lhs &&
+            call->lhs->kind == AstExprKind::Ident && call->lhs->name.eq(lit_str("json")) &&
+            call->name.eq(lit_str("get")) && call->args.len == 2 && call->args[0] &&
+            call->args[1] && call->args[0]->kind == AstExprKind::Ident &&
+            call->args[1]->kind == AstExprKind::StrLit) {
+            for (u32 i = 0; i < documents.len; ++i) {
+                if (!documents[i].eq(call->args[0]->name)) continue;
+                auto path =
+                    decoded_expression_string(call->args[1]->str_value, mod, call->args[1]->span);
+                if (!path) return core::make_unexpected(path.error());
+                WsLenGuard g{};
+                g.accessor = WsLenGuard::Accessor::JsonHasPath;
+                g.pattern = path.value();
+                g.negate = !negate;  // get(...) == nil means the path is absent.
+                g.verdict = verdict;
+                return g;
+            }
         }
     }
     // Literal comparison is byte-exact, like ordinary string equality. Reuse the
@@ -7382,6 +7407,7 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
                                                      WsVerdict verdict,
                                                      HirRoute& route,
                                                      const HirModule& mod,
+                                                     const WsJsonBindings& documents,
                                                      bool is_operand = false,
                                                      bool negate = false,
                                                      u32 depth = 0) {
@@ -7392,17 +7418,17 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs &&
         cond.rhs->kind == AstExprKind::BoolLit && !cond.rhs->bool_value) {
         return analyze_message_condition(
-            *cond.lhs, verdict, route, mod, is_operand, !negate, depth + 1);
+            *cond.lhs, verdict, route, mod, documents, is_operand, !negate, depth + 1);
     }
     WsLenGuard node{};
     if (cond.kind == AstExprKind::And || cond.kind == AstExprKind::Or) {
         if (!cond.lhs || !cond.rhs)
             return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
-        auto lhs =
-            analyze_message_condition(*cond.lhs, verdict, route, mod, true, false, depth + 1);
+        auto lhs = analyze_message_condition(
+            *cond.lhs, verdict, route, mod, documents, true, false, depth + 1);
         if (!lhs) return core::make_unexpected(lhs.error());
-        auto rhs =
-            analyze_message_condition(*cond.rhs, verdict, route, mod, true, false, depth + 1);
+        auto rhs = analyze_message_condition(
+            *cond.rhs, verdict, route, mod, documents, true, false, depth + 1);
         if (!rhs) return core::make_unexpected(rhs.error());
         node.accessor =
             cond.kind == AstExprKind::And ? WsLenGuard::Accessor::And : WsLenGuard::Accessor::Or;
@@ -7411,7 +7437,7 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
         node.negate = negate;
         node.verdict = verdict;
     } else {
-        auto leaf = analyze_message_guard_cond(cond, verdict, negate, mod, route);
+        auto leaf = analyze_message_guard_cond(cond, verdict, negate, mod, route, documents);
         if (!leaf) return core::make_unexpected(leaf.error());
         node = leaf.value();
     }
@@ -13143,6 +13169,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::UnsupportedSyntax, body->span);
             if (stmt_count - 1 > HirWsHandler::kMaxLenGuards)
                 return frontend_error(FrontendError::TooManyItems, body->span);
+            WsJsonBindings documents{};
             for (u32 i = 0; i + 1 < stmt_count; i++) {  // all but the last are guards
                 const AstStatement* gs = body->block_stmts[i];
                 if (gs == nullptr || gs->kind != AstStmtKind::Guard || gs->else_stmt == nullptr ||
@@ -13151,8 +13178,29 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                           gs ? gs->span : body->span);
                 auto gv = analyze_message_guard_verdict(gs->else_stmt->expr, *route, mod);
                 if (!gv) return core::make_unexpected(gv.error());
-                auto g = analyze_message_condition(gs->expr, gv.value(), *route, mod);
-                if (!g) return core::make_unexpected(g.error());
+                if (gs->bind_value) {
+                    // Document bindings are scoped aliases for this immutable message's JSON.
+                    // Reject collisions rather than resolving later expressions as an outer value.
+                    bool collision =
+                        gs->name.eq(lit_str("message")) || gs->name.eq(lit_str("json")) ||
+                        user_bound_ident_name(
+                            mod, route->locals.data, route->locals.len, nullptr, gs->name);
+                    for (Str name : documents) collision |= name.eq(gs->name);
+                    if (collision || !ws_is_json_parse(gs->expr, mod, *route))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              gs->span,
+                                              lit_str("message guard bindings require "
+                                                      "json.parse(message.text) and a fresh name"));
+                    WsLenGuard node{};
+                    node.accessor = WsLenGuard::Accessor::JsonValid;
+                    node.verdict = gv.value();
+                    if (!route->ws_handler.len_guards.push(node) || !documents.push(gs->name))
+                        return frontend_error(FrontendError::TooManyItems, gs->span);
+                } else {
+                    auto g =
+                        analyze_message_condition(gs->expr, gv.value(), *route, mod, documents);
+                    if (!g) return core::make_unexpected(g.error());
+                }
             }
             const AstStatement* last = body->block_stmts[stmt_count - 1];
             if (last == nullptr || last->kind != AstStmtKind::Expr)

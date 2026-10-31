@@ -46,7 +46,29 @@ There is no public FIN, mask, continuation, Ping or Pong accessor.
 `guard json.parse(message.text) != nil else { message.close(1007) }` rejects
 messages whose payload fails the existing JSON parser. `== nil`, mirrored operand
 order and logical conditions are supported. A JSON `null` document is valid and
-is distinct from a parse failure. The handler does not gain a bound `Json` value.
+is distinct from a parse failure.
+
+Use an optional binding followed by a presence check to require a message field:
+
+```swift
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard json.get(document, "/name") != nil else { message.close(1008, "name required") }
+    message.forward()
+}
+```
+
+Pointers are string literals with the ordinary RFC 6901 rules: `/a/0` selects
+an array element, `~0` and `~1` escape tilde and slash, and `""` selects the root.
+A present field with value `null` passes `!= nil`; a missing or invalid pointer
+does not. Literal escapes, including embedded NUL, are supported. Mirrored
+comparisons and short-circuit conditions work as for other message guards.
+
+The document binding must use a fresh name, appears only after its guard and
+is limited to later `json.get` presence checks in the same handler. General JSON
+value extraction and mutation are not yet supported here. Bindings count toward
+the four-guard limit. Each reached check reparses the bounded complete payload;
+no parsed document or borrowed payload view is retained between callbacks.
 
 The parser limits remain 8 KiB input, 2048 nodes and depth 64; exceeding any limit
 fails validation. Duplicate decoded object keys are rejected. For Text-only
