@@ -24090,6 +24090,43 @@ TEST(jit, github_webhook_rotation_example_compiles) {
     rir.destroy();
 }
 
+TEST(jit, lexer_accepts_large_input_and_auth_imports) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/github-webhook-rotation-auth.rut";
+    std::string large_source;
+    for (u32 i = 0; i < 6143; ++i) large_source += "1 ";
+    {
+        auto large_tokens = lex({large_source.data(), static_cast<u32>(large_source.size())});
+        REQUIRE(large_tokens);
+        CHECK(large_tokens.value().tokens.len == 6144);
+    }
+    large_source += "1 ";
+    auto overflow_tokens = lex({large_source.data(), static_cast<u32>(large_source.size())});
+    REQUIRE(!overflow_tokens);
+    CHECK(overflow_tokens.error().code == FrontendError::TooManyTokens);
+    constexpr char source[] = R"rut(
+import "middleware/auth.rut"
+route GET "/auth" { return 200 }
+)rut";
+    auto tokens = lex({source, static_cast<u32>(sizeof(source) - 1)});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, digest_and_hmac_builtins_return_owned_hex_for_exact_body_bytes) {
     const char* source = R"rut(
 func digestInHelper(_ data: str) -> str {
