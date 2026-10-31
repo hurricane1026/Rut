@@ -8762,6 +8762,29 @@ HTTP fields, provide endpoint-specific strong keys, and durably deduplicate
 verified IDs before side effects. See [auth coverage](docs/auth-coverage.md) for
 wire-profile bounds, fixtures and remaining acceptance work.
 
+### GitHub Webhook secret rotation
+
+`auth.rotatingGithubWebhook` adds a current/previous window to the existing
+GitHub-specific signature policy. Both slots verify the same original body and
+singleton `X-Hub-Signature-256` value using the fixed `sha256=` prefix and full
+lowercase hexadecimal SHA-256 digest. There is no bare-HMAC or SHA-1 fallback.
+Empty keys disable slots; Consumer and both credential IDs remain nonempty.
+Both disabled slots or missing metadata returns 503; failed verification returns
+401. Both verifiers run, and current wins a tie. Removing the previous key and
+activating a new static configuration revokes that slot.
+
+The returned Identity uses only configured Consumer/credential IDs and method
+`hmac`. Existing synchronous, bounded crypto helpers preserve exact empty and
+binary body bytes. No primitive, keyword, dependency or mutable registry is
+introduced. Verify before interpreting JSON; payload signatures alone do not
+establish delivery uniqueness, freshness or authenticated delivery-ID binding.
+Durable replay protection remains separate acceptance work. See
+`examples/github-webhook-rotation-auth.rut` and independent signed JIT/native
+HTTP fixtures.
+HTTP/1 body-reading handlers retain their existing admission behavior: chunked
+requests receive 400 before handler invocation. This policy adds no streaming
+body signature support.
+
 ### Static Consumer groups
 
 The imported `auth` module provides `ConsumerGroups(consumerId: ..., first: ...,

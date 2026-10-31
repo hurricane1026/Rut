@@ -135,18 +135,19 @@ struct LexedTokens {
     // failure policy) need far more headroom than a single hand-written
     // route. A 2-node/4-route-method Envoy lowering measures 963 tokens; a
     // realistic upper bound of 8 routes x 2 methods with the same
-    // policy-heavy shape is ~4x that (~3,852 tokens). 4096 covers that with
-    // margin while staying a single allocation-free FixedVec.
-    static constexpr u32 kMaxTokens = 4096;
+    // policy-heavy shape is ~4x that (~3,852 tokens). Shared auth middleware
+    // modules can exceed that as helpers accumulate; 6144 covers both while
+    // keeping the fixed token buffer below 256 KiB.
+    static constexpr u32 kMaxTokens = 6144;
     FixedVec<Token, kMaxTokens> tokens;
 };
 
 using LexResult = core::Expected<LexedTokens, Diagnostic>;
 
 // Keep each bounded lexer result object below 256 KiB on every supported data
-// model. At capacity 4096 the current LP64 sizes are 163,848 bytes for
-// LexedTokens and 163,856 bytes for LexResult. lex() places both its output
-// and the returned value on the call stack (~320 KiB before other
+// model. At capacity 6144 the current LP64 sizes are 245,768 bytes for
+// LexedTokens and 245,776 bytes for LexResult. lex() places both its output
+// and the returned value on the call stack (~480 KiB before other
 // frames/redzones), so it is only for shallow, non-recursive callers (tests,
 // tools). Anything that can recurse -- nested `import` analysis re-enters the
 // ~1.3 MiB analyzer frame once per level -- or that keeps tokens alive across

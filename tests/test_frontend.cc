@@ -1203,7 +1203,19 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(4096);
+        const std::string source = make_ident_stream(6143);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 6144u);  // 6143 identifiers + EOF
+        CHECK(result->tokens[6143].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[6143].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[6143].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[6143].line, 1u);
+        CHECK_EQ(result->tokens[6143].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(6144);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
@@ -1215,16 +1227,16 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(4097);
+        const std::string source = make_ident_stream(6145);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
         CHECK(result.error().code == FrontendError::TooManyTokens);
-        // The 4097th one-character identifier starts after 4096 "a " pairs.
-        CHECK_EQ(result.error().span.start, 8192u);
-        CHECK_EQ(result.error().span.end, 8193u);
+        // The 6145th one-character identifier starts after 6144 "a " pairs.
+        CHECK_EQ(result.error().span.start, 12288u);
+        CHECK_EQ(result.error().span.end, 12289u);
         CHECK_EQ(result.error().span.line, 1u);
-        CHECK_EQ(result.error().span.col, 8193u);
+        CHECK_EQ(result.error().span.col, 12289u);
     }
 }
 

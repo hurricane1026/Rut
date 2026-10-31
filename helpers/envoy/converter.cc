@@ -1382,12 +1382,16 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
 // for a configuration `rut` couldn't even parse. #697 later raised
 // `kMaxTokens` to 4096, under which that exact scenario lexes successfully
 // (963 tokens; `golden_routes_a_prefix_then_root`,
-// `tests/test_envoy_convert.cc`) -- the fail-closed check below still
-// matters for larger route lists at `kMaxEnvoyRoutes` scale (see
+// `tests/test_envoy_convert.cc`). #979 raised `kMaxTokens` again to 6144;
+// the worst-case 8-route nested-prefix output now lexes successfully at 5542
+// tokens (`capacity_covers_worst_case_node_arm_duplication`,
+// `tests/test_envoy_convert.cc`). The fail-closed check below still
+// guards generated source if converter output grows beyond the lexer limit
+// (see
 // `RutSource::kWorstCaseOrderedRouteListBytes`,
 // include/rut/envoy/converter.h, and
 // `capacity_covers_worst_case_node_arm_duplication`,
-// tests/test_envoy_convert.cc, which still exceeds 4096 tokens).
+// tests/test_envoy_convert.cc).
 //
 // This estimate is intentionally conservative (never an UNDER-count) rather
 // than exact, so `lower_to_rut` stays free of any dependency on `rut`'s own

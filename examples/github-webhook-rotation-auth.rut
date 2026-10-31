@@ -1,0 +1,26 @@
+import "middleware/auth.rut"
+
+listen :8080
+
+// Trusted, high-entropy secrets resolved at compilation. Set the previous value
+// to empty and reload/restart to revoke it. Protect compiled secret-bearing artifacts.
+route POST "/webhooks/github" {
+    let identity = auth.rotatingGithubWebhook(req.body,
+        req.uniqueHeader("X-Hub-Signature-256").or(""),
+        env("GITHUB_WEBHOOK_SECRET"), env("GITHUB_WEBHOOK_PREVIOUS_SECRET"),
+        "github", "current", "previous")
+    let credentialId = identity.credentialId
+    // Verify before JSON parsing. Deduplicate authenticated deliveries durably
+    // before side effects; accepting a signature does not prove uniqueness.
+    return response(200, body: credentialId)
+}
+
+route POST "/webhooks/github/revoked" {
+    let identity = auth.rotatingGithubWebhook(req.body,
+        req.uniqueHeader("X-Hub-Signature-256").or(""),
+        env("GITHUB_WEBHOOK_SECRET"), "", "github", "current", "previous")
+    let credentialId = identity.credentialId
+    return response(200, body: credentialId)
+}
+
+route "/" { return 404 }
