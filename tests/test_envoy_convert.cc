@@ -2586,7 +2586,7 @@ TEST(envoy_convert, blocked_on_redirect) {
 // the real lexer). This is a golden SUCCESS case again, the same shape as
 // (b)/(c) below; `capacity_covers_worst_case_node_arm_duplication`
 // (include/rut/envoy/converter.h's `RutSource::kWorstCaseOrderedRouteListBytes`)
-// covers the still-over-budget case at `kMaxEnvoyRoutes` scale.
+// covers the byte and lexer boundaries at `kMaxEnvoyRoutes` scale.
 TEST(envoy_convert, golden_routes_a_prefix_then_root) {
     const std::string text = routes_scenario_a_json();
     static envoy::JsonDocument doc;
@@ -2652,15 +2652,10 @@ TEST(envoy_convert, token_budget_goldens_match_the_real_lexer) {
 // HEAD/non-HEAD method variants (`put_route_node`), for 30 total forward()
 // blocks at `kMaxEnvoyRoutes == 8`, not 16.
 //
-// This shape also exceeds the unrelated, separately-tested lexer token
-// budget (`LexedTokens::kMaxTokens`; see `token_budget_goldens_match_the_
-// real_lexer` above and docs/envoy-converter.md, "Emitted program size is
-// separately capped..."), so `lower_to_rut` itself cannot return a
-// successful `RutSource` for it -- `lower_to_rut_ignoring_token_budget_for_
-// test` (include/rut/envoy/converter.h) skips only that unrelated gate to
-// let this test measure the real emitted byte count against
-// `RutSource::kCapacity` and the corrected `kWorstCaseOrderedRouteListBytes`
-// bound directly.
+// This shape exercises the worst-case emitted byte count and token count.
+// `lower_to_rut` must return source that the real lexer accepts, while the
+// independent byte bounds cover `RutSource::kCapacity` and the corrected
+// `kWorstCaseOrderedRouteListBytes` directly.
 TEST(envoy_convert, capacity_covers_worst_case_node_arm_duplication) {
     std::vector<std::string> prefixes;
     std::string cumulative;
@@ -2687,18 +2682,13 @@ TEST(envoy_convert, capacity_covers_worst_case_node_arm_duplication) {
     REQUIRE(parsed);
     const envoy::RutCapabilities all_true{true, true, true};
 
-    // Confirms the premise: the full worst-case shape does exceed the
-    // (separate) token budget, so `lower_to_rut` itself cannot be used to
-    // observe the emitted byte count for it.
     const auto lowered = envoy::lower_to_rut(parsed.value(), all_true);
-    CHECK_FALSE(lowered);
-    CHECK(lowered.error().code == FrontendError::TooManyTokens);
-
-    const auto emitted =
-        envoy::lower_to_rut_ignoring_token_budget_for_test(parsed.value(), all_true);
-    REQUIRE(emitted);
-    CHECK_LT(emitted.value().len, envoy::RutSource::kCapacity);
-    CHECK_LT(emitted.value().len, envoy::RutSource::kWorstCaseOrderedRouteListBytes);
+    REQUIRE(lowered);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+    CHECK_LE(lexed.value().tokens.len, LexedTokens::kMaxTokens);
+    CHECK_LT(lowered.value().len, envoy::RutSource::kCapacity);
+    CHECK_LT(lowered.value().len, envoy::RutSource::kWorstCaseOrderedRouteListBytes);
 }
 
 // Codex round-9 review: "/" declared before "/api/" makes "/api" globally
@@ -2830,9 +2820,8 @@ TEST(envoy_convert, prefix_shadowed_exact_path_arm_dropped) {
 // via the `TooManyTokens` failure proving both nodes reached full text
 // generation (a `BLOCKED_BY_RUT` failure happens during planning, before any
 // text is generated at all). #697 raised the budget to 4096, under which
-// this shape lowers successfully (1271 real tokens; well below the 4096
-// budget the `capacity_covers_worst_case_node_arm_duplication` test
-// separately still exceeds at `kMaxEnvoyRoutes` scale), so the point is now
+// this shape lowers successfully (1271 real tokens; well below the 6144
+// budget and the 5542-token maximum nested-prefix case), so the point is now
 // asserted directly: the real emitted text contains both nodes.
 TEST(envoy_convert, specific_prefix_before_general_prefix_keeps_both) {
     const std::string text = route_list_json(

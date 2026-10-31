@@ -539,12 +539,12 @@ are recorded from the pinned Envoy build, not assumed.
   `blocked_on_shadowed_exact_needs_all_method_fallback` — see the
   node's-own-literal paragraph below); a root with exact routes but no
   catch-all hits the same no-RUT-form-for-a-404 problem at its own
-  fallthrough (`blocked_root_exact_arms_without_catch_all`); and any
-  otherwise-valid list can still exceed the compiler frontend's lexer token
+  fallthrough (`blocked_root_exact_arms_without_catch_all`); and every
+  emitted program is checked against the compiler frontend's lexer token
   budget (`token_budget_goldens_match_the_real_lexer`,
   `golden_routes_a_prefix_then_root` — see the token-budget bullet below).
   docs/envoy-compatibility.md's increment-4 rows record the exact status
-  (BLOCKED_BY_RUT or the token-budget PARTIAL) for each of these. For each
+  (BLOCKED_BY_RUT or lexer validation) for each of these. For each
   RUT route
   entry ("node" — `"/"` plus, for every other declared `prefix`, that prefix
   with its trailing `/` removed), the converter walks Envoy's route list in
@@ -584,9 +584,8 @@ are recorded from the pinned Envoy build, not assumed.
   `RutSource::kCapacity` (128 KiB, `helpers/envoy/include/rut/envoy/converter.h`) only
   bounds the emitted program's byte count. `rut`'s own frontend lexer
   separately bounds every program's token count at
-  `LexedTokens::kMaxTokens` (`include/rut/compiler/lexer.h`) — **4096 today**
-  (#697 raised it from 932). A route list well inside `kMaxEnvoyRoutes` (8)
-  can still exceed it: each node's `if`/`else` arm duplicates the full
+  `LexedTokens::kMaxTokens` (`include/rut/compiler/lexer.h`) — **6144 after
+  #979** (#697 raised it from 932 to 4096). Each node's `if`/`else` arm duplicates the full
   `request_policy`/`response_policy`/`failure_policy` block (see the
   milestone-S golden, `tests/fixtures/envoy_milestone_s.inc`) for both its
   `HEAD` and any-method emission, so a single extra arm on a single node
@@ -604,15 +603,16 @@ are recorded from the pinned Envoy build, not assumed.
   earlier root route — it now lowers root-only and measures 360 tokens, not
   the 655 a two-node program of its old shape would have needed. Scenario
   (a) — two nodes, one of them with an `if`/`else` arm — needs 963 tokens,
-  comfortably under the current 4096 budget (it needed over the old 932
+  comfortably under the current 6144 budget (it needed over the old 932
   budget and failed to lex at byte 8400 of its 8804-byte, well-under-
   `kCapacity` output; `golden_routes_a_prefix_then_root`,
-  `tests/test_envoy_convert.cc`, is a golden success case again). A
-  `kMaxEnvoyRoutes`-sized worst case (8 nested prefixes, narrowest declared
-  first) still exceeds even the raised 4096 budget
+  `tests/test_envoy_convert.cc`, is a golden success case again). The
+  `kMaxEnvoyRoutes`-sized nested-prefix case (8 routes, narrowest declared
+  first) lexes to 5,542 tokens under the raised 6144-token limit
   (`capacity_covers_worst_case_node_arm_duplication`,
-  `tests/test_envoy_convert.cc`), so the fail-closed check below still
-  matters at that scale. `lower_to_rut` computes a conservative
+  `tests/test_envoy_convert.cc`). The fail-closed check below still guards
+  against future converter output growth beyond that limit. `lower_to_rut`
+  computes a conservative
   (never-under-counting) estimate of the emitted token count and fails
   closed with `TooManyTokens` before returning a program `rut` cannot load,
   rather than reporting success for one. `rut_envoy`/`rut-envoy-convert`
