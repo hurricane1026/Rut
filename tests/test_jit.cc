@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/jwt_secret_rotation.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
@@ -24946,6 +24947,190 @@ TEST(jit, consumer_group_deny_example_compiles) {
     REQUIRE(input.good());
     const std::string source((std::istreambuf_iterator<char>(input)),
                              std::istreambuf_iterator<char>());
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, rotating_jwt_secrets_preserve_claims_and_pin_algorithms) {
+    using namespace jwt_secret_rotation_fixture;
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-secret-rotation-auth.rut";
+    const char* secrets[][2] = {{kCurrentSecret, kPreviousSecret},
+                                {kCurrentSecret, ""},
+                                {"", kPreviousSecret},
+                                {"", ""},
+                                {kCurrentSecret, kCurrentSecret},
+                                {kUnknownSecret, kPreviousSecret},
+                                {"short", kPreviousSecret},
+                                {"", "short"}};
+    constexpr u32 kConfigurations = sizeof(secrets) / sizeof(secrets[0]);
+    std::string source = "import \"middleware/auth.rut\"\n";
+    for (u32 algorithm = 0; algorithm < 3; ++algorithm) {
+        for (u32 config = 0; config < kConfigurations; ++config) {
+            const u32 route = algorithm * kConfigurations + config;
+            source += "route GET \"/" + std::to_string(route) + "\" {\n";
+            source += "let claims = auth.rotatingJwtDocumentHs" +
+                      std::string(kTokens[algorithm].algorithm + 2) +
+                      "(req.authorization.or(\"\"), \"" + secrets[config][0] + "\", \"" +
+                      secrets[config][1] + "\")\n";
+            source += R"rut(
+    let identity = auth.jwtIdentity(claims, "https://issuer.example", "orders", "rotation-policy")
+    guard jwtHasScope(claims, "orders.read") else { return 403 }
+    guard identity.consumerId == "alice" && identity.credentialId == "rotation-policy" &&
+          identity.method == "jwt" else { return 500 }
+    return 204
+}
+)rut";
+        }
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "rotating JWT HIR: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    if (!mir)
+        std::fprintf(stderr,
+                     "rotating JWT MIR: %.*s at %u:%u\n",
+                     mir.error().detail.len,
+                     mir.error().detail.ptr,
+                     mir.error().span.line,
+                     mir.error().span.col);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const auto check = [&](u32 route, const std::string& headers, u16 expected, u32 storage = 0) {
+        const std::string name = "handler_route_" + std::to_string(route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+        REQUIRE(handler != nullptr);
+        arena.reset();
+        if (storage == 2) {
+            while (arena.space_used() < 262144) REQUIRE(arena.alloc(8192) != nullptr);
+        }
+        const std::string request = "GET / HTTP/1.1\r\nHost: localhost\r\n" + headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          storage == 1 ? nullptr : &arena));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != expected)
+            std::fprintf(stderr,
+                         "JWT rotation route %u got %u expected %u\n",
+                         route,
+                         result.status_code,
+                         expected);
+        CHECK_EQ(result.status_code, expected);
+        if (expected == 401) {
+            REQUIRE(result.next_state != 0 && result.next_state <= rir.module.header_set_count);
+            const auto& set = rir.module.header_sets[result.next_state - 1];
+            REQUIRE_EQ(set.count, 1u);
+            CHECK(rir.module.header_keys[set.offset].eq(lit("WWW-Authenticate")));
+            CHECK(rir.module.header_values[set.offset].eq(lit("Bearer")));
+        }
+    };
+    const auto bearer = [](const char* token) {
+        return std::string("Authorization: Bearer ") + token + "\r\n";
+    };
+    for (u32 algorithm = 0; algorithm < 3; ++algorithm) {
+        const auto& fixture = kTokens[algorithm];
+        for (u32 config = 0; config < kConfigurations; ++config) {
+            const u32 route = algorithm * kConfigurations + config;
+            const u16 current_status = config == 3 ? 503 : (config == 2 || config >= 5 ? 401 : 204);
+            const u16 previous_status =
+                config == 3 ? 503 : (config == 1 || config == 4 || config == 7 ? 401 : 204);
+            check(route, bearer(fixture.current), current_status);
+            check(route, bearer(fixture.previous), previous_status);
+            check(route, "", config == 3 ? 503 : 401);
+            check(route, "Authorization:\r\n", config == 3 ? 503 : 401);
+            check(route,
+                  bearer(fixture.current) + "authorization: Bearer " + fixture.previous + "\r\n",
+                  config == 3 ? 503 : 401);
+        }
+        const u32 route = algorithm * kConfigurations;
+        const char* invalid[] = {fixture.unknown,
+                                 fixture.expired,
+                                 fixture.previousExpired,
+                                 fixture.future,
+                                 fixture.wrongIssuer,
+                                 fixture.wrongAudience,
+                                 fixture.missingSubject,
+                                 fixture.wrongAlgorithm,
+                                 fixture.shortKey,
+                                 fixture.emptyKey,
+                                 fixture.duplicateClaims,
+                                 fixture.criticalHeader};
+        for (const char* token : invalid) check(route, bearer(token), 401);
+        check(route, bearer(fixture.missingScope), 403);
+        check(route, bearer(fixture.current), 401, 1);
+        check(route, bearer(fixture.previous), 401, 2);
+        check(algorithm * kConfigurations + 6, bearer(fixture.shortKey), 401);
+        check(algorithm * kConfigurations + 7, bearer(fixture.shortKey), 401);
+        check(route, "Authorization: Basic YWxpY2U6cHc=\r\n", 401);
+        check(route,
+              bearer(fixture.current) + "X-Consumer-ID: mallory\r\nX-JWT-Sub: mallory\r\n",
+              204);
+        std::string tampered = fixture.current;
+        const auto signature = tampered.rfind('.') + 1;
+        tampered[signature] = tampered[signature] == 'A' ? 'B' : 'A';
+        check(route, bearer(tampered.c_str()), 401);
+    }
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, jwt_secret_rotation_example_compiles) {
+    using namespace jwt_secret_rotation_fixture;
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-secret-rotation-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    for (const char* bits : {"256", "384", "512"}) {
+        for (const auto& binding :
+             {std::pair{"CURRENT", kCurrentSecret}, std::pair{"PREVIOUS", kPreviousSecret}}) {
+            const std::string expression =
+                std::string("env(\"HS") + bits + "_" + binding.first + "_SECRET\")";
+            const auto pos = source.find(expression);
+            REQUIRE(pos != std::string::npos);
+            source.replace(pos, expression.size(), std::string("\"") + binding.second + "\"");
+        }
+    }
     auto tokens = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(tokens);
     auto ast = parse_file_heap(tokens.value());
