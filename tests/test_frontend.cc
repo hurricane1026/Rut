@@ -5463,10 +5463,10 @@ TEST(frontend, parse_return_websocket_bare_is_passthrough) {
 
 TEST(frontend, parse_return_websocket_block_is_terminate) {
     // A trailing `{ message in ... }` block turns it into TERMINATE mode (WsTerminate) — the block
-    // is the per-message frame handler, parsed onto `then_stmt`. Frame verdicts are bare method
+    // is the per-message handler, parsed onto `then_stmt`. Message verdicts are bare method
     // calls
-    // (`message.forward()`), parsed by the dedicated frame-body parser (parse_ws_frame_body), so
-    // the one-statement body unwraps to an Expr/MethodCall statement.
+    // (`message.forward()`), parsed by the dedicated message-body parser (parse_ws_message_body),
+    // so the one-statement body unwraps to an Expr/MethodCall statement.
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward() } "
         "}\n";
@@ -5480,24 +5480,32 @@ TEST(frontend, parse_return_websocket_block_is_terminate) {
     const AstStatement& stmt = *route.statements[0];
     CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::WsTerminate));
     CHECK(stmt.name.eq(lit("ws")));
-    REQUIRE(stmt.then_stmt != nullptr);  // the frame-handler body
+    REQUIRE(stmt.then_stmt != nullptr);  // the message-handler body
     CHECK_EQ(static_cast<u8>(stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Expr));
     CHECK_EQ(static_cast<u8>(stmt.then_stmt->expr.kind), static_cast<u8>(AstExprKind::MethodCall));
 }
 
 TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
-    const char* sources[] = {
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message.forward() } }\n",
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
-        "message.forward() } }\n",
-    };
-    for (const char* src : sources) {
-        auto lexed = lex(lit(src));
-        REQUIRE(lexed);
-        auto ast = parse_file_heap(lexed.value());
-        REQUIRE_FALSE(ast.has_value());
-        CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ message in ... }`")));
-    }
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ message in ... }`")));
+}
+
+TEST(frontend, parse_rejects_legacy_websocket_frame_binding) {
+    // Deliberately old syntax: this test proves the removed entry point stays rejected.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ message in ... }`")));
+    const u32 binding_start = static_cast<u32>(strstr(src, "frame in") - src);
+    CHECK_EQ(ast.error().span.start, binding_start);
 }
 
 TEST(frontend, websocket_message_rejects_wire_frame_properties) {
@@ -5520,7 +5528,7 @@ TEST(frontend, websocket_message_rejects_wire_frame_properties) {
 }
 
 TEST(frontend, analyze_accepts_websocket_forward_only) {
-    // Slice B: the forward-only frame handler `message.forward()` analyzes into a HirWsHandler
+    // Slice B: the forward-only message handler `message.forward()` analyzes into a HirWsHandler
     // on the route (verdict Forward) instead of an HTTP terminator.
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward() } "
@@ -5766,7 +5774,12 @@ TEST(frontend, analyze_rejects_websocket_close_reserved_code) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+    // The message binding parsed successfully; rejection must point to the illegal code.
+    const u32 code_start = static_cast<u32>(strstr(src, "1006") - src);
+    CHECK_EQ(hir.error().span.start, code_start);
+    CHECK_EQ(hir.error().span.end, code_start + 4u);
 }
 
 TEST(frontend, analyze_rejects_websocket_drop_with_args) {
@@ -5782,7 +5795,7 @@ TEST(frontend, analyze_rejects_websocket_drop_with_args) {
 }
 
 TEST(frontend, analyze_rejects_websocket_unknown_verdict) {
-    // Only forward/drop/close are verdicts; an unknown frame method is rejected.
+    // Only forward/drop/close are verdicts; an unknown message method is rejected.
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.bogus() } }\n";
     auto lexed = lex(lit(src));
