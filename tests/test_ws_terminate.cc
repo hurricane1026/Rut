@@ -71,7 +71,7 @@ TEST(ws_terminate, fixed_text_rewrite_reassembles_and_preserves_control_frames) 
     for (bool masked : kMaskDirections) {
         for (Str replacement : replacements) {
             WsInspector st = make_state(masked);
-            st.forward_text = replacement;
+            st.forward_text = {replacement};
             Recorder r;
             r.verdict = WsFrameAction::ForwardText;
             u8 in[128], out[128], msg[128], decoded[128];
@@ -156,7 +156,7 @@ TEST(ws_terminate, fixed_text_rewrite_retries_after_output_drain) {
         CHECK_EQ(used, two);
         CHECK_EQ(r.calls, 2);
         REQUIRE(parse_one(out, produced, masked, &h, decoded) != 0);
-        CHECK(memcmp(decoded, st.forward_text.ptr, 20) == 0);
+        CHECK(memcmp(decoded, st.forward_text.prefix.ptr, 20) == 0);
     }
 }
 
@@ -166,7 +166,7 @@ TEST(ws_terminate, fixed_text_rewrite_fails_closed_on_invalid_output) {
     for (Str replacement : replacements) {
         WsInspector st = make_state(false);
         st.max_message_size = 4;
-        st.forward_text = replacement;
+        st.forward_text = {replacement};
         Recorder r;
         r.verdict = WsFrameAction::ForwardText;
         u8 in[64], out[64], msg[64];
@@ -818,7 +818,7 @@ TEST(ws_terminate, handler_close_emits_close_and_stops) {
     CHECK_EQ(st.echo_close_code, 1000u);
 }
 
-// frame.close(code): the handler's configured close_code is put on the wire — both the
+// message.close(code): the handler's configured close_code is put on the wire — both the
 // forward Close (emitted here) and the echo code the caller reads back for the other peer.
 TEST(ws_terminate, handler_close_reason_and_echo_serialize_both_roles) {
     char reason[kWsMaxCloseReasonBytes];
@@ -1009,7 +1009,7 @@ TEST(ws_terminate, branch_close_reason_waits_for_prior_output_drain) {
 
 TEST(ws_terminate, handler_close_emits_configured_code) {
     WsInspector st = make_state(false);
-    st.close_code = 1008;  // Policy Violation — what frame.close(1008) lowers to
+    st.close_code = 1008;  // Policy Violation — what message.close(1008) lowers to
     Recorder r;
     r.close_now = true;
     u8 in[64];
@@ -1078,7 +1078,7 @@ TEST(ws_terminate, handler_close_tiny_message_keeps_code_when_room) {
 }
 
 // A peer-sent Close leaves the echo at 1000 (unchanged) even when the route configured a
-// different frame.close(code) — the peer's own code is relayed verbatim on the forward leg.
+// different message.close(code) — the peer's own code is relayed verbatim on the forward leg.
 TEST(ws_terminate, peer_close_echo_stays_1000) {
     WsInspector st = make_state(false);
     st.close_code = 1008;
@@ -1278,7 +1278,7 @@ int main(int argc, char** argv) {
 }
 
 TEST(ws_terminate, branch_text_policies_select_independent_payloads) {
-    const Str texts[] = {{"", 0}, {"one\0two", 7}, {"\xe2\x82\xac", 3}, {"fourth", 6}};
+    const WsTextRewrite texts[] = {{"", 0}, {"one\0two", 7}, {"\xe2\x82\xac", 3}, {"fourth", 6}};
     for (bool masked : kMaskDirections) {
         for (u32 i = 0; i < kWsMaxForwardTexts; i++) {
             auto st = make_state(masked);
@@ -1299,8 +1299,9 @@ TEST(ws_terminate, branch_text_policies_select_independent_payloads) {
             WsFrameHeader h;
             REQUIRE_EQ(parse_one(out, produced, masked, &h, payload), produced);
             CHECK(h.opcode == WsOpcode::Text);
-            CHECK_EQ(h.payload_len, texts[i].len);
-            if (texts[i].len) CHECK(memcmp(payload, texts[i].ptr, texts[i].len) == 0);
+            CHECK_EQ(h.payload_len, texts[i].prefix.len);
+            if (texts[i].prefix.len)
+                CHECK(memcmp(payload, texts[i].prefix.ptr, texts[i].prefix.len) == 0);
         }
     }
 }
@@ -1308,7 +1309,7 @@ TEST(ws_terminate, branch_text_policies_select_independent_payloads) {
 TEST(ws_terminate, invalid_branch_text_policy_fails_without_output) {
     const char bad[] = {static_cast<char>(0xff)};
     for (u32 invalid = 0; invalid < 7; invalid++) {
-        Str texts[] = {{"replacement", 11}};
+        WsTextRewrite texts[] = {{"replacement", 11}};
         auto st = make_state(false);
         st.forward_texts = texts;
         st.forward_text_count = 1;
@@ -1337,7 +1338,7 @@ TEST(ws_terminate, branch_text_waits_for_prior_output_drain) {
     auto st = make_state(false);
     char replacement[80];
     memset(replacement, 'r', sizeof(replacement));
-    const Str texts[] = {{replacement, sizeof(replacement)}};
+    const WsTextRewrite texts[] = {{replacement, sizeof(replacement)}};
     st.forward_texts = texts;
     st.forward_text_count = 1;
     auto handler = +[](void*, WsOpcode, const u8* p, u64, bool) {
@@ -1368,4 +1369,154 @@ TEST(ws_terminate, branch_text_waits_for_prior_output_drain) {
     CHECK_EQ(used, n - first);
     CHECK_EQ(produced, 82u);
     CHECK(memcmp(out + 2, replacement, sizeof(replacement)) == 0);
+}
+
+TEST(ws_terminate, affix_rewrite_reassembles_preserves_control_and_masks_both_roles) {
+    const WsTextRewrite recipes[] = {
+        {{"pre\0", 4}, {"\xe2\x82\xac", 3}, true}, {{}, {}, true}, {{}, {"end", 3}, true}};
+    for (bool masked : kMaskDirections) {
+        for (u32 i = 0; i < 3; i++) {
+            auto st = make_state(masked);
+            st.forward_texts = recipes;
+            st.forward_text_count = 3;
+            Recorder r;
+            r.verdict = static_cast<WsFrameAction>(8 + i);
+            const u8 a[] = {'a'}, b[] = {0, 'b'};
+            u8 in[64], out[128], msg[64], payload[64];
+            u32 n = build(in, WsOpcode::Text, false, masked, a, 1);
+            u32 used = 0, produced = 0;
+            REQUIRE(
+                ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+            CHECK_EQ(produced, 0u);
+            CHECK_EQ(r.calls, 0);
+            n = build(in, WsOpcode::Ping, true, masked, a, 1);
+            n += build(in + n, WsOpcode::Continuation, true, masked, b, 2);
+            REQUIRE(
+                ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+            WsFrameHeader h;
+            const u32 ping = parse_one(out, produced, masked, &h, payload);
+            REQUIRE(ping != 0);
+            CHECK(h.opcode == WsOpcode::Ping);
+            REQUIRE_EQ(parse_one(out + ping, produced - ping, masked, &h, payload),
+                       produced - ping);
+            CHECK(h.opcode == WsOpcode::Text);
+            const auto& recipe = recipes[i];
+            REQUIRE_EQ(h.payload_len, recipe.prefix.len + 3u + recipe.suffix.len);
+            if (recipe.prefix.len)
+                CHECK(memcmp(payload, recipe.prefix.ptr, recipe.prefix.len) == 0);
+            CHECK(memcmp(payload + recipe.prefix.len, "a\0b", 3) == 0);
+            if (recipe.suffix.len)
+                CHECK(memcmp(payload + recipe.prefix.len + 3,
+                             recipe.suffix.ptr,
+                             recipe.suffix.len) == 0);
+            CHECK_EQ(r.calls, 1);
+        }
+    }
+}
+
+TEST(ws_terminate, affix_rewrite_rejects_binary_size_utf8_and_truncated_output) {
+    const char bad[] = {static_cast<char>(0xff)};
+    for (u32 invalid = 0; invalid < 6; invalid++) {
+        auto st = make_state(false);
+        st.forward_text = {{"pre", 3}, {"end", 3}, true};
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        u32 cap = 128;
+        WsOpcode op = WsOpcode::Text;
+        if (invalid == 0) op = WsOpcode::Binary;
+        if (invalid == 1) st.max_message_size = 6;
+        if (invalid == 2) st.forward_text.suffix = {bad, 1};
+        if (invalid == 3) st.forward_text.prefix = {nullptr, 3};
+        if (invalid == 4) cap = 8;  // payload 7 plus header 2
+        char oversized[kWsTerminateMessageCapacity];
+        memset(oversized, 'a', sizeof(oversized));
+        if (invalid == 5) {
+            st.forward_text = {{oversized, sizeof(oversized)}, {}, true};
+        }
+        const u8 input[] = {'x'};
+        u8 in[32], out[128], msg[32];
+        const u32 n = build(in, op, true, false, input, 1);
+        u32 used = 0, produced = 0;
+        CHECK(ws_inspect(st, in, n, out, cap, msg, sizeof(msg), record, &r, &used, &produced) ==
+              WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
+    }
+}
+
+TEST(ws_terminate, affix_rewrite_accepts_exact_output_limit) {
+    auto st = make_state(false);
+    st.max_message_size = 5;
+    st.forward_text = {{"<", 1}, {">", 1}, true};
+    Recorder r;
+    r.verdict = WsFrameAction::ForwardText;
+    const u8 data[] = {'a', 'b', 'c'};
+    u8 in[32], out[7], msg[32];
+    const u32 n = build(in, WsOpcode::Text, true, false, data, 3);
+    u32 used = 0, produced = 0;
+    REQUIRE(
+        ws_inspect(st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+        WsInspectStatus::Ok);
+    CHECK_EQ(produced, 7u);
+    CHECK(memcmp(out + 2, "<abc>", 5) == 0);
+}
+
+TEST(ws_terminate, affix_growth_waits_before_consuming_next_message) {
+    auto st = make_state(false);
+    char suffix[70];
+    memset(suffix, 'r', sizeof(suffix));
+    st.forward_text = {{}, {suffix, sizeof(suffix)}, true};
+    Recorder r;
+    r.verdict = WsFrameAction::ForwardText;
+    const u8 data[] = {'x'};
+    u8 in[32], out[80], msg[32];
+    const u32 first = build(in, WsOpcode::Text, true, false, data, 1);
+    const u32 n = first + build(in + first, WsOpcode::Text, true, false, data, 1);
+    u32 used = 0, produced = 0;
+    REQUIRE(
+        ws_inspect(st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+        WsInspectStatus::Ok);
+    CHECK_EQ(used, first);
+    CHECK_EQ(produced, 73u);
+    REQUIRE(ws_inspect(st,
+                       in + first,
+                       n - first,
+                       out,
+                       sizeof(out),
+                       msg,
+                       sizeof(msg),
+                       record,
+                       &r,
+                       &used,
+                       &produced) == WsInspectStatus::Ok);
+    CHECK_EQ(used, n - first);
+    CHECK_EQ(produced, 73u);
+}
+
+TEST(ws_terminate, affix_rewrite_accepts_single_slice_limit_both_roles) {
+    char prefix[kWsTerminateMessageCapacity - 2];
+    memset(prefix, 'p', sizeof(prefix));
+    for (bool masked : kMaskDirections) {
+        auto st = make_state(masked);
+        st.max_message_size = kWsTerminateMessageCapacity;
+        st.forward_text = {{prefix, sizeof(prefix)}, {"!", 1}, true};
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        const u8 data[] = {'x'};
+        u8 in[32], out[16384], msg[32], payload[kWsTerminateMessageCapacity];
+        const u32 n = build(in, WsOpcode::Text, true, masked, data, 1);
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+        WsFrameHeader h;
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, payload), produced);
+        REQUIRE_EQ(h.payload_len, kWsTerminateMessageCapacity);
+        CHECK(memcmp(payload, prefix, sizeof(prefix)) == 0);
+        CHECK_EQ(payload[sizeof(prefix)], static_cast<u8>('x'));
+        CHECK_EQ(payload[sizeof(prefix) + 1], static_cast<u8>('!'));
+    }
 }

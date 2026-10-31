@@ -667,23 +667,24 @@ struct ConnectionBase {
     bool is_ws_terminate;           // active: 101 seen + inspection buffers acquired
     WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
-    const Str* ws_forward_texts = nullptr;
+    const WsTextRewrite* ws_forward_texts = nullptr;
     u32 ws_forward_text_count = 0;
-    Str ws_forward_text{};  // route-owned replacement view, pinned with the route config
+    WsTextRewrite ws_forward_text{};  // route-owned replacement view, pinned with the route config
     bool ws_has_nonempty_rewrite() const {
-        if (ws_forward_text.len != 0) return true;
+        if (ws_forward_text.prefix.len != 0 || ws_forward_text.suffix.len != 0) return true;
         if (ws_forward_text_count > kWsMaxForwardTexts ||
             (ws_forward_text_count != 0 && !ws_forward_texts))
             return true;
         for (u32 i = 0; i < ws_forward_text_count; i++)
-            if (ws_forward_texts[i].len != 0) return true;
+            if (ws_forward_texts[i].prefix.len != 0 || ws_forward_texts[i].suffix.len != 0)
+                return true;
         return false;
     }
     Str ws_close_reason{};  // pinned route-owned close reason
     const WsClosePolicy* ws_close_policies = nullptr;
     u32 ws_close_policy_count = 0;
     Str ws_echo_close_reason{};
-    u16 ws_close_code;       // route's frame.close(code) status (seeds both inspectors)
+    u16 ws_close_code;       // route's message.close(code) status (seeds both inspectors)
     u16 ws_echo_close_code;  // code for the echo Close (set from the inspector on close)
     WsInspector ws_c2u;      // client->upstream inspection state (masked)
     WsInspector ws_u2c;      // upstream->client inspection state (unmasked)

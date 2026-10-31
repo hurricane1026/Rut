@@ -2857,8 +2857,8 @@ bool emit_ws_handler(LLVMModuleRef mod,
     LLVMValueRef fn = LLVMAddFunction(mod, sym, fn_ty);
     if (!fn) return false;
     LLVMTypeRef i32_ty = LLVMInt32TypeInContext(ctx);
-    LLVMValueRef len = LLVMGetParam(fn, 3);          // i64 message length == frame.len
-    LLVMValueRef opcode = LLVMGetParam(fn, 1);       // i8 WsOpcode == frame opcode
+    LLVMValueRef len = LLVMGetParam(fn, 3);          // i64 message length == message.len
+    LLVMValueRef opcode = LLVMGetParam(fn, 1);       // i8 internal WsOpcode for the message type
     LLVMValueRef payload = LLVMGetParam(fn, 2);      // i8* reassembled message bytes
     LLVMValueRef from_client = LLVMGetParam(fn, 4);  // i8 bool: 1 on the client→upstream leg
 

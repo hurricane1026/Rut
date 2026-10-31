@@ -1156,8 +1156,9 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // each add one route view on the connection and one view per direction. Branch
     // close policies add bounded table views and the selected echo reason. Branch
     // text replacements add one table view on the connection and each inspector.
+    // Affix recipes also retain a suffix view and an include-payload flag.
     // Keep the bounded layout explicit so future owner fields cannot grow it unnoticed.
-    CHECK_EQ(sizeof(Connection), 4432u);
+    CHECK_EQ(sizeof(Connection), 4504u);
 }
 
 TEST(iouring_idle_trim,

@@ -5399,51 +5399,44 @@ TEST(frontend, parse_return_forward_name) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
-TEST(frontend, websocket_opcode_comparisons_lower_to_existing_opcode_guards) {
-    const char* cases[] = {"frame.opcode == .text",
-                           ".text == frame.opcode",
-                           "frame.opcode != .text",
-                           ".binary != frame.opcode",
-                           "!(frame.opcode == .binary)",
-                           "!!(frame.opcode != .binary)"};
-    const u32 opcodes[] = {1, 1, 1, 2, 2, 2};
-    const bool negations[] = {false, false, true, true, true, true};
+TEST(frontend, websocket_message_rejects_wire_opcode_access) {
+    const char* cases[] = {"message.opcode == .text",
+                           ".text == message.opcode",
+                           "message.opcode != .text",
+                           ".binary != message.opcode",
+                           "!(message.opcode == .binary)",
+                           "!!(message.opcode != .binary)"};
     for (u32 i = 0; i < 6; i++) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n guard ";
         source += cases[i];
-        source += " else { frame.drop() }\n frame.forward() } }\n";
+        source += " else { message.drop() }\n message.forward() } }\n";
         auto tokens = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        REQUIRE(hir);
-        const auto& nodes = hir->routes[0].ws_handler.len_guards;
-        REQUIRE_EQ(nodes.len, 1u);
-        CHECK(nodes[0].accessor == WsLenGuard::Accessor::Opcode);
-        CHECK_EQ(nodes[0].bound, opcodes[i]);
-        CHECK_EQ(nodes[0].negate, negations[i]);
+        CHECK_FALSE(hir);
     }
 }
 
 TEST(frontend, websocket_opcode_comparisons_reject_non_data_cases_and_other_types) {
-    for (const char* condition : {"frame.opcode == .ping",
-                                  "frame.opcode != .pong",
-                                  ".close == frame.opcode",
-                                  "frame.opcode == .continuation",
-                                  "frame.opcode == .Text",
-                                  "frame.opcode == .text(1)",
-                                  "frame.opcode == 1",
-                                  "frame.opcode == \"text\"",
-                                  "frame.opcode == frame.text",
-                                  "frame.opcode == frame.opcode",
-                                  "frame.opcode < .binary",
-                                  "frame.opcode"}) {
+    for (const char* condition : {"message.opcode == .ping",
+                                  "message.opcode != .pong",
+                                  ".close == message.opcode",
+                                  "message.opcode == .continuation",
+                                  "message.opcode == .Text",
+                                  "message.opcode == .text(1)",
+                                  "message.opcode == 1",
+                                  "message.opcode == \"text\"",
+                                  "message.opcode == message.text",
+                                  "message.opcode == message.opcode",
+                                  "message.opcode < .binary",
+                                  "message.opcode"}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n guard ";
         source += condition;
-        source += " else { frame.drop() }\n frame.forward() } }\n";
+        source += " else { message.drop() }\n message.forward() } }\n";
         auto tokens = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
@@ -5469,12 +5462,14 @@ TEST(frontend, parse_return_websocket_bare_is_passthrough) {
 }
 
 TEST(frontend, parse_return_websocket_block_is_terminate) {
-    // A trailing `{ frame in ... }` block turns it into TERMINATE mode (WsTerminate) — the block is
-    // the per-message frame handler, parsed onto `then_stmt`. Frame verdicts are bare method calls
-    // (`frame.forward()`), parsed by the dedicated frame-body parser (parse_ws_frame_body), so
-    // the one-statement body unwraps to an Expr/MethodCall statement.
+    // A trailing `{ message in ... }` block turns it into TERMINATE mode (WsTerminate) — the block
+    // is the per-message handler, parsed onto `then_stmt`. Message verdicts are bare method
+    // calls
+    // (`message.forward()`), parsed by the dedicated message-body parser (parse_ws_message_body),
+    // so the one-statement body unwraps to an Expr/MethodCall statement.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward() } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5485,31 +5480,59 @@ TEST(frontend, parse_return_websocket_block_is_terminate) {
     const AstStatement& stmt = *route.statements[0];
     CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::WsTerminate));
     CHECK(stmt.name.eq(lit("ws")));
-    REQUIRE(stmt.then_stmt != nullptr);  // the frame-handler body
+    REQUIRE(stmt.then_stmt != nullptr);  // the message-handler body
     CHECK_EQ(static_cast<u8>(stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Expr));
     CHECK_EQ(static_cast<u8>(stmt.then_stmt->expr.kind), static_cast<u8>(AstExprKind::MethodCall));
 }
 
-TEST(frontend, parse_rejects_websocket_block_without_frame_binding) {
-    const char* sources[] = {
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n",
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
-        "message.forward() } }\n",
-    };
-    for (const char* src : sources) {
-        auto lexed = lex(lit(src));
-        REQUIRE(lexed);
-        auto ast = parse_file_heap(lexed.value());
-        REQUIRE_FALSE(ast.has_value());
-        CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ frame in ... }`")));
+TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ message in ... }`")));
+}
+
+TEST(frontend, parse_rejects_legacy_websocket_frame_binding) {
+    // Deliberately old syntax: this test proves the removed entry point stays rejected.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ message in ... }`")));
+    const u32 binding_start = static_cast<u32>(strstr(src, "frame in") - src);
+    CHECK_EQ(ast.error().span.start, binding_start);
+}
+
+TEST(frontend, websocket_message_rejects_wire_frame_properties) {
+    for (const char* condition : {"message.fin",
+                                  "message.masked",
+                                  "message.isPing",
+                                  "message.isPong",
+                                  "message.opcode == .text",
+                                  "message.opcode == .continuation"}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n guard ";
+        source += condition;
+        source += " else { message.drop() }\n message.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
     }
 }
 
 TEST(frontend, analyze_accepts_websocket_forward_only) {
-    // Slice B: the forward-only frame handler `frame.forward()` analyzes into a HirWsHandler
+    // Slice B: the forward-only message handler `message.forward()` analyzes into a HirWsHandler
     // on the route (verdict Forward) instead of an HTTP terminator.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward() } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5523,9 +5546,9 @@ TEST(frontend, analyze_accepts_websocket_forward_only) {
 }
 
 TEST(frontend, analyze_accepts_websocket_drop) {
-    // `frame.drop()` → Drop verdict.
+    // `message.drop()` → Drop verdict.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.drop() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.drop() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5539,11 +5562,11 @@ TEST(frontend, analyze_accepts_websocket_drop) {
 }
 
 TEST(frontend, analyze_accepts_websocket_max_message_size_kwarg) {
-    // `websocket(ws, maxMessageSize: 4kb) { frame in ... }` → ByteSize lexes as IntLit + unit
+    // `websocket(ws, maxMessageSize: 4kb) { message in ... }` → ByteSize lexes as IntLit + unit
     // Ident; 4kb = 4096 bytes carried onto the handler.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4kb) { frame in\n"
-        "  frame.forward()\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4kb) { message in\n"
+        "  message.forward()\n"
         "} }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5557,7 +5580,8 @@ TEST(frontend, analyze_accepts_websocket_max_message_size_kwarg) {
 TEST(frontend, analyze_websocket_max_message_size_omitted_is_zero) {
     // Omitting the kwarg leaves max_message_size 0 (the loader then uses the engine default).
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward() } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5569,7 +5593,7 @@ TEST(frontend, analyze_websocket_max_message_size_omitted_is_zero) {
 
 TEST(frontend, parse_rejects_websocket_max_message_size_without_block) {
     // maxMessageSize only governs terminate-mode reassembly; on the bare passthrough form
-    // (no frame-handler block) it's meaningless and must be rejected, not silently dropped.
+    // (no message-handler block) it's meaningless and must be rejected, not silently dropped.
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4kb) }\n";
     auto lexed = lex(lit(src));
@@ -5579,9 +5603,9 @@ TEST(frontend, parse_rejects_websocket_max_message_size_without_block) {
 }
 
 TEST(frontend, analyze_accepts_websocket_close_default_code) {
-    // `frame.close()` → Close verdict, default code 1000.
+    // `message.close()` → Close verdict, default code 1000.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.close() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5594,9 +5618,10 @@ TEST(frontend, analyze_accepts_websocket_close_default_code) {
 }
 
 TEST(frontend, analyze_accepts_websocket_close_with_code) {
-    // `frame.close(1008)` → Close verdict, policy-violation code.
+    // `message.close(1008)` → Close verdict, policy-violation code.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008) } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.close(1008) } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5611,7 +5636,8 @@ TEST(frontend, analyze_accepts_websocket_close_with_code) {
 TEST(frontend, analyze_websocket_close_reason_literal_and_byte_limit) {
     for (u32 length : {0u, 123u, 124u}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008, \"";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+            "message.close(1008, \"";
         source.append(length, 'x');
         source += "\") } }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -5631,7 +5657,8 @@ TEST(frontend, analyze_websocket_close_reason_literal_and_byte_limit) {
     }
     for (u32 count : {41u, 42u}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008, \"";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+            "message.close(1008, \"";
         for (u32 i = 0; i < count; i++) source += "\\u{20ac}";
         source += "\") } }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -5641,9 +5668,10 @@ TEST(frontend, analyze_websocket_close_reason_literal_and_byte_limit) {
         auto hir = analyze_file_heap(ast.value());
         CHECK_EQ(static_cast<bool>(hir), count == 41);
     }
-    for (const char* arg : {"1", "frame.text", "\"\\(frame.len)\"", "\"a\", \"b\""}) {
+    for (const char* arg : {"1", "message.text", "\"\\(message.len)\"", "\"a\", \"b\""}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008, ";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+            "message.close(1008, ";
         source += arg;
         source += ") } }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -5654,7 +5682,8 @@ TEST(frontend, analyze_websocket_close_reason_literal_and_byte_limit) {
     }
     for (bool invalid : {false, true}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008, \"";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+            "message.close(1008, \"";
         if (invalid)
             source += static_cast<char>(0xff);
         else
@@ -5677,12 +5706,12 @@ TEST(frontend, analyze_websocket_close_reason_literal_and_byte_limit) {
 
 TEST(frontend, analyze_websocket_guard_close_policies) {
     const char* source =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
-        "guard frame.fromClient else { frame.close(1008, \"one\\0\") }\n"
-        "guard frame.isText else { frame.close(1009) }\n"
-        "guard frame.len < 10 else { frame.close(1011, \"third\") }\n"
-        "guard frame.text.isEmpty else { frame.close(4001, \"fourth\") }\n"
-        "frame.close(1000, \"default\") } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+        "guard message.fromClient else { message.close(1008, \"one\\0\") }\n"
+        "guard message.isText else { message.close(1009) }\n"
+        "guard message.len < 10 else { message.close(1011, \"third\") }\n"
+        "guard message.text.isEmpty else { message.close(4001, \"fourth\") }\n"
+        "message.close(1000, \"default\") } }\n";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5702,17 +5731,18 @@ TEST(frontend, analyze_websocket_guard_close_policies) {
 }
 
 TEST(frontend, analyze_websocket_guard_close_rejects_invalid_arguments) {
-    for (const char* verdict : {"frame.close(1006)",
-                                "frame.close(1008, 1)",
-                                "frame.close(frame.len)",
-                                "frame.close(1008, frame.text)",
-                                "frame.close(1008, \"\\(frame.len)\")",
-                                "frame.forward(frame.text)"}) {
+    for (const char* verdict : {"message.close(1006)",
+                                "message.close(1008, 1)",
+                                "message.close(message.len)",
+                                "message.close(1008, message.text)",
+                                "message.close(1008, \"\\(message.len)\")",
+                                "message.forward(message.text + message.text)"}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard frame.isText "
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n guard "
+            "message.isText "
             "else { ";
         source += verdict;
-        source += " }\nframe.forward() } }\n";
+        source += " }\nmessage.forward() } }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -5721,10 +5751,11 @@ TEST(frontend, analyze_websocket_guard_close_rejects_invalid_arguments) {
     }
     for (u32 length : {123u, 124u}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard frame.isText "
-            "else { frame.close(1008, \"";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n guard "
+            "message.isText "
+            "else { message.close(1008, \"";
         source.append(length, 'x');
-        source += "\") }\nframe.forward() } }\n";
+        source += "\") }\nmessage.forward() } }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -5736,19 +5767,25 @@ TEST(frontend, analyze_websocket_guard_close_rejects_invalid_arguments) {
 TEST(frontend, analyze_rejects_websocket_close_reserved_code) {
     // 1006 (abnormal closure) must never be sent on the wire → rejected.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1006) } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.close(1006) } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+    // The message binding parsed successfully; rejection must point to the illegal code.
+    const u32 code_start = static_cast<u32>(strstr(src, "1006") - src);
+    CHECK_EQ(hir.error().span.start, code_start);
+    CHECK_EQ(hir.error().span.end, code_start + 4u);
 }
 
 TEST(frontend, analyze_rejects_websocket_drop_with_args) {
     // drop takes no arguments.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.drop(1) } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.drop(1) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5758,9 +5795,9 @@ TEST(frontend, analyze_rejects_websocket_drop_with_args) {
 }
 
 TEST(frontend, analyze_rejects_websocket_unknown_verdict) {
-    // Only forward/drop/close are verdicts; an unknown frame method is rejected.
+    // Only forward/drop/close are verdicts; an unknown message method is rejected.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.bogus() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.bogus() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5770,12 +5807,12 @@ TEST(frontend, analyze_rejects_websocket_unknown_verdict) {
 }
 
 TEST(frontend, analyze_accepts_websocket_len_guard) {
-    // `guard frame.len < 4096 else { frame.drop() }` then forward → one len-guard (Lt, 4096,
+    // `guard message.len < 4096 else { message.drop() }` then forward → one len-guard (Lt, 4096,
     // Drop) plus the default Forward verdict. (Rut's comparison ops are < > ==; there is no <=.)
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
-        "  guard frame.len < 4096 else { frame.drop() }\n"
-        "  frame.forward()\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+        "  guard message.len < 4096 else { message.drop() }\n"
+        "  message.forward()\n"
         "} }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5794,12 +5831,12 @@ TEST(frontend, analyze_accepts_websocket_len_guard) {
 }
 
 TEST(frontend, analyze_accepts_websocket_opcode_guard) {
-    // `guard frame.isText else { frame.drop() }` then forward → one opcode guard (Opcode, Eq,
+    // `guard message.isText else { message.drop() }` then forward → one opcode guard (Opcode, Eq,
     // Text=1, Drop) plus the default Forward verdict — a text-only handler.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
-        "  guard frame.isText else { frame.drop() }\n"
-        "  frame.forward()\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+        "  guard message.isText else { message.drop() }\n"
+        "  message.forward()\n"
         "} }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5817,12 +5854,12 @@ TEST(frontend, analyze_accepts_websocket_opcode_guard) {
 }
 
 TEST(frontend, analyze_accepts_websocket_direction_guard) {
-    // `guard frame.fromClient else { frame.forward() }` then drop → one direction guard
+    // `guard message.fromClient else { message.forward() }` then drop → one direction guard
     // (FromClient, Eq, 1, Forward) plus the default Drop verdict — police only the client leg.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
-        "  guard frame.fromClient else { frame.forward() }\n"
-        "  frame.drop()\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+        "  guard message.fromClient else { message.forward() }\n"
+        "  message.drop()\n"
         "} }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5841,12 +5878,12 @@ TEST(frontend, analyze_accepts_websocket_direction_guard) {
 }
 
 TEST(frontend, analyze_accepts_websocket_text_match_guard) {
-    // `guard !frame.text.matches(re"badword") else { frame.drop() }` then forward → one
+    // `guard !message.text.matches(re"badword") else { message.drop() }` then forward → one
     // TextMatch guard (negated, pattern "badword", Drop) — a content blocklist.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
-        "  guard !frame.text.matches(re\"badword\") else { frame.drop() }\n"
-        "  frame.forward()\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+        "  guard !message.text.matches(re\"badword\") else { message.drop() }\n"
+        "  message.forward()\n"
         "} }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5865,11 +5902,12 @@ TEST(frontend, analyze_accepts_websocket_text_match_guard) {
 }
 
 TEST(frontend, analyze_accepts_websocket_text_match_guard_positive) {
-    // The non-negated allowlist form: `guard frame.text.matches(re"^ok$") else { frame.drop() }`.
+    // The non-negated allowlist form: `guard message.text.matches(re"^ok$") else { message.drop()
+    // }`.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
-        "  guard frame.text.matches(re\"^ok$\") else { frame.drop() }\n"
-        "  frame.forward()\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+        "  guard message.text.matches(re\"^ok$\") else { message.drop() }\n"
+        "  message.forward()\n"
         "} }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5886,9 +5924,9 @@ TEST(frontend, analyze_accepts_websocket_text_match_guard_positive) {
 
 TEST(frontend, analyze_websocket_compound_conditions) {
     const char* src = R"(upstream ws
-route GET "/ws" { return websocket(ws) { frame in
-    guard (frame.fromClient && !frame.isBinary) || frame.len <= 4 else { frame.drop() }
-    frame.forward()
+route GET "/ws" { return websocket(ws) { message in
+    guard (message.fromClient && !message.isBinary) || message.len <= 4 else { message.drop() }
+    message.forward()
 } }
 )";
     auto lexed = lex(lit(src));
@@ -5912,16 +5950,16 @@ route GET "/ws" { return websocket(ws) { frame in
 }
 
 TEST(frontend, analyze_websocket_text_literal_conditions) {
-    const char* conditions[] = {"frame.text == \"ping\"",
-                                "\"ping\" != frame.text",
-                                "frame.text.isEmpty",
-                                "!frame.text.isEmpty",
-                                "frame.isText && frame.text == \"a\\0b\\n\""};
+    const char* conditions[] = {"message.text == \"ping\"",
+                                "\"ping\" != message.text",
+                                "message.text.isEmpty",
+                                "!message.text.isEmpty",
+                                "message.isText && message.text == \"a\\0b\\n\""};
     for (u32 i = 0; i < 5; i++) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n guard ";
         source += conditions[i];
-        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        source += " else { message.drop() }\n message.forward()\n} }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -5950,22 +5988,22 @@ TEST(frontend, analyze_websocket_text_literal_conditions) {
 }
 
 TEST(frontend, analyze_websocket_text_literal_rejects_invalid_shapes) {
-    for (const char* condition : {"frame.text == 1",
-                                  "frame.text == frame.text",
-                                  "frame.text < \"ping\"",
-                                  "frame.text.isEmpty()",
-                                  "frame.text.hasPrefix",
-                                  "frame.binary.hasSuffix(\"x\")",
-                                  "frame.text.hasPrefix(\"\\(frame.len)\")",
-                                  "frame.text.contains",
-                                  "frame.binary.contains(\"x\")",
-                                  "frame.text.contains(\"\\(frame.len)\")",
-                                  "frame.binary.isEmpty",
-                                  "frame.text == \"\\q\""}) {
+    for (const char* condition : {"message.text == 1",
+                                  "message.text == message.text",
+                                  "message.text < \"ping\"",
+                                  "message.text.isEmpty()",
+                                  "message.text.hasPrefix",
+                                  "message.binary.hasSuffix(\"x\")",
+                                  "message.text.hasPrefix(\"\\(message.len)\")",
+                                  "message.text.contains",
+                                  "message.binary.contains(\"x\")",
+                                  "message.text.contains(\"\\(message.len)\")",
+                                  "message.binary.isEmpty",
+                                  "message.text == \"\\q\""}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n guard ";
         source += condition;
-        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        source += " else { message.drop() }\n message.forward()\n} }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -5977,14 +6015,14 @@ TEST(frontend, analyze_websocket_text_literal_rejects_invalid_shapes) {
 TEST(frontend, analyze_websocket_text_prefix_suffix_conditions) {
     for (const char* method : {"hasPrefix", "hasSuffix", "contains"}) {
         for (const char* argument :
-             {"\"a\\0b\"", "", "1", "frame.text", "\"a\", \"b\"", "\"\\q\""}) {
+             {"\"a\\0b\"", "", "1", "message.text", "\"a\", \"b\"", "\"\\q\""}) {
             std::string source =
-                "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard "
-                "!frame.text.";
+                "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n guard "
+                "!message.text.";
             source += method;
             source += "(";
             source += argument;
-            source += ") else { frame.drop() }\n frame.forward()\n} }\n";
+            source += ") else { message.drop() }\n message.forward()\n} }\n";
             auto lexed = lex({source.data(), static_cast<u32>(source.size())});
             REQUIRE(lexed);
             auto ast = parse_file_heap(lexed.value());
@@ -6010,10 +6048,10 @@ TEST(frontend, analyze_websocket_text_prefix_suffix_conditions) {
 TEST(frontend, analyze_websocket_condition_limits) {
     // Sixteen leaves + fifteen binary nodes fit; the next leaf exceeds the budget.
     for (u32 leaves : {16u, 17u}) {
-        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n";
-        source += "guard frame.isText";
-        for (u32 i = 1; i < leaves; i++) source += " || frame.isBinary";
-        source += " else { frame.drop() }\nframe.forward()\n} }\n";
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        source += "guard message.isText";
+        for (u32 i = 1; i < leaves; i++) source += " || message.isBinary";
+        source += " else { message.drop() }\nmessage.forward()\n} }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -6029,12 +6067,13 @@ TEST(frontend, analyze_websocket_condition_limits) {
     }
     // The node budget is shared across source guards: 31 + 1 fits, 31 + 2 does not.
     for (u32 extra : {1u, 2u}) {
-        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n";
-        source += "guard frame.isText";
-        for (u32 i = 1; i < 16; i++) source += " || frame.isBinary";
-        source += " else { frame.drop() }\n";
-        for (u32 i = 0; i < extra; i++) source += "guard frame.fromClient else { frame.drop() }\n";
-        source += "frame.forward()\n} }\n";
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        source += "guard message.isText";
+        for (u32 i = 1; i < 16; i++) source += " || message.isBinary";
+        source += " else { message.drop() }\n";
+        for (u32 i = 0; i < extra; i++)
+            source += "guard message.fromClient else { message.drop() }\n";
+        source += "message.forward()\n} }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -6049,9 +6088,9 @@ TEST(frontend, analyze_websocket_condition_limits) {
         }
     }
     // Four source guards remain the limit regardless of their condition sizes.
-    std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n";
-    for (u32 i = 0; i < 5; i++) source += "guard frame.isText else { frame.drop() }\n";
-    source += "frame.forward()\n} }\n";
+    std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+    for (u32 i = 0; i < 5; i++) source += "guard message.isText else { message.drop() }\n";
+    source += "message.forward()\n} }\n";
     auto lexed = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6062,15 +6101,15 @@ TEST(frontend, analyze_websocket_condition_limits) {
 }
 
 TEST(frontend, analyze_websocket_compound_rejects_invalid_operands) {
-    for (const char* cond : {"frame.isText && 1",
-                             "frame.fromClient || frame.unknown",
-                             "!(frame.len)",
-                             "frame.len == false",
-                             "frame.isText && req.path"}) {
+    for (const char* cond : {"message.isText && 1",
+                             "message.fromClient || message.unknown",
+                             "!(message.len)",
+                             "message.len == false",
+                             "message.isText && req.path"}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n guard ";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n guard ";
         source += cond;
-        source += " else { frame.drop() }\n frame.forward()\n} }\n";
+        source += " else { message.drop() }\n message.forward()\n} }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -6081,12 +6120,12 @@ TEST(frontend, analyze_websocket_compound_rejects_invalid_operands) {
 }
 
 TEST(frontend, analyze_rejects_websocket_non_len_guard) {
-    // Only `frame.len <cmp> N` guard conditions are supported for now; other accessors are a
-    // follow-up, so a non-frame.len guard condition is rejected.
+    // Only `message.len <cmp> N` guard conditions are supported for now; other accessors are a
+    // follow-up, so a non-message.len guard condition is rejected.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
-        "  guard frame.opcode == 1 else { frame.drop() }\n"
-        "  frame.forward()\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+        "  guard message.opcode == 1 else { message.drop() }\n"
+        "  message.forward()\n"
         "} }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -6097,11 +6136,12 @@ TEST(frontend, analyze_rejects_websocket_non_len_guard) {
 }
 
 TEST(frontend, build_mir_skips_ws_terminate_route) {
-    // A ws-terminate route compiles via the frame-handler JIT path in the serve loader, NOT
+    // A ws-terminate route compiles via the message-handler JIT path in the serve loader, NOT
     // the HTTP MIR/RIR pipeline, so build_mir SKIPS it (rather than rejecting): a ws-only
     // program produces a valid MIR module with zero HTTP functions.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward() } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6114,12 +6154,13 @@ TEST(frontend, build_mir_skips_ws_terminate_route) {
 }
 
 TEST(frontend, analyze_accepts_websocket_forward_payload) {
-    // `frame.forward(payload)` is the modify-and-send form. It must PARSE as a MethodCall on
+    // `message.forward(payload)` is the modify-and-send form. It must PARSE as a MethodCall on
     // `frame` named "forward" with ONE arg — NOT get mis-routed into the `forward(upstream)`
     // proxy terminator by the contextual-keyword rule — and analyze accepts it when the arg is
     // a fixed Str literal payload, recording has_forward_payload for the loader.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(\"hi\") } "
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+        "message.forward(\"hi\") } "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -6132,7 +6173,7 @@ TEST(frontend, analyze_accepts_websocket_forward_payload) {
     CHECK_EQ(static_cast<u8>(call.kind), static_cast<u8>(AstExprKind::MethodCall));
     CHECK(call.name.eq(lit("forward")));  // member name, not a terminator
     REQUIRE(call.lhs != nullptr);
-    CHECK(call.lhs->name.eq(lit("frame")));
+    CHECK(call.lhs->name.eq(lit("message")));
     CHECK_EQ(call.args.len, 1u);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
@@ -6146,7 +6187,8 @@ TEST(frontend, analyze_accepts_websocket_forward_payload) {
 TEST(frontend, analyze_rejects_websocket_forward_nonstring_payload) {
     // The modify payload must be a Str (text-frame content). A non-Str arg is rejected.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(123) } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward(123) } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6157,10 +6199,11 @@ TEST(frontend, analyze_rejects_websocket_forward_nonstring_payload) {
 
 TEST(frontend, analyze_websocket_rewrite_rejects_dynamic_and_oversize_text) {
     const char* sources[] = {
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(req.path) "
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+        "message.forward(req.path) "
         "} }\n",
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4b) { frame in "
-        "frame.forward(\"12345\") } }\n"};
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4b) { message in "
+        "message.forward(\"12345\") } }\n"};
     for (const char* source : sources) {
         auto lexed = lex(lit(source));
         REQUIRE(lexed);
@@ -6170,10 +6213,180 @@ TEST(frontend, analyze_websocket_rewrite_rejects_dynamic_and_oversize_text) {
     }
 }
 
+TEST(frontend, websocket_text_affix_rewrite_analyzes_bounded_concatenation) {
+    const char* expressions[] = {"message.text",
+                                 "\"pre\" + message.text",
+                                 "message.text + \"end\"",
+                                 "\"a\" + (\"b\" + message.text) + (\"c\" + \"d\")",
+                                 "\"a\" + \"b\""};
+    const Str prefixes[] = {{}, {"pre", 3}, {}, {"ab", 2}, {"ab", 2}};
+    const Str suffixes[] = {{}, {}, {"end", 3}, {"cd", 2}, {}};
+    for (u32 i = 0; i < 5; i++) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\nmessage.forward(";
+        source += expressions[i];
+        source += ") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& route = hir->routes[0];
+        const auto& recipe = route.ws_handler.forward_payload;
+        CHECK_EQ(recipe.include_payload, i != 4);
+        CHECK(route.exprs[recipe.prefix_expr].str_value.eq(prefixes[i]));
+        CHECK(route.exprs[recipe.suffix_expr].str_value.eq(suffixes[i]));
+    }
+}
+
+TEST(frontend, websocket_text_rewrite_accepts_constant_local_aliases) {
+    const char* source = R"rut(
+upstream ws
+route GET "/ws" {
+    let prefix = "a\0b"
+    let alias = prefix
+    let suffix = "\né"
+    return websocket(ws) { message in
+        guard message.isText else { message.forward(alias) }
+        message.forward("[" + alias + message.text + suffix + "]")
+    }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    const auto& handler = route.ws_handler;
+    REQUIRE_EQ(handler.forward_payloads.len, 1u);
+    const auto& branch = handler.forward_payloads[0];
+    CHECK_FALSE(branch.include_payload);
+    CHECK(route.exprs[branch.prefix_expr].str_value.eq({"a\0b", 3}));
+    CHECK(handler.forward_payload.include_payload);
+    CHECK(route.exprs[handler.forward_payload.prefix_expr].str_value.eq({"[a\0b", 4}));
+    CHECK(route.exprs[handler.forward_payload.suffix_expr].str_value.eq(lit("\né]")));
+}
+
+TEST(frontend, websocket_text_rewrite_constant_locals_preserve_validation) {
+    const char* invalid[] = {
+        "let text = req.path\n",
+        "let text = 42\n",
+        "let text = req.header(\"X-Text\")\n",
+        "let text = \"12345\"\n",
+    };
+    for (const char* binding : invalid) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { ";
+        source += binding;
+        source +=
+            "return websocket(ws, maxMessageSize: 4b) { message in message.forward(text) } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    for (const char* expression : {"text", "text + message.text", "text + message.text + text"}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { let text = \"1234\"\n";
+        source += "return websocket(ws, maxMessageSize: 4b) { message in message.forward(";
+        source += expression;
+        source += ") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())),
+                 strcmp(expression, "text + message.text + text") != 0);
+    }
+}
+
+TEST(frontend, websocket_text_rewrite_constant_locals_obey_capacity_and_utf8) {
+    for (const std::string& value :
+         {std::string(16371, 'a'), std::string(1, static_cast<char>(0xff))}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { let text = \"" + value +
+                             "\"\nreturn websocket(ws) { message in message.forward(text) } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, websocket_text_affix_rewrite_rejects_unbounded_or_unsupported_expressions) {
+    for (const char* expression : {"message.text + message.text",
+                                   "message.text + message.len",
+                                   "req.path + message.text",
+                                   "message.text.lowercased()",
+                                   "message.text - \"x\"",
+                                   "\"\\(message.text)\""}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\nmessage.forward(";
+        source += expression;
+        source += ") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    for (u32 length : {4u, 5u}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4b) { message "
+            "in\nmessage.forward(\"";
+        source.append(length, 'x');
+        source += "\" + message.text) } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())), length == 4);
+    }
+    std::string deep =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+        "message.forward(message.text";
+    for (u32 i = 0; i < 40; i++) deep += " + \"\"";
+    deep += ") } }\n";
+    auto tokens = lex({deep.data(), static_cast<u32>(deep.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, websocket_text_affix_node_budget_and_utf8_validation) {
+    for (u32 levels : {4u, 5u}) {
+        std::string expr = "\"\"";
+        for (u32 i = 0; i < levels; i++) expr = "(" + expr + " + " + expr + ")";
+        expr.replace(expr.find("\"\""), 2, "message.text");
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward(" +
+            expr + ") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())), levels == 4);
+    }
+    std::string source =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+        "message.forward(message.text "
+        "+ \"";
+    source += static_cast<char>(0xff);
+    source += "\") } }\n";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+
 TEST(frontend, analyze_rejects_websocket_forward_two_args) {
     // forward takes at most one payload; two args is rejected.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(\"a\", "
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward(\"a\", "
         "\"b\") } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9160,7 +9373,7 @@ func mutate(_ resp: Response) -> i32 {
 }
 chain access { after mutate(resp) }
 route GET "/ws" use chain access {
-    return websocket(ws) { frame in frame.forward() }
+    return websocket(ws) { message in message.forward() }
 }
 )rut";
     auto lexed = lex(lit(src));
@@ -41746,24 +41959,24 @@ TEST(frontend, rs256_requires_static_valid_trust_policy_and_unwrapped_token) {
 
 #if RUT_ENABLE_WEBSOCKET
 TEST(frontend, websocket_guard_text_replacements_validate_literals_and_limits) {
-    for (const char* verdict : {"frame.forward(\"\")",
-                                "frame.forward(\"a\\0b\")",
-                                "frame.forward(\"\\u{20ac}\")",
-                                "frame.forward(frame.text)",
-                                "frame.forward(1)",
-                                "frame.forward(\"a\", \"b\")",
-                                "frame.forward(\"\\(frame.len)\")"}) {
+    for (const char* verdict : {"message.forward(\"\")",
+                                "message.forward(\"a\\0b\")",
+                                "message.forward(\"\\u{20ac}\")",
+                                "message.forward(message.text + message.text)",
+                                "message.forward(1)",
+                                "message.forward(\"a\", \"b\")",
+                                "message.forward(\"\\(message.len)\")"}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
-            "guard frame.isText else { ";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard message.isText else { ";
         source += verdict;
-        source += " }\nframe.forward() } }\n";
+        source += " }\nmessage.forward() } }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        const bool valid = strstr(verdict, "frame.text") == nullptr &&
+        const bool valid = strstr(verdict, "message.text") == nullptr &&
                            strstr(verdict, "(1)") == nullptr && strstr(verdict, ",") == nullptr &&
                            strstr(verdict, "\\(") == nullptr;
         CHECK_EQ(static_cast<bool>(hir), valid);
@@ -41775,10 +41988,10 @@ TEST(frontend, websocket_guard_text_replacements_validate_literals_and_limits) {
     }
     for (u32 length : {16370u, 16371u}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
-            "guard frame.isText else { frame.forward(\"";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard message.isText else { message.forward(\"";
         source.append(length, 'x');
-        source += "\") }\nframe.forward() } }\n";
+        source += "\") }\nmessage.forward() } }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -41790,10 +42003,11 @@ TEST(frontend, websocket_guard_text_replacements_validate_literals_and_limits) {
 TEST(frontend, websocket_guard_replacement_respects_max_message_size) {
     for (const char* text : {"four", "five!"}) {
         std::string source =
-            "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4b) { frame in\n"
-            "guard frame.isText else { frame.forward(\"";
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4b) { message "
+            "in\n"
+            "guard message.isText else { message.forward(\"";
         source += text;
-        source += "\") }\nframe.forward() } }\n";
+        source += "\") }\nmessage.forward() } }\n";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());

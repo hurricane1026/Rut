@@ -155,14 +155,14 @@ struct RouteEntry {
     bool ws_terminate = false;
     WsMessageHandlerFn ws_frame_handler = nullptr;
     u32 ws_max_message_size = 0;
-    // RFC 6455 status the handler's `frame.close(code)` verdict puts on the wire (1000 default).
+    // RFC 6455 status the handler's `message.close(code)` verdict puts on the wire (1000 default).
     WsClosePolicy ws_close_policies[kWsMaxClosePolicies]{};
     u32 ws_close_policy_count = 0;
     Str ws_close_reason{};
     u16 ws_close_code = 1000;
-    Str ws_forward_texts[kWsMaxForwardTexts]{};
+    WsTextRewrite ws_forward_texts[kWsMaxForwardTexts]{};
     u32 ws_forward_text_count = 0;
-    Str ws_forward_text{};  // immutable replacement for ForwardText verdicts
+    WsTextRewrite ws_forward_text{};  // immutable replacement for ForwardText verdicts
     // Nonzero only for the bounded static direct-forward timeout preflight.
     // Resolves through the same pinned RouteConfig as this RouteEntry.
     ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
@@ -1512,11 +1512,11 @@ public:
                           WsMessageHandlerFn handler,
                           u32 max_message_size,
                           u16 close_code = 1000,
-                          Str forward_text = {},
+                          WsTextRewrite forward_text = {},
                           Str close_reason = {},
                           const WsClosePolicy* close_policies = nullptr,
                           u32 close_policy_count = 0,
-                          const Str* forward_texts = nullptr,
+                          const WsTextRewrite* forward_texts = nullptr,
                           u32 forward_text_count = 0) {
 #if !RUT_ENABLE_WEBSOCKET
         // The 101/tunnel path is compiled out in this build — a terminate route could
@@ -1535,8 +1535,8 @@ public:
         (void)forward_text_count;
         return false;
 #else
-        if (handler == nullptr || max_message_size == 0 || forward_text.len > max_message_size ||
-            forward_text.len > kWsTerminateMessageCapacity || !ws_valid_text_payload(forward_text))
+        if (handler == nullptr || max_message_size == 0 ||
+            !ws_valid_text_rewrite(forward_text, max_message_size))
             return false;
         // Fail closed on a close code the runtime would refuse to put on the wire, using the
         // SAME predicate as the receive-side validator (ws_inspect) and the .rut analyze check
@@ -1553,10 +1553,7 @@ public:
         if (forward_text_count > kWsMaxForwardTexts || (forward_text_count != 0 && !forward_texts))
             return false;
         for (u32 i = 0; i < forward_text_count; i++)
-            if (forward_texts[i].len > max_message_size ||
-                forward_texts[i].len > kWsTerminateMessageCapacity ||
-                !ws_valid_text_payload(forward_texts[i]))
-                return false;
+            if (!ws_valid_text_rewrite(forward_texts[i], max_message_size)) return false;
         if (!add_proxy(path, method, upstream_id)) return false;
         auto& r = routes[route_count - 1];
         r.ws_terminate = true;

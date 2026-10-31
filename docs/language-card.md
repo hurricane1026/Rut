@@ -826,72 +826,77 @@ return forward(users, load_balance: .roundRobin, streaming: true)         // ⏳
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
-// Current terminate handlers: up to 4 guards over direction, text/binary opcode,
-// frame.opcode ==/!= .text/.binary (either side),
-// frame.len (< > == <= >= != integer literal, either side), text.matches(re),
+// Current terminate handlers: up to 4 guards over direction, text/binary message type,
+// message.len (< > == <= >= != integer literal, either side), text.matches(re),
 // text ==/!= string literal (either side), text.isEmpty, and
 // text.hasPrefix("literal"), text.hasSuffix("literal"), text.contains("literal").
 // Text predicates
-// compare raw payload bytes; use frame.isText for text-only filtering.
+// compare raw payload bytes; use message.isText for text-only filtering.
 // Literal predicates decode ordinary escapes, including embedded NUL.
 // Empty prefixes/suffixes/substrings match every message; arguments must be literals.
 // Conditions support !, &&, ||, parentheses and left-to-right short-circuiting.
 // ! binds tighter than comparisons; && binds tighter than ||.
 // At most 32 condition nodes (leaf predicates + binary operators); nesting is bounded.
-return websocket(chat) { frame in
-    guard !frame.fromClient || !frame.isText || !frame.text.matches(re".*spam.*") else {
-        frame.drop()
+return websocket(chat) { message in
+    guard !message.fromClient || !message.isText || !message.text.matches(re".*spam.*") else {
+        message.drop()
     }
-    guard !frame.fromClient || frame.text != "ping" else { frame.drop() }
-    guard frame.opcode != .binary else { frame.close(1008, "text only") }
-    guard frame.len <= 4096 else { frame.close() }
-    frame.forward()
+    guard !message.fromClient || message.text != "ping" else { message.drop() }
+    guard message.isText else { message.close(1008, "text only") }
+    guard message.len <= 4096 else { message.close() }
+    message.forward()
 }
 
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
-// and the single-slice cap. Dynamic expressions/interpolation remain unsupported.
-return websocket(chat, maxMessageSize: 4kb) { frame in
-    guard frame.fromClient && frame.isText else { frame.forward() }
-    frame.forward("message replaced")
+// and the single-slice cap. General expressions/interpolation remain unsupported.
+return websocket(chat, maxMessageSize: 4kb) { message in
+    guard message.fromClient && message.isText else { message.forward() }
+    message.forward("message replaced")
+}
+
+// Add fixed UTF-8 affixes around one complete Text message, using String +.
+// Parentheses, concatenated literals, and compile-time-known route let strings
+// (including aliases) are accepted, with at most 32 expression nodes.
+// Request-derived strings, optional values, and calls are rejected.
+// At most one message.text reference may appear; repeated references/interpolation reject.
+// Binary messages selected for this operation fail the tunnel; guard the opcode first.
+// The complete rewritten output must fit maxMessageSize and the single-slice cap.
+let label = "audit:"
+return websocket(chat, maxMessageSize: 4kb) { message in
+    guard message.isText else { message.forward() }
+    guard !message.text.hasPrefix("audit:") else { message.forward("[" + message.text + "]") }
+    message.forward(label + message.text)
 }
 
 // Each guard may choose its own replacement; the first failing guard wins.
-return websocket(chat) { frame in
-    guard frame.text != "ping" else { frame.forward("pong") }
-    guard frame.text != "hello" else { frame.forward("welcome") }
-    frame.forward()
+return websocket(chat) { message in
+    guard message.text != "ping" else { message.forward("pong") }
+    guard message.text != "hello" else { message.forward("welcome") }
+    message.forward()
 }
 
 // Guard branches can choose independent close codes and fixed UTF-8 reasons.
 // close(code) uses an empty reason; a bare close() keeps the route's default policy.
-return websocket(chat) { frame in
-    guard frame.len <= 4096 else { frame.close(1009, "message too large") }
-    guard !frame.text.contains("secret") else { frame.close(1008, "policy violation") }
-    frame.forward()
+return websocket(chat) { message in
+    guard message.len <= 4096 else { message.close(1009, "message too large") }
+    guard !message.text.contains("secret") else { message.close(1008, "policy violation") }
+    message.forward()
 }
 
 // Close with a status and fixed UTF-8 reason (also accepted in guard branches).
 // Reason length is at most 123 UTF-8 bytes; empty reasons and NUL are supported.
 // Handler closes send the configured code/reason to both peers. Peer closes
 // retain their original forwarding and normal-closure echo behavior.
-return websocket(chat) { frame in
-    guard frame.fromClient && frame.text.contains("secret") else { frame.forward() }
-    frame.close(1008, "policy violation")
+return websocket(chat) { message in
+    guard message.fromClient && message.text.contains("secret") else { message.forward() }
+    message.close(1008, "policy violation")
 }
 
-// WebSocket proxy. The inspection sketch below is a target API; current terminate
-// handlers use `return websocket(chat) { frame in ... }`, forward/drop/close,
-// and final frame.forward("fixed text").
-// Reassembled messages are currently limited to approximately one 16 KB slice.
-guard req.upgrade == .websocket else { return 400 }
-return websocket(chat)                          // transparent
-websocket(chat, maxMessageSize: 64kb) { frame in    // per-frame inspection
-    if frame.direction == .client && frame.isText {
-        guard !frame.text.matches(re"(?i)spam") else { return .drop }
-    }
-    return .forward       // .forward .drop .close(reason:) .send(t) .inject(t)
-}
+// Transparent proxy: no application message processing.
+return websocket(chat)
+// Message handlers above see complete Text/Binary payloads. No frame binding,
+// wire opcode, FIN, mask, continuation, or ping/pong API is exposed.
 
 // HTTP calls — native syntax, async is invisible (no await anywhere)
 let res = post http://orders/create {

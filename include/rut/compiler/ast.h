@@ -68,9 +68,9 @@ enum class AstStmtKind : u8 {
     RespondStatus,
     ForwardUpstream,
     Redirect,
-    // `websocket(<upstream>) { <frame-handler> }` — terminate mode (vs the bare
+    // `websocket(<upstream>) { <message-handler> }` — terminate mode (vs the bare
     // `websocket(x)` passthrough, which stays ForwardUpstream). `name` = upstream
-    // identifier; `then_stmt` = the parsed frame-handler body block (reused like For).
+    // identifier; `then_stmt` = the parsed message-handler body block (reused like For).
     // The body's per-message verdicts (forward/drop/close) are a follow-up slice.
     WsTerminate,
     If,

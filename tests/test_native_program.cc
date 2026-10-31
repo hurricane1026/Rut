@@ -250,15 +250,15 @@ TEST(native_program, websocket_rewrite_survives_compiler_exit_and_source_removal
     Source source;
     REQUIRE(
         source.append("upstream backend at \"127.0.0.1:9999\"\n"
-                      "route GET \"/ws\" { return websocket(backend) { frame in "
-                      "frame.forward(\"native\\0text\") } }\n"));
+                      "route GET \"/ws\" { return websocket(backend) { message in "
+                      "message.forward(\"native\\0text\") } }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     const auto& route = owner.p->config.routes[0];
-    REQUIRE_EQ(route.ws_forward_text.len, 11u);
-    CHECK(memcmp(route.ws_forward_text.ptr, "native\0text", 11) == 0);
+    REQUIRE_EQ(route.ws_forward_text.prefix.len, 11u);
+    CHECK(memcmp(route.ws_forward_text.prefix.ptr, "native\0text", 11) == 0);
     WsInspector st;
     st.forward_text = route.ws_forward_text;
     st.max_message_size = route.ws_max_message_size;
@@ -281,14 +281,62 @@ TEST(native_program, websocket_rewrite_survives_compiler_exit_and_source_removal
     CHECK(memcmp(output + 2, "native\0text", 11) == 0);
 }
 
+TEST(native_program, websocket_affix_rewrites_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(
+        "upstream backend at \"127.0.0.1:9999\"\n"
+        "route GET \"/ws\" { let prefix = \"one\\0\"\n"
+        " let alias = prefix\n let suffix = \"\\u{20ac}\"\n"
+        " return websocket(backend) { message in\n"
+        " guard message.text != \"a\" else { message.forward(alias + message.text + "
+        "suffix) }\n"
+        " guard message.text != \"b\" else { message.forward(message.text + \"end\") }\n"
+        " guard message.text != \"c\" else { message.forward(\"pre\" + message.text) }\n"
+        " guard message.text != \"d\" else { message.forward(\"fixed\") }\n"
+        " message.forward(\"[\" + message.text + \"]\") } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+
+    REQUIRE_EQ(route.ws_forward_text_count, 4u);
+    const Str expected[] = {
+        {"one\0a\xe2\x82\xac", 8}, {"bend", 4}, {"prec", 4}, {"fixed", 5}, {"[e]", 3}};
+    for (u32 i = 0; i < 5; i++) {
+        WsInspector st;
+        st.forward_text = route.ws_forward_text;
+        st.forward_texts = route.ws_forward_texts;
+        st.forward_text_count = route.ws_forward_text_count;
+        st.max_message_size = route.ws_max_message_size;
+        const u8 input[] = {0x81, 1, static_cast<u8>('a' + i)};
+        u8 out[128], msg[32];
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           sizeof(input),
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           route.ws_frame_handler,
+                           nullptr,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        REQUIRE_EQ(produced, 2u + expected[i].len);
+        CHECK_EQ(out[0], 0x81u);
+        CHECK(memcmp(out + 2, expected[i].ptr, expected[i].len) == 0);
+    }
+}
+
 TEST(native_program, websocket_affixes_survive_source_removal) {
     Source source;
     REQUIRE(
         source.append("upstream backend at \"127.0.0.1:9999\"\n"
-                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                      "guard !frame.fromClient || (frame.text.hasPrefix(\"a\\0\") && "
-                      "frame.text.hasSuffix(\"\\u{20ac}\")) else { frame.drop() }\n"
-                      "frame.forward() } }\n"));
+                      "route GET \"/ws\" { return websocket(backend) { message in\n"
+                      "guard !message.fromClient || (message.text.hasPrefix(\"a\\0\") && "
+                      "message.text.hasSuffix(\"\\u{20ac}\")) else { message.drop() }\n"
+                      "message.forward() } }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
@@ -312,10 +360,10 @@ TEST(native_program, websocket_contains_survives_source_removal) {
     Source source;
     REQUIRE(
         source.append("upstream backend at \"127.0.0.1:9999\"\n"
-                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                      "guard !frame.fromClient || (frame.text.contains(\"a\\0\") && "
-                      "!frame.text.contains(\"\\u{20ac}\")) else { frame.drop() }\n"
-                      "frame.forward() } }\n"));
+                      "route GET \"/ws\" { return websocket(backend) { message in\n"
+                      "guard !message.fromClient || (message.text.contains(\"a\\0\") && "
+                      "!message.text.contains(\"\\u{20ac}\")) else { message.drop() }\n"
+                      "message.forward() } }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
@@ -332,10 +380,10 @@ TEST(native_program, websocket_contains_survives_source_removal) {
 
 TEST(native_program, websocket_close_reason_survives_source_removal) {
     Source source;
-    REQUIRE(
-        source.append("upstream backend at \"127.0.0.1:9999\"\n"
-                      "route GET \"/ws\" { return websocket(backend) { frame in frame.close(1008, "
-                      "\"native\\0\\u{20ac}\") } }\n"));
+    REQUIRE(source.append(
+        "upstream backend at \"127.0.0.1:9999\"\n"
+        "route GET \"/ws\" { return websocket(backend) { message in message.close(1008, "
+        "\"native\\0\\u{20ac}\") } }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
@@ -367,14 +415,14 @@ TEST(native_program, websocket_close_reason_survives_source_removal) {
 
 TEST(native_program, websocket_guard_close_policies_survive_source_removal) {
     Source source;
-    REQUIRE(
-        source.append("upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
-                      "websocket(backend) { frame in\n"
-                      "guard frame.text != \"a\" else { frame.close(1008, \"a\\0\\u{20ac}\") }\n"
-                      "guard frame.text != \"b\" else { frame.close(1009) }\n"
-                      "guard frame.text != \"c\" else { frame.close(1011, \"third\") }\n"
-                      "guard frame.text != \"d\" else { frame.close(4001, \"fourth\") }\n"
-                      "frame.close(1000, \"default\") } }\n"));
+    REQUIRE(source.append(
+        "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+        "websocket(backend) { message in\n"
+        "guard message.text != \"a\" else { message.close(1008, \"a\\0\\u{20ac}\") }\n"
+        "guard message.text != \"b\" else { message.close(1009) }\n"
+        "guard message.text != \"c\" else { message.close(1011, \"third\") }\n"
+        "guard message.text != \"d\" else { message.close(4001, \"fourth\") }\n"
+        "message.close(1000, \"default\") } }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
@@ -410,13 +458,13 @@ TEST(native_program, websocket_guard_close_policies_survive_source_removal) {
     }
 }
 
-TEST(native_program, websocket_opcode_guards_survive_compiler_exit) {
+TEST(native_program, websocket_message_type_guards_survive_compiler_exit) {
     Source source;
     REQUIRE(
         source.append("upstream backend at \"127.0.0.1:9999\"\n"
-                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                      "guard !frame.fromClient || (.text == frame.opcode && frame.text == \"ok\") "
-                      "else { frame.drop() }\nframe.forward() } }\n"));
+                      "route GET \"/ws\" { return websocket(backend) { message in\n"
+                      "guard !message.fromClient || (message.isText && message.text == \"ok\") "
+                      "else { message.drop() }\nmessage.forward() } }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
@@ -441,9 +489,9 @@ TEST(native_program, websocket_regex_handler_survives_compiler_exit) {
     Source source;
     REQUIRE(
         source.append("upstream backend at \"127.0.0.1:9999\"\n"
-                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                      "guard !frame.text.matches(re\".*badword.*\") else { frame.drop() }\n"
-                      "frame.forward() } }\n"));
+                      "route GET \"/ws\" { return websocket(backend) { message in\n"
+                      "guard !message.text.matches(re\".*badword.*\") else { message.drop() }\n"
+                      "message.forward() } }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
@@ -844,12 +892,12 @@ TEST(native_program, websocket_guard_text_policies_survive_source_removal) {
     Source source;
     REQUIRE(
         source.append("upstream backend at \"127.0.0.1:9999\"\n"
-                      "route GET \"/ws\" { return websocket(backend) { frame in\n"
-                      " guard frame.text != \"a\" else { frame.forward(\"one\\0\\u{20ac}\") }\n"
-                      " guard frame.text != \"b\" else { frame.forward(\"\") }\n"
-                      " guard frame.text != \"c\" else { frame.forward(\"third\") }\n"
-                      " guard frame.text != \"d\" else { frame.forward(\"fourth\") }\n"
-                      " frame.forward(\"default\") } }\n"));
+                      "route GET \"/ws\" { return websocket(backend) { message in\n"
+                      " guard message.text != \"a\" else { message.forward(\"one\\0\\u{20ac}\") }\n"
+                      " guard message.text != \"b\" else { message.forward(\"\") }\n"
+                      " guard message.text != \"c\" else { message.forward(\"third\") }\n"
+                      " guard message.text != \"d\" else { message.forward(\"fourth\") }\n"
+                      " message.forward(\"default\") } }\n"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
