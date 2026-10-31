@@ -20775,7 +20775,7 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
         REQUIRE(affix.ok);
         dispose_module(affix.mod, affix.ctx);
     }
-    node.accessor = 10;
+    node.accessor = 11;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 

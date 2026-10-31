@@ -25,6 +25,8 @@ inline constexpr u32 kWsTerminateMessageCapacity = SlicePool::kSliceSize - kWsMa
 // Valid UTF-8 for a text message; an empty view is valid.
 bool ws_valid_text_payload(Str text);
 bool ws_valid_close_reason(Str reason);
+// Complete payload validation using the ordinary bounded JSON parser; no view escapes.
+bool ws_valid_json_payload(const u8* payload, u64 len);
 
 // RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close message.
 // Accepts 1000–1003, 1007–1014, and 3000–4999; rejects the unassigned ranges (<1000,

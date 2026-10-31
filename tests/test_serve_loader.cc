@@ -4793,6 +4793,64 @@ TEST(serve_loader, websocket_terminate_empty_rewrite_and_invalid_config) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_json_validation_uses_complete_payloads) {
+    const char* conditions[] = {"json.parse(message.text) != nil",
+                                "nil != json.parse(message.text)",
+                                "!(json.parse(message.text) == nil)",
+                                "json.parse(message.text) == nil"};
+    const char* payloads[] = {
+        "{}", "null", "[1,true,\"x\"]", "{\"name\":", "{} trailing", "", "{\"x\":1,\"x\":2}"};
+    for (u32 c = 0; c < 4; ++c) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(backend) "
+            "{ message in\nguard ";
+        source += conditions[c];
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_json", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (u32 i = 0; i < 7; ++i) {
+            const bool valid = i < 3;
+            for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+                const auto result = handler(nullptr,
+                                            opcode,
+                                            reinterpret_cast<const u8*>(payloads[i]),
+                                            strlen(payloads[i]),
+                                            true);
+                CHECK(result ==
+                      ((valid != (c == 3)) ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+        CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0x100000002ULL, true) ==
+              (c == 3 ? WsFrameAction::Forward : WsFrameAction::Drop));
+        if (c == 0) {
+            WsInspector st;
+            u8 out[64], message[64];
+            const u8 frames[] = {0x01, 1, '{', 0x89, 1, 'p', 0x80, 1, '}'};
+            u32 consumed = 0, produced = 0;
+            REQUIRE(ws_inspect(st,
+                               frames,
+                               sizeof(frames),
+                               out,
+                               sizeof(out),
+                               message,
+                               sizeof(message),
+                               handler,
+                               nullptr,
+                               &consumed,
+                               &produced) == WsInspectStatus::Ok);
+            CHECK_EQ(consumed, sizeof(frames));
+            REQUIRE_EQ(produced, 7u);
+            const u8 expected[] = {0x89, 1, 'p', 0x81, 2, '{', '}'};
+            CHECK(memcmp(out, expected, sizeof(expected)) == 0);
+        }
+        program.destroy();
+    }
+}
+
 TEST(serve_loader, websocket_message_type_comparisons_execute_for_both_directions) {
     const char* conditions[] = {"message.isText",
                                 "message.isText",

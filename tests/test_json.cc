@@ -3,6 +3,19 @@
 
 using namespace rut;
 
+TEST(json, string_lookup_rejects_invalid_node_indices) {
+    json::Document document;
+    REQUIRE(document.parse(lit_str("\"ok\"")));
+    char output[16];
+    json::Writer writer{output, sizeof(output)};
+    CHECK_FALSE(document.string(json::kNone, writer));
+    CHECK_FALSE(document.string(document.count, writer));
+    CHECK_FALSE(document.string(json::kMaxNodes, writer));
+    CHECK_EQ(writer.len, 0u);
+    CHECK(document.string(0, writer));
+    CHECK((Str{output, writer.len}.eq(lit_str("ok"))));
+}
+
 TEST(json, valid_values_and_lossless_numbers) {
     json::Document d;
     const Str values[] = {lit_str("null"),

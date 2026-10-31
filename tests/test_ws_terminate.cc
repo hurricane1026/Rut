@@ -2,12 +2,48 @@
 // reassembly + handler dispatch + re-framing, across both tunnel directions, forward/
 // drop/close, fragmentation, control pass-through, partial frames, and bounds.
 
+#include "rut/runtime/json.h"
 #include "rut/runtime/ws_frame.h"
 #include "rut/runtime/ws_terminate.h"
 #include "test.h"
 #include <cstring>
 
 using namespace rut;
+
+TEST(ws_terminate, json_payload_validation_bounds_and_recovery) {
+    auto valid = [](const char* text, u64 len) {
+        return ws_valid_json_payload(reinterpret_cast<const u8*>(text), len);
+    };
+    CHECK(valid("null", 4));
+    CHECK_FALSE(valid("{", 1));
+    CHECK(valid("[]", 2));
+    CHECK_FALSE(valid(nullptr, 0x100000002ULL));
+    CHECK_FALSE(valid(nullptr, 0));
+    char boundary[json::kMaxBytes + 1];
+    memset(boundary, ' ', sizeof(boundary));
+    boundary[0] = '{';
+    boundary[1] = '}';
+    CHECK(valid(boundary, json::kMaxBytes));
+    CHECK_FALSE(valid(boundary, sizeof(boundary)));
+    char deep[2 * (json::kMaxDepth + 2)];
+    memset(deep, '[', sizeof(deep) / 2);
+    memset(deep + sizeof(deep) / 2, ']', sizeof(deep) / 2);
+    CHECK_FALSE(valid(deep, sizeof(deep)));
+    char nodes[2 * json::kMaxNodes + 1];
+    nodes[0] = '[';
+    for (u32 i = 0; i < json::kMaxNodes; ++i) {
+        nodes[1 + 2 * i] = '0';
+        nodes[2 + 2 * i] = ',';
+    }
+    nodes[2 * json::kMaxNodes - 2] = ']';
+    CHECK(valid(nodes, 2 * json::kMaxNodes - 1));
+    nodes[2 * json::kMaxNodes - 2] = ',';
+    nodes[2 * json::kMaxNodes] = ']';
+    CHECK_FALSE(valid(nodes, sizeof(nodes)));
+    const char bad_utf8[] = {'"', static_cast<char>(0xc0), static_cast<char>(0xaf), '"'};
+    CHECK_FALSE(valid(bad_utf8, sizeof(bad_utf8)));
+    CHECK(valid("true", 4));
+}
 
 namespace {
 constexpr bool kMaskDirections[] = {false, true};

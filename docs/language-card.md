@@ -847,6 +847,20 @@ return websocket(chat) { message in
     message.forward()
 }
 
+// Validate a complete message with the existing JSON parser. Only presence
+// comparisons are supported here; this does not bind a Json value inside the handler.
+// JSON null is a valid document, so json.parse("null") succeeds.
+// Parsing uses the ordinary JSON limits: 8 KiB input, 2048 nodes, depth 64.
+// Values exceeding those bounds count as parse failures, even if valid JSON.
+return websocket(chat) { message in
+    guard !message.fromClient || !message.isText || json.parse(message.text) != nil else {
+        message.close(1007, "invalid JSON")
+    }
+    message.forward()
+}
+// == nil, either operand order, !, && and || are supported with short-circuiting.
+// Text payload access retains its raw-byte semantics; use isText to select Text messages.
+
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
 // and the single-slice cap. General expressions/interpolation remain unsupported.
