@@ -209,6 +209,66 @@ func jwtDocumentHs512(_ authorization: str, _ secret: str) -> Json {
     document
 }
 
+// Static two-secret rotation, pinned to one trusted algorithm per helper.
+// Each successful decode owns independent claims bytes in the request arena.
+// Signature verification remains separate from issuer/audience/time/scope policy.
+func rotatingJwtClaimsHs256(_ token: str, _ currentSecret: str, _ previousSecret: str) -> Json {
+    let current = Crypto.jwtHs256(token, currentSecret)
+    let previous = Crypto.jwtHs256(token, previousSecret)
+    match current != nil {
+        true => current
+        _ => previous
+    }
+}
+
+func rotatingJwtDocumentHs256(_ authorization: str, _ currentSecret: str,
+                             _ previousSecret: str) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard currentSecret != "" || previousSecret != "" else { respond 503 }
+    guard let document = rotatingJwtClaimsHs256(bearerToken(authorization).or(""),
+        currentSecret, previousSecret) else { respond denied }
+    document
+}
+
+func rotatingJwtClaimsHs384(_ token: str, _ currentSecret: str, _ previousSecret: str) -> Json {
+    let current = Crypto.jwtHs384(token, currentSecret)
+    let previous = Crypto.jwtHs384(token, previousSecret)
+    match current != nil {
+        true => current
+        _ => previous
+    }
+}
+
+func rotatingJwtDocumentHs384(_ authorization: str, _ currentSecret: str,
+                             _ previousSecret: str) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard currentSecret != "" || previousSecret != "" else { respond 503 }
+    guard let document = rotatingJwtClaimsHs384(bearerToken(authorization).or(""),
+        currentSecret, previousSecret) else { respond denied }
+    document
+}
+
+func rotatingJwtClaimsHs512(_ token: str, _ currentSecret: str, _ previousSecret: str) -> Json {
+    let current = Crypto.jwtHs512(token, currentSecret)
+    let previous = Crypto.jwtHs512(token, previousSecret)
+    match current != nil {
+        true => current
+        _ => previous
+    }
+}
+
+func rotatingJwtDocumentHs512(_ authorization: str, _ currentSecret: str,
+                             _ previousSecret: str) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard currentSecret != "" || previousSecret != "" else { respond 503 }
+    guard let document = rotatingJwtClaimsHs512(bearerToken(authorization).or(""),
+        currentSecret, previousSecret) else { respond denied }
+    document
+}
+
 struct JwtSubject { sub: str }
 struct JwtTokenId { jti: str }
 

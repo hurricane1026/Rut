@@ -16,7 +16,7 @@ whether a competing open-source edition includes them.
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
-| JWT verification | HS256/384/512 policy helpers; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper | ES keys, remote JWKS refresh/cache, live and durable token revocation |
+| JWT verification | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper | ES keys, remote JWKS refresh/cache, live and durable token revocation |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks durable replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either-group allow and deny with deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
@@ -228,6 +228,30 @@ positions and membership slots, case/prefix distinctions, empty slots, malformed
 configuration, spoofed identity/group headers, deny-before-allow composition,
 unknown verified Consumers and optional-auth guests. See
 [the runnable example](../examples/consumer-group-deny-auth.rut).
+
+## Static HS JWT secret rotation
+
+`auth.rotatingJwtDocumentHs256` / `Hs384` / `Hs512` verify against an explicit
+current/previous secret window, preserving a fixed trusted algorithm. Empty
+secrets disable slots; both disabled returns 503. Nonempty keys retain the
+existing 32/48/64-byte verifier minimums. Removing the previous secret revokes
+that slot after configuration reload/restart. Token `kid`/URL hints do not select
+or fetch keys, and no algorithm fallback is performed.
+
+Both bounded decoders run, with independently request-owned claims bytes; their
+first successful result is selected. A failed second decode cannot erase a
+successful first result. This is signature verification only. The example
+composes issuer/audience/time/subject validation and exact scope authorization;
+signed but expired, premature or wrong-recipient tokens remain 401, and missing
+scope returns 403. The policy credential ID comes from trusted configuration,
+not token headers or the matched key. Live rotation and durable revocation remain
+separate work.
+
+The JIT matrix uses independently Python-signed tokens for all three algorithms
+and covers slot disabling/revocation, equal keys, wrong-key/algorithm signatures,
+malformed JOSE/claims, duplicate Authorization, spoofed identity headers and
+claims preservation after the second verification. See
+[the native-capable example](../examples/jwt-secret-rotation-auth.rut).
 
 ## Implementation order and gates
 

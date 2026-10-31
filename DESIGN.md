@@ -8456,6 +8456,27 @@ This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism
 Other asymmetric algorithms and remote JWKS refresh remain separate work;
 configured RS256 verification is described below.
 
+### Static HS JWT secret rotation
+
+The auth module adds `rotatingJwtDocumentHs256`, `rotatingJwtDocumentHs384` and
+`rotatingJwtDocumentHs512` over the existing fixed-algorithm Crypto functions.
+Each takes singleton Authorization plus trusted current/previous secrets and
+returns the first successful signature-verified Json. Empty secrets disable
+individual slots; both empty returns 503. Other invalid tokens return a Bearer
+401. The existing 32/48/64-byte minimum key lengths and strict JOSE/Base64url/JSON
+validation apply unchanged. No token-controlled algorithm or key selection is
+introduced. Removing a secret requires reloading/restarting the static snapshot.
+
+Both bounded verifiers run before selecting their optional results. The JSON helper copies each successful
+claims value into independent request-arena storage before returning, preserving
+the first result across a later unsuccessful verification. Equal keys may retain
+two claims copies; the existing per-request JSON budget remains the bound.
+Callers must still validate issuer, audience, subject, time and scope. Rotation
+does not turn an expired or wrong-recipient signature into an authorized identity,
+and these functions publish no matched-key metadata. See
+`examples/jwt-secret-rotation-auth.rut`, the independently signed fixture matrix,
+and native HTTP verification. No primitive, keyword or dependency is added.
+
 ### Public HTTP response cache
 
 Implemented `@cache(ttl: Duration)` on explicit GET routes, using the existing

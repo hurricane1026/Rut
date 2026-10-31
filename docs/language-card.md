@@ -1629,6 +1629,31 @@ This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism
 Other asymmetric algorithms and remote JWKS refresh remain separate work;
 configured RS256 verification is described below.
 
+### Static HS JWT secret rotation
+
+`auth.rotatingJwtDocumentHs256(authorization, currentSecret, previousSecret)`
+and the corresponding `Hs384` / `Hs512` helpers accept either configured secret
+while pinning exactly one algorithm. Pass `req.authorization.or("")` so duplicate
+Authorization fields fail closed. Empty secrets disable slots; two disabled slots
+return 503 before token verification. Removing the previous secret revokes that
+slot after reloading/restarting the compiled configuration. Nonempty secrets
+retain the verifier's minimum lengths (32/48/64 bytes); short or incorrect
+keys cannot verify. Token `kid` and URL hints do not select or fetch keys.
+
+Both verification calls run eagerly; the first successful optional Json is
+selected. Each successful result has independent request-arena-owned claims
+bytes, so a later failed verification cannot invalidate earlier claims. Equal
+secrets are valid. Two successful decodes can retain two bounded claims copies;
+an allocation failure cannot publish claims from that decode.
+The result proves signature verification only: apply `jwtIdentity` for the trusted
+issuer/audience/time/subject policy and `jwtHasScope` for authorization before
+using or forwarding an identity. These helpers do not report which secret matched.
+
+See [the rotation example](../examples/jwt-secret-rotation-auth.rut), which resolves
+separate algorithm-specific secrets from compile-time environment values. Protect
+the resulting artifacts, which contain those secrets. This is a static two-key
+window, not remote JWKS refresh, live revocation or persistent key storage.
+
 ## Public HTTP response cache (implemented)
 
 ```rut
