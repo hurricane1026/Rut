@@ -2828,10 +2828,11 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 10 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 11 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
-        if ((guards[i].accessor == 3 || (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
+        if ((guards[i].accessor == 11 || guards[i].accessor == 3 ||
+             (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
             guards[i].pattern_len != 0 && !guards[i].pattern)
             return false;
         if (guards[i].accessor == 4 || guards[i].accessor == 5) {
@@ -2893,7 +2894,28 @@ bool emit_ws_handler(LLVMModuleRef mod,
             return;
         }
         LLVMValueRef cond;
-        if (guards[i].accessor == 10) {  // JsonValid: bounded syntax validation only.
+        if (guards[i].accessor == 11) {  // JsonHasPath: presence includes a JSON null node.
+            LLVMTypeRef json_params[4] = {ptr_ty, i64_ty, ptr_ty, i32_ty};
+            LLVMTypeRef json_ty = LLVMFunctionType(i8_ty, json_params, 4, 0);
+            LLVMValueRef json_fn = LLVMGetNamedFunction(mod, "rut_helper_ws_json_has_path");
+            if (!json_fn) json_fn = LLVMAddFunction(mod, "rut_helper_ws_json_has_path", json_ty);
+            LLVMValueRef path = LLVMBuildGlobalStringPtr(builder, "", "json.root");
+            if (guards[i].pattern_len) {
+                LLVMValueRef bytes =
+                    LLVMConstStringInContext(ctx, guards[i].pattern, guards[i].pattern_len, 1);
+                path = LLVMAddGlobal(mod, LLVMTypeOf(bytes), "json.path");
+                LLVMSetInitializer(path, bytes);
+                LLVMSetGlobalConstant(path, 1);
+                LLVMSetLinkage(path, LLVMPrivateLinkage);
+                LLVMSetUnnamedAddress(path, LLVMGlobalUnnamedAddr);
+            }
+            LLVMValueRef args[4] = {
+                payload, len, path, LLVMConstInt(i32_ty, guards[i].pattern_len, 0)};
+            LLVMValueRef present =
+                LLVMBuildCall2(builder, json_ty, json_fn, args, 4, "json.present");
+            cond = LLVMBuildICmp(
+                builder, LLVMIntNE, present, LLVMConstInt(i8_ty, 0, 0), "json.has.path");
+        } else if (guards[i].accessor == 10) {  // JsonValid: bounded syntax validation only.
             LLVMTypeRef json_params[2] = {ptr_ty, i64_ty};
             LLVMTypeRef json_ty = LLVMFunctionType(i8_ty, json_params, 2, 0);
             LLVMValueRef json_fn = LLVMGetNamedFunction(mod, "rut_helper_ws_json_valid");

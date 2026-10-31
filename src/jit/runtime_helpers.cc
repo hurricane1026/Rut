@@ -1931,6 +1931,13 @@ bool jwt_decode_claims(Str token,
 
 }  // namespace
 
+extern "C" u8 rut_helper_ws_json_has_path(const char* payload,
+                                          u64 len,
+                                          const char* path,
+                                          u32 path_len) {
+    return ws_json_has_path(reinterpret_cast<const u8*>(payload), len, {path, path_len}) ? 1 : 0;
+}
+
 extern "C" u8 rut_helper_ws_json_valid(const char* payload, u64 len) {
     return ws_valid_json_payload(reinterpret_cast<const u8*>(payload), len) ? 1u : 0u;
 }

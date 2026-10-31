@@ -2719,8 +2719,21 @@ and text predicates follow the constraints described above.
 `json.parse(message.text)` with `nil`, in either operand order, using `==` or `!=`.
 This reuses the ordinary optional-JSON syntax; JSON null remains a successful
 parse. The condition composes with message type/direction guards and the existing
-short-circuit condition forest. It does not materialize or bind a JSON value in
-handler scope, and calls shadowing the `json` namespace are rejected.
+short-circuit condition forest. Calls shadowing the `json` namespace are rejected.
+
+A handler may also unwrap the document with
+`guard let document = json.parse(message.text) else { message.close(1007) }`.
+Subsequent guards may compare `json.get(document, "/name")` with `nil` in either
+operand order, using `==`, `!=`, `!`, `&&` and `||`. The path must be a string
+literal and follows the ordinary RFC 6901 JSON Pointer semantics: empty selects
+the root, `/` separates tokens, `~0` and `~1` decode tilde and slash, and arrays
+use zero-based indices. A present JSON null node counts as present; missing or
+invalid paths return nil. Literal escapes, including embedded NUL, are decoded.
+Bindings require fresh names (including no collision with route locals, `json`
+or `message`), become available only after their guard and stay inside this
+handler. They currently support only these presence checks; general document
+operations, value bindings, extraction and rewriting remain unsupported.
+The binding guard counts toward the four-source-guard limit.
 
 The native/JIT helper validates the complete unmasked, reassembled payload with
 the existing JSON parser and a bounded workspace per worker thread. It accepts
@@ -2731,7 +2744,10 @@ binary payloads follow the same byte-oriented text-access semantics; policies
 that validate only Text messages should explicitly check `message.isText`.
 The full 64-bit message length is checked before narrowing. No message-time heap
 allocation, new dependency, runtime layout, or native artifact version change
-is needed; native artifacts reference the exported validation helper.
+is needed; native artifacts reference the exported JSON helpers. Each reached
+presence check reparses the immutable payload in the same bounded workspace.
+No document or payload-address cache survives a handler invocation, so reuse of
+message buffers cannot retain fields from an earlier message.
 
 **Runtime semantics (passthrough tunnel).**
 

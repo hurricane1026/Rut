@@ -246,6 +246,35 @@ TEST(native_program, timer_cache_activation_and_fail_closed) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_json_field_presence_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard json.get(document, "/a~1b/~0/0") != nil && json.get(document, "/\0") != nil else {
+  message.close(1008)
+ }
+ message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const char* payloads[] = {"{\"a/b\":{\"~\":[null]},\"\\u0000\":1}", "{}", "{"};
+    for (const char* payload : payloads) {
+        const auto expected = payload[1] == '"'   ? WsFrameAction::Forward
+                              : payload[1] == '}' ? WsFrameAction::ClosePolicy1
+                                                  : WsFrameAction::ClosePolicy0;
+        CHECK(handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(payload),
+                      strlen(payload),
+                      true) == expected);
+    }
+}
+
 TEST(native_program, websocket_json_validation_survives_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

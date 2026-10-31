@@ -27,6 +27,8 @@ bool ws_valid_text_payload(Str text);
 bool ws_valid_close_reason(Str reason);
 // Complete payload validation using the ordinary bounded JSON parser; no view escapes.
 bool ws_valid_json_payload(const u8* payload, u64 len);
+// True for an existing JSON Pointer node, including JSON null; false on parse/path failure.
+bool ws_json_has_path(const u8* payload, u64 len, Str path);
 
 // RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close message.
 // Accepts 1000–1003, 1007–1014, and 3000–4999; rejects the unassigned ranges (<1000,

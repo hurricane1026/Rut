@@ -848,7 +848,7 @@ return websocket(chat) { message in
 }
 
 // Validate a complete message with the existing JSON parser. Only presence
-// comparisons are supported here; this does not bind a Json value inside the handler.
+// comparisons and the document bindings shown below are supported here.
 // JSON null is a valid document, so json.parse("null") succeeds.
 // Parsing uses the ordinary JSON limits: 8 KiB input, 2048 nodes, depth 64.
 // Values exceeding those bounds count as parse failures, even if valid JSON.
@@ -860,6 +860,19 @@ return websocket(chat) { message in
 }
 // == nil, either operand order, !, && and || are supported with short-circuiting.
 // Text payload access retains its raw-byte semantics; use isText to select Text messages.
+
+// Unwrap a complete message's JSON, then require a field (JSON null counts as present).
+// Literal RFC 6901 pointers support nested objects, array indices, ~0 and ~1;
+// an empty pointer selects the root. Missing/invalid pointers return nil.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard json.get(document, "/name") != nil else { message.close(1008, "name required") }
+    message.forward()
+}
+// Bindings require fresh names and are available only to later json.get presence checks.
+// General JSON extraction, value binding and mutation in handlers remain unsupported.
+// Binding guards count toward the four-guard limit. Each reached query reparses the
+// payload within the same JSON bounds; no borrowed document survives the callback.
 
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
