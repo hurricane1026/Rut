@@ -25150,6 +25150,220 @@ TEST(jit, jwt_secret_rotation_example_compiles) {
     rir.destroy();
 }
 
+TEST(jit, custom_header_keys_rotate_and_never_downgrade_presented_credentials) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/header-key-policies-auth.rut";
+    struct Rotation {
+        const char* args;
+        u16 current;
+        u16 previous;
+        u16 missing;
+    };
+    const Rotation rotations[] = {
+        {"\"current-key\", \"previous-key\", \"registered-app\", \"current\", \"previous\"",
+         204,
+         202,
+         401},
+        {"\"current-key\", \"\", \"registered-app\", \"current\", \"previous\"", 204, 401, 401},
+        {"\"\", \"previous-key\", \"registered-app\", \"current\", \"previous\"", 401, 202, 401},
+        {"\"\", \"\", \"registered-app\", \"current\", \"previous\"", 503, 503, 503},
+        {"\"current-key\", \"current-key\", \"registered-app\", \"current\", \"previous\"",
+         204,
+         401,
+         401},
+        {"\"current-key\", \"previous-key\", \"\", \"current\", \"previous\"", 503, 503, 503},
+        {"\"current-key\", \"previous-key\", \"registered-app\", \"\", \"previous\"",
+         503,
+         503,
+         503},
+        {"\"current-key\", \"\", \"registered-app\", \"current\", \"\"", 503, 503, 503},
+        {"\"a:b /+==\", \"previous-key\", \"registered-app\", \"current\", \"previous\"",
+         401,
+         202,
+         401},
+    };
+    std::string source = "import \"middleware/auth.rut\"\n";
+    constexpr u32 kRotations = sizeof(rotations) / sizeof(rotations[0]);
+    for (u32 i = 0; i < kRotations; ++i) {
+        source += "route GET \"/rotation-" + std::to_string(i) + "\" {\n";
+        source +=
+            "let identity = auth.rotatingHeaderKey(req.uniqueHeader(\"X-API-Key\").or(\"\"), " +
+            std::string(rotations[i].args) + ")\n";
+        source += R"rut(
+    guard identity.consumerId == "registered-app" && identity.method == "apiKey" &&
+          (identity.credentialId == "current" || identity.credentialId == "previous") else { return 500 }
+    if identity.credentialId == "previous" { return 202 } else { return 204 }
+}
+)rut";
+    }
+    const char* optional_args[] = {
+        "\"current-key\", \"registered-app\", \"current\", \"guest\"",
+        "\"\", \"registered-app\", \"current\", \"guest\"",
+        "\"current-key\", \"\", \"current\", \"guest\"",
+        "\"current-key\", \"registered-app\", \"\", \"guest\"",
+        "\"current-key\", \"registered-app\", \"current\", \"\"",
+        "\"current-key\", \"registered-app\", \"current\", \"registered-app\"",
+    };
+    constexpr u32 kOptionalConfigs = sizeof(optional_args) / sizeof(optional_args[0]);
+    for (u32 i = 0; i < kOptionalConfigs + 2; ++i) {
+        source += "route POST \"/optional-" + std::to_string(i) + "\" {\n";
+        if (i == kOptionalConfigs) source += "req.remove(\"X-API-Key\")\n";
+        source +=
+            "let identity = auth.headerKeyOrAnonymous(req.headerCount(\"X-API-Key\"), "
+            "req.uniqueHeader(\"X-API-Key\").or(\"\"), " +
+            std::string(optional_args[i < kOptionalConfigs ? i : 0]) + ")\n";
+        if (i == kOptionalConfigs + 1)
+            source += "let allowed = auth.requireConsumer(identity, \"registered-app\")\n";
+        source += R"rut(
+    guard (identity.consumerId == "registered-app" && identity.credentialId == "current" &&
+           identity.method == "apiKey") ||
+          (identity.consumerId == "guest" && identity.credentialId == "" &&
+           identity.method == "anonymous") else { return 500 }
+    if identity.method == "anonymous" { return 200 } else { return 204 }
+}
+)rut";
+    }
+    const char* inconsistent[] = {
+        "0, \"current-key\"", "2, \"current-key\"", "-1, \"\"", "1, \"\"", "0, \"wrong\""};
+    constexpr u32 kInconsistent = sizeof(inconsistent) / sizeof(inconsistent[0]);
+    for (u32 i = 0; i < kInconsistent; ++i) {
+        source += "route GET \"/inconsistent-" + std::to_string(i) + "\" {\n";
+        source +=
+            "let identity = auth.headerKeyOrAnonymous(" + std::string(inconsistent[i]) +
+            ", \"current-key\", \"registered-app\", \"current\", \"guest\")\n return 204\n}\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(
+            stderr, "header key HIR: %.*s\n", hir.error().detail.len, hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    Connection conn;
+    const auto check =
+        [&](u32 route, const char* version, const char* headers, const char* body, u16 status) {
+            const auto name = "handler_route_" + std::to_string(route);
+            auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+            REQUIRE(handler != nullptr);
+            conn.reset();
+            const std::string request =
+                std::string("POST /?api_key=current-key ") + version +
+                "\r\nHost: localhost\r\nContent-Length: " + std::to_string(strlen(body)) + "\r\n" +
+                headers + "\r\n" + body;
+            const auto result =
+                HandlerResult::unpack(handler(&conn,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              static_cast<u32>(request.size()),
+                                              nullptr));
+            CHECK(result.action == HandlerAction::ReturnStatus);
+            if (result.status_code != status)
+                std::fprintf(stderr,
+                             "header key route %u got %u expected %u\n",
+                             route,
+                             result.status_code,
+                             status);
+            CHECK_EQ(result.status_code, status);
+            if (status == 401) {
+                REQUIRE(result.next_state != 0 && result.next_state <= rir.module.header_set_count);
+                const auto& set = rir.module.header_sets[result.next_state - 1];
+                REQUIRE_EQ(set.count, 1u);
+                CHECK(rir.module.header_keys[set.offset].eq(lit("WWW-Authenticate")));
+                CHECK(rir.module.header_values[set.offset].eq(lit("ApiKey")));
+            }
+            if (route == kRotations + kOptionalConfigs) {
+                REQUIRE_EQ(conn.req_header_override_count, 1u);
+                CHECK_EQ(conn.req_header_remove_mask, 1u);
+            }
+        };
+    for (const char* version : {"HTTP/1.0", "HTTP/1.1"}) {
+        for (u32 i = 0; i < kRotations; ++i) {
+            check(i, version, "X-API-Key: current-key\r\n", "", rotations[i].current);
+            check(i, version, "x-api-key: previous-key\r\n", "", rotations[i].previous);
+            check(i, version, "", "api_key=current-key", rotations[i].missing);
+            check(i, version, "X-API-Key:\r\n", "", rotations[i].missing);
+            check(i, version, "X-API-Key: wrong\r\n", "", rotations[i].missing);
+            check(i,
+                  version,
+                  "X-API-Key: current-key\r\nx-api-key: current-key\r\n",
+                  "",
+                  rotations[i].missing);
+            check(i, version, "X-API-Key: Bearer current-key\r\n", "", rotations[i].missing);
+            check(i,
+                  version,
+                  "X-API-Key: current-key\r\nX-Consumer-ID: guest\r\nX-Credential-ID: previous\r\n",
+                  "",
+                  rotations[i].current);
+        }
+        check(8, version, "X-API-Key: a:b /+==\r\n", "", 204);
+        for (u32 i = 0; i < kOptionalConfigs + 2; ++i) {
+            const u32 route = kRotations + i;
+            const bool invalid_config = i > 0 && i < kOptionalConfigs;
+            const u16 success = invalid_config ? 503 : 204;
+            const u16 denied = invalid_config ? 503 : 401;
+            const u16 absent = invalid_config ? 503 : (i == kOptionalConfigs + 1 ? 403 : 200);
+            check(route, version, "X-API-Key: current-key\r\n", "", success);
+            check(route, version, "x-api-key: \tcurrent-key \t\r\n", "", success);
+            check(route, version, "", "api_key=current-key", absent);
+            check(route,
+                  version,
+                  "Authorization: Bearer wrong\r\nX-Consumer-ID: registered-app\r\n",
+                  "",
+                  absent);
+            check(route, version, "X-API-Key:\r\n", "", denied);
+            check(route, version, "X-API-Key: wrong\r\n", "api_key=current-key", denied);
+            check(route,
+                  version,
+                  "X-API-Key: current-key\r\nx-api-key: previous-key\r\n",
+                  "",
+                  denied);
+            check(
+                route, version, "X-API-Key: current-key\r\nx-api-key: current-key\r\n", "", denied);
+        }
+        for (u32 i = 0; i < kInconsistent; ++i)
+            check(kRotations + kOptionalConfigs + 2 + i, version, "", "", 401);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, header_key_policies_example_compiles) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/header-key-policies-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    const std::string source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, standard_webhook_identity_helper_rejects_ambiguous_headers_and_bad_config) {
     const char* source = R"rut(
 import "middleware/auth.rut"

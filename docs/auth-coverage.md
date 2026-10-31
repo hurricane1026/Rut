@@ -14,7 +14,7 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
+| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper | ES keys, remote JWKS refresh/cache, live and durable token revocation |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks durable replay persistence |
@@ -185,6 +185,33 @@ Consumer slots, configuration failure before fallback, challenge fields and
 public/private authorization on HTTP/1.0 and HTTP/1.1 request buffers. This is
 handler-level coverage; the existing network backends are unchanged. See
 [optional-multi-auth.rut](../examples/optional-multi-auth.rut).
+
+## Custom-header API Key rotation and optional access
+
+`auth.rotatingHeaderKey` adds a current/previous opaque key window for a single
+configured Consumer. Use `req.uniqueHeader("X-API-Key").or("")`; disabled slots
+never authenticate an empty value. Both credential IDs stay nonempty even when
+a slot is disabled. Current wins a tie; removing the previous key revokes it
+after configuration reload/restart. Successful metadata comes only from the
+configured Consumer and selected credential ID. Invalid credentials receive an
+ApiKey challenge with 401; invalid configuration returns 503.
+
+`auth.headerKeyOrAnonymous` requires count and singleton value from the same
+original custom header. Only count 0 with an empty value grants the explicit,
+distinct guest Identity with empty credential ID and method `anonymous`.
+Empty/wrong/duplicate fields, parser errors and inconsistent arguments receive
+401, never guest fallback. Empty trusted configuration or colliding Consumer IDs
+returns 503 even when the field is absent. Authenticate before applying explicit
+Consumer/group authorization; a guest can still receive 403.
+
+Both functions select exactly the configured header source. Authorization,
+query and body values do not supply fallback credentials. Reads continue to use
+the original request after leading credential-removal effects. The JIT matrix
+covers both HTTP/1 versions, disabled and revoked slots, equal keys, opaque
+values, metadata spoofing, duplicate/malformed input, configuration failures,
+inconsistent presence evidence and denial of guests on private routes. See
+[the runnable example](../examples/header-key-policies-auth.rut). These are
+compiled-in policies, not a dynamic credential registry.
 
 ## Static Consumer groups
 

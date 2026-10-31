@@ -1,0 +1,39 @@
+import "middleware/auth.rut"
+
+listen :8080
+
+// Illustrative keys: replace with trusted configuration before deployment.
+// Only X-API-Key is a credential source here. Do not read first-field headers.
+route GET "/rotating" {
+    let identity = auth.rotatingHeaderKey(req.uniqueHeader("X-API-Key").or(""),
+        "current-key", "previous-key", "registered-app", "current", "previous")
+    let credentialId = identity.credentialId
+    return response(200, body: credentialId)
+}
+
+route GET "/revoked" {
+    let identity = auth.rotatingHeaderKey(req.uniqueHeader("X-API-Key").or(""),
+        "current-key", "", "registered-app", "current", "previous")
+    let credentialId = identity.credentialId
+    return response(200, body: credentialId)
+}
+
+// Removal affects forwarding; authentication still reads the original request.
+// Wrong, empty and duplicate X-API-Key fields cannot become anonymous access.
+route GET "/optional" {
+    req.remove("X-API-Key")
+    let identity = auth.headerKeyOrAnonymous(req.headerCount("X-API-Key"),
+        req.uniqueHeader("X-API-Key").or(""), "current-key", "registered-app", "current", "guest")
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
+
+route GET "/private" {
+    let identity = auth.headerKeyOrAnonymous(req.headerCount("X-API-Key"),
+        req.uniqueHeader("X-API-Key").or(""), "current-key", "registered-app", "current", "guest")
+    let allowed = auth.requireConsumer(identity, "registered-app")
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+route "/" { return 404 }
