@@ -354,6 +354,22 @@ func githubWebhook(_ body: str, _ signature: str, _ key: str,
     Identity(consumerId: consumerId, credentialId: credentialId, method: "hmac")
 }
 
+// GitHub-specific two-key window: never accept a bare HMAC or SHA-1 fallback.
+// Both slots use the same exact body and singleton X-Hub-Signature-256 value.
+func rotatingGithubWebhook(_ body: str, _ signature: str, _ currentKey: str,
+                           _ previousKey: str, _ consumerId: str,
+                           _ currentId: str, _ previousId: str) -> Identity {
+    guard consumerId != "" && currentId != "" && previousId != "" &&
+        (currentKey != "" || previousKey != "") else { respond 503 }
+    let current = Crypto.hmacSha256Valid(body, currentKey, signature, "sha256=")
+    let previous = Crypto.hmacSha256Valid(body, previousKey, signature, "sha256=")
+    guard current || previous else { respond 401 }
+    match current {
+        true => Identity(consumerId: consumerId, credentialId: currentId, method: "hmac")
+        _ => Identity(consumerId: consumerId, credentialId: previousId, method: "hmac")
+    }
+}
+
 // Standard Webhooks v1. Pass singleton webhook-id, webhook-timestamp and
 // webhook-signature values, the exact raw body, and trusted decoded key bytes.
 // The key is not the whsec_ wire encoding. Freshness is bounded to 300 seconds;

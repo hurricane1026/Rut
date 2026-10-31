@@ -1548,6 +1548,20 @@ the exact `sha256=` prefix before the digest. Supply raw `req.body` and
 when identical. See [webhook-auth.rut](../examples/webhook-auth.rut). Verify
 before parsing or transforming JSON; payload signatures do not prevent replay.
 Durable delivery deduplication remains the receiving application's duty.
+
+`auth.rotatingGithubWebhook(body, signature, currentKey, previousKey, consumerId,
+currentId, previousId)` adds a static two-key window with that same strict wire
+profile. Supply the same original raw body and singleton signature field to both
+slots. Empty keys disable slots; both credential IDs must stay nonempty even for
+a disabled slot. Current wins if both keys match. Two disabled keys or empty
+identity metadata returns 503; all verification failures return 401. Removing
+the previous key revokes it after configuration reload/restart. Successful
+identity metadata comes from the matched configuration, with method `hmac`.
+Neither slot accepts bare hex, SHA-1, uppercase hex, duplicate fields or changed
+body bytes. No delivery-ID, timestamp or replay store is added. See
+[github-webhook-rotation-auth.rut](../examples/github-webhook-rotation-auth.rut).
+The example inherits the existing HTTP/1 buffered-body admission profile:
+chunked requests receive 400 before the authentication handler runs.
 The 1 MiB primitive bound does not extend the runtime's request-body limit.
 
 Kong/APISIX canonical HTTP-signature protocols define additional signed header

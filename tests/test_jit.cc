@@ -23866,6 +23866,230 @@ route POST "/misconfigured" {
     rir.destroy();
 }
 
+TEST(jit, github_webhook_rotation_pins_wire_profile_and_preserves_identity) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/github-webhook-rotation-auth.rut";
+    struct Config {
+        const char* args;
+        u16 current;
+        u16 previous;
+        u16 invalid;
+    };
+    const Config configs[] = {
+        {"\"current-webhook-key\", \"previous-webhook-key\", \"github\", \"current\", \"previous\"",
+         204,
+         202,
+         401},
+        {"\"current-webhook-key\", \"\", \"github\", \"current\", \"previous\"", 204, 401, 401},
+        {"\"\", \"previous-webhook-key\", \"github\", \"current\", \"previous\"", 401, 202, 401},
+        {"\"\", \"\", \"github\", \"current\", \"previous\"", 503, 503, 503},
+        {"\"current-webhook-key\", \"current-webhook-key\", \"github\", \"current\", \"previous\"",
+         204,
+         401,
+         401},
+        {"\"current-webhook-key\", \"previous-webhook-key\", \"\", \"current\", \"previous\"",
+         503,
+         503,
+         503},
+        {"\"current-webhook-key\", \"previous-webhook-key\", \"github\", \"\", \"previous\"",
+         503,
+         503,
+         503},
+        {"\"current-webhook-key\", \"\", \"github\", \"current\", \"\"", 503, 503, 503},
+        {"\"\", \"previous-webhook-key\", \"github\", \"\", \"previous\"", 503, 503, 503},
+    };
+    constexpr u32 kConfigs = sizeof(configs) / sizeof(configs[0]);
+    std::string source = "import \"middleware/auth.rut\"\n";
+    for (u32 i = 0; i < kConfigs; ++i) {
+        source += "route POST \"/" + std::to_string(i) + "\" {\n";
+        source +=
+            "let identity = auth.rotatingGithubWebhook(req.body, "
+            "req.uniqueHeader(\"X-Hub-Signature-256\").or(\"\"), " +
+            std::string(configs[i].args) + ")\n";
+        source += R"rut(
+    guard identity.consumerId == "github" && identity.method == "hmac" &&
+          (identity.credentialId == "current" || identity.credentialId == "previous") else { return 500 }
+    if identity.credentialId == "previous" { return 202 } else { return 204 }
+}
+)rut";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir_function_needs_req_body(rir.module.functions[0]));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Fixture {
+        std::string body;
+        const char* current;
+        const char* previous;
+        const char* unknown;
+        const char* empty_key;
+        const char* legacy;
+    };
+    // Independent Python stdlib hmac(key, exact_bytes, hashlib.sha256).hexdigest().
+    const Fixture fixtures[] = {
+        {
+            std::string("Hello, World!"),
+            "sha256=ae989aef6c9528a976df5e09704e3529baaaa78a7847995b9701ca79ff362c09",
+            "sha256=af9ae029bc3aa9e48988d57846ac0310c39db7b0643aa2f186952dfce06a3768",
+            "sha256=abe34026e78d86a843b150027691ca3794ad47646bbf01c7dbbecf718dda8aaa",
+            "sha256=2bbcfa9524f3218c7a34b30e6936f8b1a4516cb097f1a85a1c7d98b5977ec769",
+            "sha1=3fb77f60809e66d17aed40ebd88eb3fda3189c70",
+        },
+        {
+            std::string(),
+            "sha256=ecdf8a24d70b2ae51a77c85b0456a0a5c22431824549b3f94bc198a9925b822c",
+            "sha256=c7879b7a3b12f93326ede91c61a3bb64763ab53817dcac5a0920d5bca526fa79",
+            "sha256=ca2249156edac44e0fef7c3bf87813e5b16319e673a07c587beb744d7037acc8",
+            "sha256=b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad",
+            "sha1=90aa06d4bb3de72d6fc98fba29e925cec252b5bf",
+        },
+        {
+            std::string("a\0b\xff", 4),
+            "sha256=147e640256a2c427d6b2514ed15a43351322637df7007140ef12c7e13bffef92",
+            "sha256=8d8bf2975fd94e8fb61f4b5acec155f73932a974b8253a350f0fe7e1b374f0d9",
+            "sha256=c70a1fe1683830b8ff219431266e91d967a121729f04fb600b55642acdd867ac",
+            "sha256=425a3d5addbc50b07ac183505a815cb444a568c7e1bff9f09014779fdcb96138",
+            "sha1=17807c57237b3e1985f83754465ba0bdaed2238e",
+        },
+    };
+    const auto header = [](const std::string& signature) {
+        return "X-Hub-Signature-256: " + signature + "\r\n";
+    };
+    const auto check = [&](u32 route,
+                           const char* version,
+                           const std::string& headers,
+                           const std::string& body,
+                           u16 expected) {
+        const auto name = "handler_route_" + std::to_string(route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+        REQUIRE(handler != nullptr);
+        const std::string request =
+            std::string("POST / ") + version +
+            "\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) + "\r\n" +
+            headers + "\r\n" + body;
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != expected)
+            std::fprintf(stderr,
+                         "GitHub rotation route %u got %u expected %u\n",
+                         route,
+                         result.status_code,
+                         expected);
+        CHECK_EQ(result.status_code, expected);
+    };
+    for (const char* version : {"HTTP/1.0", "HTTP/1.1"}) {
+        for (u32 i = 0; i < kConfigs; ++i) {
+            for (const auto& fixture : fixtures) {
+                const std::string signature = fixture.current;
+                check(i, version, header(signature), fixture.body, configs[i].current);
+                check(i, version, header(fixture.previous), fixture.body, configs[i].previous);
+                check(i, version, header(fixture.unknown), fixture.body, configs[i].invalid);
+                check(i, version, header(fixture.empty_key), fixture.body, configs[i].invalid);
+                check(i, version, "", fixture.body, configs[i].invalid);
+                check(i, version, header(""), fixture.body, configs[i].invalid);
+                check(i,
+                      version,
+                      header(signature) + header(signature),
+                      fixture.body,
+                      configs[i].invalid);
+                check(i,
+                      version,
+                      header(fixture.unknown) + "x-hub-signature-256: " + signature + "\r\n",
+                      fixture.body,
+                      configs[i].invalid);
+                check(i, version, header(signature.substr(7)), fixture.body, configs[i].invalid);
+                check(i, version, header(fixture.legacy), fixture.body, configs[i].invalid);
+                check(i,
+                      version,
+                      std::string("X-Hub-Signature: ") + fixture.legacy + "\r\n",
+                      fixture.body,
+                      configs[i].invalid);
+                check(i,
+                      version,
+                      header("SHA256=" + signature.substr(7)),
+                      fixture.body,
+                      configs[i].invalid);
+                std::string upper = signature;
+                for (u32 j = 7; j < upper.size(); ++j)
+                    if (upper[j] >= 'a' && upper[j] <= 'f') upper[j] -= 'a' - 'A';
+                check(i, version, header(upper), fixture.body, configs[i].invalid);
+                check(i,
+                      version,
+                      header(signature.substr(0, signature.size() - 1)),
+                      fixture.body,
+                      configs[i].invalid);
+                check(i, version, header(signature + "0"), fixture.body, configs[i].invalid);
+                check(i, version, header(signature), fixture.body + " ", configs[i].invalid);
+                check(i,
+                      version,
+                      header(signature) + "X-Consumer-ID: mallory\r\nX-Credential-ID: previous\r\n",
+                      fixture.body,
+                      configs[i].current);
+            }
+        }
+        // Repeating an authenticated delivery still verifies: persistence is a separate gate.
+        check(0, version, header(fixtures[0].current), fixtures[0].body, 204);
+        check(0, version, header(fixtures[0].current), fixtures[0].body, 204);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, github_webhook_rotation_example_compiles) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/github-webhook-rotation-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    for (const auto& binding :
+         {std::pair{"GITHUB_WEBHOOK_SECRET", "current-webhook-key"},
+          std::pair{"GITHUB_WEBHOOK_PREVIOUS_SECRET", "previous-webhook-key"}}) {
+        const std::string expression = std::string("env(\"") + binding.first + "\")";
+        u32 replacements = 0;
+        auto pos = source.find(expression);
+        while (pos != std::string::npos) {
+            source.replace(pos, expression.size(), std::string("\"") + binding.second + "\"");
+            ++replacements;
+            pos = source.find(expression);
+        }
+        REQUIRE(replacements != 0);
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, digest_and_hmac_builtins_return_owned_hex_for_exact_body_bytes) {
     const char* source = R"rut(
 func digestInHelper(_ data: str) -> str {

@@ -17,7 +17,7 @@ whether a competing open-source edition includes them.
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating key window; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper | ES keys, remote JWKS refresh/cache, live and durable token revocation |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation, GitHub sha256 prefix; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; Standard Webhooks durable replay persistence |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; durable delivery replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either-group allow and deny with deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
@@ -291,6 +291,28 @@ ambiguous fields, configuration errors and previous-key revocation. Verification
 alone intentionally makes no delivery replay guarantee. A duplicate delivery can
 still verify successfully; receiving applications must deduplicate durable side
 effects until a complete gateway replay policy is implemented.
+
+### GitHub Webhook secret rotation
+
+`auth.rotatingGithubWebhook` evaluates trusted current/previous keys against the
+same raw body and singleton `X-Hub-Signature-256` value. Both slots retain the
+exact `sha256=` prefix and full lowercase SHA-256 digest requirement. Empty keys
+disable slots, while Consumer and both credential IDs must be nonempty. Current
+wins a tie; removing the previous key revokes it after configuration reload or
+restart. Both disabled keys or empty metadata returns 503, and verification
+failures return 401. Successful identity uses configured Consumer/credential IDs
+and method `hmac`, never client identity headers.
+
+The JIT matrix uses independently Python-signed ordinary, empty and binary body
+fixtures. It covers both HTTP/1 versions, disabled/revoked/equal keys, metadata
+errors and spoofing, duplicate signature fields, wrong algorithms/prefixes,
+noncanonical/truncated hex and body tampering. The native-capable
+[example](../examples/github-webhook-rotation-auth.rut) verifies before JSON
+processing. Repeated authenticated deliveries can still verify during the
+window: this adds no timestamp policy, delivery-ID binding or durable replay
+store, and does not complete the signed-request/replay acceptance gates.
+HTTP/1 delivery in the example retains the current buffered-body profile:
+chunked requests are rejected with 400 at admission, before verification.
 
 ## Asymmetric key ownership foundation
 
