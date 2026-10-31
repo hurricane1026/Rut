@@ -158,6 +158,39 @@ func headerKey(_ presented: str, _ key: str, _ consumerId: str, _ credentialId: 
     Identity(consumerId: consumerId, credentialId: credentialId, method: "apiKey")
 }
 
+// Read a singleton custom field with req.uniqueHeader(...).or(""). Empty
+// secrets disable slots, including when the presented field is empty/missing.
+func rotatingHeaderKey(_ presented: str, _ currentKey: str, _ previousKey: str,
+                       _ consumerId: str, _ currentId: str, _ previousId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "ApiKey")
+    guard consumerId != "" && currentId != "" && previousId != "" &&
+        (currentKey != "" || previousKey != "") else { respond 503 }
+    let current = currentKey != "" && Crypto.equal(presented, currentKey)
+    let previous = previousKey != "" && Crypto.equal(presented, previousKey)
+    guard current || previous else { respond denied }
+    match current {
+        true => Identity(consumerId: consumerId, credentialId: currentId, method: "apiKey")
+        _ => Identity(consumerId: consumerId, credentialId: previousId, method: "apiKey")
+    }
+}
+
+// Count and singleton value must describe the SAME original custom header.
+// Count zero plus an empty value is the only anonymous path; never use nil alone.
+func headerKeyOrAnonymous(_ count: i32, _ presented: str, _ key: str,
+                          _ consumerId: str, _ credentialId: str, _ anonymousId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "ApiKey")
+    guard key != "" && consumerId != "" && credentialId != "" && anonymousId != "" &&
+        consumerId != anonymousId else { respond 503 }
+    guard count == 1 || (count == 0 && presented == "") else { respond denied }
+    guard count == 0 || Crypto.equal(presented, key) else { respond denied }
+    match count {
+        0 => Identity(consumerId: anonymousId, credentialId: "", method: "anonymous")
+        _ => Identity(consumerId: consumerId, credentialId: credentialId, method: "apiKey")
+    }
+}
+
 // Anonymous only when the ORIGINAL Authorization field count is exactly zero.
 // Pair req.headerCount("Authorization") with req.authorization.or(""). A nil
 // singleton value alone also means duplicates and is not proof of absence.

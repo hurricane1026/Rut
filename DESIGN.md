@@ -8217,6 +8217,32 @@ expression-string decoder and its owned HIR buffers. Request header validation
 runs on decoded bytes before lowering, preventing escaped CR/LF injection.
 Configuration remains static; CLI restart activates rotation/revocation changes.
 
+### Custom-header API Key rotation and optional access
+
+`auth.rotatingHeaderKey` uses the existing constant-time equality operation for
+an opaque singleton custom-header key. Current/previous keys each have a stable,
+nonempty credential ID; empty keys disable slots. Disabled slots are explicitly
+excluded from matching, including when the presented value is empty. Current
+wins a tie; replacing/removing the previous key and activating the static
+configuration implements rotation/revocation. Missing metadata or two disabled
+slots returns 503; authentication failure returns a challenged ApiKey 401.
+
+`auth.headerKeyOrAnonymous` pairs original header cardinality with the matching
+singleton read. Only count 0 plus an empty value creates the configured guest
+Identity (empty credential ID, method `anonymous`). Count 1 must verify the
+nonempty key. Duplicates, parse failures, empty/wrong credentials and inconsistent
+count/value pairs return 401. Empty configuration and equal guest/authenticated
+Consumer IDs return 503 even on absent requests. Authorization remains separate;
+private routes may reject the guest with 403. Successful key identities retain
+the existing `apiKey` method.
+
+Both helpers use only the selected custom field: query, body and Authorization
+are not fallback sources. Leading request-removal effects do not rewrite the
+original count or singleton values used by authentication. This is the existing
+bounded request/header machinery and typed Rut policy; it adds no primitive,
+keyword, dependency or mutable registry. See `examples/header-key-policies-auth.rut`
+and its JIT/native HTTP evidence.
+
 ### Absence-only anonymous API key policy
 
 `auth.apiKeyOrAnonymous` requires the original Authorization field count together

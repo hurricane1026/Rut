@@ -1314,6 +1314,27 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   original presence evidence. See [optional-multi-auth.rut](../examples/optional-multi-auth.rut).
 - `auth.headerKey(req.uniqueHeader("X-API-Key").or(""), key, consumerId, credentialId)`
   verifies a custom header key. Do not replace uniqueHeader with first-field reads.
+- `auth.rotatingHeaderKey(presented, currentKey, previousKey, consumerId, currentId, previousId)`
+  reads the same singleton custom field and verifies either configured opaque
+  key. Empty keys disable slots, even for an empty/missing presented field.
+  Both credential IDs must remain nonempty; current wins when both keys match.
+  Removing the previous key revokes it after configuration reload/restart.
+  Failure returns 401 with `WWW-Authenticate: ApiKey`; missing metadata or two
+  disabled slots return 503. Unlike Bearer authentication, the presented value
+  is the raw key with no scheme prefix or Base64 transformation.
+- `auth.headerKeyOrAnonymous(count, presented, key, consumerId, credentialId, anonymousId)`
+  pairs `req.headerCount("X-API-Key")` with
+  `req.uniqueHeader("X-API-Key").or("")` from the same original request field.
+  Only count 0 and an empty value returns the configured guest, empty credential
+  ID and method `anonymous`. Count 1 must match the nonempty configured key.
+  Empty/wrong/duplicate fields, parsing failure and inconsistent count/value
+  arguments return a challenged 401. Empty configuration or equal authenticated
+  and guest IDs returns 503, including on the anonymous path. Successful key
+  authentication retains method `apiKey`. Downstream authorization may deny
+  the guest with 403. Removal effects do not change original presence evidence.
+  Only the selected custom header participates: Authorization, query and body
+  values are not alternative sources. See
+  [header-key-policies-auth.rut](../examples/header-key-policies-auth.rut).
 - `auth.basic(authorization, credentials, consumerId, credentialId)` takes configured
   `user:password` bytes; password may contain colons or be explicitly empty.
 - `auth.rotatingBasic(authorization, currentCredentials, previousCredentials, consumerId, currentId, previousId)`
