@@ -1,0 +1,37 @@
+import "middleware/auth.rut"
+
+listen :8080
+
+// Illustrative static credentials and membership: replace before deployment.
+// Alice belongs to both operators and suspended; the deny must run first.
+// Client identity/group headers never populate this trusted snapshot.
+route GET "/operators" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "alice-key", credentials: "",
+            keyId: "alice-key-id", passwordId: "alice-password-id"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "bob-key", credentials: "",
+            keyId: "bob-key-id", passwordId: "bob-password-id"))
+    let checked = auth.denyGroup(identity, "suspended",
+        auth.ConsumerGroups(consumerId: "alice", first: "operators", second: "suspended"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let allowed = auth.requireGroup(checked, "operators",
+        auth.ConsumerGroups(consumerId: "alice", first: "operators", second: "suspended"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+route GET "/not-suspended-or-quarantined" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "alice-key", credentials: "",
+            keyId: "alice-key-id", passwordId: "alice-password-id"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "bob-key", credentials: "",
+            keyId: "bob-key-id", passwordId: "bob-password-id"))
+    let allowed = auth.denyAnyGroup(identity, "suspended", "quarantined",
+        auth.ConsumerGroups(consumerId: "alice", first: "operators", second: "suspended"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+route "/" { return 404 }
