@@ -8804,13 +8804,21 @@ body signature support.
 ### Static Consumer groups
 
 The imported `auth` module provides `ConsumerGroups(consumerId: ..., first: ...,
-second: ...)` and `requireGroup(identity, required, first, second)`. Supply a
+second: ...)`, `requireGroup(identity, required, first, second)`,
+`requireAnyGroup(identity, firstRequired, secondRequired, first, second)`, and
+`requireAllGroups(identity, firstRequired, secondRequired, first, second)`. Supply a
 verified `auth.Identity` and trusted static membership records. This bounded
 policy maps two distinct Consumers to up to two exact, case-sensitive groups
 each. Empty slots disable membership. Unknown Consumers and missing membership
 receive 403; invalid configuration receives 503. Replacing the trusted snapshot
 revokes membership. Client identity/group headers never populate the registry.
-See `examples/consumer-group-auth.rut` (relative to the repository root).
+`requireAnyGroup` accepts membership in either required group, while
+`requireAllGroups` requires both distinct groups in one record belonging to the
+same Consumer; equal required names are invalid configuration (503), while
+`requireAnyGroup` permits equal names. Groups cannot be combined across
+Consumers. See
+`examples/consumer-group-auth.rut` and `examples/consumer-group-all-auth.rut`
+(relative to the repository root).
 
 The same bounded registry supports explicit group denials:
 `denyGroup(identity, denied, first, second)` rejects one group, and

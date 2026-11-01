@@ -1,0 +1,38 @@
+import "middleware/auth.rut"
+
+listen :8080
+
+// Illustrative static keys: replace before deployment. Both memberships must
+// be assigned to the same Consumer in the trusted snapshot.
+route GET "/reports-and-operators" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "alice-key", credentials: "",
+            keyId: "alice-key-id", passwordId: "alice-password-id"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "bob-key", credentials: "",
+            keyId: "bob-key-id", passwordId: "bob-password-id"))
+    let allowed = auth.requireAllGroups(identity, "reports", "operators",
+        auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "operators"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+// Put denials before intersections so a denied member cannot pass an
+// overlapping allow policy.
+route GET "/denied-reports-and-operators" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "alice-key", credentials: "",
+            keyId: "alice-key-id", passwordId: "alice-password-id"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "bob-key", credentials: "",
+            keyId: "bob-key-id", passwordId: "bob-password-id"))
+    let checked = auth.denyGroup(identity, "reports",
+        auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "operators"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let allowed = auth.requireAllGroups(checked, "reports", "operators",
+        auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "operators"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+route "/" { return 404 }
