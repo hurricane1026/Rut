@@ -358,6 +358,13 @@ func jwtIdentityWithLifetime(_ verifiedDoc: Json, _ issuer: str, _ audience: str
     Identity(consumerId: subject.sub, credentialId: credentialId, method: "jwt")
 }
 
+// This helper uses consumerId as the JWT subject. Call it only after the
+// identity was produced by a successful authentication policy; Identity values
+// are constructible and carry no authentication provenance by themselves.
+func jwtForIdentityHs256(_ identity: Identity, _ issuer: str, _ audience: str,
+    _ key: str, _ ttl: i32) =>
+    Crypto.issueJwtHs256(identity.consumerId, issuer, audience, key, ttl)
+
 // Use only after signature and issuer/audience/time validation. Each configured
 // ID belongs to the same trusted issuer as the verified claims; empty slots are
 // disabled. Changing this static snapshot requires a configuration reload.

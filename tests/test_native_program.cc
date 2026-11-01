@@ -35,6 +35,7 @@ TEST(native_program, helper_resolver_rejects_unlisted_symbols) {
     CHECK(find_native_helper(lit_str("malloc")) == nullptr);
     CHECK(find_native_helper(lit_str("rut_helper_hash_extra")) == nullptr);
     CHECK(find_native_helper({nullptr, 1}) == nullptr);
+    CHECK(find_native_helper(lit_str("rut_helper_jwt_issue_hs256")) != nullptr);
 }
 namespace {
 struct Source {
@@ -250,6 +251,35 @@ TEST(native_program, code_and_views_survive_compiler_exit_and_source_removal) {
     REQUIRE_EQ(c.header_pool_used, 1u);
     CHECK((Str{c.header_keys[0].data, c.header_keys[0].len}.eq(lit_str("X-Native"))));
     CHECK((Str{c.header_values[0].data, c.header_values[0].len}.eq(lit_str("yes"))));
+}
+
+TEST(native_program, jwt_issue_helper_survives_native_artifact_source_removal) {
+    Source source;
+    const char rut_source[] =
+        "route GET \"/token\" { let issued = jwtIssueHs256(\"alice\", \"issuer\", "
+        "\"orders\", \"01234567890123456789012345678901\", 60) "
+        "guard let token = issued else { return 503 } "
+        "guard let claims = jwtDecode(token, \"01234567890123456789012345678901\", \"HS256\") "
+        "else { return 501 } "
+        "guard jwtClaimsValid(claims, \"issuer\", \"orders\") else { return 502 } "
+        "return 204 }\n";
+    REQUIRE(source.append(rut_source, sizeof(rut_source) - 1));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(owner.p->config.route_count, 1u);
+    REQUIRE_EQ(unlink(source.path), 0);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    jit::HandlerCtx ctx{};
+    const char request[] = "GET /token HTTP/1.1\r\nHost: test\r\n\r\n";
+    const auto result = jit::HandlerResult::unpack(owner.p->config.routes[0].fn(
+        nullptr, &ctx, reinterpret_cast<const u8*>(request), sizeof(request) - 1, &arena));
+    CHECK_EQ(result.status_code, 204u);
+    arena.destroy();
+    pool.destroy();
 }
 
 TEST(native_program, signed_request_helper_survives_native_artifact_source_removal) {

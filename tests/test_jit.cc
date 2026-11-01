@@ -26087,6 +26087,52 @@ route GET "/orders" {
     rir.destroy();
 }
 
+TEST(jit, fixed_profile_hs256_issue_round_trips_through_decoder) {
+    const char* source = R"rut(
+import Crypto
+route GET "/" {
+    let direct = jwtIssueHs256("alice", "issuer", "orders", "01234567890123456789012345678901", 60)
+    guard let token = direct else { return 500 }
+    guard let claims = jwtDecode(token, "01234567890123456789012345678901", "HS256") else { return 504 }
+    guard jwtClaimsValid(claims, "issuer", "orders") else { return 501 }
+    let qualified = Crypto.issueJwtHs256("alice", "issuer", "orders", "01234567890123456789012345678901", 60)
+    guard let second = qualified else { return 502 }
+    guard let secondClaims = jwtDecode(second, "01234567890123456789012345678901", "HS256") else { return 505 }
+    guard jwtClaimsValid(secondClaims, "issuer", "orders") else { return 503 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    const char request[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, &arena));
+    CHECK_EQ(result.status_code, 204u);
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, jwt_groups_example_compiles) {
     const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
                              "examples/jwt-groups-auth.rut";
