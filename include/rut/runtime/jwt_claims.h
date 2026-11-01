@@ -20,4 +20,9 @@ bool jwt_claims_valid(
 // verify signatures or claims policy. Invalid documents/tokens fail closed.
 bool jwt_has_scope(json::Document& scratch, Str claims, Str required);
 
+// Exact membership in a nonempty top-level JWT groups string array. Does not
+// verify signatures or claims policy. Every array entry must be a nonempty
+// string; malformed/invalid entries fail the whole check, even after a match.
+bool jwt_has_group(json::Document& scratch, Str claims, Str required);
+
 }  // namespace rut

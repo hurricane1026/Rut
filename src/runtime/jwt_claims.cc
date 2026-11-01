@@ -105,4 +105,26 @@ bool jwt_has_scope(json::Document& document, Str claims, Str required) {
     return found;
 }
 
+bool jwt_has_group(json::Document& document, Str claims, Str required) {
+    if (required.ptr == nullptr || required.len == 0 || required.len > json::kMaxBytes ||
+        claims.ptr == nullptr || !document.parse(claims) ||
+        document.nodes[0].kind != json::Kind::Object)
+        return false;
+    const u32 kGroups = member(document, lit_str("groups"));
+    if (kGroups == json::kNone || document.nodes[kGroups].kind != json::Kind::Array ||
+        document.nodes[kGroups].child == json::kNone)
+        return false;
+
+    // Membership is exact, but validate every entry even after a match so a
+    // malformed suffix cannot turn an invalid policy document into success.
+    bool found = false;
+    for (u32 node = document.nodes[kGroups].child; node != json::kNone;
+         node = document.nodes[node].next) {
+        json::Writer value{document.scratch};
+        if (!document.string(node, value) || value.len == 0) return false;
+        found |= Str{document.scratch, value.len}.eq(required);
+    }
+    return found;
+}
+
 }  // namespace rut
