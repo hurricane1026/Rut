@@ -90,6 +90,9 @@
     X(rut_helper_ws_json_bool_equals_at_path)    \
     X(rut_helper_ws_json_int_at_path)            \
     X(rut_helper_ws_json_int_compare_at_path)    \
+    X(rut_helper_ws_json_kind_equals_at_path)    \
+    X(rut_helper_ws_json_count_at_path)          \
+    X(rut_helper_ws_json_count_compare_at_path)  \
     X(rut_helper_str_contains)                   \
     X(rut_helper_str_eq)                         \
     X(rut_helper_str_cmp)                        \

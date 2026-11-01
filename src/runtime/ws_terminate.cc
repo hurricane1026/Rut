@@ -155,6 +155,87 @@ bool ws_json_int_compare_at_path(
     return matches;
 }
 
+bool ws_json_kind_equals_at_path(const u8* payload, u64 len, Str path, Str expected) {
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len) || (!expected.ptr && expected.len))
+        return false;
+    json::Document& document = ws_json_document();
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    Str kind{};
+    if (kId != json::kNone) {
+        switch (document.nodes[kId].kind) {
+            case json::Kind::Null:
+                kind = lit_str("null");
+                break;
+            case json::Kind::Boolean:
+                kind = lit_str("boolean");
+                break;
+            case json::Kind::Number:
+                kind = lit_str("number");
+                break;
+            case json::Kind::String:
+                kind = lit_str("string");
+                break;
+            case json::Kind::Array:
+                kind = lit_str("array");
+                break;
+            case json::Kind::Object:
+                kind = lit_str("object");
+                break;
+        }
+    }
+    const bool kMatches = kId != json::kNone && kind.eq(expected);
+    document.source = {};
+    return kMatches;
+}
+
+bool ws_json_count_at_path(const u8* payload, u64 len, Str path) {
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
+        return false;
+    json::Document& document = ws_json_document();
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    const bool kIsContainer =
+        kId != json::kNone && (document.nodes[kId].kind == json::Kind::Array ||
+                               document.nodes[kId].kind == json::Kind::Object);
+    document.source = {};
+    return kIsContainer;
+}
+
+bool ws_json_count_compare_at_path(
+    const u8* payload, u64 len, Str path, i32 expected, WsJsonIntComparison comparison) {
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
+        return false;
+    json::Document& document = ws_json_document();
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    bool matches = false;
+    if (kId != json::kNone && (document.nodes[kId].kind == json::Kind::Array ||
+                               document.nodes[kId].kind == json::Kind::Object)) {
+        const i32 kCount = static_cast<i32>(document.size(kId));
+        switch (comparison) {
+            case WsJsonIntComparison::Lt:
+                matches = kCount < expected;
+                break;
+            case WsJsonIntComparison::Gt:
+                matches = kCount > expected;
+                break;
+            case WsJsonIntComparison::Eq:
+                matches = kCount == expected;
+                break;
+            default:
+                matches = false;
+                break;
+        }
+    }
+    document.source = {};
+    return matches;
+}
+
 bool ws_valid_json_payload(const u8* payload, u64 len) {
     return ws_json_has_path(payload, len, {});  // the empty pointer selects any valid JSON root
 }

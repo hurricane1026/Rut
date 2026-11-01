@@ -908,6 +908,21 @@ return websocket(chat) { message in
 // with == / != / < / <= / > / >= in either order. No arithmetic or alias comparison;
 // fractions, exponents and values outside signed i64 fail the binding.
 
+// Apply both kind and cardinality checks to a root array within four guards.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let tag = json.kind(document) else { message.close(1003) }
+    guard let amount = json.count(document) else { message.close(1003) }
+    guard tag == "array" && amount <= 32 else { message.drop() }
+    message.forward()
+}
+// json.kind(document) also checks the root and binds one of null/boolean/number/
+// string/array/object; JSON null is a successful "null" kind. Compare its alias
+// only to string literals with == / !=. json.count checks direct array elements
+// or object members; empty containers bind zero. Its Int literals must fit i32.
+// Selected-field chains need json.get too, so only one complete selected-field
+// kind/count check fits under the four source-guard limit.
+
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
 // and the single-slice cap. General expressions/interpolation remain unsupported.

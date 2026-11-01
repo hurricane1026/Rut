@@ -1,3 +1,4 @@
+#include "rut/common/types.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_artifact.h"
 #include "rut/runtime/cache_table.h"
@@ -29,6 +30,70 @@ namespace {
 volatile sig_atomic_t g_startup_cancelled = 0;
 void startup_cancel_handler(int) {
     g_startup_cancelled = 1;
+}
+
+void child_write_all(int fd, const char* bytes, u32 length) {
+    u32 offset = 0;
+    while (offset < length) {
+        const ssize_t kWritten = write(fd, bytes + offset, length - offset);
+        if (kWritten < 0 && errno == EINTR) continue;
+        if (kWritten <= 0) return;
+        offset += static_cast<u32>(kWritten);
+    }
+}
+
+void child_setup_failure(const char* stage, int error_number) {
+    static constexpr char kPrefix[] = "rut-compile child setup failed: ";
+    static constexpr char kErrno[] = " errno=";
+    static constexpr char kNewline[] = "\n";
+    char digits[10];
+    u32 digit_count = 0;
+    unsigned int value = error_number < 0 ? 0u : static_cast<unsigned int>(error_number);
+    do {
+        digits[digit_count++] = static_cast<char>('0' + value % 10u);
+        value /= 10u;
+    } while (value && digit_count < sizeof(digits));
+
+    u32 stage_length = 0;
+    while (stage[stage_length]) ++stage_length;
+    child_write_all(STDERR_FILENO, kPrefix, sizeof(kPrefix) - 1u);
+    child_write_all(STDERR_FILENO, stage, stage_length);
+    child_write_all(STDERR_FILENO, kErrno, sizeof(kErrno) - 1u);
+    while (digit_count) {
+        const char kDigit = digits[--digit_count];
+        child_write_all(STDERR_FILENO, &kDigit, 1);
+    }
+    child_write_all(STDERR_FILENO, kNewline, sizeof(kNewline) - 1u);
+}
+
+void format_producer_failure(char* message,
+                             u32 message_size,
+                             const char* stage,
+                             bool status_observed_before_cleanup,
+                             int status_before_cleanup,
+                             bool cleanup_attempted) {
+    if (status_observed_before_cleanup && WIFEXITED(status_before_cleanup)) {
+        snprintf(message,
+                 message_size,
+                 "rut-compile failed during %s: exit code %d",
+                 stage,
+                 WEXITSTATUS(status_before_cleanup));
+    } else if (status_observed_before_cleanup && WIFSIGNALED(status_before_cleanup)) {
+        snprintf(message,
+                 message_size,
+                 "rut-compile failed during %s: signal %d",
+                 stage,
+                 WTERMSIG(status_before_cleanup));
+    } else if (cleanup_attempted) {
+        snprintf(message,
+                 message_size,
+                 "rut-compile failed during %s: status unavailable before cleanup; SIGKILL "
+                 "cleanup attempted; post-cleanup status unavailable",
+                 stage);
+    } else {
+        snprintf(
+            message, message_size, "rut-compile failed during %s: wait status unavailable", stage);
+    }
 }
 
 struct StartupSignalScope {
@@ -188,7 +253,11 @@ bool load_native_program(const char* source,
     pid_t child = fork();
     if (child == 0) {
         close(channel[0]);
-        if (setpgid(0, 0) != 0) _exit(127);
+        if (setpgid(0, 0) != 0) {
+            const int kErrorNumber = errno;
+            child_setup_failure("setpgid", kErrorNumber);
+            _exit(127);
+        }
         struct sigaction default_action{};
         default_action.sa_handler = SIG_DFL;
         sigemptyset(&default_action.sa_mask);
@@ -198,20 +267,39 @@ bool load_native_program(const char* source,
         // The compiler must never survive a killed or cancelled server
         // startup. Check the parent PID after arming the signal to close the
         // fork/parent-death race.
-        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent_pid) _exit(127);
-#endif
-        if (dup2(channel[1], STDOUT_FILENO) < 0) _exit(127);
-        int descriptor_flags = fcntl(STDOUT_FILENO, F_GETFD);
-        if (descriptor_flags < 0 ||
-            fcntl(STDOUT_FILENO, F_SETFD, descriptor_flags & ~FD_CLOEXEC) != 0)
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+            const int kErrorNumber = errno;
+            child_setup_failure("prctl-pdeathsig", kErrorNumber);
             _exit(127);
+        }
+        if (getppid() != parent_pid) {
+            child_setup_failure("parent-changed", 0);
+            _exit(127);
+        }
+#endif
+        if (dup2(channel[1], STDOUT_FILENO) < 0) {
+            const int kErrorNumber = errno;
+            child_setup_failure("dup2-stdout", kErrorNumber);
+            _exit(127);
+        }
+        const int kDescriptorFlags = fcntl(STDOUT_FILENO, F_GETFD);
+        if (kDescriptorFlags < 0) {
+            const int kErrorNumber = errno;
+            child_setup_failure("fcntl-getfd", kErrorNumber);
+            _exit(127);
+        }
+        if (fcntl(STDOUT_FILENO, F_SETFD, kDescriptorFlags & ~FD_CLOEXEC) != 0) {
+            const int kErrorNumber = errno;
+            child_setup_failure("fcntl-setfd", kErrorNumber);
+            _exit(127);
+        }
         if (channel[1] != STDOUT_FILENO) close(channel[1]);
         if (request_ebpf_plan)
             execl(compiler, compiler, source, level, "--ebpf-plan", nullptr);
         else
             execl(compiler, compiler, source, level, nullptr);
-        const char message[] = "Cannot execute sibling rut-compile\n";
-        (void)write(2, message, sizeof(message) - 1);
+        const int kErrorNumber = errno;
+        child_setup_failure("exec-rut-compile", kErrorNumber);
         _exit(127);
     }
     close(channel[1]);
@@ -220,17 +308,22 @@ bool load_native_program(const char* source,
         return fail("cannot start rut-compile");
     }
     if (setpgid(child, child) != 0 && errno != EACCES && errno != ESRCH) {
+        const int kErrorNumber = errno;
+        char message[96];
+        snprintf(
+            message, sizeof(message), "cannot isolate compiler process (errno=%d)", kErrorNumber);
         kill(child, SIGKILL);
         while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
         }
         close(channel[0]);
-        return fail("cannot isolate compiler process");
+        return fail(message);
     }
     struct Child {
         pid_t pid;
         int fd;
         int status = 0;
         bool reaped = false;
+        bool status_observed = false;
         bool wait() {
             close(fd);
             fd = -1;
@@ -239,12 +332,13 @@ bool load_native_program(const char* source,
                     cancel();
                     return false;
                 }
-                pid_t n = waitpid(pid, &status, WNOHANG);
-                if (n == pid) {
+                const pid_t kChildResult = waitpid(pid, &status, WNOHANG);
+                if (kChildResult == pid) {
                     reaped = true;
+                    status_observed = true;
                     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
                 }
-                if (n < 0 && errno != EINTR) return false;
+                if (kChildResult < 0 && errno != EINTR) return false;
                 poll(nullptr, 0, 10);
             }
         }
@@ -254,7 +348,12 @@ bool load_native_program(const char* source,
             }
             while (!reaped) {
                 pid_t result = waitpid(pid, &status, WNOHANG);
-                if (result == pid || (result < 0 && errno == ECHILD)) {
+                if (result == pid) {
+                    reaped = true;
+                    status_observed = true;
+                    break;
+                }
+                if (result < 0 && errno == ECHILD) {
                     reaped = true;
                     break;
                 }
@@ -290,8 +389,26 @@ bool load_native_program(const char* source,
     native::StreamHeader stream{};
     if (!read_all(&stream, sizeof(stream))) {
         producer.cancel();
+        const bool kCleanupStatusObserved = producer.status_observed;
+        const int kCleanupStatus = producer.status;
         if (g_startup_cancelled) return fail("startup cancelled");
-        return fail("rut-compile failed (see diagnostic above)");
+        char message[128];
+        if (kCleanupStatusObserved && WIFEXITED(kCleanupStatus)) {
+            snprintf(message,
+                     sizeof(message),
+                     "rut-compile failed during header: no status before cleanup; status observed "
+                     "during SIGKILL cleanup: exit code %d",
+                     WEXITSTATUS(kCleanupStatus));
+        } else if (kCleanupStatusObserved && WIFSIGNALED(kCleanupStatus)) {
+            snprintf(message,
+                     sizeof(message),
+                     "rut-compile failed during header: no status before cleanup; status observed "
+                     "during SIGKILL cleanup: signal %d",
+                     WTERMSIG(kCleanupStatus));
+        } else {
+            format_producer_failure(message, sizeof(message), "header", false, 0, true);
+        }
+        return fail(message);
     }
     if (stream.magic != native::kMagic || stream.version != native::kVersion ||
         memcmp(stream.build_id, native::kBuildId, sizeof(stream.build_id)) != 0)
@@ -359,7 +476,12 @@ bool load_native_program(const char* source,
     const bool producer_ok = producer.wait();
     const bool startup_cancelled = startup_signals.finish();
     if (startup_cancelled) return fail("startup cancelled");
-    if (!producer_ok) return fail("rut-compile failed (see diagnostic above)");
+    if (!producer_ok) {
+        char message[128];
+        format_producer_failure(
+            message, sizeof(message), "tail", producer.status_observed, producer.status, false);
+        return fail(message);
+    }
 #ifdef __linux__
     if (fcntl(out.artifact_fd,
               F_ADD_SEALS,

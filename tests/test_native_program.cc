@@ -467,6 +467,59 @@ route GET "/ws" { return websocket(backend) { message in
     REQUIRE_EQ(owner.p->config.routes[0].ws_close_policy_count, 3u);
 }
 
+TEST(native_program, websocket_json_kind_and_count_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/kind" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/value") else { message.close(1008) }
+ guard let tag = json.kind(field) else { message.close(1003) }
+ guard "object" == tag else { message.drop() }
+ message.forward()
+} }
+route GET "/count" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/items") else { message.close(1008) }
+ guard let amount = json.count(field) else { message.close(1003) }
+ guard 1 < amount && amount <= 2 else { message.drop() }
+ message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+
+    const auto kind_handler = owner.p->config.routes[0].ws_frame_handler;
+    const auto count_handler = owner.p->config.routes[1].ws_frame_handler;
+    REQUIRE(kind_handler);
+    REQUIRE(count_handler);
+    CHECK(kind_handler(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(R"({"value":{}})"),
+                       strlen(R"({"value":{}})"),
+                       true) == WsFrameAction::Forward);
+    CHECK(kind_handler(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(R"({"value":null})"),
+                       strlen(R"({"value":null})"),
+                       false) == WsFrameAction::Drop);
+    CHECK(count_handler(nullptr,
+                        WsOpcode::Text,
+                        reinterpret_cast<const u8*>(R"({"items":[1,2]})"),
+                        strlen(R"({"items":[1,2]})"),
+                        true) == WsFrameAction::Forward);
+    CHECK(count_handler(nullptr,
+                        WsOpcode::Binary,
+                        reinterpret_cast<const u8*>(R"({"items":[]})"),
+                        strlen(R"({"items":[]})"),
+                        false) == WsFrameAction::Drop);
+    CHECK(count_handler(nullptr,
+                        WsOpcode::Text,
+                        reinterpret_cast<const u8*>(R"({"items":null})"),
+                        strlen(R"({"items":null})"),
+                        true) == WsFrameAction::ClosePolicy2);
+}
+
 TEST(native_program, websocket_json_validation_survives_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

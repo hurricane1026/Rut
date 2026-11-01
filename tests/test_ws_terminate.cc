@@ -90,6 +90,115 @@ TEST(ws_terminate, json_field_presence_is_bounded_and_message_scoped) {
     CHECK(present(payload, lit_str("/name")));
 }
 
+TEST(ws_terminate, json_kind_names_are_bounded_and_reparsed) {
+    auto matches = [](Str payload, Str path, Str expected) {
+        return ws_json_kind_equals_at_path(
+            reinterpret_cast<const u8*>(payload.ptr), payload.len, path, expected);
+    };
+    const char* const kPayloads[] = {"null", "true", "1.0", "\"x\"", "[]", "{}"};
+    const char* const kKinds[] = {"null", "boolean", "number", "string", "array", "object"};
+    for (u32 i = 0; i < sizeof(kPayloads) / sizeof(kPayloads[0]); ++i) {
+        CHECK(matches({kPayloads[i], static_cast<u32>(strlen(kPayloads[i]))},
+                      {},
+                      {kKinds[i], static_cast<u32>(strlen(kKinds[i]))}));
+        CHECK_FALSE(matches({kPayloads[i], static_cast<u32>(strlen(kPayloads[i]))}, {}, {}));
+    }
+    CHECK(matches(lit_str(R"({"value":null})"), lit_str("/value"), lit_str("null")));
+    CHECK(matches(lit_str(R"({"value":[]})"), lit_str("/value"), lit_str("array")));
+    CHECK_FALSE(matches(lit_str(R"({"value":null})"), lit_str("/missing"), lit_str("")));
+    CHECK_FALSE(matches(lit_str("{"), {}, lit_str("object")));
+    CHECK_FALSE(matches(lit_str("{}"), Str{nullptr, 1}, lit_str("object")));
+    CHECK_FALSE(ws_json_kind_equals_at_path(
+        reinterpret_cast<const u8*>("null"), 0x100000004ULL, {}, lit_str("null")));
+    const char kExpectedNul[] = {'n', 'u', 'l', 'l', '\0', 'x'};
+    CHECK_FALSE(matches(lit_str("null"), {}, {kExpectedNul, sizeof(kExpectedNul)}));
+    CHECK_FALSE(matches(lit_str("null"), {}, lit_str("NULL")));
+    const char kNulPointerPayload[] = R"({"a\u0000b":[]})";
+    const char kNulPointer[] = {'/', 'a', '\0', 'b'};
+    CHECK(matches({kNulPointerPayload, static_cast<u32>(strlen(kNulPointerPayload))},
+                  {kNulPointer, sizeof(kNulPointer)},
+                  lit_str("array")));
+    CHECK_FALSE(matches(lit_str(R"({"a":[],"\u0061":[]})"), {}, lit_str("object")));
+
+    char reused[] = R"({"value":[]})";
+    const Str kReusedView{reused, static_cast<u32>(strlen(reused))};
+    CHECK(matches(kReusedView, lit_str("/value"), lit_str("array")));
+
+    char bounded[json::kMaxBytes + 1];
+    memset(bounded, ' ', sizeof(bounded));
+    bounded[0] = '[';
+    bounded[1] = ']';
+    CHECK(ws_json_kind_equals_at_path(
+        reinterpret_cast<const u8*>(bounded), json::kMaxBytes, {}, lit_str("array")));
+    CHECK_FALSE(ws_json_kind_equals_at_path(
+        reinterpret_cast<const u8*>(bounded), sizeof(bounded), {}, lit_str("array")));
+    reused[9] = '{';
+    reused[10] = '}';
+    CHECK(matches(kReusedView, lit_str("/value"), lit_str("object")));
+    reused[9] = '[';
+    reused[10] = 'x';
+    CHECK_FALSE(matches(kReusedView, lit_str("/value"), lit_str("array")));
+    reused[10] = ']';
+    CHECK(matches(kReusedView, lit_str("/value"), lit_str("array")));
+}
+
+TEST(ws_terminate, json_count_is_direct_container_size_and_reparsed) {
+    auto valid = [](Str payload, Str path) {
+        return ws_json_count_at_path(reinterpret_cast<const u8*>(payload.ptr), payload.len, path);
+    };
+    auto compare = [](Str payload, Str path, i32 expected, WsJsonIntComparison op) {
+        return ws_json_count_compare_at_path(
+            reinterpret_cast<const u8*>(payload.ptr), payload.len, path, expected, op);
+    };
+    CHECK(valid(lit_str("[]"), {}));
+    CHECK(valid(lit_str("{}"), {}));
+    CHECK(compare(lit_str("[]"), {}, 0, WsJsonIntComparison::Eq));
+    CHECK(compare(lit_str("{}"), {}, 0, WsJsonIntComparison::Eq));
+    CHECK(compare(lit_str("[1,{\"nested\":[1,2,3]}]"), {}, 2, WsJsonIntComparison::Eq));
+    CHECK(compare(lit_str(R"({"a":{"x":1,"y":2},"b":[]})"), {}, 2, WsJsonIntComparison::Eq));
+    CHECK(compare(
+        lit_str(R"({"a":{"x":1,"y":2},"b":[]})"), lit_str("/a"), 2, WsJsonIntComparison::Eq));
+    CHECK(compare(lit_str("[1,2]"), {}, -1, WsJsonIntComparison::Gt));
+    CHECK(compare(lit_str("[1,2]"), {}, 3, WsJsonIntComparison::Lt));
+    CHECK(compare(lit_str("[1]"), {}, (-2147483647 - 1), WsJsonIntComparison::Gt));
+    CHECK(compare(lit_str("[1]"), {}, 2147483647, WsJsonIntComparison::Lt));
+    // Deliberately exercise the invalid-operation fail-closed branch.
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+    CHECK_FALSE(compare(lit_str("[1,2]"), {}, 2, static_cast<WsJsonIntComparison>(255)));
+    const Str kScalars[] = {lit_str("null"), lit_str("true"), lit_str("1"), lit_str("\"x\"")};
+    for (const Str kScalar : kScalars) {
+        CHECK_FALSE(valid(kScalar, {}));
+        CHECK_FALSE(compare(kScalar, {}, 0, WsJsonIntComparison::Eq));
+    }
+    CHECK_FALSE(valid(lit_str("{"), {}));
+    CHECK_FALSE(valid(lit_str("{}"), lit_str("/missing")));
+    CHECK_FALSE(ws_json_count_at_path(nullptr, 0x100000001ULL, {}));
+    CHECK_FALSE(ws_json_count_at_path(reinterpret_cast<const u8*>("[]"), 0x100000002ULL, {}));
+    const char kNulPointerPayload[] = R"({"a\u0000b":[]})";
+    const char kNulPointer[] = {'/', 'a', '\0', 'b'};
+    CHECK(compare({kNulPointerPayload, static_cast<u32>(strlen(kNulPointerPayload))},
+                  {kNulPointer, sizeof(kNulPointer)},
+                  0,
+                  WsJsonIntComparison::Eq));
+    CHECK_FALSE(valid(lit_str(R"({"a":[],"\u0061":[]})"), {}));
+    char bounded[json::kMaxBytes + 1];
+    memset(bounded, ' ', sizeof(bounded));
+    bounded[0] = '[';
+    bounded[1] = ']';
+    CHECK(ws_json_count_at_path(reinterpret_cast<const u8*>(bounded), json::kMaxBytes, {}));
+    CHECK_FALSE(ws_json_count_at_path(reinterpret_cast<const u8*>(bounded), sizeof(bounded), {}));
+
+    char reused[] = "[1]";
+    const Str kReusedView{reused, static_cast<u32>(strlen(reused))};
+    CHECK(compare(kReusedView, {}, 1, WsJsonIntComparison::Eq));
+    reused[1] = ' ';
+    CHECK(compare(kReusedView, {}, 0, WsJsonIntComparison::Eq));
+    reused[1] = 'x';
+    CHECK_FALSE(valid(kReusedView, {}));
+    reused[1] = ' ';
+    CHECK(valid(kReusedView, {}));
+}
+
 TEST(ws_terminate, json_string_lookup_decodes_and_reuses_bounded_workspace) {
     const Str kPaths[] = {lit_str("/kind"), lit_str("/empty"), lit_str("/nul"), lit_str("")};
     const char* const kPayloads[] = {R"({"kind":"subscribe","empty":"","nul":"a\u0000b"})",
@@ -999,6 +1108,44 @@ TEST(ws_terminate, fragmented_message_handler_sees_whole) {
     CHECK_EQ(h.payload_len, 5u);
     CHECK(h.fin);
     CHECK_EQ(memcmp(pl, "AAABB", 5), 0);  // "AAA" + "BB"
+}
+
+TEST(ws_terminate, fragmented_json_count_policy_sees_complete_message_both_directions) {
+    auto json_count_handler = [](void*, WsOpcode, const u8* payload, u64 len, bool) {
+        return ws_json_count_compare_at_path(payload, len, {}, 2, WsJsonIntComparison::Eq)
+                   ? WsFrameAction::Forward
+                   : WsFrameAction::Drop;
+    };
+    for (const bool kMasked : kMaskDirections) {
+        WsInspector st = make_state(kMasked);
+        st.max_message_size = 32;
+        u8 in[64], out[64], msg[64];
+        const u8 kFirst[] = {'[', '1', ','};
+        const u8 kLast[] = {'2', ']'};
+        u32 n = build(in, WsOpcode::Text, false, kMasked, kFirst, sizeof(kFirst));
+        n += build(in + n, WsOpcode::Continuation, true, kMasked, kLast, sizeof(kLast));
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           n,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           json_count_handler,
+                           nullptr,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(consumed, n);
+        CHECK(produced > 0);
+        WsFrameHeader header{};
+        u8 forwarded[16];
+        CHECK(parse_one(out, produced, kMasked, &header, forwarded) == produced);
+        CHECK(header.fin);
+        CHECK(header.opcode == WsOpcode::Text);
+        CHECK_EQ(header.payload_len, 5u);
+        CHECK(memcmp(forwarded, "[1,2]", 5) == 0);
+    }
 }
 
 TEST(ws_terminate, fragmented_utf8_with_interleaved_ping) {

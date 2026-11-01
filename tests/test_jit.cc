@@ -20767,13 +20767,15 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     auto empty = codegen_ws_handler(0, &node, 1, 0);
     REQUIRE(empty.ok);
     dispose_module(empty.mod, empty.ctx);
-    for (u8 accessor : {7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}) {
+    const u8 kAccessors[] = {7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23};
+    for (u8 accessor : kAccessors) {
         node.accessor = accessor;
         node.pattern_len = 4;
         CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
         node.pattern_len = 0;
-        if (accessor >= 13 && accessor <= 16) node.value_len = 4;
-        if (accessor >= 13 && accessor <= 16) CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+        if ((accessor >= 13 && accessor <= 16) || accessor == 21) node.value_len = 4;
+        if ((accessor >= 13 && accessor <= 16) || accessor == 21)
+            CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
         node.value_len = 0;
         auto affix = codegen_ws_handler(0, &node, 1, 0);
         REQUIRE(affix.ok);
@@ -20796,7 +20798,27 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     dispose_module(max_int.mod, max_int.ctx);
     node.cmp = 3;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.cmp = 0;
     node.accessor = 21;
+    node.pattern_len = 4;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.pattern_len = 0;
+    node.value_len = 4;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.value_len = 0;
+    auto kind_equal = codegen_ws_handler(0, &node, 1, 0);
+    REQUIRE(kind_equal.ok);
+    dispose_module(kind_equal.mod, kind_equal.ctx);
+    node.accessor = 23;
+    node.int_bound = 2147483648LL;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.int_bound = -2147483649LL;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.int_bound = 2147483647LL;
+    auto max_count = codegen_ws_handler(0, &node, 1, 0);
+    REQUIRE(max_count.ok);
+    dispose_module(max_count.mod, max_count.ctx);
+    node.accessor = 24;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 
