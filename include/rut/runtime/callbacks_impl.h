@@ -10776,20 +10776,18 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
 #if RUT_ENABLE_WEBSOCKET
 // Arm terminate mode at the 101: acquire reassembly and output slices, initialize both
-// per-direction inspectors (client->upstream masked, upstream->client unmasked), bound the
-// message cap to one slice. Returns
-// false if the slice pool is exhausted (or the loop has no pool) — the caller closes.
+// per-direction inspectors (client->upstream masked, upstream->client unmasked). Returns
+// false for an invalid message cap or if slice allocation fails — the caller closes.
 template <typename Loop>
 bool ws_arm_terminate(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* lp, Connection& c) { lp->alloc_ws_terminate_bufs(c); }) {
+        const u32 kCap = conn.ws_max_message_size;
+        if (!ws_valid_message_capacity(kCap)) return false;
         if (!loop->alloc_ws_terminate_bufs(conn)) return false;
-        u32 cap = conn.ws_max_message_size;
-        const u32 kCap = kWsTerminateMessageCapacity;
-        if (cap == 0 || cap > kCap) cap = kCap;
         conn.ws_c2u.reset();
         conn.ws_c2u.masked = true;       // client->upstream is client-role on both ends → masked
         conn.ws_c2u.from_client = true;  // this leg is the client→upstream direction
-        conn.ws_c2u.max_message_size = cap;
+        conn.ws_c2u.max_message_size = kCap;
         conn.ws_c2u.forward_text = conn.ws_forward_text;
         conn.ws_c2u.forward_texts = conn.ws_forward_texts;
         conn.ws_c2u.forward_text_count = conn.ws_forward_text_count;
@@ -10801,7 +10799,7 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_u2c.reset();
         conn.ws_u2c.masked = false;       // upstream->client is server-role on both ends → unmasked
         conn.ws_u2c.from_client = false;  // this leg is the upstream→client direction
-        conn.ws_u2c.max_message_size = cap;
+        conn.ws_u2c.max_message_size = kCap;
         conn.ws_u2c.forward_text = conn.ws_forward_text;
         conn.ws_u2c.forward_texts = conn.ws_forward_texts;
         conn.ws_u2c.forward_text_count = conn.ws_forward_text_count;

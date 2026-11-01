@@ -947,6 +947,10 @@ return websocket(chat, maxMessageSize: 4kb) { message in
     message.forward("message replaced")
 }
 
+// Terminate mode defaults to 16370 bytes (16 KiB slice minus the maximum 14-byte
+// WebSocket header). Explicit `maxMessageSize` values must be 1b through 16370b;
+// values such as 16kb or 64kb are rejected because larger-message buffering is not implemented.
+
 // Add fixed UTF-8 affixes around one complete Text message, using String +.
 // Parentheses, concatenated literals, and compile-time-known route let strings
 // (including aliases) are accepted, with at most 32 expression nodes.

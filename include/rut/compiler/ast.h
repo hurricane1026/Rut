@@ -248,7 +248,8 @@ struct AstStatement {
     Str name{};
     bool bind_value = false;
     // WsTerminate only: the `maxMessageSize:` kwarg in bytes (`websocket(x, maxMessageSize: 8kb)`),
-    // 0 when omitted (the loader then uses the engine default). Carried to HirWsHandler.
+    // 0 when omitted (the loader then uses the engine default); explicit values fit one slice.
+    // Carried to HirWsHandler.
     u32 ws_max_message_size = 0;
     bool is_const = false;
     bool has_type = false;

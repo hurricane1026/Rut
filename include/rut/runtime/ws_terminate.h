@@ -22,6 +22,10 @@ inline constexpr u32 kWsMaxCloseReasonBytes = kWsMaxControlPayload - 2;
 
 inline constexpr u32 kWsTerminateMessageCapacity = SlicePool::kSliceSize - kWsMaxHeaderSize;
 
+constexpr bool ws_valid_message_capacity(u32 size) {
+    return size != 0 && size <= kWsTerminateMessageCapacity;
+}
+
 enum class WsJsonStringMatch : u8 { Equal, Prefix, Suffix, Contains };
 enum class WsJsonIntComparison : u8 { Lt, Gt, Eq };
 

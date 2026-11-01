@@ -3796,7 +3796,8 @@ if(RUT_ENABLE_JIT)
     if(Python3_Interpreter_FOUND)
         add_test(NAME test_native_protocol
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test_native_protocol.py
-                --server $<TARGET_FILE:rut> --compiler $<TARGET_FILE:rut-compile>)
+                --server $<TARGET_FILE:rut> --compiler $<TARGET_FILE:rut-compile>
+                --websocket-enabled $<BOOL:${RUT_ENABLE_WEBSOCKET}>)
         set_tests_properties(test_native_protocol PROPERTIES LABELS "unit;jit" TIMEOUT 30)
     endif()
 

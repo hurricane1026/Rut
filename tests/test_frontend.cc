@@ -6232,6 +6232,51 @@ TEST(frontend, analyze_accepts_websocket_max_message_size_kwarg) {
     CHECK_EQ(hir->routes[0].ws_handler.max_message_size, 4096u);
 }
 
+TEST(frontend, websocket_max_message_size_accepts_single_slice_boundaries) {
+    const char* values[] = {"1b", "16370b"};
+    const u32 expected_sizes[] = {1, kWsTerminateMessageCapacity};
+    for (u32 i = 0; i < 2; i++) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws, ";
+        source += "maxMessageSize: ";
+        source += values[i];
+        source += ") { message in message.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].ws_handler.max_message_size, expected_sizes[i]);
+    }
+}
+
+TEST(frontend, websocket_max_message_size_rejects_values_over_single_slice) {
+    constexpr Str kExpectedDetail = lit_str("single-slice maximum is 16370 bytes");
+    for (const char* value : {"16371b", "16kb", "64kb"}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws, ";
+        source += "maxMessageSize: ";
+        source += value;
+        source += ") { message in message.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(ast.error().detail.eq(kExpectedDetail));
+        const char* value_start = strstr(source.c_str(), value);
+        REQUIRE(value_start != nullptr);
+        CHECK_EQ(ast.error().span.start, static_cast<u32>(value_start - source.c_str()));
+        CHECK_EQ(ast.error().span.end,
+                 static_cast<u32>(value_start - source.c_str() + strlen(value)));
+    }
+    const char* zero_source =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 0b) { message "
+        "in message.forward() } }\n";
+    auto zero_tokens = lex(lit(zero_source));
+    REQUIRE(zero_tokens);
+    CHECK_FALSE(parse_file_heap(zero_tokens.value()));
+}
+
 TEST(frontend, analyze_websocket_max_message_size_omitted_is_zero) {
     // Omitting the kwarg leaves max_message_size 0 (the loader then uses the engine default).
     const char* src =

@@ -1177,7 +1177,7 @@ struct HirWsHandler {
     u16 close_code = 1000;
     u32 close_reason_expr = 0xffffffffu;  // decoded literal in HirRoute.exprs, or absent
     // `maxMessageSize:` kwarg in bytes (0 = omitted → the loader uses the engine default). The
-    // runtime arm-time clamps this to one slice (~16 KB); a larger value is silently capped.
+    // explicit values are validated against the single-slice payload capacity.
     u32 max_message_size = 0;
     u32 upstream_index = 0;
     Span span{};

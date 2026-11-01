@@ -6180,7 +6180,7 @@ TEST(serve_loader, websocket_terminate_max_message_size_kwarg_reaches_route) {
 }
 
 TEST(serve_loader, websocket_terminate_default_max_message_size) {
-    // No kwarg → the route gets the engine's single-slice default cap (nonzero, ~16 KB).
+    // No kwarg → the route gets the exact single-slice payload cap.
     const std::string dir = "/tmp/rut_serve_loader_ws_maxmsg_default";
     const std::string path =
         write_file(dir,
@@ -6192,11 +6192,62 @@ TEST(serve_loader, websocket_terminate_default_max_message_size) {
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
+    bool found = false;
     for (u32 i = 0; i < program.config.route_count; i++) {
         if (!program.config.routes[i].ws_terminate) continue;
-        CHECK(program.config.routes[i].ws_max_message_size > 4096u);  // ~16 KB slice default
+        found = true;
+        CHECK_EQ(program.config.routes[i].ws_max_message_size, kWsTerminateMessageCapacity);
     }
+    CHECK(found);
     program.destroy();
+}
+
+TEST(serve_loader, websocket_terminate_max_message_size_capacity_boundaries_load) {
+    const char* values[] = {"1b", "16370b"};
+    const char* dirs[] = {"/tmp/rut_serve_loader_ws_maxmsg_boundary_one",
+                          "/tmp/rut_serve_loader_ws_maxmsg_boundary_max"};
+    const u32 expected[] = {1, kWsTerminateMessageCapacity};
+    for (u32 i = 0; i < 2; i++) {
+        char contents[256];
+        const int length = snprintf(contents,
+                                    sizeof(contents),
+                                    "upstream backend at \"127.0.0.1:9999\"\n"
+                                    "route GET \"/ws\" { return websocket(backend, "
+                                    "maxMessageSize: %s) { message in message.forward() } }\n",
+                                    values[i]);
+        REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(contents));
+        const std::string path = write_file(dirs[i], "app.rut", contents);
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        bool found = false;
+        for (u32 route = 0; route < program.config.route_count; route++) {
+            if (!program.config.routes[route].ws_terminate) continue;
+            found = true;
+            CHECK_EQ(program.config.routes[route].ws_max_message_size, expected[i]);
+        }
+        CHECK(found);
+        program.destroy();
+    }
+}
+
+TEST(serve_loader, add_ws_terminate_rejects_invalid_message_limits_without_route_changes) {
+    RouteConfig cfg;
+    auto up = cfg.add_upstream("backend", 0x7F000001u, 9999);
+    REQUIRE(up.has_value());
+    const u16 uid = static_cast<u16>(up.value());
+    WsMessageHandlerFn handler = [](void*, WsOpcode, const u8*, u64, bool) {
+        return WsFrameAction::Forward;
+    };
+    const u32 invalid[] = {0, kWsTerminateMessageCapacity + 1u, 0xffffffffu};
+    for (u32 size : invalid) {
+        CHECK_FALSE(cfg.add_ws_terminate("/ws", 0, uid, handler, size));
+        CHECK_EQ(cfg.route_count, 0u);
+        CHECK_FALSE(cfg.routes[0].ws_terminate);
+    }
+    CHECK(cfg.add_ws_terminate("/ws", 0, uid, handler, kWsTerminateMessageCapacity));
+    CHECK_EQ(cfg.route_count, 1u);
+    CHECK_EQ(cfg.routes[0].ws_max_message_size, kWsTerminateMessageCapacity);
 }
 
 TEST(serve_loader, add_ws_terminate_rejects_invalid_close_code) {

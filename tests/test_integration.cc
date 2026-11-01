@@ -19467,7 +19467,8 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
     RouteConfig cfg{};
     auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
-    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    REQUIRE(cfg.add_ws_terminate(
+        "/ws", 0, id.value(), terminate_test_handler, kWsTerminateMessageCapacity));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -19582,7 +19583,8 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
     RouteConfig cfg{};
     auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
-    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    REQUIRE(cfg.add_ws_terminate(
+        "/ws", 0, id.value(), terminate_test_handler, kWsTerminateMessageCapacity));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -19700,7 +19702,8 @@ TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
     RouteConfig cfg{};
     auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
-    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    REQUIRE(cfg.add_ws_terminate(
+        "/ws", 0, id.value(), terminate_test_handler, kWsTerminateMessageCapacity));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -19782,7 +19785,8 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     RouteConfig cfg{};
     auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
-    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    REQUIRE(cfg.add_ws_terminate(
+        "/ws", 0, id.value(), terminate_test_handler, kWsTerminateMessageCapacity));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -19934,7 +19938,7 @@ static void check_ws_close_reason_round_trip(rut::test::TestCase* _tc, bool bran
                                  0,
                                  id.value(),
                                  handler,
-                                 16370,
+                                 kWsTerminateMessageCapacity,
                                  branch_policy ? 1000 : 1008,
                                  {},
                                  branch_policy ? Str{"default", 7} : Str{reason, sizeof(reason)},
@@ -20073,7 +20077,7 @@ static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc,
                                      0,
                                      id.value(),
                                      handler,
-                                     16370,
+                                     kWsTerminateMessageCapacity,
                                      1000,
                                      branch ? WsTextRewrite{} : texts[0],
                                      {},
@@ -20227,7 +20231,8 @@ TEST(websocket_e2e, terminate_forwards_fragmented) {
     RouteConfig cfg{};
     auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
-    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    REQUIRE(cfg.add_ws_terminate(
+        "/ws", 0, id.value(), terminate_test_handler, kWsTerminateMessageCapacity));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -20298,7 +20303,8 @@ TEST(websocket_e2e, terminate_iouring) {
     RouteConfig cfg{};
     auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
-    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    REQUIRE(cfg.add_ws_terminate(
+        "/ws", 0, id.value(), terminate_test_handler, kWsTerminateMessageCapacity));
     const RouteConfig* active = &cfg;
 
     Shard<IoUringEventLoop> shard;

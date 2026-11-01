@@ -2631,7 +2631,10 @@ four guards may select an independent literal; the first failing guard wins. Bar
 `message.forward()` retains the original message even when the final verdict has a
 replacement. Close policies and text replacements use independent route tables.
 Control frames retain their existing relay behavior.
-A fixed replacement uses ordinary string escape decoding and must fit both
+A terminate route defaults to a 16370-byte `maxMessageSize`: one 16 KiB slice minus
+the maximum 14-byte WebSocket header. Explicit limits must be from 1 through 16370
+bytes; larger values such as `16kb` are rejected until larger-message buffering is
+implemented. A fixed replacement uses ordinary string escape decoding and must fit both
 `maxMessageSize` and the single-slice terminate cap. Bounded text concatenation is
 also supported: `message.forward("prefix" + message.text + "suffix")`, including either
 affix alone or an identity `message.text`. Route-local `let` strings whose values
