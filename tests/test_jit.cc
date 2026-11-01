@@ -25023,6 +25023,235 @@ TEST(jit, consumer_groups_bind_verified_identity_and_default_deny) {
     rir.destroy();
 }
 
+TEST(jit, consumer_groups_require_both_groups_for_one_verified_consumer) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/consumer-group-all-auth.rut";
+    const char* policies[] = {
+        // Both slots in either order satisfy the intersection.
+        "auth.requireAllGroups(identity, \"reports\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"operators\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        "auth.requireAllGroups(identity, \"reports\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"reports\"))",
+        // Configuration record order does not affect Alice's identity mapping.
+        "auth.requireAllGroups(identity, \"reports\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"), "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"operators\"))",
+        // Required argument order does not affect the intersection.
+        "auth.requireAllGroups(identity, \"operators\", \"reports\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"operators\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        // Both required names must be present.
+        "auth.requireAllGroups(identity, \"reports\", \"\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"operators\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        // Do not combine Alice's reports with Bob's operators membership.
+        "auth.requireAllGroups(identity, \"reports\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        // Empty slots, case changes, and prefixes do not match.
+        "auth.requireAllGroups(identity, \"reports\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        "auth.requireAllGroups(identity, \"Reports\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"operators\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        "auth.requireAllGroups(identity, \"report\", \"operator\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports-admin\", second: "
+        "\"operators\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        // Every malformed static snapshot is a configuration error.
+        "auth.requireAllGroups(identity, \"\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"operators\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        "auth.requireAllGroups(identity, \"reports\", \"reports\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"operators\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        "auth.requireAllGroups(identity, \"reports\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"operators\"), "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"operators\", second: \"\"))",
+        "auth.requireAllGroups(identity, \"reports\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"\", first: \"reports\", second: \"operators\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+        "auth.requireAllGroups(identity, \"reports\", \"operators\", "
+        "auth.ConsumerGroups(consumerId: \"alice\", first: \"reports\", second: \"reports\"), "
+        "auth.ConsumerGroups(consumerId: \"bob\", first: \"operators\", second: \"\"))",
+    };
+    std::string source = "import \"middleware/auth.rut\"\n";
+    for (u32 i = 0; i < sizeof(policies) / sizeof(policies[0]); ++i) {
+        source += "route GET \"/all-" + std::to_string(i) + "\" {\n";
+        source += R"rut(
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "a", credentials: "", keyId: "alice-key", passwordId: "alice-pass"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "b", credentials: "", keyId: "bob-key", passwordId: "bob-pass"))
+)rut";
+        source += "    let allowed = " + std::string(policies[i]) + "\n";
+        source += R"rut(
+    guard allowed.consumerId == identity.consumerId &&
+        allowed.credentialId == identity.credentialId && allowed.method == identity.method
+        else { return 500 }
+    return 204
+}
+)rut";
+    }
+    source += R"rut(
+route GET "/unknown" {
+    let identity = auth.Identity(consumerId: "mallory", credentialId: "trusted", method: "test")
+    let allowed = auth.requireAllGroups(identity, "reports", "operators",
+        auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "operators"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+route GET "/spoofed" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "a", credentials: "", keyId: "alice-key", passwordId: "alice-pass"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "b", credentials: "", keyId: "bob-key", passwordId: "bob-pass"))
+    let allowed = auth.requireAllGroups(identity, "reports", "operators",
+        auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "operators"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+route GET "/deny-first" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "a", credentials: "", keyId: "alice-key", passwordId: "alice-pass"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "b", credentials: "", keyId: "bob-key", passwordId: "bob-pass"))
+    let checked = auth.denyGroup(identity, "reports",
+        auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "operators"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let allowed = auth.requireAllGroups(checked, "reports", "operators",
+        auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "operators"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+)rut";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    if (!ast)
+        std::fprintf(stderr,
+                     "require-all-groups parse: code %u at %u:%u: %.*s\n",
+                     static_cast<unsigned>(ast.error().code),
+                     ast.error().span.line,
+                     ast.error().span.col,
+                     ast.error().detail.len,
+                     ast.error().detail.ptr);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "require-all-groups: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    struct Case {
+        u32 route;
+        const char* headers;
+        u16 status;
+    };
+    const Case cases[] = {
+        {0, "Authorization: Bearer a\r\n", 204},
+        {1, "Authorization: Bearer b\r\n", 204},
+        {2, "Authorization: Bearer a\r\n", 204},
+        {3, "Authorization: Bearer a\r\n", 204},
+        {4, "Authorization: Bearer a\r\n", 503},
+        {5, "Authorization: Bearer a\r\n", 403},
+        {6, "Authorization: Bearer a\r\n", 403},
+        {7, "Authorization: Bearer a\r\n", 403},
+        {8, "Authorization: Bearer a\r\n", 403},
+        {9, "Authorization: Bearer a\r\n", 503},
+        {10, "Authorization: Bearer a\r\n", 503},
+        {11, "Authorization: Bearer a\r\n", 503},
+        {12, "Authorization: Bearer a\r\n", 503},
+        {13, "Authorization: Bearer a\r\n", 503},
+        {14, "", 403},
+        {15,
+         "Authorization: Bearer b\r\nX-Consumer-ID: alice\r\nX-Consumer-Groups: "
+         "reports,operators\r\n",
+         403},
+        {0, "Authorization: Bearer wrong\r\n", 401},
+        {0, "", 401},
+        {0, "Authorization: Bearer a\r\nauthorization: Bearer a\r\n", 401},
+        {16, "Authorization: Bearer a\r\n", 403},
+    };
+    for (const auto& tc : cases) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", tc.route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler != nullptr);
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + tc.headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        if (result.status_code != tc.status)
+            std::fprintf(
+                stderr, "route %u got %u expected %u\n", tc.route, result.status_code, tc.status);
+        CHECK_EQ(result.status_code, tc.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, consumer_group_all_example_compiles) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/consumer-group-all-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    const std::string source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    if (!ast)
+        std::fprintf(stderr,
+                     "consumer-group-all example parse: code %u at %u:%u: %.*s\n",
+                     static_cast<unsigned>(ast.error().code),
+                     ast.error().span.line,
+                     ast.error().span.col,
+                     ast.error().detail.len,
+                     ast.error().detail.ptr);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "consumer-group-all example: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, consumer_group_denials_preserve_identity_and_take_precedence) {
     const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
                              "examples/consumer-group-deny-auth.rut";

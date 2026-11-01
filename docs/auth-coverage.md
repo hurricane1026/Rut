@@ -18,7 +18,7 @@ whether a competing open-source edition includes them.
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper | ES keys, remote JWKS refresh/cache, live and durable token revocation |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; durable delivery replay persistence |
-| ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either-group allow and deny with deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
+| ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
 | Forward auth / OPA | Pending | Consume bounded external response, identity allowlist, strip spoofed identity, deny vs unavailable, timeout/cancellation/close in both backends |
@@ -218,19 +218,24 @@ compiled-in policies, not a dynamic credential registry.
 `auth.ConsumerGroups` binds one verified Consumer ID to up to two exact,
 case-sensitive group names. `auth.requireGroup(identity, group, first, second)`
 checks one group, while `auth.requireAnyGroup(identity, first, second, member1,
-member2)` allows either exact group. Both preserve the full verified identity
-only when its Consumer is configured for the required membership; empty
-membership slots are disabled. Empty required group names or invalid membership
-configuration return 503. Missing, malformed, duplicate or invalid credentials
-remain authentication failures, while a valid identity outside the requested
-groups is denied with 403. Empty or duplicate Consumer IDs are configuration
-failures. Group membership comes only from trusted configuration, not client
-identity or group headers, and is compiled in until restart.
+member2)` allows either exact group. `auth.requireAllGroups(identity, first,
+second, member1, member2)` requires both distinct exact groups in the same
+Consumer record. None combines memberships across Consumers, and every helper
+preserves the full verified identity on success; empty membership slots are
+disabled. Empty group names, equal `requireAllGroups` required names, or invalid
+membership configuration return 503. Equal required names remain valid for
+`requireAnyGroup`. Missing, malformed, duplicate or invalid credentials remain
+authentication failures, while a valid identity outside the requested groups is
+denied with 403. Empty or duplicate Consumer IDs are configuration failures.
+Group membership comes only from trusted configuration, not client identity or
+group headers, and is compiled in until restart.
 
-The JIT matrix covers successful single and either-group membership, default
-deny, invalid and duplicate credentials, empty slots and required names,
-duplicate groups or Consumer IDs, Consumer ID case mismatches and spoofed
-identity/group headers. See `examples/consumer-group-auth.rut`.
+The JIT matrix covers successful single, either-group and both-group membership
+in either slot order; rejects groups split across Consumers, empty slots,
+case/prefix mismatches, unknown Consumers, malformed group configuration,
+spoofed identity/group headers, invalid and duplicate credentials, and deny
+before allow. See `examples/consumer-group-auth.rut` and
+`examples/consumer-group-all-auth.rut`.
 
 ### Explicit group denial and precedence
 

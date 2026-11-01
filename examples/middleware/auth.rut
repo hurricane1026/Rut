@@ -492,6 +492,23 @@ func requireAnyGroup(_ identity: Identity, _ firstRequired: str, _ secondRequire
     identity
 }
 
+// Intersection of two exact groups. Both memberships must belong to the
+// verified Consumer in one record; memberships cannot be combined across users.
+func requireAllGroups(_ identity: Identity, _ firstRequired: str, _ secondRequired: str,
+                      _ first: ConsumerGroups, _ second: ConsumerGroups) -> Identity {
+    guard firstRequired != "" && secondRequired != "" && firstRequired != secondRequired &&
+        validGroupMember(first) && validGroupMember(second) &&
+        first.consumerId != second.consumerId else { respond 503 }
+    let firstConsumerMatches = identity.consumerId == first.consumerId &&
+        (firstRequired == first.first || firstRequired == first.second) &&
+        (secondRequired == first.first || secondRequired == first.second)
+    let secondConsumerMatches = identity.consumerId == second.consumerId &&
+        (firstRequired == second.first || firstRequired == second.second) &&
+        (secondRequired == second.first || secondRequired == second.second)
+    guard firstConsumerMatches || secondConsumerMatches else { respond 403 }
+    identity
+}
+
 // Deny either exact group, but only after finding the verified Consumer in
 // the trusted snapshot. Unknown Consumers fail closed even for a deny policy.
 // A known Consumer with both membership slots disabled may pass this check.
