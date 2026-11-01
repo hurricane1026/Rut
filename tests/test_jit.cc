@@ -24887,6 +24887,107 @@ route POST "/signed" {
     rir.destroy();
 }
 
+TEST(jit, rotating_signed_request_verifies_both_slots_and_validates_configuration_first) {
+    const char* source = R"rut(
+import "middleware/auth.rut"
+func config(_ currentKeyId: str, _ currentKey: str, _ previousKeyId: str, _ previousKey: str,
+            _ consumerId: str, _ currentId: str, _ previousId: str) -> auth.SignedRequestRotation =>
+    auth.SignedRequestRotation(currentKeyId: currentKeyId, currentKey: currentKey,
+        previousKeyId: previousKeyId, previousKey: previousKey, consumerId: consumerId,
+        currentId: currentId, previousId: previousId)
+route POST "/current" {
+    let identity = auth.rotatingSignedRequest(config("current-kid", "current-secret", "previous-kid", "previous-secret", "orders", "current", "previous"))
+    guard identity.consumerId == "orders" && identity.credentialId == "current" && identity.method == "signedRequest" else { return 500 }
+    return 204
+}
+route POST "/previous" {
+    let identity = auth.rotatingSignedRequest(config("current-kid", "current-secret", "previous-kid", "previous-secret", "orders", "current", "previous"))
+    guard identity.consumerId == "orders" && identity.credentialId == "previous" && identity.method == "signedRequest" else { return 500 }
+    return 204
+}
+route POST "/revoked" {
+    let identity = auth.rotatingSignedRequest(config("current-kid", "current-secret", "", "", "orders", "current", "previous"))
+    return 204
+}
+route POST "/previous-only" {
+    let identity = auth.rotatingSignedRequest(config("", "", "previous-kid", "previous-secret", "orders", "current", "previous"))
+    guard identity.credentialId == "previous" else { return 500 }
+    return 204
+}
+route POST "/none" { let identity = auth.rotatingSignedRequest(config("", "", "", "", "orders", "current", "previous")) return 204 }
+route POST "/half" { let identity = auth.rotatingSignedRequest(config("current-kid", "", "", "", "orders", "current", "previous")) return 204 }
+route POST "/duplicate-kid" { let identity = auth.rotatingSignedRequest(config("same", "current-secret", "same", "previous-secret", "orders", "current", "previous")) return 204 }
+route POST "/empty-meta" { let identity = auth.rotatingSignedRequest(config("current-kid", "current-secret", "", "", "orders", "current", "")) return 204 }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/signed-request-rotation-test.rut";
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    bool body_trait = false;
+    for (u32 i = 0; i < rir.module.func_count; ++i)
+        body_trait |= rir_function_needs_req_body(rir.module.functions[i]);
+    CHECK(body_trait);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    const std::string target = "/current?raw=a%2Fb";
+    const std::string body("signed\0body", 11);
+    auto invoke = [&](u32 route,
+                      const std::string& uri,
+                      const ::rut::test::signed_request::Headers& headers) {
+        const auto handler = reinterpret_cast<HandlerFn>(
+            engine.lookup(("handler_route_" + std::to_string(route)).c_str()));
+        CHECK(handler != nullptr);
+        if (handler == nullptr) return static_cast<u16>(0);
+        std::string request =
+            "POST " + uri + " HTTP/1.1\r\nHost: local\r\nAuthorization: " + headers.authorization +
+            "\r\nDate: " + headers.date + "\r\nDigest: " + headers.digest +
+            "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+        Connection conn;
+        conn.reset();
+        return HandlerResult::unpack(handler(&conn,
+                                             nullptr,
+                                             reinterpret_cast<const u8*>(request.data()),
+                                             static_cast<u32>(request.size()),
+                                             nullptr))
+            .status_code;
+    };
+    const auto current = ::rut::test::signed_request::make_headers(
+        "POST", target, body, now.tv_sec, "current-kid", "current-secret");
+    const auto previous = ::rut::test::signed_request::make_headers(
+        "POST", target, body, now.tv_sec, "previous-kid", "previous-secret");
+    REQUIRE(!current.authorization.empty());
+    REQUIRE(!previous.authorization.empty());
+    CHECK_EQ(invoke(0, target, current), 204u);
+    CHECK_EQ(invoke(1, target, previous), 204u);
+    const auto unknown_key = ::rut::test::signed_request::make_headers(
+        "POST", target, body, now.tv_sec, "unknown-kid", "current-secret");
+    const auto wrong_secret = ::rut::test::signed_request::make_headers(
+        "POST", target, body, now.tv_sec, "current-kid", "wrong-secret");
+    CHECK_EQ(invoke(0, target, unknown_key), 401u);
+    CHECK_EQ(invoke(0, target, wrong_secret), 401u);
+    CHECK_EQ(invoke(2, target, previous), 401u);
+    CHECK_EQ(invoke(3, target, previous), 204u);
+    CHECK_EQ(invoke(4, target, current), 503u);
+    CHECK_EQ(invoke(5, target, current), 503u);
+    CHECK_EQ(invoke(6, target, current), 503u);
+    CHECK_EQ(invoke(7, target, current), 503u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, required_credentials_and_exact_consumer_union_fail_closed) {
     const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
                              "examples/multi-consumer-auth.rut";

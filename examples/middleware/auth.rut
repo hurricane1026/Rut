@@ -458,6 +458,57 @@ func signedRequest(_ keyId: str, _ key: str,
     Identity(consumerId: consumerId, credentialId: credentialId, method: "signedRequest")
 }
 
+struct SignedRequestRotation {
+    currentKeyId: str
+    currentKey: str
+    previousKeyId: str
+    previousKey: str
+    consumerId: str
+    currentId: str
+    previousId: str
+}
+
+func validSignedRequestRotation(_ config: SignedRequestRotation) -> bool {
+    config.consumerId != "" && config.currentId != "" && config.previousId != "" &&
+        ((config.currentKeyId == "" && config.currentKey == "") ||
+         (config.currentKeyId != "" && config.currentKey != "")) &&
+        ((config.previousKeyId == "" && config.previousKey == "") ||
+         (config.previousKeyId != "" && config.previousKey != "")) &&
+        (config.currentKey != "" || config.previousKey != "") &&
+        (config.currentKeyId == "" || config.previousKeyId == "" ||
+         config.currentKeyId != config.previousKeyId)
+}
+
+func verifySignedRequestRotation(_ config: SignedRequestRotation, _ method: Method,
+                                 _ target: str, _ authorization: str, _ date: str,
+                                 _ digest: str, _ body: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Signature")
+    let current = Crypto.signedRequestValid(method, target, authorization,
+                                            date, digest, body,
+                                            config.currentKeyId, config.currentKey)
+    let previous = Crypto.signedRequestValid(method, target, authorization,
+                                             date, digest, body,
+                                             config.previousKeyId, config.previousKey)
+    guard current || previous else { respond denied }
+    match current {
+        true => Identity(consumerId: config.consumerId, credentialId: config.currentId, method: "signedRequest")
+        _ => Identity(consumerId: config.consumerId, credentialId: config.previousId, method: "signedRequest")
+    }
+}
+
+// Both configured slots verify the same request snapshot. Empty key-id/key
+// pairs disable a slot; removing the previous pair revokes it.
+func rotatingSignedRequest(_ config: SignedRequestRotation) -> Identity {
+    guard validSignedRequestRotation(config) else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Signature")
+    guard !req.chunked else { respond denied }
+    verifySignedRequestRotation(config, req.method, req.path,
+        req.authorization.or(""), req.uniqueHeader("Date").or(""),
+        req.uniqueHeader("Digest").or(""), req.body)
+}
+
 struct WebhookRotation {
     currentKey: str
     previousKey: str

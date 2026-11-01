@@ -8588,6 +8588,18 @@ dependency, remote key refresh, or replay store. See the
 [language card](docs/language-card.md#hmac-sha256-and-webhook-authentication-implemented)
 and [auth coverage](docs/auth-coverage.md).
 
+`auth.rotatingSignedRequest(config)` accepts a bounded static
+`SignedRequestRotation` containing current/previous key IDs and secrets, one
+Consumer ID, and current/previous credential IDs. Each key-ID/secret pair is
+enabled together or disabled together; at least one slot is required and
+enabled key IDs must differ. All metadata is validated before request
+verification, so invalid configuration returns 503 regardless of request
+contents. Both enabled slots verify one captured method, exact target,
+singleton headers, and complete body. A valid request returns the matching
+configured credential ID; removing the previous pair revokes it. The same
+secret may be used with distinct key IDs. This remains static route
+configuration without remote key refresh or replay storage.
+
 ### Implemented generic digest and HMAC calls
 
 The six MD5/SHA-1/SHA-224/SHA-256/SHA-384/SHA-512 calls and their six HMAC

@@ -200,6 +200,76 @@ TEST(native_program, signed_request_helper_survives_native_artifact_source_remov
     CHECK_EQ(result.status_code, 204u);
 }
 
+TEST(native_program, rotating_signed_request_survives_native_artifact_source_removal) {
+    Source source;
+    const auto auth_path = (std::filesystem::path(__FILE__).parent_path().parent_path() /
+                            "examples/middleware/auth.rut")
+                               .string();
+    const std::string rut_source =
+        "import \"" + auth_path +
+        "\"\nroute POST \"/signed-current\" { let config = "
+        "auth.SignedRequestRotation(currentKeyId: "
+        "\"current-kid\", currentKey: \"current-secret\", previousKeyId: \"previous-kid\", "
+        "previousKey: \"previous-secret\", consumerId: \"orders\", currentId: \"key-current\", "
+        "previousId: \"key-previous\") let identity = auth.rotatingSignedRequest(config) "
+        "guard identity.consumerId == \"orders\" && identity.credentialId == \"key-current\" else "
+        "{ "
+        "return 500 } "
+        "return 204 }\n"
+        "route POST \"/signed-previous\" { let config = auth.SignedRequestRotation(currentKeyId: "
+        "\"current-kid\", currentKey: \"current-secret\", previousKeyId: \"previous-kid\", "
+        "previousKey: \"previous-secret\", consumerId: \"orders\", currentId: \"key-current\", "
+        "previousId: \"key-previous\") let identity = auth.rotatingSignedRequest(config) "
+        "guard identity.consumerId == \"orders\" && identity.credentialId == \"key-previous\" else "
+        "{ "
+        "return 500 } "
+        "return 204 }\n"
+        "route POST \"/signed-revoked\" { let config = auth.SignedRequestRotation(currentKeyId: "
+        "\"current-kid\", currentKey: \"current-secret\", previousKeyId: \"\", previousKey: \"\", "
+        "consumerId: \"orders\", currentId: \"key-current\", previousId: \"key-previous\") let "
+        "identity = auth.rotatingSignedRequest(config) return 204 }\n";
+    REQUIRE(source.append(rut_source.data(), static_cast<u32>(rut_source.size())));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(owner.p->config.route_count, 3u);
+    REQUIRE_EQ(unlink(source.path), 0);
+
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    REQUIRE(now.tv_sec > 1000);
+    const std::string target = "/signed-current?artifact=source-free";
+    const std::string body("native\0body", 11);
+    const auto headers = ::rut::test::signed_request::make_headers(
+        "POST", target, body, now.tv_sec, "current-kid", "current-secret");
+    REQUIRE(!headers.authorization.empty());
+    const std::string request =
+        "POST " + target +
+        " HTTP/1.1\r\nHost: localhost\r\nAuthorization: " + headers.authorization +
+        "\r\nDate: " + headers.date + "\r\nDigest: " + headers.digest +
+        "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    const auto result = invoke(owner.p->config.routes[0], request);
+    CHECK_EQ(result.status_code, 204u);
+    const std::string previous_target = "/signed-previous?artifact=source-free";
+    const auto previous_headers = ::rut::test::signed_request::make_headers(
+        "POST", previous_target, body, now.tv_sec, "previous-kid", "previous-secret");
+    const std::string previous_request =
+        "POST " + previous_target +
+        " HTTP/1.1\r\nHost: localhost\r\nAuthorization: " + previous_headers.authorization +
+        "\r\nDate: " + previous_headers.date + "\r\nDigest: " + previous_headers.digest +
+        "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    CHECK_EQ(invoke(owner.p->config.routes[1], previous_request).status_code, 204u);
+    const std::string revoked_target = "/signed-revoked?artifact=source-free";
+    const auto revoked_headers = ::rut::test::signed_request::make_headers(
+        "POST", revoked_target, body, now.tv_sec, "previous-kid", "previous-secret");
+    const std::string revoked_request =
+        "POST " + revoked_target +
+        " HTTP/1.1\r\nHost: localhost\r\nAuthorization: " + revoked_headers.authorization +
+        "\r\nDate: " + revoked_headers.date + "\r\nDigest: " + revoked_headers.digest +
+        "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    CHECK_EQ(invoke(owner.p->config.routes[2], revoked_request).status_code, 401u);
+}
+
 TEST(native_program, links_with_closed_stderr) {
     Source source;
     REQUIRE(source.append("route GET \"/\" { return 200 }\n"));
