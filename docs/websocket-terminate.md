@@ -21,6 +21,17 @@ route GET "/ws" {
 A bare `websocket(chat)` remains a transparent tunnel. The trailing block opts
 into message inspection and its bounded buffering costs.
 
+Terminate routes admit a 101 only when the request offered the exact `websocket`
+Upgrade token and the response selects exactly one `Upgrade: websocket` field,
+includes an exact `Upgrade` token in its Connection fields, and has a complete,
+untruncated header block. A nonempty `Sec-WebSocket-Extensions` response is
+rejected because terminate mode does not negotiate extensions. These checks
+apply only to terminate routes; bare passthrough routes retain generic Upgrade
+tunneling. This is a bounded WebSocket admission check, not full RFC 6455
+handshake validation: key/accept, version, subprotocol, and Origin are not
+validated here. An invalid terminate-mode 101 closes the connection before the
+101 is sent; the runtime does not synthesize a 502 or WebSocket Close frame.
+
 - `message.fromClient` identifies the sender: client or upstream.
 - `message.isText` / `message.isBinary` select application message types.
 - `message.len` is the complete payload length in bytes, excluding frame headers

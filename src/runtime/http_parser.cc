@@ -313,23 +313,29 @@ static inline ParseStatus apply_semantic_header(
         }
     } else if (first == 'u') {
         if (name_len == 7 && str_ci_eq(name + 1, "pgrade", 6)) {
-            // Walk the comma-separated token list. has_upgrade_header = any non-OWS token
-            // (an empty/whitespace-only Upgrade requests no protocol and must not gate a
-            // tunnel). upgrade_is_websocket = a "websocket" token ANYWHERE in the list — a
-            // client may offer e.g. "Upgrade: h2c, websocket", and terminate must still see
-            // the WebSocket offer. A token may carry a "/version" suffix.
+            // has_upgrade_header = any non-OWS token (an empty/whitespace-only Upgrade
+            // requests no protocol and must not gate a tunnel). Preserve the generic header
+            // interpretation for passthrough routes; terminate-mode WebSocket eligibility
+            // separately requires an exact comma-list item below.
             u32 i = 0;
             while (i < vlen) {
                 while (i < vlen && (val[i] == ' ' || val[i] == '\t' || val[i] == ',')) i++;
                 if (i >= vlen) break;
-                u32 ts = i;
                 while (i < vlen && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
-                const u32 tlen = i - ts;
                 req->has_upgrade_header = true;
-                if (tlen >= 9 && str_ci_eq(val + ts, "websocket", 9) &&
-                    (tlen == 9 || val[ts + 9] == '/')) {
+            }
+            i = 0;
+            while (i <= vlen) {
+                const u32 kItemStart = i;
+                while (i < vlen && val[i] != ',') i++;
+                u32 end = i;
+                u32 start = kItemStart;
+                while (start < end && (val[start] == ' ' || val[start] == '\t')) start++;
+                while (end > start && (val[end - 1] == ' ' || val[end - 1] == '\t')) end--;
+                if (end - start == 9 && str_ci_eq(val + start, "websocket", 9))
                     req->upgrade_is_websocket = true;
-                }
+                if (i == vlen) break;
+                i++;
             }
             return ParseStatus::Complete;
         }

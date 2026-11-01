@@ -851,6 +851,12 @@ return websocket(chat) { message in
     message.forward()
 }
 
+// Terminate-mode routes send a backend `101` to the client only for an exact
+// WebSocket offer/selection with an untruncated response, a Connection `Upgrade`
+// token, and no negotiated extensions. An invalid 101 closes before it is sent;
+// bare `websocket(chat)` passthrough keeps generic Upgrade behavior. This bounded
+// gate is not full RFC 6455 handshake validation.
+
 // The runtime bounds a graceful Close or clean-EOF drain to about five
 // seconds; a healthy quiet tunnel has no idle timeout.
 

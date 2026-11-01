@@ -11432,23 +11432,24 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         close_conn_if_live(loop, conn);
         return;
     }
+#if RUT_ENABLE_WEBSOCKET
+    if (conn.is_ws_terminate_route) {
+        if (!conn.req_wants_upgrade || !conn.req_upgrade_is_websocket ||
+            !conn.resp_upgrade_is_websocket || !ws_arm_terminate(loop, conn)) {
+            close_conn_if_live(loop, conn);
+            return;
+        }
+    }
+#endif
     conn.is_ws_tunnel = true;
     conn.ws_client_send_pending = false;
     conn.ws_upstream_send_pending = false;
     conn.ws_client_send_len = 0;
     conn.ws_upstream_send_len = 0;
 #if RUT_ENABLE_WEBSOCKET
-    // Arm terminate-mode inspection before any early upstream frames are flushed, so they
-    // flow through ws_inspect like the rest of the data phase. Only arm for a genuine
-    // WebSocket handshake: the client must have offered "websocket" AND the backend's 101
-    // must have SELECTED it (the response is authoritative). A 101 negotiating another
-    // offered protocol (e.g. h2c from "Upgrade: websocket, h2c") falls through to the opaque
-    // passthrough tunnel, which relays bytes correctly, rather than mis-parsing them.
-    if (conn.is_ws_terminate_route && conn.req_upgrade_is_websocket &&
-        conn.resp_upgrade_is_websocket && !ws_arm_terminate(loop, conn)) {
-        close_conn_if_live(loop, conn);
-        return;
-    }
+    // Terminate-mode eligibility is checked before the 101 is sent and again
+    // above as a defensive callback boundary. Never downgrade a terminate route
+    // to the opaque tunnel.
 #endif
     if (conn.pipeline_stash_len > 0) {
         // Recover the stashed post-upgrade bytes into recv_buf. If they (plus any
@@ -11550,6 +11551,78 @@ inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tle
         }
     }
     return false;
+}
+
+// HTTP list fields split on commas only; SP/HTAB trim the item ends but do not
+// turn malformed whitespace-separated text into multiple tokens.
+inline bool ws_value_has_exact_token(const char* value,
+                                     u32 value_len,
+                                     const char* token,
+                                     u32 token_len) {
+    auto lower = [](char ch) {
+        return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+    };
+    u32 i = 0;
+    while (i <= value_len) {
+        u32 start = i;
+        while (i < value_len && value[i] != ',') i++;
+        u32 end = i;
+        while (start < end && (value[start] == ' ' || value[start] == '\t')) start++;
+        while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t')) end--;
+        if (end - start == token_len) {
+            bool equal = true;
+            for (u32 j = 0; j < token_len; j++) {
+                if (lower(value[start + j]) != lower(token[j])) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) return true;
+        }
+        if (i == value_len) break;
+        i++;
+    }
+    return false;
+}
+
+inline bool ws_terminate_response_admitted(const ParsedResponse& response) {
+    if (response.headers_truncated) return false;
+    u32 upgrade_fields = 0;
+    bool websocket_selected = false;
+    bool connection_upgrade = false;
+    for (u32 i = 0; i < response.header_count; i++) {
+        const Header& header = response.headers[i];
+        if (http_header_name_eq_ci(header.name.ptr, header.name.len, "upgrade", 7)) {
+            if (++upgrade_fields != 1) return false;
+            u32 start = 0;
+            u32 end = header.value.len;
+            while (start < end &&
+                   (header.value.ptr[start] == ' ' || header.value.ptr[start] == '\t'))
+                start++;
+            while (end > start &&
+                   (header.value.ptr[end - 1] == ' ' || header.value.ptr[end - 1] == '\t'))
+                end--;
+            websocket_selected =
+                end - start == 9 &&
+                http_header_name_eq_ci(header.value.ptr + start, 9, "websocket", 9);
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "connection", 10)) {
+            connection_upgrade |=
+                ws_value_has_exact_token(header.value.ptr, header.value.len, "upgrade", 7);
+        } else if (http_header_name_eq_ci(
+                       header.name.ptr, header.name.len, "sec-websocket-extensions", 24)) {
+            for (u32 j = 0; j < header.value.len; j++) {
+                if (header.value.ptr[j] != ' ' && header.value.ptr[j] != '\t') return false;
+            }
+        }
+    }
+    return upgrade_fields == 1 && websocket_selected && connection_upgrade;
+}
+
+inline bool ws_terminate_handshake_admitted(bool request_wants_upgrade,
+                                            bool request_offered_websocket,
+                                            const ParsedResponse& response) {
+    return request_wants_upgrade && request_offered_websocket &&
+           ws_terminate_response_admitted(response);
 }
 #endif  // RUT_ENABLE_WEBSOCKET
 
@@ -15086,6 +15159,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             loop->close_conn(conn);
             return;
         }
+#if RUT_ENABLE_WEBSOCKET
+        if (conn.is_ws_terminate_route &&
+            !ws_terminate_handshake_admitted(
+                conn.req_wants_upgrade, conn.req_upgrade_is_websocket, resp)) {
+            loop->close_conn(conn);
+            return;
+        }
+#endif
         // The 101 is authoritative for what was actually negotiated (the request's offer
         // is only a proposal). Record whether the backend selected WebSocket — terminate
         // arms on THIS, not the request — and refuse a response extension terminate can't
