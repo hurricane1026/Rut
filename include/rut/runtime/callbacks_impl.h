@@ -3024,7 +3024,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // the Proxy branch) so stale state from a prior keep-alive request — e.g. a terminate
     // route that returned a normal response, followed by a JIT websocket()/forward() — can
     // never mis-arm a later 101 as terminate.
-    const bool ws_term = route && route->action == RouteAction::Proxy && route->ws_terminate;
+    const bool ws_term = route && route->ws_terminate &&
+                         (route->action == RouteAction::Proxy ||
+                          (route->action == RouteAction::JitHandler && route->fn != nullptr));
     conn.is_ws_terminate_route = ws_term;
     conn.ws_handler = ws_term ? route->ws_frame_handler : nullptr;
     conn.ws_max_message_size = ws_term ? route->ws_max_message_size : 0;
@@ -4366,6 +4368,15 @@ void handle_jit_outcome(Loop* loop,
             return;
         }
         case JitDispatchOutcome::Kind::Forward: {
+#if RUT_ENABLE_WEBSOCKET
+            if (selected_route != nullptr && selected_route->ws_terminate &&
+                (selected_route->action != RouteAction::JitHandler ||
+                 selected_route->fn == nullptr ||
+                 outcome.upstream_id != selected_route->upstream_id)) {
+                loop->close_conn(conn);
+                return;
+            }
+#endif
             if (!forward_load_balance_valid(conn.forward_load_balance)) {
                 loop->close_conn(conn);
                 return;

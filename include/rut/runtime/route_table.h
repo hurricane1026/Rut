@@ -130,7 +130,7 @@ struct RouteEntry {
 
     // Action
     RouteAction action;
-    u16 upstream_id;              // index into RouteConfig::upstreams (if action == Proxy)
+    u16 upstream_id;              // Proxy target or the fixed WebSocket JIT forward target
     u16 status_code;              // status code (if action == Static, e.g., 200, 404)
     jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
     bool needs_req_body = false;  // JIT handler reads req.body and needs the full body buffered
@@ -148,7 +148,7 @@ struct RouteEntry {
     // paces the response so it isn't sent faster than this.
     u32 throttle_down_bps = 0;
     u32 http_cache_ttl = 0;
-    // WebSocket TERMINATE mode (Proxy routes only). When `ws_terminate` is set, a 101
+    // WebSocket TERMINATE mode (Proxy or guarded JIT routes). When `ws_terminate` is set, a 101
     // upgrade enters frame-inspection mode instead of the raw passthrough tunnel: each
     // reassembled message is handed to `ws_frame_handler` (forward/drop/close), bounded by
     // `ws_max_message_size`. Off (default) keeps the passthrough behavior.
@@ -1535,37 +1535,98 @@ public:
         (void)forward_text_count;
         return false;
 #else
-        if (handler == nullptr || !ws_valid_message_capacity(max_message_size) ||
-            !ws_valid_text_rewrite(forward_text, max_message_size))
+        if (!ws_terminate_metadata_valid(handler,
+                                         max_message_size,
+                                         close_code,
+                                         forward_text,
+                                         close_reason,
+                                         close_policies,
+                                         close_policy_count,
+                                         forward_texts,
+                                         forward_text_count))
             return false;
-        // Fail closed on a close code the runtime would refuse to put on the wire, using the
-        // SAME predicate as the receive-side validator (ws_inspect) and the .rut analyze check
-        // — including the reserved 1016–2999 range — so this C++ surface can't publish a route
-        // whose handler Close serializes a code the runtime itself considers invalid.
-        if (!ws_valid_close_code(close_code) || !ws_valid_close_reason(close_reason)) return false;
-        if (close_policy_count > kWsMaxClosePolicies ||
-            (close_policy_count != 0 && !close_policies))
-            return false;
-        for (u32 i = 0; i < close_policy_count; i++)
-            if (!ws_valid_close_code(close_policies[i].code) ||
-                !ws_valid_close_reason(close_policies[i].reason))
-                return false;
-        if (forward_text_count > kWsMaxForwardTexts || (forward_text_count != 0 && !forward_texts))
-            return false;
-        for (u32 i = 0; i < forward_text_count; i++)
-            if (!ws_valid_text_rewrite(forward_texts[i], max_message_size)) return false;
         if (!add_proxy(path, method, upstream_id)) return false;
         auto& r = routes[route_count - 1];
-        r.ws_terminate = true;
-        r.ws_frame_handler = handler;
-        r.ws_max_message_size = max_message_size;
-        r.ws_close_code = close_code;
-        r.ws_close_reason = close_reason;
-        r.ws_close_policy_count = close_policy_count;
-        for (u32 i = 0; i < close_policy_count; i++) r.ws_close_policies[i] = close_policies[i];
-        r.ws_forward_text = forward_text;
-        r.ws_forward_text_count = forward_text_count;
-        for (u32 i = 0; i < forward_text_count; i++) r.ws_forward_texts[i] = forward_texts[i];
+        set_ws_terminate_metadata(r,
+                                  handler,
+                                  max_message_size,
+                                  close_code,
+                                  forward_text,
+                                  close_reason,
+                                  close_policies,
+                                  close_policy_count,
+                                  forward_texts,
+                                  forward_text_count);
+        return true;
+#endif
+    }
+
+    // Attach terminate-mode metadata to an already registered HTTP JIT route.
+    // The compiler uses this after `register_jit_routes` so HTTP guards execute
+    // before the handler's Forward outcome can open the configured upstream.
+    bool attach_ws_terminate_to_jit(u32 route_index,
+                                    const char* path,
+                                    u8 method,
+                                    u16 upstream_id,
+                                    WsMessageHandlerFn handler,
+                                    u32 max_message_size,
+                                    u16 close_code = 1000,
+                                    WsTextRewrite forward_text = {},
+                                    Str close_reason = {},
+                                    const WsClosePolicy* close_policies = nullptr,
+                                    u32 close_policy_count = 0,
+                                    const WsTextRewrite* forward_texts = nullptr,
+                                    u32 forward_text_count = 0) {
+#if !RUT_ENABLE_WEBSOCKET
+        (void)route_index;
+        (void)path;
+        (void)method;
+        (void)upstream_id;
+        (void)handler;
+        (void)max_message_size;
+        (void)close_code;
+        (void)forward_text;
+        (void)close_reason;
+        (void)close_policies;
+        (void)close_policy_count;
+        (void)forward_texts;
+        (void)forward_text_count;
+        return false;
+#else
+        if (route_index >= route_count || path == nullptr || upstream_id >= upstream_count ||
+            !ws_terminate_metadata_valid(handler,
+                                         max_message_size,
+                                         close_code,
+                                         forward_text,
+                                         close_reason,
+                                         close_policies,
+                                         close_policy_count,
+                                         forward_texts,
+                                         forward_text_count))
+            return false;
+        RouteEntry& route = routes[route_index];
+        const u8 method_key = route_method_key_from_legacy_char(method);
+        if (route.action != RouteAction::JitHandler || route.fn == nullptr ||
+            route.method != method_key || route.ws_terminate || route.ws_frame_handler != nullptr)
+            return false;
+        u32 path_len = 0;
+        while (path_len < RouteEntry::kMaxPathLen && path[path_len]) path_len++;
+        if (path_len >= RouteEntry::kMaxPathLen || path_len != route.path_len ||
+            path[path_len] != '\0')
+            return false;
+        for (u32 i = 0; i < path_len; i++)
+            if (route.path[i] != path[i]) return false;
+        route.upstream_id = upstream_id;
+        set_ws_terminate_metadata(route,
+                                  handler,
+                                  max_message_size,
+                                  close_code,
+                                  forward_text,
+                                  close_reason,
+                                  close_policies,
+                                  close_policy_count,
+                                  forward_texts,
+                                  forward_text_count);
         return true;
 #endif
     }
@@ -1768,6 +1829,54 @@ public:
     }
 
 private:
+    static bool ws_terminate_metadata_valid(WsMessageHandlerFn handler,
+                                            u32 max_message_size,
+                                            u16 close_code,
+                                            WsTextRewrite forward_text,
+                                            Str close_reason,
+                                            const WsClosePolicy* close_policies,
+                                            u32 close_policy_count,
+                                            const WsTextRewrite* forward_texts,
+                                            u32 forward_text_count) {
+        if (handler == nullptr || !ws_valid_message_capacity(max_message_size) ||
+            !ws_valid_text_rewrite(forward_text, max_message_size) ||
+            !ws_valid_close_code(close_code) || !ws_valid_close_reason(close_reason) ||
+            close_policy_count > kWsMaxClosePolicies ||
+            (close_policy_count != 0 && close_policies == nullptr) ||
+            forward_text_count > kWsMaxForwardTexts ||
+            (forward_text_count != 0 && forward_texts == nullptr))
+            return false;
+        for (u32 i = 0; i < close_policy_count; i++)
+            if (!ws_valid_close_code(close_policies[i].code) ||
+                !ws_valid_close_reason(close_policies[i].reason))
+                return false;
+        for (u32 i = 0; i < forward_text_count; i++)
+            if (!ws_valid_text_rewrite(forward_texts[i], max_message_size)) return false;
+        return true;
+    }
+
+    static void set_ws_terminate_metadata(RouteEntry& route,
+                                          WsMessageHandlerFn handler,
+                                          u32 max_message_size,
+                                          u16 close_code,
+                                          WsTextRewrite forward_text,
+                                          Str close_reason,
+                                          const WsClosePolicy* close_policies,
+                                          u32 close_policy_count,
+                                          const WsTextRewrite* forward_texts,
+                                          u32 forward_text_count) {
+        route.ws_terminate = true;
+        route.ws_frame_handler = handler;
+        route.ws_max_message_size = max_message_size;
+        route.ws_close_code = close_code;
+        route.ws_close_reason = close_reason;
+        route.ws_close_policy_count = close_policy_count;
+        for (u32 i = 0; i < close_policy_count; i++) route.ws_close_policies[i] = close_policies[i];
+        route.ws_forward_text = forward_text;
+        route.ws_forward_text_count = forward_text_count;
+        for (u32 i = 0; i < forward_text_count; i++) route.ws_forward_texts[i] = forward_texts[i];
+    }
+
     friend bool register_jit_routes(RouteConfig& cfg,
                                     const rir::Module& mod,
                                     jit::JitEngine& engine);

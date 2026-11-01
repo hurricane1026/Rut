@@ -247,14 +247,14 @@ bool load_rut_program(const char* path,
     ir.hir = hir.value();
 #if RUT_ENABLE_WEBSOCKET
     constexpr Str kWsPreludeDetail = lit_str(
-        "WebSocket message routes currently allow only compile-time constant let bindings before "
-        "websocket; request guards/effects are not executed");
-    // Keep a cheap publication boundary in the loader too: a malformed/future HIR producer must
-    // not turn an HTTP-only route feature into a silently omitted WebSocket prelude.
+        "WebSocket message routes allow only compile-time constant lets and bounded request guards "
+        "before websocket; effects are not executed");
+    // Keep a cheap publication boundary in the loader too: route effects and control flow that
+    // cannot be executed by the ordinary HTTP handler must not be silently omitted.
     for (u32 i = 0; i < ir.hir->routes.len; i++) {
         const HirRoute& route = ir.hir->routes[i];
         if (!route.is_ws_terminate) continue;
-        if (route.guards.len != 0 || route.waits.len != 0 || route.for_loops.len != 0 ||
+        if (route.waits.len != 0 || route.for_loops.len != 0 ||
             route.control.kind != HirControlKind::Direct || route.decorators.len != 0 ||
             route.rate_limit.count != 0 || route.throttle_down_bps != 0 ||
             route.http_cache_ttl != 0) {
@@ -373,21 +373,26 @@ bool load_rut_program(const char* path,
     if (!register_jit_routes(out.config, out.rir.module, out.engine)) return false;
 
 #if RUT_ENABLE_WEBSOCKET
-    // Register each terminate route: look up its compiled verdict fn and publish a proxy +
-    // message-handler route. The `maxMessageSize:` kwarg sets the cap when given; otherwise it
-    // defaults to the engine's single-slice cap. The runtime rejects values outside the same
-    // single-slice bound.
+    // Attach each terminate message handler to its registered HTTP JIT route. HIR and RIR keep
+    // declaration order after timer routes are filtered, so this ordinal names the same route
+    // slot created by register_jit_routes.
     {
         constexpr u32 kWsDefaultMaxMessageSize = kWsTerminateMessageCapacity;
         u32 ws_n = 0;
+        u32 http_route_ordinal = 0;
         for (u32 i = 0; i < ir.hir->routes.len; i++) {
             const auto& route = ir.hir->routes[i];
-            if (!route.is_ws_terminate) continue;
+            if (route.is_timer) continue;
+            if (!route.is_ws_terminate) {
+                http_route_ordinal++;
+                continue;
+            }
             char sym[64];
             jit::format_ws_handler_symbol(ws_n, sym, sizeof(sym));
             auto* addr = out.engine.lookup(sym);
             if (!addr) return false;
             auto handler = reinterpret_cast<WsMessageHandlerFn>(addr);
+            if (http_route_ordinal >= out.config.route_count) return false;
             if (route.path.len >= RouteEntry::kMaxPathLen) return false;
             char path[RouteEntry::kMaxPathLen];
             for (u32 j = 0; j < route.path.len; j++) path[j] = route.path.ptr[j];
@@ -484,21 +489,25 @@ bool load_rut_program(const char* path,
                                          close_policies[i].reason))
                     return false;
             }
-            if (!out.config.add_ws_terminate(path,
-                                             route.method,
-                                             static_cast<u16>(route.ws_handler.upstream_index),
-                                             handler,
-                                             max_msg,
-                                             route.ws_handler.close_code,
-                                             forward_text,
-                                             close_reason,
-                                             close_policies,
-                                             policy_count,
-                                             forward_texts,
-                                             forward_text_count))
+            if (!out.config.attach_ws_terminate_to_jit(
+                    http_route_ordinal,
+                    path,
+                    route.method,
+                    static_cast<u16>(route.ws_handler.upstream_index),
+                    handler,
+                    max_msg,
+                    route.ws_handler.close_code,
+                    forward_text,
+                    close_reason,
+                    close_policies,
+                    policy_count,
+                    forward_texts,
+                    forward_text_count))
                 return false;
             ws_n++;
+            http_route_ordinal++;
         }
+        if (http_route_ordinal != out.config.route_count) return false;
     }
 #endif
 
