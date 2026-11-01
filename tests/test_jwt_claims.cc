@@ -115,6 +115,58 @@ TEST(jwt_claims, scope_membership_is_exact_and_validates_the_entire_list) {
     CHECK(has(claims));
 }
 
+TEST(jwt_claims, group_membership_is_exact_and_validates_the_entire_array) {
+    json::Document scratch;
+    const auto has = [&](Str claims, Str required = lit_str("orders:read")) {
+        return jwt_has_group(scratch, claims, required);
+    };
+    CHECK(has(lit_str(R"({"groups":["orders:read"]})")));
+    CHECK(has(lit_str(R"({"groups":["profile","orders:read","admin"]})")));
+    CHECK(has(lit_str(R"({"groups":["orders:read","orders:read"]})")));
+    CHECK(has(lit_str(R"({"groups":["orders:re\u0061d"]})")));
+    CHECK(has(lit_str(R"({"groups":["sécurité"]})"), lit_str("sécurité")));
+    CHECK(has(lit_str(R"({"groups":["x\u0000y"]})"), {"x\0y", 3}));
+
+    const Str denied[] = {
+        lit_str(R"({})"),
+        lit_str(R"({"nested":{"groups":["orders:read"]}})"),
+        lit_str(R"({"groups":[]})"),
+        lit_str(R"({"groups":"orders:read"})"),
+        lit_str(R"({"groups":null})"),
+        lit_str(R"({"groups":7})"),
+        lit_str(R"({"groups":true})"),
+        lit_str(R"({"groups":[""]})"),
+        lit_str(R"({"groups":[null,"orders:read"]})"),
+        lit_str(R"({"groups":[7,"orders:read"]})"),
+        lit_str(R"({"groups":[true,"orders:read"]})"),
+        lit_str(R"({"groups":[{},"orders:read"]})"),
+        lit_str(R"({"groups":[[],"orders:read"]})"),
+        lit_str(R"({"groups":["orders:read",""]})"),
+        lit_str(R"({"groups":["orders:read",null]})"),
+        lit_str(R"({"groups":["orders:read",7]})"),
+        lit_str(R"({"groups":["orders:read",{}]})"),
+        lit_str(R"({"groups":["Orders:read"]})"),
+        lit_str(R"({"groups":["orders:reader"]})"),
+        lit_str(R"({"groups":["xorders:read"]})"),
+        lit_str(R"({"groups":["other",["orders:read"]]})"),
+        lit_str(R"({"groups":["orders:read"],"groups":["other"]})"),
+        lit_str(R"({"groups":["orders:read"],"gr\u006fups":["orders:read"]})"),
+        lit_str("[]"),
+        lit_str("null"),
+        lit_str("broken"),
+    };
+    for (Str claims : denied) CHECK(!has(claims));
+    const Str valid = lit_str(R"({"groups":["orders:read"]})");
+    CHECK(!has(valid, lit_str("")));
+    CHECK(!has(valid, {nullptr, 1}));
+    char oversized[json::kMaxBytes + 1];
+    for (char& c : oversized) c = 'x';
+    CHECK(!has(valid, {oversized, sizeof(oversized)}));
+    CHECK(!has({nullptr, 1}));
+    // A failed call leaves the caller-owned document reusable.
+    CHECK(has(valid));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
