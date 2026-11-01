@@ -189,6 +189,90 @@ def main():
         wrong = header[:start] + b"x" + header[start + 1:]
         server = root / "rut"
         shutil.copy2(args.server, server)
+        helper = root / "rut-compile"
+        helper.write_text(f"#!{sys.executable}\nimport os\nos._exit(37)\n")
+        helper.chmod(0o700)
+        run = subprocess.run(
+            [str(server), "--compile", str(source), "--shards", "1", "--no-pin"],
+            capture_output=True,
+            timeout=5,
+        )
+        diagnostic = run.stderr.decode()
+        assert run.returncode != 0 and "failed during header:" in diagnostic, diagnostic
+        assert any(text in diagnostic for text in (
+            "status observed during SIGKILL cleanup: exit code 37",
+            "status observed during SIGKILL cleanup: signal 9",
+            "post-cleanup status unavailable",
+        )), diagnostic
+        assert "Listening on" not in diagnostic, diagnostic
+        print(json.dumps({"case": "compiler exits before header", "diagnostic": diagnostic.strip()}))
+
+        grandchild_pid_file = root / "header-failure-grandchild.pid"
+        helper.write_text(
+            f"#!{sys.executable}\nimport os,time\n"
+            "leader_pid=os.getpid()\n"
+            "grandchild=os.fork()\n"
+            "if grandchild == 0:\n"
+            " while os.getppid() == leader_pid:\n"
+            "  time.sleep(0.001)\n"
+            " os.close(1)\n"
+            " os.close(2)\n"
+            " time.sleep(30)\n"
+            " os._exit(0)\n"
+            f"with open({str(grandchild_pid_file)!r}, 'w') as marker:\n"
+            " marker.write(f'{leader_pid},{grandchild}')\n"
+            "os.close(1)\n"
+            "os._exit(37)\n"
+        )
+        helper.chmod(0o700)
+        unconfirmed_pids = set()
+        group_cleanup_passed = False
+        try:
+            run = subprocess.run(
+                [str(server), "--compile", str(source), "--shards", "1", "--no-pin"],
+                capture_output=True,
+                timeout=5,
+            )
+            diagnostic = run.stderr.decode()
+            assert run.returncode != 0 and "failed during header:" in diagnostic, diagnostic
+            assert grandchild_pid_file.exists(), diagnostic
+            producer_pid, grandchild_pid = map(int, grandchild_pid_file.read_text().split(','))
+            unconfirmed_pids.update((producer_pid, grandchild_pid))
+            for pid in (producer_pid, grandchild_pid):
+                wait_dead(pid)
+                unconfirmed_pids.discard(pid)
+            group_cleanup_passed = True
+        finally:
+            if not group_cleanup_passed and not unconfirmed_pids and grandchild_pid_file.exists():
+                unconfirmed_pids.update(
+                    map(int, grandchild_pid_file.read_text().split(',')))
+            for pid in unconfirmed_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        print(json.dumps({"case": "header failure reaps compiler process group",
+                          "diagnostic": diagnostic.strip()}))
+
+        frame_hex = (header + image).hex()
+        helper.write_text(
+            f"#!{sys.executable}\nimport os\n"
+            f"view=memoryview(bytes.fromhex({frame_hex!r}))\n"
+            "while view:\n"
+            " written=os.write(1, view)\n"
+            " view=view[written:]\n"
+            "os._exit(37)\n"
+        )
+        helper.chmod(0o700)
+        run = subprocess.run(
+            [str(server), "--compile", str(source), "--shards", "1", "--no-pin"],
+            capture_output=True,
+            timeout=5,
+        )
+        diagnostic = run.stderr.decode()
+        assert run.returncode != 0 and "failed during tail: exit code 37" in diagnostic, diagnostic
+        assert "Listening on" not in diagnostic, diagnostic
+        print(json.dumps({"case": "compiler exits after artifact", "diagnostic": diagnostic.strip()}))
         for signal_name in ("SIGINT", "SIGTERM"):
             for mode in ("header", "tail", "eof"):
                 source.write_text('route GET "/" { return 200 }\n')
