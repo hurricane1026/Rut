@@ -861,18 +861,22 @@ return websocket(chat) { message in
 // == nil, either operand order, !, && and || are supported with short-circuiting.
 // Text payload access retains its raw-byte semantics; use isText to select Text messages.
 
-// Unwrap a complete message's JSON, then require a field (JSON null counts as present).
-// Literal RFC 6901 pointers support nested objects, array indices, ~0 and ~1;
-// an empty pointer selects the root. Missing/invalid pointers return nil.
+// Unwrap a complete message's JSON, require a field (JSON null counts as present),
+// then route on an exact JSON string value. Literal RFC 6901 pointers support
+// nested objects, array indices, ~0 and ~1; an empty pointer selects the root.
 return websocket(chat) { message in
     guard let document = json.parse(message.text) else { message.close(1007) }
-    guard json.get(document, "/name") != nil else { message.close(1008, "name required") }
+    guard let field = json.get(document, "/type") else { message.close(1008) }
+    guard let kind = json.string(field) else { message.close(1008) }
+    guard kind == "subscribe" else { message.drop() }
     message.forward()
 }
-// Bindings require fresh names and are available only to later json.get presence checks.
-// General JSON extraction, value binding and mutation in handlers remain unsupported.
-// Binding guards count toward the four-guard limit. Each reached query reparses the
-// payload within the same JSON bounds; no borrowed document survives the callback.
+// json.string(document) also checks a root JSON string. A get result must be
+// unwrapped before json.string; missing, null, number, bool, array and object fail.
+// String aliases support only literal == / != comparisons (either operand order).
+// Bindings require fresh names and count toward the four-guard limit. Each reached
+// check reparses within the JSON bounds; no document or borrowed string survives.
+// Nested get, dynamic paths, arbitrary extraction and mutation remain unsupported.
 
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize

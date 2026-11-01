@@ -4893,6 +4893,139 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(serve_loader, websocket_json_string_policy_reparses_and_compares_decoded_bytes) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/type") else { message.close(1008) }
+ guard let kind = json.string(field) else { message.close(1003) }
+ guard !message.fromClient || ((! ("subscribe" != kind) && kind == "subscribe") || kind == "publish") else {
+  message.drop()
+ }
+ message.forward()
+} }
+)rut";
+    auto path = write_file("/tmp/rut_ws_json_string_policy", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    const auto handler = route.ws_frame_handler;
+    REQUIRE(handler);
+    const char* payloads[] = {R"({"type":"subscribe"})",
+                              R"({"type":"sub\u0073cribe"})",
+                              R"({"type":"publish"})",
+                              R"({"type":""})",
+                              R"({"type":null})",
+                              R"({"type":42})",
+                              R"({"type":true})",
+                              R"({"type":{}})",
+                              R"({"type":[]})",
+                              R"({})",
+                              "null",
+                              "{",
+                              R"({"type":"subscribe","type":"subscribe"})"};
+    const WsFrameAction kExpectedClient[] = {WsFrameAction::Forward,
+                                             WsFrameAction::Forward,
+                                             WsFrameAction::Forward,
+                                             WsFrameAction::Drop,
+                                             WsFrameAction::ClosePolicy2,
+                                             WsFrameAction::ClosePolicy2,
+                                             WsFrameAction::ClosePolicy2,
+                                             WsFrameAction::ClosePolicy2,
+                                             WsFrameAction::ClosePolicy2,
+                                             WsFrameAction::ClosePolicy1,
+                                             WsFrameAction::ClosePolicy1,
+                                             WsFrameAction::ClosePolicy0,
+                                             WsFrameAction::ClosePolicy0};
+    for (u32 i = 0; i < sizeof(payloads) / sizeof(payloads[0]); ++i) {
+        for (bool from_client : {false, true}) {
+            for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+                CHECK(handler(nullptr,
+                              opcode,
+                              reinterpret_cast<const u8*>(payloads[i]),
+                              strlen(payloads[i]),
+                              from_client) ==
+                      (i == 3 && !from_client ? WsFrameAction::Forward : kExpectedClient[i]));
+            }
+        }
+    }
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0x100000002ULL, true) ==
+          WsFrameAction::ClosePolicy0);
+    REQUIRE_EQ(route.ws_close_policy_count, 3u);
+    CHECK_EQ(route.ws_close_policies[0].code, 1007u);
+    CHECK_EQ(route.ws_close_policies[1].code, 1008u);
+    CHECK_EQ(route.ws_close_policies[2].code, 1003u);
+    {
+        WsInspector inspector;
+        inspector.close_policies = route.ws_close_policies;
+        inspector.close_policy_count = route.ws_close_policy_count;
+        const char* fragmented = R"({"type":"subscribe"})";
+        const u32 size = static_cast<u32>(strlen(fragmented));
+        const u32 split = size / 2;
+        u8 frames[128];
+        u32 at = 0;
+        frames[at++] = 0x01;  // non-final Text
+        frames[at++] = static_cast<u8>(split);
+        memcpy(frames + at, fragmented, split);
+        at += split;
+        frames[at++] = 0x89;  // interleaved Ping
+        frames[at++] = 1;
+        frames[at++] = 'p';
+        frames[at++] = 0x80;  // final continuation
+        frames[at++] = static_cast<u8>(size - split);
+        memcpy(frames + at, fragmented + split, size - split);
+        at += size - split;
+        u8 output[128], message[128];
+        u32 consumed = 0, produced = 0;
+        CHECK(ws_inspect(inspector,
+                         frames,
+                         at,
+                         output,
+                         sizeof(output),
+                         message,
+                         sizeof(message),
+                         handler,
+                         nullptr,
+                         &consumed,
+                         &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(consumed, at);
+        CHECK_EQ(produced, size + 5);
+        CHECK(output[0] == 0x89 && output[2] == 'p');
+        CHECK(output[3] == 0x81 && output[4] == size);
+        CHECK(memcmp(output + 5, fragmented, size) == 0);
+    }
+    program.destroy();
+
+    // JSON escape decoding and Rut string escape decoding both preserve embedded NUL bytes.
+    const char* nul_source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let field = json.get(document, "/type") else { message.drop() }
+ guard let kind = json.string(field) else { message.drop() }
+ guard kind == "a\0b" else { message.drop() }
+ message.forward()
+} }
+)rut";
+    path = write_file("/tmp/rut_ws_json_string_policy_nul", "app.rut", nul_source);
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto nul_handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(nul_handler);
+    const char* nul_payload = R"({"type":"a\u0000b"})";
+    const char* mismatch_payload = R"({"type":"a\u0000c"})";
+    CHECK(nul_handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(nul_payload),
+                      strlen(nul_payload),
+                      true) == WsFrameAction::Forward);
+    CHECK(nul_handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(mismatch_payload),
+                      strlen(mismatch_payload),
+                      true) == WsFrameAction::Drop);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_json_validation_uses_complete_payloads) {
     const char* conditions[] = {"json.parse(message.text) != nil",
                                 "nil != json.parse(message.text)",

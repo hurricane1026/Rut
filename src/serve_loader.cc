@@ -295,6 +295,8 @@ bool load_rut_program(const char* path,
                 guards[g].verdict = static_cast<u8>(h.len_guards[g].verdict);
                 guards[g].pattern = h.len_guards[g].pattern.ptr;
                 guards[g].pattern_len = h.len_guards[g].pattern.len;
+                guards[g].value = h.len_guards[g].value.ptr;
+                guards[g].value_len = h.len_guards[g].value.len;
                 guards[g].negate = h.len_guards[g].negate ? 1u : 0u;
                 guards[g].lhs = h.len_guards[g].lhs;
                 guards[g].rhs = h.len_guards[g].rhs;

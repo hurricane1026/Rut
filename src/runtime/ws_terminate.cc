@@ -8,16 +8,60 @@
 
 namespace rut {
 
+namespace {
+json::Document& ws_json_document() {
+    thread_local json::Document document;
+    return document;
+}
+}  // namespace
+
 bool ws_json_has_path(const u8* payload, u64 len, Str path) {
     // One bounded workspace per worker thread. Never narrow an unchecked message length.
     if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
         return false;
-    thread_local json::Document document;
+    json::Document& document = ws_json_document();
     const bool kValid =
         document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
     const bool kPresent = kValid && document.pointer(path) != json::kNone;
     document.source = {};  // do not retain a borrowed message view between callbacks
     return kPresent;
+}
+
+bool ws_json_string_at_path(const u8* payload, u64 len, Str path) {
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
+        return false;
+    json::Document& document = ws_json_document();
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    const bool kIsString = kId != json::kNone && document.nodes[kId].kind == json::Kind::String;
+    document.source = {};
+    return kIsString;
+}
+
+bool ws_json_string_equals_at_path(const u8* payload, u64 len, Str path, Str expected) {
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len) || (!expected.ptr && expected.len))
+        return false;
+    json::Document& document = ws_json_document();
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    bool equal = false;
+    if (kId != json::kNone && document.nodes[kId].kind == json::Kind::String) {
+        json::Writer decoded{document.scratch};
+        if (document.string(kId, decoded) && decoded.len == expected.len) {
+            equal = true;
+            for (u32 i = 0; i < decoded.len; ++i) {
+                if (document.scratch[i] != expected.ptr[i]) {
+                    equal = false;
+                    break;
+                }
+            }
+        }
+    }
+    document.source = {};
+    return equal;
 }
 
 bool ws_valid_json_payload(const u8* payload, u64 len) {

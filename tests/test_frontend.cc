@@ -5611,6 +5611,154 @@ route GET "/ws" { return websocket(ws) { message in
     CHECK(analyze_file_heap(ast.value()));
 }
 
+TEST(frontend, websocket_json_string_aliases_are_typed_and_bounded) {
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/type") else { message.close(1008) }
+ guard let kind = json.string(field) else { message.close(1008) }
+ guard kind == "sub\u{73}cribe" else { message.drop() }
+ message.forward()
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& nodes = hir->routes[0].ws_handler.len_guards;
+    REQUIRE_EQ(nodes.len, 4u);
+    CHECK(nodes[0].accessor == WsLenGuard::Accessor::JsonValid);
+    CHECK(nodes[1].accessor == WsLenGuard::Accessor::JsonHasPath);
+    CHECK(nodes[1].pattern.eq(lit("/type")));
+    CHECK(nodes[2].accessor == WsLenGuard::Accessor::JsonStringValid);
+    CHECK(nodes[2].pattern.eq(lit("/type")));
+    CHECK(nodes[3].accessor == WsLenGuard::Accessor::JsonStringEqual);
+    CHECK(nodes[3].pattern.eq(lit("/type")));
+    CHECK(nodes[3].value.eq(lit("subscribe")));
+
+    const char* root_string = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let root = json.string(document) else { message.drop() }
+ guard root == "ok" else { message.drop() }
+ message.forward()
+} })rut";
+    tokens = lex(lit(root_string));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+
+    const char* mirrored_inequality = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let field = json.get(document, "/type") else { message.drop() }
+ guard let kind = json.string(field) else { message.drop() }
+ guard "bad" != kind else { message.drop() }
+ message.forward()
+} })rut";
+    tokens = lex(lit(mirrored_inequality));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+
+    const char* too_many_guards =
+        "guard let document = json.parse(message.text) else { message.drop() }\n"
+        "guard let field = json.get(document, \"/type\") else { message.drop() }\n"
+        "guard let kind = json.string(field) else { message.drop() }\n"
+        "guard kind == \"ok\" else { message.drop() }\n"
+        "guard kind != \"bad\" else { message.drop() }";
+    {
+        std::string invalid =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        invalid += too_many_guards;
+        invalid += "\nmessage.forward() } }\n";
+        tokens = lex({invalid.data(), static_cast<u32>(invalid.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+
+    for (const char* invalid_guards :
+         {"guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard json.string(json.get(document, \"/type\")) != nil else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let kind = json.string(document) else { message.drop() }\n"
+          "guard json.get(kind, \"/type\") != nil else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let first = json.get(document, \"/type\") else { message.drop() }\n"
+          "guard let second = json.get(first, \"/nested\") else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard document == \"{}\" else { message.drop() }"}) {
+        std::string invalid =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        invalid += invalid_guards;
+        invalid += "\nmessage.forward() } }\n";
+        tokens = lex({invalid.data(), static_cast<u32>(invalid.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+
+    for (const char* guards :
+         {"guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let document = json.get(document, \"/type\") else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let field = json.get(document, \"/type\") else { message.drop() }\n"
+          "guard let field = json.string(field) else { message.drop() }",
+          "guard kind == \"subscribe\" else { message.drop() }\n"
+          "guard let document = json.parse(message.text) else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let field = json.get(document, \"/type\") else { message.drop() }\n"
+          "guard let kind = json.string(field) else { message.drop() }\n"
+          "guard json.get(kind, \"/nested\") != nil else { message.drop() }"}) {
+        std::string invalid =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        invalid += guards;
+        invalid += "\nmessage.forward() } }\n";
+        tokens = lex({invalid.data(), static_cast<u32>(invalid.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    const char* collision = R"rut(upstream ws
+route GET "/ws" {
+ let kind = "outer"
+ return websocket(ws) { message in
+  guard let document = json.parse(message.text) else { message.drop() }
+  guard let field = json.get(document, "/type") else { message.drop() }
+  guard let kind = json.string(field) else { message.drop() }
+  message.forward()
+ }
+}
+)rut";
+    tokens = lex(lit(collision));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+
+    for (const char* reserved : {"json", "message"}) {
+        std::string invalid =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        invalid += "guard let document = json.parse(message.text) else { message.drop() }\n";
+        invalid += "guard let field = json.get(document, \"/type\") else { message.drop() }\n";
+        invalid += "guard let ";
+        invalid += reserved;
+        invalid += " = json.string(field) else { message.drop() }\nmessage.forward() } }\n";
+        tokens = lex({invalid.data(), static_cast<u32>(invalid.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
 TEST(frontend, websocket_json_parse_presence_conditions) {
     for (const char* condition : {"json.parse(message.text) != nil",
                                   "nil != json.parse(message.text)",

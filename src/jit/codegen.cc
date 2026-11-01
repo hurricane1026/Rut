@@ -2828,13 +2828,14 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 11 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 13 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
-        if ((guards[i].accessor == 11 || guards[i].accessor == 3 ||
-             (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
+        if ((guards[i].accessor == 11 || guards[i].accessor == 12 || guards[i].accessor == 13 ||
+             guards[i].accessor == 3 || (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
             guards[i].pattern_len != 0 && !guards[i].pattern)
             return false;
+        if (guards[i].accessor == 13 && guards[i].value_len != 0 && !guards[i].value) return false;
         if (guards[i].accessor == 4 || guards[i].accessor == 5) {
             const u32 children[2] = {guards[i].lhs, guards[i].rhs};
             for (u32 child : children) {
@@ -2923,6 +2924,43 @@ bool emit_ws_handler(LLVMModuleRef mod,
             LLVMValueRef args[2] = {payload, len};
             LLVMValueRef valid = LLVMBuildCall2(builder, json_ty, json_fn, args, 2, "json.valid");
             cond = LLVMBuildICmp(builder, LLVMIntNE, valid, LLVMConstInt(i8_ty, 0, 0), "json.ok");
+        } else if (guards[i].accessor == 12 || guards[i].accessor == 13) {
+            const bool equals = guards[i].accessor == 13;
+            LLVMTypeRef json_params[6] = {ptr_ty, i64_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef json_ty = LLVMFunctionType(i8_ty, json_params, equals ? 6 : 4, 0);
+            const char* helper = equals ? "rut_helper_ws_json_string_equals_at_path"
+                                        : "rut_helper_ws_json_string_at_path";
+            LLVMValueRef json_fn = LLVMGetNamedFunction(mod, helper);
+            if (!json_fn) json_fn = LLVMAddFunction(mod, helper, json_ty);
+            auto bytes_global = [&](const char* value, u32 size, const char* name) {
+                LLVMValueRef initializer =
+                    LLVMConstStringInContext(ctx, value ? value : "", size, 1);
+                LLVMValueRef global = LLVMAddGlobal(mod, LLVMTypeOf(initializer), name);
+                LLVMSetInitializer(global, initializer);
+                LLVMSetGlobalConstant(global, 1);
+                LLVMSetLinkage(global, LLVMPrivateLinkage);
+                LLVMSetUnnamedAddress(global, LLVMGlobalUnnamedAddr);
+                return global;
+            };
+            LLVMValueRef path =
+                bytes_global(guards[i].pattern,
+                             guards[i].pattern_len,
+                             equals ? "json.string.equal.path" : "json.string.valid.path");
+            LLVMValueRef args[6] = {payload,
+                                    len,
+                                    path,
+                                    LLVMConstInt(i32_ty, guards[i].pattern_len, 0),
+                                    nullptr,
+                                    nullptr};
+            if (equals) {
+                args[4] =
+                    bytes_global(guards[i].value, guards[i].value_len, "json.string.expected");
+                args[5] = LLVMConstInt(i32_ty, guards[i].value_len, 0);
+            }
+            LLVMValueRef valid =
+                LLVMBuildCall2(builder, json_ty, json_fn, args, equals ? 6 : 4, "json.string");
+            cond = LLVMBuildICmp(
+                builder, LLVMIntNE, valid, LLVMConstInt(i8_ty, 0, 0), "json.string.matches");
         } else if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
             // Emit the pattern + db globals JIT finalization compiles & back-patches. The `ws<id>`
             // suffix keeps these distinct from the HTTP regex globals already in this module.

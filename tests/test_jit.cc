@@ -20766,16 +20766,19 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     auto empty = codegen_ws_handler(0, &node, 1, 0);
     REQUIRE(empty.ok);
     dispose_module(empty.mod, empty.ctx);
-    for (u8 accessor : {7, 8, 9, 11}) {
+    for (u8 accessor : {7, 8, 9, 11, 12, 13}) {
         node.accessor = accessor;
         node.pattern_len = 4;
         CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
         node.pattern_len = 0;
+        if (accessor == 13) node.value_len = 4;
+        if (accessor == 13) CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+        node.value_len = 0;
         auto affix = codegen_ws_handler(0, &node, 1, 0);
         REQUIRE(affix.ok);
         dispose_module(affix.mod, affix.ctx);
     }
-    node.accessor = 12;
+    node.accessor = 14;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 

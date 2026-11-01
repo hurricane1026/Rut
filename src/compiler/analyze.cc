@@ -7257,7 +7257,20 @@ static Str ws_message_text_match_pattern(const AstExpr& cond) {
     return cond.args[0]->str_value;
 }
 
-using WsJsonBindings = FixedVec<Str, HirWsHandler::kMaxLenGuards>;
+struct WsJsonBinding {
+    enum class Kind : u8 { Document, SelectedValue, String };
+    Str name{};
+    Str path{};
+    Kind kind = Kind::Document;
+};
+
+using WsJsonBindings = FixedVec<WsJsonBinding, HirWsHandler::kMaxLenGuards>;
+
+static const WsJsonBinding* ws_json_binding(const WsJsonBindings& bindings, Str name) {
+    for (u32 i = 0; i < bindings.len; ++i)
+        if (bindings[i].name.eq(name)) return &bindings[i];
+    return nullptr;
+}
 
 static bool ws_is_json_parse(const AstExpr& call, const HirModule& mod, const HirRoute& route) {
     return call.kind == AstExprKind::MethodCall && call.lhs &&
@@ -7299,8 +7312,8 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
             call->name.eq(lit_str("get")) && call->args.len == 2 && call->args[0] &&
             call->args[1] && call->args[0]->kind == AstExprKind::Ident &&
             call->args[1]->kind == AstExprKind::StrLit) {
-            for (u32 i = 0; i < documents.len; ++i) {
-                if (!documents[i].eq(call->args[0]->name)) continue;
+            const WsJsonBinding* document = ws_json_binding(documents, call->args[0]->name);
+            if (document && document->kind == WsJsonBinding::Kind::Document) {
                 auto path =
                     decoded_expression_string(call->args[1]->str_value, mod, call->args[1]->span);
                 if (!path) return core::make_unexpected(path.error());
@@ -7308,6 +7321,33 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
                 g.accessor = WsLenGuard::Accessor::JsonHasPath;
                 g.pattern = path.value();
                 g.negate = !negate;  // get(...) == nil means the path is absent.
+                g.verdict = verdict;
+                return g;
+            }
+        }
+    }
+    // Only a string alias produced by a prior `guard let kind = json.string(field)` may
+    // be compared. Ordinary optional JSON values and outer locals never fall through as Str.
+    if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
+        const AstExpr* alias = nullptr;
+        const AstExpr* literal = nullptr;
+        if (cond.lhs->kind == AstExprKind::Ident && cond.rhs->kind == AstExprKind::StrLit) {
+            alias = cond.lhs;
+            literal = cond.rhs;
+        } else if (cond.rhs->kind == AstExprKind::Ident && cond.lhs->kind == AstExprKind::StrLit) {
+            alias = cond.rhs;
+            literal = cond.lhs;
+        }
+        if (alias && literal) {
+            const WsJsonBinding* binding = ws_json_binding(documents, alias->name);
+            if (binding && binding->kind == WsJsonBinding::Kind::String) {
+                auto decoded = decoded_expression_string(literal->str_value, mod, literal->span);
+                if (!decoded) return core::make_unexpected(decoded.error());
+                WsLenGuard g{};
+                g.accessor = WsLenGuard::Accessor::JsonStringEqual;
+                g.pattern = binding->path;
+                g.value = decoded.value();
+                g.negate = negate;
                 g.verdict = verdict;
                 return g;
             }
@@ -13185,16 +13225,65 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         gs->name.eq(lit_str("message")) || gs->name.eq(lit_str("json")) ||
                         user_bound_ident_name(
                             mod, route->locals.data, route->locals.len, nullptr, gs->name);
-                    for (Str name : documents) collision |= name.eq(gs->name);
-                    if (collision || !ws_is_json_parse(gs->expr, mod, *route))
+                    for (u32 binding_index = 0; binding_index < documents.len; ++binding_index)
+                        collision |= documents[binding_index].name.eq(gs->name);
+                    if (collision)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            gs->span,
+                            lit_str("message guard bindings require a fresh name"));
+                    WsJsonBinding binding{};
+                    binding.name = gs->name;
+                    WsLenGuard node{};
+                    node.verdict = gv.value();
+                    if (ws_is_json_parse(gs->expr, mod, *route)) {
+                        node.accessor = WsLenGuard::Accessor::JsonValid;
+                        binding.kind = WsJsonBinding::Kind::Document;
+                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
+                               gs->expr.lhs->kind == AstExprKind::Ident &&
+                               gs->expr.lhs->name.eq(lit_str("json")) &&
+                               gs->expr.name.eq(lit_str("get")) && gs->expr.args.len == 2 &&
+                               gs->expr.args[0] && gs->expr.args[1] &&
+                               gs->expr.args[0]->kind == AstExprKind::Ident &&
+                               gs->expr.args[1]->kind == AstExprKind::StrLit) {
+                        const WsJsonBinding* source =
+                            ws_json_binding(documents, gs->expr.args[0]->name);
+                        if (!source || source->kind != WsJsonBinding::Kind::Document)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  gs->span,
+                                                  lit_str("json.get message bindings require a "
+                                                          "validated document alias"));
+                        auto path = decoded_expression_string(
+                            gs->expr.args[1]->str_value, mod, gs->expr.args[1]->span);
+                        if (!path) return core::make_unexpected(path.error());
+                        node.accessor = WsLenGuard::Accessor::JsonHasPath;
+                        node.pattern = path.value();
+                        binding.kind = WsJsonBinding::Kind::SelectedValue;
+                        binding.path = path.value();
+                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
+                               gs->expr.lhs->kind == AstExprKind::Ident &&
+                               gs->expr.lhs->name.eq(lit_str("json")) &&
+                               gs->expr.name.eq(lit_str("string")) && gs->expr.args.len == 1 &&
+                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
+                        const WsJsonBinding* source =
+                            ws_json_binding(documents, gs->expr.args[0]->name);
+                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
+                                        source->kind != WsJsonBinding::Kind::SelectedValue))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  gs->span,
+                                                  lit_str("json.string message bindings require "
+                                                          "a validated JSON value alias"));
+                        node.accessor = WsLenGuard::Accessor::JsonStringValid;
+                        node.pattern = source->path;
+                        binding.kind = WsJsonBinding::Kind::String;
+                        binding.path = source->path;
+                    } else {
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               gs->span,
-                                              lit_str("message guard bindings require "
-                                                      "json.parse(message.text) and a fresh name"));
-                    WsLenGuard node{};
-                    node.accessor = WsLenGuard::Accessor::JsonValid;
-                    node.verdict = gv.value();
-                    if (!route->ws_handler.len_guards.push(node) || !documents.push(gs->name))
+                                              lit_str("message guard bindings require json.parse, "
+                                                      "json.get, or json.string aliases"));
+                    }
+                    if (!route->ws_handler.len_guards.push(node) || !documents.push(binding))
                         return frontend_error(FrontendError::TooManyItems, gs->span);
                 } else {
                     auto g =
