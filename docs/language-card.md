@@ -1345,6 +1345,15 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   original presence evidence. See [optional-multi-auth.rut](../examples/optional-multi-auth.rut).
 - `auth.headerKey(req.uniqueHeader("X-API-Key").or(""), key, consumerId, credentialId)`
   verifies a custom header key. Do not replace uniqueHeader with first-field reads.
+- `auth.multiHeaderKey(presented, first, second)` accepts one singleton custom
+  header key for either of two configured Consumers. Use
+  `auth.HeaderKeyConsumer(consumerId: ..., key: ..., credentialId: ...)` values;
+  pass `req.uniqueHeader("X-API-Key").or("")`. Empty keys disable a Consumer,
+  but both IDs must be nonempty and distinct, and at least one key must be
+  enabled. Identical enabled keys are a 503 configuration error. Failure is a
+  challenged 401; success uses configured identity metadata and method `apiKey`.
+  Strip the credential explicitly with `req.remove("X-API-Key")` before
+  forwarding when the upstream should not receive it.
 - `auth.rotatingHeaderKey(presented, currentKey, previousKey, consumerId, currentId, previousId)`
   reads the same singleton custom field and verifies either configured opaque
   key. Empty keys disable slots, even for an empty/missing presented field.
