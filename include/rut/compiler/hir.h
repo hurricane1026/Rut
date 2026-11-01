@@ -1114,7 +1114,10 @@ struct WsLenGuard {
         JsonBoolValid,
         JsonBoolEqual,
         JsonIntValid,
-        JsonIntCompare
+        JsonIntCompare,
+        JsonKindEqual,
+        JsonCountValid,
+        JsonCountCompare
     };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
@@ -1126,9 +1129,11 @@ struct WsLenGuard {
     // JsonStringEqual/Prefix/Suffix/Contains: pattern is the pointer and value is the
     // decoded expected string (empty for isEmpty).
     // JsonBoolValid/Equal: pattern is the JSON Pointer; bound is the expected bool for Equal.
+    // JsonKindEqual: pattern is the JSON Pointer; value is an expected kind name.
+    // JsonCountValid/Compare: pattern is the JSON Pointer; int_bound is a signed i32 literal.
     Str pattern{};
     Str value{};
-    i64 int_bound = 0;    // JsonIntCompare: independent exact signed 64-bit literal bound.
+    i64 int_bound = 0;    // JsonIntCompare: i64 bound; JsonCountCompare: validated i32 bound.
     bool negate = false;  // invert this node's condition, including an entire subtree
     // Compound conditions reference earlier nodes in the handler's postorder array.
     u32 lhs = 0;

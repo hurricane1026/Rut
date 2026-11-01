@@ -5966,6 +5966,154 @@ route GET "/ws" { return websocket(ws) { message in
     }
 }
 
+TEST(frontend, websocket_json_kind_and_count_aliases_are_typed) {
+    const char* kind_source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let field = json.get(document, "/value") else { message.drop() }
+ guard let tag = json.kind(field) else { message.drop() }
+ guard tag == "object" || "null" == tag else { message.drop() }
+ message.forward()
+} })rut";
+    auto tokens = lex(lit(kind_source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& kind_nodes = hir->routes[0].ws_handler.len_guards;
+    REQUIRE_EQ(kind_nodes.len, 6u);
+    CHECK(kind_nodes[0].accessor == WsLenGuard::Accessor::JsonValid);
+    CHECK(kind_nodes[1].accessor == WsLenGuard::Accessor::JsonHasPath);
+    CHECK(kind_nodes[2].accessor == WsLenGuard::Accessor::JsonHasPath);
+    CHECK(kind_nodes[3].accessor == WsLenGuard::Accessor::JsonKindEqual);
+    CHECK(kind_nodes[3].value.eq(lit_str("object")));
+    CHECK(kind_nodes[4].accessor == WsLenGuard::Accessor::JsonKindEqual);
+    CHECK(kind_nodes[4].value.eq(lit_str("null")));
+    CHECK(kind_nodes[5].accessor == WsLenGuard::Accessor::Or);
+
+    const char* count_source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let field = json.get(document, "/items") else { message.drop() }
+ guard let amount = json.count(field) else { message.drop() }
+ guard amount >= -2147483648 && amount <= 2147483647 else { message.drop() }
+ message.forward()
+} })rut";
+    tokens = lex(lit(count_source));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& count_nodes = hir->routes[0].ws_handler.len_guards;
+    REQUIRE_EQ(count_nodes.len, 6u);
+    CHECK(count_nodes[2].accessor == WsLenGuard::Accessor::JsonCountValid);
+    CHECK(count_nodes[3].accessor == WsLenGuard::Accessor::JsonCountCompare);
+    CHECK(count_nodes[3].cmp == WsLenGuard::Cmp::Lt);
+    CHECK(count_nodes[3].int_bound == -2147483648LL);
+    CHECK(count_nodes[4].accessor == WsLenGuard::Accessor::JsonCountCompare);
+    CHECK(count_nodes[4].cmp == WsLenGuard::Cmp::Gt);
+    CHECK(count_nodes[4].int_bound == 2147483647LL);
+    CHECK(count_nodes[5].accessor == WsLenGuard::Accessor::And);
+
+    const char* root_combined = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let tag = json.kind(document) else { message.drop() }
+ guard let amount = json.count(document) else { message.drop() }
+ guard tag == "array" && amount <= 64 else { message.drop() }
+ message.forward()
+} })rut";
+    tokens = lex(lit(root_combined));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto combined_hir = analyze_file_heap(ast.value());
+    REQUIRE(combined_hir);
+    CHECK_EQ(combined_hir->routes[0].ws_handler.len_guards.len, 6u);
+
+    const char* root_kind = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let tag = json.kind(document) else { message.drop() }
+ guard tag != "boolean" else { message.drop() }
+ message.forward()
+} })rut";
+    tokens = lex(lit(root_kind));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+
+    const char* const kComparisons[] = {"amount < 1",
+                                        "1 < amount",
+                                        "amount > -1",
+                                        "-1 > amount",
+                                        "amount == 1",
+                                        "1 == amount",
+                                        "amount <= 1",
+                                        "1 >= amount",
+                                        "amount >= 1",
+                                        "1 <= amount",
+                                        "amount != 1",
+                                        "1 != amount"};
+    for (const char* comparison : kComparisons) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.drop() }\n"
+            "guard let amount = json.count(document) else { message.drop() }\nguard ";
+        source += comparison;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(analyze_file_heap(ast.value()));
+    }
+
+    const char* const kInvalidCountGuards[] = {"amount < -2147483649", "amount > 2147483648"};
+    for (const char* invalid_guard : kInvalidCountGuards) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.drop() }\n"
+            "guard let amount = json.count(document) else { message.drop() }\nguard ";
+        source += invalid_guard;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+
+    const char* const kInvalidGuards[] = {
+        "guard tag == \"object\" else { message.drop() }\n"
+        "guard let document = json.parse(message.text) else { message.drop() }",
+        "guard let document = json.parse(message.text) else { message.drop() }\n"
+        "guard let tag = json.kind(json.get(document, \"/value\")) else { message.drop() }",
+        "guard let document = json.parse(message.text) else { message.drop() }\n"
+        "guard let field = json.get(document, \"/value\") else { message.drop() }\n"
+        "guard let tag = json.kind(field) else { message.drop() }\n"
+        "guard tag.hasPrefix(\"o\") else { message.drop() }",
+        "guard let document = json.parse(message.text) else { message.drop() }\n"
+        "guard let field = json.get(document, \"/value\") else { message.drop() }\n"
+        "guard let amount = json.count(field) else { message.drop() }\n"
+        "guard amount == amount else { message.drop() }",
+        "guard let document = json.parse(message.text) else { message.drop() }\n"
+        "guard let amount = json.count(message.text) else { message.drop() }"};
+    for (const char* invalid_guards : kInvalidGuards) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        source += invalid_guards;
+        source += "\nmessage.forward() } }\n";
+        tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
 TEST(frontend, websocket_json_parse_presence_conditions) {
     for (const char* condition : {"json.parse(message.text) != nil",
                                   "nil != json.parse(message.text)",

@@ -2772,6 +2772,23 @@ are limited to a bare alias and one literal; arithmetic and alias-to-alias
 comparisons are unsupported. The JSON integer threshold uses its own signed
 64-bit field, independent of the existing message-length bound.
 
+JSON structure aliases use `json.kind(documentOrField)` or
+`json.count(documentOrField)` after the same parse and optional presence guards.
+`kind` binds the exact lowercase label `null`, `boolean`, `number`, `string`,
+`array`, or `object`; JSON null is a successful `null` binding. It supports only
+`==`/`!=` against a string literal in either operand order, plus `!`, `&&`, and
+`||`. Equality with any other literal label is false. `count` succeeds only for
+arrays and objects and returns their direct element/member count, including zero for empty
+containers; it does not count descendants. Count aliases compare with signed
+32-bit integer literals using the six integer comparisons, and out-of-range
+literals are rejected. Arithmetic and alias-to-alias comparisons are unsupported.
+These checks use the same bounded JSON workspace and per-check reparse behavior.
+The four source-guard limit means a selected-field handler can use a
+parse/get/kind/comparison chain or a parse/get/count/comparison chain, but cannot
+combine both complete selected-field chains. A root document can bind both kind
+and count and combine their predicates within four guards because it needs no
+`get` presence guard. The 32-condition-node and JSON parser limits are unchanged.
+
 The native/JIT helper validates the complete unmasked, reassembled payload with
 the existing JSON parser and a bounded workspace per worker thread. It accepts
 at most 8192 bytes, 2048 nodes and depth 64, rejects duplicate decoded object

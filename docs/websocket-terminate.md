@@ -115,6 +115,22 @@ binding. Integer aliases compare with Int literals using all six comparisons
 arithmetic and alias-to-alias comparisons are unsupported. The signed 64-bit
 comparison bound is separate from the existing `u32` message and opcode bound.
 
+JSON structure checks can bind a kind label with `json.kind(documentOrField)`
+or a direct container size with `json.count(documentOrField)`. Kind aliases use
+the fixed lowercase labels `null`, `boolean`, `number`, `string`, `array`, and
+`object`; null is a valid kind, and equality with another literal label is false.
+Only `==`/`!=` against string literals are supported for kind aliases. Count accepts
+only arrays and objects, including empty containers with count zero, and counts
+only their immediate elements or members. Its comparison literals must fit
+signed i32. Both aliases support the existing logical condition forms; other
+extraction, arithmetic, and alias-to-alias comparisons remain unsupported.
+Because parse, optional path presence, typed binding, and comparison each use a
+source guard, a selected-field chain leaves room for either a kind policy or a
+count policy under the four-guard limit. A root document can bind both kind and
+count and combine their predicates within that limit because it needs no `get`
+presence guard. Every reached check reparses the bounded full message in the
+shared thread-local JSON workspace.
+
 The parser limits remain 8 KiB input, 2048 nodes and depth 64; exceeding any limit
 fails validation. Duplicate decoded object keys are rejected. For Text-only
 validation, combine the condition with `message.isText`; ordinary payload text

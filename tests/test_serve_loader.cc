@@ -5363,6 +5363,232 @@ route GET "/ws" { return websocket(backend) { message in
     program.destroy();
 }
 
+TEST(serve_loader, websocket_json_kind_and_count_guards_use_exact_types) {
+    struct KindCase {
+        const char* literal;
+        const char* payload;
+        bool matches;
+    };
+    const bool kDirections[] = {false, true};
+    const WsOpcode kOpcodes[] = {WsOpcode::Text, WsOpcode::Binary};
+    const KindCase kKinds[] = {{"null", R"({"value":null})", true},
+                               {"boolean", R"({"value":false})", true},
+                               {"number", R"({"value":1.5})", true},
+                               {"string", R"({"value":"x"})", true},
+                               {"array", R"({"value":[]})", true},
+                               {"object", R"({"value":{}})", true},
+                               {"\\u{6f}bject", R"({"value":{}})", true},
+                               {"", R"({"value":{}})", false},
+                               {"x\\0y", R"({"value":{}})", false},
+                               {"Object", R"({"value":{}})", false},
+                               {"other", R"({"value":null})", false}};
+    for (const KindCase& test : kKinds) {
+        const char* const kConditions[] = {
+            "tag == \"TARGET\"", "\"TARGET\" == tag", "tag != \"TARGET\"", "\"TARGET\" != tag"};
+        for (u32 condition_index = 0;
+             condition_index < sizeof(kConditions) / sizeof(kConditions[0]);
+             ++condition_index) {
+            const char* condition = kConditions[condition_index];
+            const bool invert = condition_index >= 2;
+            std::string source =
+                "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { "
+                "return websocket(backend) { message in\n"
+                "guard let document = json.parse(message.text) else { message.close(1007) }\n"
+                "guard let field = json.get(document, \"/value\") else { message.close(1008) }\n"
+                "guard let tag = json.kind(field) else { message.close(1003) }\nguard ";
+            source += condition;
+            size_t pos = source.find("TARGET");
+            REQUIRE(pos != std::string::npos);
+            source.replace(pos, 6, test.literal);
+            source += " else { message.drop() }\nmessage.forward() } }\n";
+            auto path = write_file("/tmp/rut_ws_json_kind_policy", "app.rut", source.c_str());
+            LoadedProgram program;
+            LoadError err;
+            REQUIRE(load_rut_program(path.c_str(), program, err));
+            const auto handler = program.config.routes[0].ws_frame_handler;
+            REQUIRE(handler);
+            for (bool from_client : kDirections) {
+                for (WsOpcode opcode : kOpcodes) {
+                    CHECK(handler(nullptr,
+                                  opcode,
+                                  reinterpret_cast<const u8*>(test.payload),
+                                  strlen(test.payload),
+                                  from_client) == ((test.matches != invert) ? WsFrameAction::Forward
+                                                                            : WsFrameAction::Drop));
+                }
+            }
+            CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("{}"), 2, true) ==
+                  WsFrameAction::ClosePolicy1);
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(R"({"value":null})"),
+                          strlen(R"({"value":null})"),
+                          true) == ((strcmp(test.literal, "null") == 0) != invert
+                                        ? WsFrameAction::Forward
+                                        : WsFrameAction::Drop));
+            REQUIRE_EQ(program.config.routes[0].ws_close_policy_count, 3u);
+            program.destroy();
+        }
+    }
+
+    const char* kind_or_source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/value") else { message.close(1008) }
+ guard let tag = json.kind(field) else { message.close(1003) }
+ guard tag == "array" || tag == "object" else { message.drop() }
+ message.forward()
+} }
+)rut";
+    auto kind_or_path = write_file("/tmp/rut_ws_json_kind_or", "app.rut", kind_or_source);
+    LoadedProgram kind_or_program;
+    LoadError kind_or_err;
+    REQUIRE(load_rut_program(kind_or_path.c_str(), kind_or_program, kind_or_err));
+    const auto kind_or_handler = kind_or_program.config.routes[0].ws_frame_handler;
+    REQUIRE(kind_or_handler);
+    struct KindOrCase {
+        const char* payload;
+        WsFrameAction expected;
+    };
+    const KindOrCase kKindOrCases[] = {{R"({"value":[]})", WsFrameAction::Forward},
+                                       {R"({"value":{}})", WsFrameAction::Forward},
+                                       {R"({"value":null})", WsFrameAction::Drop},
+                                       {R"({"value":1})", WsFrameAction::Drop}};
+    for (const KindOrCase& test : kKindOrCases) {
+        CHECK(kind_or_handler(nullptr,
+                              WsOpcode::Text,
+                              reinterpret_cast<const u8*>(test.payload),
+                              strlen(test.payload),
+                              true) == test.expected);
+    }
+    kind_or_program.destroy();
+
+    struct CountCase {
+        const char* condition;
+        bool zero;
+        bool one;
+        bool two;
+    };
+    const CountCase kComparisons[] = {{"amount < 1", true, false, false},
+                                      {"1 < amount", false, false, true},
+                                      {"amount > 1", false, false, true},
+                                      {"1 > amount", true, false, false},
+                                      {"amount == 1", false, true, false},
+                                      {"1 == amount", false, true, false},
+                                      {"amount <= 1", true, true, false},
+                                      {"1 >= amount", true, true, false},
+                                      {"amount >= 1", false, true, true},
+                                      {"1 <= amount", false, true, true},
+                                      {"amount != 1", true, false, true},
+                                      {"1 != amount", true, false, true},
+                                      {"amount == 0 || 2 <= amount", true, false, true},
+                                      {"!(amount < 1) && amount <= 2", false, true, true}};
+    const char* const kPayloads[] = {R"({"value":[]})",
+                                     R"({"value":[0]})",
+                                     R"({"value":[0,{"nested":[1,2]}]})",
+                                     R"({"value":{}})",
+                                     R"({"value":{"a":1,"b":2}})"};
+    for (const CountCase& test : kComparisons) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { "
+            "return websocket(backend) { message in\n"
+            "guard let document = json.parse(message.text) else { message.close(1007) }\n"
+            "guard let field = json.get(document, \"/value\") else { message.close(1008) }\n"
+            "guard let amount = json.count(field) else { message.close(1003) }\nguard ";
+        source += test.condition;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_json_count_policy", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        const bool expected[] = {test.zero, test.one, test.two, test.zero, test.two};
+        for (u32 i = 0; i < sizeof(kPayloads) / sizeof(kPayloads[0]); ++i) {
+            for (bool from_client : kDirections) {
+                for (WsOpcode opcode : kOpcodes) {
+                    CHECK(handler(nullptr,
+                                  opcode,
+                                  reinterpret_cast<const u8*>(kPayloads[i]),
+                                  strlen(kPayloads[i]),
+                                  from_client) ==
+                          (expected[i] ? WsFrameAction::Forward : WsFrameAction::Drop));
+                }
+            }
+        }
+        const char* const kNonContainers[] = {
+            R"({"value":null})", R"({"value":false})", R"({"value":1})", R"({"value":"x"})"};
+        for (const char* non_container : kNonContainers) {
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(non_container),
+                          strlen(non_container),
+                          true) == WsFrameAction::ClosePolicy2);
+        }
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("{}"), 2, true) ==
+              WsFrameAction::ClosePolicy1);
+        REQUIRE_EQ(program.config.routes[0].ws_close_policy_count, 3u);
+        program.destroy();
+    }
+
+    const char* root_count_source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let amount = json.count(document) else { message.close(1003) }
+ guard amount == 0 else { message.drop() }
+ message.forward()
+} }
+)rut";
+    auto path = write_file("/tmp/rut_ws_json_count_root", "app.rut", root_count_source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("[]"), 2, true) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("{}"), 2, true) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("null"), 4, true) ==
+          WsFrameAction::ClosePolicy1);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_json_root_kind_and_count_compose_within_guard_limit) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let tag = json.kind(document) else { message.close(1003) }
+ guard let amount = json.count(document) else { message.close(1003) }
+ guard tag == "array" && amount <= 2 else { message.drop() }
+ message.forward()
+} }
+)rut";
+    auto path = write_file("/tmp/rut_ws_json_root_kind_count", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    struct RootCase {
+        const char* payload;
+        WsFrameAction expected;
+    };
+    const RootCase kCases[] = {{"[]", WsFrameAction::Forward},
+                               {"[1,2]", WsFrameAction::Forward},
+                               {"[1,2,3]", WsFrameAction::Drop},
+                               {"{}", WsFrameAction::Drop},
+                               {"null", WsFrameAction::ClosePolicy2}};
+    for (const RootCase& test : kCases) {
+        CHECK(handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(test.payload),
+                      strlen(test.payload),
+                      true) == test.expected);
+    }
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_json_validation_uses_complete_payloads) {
     const char* conditions[] = {"json.parse(message.text) != nil",
                                 "nil != json.parse(message.text)",

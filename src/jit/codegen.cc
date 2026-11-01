@@ -2828,17 +2828,20 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 20 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 23 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
-        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 20) ||
+        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 23) ||
              guards[i].accessor == 3 || (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
             guards[i].pattern_len != 0 && !guards[i].pattern)
             return false;
-        if (guards[i].accessor >= 13 && guards[i].accessor <= 16 && guards[i].value_len != 0 &&
-            !guards[i].value)
+        if (((guards[i].accessor >= 13 && guards[i].accessor <= 16) || guards[i].accessor == 21) &&
+            guards[i].value_len != 0 && !guards[i].value)
             return false;
         if (guards[i].accessor == 18 && guards[i].bound > 1) return false;
+        if (guards[i].accessor == 23 &&
+            (guards[i].int_bound < -2147483648LL || guards[i].int_bound > 2147483647LL))
+            return false;
         if (guards[i].accessor == 4 || guards[i].accessor == 5) {
             const u32 children[2] = {guards[i].lhs, guards[i].rhs};
             for (u32 child : children) {
@@ -3024,6 +3027,62 @@ bool emit_ws_handler(LLVMModuleRef mod,
                 LLVMBuildCall2(builder, int_ty, int_fn, args, compare ? 6 : 4, "json.int");
             cond = LLVMBuildICmp(
                 builder, LLVMIntNE, valid, LLVMConstInt(i8_ty, 0, 0), "json.int.matches");
+        } else if (guards[i].accessor == 21) {
+            LLVMTypeRef kind_params[6] = {ptr_ty, i64_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef kind_ty = LLVMFunctionType(i8_ty, kind_params, 6, 0);
+            LLVMValueRef kind_fn =
+                LLVMGetNamedFunction(mod, "rut_helper_ws_json_kind_equals_at_path");
+            if (!kind_fn)
+                kind_fn = LLVMAddFunction(mod, "rut_helper_ws_json_kind_equals_at_path", kind_ty);
+            auto bytes_global = [&](const char* bytes, u32 size, const char* name) {
+                LLVMValueRef initializer =
+                    LLVMConstStringInContext(ctx, bytes ? bytes : "", size, 1);
+                LLVMValueRef global = LLVMAddGlobal(mod, LLVMTypeOf(initializer), name);
+                LLVMSetInitializer(global, initializer);
+                LLVMSetGlobalConstant(global, 1);
+                LLVMSetLinkage(global, LLVMPrivateLinkage);
+                LLVMSetUnnamedAddress(global, LLVMGlobalUnnamedAddr);
+                return global;
+            };
+            LLVMValueRef path =
+                bytes_global(guards[i].pattern, guards[i].pattern_len, "json.kind.path");
+            LLVMValueRef expected = bytes_global(guards[i].value, guards[i].value_len, "json.kind");
+            LLVMValueRef args[6] = {payload,
+                                    len,
+                                    path,
+                                    LLVMConstInt(i32_ty, guards[i].pattern_len, 0),
+                                    expected,
+                                    LLVMConstInt(i32_ty, guards[i].value_len, 0)};
+            LLVMValueRef valid = LLVMBuildCall2(builder, kind_ty, kind_fn, args, 6, "json.kind");
+            cond = LLVMBuildICmp(
+                builder, LLVMIntNE, valid, LLVMConstInt(i8_ty, 0, 0), "json.kind.matches");
+        } else if (guards[i].accessor == 22 || guards[i].accessor == 23) {
+            const bool compare = guards[i].accessor == 23;
+            LLVMTypeRef count_params[4] = {ptr_ty, i64_ty, ptr_ty, i32_ty};
+            LLVMTypeRef compare_params[6] = {ptr_ty, i64_ty, ptr_ty, i32_ty, i32_ty, i8_ty};
+            LLVMTypeRef count_ty = LLVMFunctionType(
+                i8_ty, compare ? compare_params : count_params, compare ? 6 : 4, 0);
+            const char* helper = compare ? "rut_helper_ws_json_count_compare_at_path"
+                                         : "rut_helper_ws_json_count_at_path";
+            LLVMValueRef count_fn = LLVMGetNamedFunction(mod, helper);
+            if (!count_fn) count_fn = LLVMAddFunction(mod, helper, count_ty);
+            LLVMValueRef path = LLVMConstStringInContext(
+                ctx, guards[i].pattern ? guards[i].pattern : "", guards[i].pattern_len, 1);
+            LLVMValueRef path_global = LLVMAddGlobal(mod, LLVMTypeOf(path), "json.count.path");
+            LLVMSetInitializer(path_global, path);
+            LLVMSetGlobalConstant(path_global, 1);
+            LLVMSetLinkage(path_global, LLVMPrivateLinkage);
+            LLVMSetUnnamedAddress(path_global, LLVMGlobalUnnamedAddr);
+            LLVMValueRef args[6] = {payload,
+                                    len,
+                                    path_global,
+                                    LLVMConstInt(i32_ty, guards[i].pattern_len, 0),
+                                    LLVMConstInt(i32_ty, static_cast<u32>(guards[i].int_bound), 0),
+                                    LLVMConstInt(i8_ty, guards[i].cmp, 0)};
+            LLVMValueRef valid =
+                LLVMBuildCall2(builder, count_ty, count_fn, args, compare ? 6 : 4, "json.count");
+            cond = LLVMBuildICmp(
+                builder, LLVMIntNE, valid, LLVMConstInt(i8_ty, 0, 0), "json.count.matches");
         } else if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
             // Emit the pattern + db globals JIT finalization compiles & back-patches. The `ws<id>`
             // suffix keeps these distinct from the HTTP regex globals already in this module.
