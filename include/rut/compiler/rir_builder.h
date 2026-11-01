@@ -4,6 +4,7 @@
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/hash.h"
+#include "rut/runtime/json.h"
 
 namespace rut {
 namespace rir {
@@ -1009,15 +1010,27 @@ struct Builder {
                               const ValueId* args,
                               u32 count,
                               SourceLoc loc = {}) {
-        if (count > 3) return err(RirError::InvalidState);
+        const bool kJwtIssue = op == static_cast<u32>(json::Op::JwtIssueHs256);
+        if ((kJwtIssue && count != 5) || (!kJwtIssue && count > 3) ||
+            (count != 0 && args == nullptr))
+            return err(RirError::InvalidState);
         for (u32 i = 0; i < count; ++i)
             if (!valid_val(args[i])) return err(RirError::InvalidState);
+        if (kJwtIssue) {
+            for (u32 i = 0; i < 4; ++i)
+                if (!val_has_type(args[i], TypeKind::Str)) return err(RirError::InvalidState);
+            if (!val_has_type(args[4], TypeKind::I32) || result != TypeKind::Str || !optional)
+                return err(RirError::InvalidState);
+        }
         const Type* ty = TRY(make_type(result));
         if (optional) ty = TRY(make_type(TypeKind::Optional, ty));
         auto [inst, vid] = TRY(emit(Opcode::JsonOp, ty, loc));
         inst->imm.i32_val = static_cast<i32>(op);
-        inst->operand_count = count;
-        for (u32 i = 0; i < count; ++i) inst->operands[i] = args[i];
+        auto stored = set_operands(inst, args, count);
+        if (!stored) {
+            rollback_emit({inst, vid});
+            return err(stored.error());
+        }
         return vid;
     }
 
