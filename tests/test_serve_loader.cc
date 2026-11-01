@@ -5026,6 +5026,89 @@ route GET "/ws" { return websocket(backend) { message in
     program.destroy();
 }
 
+TEST(serve_loader, websocket_json_string_predicates_match_decoded_bytes) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/topic") else { message.close(1008) }
+ guard let topic = json.string(field) else { message.close(1003) }
+ guard topic.isEmpty || (!topic.isEmpty && topic.hasPrefix("topic.") &&
+                         topic.hasSuffix(":end") && topic.contains("mid\0\u{20ac}")) else {
+  message.drop()
+ }
+ message.forward()
+} }
+)rut";
+    auto path = write_file("/tmp/rut_ws_json_string_predicates", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto& route = program.config.routes[0];
+    const auto handler = route.ws_frame_handler;
+    REQUIRE(handler);
+    const char* kPayloads[] = {
+        R"({"topic":""})",
+        R"({"topic":"topic.mid\u0000\u20ac:end"})",
+        R"({"topic":"topic.mid\u0000€:end"})",
+        R"({"topic":"topicXmid\u0000\u20ac:end"})",
+        R"({"topic":"topic.mid\u0000\u20ac:enx"})",
+        R"({"topic":"topic.mid\u0000X:end"})",
+        R"({"topic":"mid"})",
+        R"({"topic":"\u0000"})",
+        R"({"topic":null})",
+        R"({})",
+    };
+    const WsFrameAction kExpected[] = {WsFrameAction::Forward,
+                                       WsFrameAction::Forward,
+                                       WsFrameAction::Forward,
+                                       WsFrameAction::Drop,
+                                       WsFrameAction::Drop,
+                                       WsFrameAction::Drop,
+                                       WsFrameAction::Drop,
+                                       WsFrameAction::Drop,
+                                       WsFrameAction::ClosePolicy2,
+                                       WsFrameAction::ClosePolicy1};
+    for (u32 i = 0; i < sizeof(kPayloads) / sizeof(kPayloads[0]); ++i) {
+        for (bool from_client : {false, true}) {
+            for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+                CHECK(handler(nullptr,
+                              opcode,
+                              reinterpret_cast<const u8*>(kPayloads[i]),
+                              strlen(kPayloads[i]),
+                              from_client) == kExpected[i]);
+            }
+        }
+    }
+    program.destroy();
+
+    const char* empty_needle_source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/topic") else { message.close(1008) }
+ guard let topic = json.string(field) else { message.close(1003) }
+ guard topic.contains("") else { message.drop() }
+ message.forward()
+} }
+)rut";
+    path = write_file("/tmp/rut_ws_json_string_empty_needle", "app.rut", empty_needle_source);
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto empty_needle_handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(empty_needle_handler);
+    for (const char* payload : {R"({"topic":""})", R"({"topic":"value"})"}) {
+        CHECK(empty_needle_handler(nullptr,
+                                   WsOpcode::Text,
+                                   reinterpret_cast<const u8*>(payload),
+                                   strlen(payload),
+                                   true) == WsFrameAction::Forward);
+    }
+    CHECK(empty_needle_handler(nullptr,
+                               WsOpcode::Text,
+                               reinterpret_cast<const u8*>(R"({"topic":3})"),
+                               strlen(R"({"topic":3})"),
+                               true) == WsFrameAction::ClosePolicy2);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_json_validation_uses_complete_payloads) {
     const char* conditions[] = {"json.parse(message.text) != nil",
                                 "nil != json.parse(message.text)",

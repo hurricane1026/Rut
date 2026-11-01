@@ -5736,6 +5736,8 @@ route GET "/ws" {
   message.forward()
  }
 }
+
+
 )rut";
     tokens = lex(lit(collision));
     REQUIRE(tokens);
@@ -5751,6 +5753,59 @@ route GET "/ws" {
         invalid += "guard let ";
         invalid += reserved;
         invalid += " = json.string(field) else { message.drop() }\nmessage.forward() } }\n";
+        tokens = lex({invalid.data(), static_cast<u32>(invalid.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, websocket_json_string_predicates_use_unwrapped_string_aliases) {
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let field = json.get(document, "/type") else { message.drop() }
+ guard let kind = json.string(field) else { message.drop() }
+ guard !kind.hasPrefix("") || (kind.isEmpty && kind.hasSuffix(":end") && kind.contains("a.b")) else {
+  message.drop()
+ }
+ message.forward()
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& nodes = hir->routes[0].ws_handler.len_guards;
+    REQUIRE_EQ(nodes.len, 10u);
+    CHECK(nodes[3].accessor == WsLenGuard::Accessor::JsonStringPrefix);
+    CHECK(nodes[3].pattern.eq(lit("/type")));
+    CHECK(nodes[3].value.len == 0);
+    CHECK(nodes[4].accessor == WsLenGuard::Accessor::JsonStringEqual);  // isEmpty
+    CHECK(nodes[4].pattern.eq(lit("/type")));
+    CHECK(nodes[4].value.len == 0);
+    CHECK(nodes[5].accessor == WsLenGuard::Accessor::JsonStringSuffix);
+    CHECK(nodes[5].value.eq(lit(":end")));
+    CHECK(nodes[7].accessor == WsLenGuard::Accessor::JsonStringContains);
+    CHECK(nodes[7].value.eq(lit("a.b")));
+
+    for (const char* condition : {"kind.hasPrefix()",
+                                  "kind.hasPrefix(\"a\", \"b\")",
+                                  "kind.hasPrefix(message.text)",
+                                  "kind.hasPrefix(\"a\" + \"b\")",
+                                  "field.hasPrefix(\"x\")",
+                                  "document.contains(\"x\")",
+                                  "field.isEmpty"}) {
+        std::string invalid = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let field = json.get(document, "/type") else { message.drop() }
+ guard let kind = json.string(field) else { message.drop() }
+ guard )rut";
+        invalid += condition;
+        invalid += " else { message.drop() }\nmessage.forward() } }\n";
         tokens = lex({invalid.data(), static_cast<u32>(invalid.size())});
         REQUIRE(tokens);
         ast = parse_file_heap(tokens.value());
