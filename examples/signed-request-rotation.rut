@@ -1,0 +1,27 @@
+import "middleware/auth.rut"
+
+listen :8080
+upstream backend at "127.0.0.1:8081"
+
+// Each key-id/key pair is enabled together or left empty to disable that slot.
+// Compile/load configuration from a protected source and serve this route over TLS.
+route POST "/signed" {
+    let config = auth.SignedRequestRotation(
+        currentKeyId: env("SIGNED_REQUEST_CURRENT_KEY_ID"),
+        currentKey: env("SIGNED_REQUEST_CURRENT_KEY"),
+        previousKeyId: env("SIGNED_REQUEST_PREVIOUS_KEY_ID"),
+        previousKey: env("SIGNED_REQUEST_PREVIOUS_KEY"),
+        consumerId: "orders-api",
+        currentId: "signing-key-current",
+        previousId: "signing-key-previous")
+    let identity = auth.rotatingSignedRequest(config)
+
+    match identity.consumerId {
+        "orders-api" => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", identity.consumerId)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => return 403
+    }
+}

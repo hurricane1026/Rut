@@ -50,7 +50,9 @@ inline std::string format_date(long long unix_seconds) {
 inline Headers make_headers(const char* method,
                             const std::string& target,
                             const std::string& body,
-                            long long unix_seconds) {
+                            long long unix_seconds,
+                            const std::string& key_id = kKeyId,
+                            const std::string& secret = kSecret) {
     Headers result;
     result.date = format_date(unix_seconds);
     unsigned char body_hash[EVP_MAX_MD_SIZE]{};
@@ -58,21 +60,22 @@ inline Headers make_headers(const char* method,
     if (EVP_Digest(body.data(), body.size(), body_hash, &body_hash_len, EVP_sha256(), nullptr) != 1)
         return {};
     result.digest = "SHA-256=" + base64(body_hash, body_hash_len);
+    if (secret.size() > 4096) return {};
 
-    const std::string canonical = std::string(kKeyId) + "\n" + method + " " + target + "\n" +
+    const std::string canonical = key_id + "\n" + method + " " + target + "\n" +
                                   "date: " + result.date + "\n" + "digest: " + result.digest + "\n";
     unsigned char signature[EVP_MAX_MD_SIZE]{};
     unsigned int signature_len = 0;
     if (HMAC(EVP_sha256(),
-             kSecret,
-             sizeof(kSecret) - 1,
+             secret.data(),
+             static_cast<int>(secret.size()),
              reinterpret_cast<const unsigned char*>(canonical.data()),
              canonical.size(),
              signature,
              &signature_len) == nullptr)
         return {};
     result.authorization = "Signature keyId=\"";
-    result.authorization += kKeyId;
+    result.authorization += key_id;
     result.authorization +=
         "\",algorithm=\"hmac-sha256\",headers=\"@request-target date digest\",signature=\"";
     result.authorization += base64(signature, signature_len);

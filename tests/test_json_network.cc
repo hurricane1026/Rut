@@ -1618,3 +1618,218 @@ route "/empty-config" {
     loop->free_conn(*conn);
     pool.destroy();
 }
+
+TEST(json_network, rotating_signed_request_selects_and_revokes_configured_keys) {
+    using ::rut::test::signed_request::Headers;
+    constexpr i64 kNow = 1700000000;
+    constexpr const char* kCurrentId = "current-credential";
+    constexpr const char* kPreviousId = "previous-credential";
+    constexpr const char* kCurrentKeyId = "rotation-current";
+    constexpr const char* kPreviousKeyId = "rotation-previous";
+    constexpr const char* kCurrentKey = "rotation-current-secret-32-bytes";
+    constexpr const char* kPreviousKey = "rotation-previous-secret-32-bytes";
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/multi-consumer-auth.rut";
+    JsonProgram program;
+    REQUIRE(program.init(R"rut(
+import "middleware/auth.rut"
+route "/rotate" {
+    let config = auth.SignedRequestRotation(currentKeyId: "rotation-current", currentKey: "rotation-current-secret-32-bytes", previousKeyId: "rotation-previous", previousKey: "rotation-previous-secret-32-bytes", consumerId: "consumer-rotation", currentId: "current-credential", previousId: "previous-credential")
+    let identity = auth.rotatingSignedRequest(config)
+    let credential = identity.credentialId
+    return response(200, body: credential)
+}
+route "/revoked" {
+    let config = auth.SignedRequestRotation(currentKeyId: "rotation-current", currentKey: "rotation-current-secret-32-bytes", previousKeyId: "", previousKey: "", consumerId: "consumer-rotation", currentId: "current-credential", previousId: "previous-credential")
+    let identity = auth.rotatingSignedRequest(config)
+    let credential = identity.credentialId
+    return response(200, body: credential)
+}
+route "/ambiguous" {
+    let config = auth.SignedRequestRotation(currentKeyId: "rotation-current", currentKey: "rotation-current-secret-32-bytes", previousKeyId: "rotation-current", previousKey: "rotation-previous-secret-32-bytes", consumerId: "consumer-rotation", currentId: "current-credential", previousId: "previous-credential")
+    let identity = auth.rotatingSignedRequest(config)
+    let credential = identity.credentialId
+    return response(200, body: credential)
+}
+route "/partial" {
+    let config = auth.SignedRequestRotation(currentKeyId: "rotation-current", currentKey: "", previousKeyId: "", previousKey: "", consumerId: "consumer-rotation", currentId: "current-credential", previousId: "previous-credential")
+    let identity = auth.rotatingSignedRequest(config)
+    let credential = identity.credentialId
+    return response(200, body: credential)
+}
+)rut",
+                         source_path.c_str()));
+    REQUIRE_EQ(program.config->route_count, 4u);
+    for (u32 i = 0; i < program.config->route_count; ++i)
+        CHECK(program.config->routes[i].needs_req_body);
+
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    conn->json_arena.backend.pool = &pool;
+    const RouteConfig* active_config = program.config.get();
+    loop->config_ptr = &active_config;
+
+    const std::string body = "first=one&second=two";
+    const std::string target_query = "?x=%2F&x=two";
+    auto run_h1 = [&](const char* path,
+                      const Headers& auth,
+                      u32 expected_status,
+                      const char* expected_body = nullptr) {
+        const std::string target = std::string(path) + target_query;
+        const std::string head = "POST " + target +
+                                 " HTTP/1.1\r\nHost: test\r\nAuthorization: " + auth.authorization +
+                                 "\r\nDate: " + auth.date + "\r\nDigest: " + auth.digest +
+                                 "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+        const std::string prefix = "first=one";
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(head.data()), head.size()),
+                   head.size());
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(prefix.data()), prefix.size()),
+                   prefix.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        const u32 conn_id = conn->id;
+        {
+            test_fault::ScopedSyscallFault clock(
+                test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
+            on_header_received<SmallLoop>(
+                loop.get(),
+                *conn,
+                make_ev(conn_id, IoEventType::Recv, head.size() + prefix.size()));
+        }
+        CHECK(conn->on_recv == &on_jit_request_body_recvd<SmallLoop>);
+        CHECK_EQ(conn->req_body_remaining, body.size() - prefix.size());
+        CHECK_EQ(conn->send_buf.len(), 0u);
+        const std::string suffix = body.substr(prefix.size());
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(suffix.data()), suffix.size()),
+                   suffix.size());
+        {
+            test_fault::ScopedSyscallFault clock(
+                test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
+            conn->on_recv(loop.get(), *conn, make_ev(conn_id, IoEventType::Recv, suffix.size()));
+        }
+        const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+        const std::string expected_status_line = "HTTP/1.1 " + std::to_string(expected_status);
+        CHECK(wire.find(expected_status_line) == 0);
+        if (expected_body != nullptr) CHECK(wire.ends_with(expected_body));
+    };
+
+    const std::string target = "/rotate" + target_query;
+    const Headers current = ::rut::test::signed_request::make_headers(
+        "POST", target, body, kNow, kCurrentKeyId, kCurrentKey);
+    const Headers previous = ::rut::test::signed_request::make_headers(
+        "POST", target, body, kNow, kPreviousKeyId, kPreviousKey);
+    REQUIRE(!current.authorization.empty());
+    REQUIRE(!previous.authorization.empty());
+    run_h1("/rotate", current, 200, kCurrentId);
+    run_h1("/rotate", previous, 200, kPreviousId);
+
+    const Headers revoked = ::rut::test::signed_request::make_headers(
+        "POST", "/revoked" + target_query, body, kNow, kPreviousKeyId, kPreviousKey);
+    run_h1("/revoked", revoked, 401);
+    const Headers unknown = ::rut::test::signed_request::make_headers(
+        "POST", target, body, kNow, "unrecognized-key", kCurrentKey);
+    run_h1("/rotate", unknown, 401);
+    const Headers same_id_wrong_secret = ::rut::test::signed_request::make_headers(
+        "POST", target, body, kNow, kCurrentKeyId, "wrong-secret-for-current-key");
+    run_h1("/rotate", same_id_wrong_secret, 401);
+    const Headers ambiguous = ::rut::test::signed_request::make_headers(
+        "POST", "/ambiguous" + target_query, body, kNow, kCurrentKeyId, kCurrentKey);
+    run_h1("/ambiguous", ambiguous, 503);
+    const Headers partial = ::rut::test::signed_request::make_headers(
+        "POST", "/partial" + target_query, body, kNow, kCurrentKeyId, kCurrentKey);
+    run_h1("/partial", partial, 503);
+
+    // The H2 callback path must retain the request until END_STREAM before selecting a slot.
+    SmallLoop h2_loop;
+    h2_loop.setup();
+    h2_loop.config_ptr = &active_config;
+    auto* h2_conn = h2_loop.alloc_conn();
+    REQUIRE(h2_conn);
+    h2_conn->json_arena.backend.pool = &pool;
+    h2_conn->protocol = ConnProtocol::Http2;
+    Http2Conn h2;
+    h2.init();
+    h2_conn->h2 = &h2;
+    const u32 h2_conn_id = h2_conn->id;
+    u8 initial[4096]{};
+    u32 initial_len = 0;
+    __builtin_memcpy(initial, kClientPreface, kClientPrefaceLen);
+    initial_len += kClientPrefaceLen;
+    Http2Settings settings{};
+    settings.set_defaults();
+    initial_len += write_settings_frame(initial + initial_len, settings);
+    const std::string h2_target = "/rotate" + target_query;
+    const std::string content_length = std::to_string(body.size());
+    const hpack::Header headers[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {h2_target.data(), static_cast<u32>(h2_target.size())}},
+        {{":authority", 10}, {"test", 4}},
+        {{"content-length", 14}, {content_length.data(), static_cast<u32>(content_length.size())}},
+        {{"authorization", 13},
+         {previous.authorization.data(), static_cast<u32>(previous.authorization.size())}},
+        {{"date", 4}, {previous.date.data(), static_cast<u32>(previous.date.size())}},
+        {{"digest", 6}, {previous.digest.data(), static_cast<u32>(previous.digest.size())}},
+    };
+    const u32 headers_len = http2_write_headers(initial + initial_len,
+                                                sizeof(initial) - initial_len,
+                                                1,
+                                                headers,
+                                                sizeof(headers) / sizeof(headers[0]),
+                                                false);
+    REQUIRE_GT(headers_len, 0u);
+    initial_len += headers_len;
+    REQUIRE_EQ(h2_conn->recv_buf.write(initial, initial_len), initial_len);
+    on_h2_data<SmallLoop>(&h2_loop, *h2_conn, make_ev(h2_conn_id, IoEventType::Recv, initial_len));
+    CHECK_EQ(h2.pending_stream, 1u);
+    CHECK_EQ(signed_request_h2_status(h2_conn->send_buf.data(), h2_conn->send_buf.len(), 1), 0u);
+    if (h2_conn->send_buf.len() != 0)
+        h2_conn->on_send(
+            &h2_loop, *h2_conn, make_ev(h2_conn_id, IoEventType::Send, h2_conn->send_buf.len()));
+    const std::string prefix = "first=one";
+    Http2FrameHeader data_header{};
+    data_header.length = prefix.size();
+    data_header.type = static_cast<u8>(Http2FrameType::Data);
+    data_header.stream_id = 1;
+    u8 data_frame[256]{};
+    write_frame_header(data_frame, data_header);
+    __builtin_memcpy(data_frame + kFrameHeaderSize, prefix.data(), prefix.size());
+    const u32 prefix_len = kFrameHeaderSize + prefix.size();
+    REQUIRE_EQ(h2_conn->recv_buf.write(data_frame, prefix_len), prefix_len);
+    on_h2_data<SmallLoop>(&h2_loop, *h2_conn, make_ev(h2_conn_id, IoEventType::Recv, prefix_len));
+    CHECK_EQ(h2.pending_stream, 1u);
+    CHECK_EQ(signed_request_h2_status(h2_conn->send_buf.data(), h2_conn->send_buf.len(), 1), 0u);
+    const std::string suffix = body.substr(prefix.size());
+    data_header.length = suffix.size();
+    data_header.flags = http2_flag::kEndStream;
+    write_frame_header(data_frame, data_header);
+    __builtin_memcpy(data_frame + kFrameHeaderSize, suffix.data(), suffix.size());
+    const u32 suffix_len = kFrameHeaderSize + suffix.size();
+    REQUIRE_EQ(h2_conn->recv_buf.write(data_frame, suffix_len), suffix_len);
+    {
+        test_fault::ScopedSyscallFault clock(
+            test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
+        on_h2_data<SmallLoop>(
+            &h2_loop, *h2_conn, make_ev(h2_conn_id, IoEventType::Recv, suffix_len));
+    }
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_EQ(signed_request_h2_status(h2_conn->send_buf.data(), h2_conn->send_buf.len(), 1), 200u);
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK((Str{reinterpret_cast<const char*>(h2.outbound_body), h2.outbound_body_len}.eq(
+        lit_str("previous-credential"))));
+    h2_clear_outbound(h2);
+    h2_conn->h2 = nullptr;
+    release_completed_jit_json(*h2_conn);
+    h2_loop.free_conn(*h2_conn);
+    loop->free_conn(*conn);
+    pool.destroy();
+}

@@ -1677,6 +1677,18 @@ an endpoint or route, and use durable deduplication for replay-sensitive side
 effects. See
 [signed-request-auth.rut](../examples/signed-request-auth.rut).
 
+`auth.SignedRequestRotation` provides trusted `currentKeyId`, `currentKey`,
+`previousKeyId`, `previousKey`, `consumerId`, `currentId`, and `previousId`
+fields for `auth.rotatingSignedRequest(config)`. A key ID and its key must both
+be empty to disable a slot, or both nonempty to enable it. At least one slot is
+required, and enabled key IDs must differ. All identity metadata is required
+even when its slot is disabled. Configuration errors return 503 before request
+verification; invalid or revoked credentials return 401 with the Signature
+challenge. Both enabled slots verify the same captured request fields, and the
+matching credential ID is returned. Clearing the previous pair revokes it.
+This policy has no remote key refresh or replay store. See
+[`signed-request-rotation.rut`](../examples/signed-request-rotation.rut).
+
 `auth.hmac(message, signature, key, consumerId, credentialId)` publishes an
 Identity only after verification. `auth.rotatingHmac(...)` evaluates current
 and previous slots, prefers current on a tie, and supports revocation by
