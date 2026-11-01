@@ -2817,6 +2817,15 @@ re-read), each with its own buffer for natural backpressure.
   closed — a misbehaving or hostile backend cannot hijack the connection and
   have pipelined bytes forwarded raw.
 
+- **Terminate-mode admission.** Before sending a `101` on a terminate route,
+  the request must contain the exact `websocket` Upgrade token and the response
+  must contain one exact `Upgrade: websocket` field, a Connection `Upgrade`
+  token, and a complete untruncated header block. Nonempty response extensions
+  are rejected. Failure closes the connection before the `101` is sent; the
+  runtime does not synthesize a 502 or WebSocket Close frame. Bare passthrough
+  routes keep generic Upgrade behavior. This is a bounded admission check, not
+  full RFC 6455 handshake validation.
+
 - **Backpressure.** Each direction pauses its read while its paired send drains,
   so a slow peer applies TCP flow control to the fast one. Buffered bytes are
   never split or dropped: a send completion consumes only the submitted prefix

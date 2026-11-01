@@ -757,6 +757,26 @@ target_include_directories(test_ws_terminate PRIVATE
 add_test(NAME test_ws_terminate COMMAND test_ws_terminate)
 set_tests_properties(test_ws_terminate PROPERTIES LABELS "unit")
 
+if(RUT_ENABLE_WEBSOCKET)
+    add_executable(test_ws_upgrade_admission test_ws_upgrade_admission.cc)
+    target_link_libraries(test_ws_upgrade_admission rut_test_fault rut_runtime)
+    target_include_directories(test_ws_upgrade_admission PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/testing
+    )
+    add_test(NAME test_ws_upgrade_admission COMMAND test_ws_upgrade_admission)
+    set_tests_properties(test_ws_upgrade_admission PROPERTIES LABELS "unit;network")
+
+    if(RUT_ENABLE_JIT AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND Python3_Interpreter_FOUND)
+        add_test(NAME test_ws_upgrade_admission_e2e
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_ws_upgrade_admission_e2e.py
+                --server $<TARGET_FILE:rut>)
+        set_tests_properties(test_ws_upgrade_admission_e2e PROPERTIES
+            LABELS "integration;network" RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
+endif()
+
 # Differential HPACK test against the vendored nghttp2 reference.
 add_executable(test_hpack_diff test_hpack_diff.cc)
 target_link_libraries(test_hpack_diff rut_runtime nghttp2_ref)
