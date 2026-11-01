@@ -910,6 +910,19 @@ return websocket(chat) { message in
 // The selected value is parsed and copied synchronously into the existing output
 // slice; no borrowed JSON document/string survives the callback.
 
+// Preserve a JSON number's exact source lexeme as a typed text alias. No float or
+// Int conversion occurs: -0, 1.2300e+999 and values larger than i64 stay unchanged.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let field = json.get(document, "/amount") else { message.close(1008) }
+    guard let amount = json.numberText(field) else { message.close(1003) }
+    message.forward("amount=" + amount)
+}
+// numberText aliases support literal string comparisons and existing string
+// predicates, not numeric comparisons, arithmetic or alias-to-alias comparisons.
+// One prior alias may be the dynamic source with fixed UTF-8 affixes; its exact token
+// is copied synchronously to the owned output slice. Binary JSON also emits Text.
+
 // JSON Bool fields are type-checked; false is a successfully unwrapped value.
 return websocket(chat) { message in
     guard let document = json.parse(message.text) else { message.close(1007) }

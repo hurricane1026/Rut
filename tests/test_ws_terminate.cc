@@ -7,6 +7,7 @@
 #include "rut/runtime/ws_frame.h"
 #include "rut/runtime/ws_terminate.h"
 #include "test.h"
+#include <cstdio>
 #include <cstring>
 
 using namespace rut;
@@ -614,6 +615,114 @@ TEST(ws_terminate, json_string_rewrite_decodes_copies_and_supports_both_roles) {
                                                   lit_str("not equal")));
         CHECK(memcmp(out, original_output, produced) == 0);
     }
+}
+
+TEST(ws_terminate, json_number_text_rewrite_preserves_lexeme_and_copies_for_both_roles) {
+    const char* tokens[] = {
+        "-0", "1.2300", "1e+09", "1E-0002", "123456789012345678901234567890123456789"};
+    for (const char* token : tokens) {
+        char payload[96];
+        const int payload_len = snprintf(payload, sizeof(payload), "{\"n\":%s}", token);
+        REQUIRE(payload_len > 0);
+        for (bool masked : kMaskDirections) {
+            WsInspector st = make_state(masked);
+            st.forward_text = {{"<", 1}, {">", 1}, {"/n", 2}, WsTextSource::JsonNumberText};
+            st.max_message_size = 128;
+            Recorder r;
+            r.verdict = WsFrameAction::ForwardText;
+            u8 in[128], out[128], msg[128], decoded[128];
+            const u32 n = build(in,
+                                WsOpcode::Binary,
+                                true,
+                                masked,
+                                reinterpret_cast<const u8*>(payload),
+                                static_cast<u32>(payload_len));
+            u32 used = 0, produced = 0;
+            REQUIRE(
+                ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+            CHECK_EQ(used, n);
+            WsFrameHeader h{};
+            REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+            CHECK(h.opcode == WsOpcode::Text);
+            char expected[96];
+            const int expected_len = snprintf(expected, sizeof(expected), "<%s>", token);
+            REQUIRE(expected_len > 0);
+            CHECK_EQ(h.payload_len, static_cast<u64>(expected_len));
+            CHECK(memcmp(decoded, expected, static_cast<u32>(expected_len)) == 0);
+            u8 stable[128];
+            memcpy(stable, out, produced);
+            const char clobber[] = R"({"n":2})";
+            CHECK(ws_json_number_text_at_path(
+                reinterpret_cast<const u8*>(clobber), sizeof(clobber) - 1, lit_str("/n")));
+            CHECK(memcmp(stable, out, produced) == 0);
+        }
+    }
+}
+
+TEST(ws_terminate, json_number_text_binding_and_rewrite_fail_closed) {
+    const char* numbers[] = {"-0", "1.2300e+999", "92233720368547758081234567890"};
+    for (const char* number : numbers) {
+        char payload[96];
+        const int payload_len = snprintf(payload, sizeof(payload), "{\"n\":%s}", number);
+        REQUIRE(payload_len > 0);
+        const Str kToken{number, static_cast<u32>(strlen(number))};
+        CHECK(ws_json_number_text_at_path(
+            reinterpret_cast<const u8*>(payload), static_cast<u32>(payload_len), lit_str("/n")));
+        CHECK(ws_json_number_text_matches_at_path(reinterpret_cast<const u8*>(payload),
+                                                  static_cast<u32>(payload_len),
+                                                  lit_str("/n"),
+                                                  kToken,
+                                                  WsJsonStringMatch::Equal));
+        CHECK(ws_json_number_text_matches_at_path(reinterpret_cast<const u8*>(payload),
+                                                  static_cast<u32>(payload_len),
+                                                  lit_str("/n"),
+                                                  {kToken.ptr, 1},
+                                                  WsJsonStringMatch::Prefix));
+        CHECK(ws_json_number_text_matches_at_path(reinterpret_cast<const u8*>(payload),
+                                                  static_cast<u32>(payload_len),
+                                                  lit_str("/n"),
+                                                  {kToken.ptr + kToken.len - 1, 1},
+                                                  WsJsonStringMatch::Suffix));
+        CHECK(ws_json_number_text_matches_at_path(reinterpret_cast<const u8*>(payload),
+                                                  static_cast<u32>(payload_len),
+                                                  lit_str("/n"),
+                                                  lit_str("."),
+                                                  WsJsonStringMatch::Contains) ==
+              (memchr(number, '.', kToken.len) != nullptr));
+    }
+    const char* non_numbers[] = {
+        "{", "{}", R"({"n":null})", R"({"n":"1"})", R"({"n":true})", R"({"n":[]})", R"({"n":{}})"};
+    for (const char* payload : non_numbers)
+        CHECK_FALSE(ws_json_number_text_at_path(
+            reinterpret_cast<const u8*>(payload), strlen(payload), lit_str("/n")));
+    const char invalid_pointer_payload[] = R"({"n":1})";
+    CHECK_FALSE(ws_json_number_text_at_path(reinterpret_cast<const u8*>(invalid_pointer_payload),
+                                            sizeof(invalid_pointer_payload) - 1,
+                                            lit_str("/n~2x")));
+    CHECK_FALSE(ws_json_number_text_at_path(reinterpret_cast<const u8*>(invalid_pointer_payload),
+                                            sizeof(invalid_pointer_payload) - 1,
+                                            {nullptr, 1}));
+    char oversized[json::kMaxBytes + 1];
+    oversized[0] = '1';
+    memset(oversized + 1, ' ', sizeof(oversized) - 1);
+    CHECK_FALSE(
+        ws_json_number_text_at_path(reinterpret_cast<const u8*>(oversized), sizeof(oversized), {}));
+
+    auto st = make_state(false);
+    st.forward_text = {{"123456", 6}, {"!", 1}, {"/n", 2}, WsTextSource::JsonNumberText};
+    st.max_message_size = 7;
+    Recorder r;
+    r.verdict = WsFrameAction::ForwardText;
+    const char payload[] = R"({"n":1})";
+    u8 in[64], out[64], msg[64];
+    const u32 n = build(
+        in, WsOpcode::Text, true, false, reinterpret_cast<const u8*>(payload), sizeof(payload) - 1);
+    u32 used = 0, produced = 0;
+    CHECK(ws_inspect(st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+          WsInspectStatus::Error);
+    CHECK_EQ(produced, 0u);
 }
 
 TEST(ws_terminate, json_string_rewrite_fails_closed_for_invalid_values_and_bounds) {

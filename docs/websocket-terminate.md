@@ -140,6 +140,15 @@ callback or remain live during asynchronous sends. A valid JSON string from eith
 a Text or Binary input is emitted as a Text message; parse, lookup, type, decoding,
 UTF-8, and output-size failures fail closed.
 
+`json.numberText(documentOrField)` binds only JSON numbers and preserves their exact
+source lexeme. `-0`, `1.2300e+999`, and integers larger than `i64` remain unchanged.
+The typed alias supports literal string equality/inequality and the existing
+`isEmpty`, `hasPrefix`, `hasSuffix`, and `contains` predicates, but no numeric
+comparisons or arithmetic. It may be the sole dynamic source in the same fixed
+affix rewrite. The runtime copies the raw number token into the owned output slice
+during the synchronous callback; Text and Binary JSON inputs both produce Text.
+Missing/non-number values, parser-limit failures, and output overflow fail closed.
+
 JSON booleans can be unwrapped with `guard let enabled = json.bool(field) ...`;
 `json.bool(document)` checks a root Boolean. Both `true` and `false` are successful
 bindings, while missing fields, JSON null, and other JSON kinds fail. A Bool alias

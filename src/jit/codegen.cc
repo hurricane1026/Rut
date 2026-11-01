@@ -2874,16 +2874,18 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 23 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 28 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
-        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 23) ||
+        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 28) ||
              guards[i].accessor == 3 || (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
             guards[i].pattern_len != 0 && !guards[i].pattern)
             return false;
-        if (((guards[i].accessor >= 13 && guards[i].accessor <= 16) || guards[i].accessor == 21) &&
+        if (((guards[i].accessor >= 13 && guards[i].accessor <= 16) || guards[i].accessor == 21 ||
+             (guards[i].accessor >= 25 && guards[i].accessor <= 28)) &&
             guards[i].value_len != 0 && !guards[i].value)
             return false;
+        if (guards[i].accessor == 24 && guards[i].value_len != 0) return false;
         if (guards[i].accessor == 18 && guards[i].bound > 1) return false;
         if (guards[i].accessor == 23 &&
             (guards[i].int_bound < -2147483648LL || guards[i].int_bound > 2147483647LL))
@@ -3129,6 +3131,48 @@ bool emit_ws_handler(LLVMModuleRef mod,
                 LLVMBuildCall2(builder, count_ty, count_fn, args, compare ? 6 : 4, "json.count");
             cond = LLVMBuildICmp(
                 builder, LLVMIntNE, valid, LLVMConstInt(i8_ty, 0, 0), "json.count.matches");
+        } else if (guards[i].accessor >= 24 && guards[i].accessor <= 28) {
+            const bool kValidOnly = guards[i].accessor == 24;
+            LLVMTypeRef params[7] = {ptr_ty, i64_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, i8_ty};
+            LLVMTypeRef valid_params[4] = {ptr_ty, i64_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ty =
+                LLVMFunctionType(i8_ty, kValidOnly ? valid_params : params, kValidOnly ? 4 : 7, 0);
+            const char* helper = kValidOnly ? "rut_helper_ws_json_number_text_at_path"
+                                            : "rut_helper_ws_json_number_text_matches_at_path";
+            LLVMValueRef fn = LLVMGetNamedFunction(mod, helper);
+            if (!fn) fn = LLVMAddFunction(mod, helper, ty);
+            LLVMValueRef path = LLVMConstStringInContext(
+                ctx, guards[i].pattern ? guards[i].pattern : "", guards[i].pattern_len, 1);
+            LLVMValueRef path_global =
+                LLVMAddGlobal(mod, LLVMTypeOf(path), "json.number_text.path");
+            LLVMSetInitializer(path_global, path);
+            LLVMSetGlobalConstant(path_global, 1);
+            LLVMSetLinkage(path_global, LLVMPrivateLinkage);
+            LLVMSetUnnamedAddress(path_global, LLVMGlobalUnnamedAddr);
+            LLVMValueRef args[7] = {payload,
+                                    len,
+                                    path_global,
+                                    LLVMConstInt(i32_ty, guards[i].pattern_len, 0),
+                                    nullptr,
+                                    nullptr,
+                                    nullptr};
+            if (!kValidOnly) {
+                LLVMValueRef expected = LLVMConstStringInContext(
+                    ctx, guards[i].value ? guards[i].value : "", guards[i].value_len, 1);
+                LLVMValueRef expected_global =
+                    LLVMAddGlobal(mod, LLVMTypeOf(expected), "json.number_text.expected");
+                LLVMSetInitializer(expected_global, expected);
+                LLVMSetGlobalConstant(expected_global, 1);
+                LLVMSetLinkage(expected_global, LLVMPrivateLinkage);
+                LLVMSetUnnamedAddress(expected_global, LLVMGlobalUnnamedAddr);
+                args[4] = expected_global;
+                args[5] = LLVMConstInt(i32_ty, guards[i].value_len, 0);
+                args[6] = LLVMConstInt(i8_ty, guards[i].accessor - 25, 0);
+            }
+            LLVMValueRef result =
+                LLVMBuildCall2(builder, ty, fn, args, kValidOnly ? 4 : 7, "json.number_text");
+            cond = LLVMBuildICmp(
+                builder, LLVMIntNE, result, LLVMConstInt(i8_ty, 0, 0), "json.number_text.matches");
         } else if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
             // Emit the pattern + db globals JIT finalization compiles & back-patches. The `ws<id>`
             // suffix keeps these distinct from the HTTP regex globals already in this module.

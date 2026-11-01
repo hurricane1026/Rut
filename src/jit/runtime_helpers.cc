@@ -2053,6 +2053,31 @@ extern "C" u8 rut_helper_ws_json_string_matches_at_path(const char* payload,
                : 0u;
 }
 
+extern "C" u8 rut_helper_ws_json_number_text_at_path(const char* payload,
+                                                     u64 len,
+                                                     const char* path,
+                                                     u32 path_len) {
+    return ws_json_number_text_at_path(reinterpret_cast<const u8*>(payload), len, {path, path_len})
+               ? 1u
+               : 0u;
+}
+
+extern "C" u8 rut_helper_ws_json_number_text_matches_at_path(const char* payload,
+                                                             u64 len,
+                                                             const char* path,
+                                                             u32 path_len,
+                                                             const char* expected,
+                                                             u32 expected_len,
+                                                             u8 operation) {
+    return ws_json_number_text_matches_at_path(reinterpret_cast<const u8*>(payload),
+                                               len,
+                                               {path, path_len},
+                                               {expected, expected_len},
+                                               static_cast<WsJsonStringMatch>(operation))
+               ? 1u
+               : 0u;
+}
+
 extern "C" u8 rut_helper_ws_json_bool_at_path(const char* payload,
                                               u64 len,
                                               const char* path,

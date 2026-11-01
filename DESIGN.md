@@ -2665,6 +2665,17 @@ Empty values, embedded NUL, and Unicode are preserved without normalization.
 The final payload, including both affixes, must fit both bounds; overflow fails
 before a rewritten frame is emitted.
 
+`json.numberText(documentOrField)` is a separate typed alias for one JSON Number.
+It exposes the original decimal lexeme as text, preserving negative zero, decimal
+trailing zeros, exponent spelling and arbitrary-size integer digits without a
+floating-point or integer conversion. It supports literal string comparisons and
+the existing string predicates, but no numeric comparisons, arithmetic or
+alias-to-alias comparisons. As a rewrite source it follows the same prior-guard
+scope and fixed-affix limits as `json.string`; its source tag stays distinct. The
+selected raw token is copied synchronously into the existing owned output slice;
+JSON numbers from Text or Binary messages become Text output. Parser and output
+bounds remain fail-closed.
+
 The runtime reassembles and validates the original message before invoking the
 handler, writes replacement frames to the existing separate output slice, and
 pauses input while output drains. For a selected JSON string recipe, the inspector
@@ -2679,7 +2690,7 @@ upstream receive on io_uring, so multiple CQEs cannot overflow receive storage
 before the inspection callback drains it. Literal bytes and JSON Pointer paths are
 copied into the loaded program's retained arena; native artifacts relocate both
 views, so neither mode retains temporary HIR views. The native artifact format
-version is 12 following the dynamic-source recipe layout change. Encoding copies
+version is 13 following the dynamic-source recipe tag extension. Encoding copies
 the prefix, dynamic source, and suffix directly into the existing output slice,
 then masks that frame; no concatenation buffer or message-time allocation is
 introduced.

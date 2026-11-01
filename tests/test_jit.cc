@@ -20712,8 +20712,118 @@ TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     nodes[2].rhs = 1;
     nodes[1].is_operand = false;  // child is another source guard
     CHECK_FALSE(codegen_ws_handler(0, nodes, 3, 0).ok);
+    WsLenGuardSpec invalid_source{};
+    invalid_source.accessor = 29;
+    CHECK_FALSE(codegen_ws_handler(0, &invalid_source, 1, 0).ok);
+    invalid_source.accessor = 24;
+    invalid_source.pattern = nullptr;
+    invalid_source.pattern_len = 1;
+    CHECK_FALSE(codegen_ws_handler(0, &invalid_source, 1, 0).ok);
+    invalid_source.pattern = "";
+    invalid_source.pattern_len = 0;
+    invalid_source.accessor = 25;
+    invalid_source.value = nullptr;
+    invalid_source.value_len = 1;
+    CHECK_FALSE(codegen_ws_handler(0, &invalid_source, 1, 0).ok);
+    invalid_source.value = "";
+    invalid_source.value_len = 0;
+    invalid_source.accessor = 24;
+    invalid_source.value_len = 1;  // valid-only accessor must not carry a predicate value.
+    CHECK_FALSE(codegen_ws_handler(0, &invalid_source, 1, 0).ok);
     CHECK_FALSE(codegen_ws_handler(0, nullptr, 1, 0).ok);
     CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
+}
+
+TEST(jit, websocket_json_number_text_guard_is_exact_and_typed) {
+    WsLenGuardSpec guards[2]{};
+    guards[0].accessor = 24;
+    guards[0].pattern = "/n";
+    guards[0].pattern_len = 2;
+    guards[0].verdict = static_cast<u8>(WsFrameAction::Drop);
+    guards[1].accessor = 25;
+    guards[1].pattern = "/n";
+    guards[1].pattern_len = 2;
+    guards[1].value = "1.2300e+999";
+    guards[1].value_len = 11;
+    guards[1].verdict = static_cast<u8>(WsFrameAction::Drop);
+    CodegenResult generated = codegen_ws_handler(0, guards, 2, 17);
+    REQUIRE(generated.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(generated.mod, generated.ctx));
+    auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_17"));
+    REQUIRE(handler);
+    const char valid[] = R"({"n":1.2300e+999})";
+    CHECK_EQ(static_cast<u8>(handler(nullptr,
+                                     WsOpcode::Binary,
+                                     reinterpret_cast<const u8*>(valid),
+                                     sizeof(valid) - 1,
+                                     true)),
+             static_cast<u8>(WsFrameAction::Forward));
+    const char wrong[] = R"({"n":1e+999})";
+    CHECK_EQ(static_cast<u8>(handler(nullptr,
+                                     WsOpcode::Binary,
+                                     reinterpret_cast<const u8*>(wrong),
+                                     sizeof(wrong) - 1,
+                                     true)),
+             static_cast<u8>(WsFrameAction::Drop));
+    const char non_number[] = R"({"n":"1.2300e+999"})";
+    CHECK_EQ(static_cast<u8>(handler(nullptr,
+                                     WsOpcode::Binary,
+                                     reinterpret_cast<const u8*>(non_number),
+                                     sizeof(non_number) - 1,
+                                     true)),
+             static_cast<u8>(WsFrameAction::Drop));
+    engine.shutdown();
+
+    char kLongNeedle[json::kMaxBytes + 1];
+    memset(kLongNeedle, 'x', sizeof(kLongNeedle));
+    WsLenGuardSpec long_needle{};
+    long_needle.accessor = 26;
+    long_needle.pattern = "/n";
+    long_needle.pattern_len = 2;
+    long_needle.value = kLongNeedle;
+    long_needle.value_len = static_cast<u32>(sizeof(kLongNeedle));
+    long_needle.verdict = static_cast<u8>(WsFrameAction::Drop);
+    CodegenResult long_needle_generated = codegen_ws_handler(0, &long_needle, 1, 18);
+    REQUIRE(long_needle_generated.ok);
+    JitEngine long_needle_engine;
+    REQUIRE(long_needle_engine.init());
+    REQUIRE(long_needle_engine.compile(long_needle_generated.mod, long_needle_generated.ctx));
+    auto long_needle_handler =
+        reinterpret_cast<WsMessageHandlerFn>(long_needle_engine.lookup("ws_handler_18"));
+    REQUIRE(long_needle_handler);
+    const char one_number[] = R"({"n":1})";
+    CHECK_EQ(static_cast<u8>(long_needle_handler(nullptr,
+                                                 WsOpcode::Text,
+                                                 reinterpret_cast<const u8*>(one_number),
+                                                 sizeof(one_number) - 1,
+                                                 true)),
+             static_cast<u8>(WsFrameAction::Drop));
+    long_needle_engine.shutdown();
+
+    char kLongPath[json::kMaxBytes + 1];
+    memset(kLongPath, 'x', sizeof(kLongPath));
+    WsLenGuardSpec long_path{};
+    long_path.accessor = 24;
+    long_path.pattern = kLongPath;
+    long_path.pattern_len = static_cast<u32>(sizeof(kLongPath));
+    long_path.verdict = static_cast<u8>(WsFrameAction::Drop);
+    CodegenResult long_path_generated = codegen_ws_handler(0, &long_path, 1, 19);
+    REQUIRE(long_path_generated.ok);
+    JitEngine long_path_engine;
+    REQUIRE(long_path_engine.init());
+    REQUIRE(long_path_engine.compile(long_path_generated.mod, long_path_generated.ctx));
+    auto long_path_handler =
+        reinterpret_cast<WsMessageHandlerFn>(long_path_engine.lookup("ws_handler_19"));
+    REQUIRE(long_path_handler);
+    CHECK_EQ(static_cast<u8>(long_path_handler(nullptr,
+                                               WsOpcode::Text,
+                                               reinterpret_cast<const u8*>(one_number),
+                                               sizeof(one_number) - 1,
+                                               true)),
+             static_cast<u8>(WsFrameAction::Drop));
+    long_path_engine.shutdown();
 }
 
 TEST(jit, websocket_branch_policy_verdict_validation) {
@@ -20818,7 +20928,7 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     auto max_count = codegen_ws_handler(0, &node, 1, 0);
     REQUIRE(max_count.ok);
     dispose_module(max_count.mod, max_count.ctx);
-    node.accessor = 24;
+    node.accessor = 29;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 

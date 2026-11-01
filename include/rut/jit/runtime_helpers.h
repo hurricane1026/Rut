@@ -260,6 +260,17 @@ rut::u8 rut_helper_ws_json_string_matches_at_path(const char* payload,
                                                   const char* expected,
                                                   rut::u32 expected_len,
                                                   rut::u8 operation);
+rut::u8 rut_helper_ws_json_number_text_at_path(const char* payload,
+                                               rut::u64 len,
+                                               const char* path,
+                                               rut::u32 path_len);
+rut::u8 rut_helper_ws_json_number_text_matches_at_path(const char* payload,
+                                                       rut::u64 len,
+                                                       const char* path,
+                                                       rut::u32 path_len,
+                                                       const char* expected,
+                                                       rut::u32 expected_len,
+                                                       rut::u8 operation);
 rut::u8 rut_helper_ws_json_bool_at_path(const char* payload,
                                         rut::u64 len,
                                         const char* path,

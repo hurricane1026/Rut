@@ -420,8 +420,11 @@ bool load_rut_program(const char* path,
                         result.source = WsTextSource::MessageText;
                         if (source.source_path.ptr || source.source_path.len != 0) return false;
                         break;
-                    case HirWsTextSource::JsonString: {
-                        result.source = WsTextSource::JsonString;
+                    case HirWsTextSource::JsonString:
+                    case HirWsTextSource::JsonNumberText: {
+                        result.source = source.source == HirWsTextSource::JsonString
+                                            ? WsTextSource::JsonString
+                                            : WsTextSource::JsonNumberText;
                         if (source.source_path.len > json::kMaxBytes ||
                             (!source.source_path.ptr && source.source_path.len))
                             return false;
