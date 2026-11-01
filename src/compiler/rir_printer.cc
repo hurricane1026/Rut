@@ -255,6 +255,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::StandardWebhookValid:
             buf.put_cstr("auth.standard_webhook_valid");
             break;
+        case Opcode::SignedRequestValid:
+            buf.put_cstr("auth.signed_request_valid");
+            break;
         case Opcode::HmacSha256Matches:
             buf.put_cstr("hash.hmac_sha256_matches");
             break;
@@ -795,6 +798,12 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::StandardWebhookValid:
             for (u32 i = 0; i < 5; ++i) {
+                buf.put_cstr(i == 0 ? " " : ", ");
+                print_value_ref(buf, inst.operand(i));
+            }
+            break;
+        case Opcode::SignedRequestValid:
+            for (u32 i = 0; i < 8; ++i) {
                 buf.put_cstr(i == 0 ? " " : ", ");
                 print_value_ref(buf, inst.operand(i));
             }

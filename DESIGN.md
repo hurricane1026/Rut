@@ -8512,8 +8512,7 @@ Authentication and rotation remain ordinary Rut functions in
 `examples/middleware/auth.rut`: hmac, rotatingHmac and githubWebhook. Verified
 identity metadata comes from server configuration; callers must select a unique
 signature field and sign the original bytes. Integrity verification alone does
-not establish freshness, replay prevention, canonical HTTP request signing or
-any OAuth/SAML/LDAP protocol. Track those independently in
+not establish replay prevention or any OAuth/SAML/LDAP protocol. Track those independently in
 [auth-coverage.md](docs/auth-coverage.md).
 
 `standardWebhookValid(id, timestamp, signature, body, rawKey)` returns a nonoptional
@@ -8525,6 +8524,45 @@ fails closed on clock failure or nonpositive time, and enforces the fixed inclus
 field to reject duplicates. This verifies freshness and integrity; callers must
 deduplicate verified IDs durably across shards and nodes before side effects.
 The builtin uses dedicated HIR/MIR/RIR lowering and adds no keyword or dependency.
+
+### Fixed signed-request HMAC-SHA256 subprofile
+
+`Crypto.signedRequestValid(method, target, authorization, date, digest, body,
+keyId, key)` exposes a bounded native verifier, and
+`auth.signedRequest(keyId, key, consumerId, credentialId)` binds it to the
+implicit Rut request context. The helper reads `req.method`, the original `req.path` including
+the query, the singleton Authorization/Date/Digest values, and the complete
+raw body. Chunked HTTP/1 bodies are rejected; a `req.body` read marks the route
+as requiring body completion before handler execution. The Rut helper rejects
+bodies over 16 KiB; the native verifier supports up to 1 MiB.
+
+Authorization is exactly `Signature` with four quoted parameters:
+`keyId`, `algorithm="hmac-sha256"`,
+`headers="@request-target date digest"`, and canonical padded Base64
+`signature`; the fields may be reordered, but unknown, duplicate, missing, or
+trailing data fails closed. The algorithm and signed-header list are fixed.
+Only uppercase GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, and TRACE are
+accepted; CONNECT and non-origin-form targets are rejected. The exact target
+bytes, including query and percent encoding, are not normalized.
+
+Date is strict 29-byte IMF-fixdate GMT with valid weekday and calendar date,
+within an inclusive 300 seconds of the trusted runtime clock. Digest is
+mandatory for empty and nonempty bodies and equals `SHA-256=` followed by
+canonical padded Base64 of SHA-256 over exact raw body bytes. HMAC-SHA256 covers
+the trusted key ID, method/target line, date line, and digest line, each
+newline-terminated. Keys, IDs, Authorization, target and body have fixed
+bounds; processing uses existing stack-based hash primitives without large
+body concatenation. Empty configured key/identity metadata returns 503;
+signature or request validation failure returns 401 with a Signature
+challenge. Successful identity metadata comes only from trusted configuration.
+Host/authority and nonce are not signed. Callers must configure trusted keys
+for an endpoint/route scope, authorize the returned identity, remove
+Authorization before forwarding when appropriate, and use durable replay
+controls for side effects. This is a fixed native subprofile, not full HTTP
+Message Signatures or APISIX/Kong compatibility, and adds no grammar,
+dependency, remote key refresh, or replay store. See the
+[language card](docs/language-card.md#hmac-sha256-and-webhook-authentication-implemented)
+and [auth coverage](docs/auth-coverage.md).
 
 ### Implemented generic digest and HMAC calls
 

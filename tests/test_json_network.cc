@@ -1,4 +1,5 @@
 #include "fault_injection.h"
+#include "fixtures/signed_request.h"
 #include "rs256_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
@@ -1281,6 +1282,339 @@ route GET "/rs256" {
         test_fault::ScopedSyscallFault fault(clock);
         run(good, 401);
     }
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
+static u16 signed_request_h2_status(const u8* data, u32 len, u32 stream_id) {
+    u32 pos = 0;
+    hpack::DynamicTable dyn;
+    dyn.init(kDefaultHeaderTableSize);
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader frame{};
+        if (parse_frame_header(data + pos, len - pos, &frame) != ParseStatus::Complete) return 0;
+        const u32 total = kFrameHeaderSize + frame.length;
+        if (total > len - pos) return 0;
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers) &&
+            frame.stream_id == stream_id) {
+            hpack::Header headers[16];
+            u8 scratch[1024];
+            u32 count = 0;
+            if (!hpack::decode_header_block(dyn,
+                                            data + pos + kFrameHeaderSize,
+                                            frame.length,
+                                            scratch,
+                                            sizeof(scratch),
+                                            headers,
+                                            16,
+                                            &count))
+                return 0;
+            for (u32 i = 0; i < count; i++) {
+                if (!headers[i].name.eq(lit_str(":status")) || headers[i].value.len != 3) continue;
+                return static_cast<u16>((headers[i].value.ptr[0] - '0') * 100 +
+                                        (headers[i].value.ptr[1] - '0') * 10 +
+                                        headers[i].value.ptr[2] - '0');
+            }
+            return 0;
+        }
+        pos += total;
+    }
+    return 0;
+}
+
+TEST(json_network, signed_request_auth_binds_http_method_target_headers_and_complete_body) {
+    using ::rut::test::signed_request::Headers;
+    constexpr i64 kNow = 1700000000;
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/multi-consumer-auth.rut";
+    JsonProgram program;
+    REQUIRE(program.init(R"rut(
+import "middleware/auth.rut"
+route "/signed" {
+    let identity = auth.signedRequest("rut-test-key", "signed-request-test-secret-32bytes", "consumer-a", "credential-a")
+    let authMethod = identity.method
+    return response(200, body: authMethod)
+}
+route "/empty-config" {
+    let identity = auth.signedRequest("", "", "", "")
+    let authMethod = identity.method
+    return response(200, body: authMethod)
+}
+)rut",
+                         source_path.c_str()));
+    REQUIRE_EQ(program.config->route_count, 2u);
+    CHECK(program.config->routes[0].needs_req_body);
+
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    conn->json_arena.backend.pool = &pool;
+
+    auto run_h1 = [&](const char* method,
+                      const std::string& target,
+                      const std::string& body,
+                      const Headers& auth,
+                      u32 expected_status,
+                      const std::string& extra_headers = {},
+                      bool clock_failure = false) {
+        std::string request = std::string(method) + " " + target + " HTTP/1.1\r\nHost: test\r\n";
+        if (!auth.authorization.empty()) request += "Authorization: " + auth.authorization + "\r\n";
+        if (!auth.date.empty()) request += "Date: " + auth.date + "\r\n";
+        if (!auth.digest.empty()) request += "Digest: " + auth.digest + "\r\n";
+        request +=
+            extra_headers + "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        const u32 route_index = target == "/empty-config" ? 1u : 0u;
+        const auto handler = program.handler(route_index);
+        const auto outcome = [&]() {
+            if (clock_failure) {
+                test_fault::SyscallFaultConfig failed{};
+                failed.clock_gettime_errno = EIO;
+                failed.clock_gettime_failures = 100;
+                test_fault::ScopedSyscallFault fault(failed);
+                return invoke_jit_handler(
+                    handler, conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+            }
+            test_fault::ScopedSyscallFault clock(
+                test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
+            return invoke_jit_handler(
+                handler, conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        }();
+        CHECK_EQ(outcome.status_code, expected_status);
+        handle_jit_outcome(loop.get(), *conn, outcome, handler, true);
+        const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+        if (expected_status == 200)
+            CHECK(wire.ends_with("signedRequest"));
+        else
+            CHECK(wire.find("signedRequest") == std::string::npos);
+    };
+
+    const std::string target = "/signed?x=%2F&x=two";
+    const std::string body = "first=one&second=two";
+    const Headers good = ::rut::test::signed_request::make_headers("POST", target, body, kNow);
+    REQUIRE(!good.authorization.empty());
+    const RouteConfig* active_config = program.config.get();
+    loop->config_ptr = &active_config;
+    auto run_segmented_h1 = [&](const Headers& auth, u32 expected_status) {
+        auto* segmented = loop->alloc_conn();
+        REQUIRE(segmented);
+        segmented->json_arena.backend.pool = &pool;
+        const std::string prefix = "first=one";
+        const std::string head = "POST " + target +
+                                 " HTTP/1.1\r\nHost: test\r\nAuthorization: " + auth.authorization +
+                                 "\r\nDate: " + auth.date + "\r\nDigest: " + auth.digest +
+                                 "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+        REQUIRE_EQ(segmented->recv_buf.write(reinterpret_cast<const u8*>(head.data()), head.size()),
+                   head.size());
+        REQUIRE_EQ(
+            segmented->recv_buf.write(reinterpret_cast<const u8*>(prefix.data()), prefix.size()),
+            prefix.size());
+        const u32 conn_id = segmented->id;
+        {
+            test_fault::ScopedSyscallFault clock(
+                test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
+            on_header_received<SmallLoop>(
+                loop.get(),
+                *segmented,
+                make_ev(conn_id, IoEventType::Recv, head.size() + prefix.size()));
+        }
+        CHECK(segmented->on_recv == &on_jit_request_body_recvd<SmallLoop>);
+        CHECK_EQ(segmented->req_body_remaining, body.size() - prefix.size());
+        CHECK_EQ(segmented->send_buf.len(), 0u);
+        const std::string suffix = body.substr(prefix.size());
+        REQUIRE_EQ(
+            segmented->recv_buf.write(reinterpret_cast<const u8*>(suffix.data()), suffix.size()),
+            suffix.size());
+        {
+            test_fault::ScopedSyscallFault clock(
+                test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
+            segmented->on_recv(
+                loop.get(), *segmented, make_ev(conn_id, IoEventType::Recv, suffix.size()));
+        }
+        const std::string wire(reinterpret_cast<const char*>(segmented->send_buf.data()),
+                               segmented->send_buf.len());
+        CHECK(wire.find(expected_status == 200 ? "HTTP/1.1 200" : "HTTP/1.1 401") == 0);
+        if (expected_status == 200)
+            CHECK(wire.ends_with("signedRequest"));
+        else
+            CHECK(wire.find("signedRequest") == std::string::npos);
+        release_completed_jit_json(*segmented);
+        loop->free_conn(*segmented);
+    };
+    run_segmented_h1(good, 200);
+    const Headers signed_prefix =
+        ::rut::test::signed_request::make_headers("POST", target, "first=one", kNow);
+    run_segmented_h1(signed_prefix, 401);
+
+    run_h1("POST", target, body, good, 200);
+    run_h1("POST", "/signed?x=%2F&x=changed", body, good, 401);
+    run_h1("GET", target, body, good, 401, "X-Method: POST\r\nX-Path: /signed\r\n");
+    run_h1("POST", target, body + "!", good, 401);
+
+    Headers bad = good;
+    const size_t signature_field = bad.authorization.find("signature=\"");
+    REQUIRE(signature_field != std::string::npos);
+    const size_t signature_byte = signature_field + sizeof("signature=\"") - 1;
+    bad.authorization[signature_byte] = bad.authorization[signature_byte] == 'A' ? 'B' : 'A';
+    run_h1("POST", target, body, bad, 401);
+    bad = good;
+    bad.digest.back() = bad.digest.back() == 'A' ? 'B' : 'A';
+    run_h1("POST", target, body, bad, 401);
+    bad = good;
+    const std::string key_id = "keyId=\"" + std::string(::rut::test::signed_request::kKeyId) + "\"";
+    const size_t key_id_at = bad.authorization.find(key_id);
+    REQUIRE(key_id_at != std::string::npos);
+    bad.authorization.replace(key_id_at, key_id.size(), "keyId=\"other-key\"");
+    run_h1("POST", target, body, bad, 401);
+    bad = ::rut::test::signed_request::make_headers("POST", target, body, kNow - 301);
+    run_h1("POST", target, body, bad, 401);
+    bad = ::rut::test::signed_request::make_headers("POST", target, body, kNow + 301);
+    run_h1("POST", target, body, bad, 401);
+    run_h1("POST", target, body, good, 401, "authorization: duplicate\r\n");
+    run_h1("POST", target, body, good, 401, "dAtE: duplicate\r\n");
+    run_h1("POST", target, body, good, 401, "dIgEsT: duplicate\r\n");
+    bad = good;
+    bad.authorization.clear();
+    run_h1("POST", target, body, bad, 401);
+    bad = good;
+    bad.date.clear();
+    run_h1("POST", target, body, bad, 401);
+    bad = good;
+    bad.digest.clear();
+    run_h1("POST", target, body, bad, 401);
+
+    const size_t signature_start = good.authorization.find("signature=\"");
+    REQUIRE(signature_start != std::string::npos);
+    const size_t signature_value_start = signature_start + sizeof("signature=\"") - 1;
+    const size_t signature_end = good.authorization.find('"', signature_value_start);
+    REQUIRE(signature_end != std::string::npos);
+    const std::string signature =
+        good.authorization.substr(signature_value_start, signature_end - signature_value_start);
+    bad = good;
+    bad.authorization =
+        "Signature signature=\"" + signature +
+        "\",headers=\"@request-target date digest\",algorithm=\"hmac-sha256\",keyId=\"" +
+        ::rut::test::signed_request::kKeyId + "\"";
+    run_h1("POST", target, body, bad, 200);
+    run_h1("POST", target, body, good, 401, {}, true);
+    run_h1("GET", "/empty-config", body, good, 503);
+
+    auto run_segmented_h2 = [&](const Headers& auth, u32 expected_status) {
+        SmallLoop h2_loop;
+        h2_loop.setup();
+        h2_loop.config_ptr = &active_config;
+        auto* h2_conn = h2_loop.alloc_conn();
+        REQUIRE(h2_conn);
+        h2_conn->json_arena.backend.pool = &pool;
+        h2_conn->protocol = ConnProtocol::Http2;
+        Http2Conn h2;
+        h2.init();
+        h2_conn->h2 = &h2;
+        const u32 h2_conn_id = h2_conn->id;
+
+        u8 initial[4096]{};
+        u32 initial_len = 0;
+        __builtin_memcpy(initial, kClientPreface, kClientPrefaceLen);
+        initial_len += kClientPrefaceLen;
+        Http2Settings settings{};
+        settings.set_defaults();
+        initial_len += write_settings_frame(initial + initial_len, settings);
+        const std::string content_length = std::to_string(body.size());
+        const hpack::Header headers[] = {
+            {{":method", 7}, {"POST", 4}},
+            {{":scheme", 7}, {"http", 4}},
+            {{":path", 5}, {target.data(), static_cast<u32>(target.size())}},
+            {{":authority", 10}, {"test", 4}},
+            {{"content-length", 14},
+             {content_length.data(), static_cast<u32>(content_length.size())}},
+            {{"authorization", 13},
+             {auth.authorization.data(), static_cast<u32>(auth.authorization.size())}},
+            {{"date", 4}, {auth.date.data(), static_cast<u32>(auth.date.size())}},
+            {{"digest", 6}, {auth.digest.data(), static_cast<u32>(auth.digest.size())}},
+        };
+        const u32 headers_len = http2_write_headers(initial + initial_len,
+                                                    sizeof(initial) - initial_len,
+                                                    1,
+                                                    headers,
+                                                    sizeof(headers) / sizeof(headers[0]),
+                                                    false);
+        REQUIRE_GT(headers_len, 0u);
+        initial_len += headers_len;
+        REQUIRE_EQ(h2_conn->recv_buf.write(initial, initial_len), initial_len);
+        on_h2_data<SmallLoop>(
+            &h2_loop, *h2_conn, make_ev(h2_conn_id, IoEventType::Recv, initial_len));
+        CHECK_EQ(h2.pending_stream, 1u);
+        CHECK_EQ(h2.outbound_stream, 0u);
+        CHECK_EQ(signed_request_h2_status(h2_conn->send_buf.data(), h2_conn->send_buf.len(), 1),
+                 0u);
+        if (h2_conn->send_buf.len() != 0) {
+            REQUIRE(h2_conn->on_send != nullptr);
+            h2_conn->on_send(&h2_loop,
+                             *h2_conn,
+                             make_ev(h2_conn_id, IoEventType::Send, h2_conn->send_buf.len()));
+        }
+        CHECK_EQ(h2_conn->send_buf.len(), 0u);
+
+        const std::string prefix = "first=one";
+        Http2FrameHeader data_header{};
+        data_header.length = prefix.size();
+        data_header.type = static_cast<u8>(Http2FrameType::Data);
+        data_header.stream_id = 1;
+        u8 data_frame[256]{};
+        write_frame_header(data_frame, data_header);
+        __builtin_memcpy(data_frame + kFrameHeaderSize, prefix.data(), prefix.size());
+        const u32 data_len = kFrameHeaderSize + prefix.size();
+        REQUIRE_EQ(h2_conn->recv_buf.write(data_frame, data_len), data_len);
+        on_h2_data<SmallLoop>(&h2_loop, *h2_conn, make_ev(h2_conn_id, IoEventType::Recv, data_len));
+        CHECK_EQ(h2.pending_stream, 1u);
+        CHECK_EQ(h2.pending_body_len, prefix.size());
+        CHECK_EQ(h2.outbound_stream, 0u);
+        CHECK_EQ(signed_request_h2_status(h2_conn->send_buf.data(), h2_conn->send_buf.len(), 1),
+                 0u);
+
+        const std::string suffix = body.substr(prefix.size());
+        data_header.length = suffix.size();
+        data_header.flags = http2_flag::kEndStream;
+        write_frame_header(data_frame, data_header);
+        __builtin_memcpy(data_frame + kFrameHeaderSize, suffix.data(), suffix.size());
+        const u32 final_len = kFrameHeaderSize + suffix.size();
+        REQUIRE_EQ(h2_conn->recv_buf.write(data_frame, final_len), final_len);
+        {
+            test_fault::ScopedSyscallFault clock(
+                test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
+            on_h2_data<SmallLoop>(
+                &h2_loop, *h2_conn, make_ev(h2_conn_id, IoEventType::Recv, final_len));
+        }
+        CHECK_EQ(h2.pending_stream, 0u);
+        CHECK_EQ(signed_request_h2_status(h2_conn->send_buf.data(), h2_conn->send_buf.len(), 1),
+                 expected_status);
+        if (expected_status == 200) {
+            CHECK_EQ(h2.outbound_stream, 1u);
+            CHECK((Str{reinterpret_cast<const char*>(h2.outbound_body), h2.outbound_body_len}.eq(
+                lit_str("signedRequest"))));
+        } else {
+            CHECK_EQ(h2.outbound_stream, 0u);
+        }
+        h2_clear_outbound(h2);
+        h2_conn->h2 = nullptr;
+        release_completed_jit_json(*h2_conn);
+        h2_loop.free_conn(*h2_conn);
+    };
+    run_segmented_h2(good, 200);
+    run_segmented_h2(signed_prefix, 401);
     loop->free_conn(*conn);
     pool.destroy();
 }

@@ -17,7 +17,7 @@ whether a competing open-source edition includes them.
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper; exact top-level `groups` array authorization after verification | ES keys, remote JWKS refresh/cache, live and durable token revocation |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; a fixed native APISIX-style HMAC-SHA256 signed-request subprofile | Full Kong/APISIX plugin compatibility, HTTP singleton extraction/integration, credential rotation/registry, nonce/replay persistence |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` policy | Full Kong/APISIX plugin compatibility, key rotation/registry, nonce/replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
@@ -67,13 +67,17 @@ checks do not implement persistent replay protection. The bounded Consumer
 policy work from #924, required credentials from #925, and header-count
 primitive from #926 are already present in this main base.
 
-### Native signed-request HMAC-SHA256 subprofile
+### Signed-request HMAC-SHA256 subprofile
 
 `signed_request_hmac_sha256_valid` verifies a fixed native profile inspired by
-APISIX HMAC Authentication. It is a native C++ API only: HTTP header selection,
-singleton enforcement, and request method/target binding to the parsed request
-remain caller responsibilities. This API does not claim full APISIX or Kong
-plugin compatibility.
+APISIX HMAC Authentication. `auth.signedRequest(keyId, key, consumerId,
+credentialId)` is the Rut policy helper. It reads the implicit request context,
+binding the parsed request's actual method and original target, unique
+Authorization/Date/Digest fields, and full
+body; it rejects chunked HTTP/1 bodies and requires body completion before
+handler execution. Rut/JIT exposes a 16 KiB body limit and fails closed above
+it; the native verifier limit remains 1 MiB. It does not claim full APISIX or
+Kong plugin compatibility.
 
 The caller supplies the exact method, origin-form request target, singleton
 Authorization/Date/Digest values, exact raw body bytes, trusted key ID/secret,
@@ -106,12 +110,19 @@ digest: SHA-256=canonical-padded-Base64-body-hash
 ```
 
 Trusted key IDs are 1–128 visible ASCII bytes excluding quote, backslash, and
-comma; secrets are 1–4096 bytes; bodies are at most 1 MiB; Authorization is at
-most 4096 bytes. Verification uses fixed stack buffers and existing crypto
-primitives, with no heap allocation or retained input views. Freshness checks
-do not prevent replay; callers processing non-idempotent actions need durable
-replay state. PR1 provides native verification only; later HTTP integration is
-needed before this can be used as a Rut policy.
+comma; secrets are 1–4096 bytes; native bodies are at most 1 MiB; Authorization
+is at most 4096 bytes. Verification uses fixed stack buffers and existing
+crypto primitives, with no heap allocation or retained input views; the native
+verifier returns only a boolean. The Rut `auth.signedRequest` policy returns
+503 for empty configured key or identity metadata and 401 with
+`WWW-Authenticate: Signature` for rejected requests. Successful identity
+fields come only from trusted configuration. Freshness checks do not prevent replay; callers
+processing non-idempotent actions need durable replay state. The signed fields
+do not include Host/authority or a nonce. Configure trusted keys for a bounded
+endpoint/route scope and use durable deduplication if an authenticated request
+can trigger a replay-sensitive side effect. This is not full HTTP Message
+Signatures, APISIX, or Kong equivalence. See
+[`signed-request-auth.rut`](../examples/signed-request-auth.rut).
 
 ## Bounded multi-Consumer authentication
 

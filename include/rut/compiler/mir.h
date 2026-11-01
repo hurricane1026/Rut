@@ -110,6 +110,7 @@ enum class MirValueKind : u8 {
     WaitField,
     CacheGet,
     CacheSet,
+    SignedRequestValid,
 };
 
 enum class MirTypeKind : u8 {
