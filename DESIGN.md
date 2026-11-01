@@ -2602,6 +2602,13 @@ payload access. `contains` searches for a contiguous byte substring, including
 embedded NUL; an empty substring matches every message. It does not interpret
 regex metacharacters or normalize Unicode. Dynamic arguments and interpolation
 remain unsupported.
+The HTTP route prelude before a terminating `websocket(...) { message in ... }`
+is not executed by the terminate-route publisher. Such routes therefore allow
+only immutable compile-time `let` bindings before the WebSocket statement;
+request reads and guards, runtime effects or control flow, decorators, and
+chains are rejected at compile time. Bare `websocket(upstream)` passthrough
+routes remain ordinary HTTP routes and retain their normal guards and
+decorators.
 The DSL exposes complete Text/Binary messages. Wire opcodes, FIN, masking,
 continuation frames and Ping/Pong/Close frames are runtime-internal details.
 The legacy `frame` binding and `.opcode` access are rejected; message type

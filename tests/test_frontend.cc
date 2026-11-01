@@ -5497,6 +5497,89 @@ TEST(frontend, parse_return_websocket_block_is_terminate) {
     CHECK_EQ(static_cast<u8>(stmt.then_stmt->expr.kind), static_cast<u8>(AstExprKind::MethodCall));
 }
 
+TEST(frontend, websocket_terminate_rejects_unexecuted_http_prelude) {
+    const char* detail =
+        "WebSocket message routes currently allow only compile-time constant let bindings "
+        "before websocket; request guards/effects are not executed";
+    struct Case {
+        const char* source;
+        const char* marker;
+    };
+    const Case cases[] = {
+        {"upstream ws\nroute GET \"/ws\" { guard false else { return 403 }\n"
+         "return websocket(ws) { message in message.forward() } }\n",
+         "guard false"},
+        {"upstream ws\nroute GET \"/ws\" { guard true else { return 403 }\n"
+         "return websocket(ws) { message in message.forward() } }\n",
+         "guard true"},
+        {"upstream ws\nroute GET \"/ws\" { guard let token = req.header(\"Authorization\") else "
+         "{ return 403 }\nreturn websocket(ws) { message in message.forward() } }\n",
+         "guard let token"},
+        {"upstream ws\nroute GET \"/ws\" { let unused = req.header(\"Authorization\")\n"
+         "return websocket(ws) { message in message.forward() } }\n",
+         "req.header"},
+        {"upstream ws\nroute GET \"/ws\" { req.set(\"X-Test\", \"value\")\n"
+         "return websocket(ws) { message in message.forward() } }\n",
+         "req.set"},
+        {"func helper() -> str => \"literal\"\nupstream ws\nroute GET \"/ws\" { "
+         "let unused = helper()\nreturn websocket(ws) { message in message.forward() } }\n",
+         "helper()\nreturn websocket"},
+        {"upstream ws\nroute GET \"/ws\" { if true { return 403 } else { return "
+         "websocket(ws) { message in message.forward() } } }\n",
+         "if true"},
+        {"upstream ws\n@rateLimit(limit: 1, window: 1m)\nroute GET \"/ws\" { "
+         "return websocket(ws) { message in message.forward() } }\n",
+         "@rateLimit"},
+        {"func allow() -> bool => true\nchain secure { before allow() else 403 }\n"
+         "upstream ws\nroute GET \"/ws\" use chain secure { return websocket(ws) { "
+         "message in message.forward() } }\n",
+         "use chain secure"},
+    };
+    for (const Case& test_case : cases) {
+        const Str source = lit(test_case.source);
+        auto tokens = lex(source);
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit(detail)));
+        const char* marker = std::strstr(test_case.source, test_case.marker);
+        REQUIRE(marker != nullptr);
+        CHECK_EQ(hir.error().span.start, static_cast<u32>(marker - test_case.source));
+    }
+}
+
+TEST(frontend, websocket_terminate_constant_prelude_and_passthrough_guards_remain_supported) {
+    const char* terminate_source = R"rut(
+upstream ws
+route GET "/ws" {
+    let prefix = "a\0b"
+    let alias = prefix
+    return websocket(ws) { message in
+        message.forward("[" + alias + message.text + "]")
+    }
+}
+)rut";
+    auto terminate_tokens = lex(lit(terminate_source));
+    REQUIRE(terminate_tokens);
+    auto terminate_ast = parse_file_heap(terminate_tokens.value());
+    REQUIRE(terminate_ast);
+    auto terminate_hir = analyze_file_heap(terminate_ast.value());
+    REQUIRE(terminate_hir);
+
+    const char* passthrough_source =
+        "upstream ws\nroute GET \"/ws\" { guard req.method == GET else { return 400 }\n"
+        "return websocket(ws) }\n";
+    auto passthrough_tokens = lex(lit(passthrough_source));
+    REQUIRE(passthrough_tokens);
+    auto passthrough_ast = parse_file_heap(passthrough_tokens.value());
+    REQUIRE(passthrough_ast);
+    auto passthrough_hir = analyze_file_heap(passthrough_ast.value());
+    REQUIRE(passthrough_hir);
+}
+
 TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message.forward() } }\n";
@@ -10038,7 +10121,8 @@ route GET "/ws" use chain access {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
-        lit("chain after Response effects are not supported on WebSocket routes")));
+        lit("WebSocket message routes currently allow only compile-time constant let bindings "
+            "before websocket; request guards/effects are not executed")));
 }
 #endif
 
