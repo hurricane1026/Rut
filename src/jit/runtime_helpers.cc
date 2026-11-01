@@ -2004,6 +2004,30 @@ bool jwt_decode_claims(Str token,
 
 }  // namespace
 
+extern "C" u8 rut_helper_jwt_claims_valid_with_lifetime(const char* claims,
+                                                        u32 claims_len,
+                                                        const char* issuer,
+                                                        u32 issuer_len,
+                                                        const char* audience,
+                                                        u32 audience_len,
+                                                        i64 max_age_seconds,
+                                                        i64 max_lifetime_seconds) {
+    timespec now{};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+        now.tv_nsec >= 1000000000)
+        return 0;
+    thread_local json::Document document;
+    return jwt_claims_valid_with_lifetime(document,
+                                          {claims, claims_len},
+                                          {issuer, issuer_len},
+                                          {audience, audience_len},
+                                          static_cast<i64>(now.tv_sec),
+                                          max_age_seconds,
+                                          max_lifetime_seconds)
+               ? 1u
+               : 0u;
+}
+
 extern "C" u8 rut_helper_ws_json_has_path(const char* payload,
                                           u64 len,
                                           const char* path,

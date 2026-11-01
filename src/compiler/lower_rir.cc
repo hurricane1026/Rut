@@ -2639,6 +2639,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         value.kind == MirValueKind::HttpTokenListAllows ||
         value.kind == MirValueKind::StandardWebhookValid ||
         value.kind == MirValueKind::SignedRequestValid ||
+        value.kind == MirValueKind::JwtClaimsValidWithLifetime ||
         value.kind == MirValueKind::HmacSha256Matches ||
         value.kind == MirValueKind::BearerMatches || value.kind == MirValueKind::BasicMatches ||
         value.kind == MirValueKind::ConstantTimeEqual || value.kind == MirValueKind::Eq ||
@@ -2774,6 +2775,30 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                                       extra[4],
                                                       extra[5],
                                                       {span.line, span.col});
+            if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+            return result.value();
+        }
+        if (value.kind == MirValueKind::JwtClaimsValidWithLifetime) {
+            rir::ValueId extra[3];
+            for (u32 i = 0; i < 3; ++i) {
+                auto arg = materialize_value(*value.args[i],
+                                             mir,
+                                             variant_infos,
+                                             tuple_infos,
+                                             tuple_info_count,
+                                             error_scalar_infos,
+                                             error_variant_infos,
+                                             error_struct_infos,
+                                             user_struct_defs,
+                                             b,
+                                             locals,
+                                             local_count,
+                                             span);
+                if (!arg) return core::make_unexpected(arg.error());
+                extra[i] = arg.value();
+            }
+            auto result = b.emit_jwt_claims_valid_with_lifetime(
+                lhs.value(), rhs.value(), extra[0], extra[1], extra[2], {span.line, span.col});
             if (!result) return frontend_error(FrontendError::OutOfMemory, span);
             return result.value();
         }

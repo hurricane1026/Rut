@@ -2534,3 +2534,54 @@ TEST(RirBuilder, StandardWebhookFiveOperands) {
     CHECK(std::string(print_buf, pb.len).find("auth.standard_webhook_valid") != std::string::npos);
     ctx.destroy();
 }
+
+TEST(RirVerifier, JwtClaimsLifetimeChecksArityAndTypes) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("jwt_lifetime"), lit("/jwt"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto claims = V(b.emit_const_str(lit("{}")));
+    auto issuer = V(b.emit_const_str(lit("issuer")));
+    auto audience = V(b.emit_const_str(lit("audience")));
+    auto age = V(b.emit_const_i64(300));
+    auto lifetime = V(b.emit_const_i64(3600));
+    auto result = V(b.emit_jwt_claims_valid_with_lifetime(claims, issuer, audience, age, lifetime));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(verify_function(fn).ok);
+    Instruction* op = nullptr;
+    for (u32 i = 0; i < fn->entry()->inst_count; ++i) {
+        if (fn->entry()->insts[i].op == Opcode::JwtClaimsValidWithLifetime)
+            op = &fn->entry()->insts[i];
+    }
+    REQUIRE(op != nullptr);
+    const u32 original_count = op->operand_count;
+    op->operand_count = 4;
+    auto verify = verify_function(fn);
+    CHECK_FALSE(verify.ok);
+    CHECK_EQ(verify.issue.code, VerifyIssueCode::InvalidJwtClaimsLifetime);
+    op->operand_count = original_count;
+
+    ValueId* original_extra = op->extra_operands;
+    op->extra_operands = nullptr;
+    verify = verify_function(fn);
+    CHECK_FALSE(verify.ok);
+    CHECK_EQ(verify.issue.code, VerifyIssueCode::InvalidJwtClaimsLifetime);
+    op->extra_operands = original_extra;
+
+    op->extra_operands[0] = claims;
+    verify = verify_function(fn);
+    CHECK_FALSE(verify.ok);
+    CHECK_EQ(verify.issue.code, VerifyIssueCode::InvalidJwtClaimsLifetime);
+    op->extra_operands[0] = age;
+
+    op->result = age;
+    verify = verify_function(fn);
+    CHECK_FALSE(verify.ok);
+    CHECK_EQ(verify.issue.code, VerifyIssueCode::InvalidJwtClaimsLifetime);
+    op->result = result;
+    CHECK(verify_function(fn).ok);
+    ctx.destroy();
+}
