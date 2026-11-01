@@ -271,6 +271,52 @@ bool emit_frame(u8* out,
     *produced += hdr_len + static_cast<u32>(output_len);
     return true;
 }
+
+bool emit_json_string_frame(u8* out,
+                            u32 out_cap,
+                            u32* produced,
+                            const u8* payload,
+                            u64 len,
+                            Str path,
+                            Str prefix,
+                            Str suffix,
+                            u64 max_size,
+                            bool masked,
+                            u64& mask_rng) {
+    json::Document& document = ws_json_document();
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len)) {
+        document.source = {};
+        return false;
+    }
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    bool emitted = false;
+    if (kId != json::kNone && document.nodes[kId].kind == json::Kind::String) {
+        json::Writer decoded{document.scratch};
+        if (document.string(kId, decoded) && decoded.ok &&
+            ws_valid_text_payload({document.scratch, decoded.len})) {
+            const u64 kOutputSize = static_cast<u64>(prefix.len) + decoded.len + suffix.len;
+            if (kOutputSize <= kWsTerminateMessageCapacity &&
+                (max_size == 0 || kOutputSize <= max_size)) {
+                emitted = emit_frame(out,
+                                     out_cap,
+                                     produced,
+                                     WsOpcode::Text,
+                                     reinterpret_cast<const u8*>(document.scratch),
+                                     decoded.len,
+                                     masked,
+                                     mask_rng,
+                                     prefix,
+                                     suffix);
+            }
+        }
+    }
+    // `document.source` and `scratch` are borrowed workspace, never route/connection state.
+    document.source = {};
+    return emitted;
+}
 }  // namespace
 
 bool ws_valid_text_payload(Str text) {
@@ -280,7 +326,13 @@ bool ws_valid_text_payload(Str text) {
 
 bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
     const u64 literal_size = static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len;
-    return literal_size <= kWsTerminateMessageCapacity &&
+    const bool kSourceValid =
+        rewrite.source <= WsTextSource::JsonString &&
+        (rewrite.source == WsTextSource::JsonString
+             ? rewrite.source_path.len <= json::kMaxBytes &&
+                   (rewrite.source_path.ptr || rewrite.source_path.len == 0)
+             : rewrite.source_path.len == 0 && rewrite.source_path.ptr == nullptr);
+    return kSourceValid && literal_size <= kWsTerminateMessageCapacity &&
            (max_size == 0 || literal_size <= max_size) && ws_valid_text_payload(rewrite.prefix) &&
            ws_valid_text_payload(rewrite.suffix);
 }
@@ -360,7 +412,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             const u64 original_size = st.message_len + h.payload_len;
             auto rewritten_size = [original_size](const WsTextRewrite& rewrite) {
                 return static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len +
-                       (rewrite.include_payload ? original_size : 0);
+                       (rewrite.source != WsTextSource::Literal ? original_size : 0);
             };
             u64 data_size = rewritten_size(st.forward_text);
             if (original_size > data_size) data_size = original_size;
@@ -476,22 +528,34 @@ WsInspectStatus ws_inspect(WsInspector& st,
             const WsTextRewrite& rewrite = policy_forward
                                                ? st.forward_texts[action_value - first_text_policy]
                                                : st.forward_text;
-            const u64 payload_size = rewrite.include_payload ? total : 0;
+            const u64 payload_size = rewrite.source == WsTextSource::MessageText ? total : 0;
             const u64 output_size = payload_size + rewrite.prefix.len + rewrite.suffix.len;
             if (!ws_valid_text_rewrite(rewrite, st.max_message_size) ||
-                (rewrite.include_payload && msg_op != WsOpcode::Text) ||
+                (rewrite.source == WsTextSource::MessageText && msg_op != WsOpcode::Text) ||
                 output_size > kWsTerminateMessageCapacity ||
                 (st.max_message_size != 0 && output_size > st.max_message_size) ||
-                !emit_frame(out,
-                            out_cap,
-                            produced,
-                            WsOpcode::Text,
-                            msg_buf,
-                            payload_size,
-                            st.masked,
-                            st.mask_rng,
-                            rewrite.prefix,
-                            rewrite.suffix))
+                (rewrite.source == WsTextSource::JsonString
+                     ? !emit_json_string_frame(out,
+                                               out_cap,
+                                               produced,
+                                               msg_buf,
+                                               total,
+                                               rewrite.source_path,
+                                               rewrite.prefix,
+                                               rewrite.suffix,
+                                               st.max_message_size,
+                                               st.masked,
+                                               st.mask_rng)
+                     : !emit_frame(out,
+                                   out_cap,
+                                   produced,
+                                   WsOpcode::Text,
+                                   msg_buf,
+                                   payload_size,
+                                   st.masked,
+                                   st.mask_rng,
+                                   rewrite.prefix,
+                                   rewrite.suffix)))
                 return WsInspectStatus::Error;
         } else if (action == WsFrameAction::Close || policy_close) {
             const WsClosePolicy selected = policy_close

@@ -360,6 +360,88 @@ route GET "/ws" { return websocket(backend) { message in
     REQUIRE_EQ(owner.p->config.routes[0].ws_close_policy_count, 3u);
 }
 
+TEST(native_program, websocket_json_string_rewrite_path_and_affixes_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/data/name") else { message.close(1008) }
+ guard let text = json.string(field) else { message.close(1003) }
+ guard text != "drop" else { message.forward("[" + text + "]") }
+ message.forward("<" + text + ">")
+} }
+route GET "/root" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let root = json.string(document) else { message.close(1003) }
+ message.forward("(" + root + ")")
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    REQUIRE_EQ(route.ws_forward_text.source, WsTextSource::JsonString);
+    CHECK(route.ws_forward_text.source_path.eq(lit_str("/data/name")));
+    REQUIRE_EQ(route.ws_forward_text_count, 1u);
+    const WsTextRewrite& branch = route.ws_forward_texts[0];
+    CHECK_EQ(branch.source, WsTextSource::JsonString);
+    CHECK(branch.source_path.eq(lit_str("/data/name")));
+    const char json_payload[] = R"({"data":{"name":"x\u0000\u20ac"}})";
+    u8 input[64], output[64], msg[64];
+    input[0] = 0x82;
+    input[1] = static_cast<u8>(sizeof(json_payload) - 1);
+    memcpy(input + 2, json_payload, sizeof(json_payload) - 1);
+    WsInspector st;
+    st.forward_text = route.ws_forward_text;
+    st.forward_texts = route.ws_forward_texts;
+    st.forward_text_count = route.ws_forward_text_count;
+    st.max_message_size = route.ws_max_message_size;
+    u32 used = 0, produced = 0;
+    REQUIRE(ws_inspect(st,
+                       input,
+                       sizeof(json_payload) + 1,
+                       output,
+                       sizeof(output),
+                       msg,
+                       sizeof(msg),
+                       route.ws_frame_handler,
+                       nullptr,
+                       &used,
+                       &produced) == WsInspectStatus::Ok);
+    const Str expected{"<x\0\xe2\x82\xac>", 7};
+    REQUIRE_EQ(produced, expected.len + 2);
+    CHECK_EQ(output[0], 0x81u);
+    CHECK_EQ(output[1], expected.len);
+    CHECK(memcmp(output + 2, expected.ptr, expected.len) == 0);
+    const auto& root_route = owner.p->config.routes[1];
+    REQUIRE_EQ(root_route.ws_forward_text.source, WsTextSource::JsonString);
+    CHECK_EQ(root_route.ws_forward_text.source_path.len, 0u);
+    CHECK(root_route.ws_forward_text.source_path.ptr != nullptr);
+    const char root_json[] = R"("\uD83D\uDE00")";
+    input[0] = 0x81;
+    input[1] = static_cast<u8>(sizeof(root_json) - 1);
+    memcpy(input + 2, root_json, sizeof(root_json) - 1);
+    WsInspector root_st;
+    root_st.forward_text = root_route.ws_forward_text;
+    root_st.max_message_size = root_route.ws_max_message_size;
+    used = 0;
+    produced = 0;
+    REQUIRE(ws_inspect(root_st,
+                       input,
+                       sizeof(root_json) + 1,
+                       output,
+                       sizeof(output),
+                       msg,
+                       sizeof(msg),
+                       root_route.ws_frame_handler,
+                       nullptr,
+                       &used,
+                       &produced) == WsInspectStatus::Ok);
+    const Str root_expected{"(\xf0\x9f\x98\x80)", 6};
+    REQUIRE_EQ(produced, root_expected.len + 2);
+    CHECK(memcmp(output + 2, root_expected.ptr, root_expected.len) == 0);
+}
+
 TEST(native_program, websocket_json_string_predicates_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

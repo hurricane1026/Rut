@@ -6889,7 +6889,7 @@ TEST(frontend, websocket_text_affix_rewrite_analyzes_bounded_concatenation) {
         REQUIRE(hir);
         const auto& route = hir->routes[0];
         const auto& recipe = route.ws_handler.forward_payload;
-        CHECK_EQ(recipe.include_payload, i != 4);
+        CHECK_EQ(recipe.source, i != 4 ? HirWsTextSource::MessageText : HirWsTextSource::Literal);
         CHECK(route.exprs[recipe.prefix_expr].str_value.eq(prefixes[i]));
         CHECK(route.exprs[recipe.suffix_expr].str_value.eq(suffixes[i]));
     }
@@ -6907,6 +6907,7 @@ route GET "/ws" {
         message.forward("[" + alias + message.text + suffix + "]")
     }
 }
+
 )rut";
     auto tokens = lex(lit(source));
     REQUIRE(tokens);
@@ -6918,13 +6919,87 @@ route GET "/ws" {
     const auto& handler = route.ws_handler;
     REQUIRE_EQ(handler.forward_payloads.len, 1u);
     const auto& branch = handler.forward_payloads[0];
-    CHECK_FALSE(branch.include_payload);
+    CHECK_EQ(branch.source, HirWsTextSource::Literal);
     CHECK(route.exprs[branch.prefix_expr].str_value.eq({"a\0b", 3}));
-    CHECK(handler.forward_payload.include_payload);
+    CHECK_EQ(handler.forward_payload.source, HirWsTextSource::MessageText);
     CHECK(route.exprs[handler.forward_payload.prefix_expr].str_value.eq({"[a\0b", 4}));
     CHECK(route.exprs[handler.forward_payload.suffix_expr].str_value.eq(lit("\né]")));
 }
 
+TEST(frontend, websocket_json_string_alias_is_a_bounded_rewrite_source) {
+    const char* source = R"rut(
+upstream ws
+route GET "/ws" {
+    let opening = "<"
+    let closing = ">"
+    return websocket(ws) { message in
+        guard let document = json.parse(message.text) else { message.close(1007) }
+        guard let field = json.get(document, "/data/name") else { message.close(1008) }
+        guard let text = json.string(field) else { message.close(1003) }
+        guard text != "drop" else { message.forward(text + "!") }
+        message.forward(opening + text + closing)
+    }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& handler = hir->routes[0].ws_handler;
+    REQUIRE_EQ(handler.forward_payloads.len, 1u);
+    CHECK_EQ(handler.forward_payloads[0].source, HirWsTextSource::JsonString);
+    CHECK(handler.forward_payloads[0].source_path.eq(lit_str("/data/name")));
+    CHECK_EQ(handler.forward_payload.source, HirWsTextSource::JsonString);
+    CHECK(handler.forward_payload.source_path.eq(lit_str("/data/name")));
+    CHECK(hir->routes[0].exprs[handler.forward_payload.prefix_expr].str_value.eq(lit_str("<")));
+    CHECK(hir->routes[0].exprs[handler.forward_payload.suffix_expr].str_value.eq(lit_str(">")));
+}
+
+TEST(frontend, websocket_json_string_rewrite_rejects_invalid_or_repeated_sources) {
+    const char* invalid[] = {
+        "message.forward(document)",
+        "message.forward(field)",
+        "message.forward(kind)",
+        "message.forward(text + other)",
+        "message.forward(text + message.text)",
+        "message.forward(text + text)",
+        "message.forward(json.string(field))",
+    };
+    for (const char* verdict : invalid) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.drop() }\n"
+            "guard let field = json.get(document, \"/x\") else { message.drop() }\n"
+            "guard let text = json.string(field) else { message.drop() }\n";
+        if (std::string_view(verdict).find("other") != std::string_view::npos) {
+            source += "guard let other = json.string(field) else { message.drop() }\n";
+        } else if (std::string_view(verdict).find("kind") != std::string_view::npos) {
+            source += "guard let kind = json.kind(field) else { message.drop() }\n";
+        }
+        source += verdict;
+        source += " } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    const char* own_else = R"rut(
+upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let text = json.string(document) else { message.forward(text) }
+ message.forward(text)
+} }
+)rut";
+    auto tokens = lex(lit(own_else));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}
 TEST(frontend, websocket_text_rewrite_constant_locals_preserve_validation) {
     const char* invalid[] = {
         "let text = req.path\n",
