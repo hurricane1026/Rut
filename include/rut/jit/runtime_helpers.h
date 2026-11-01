@@ -251,6 +251,16 @@ rut::u8 rut_helper_ws_json_bool_at_path(const char* payload,
                                         rut::u32 path_len);
 rut::u8 rut_helper_ws_json_bool_equals_at_path(
     const char* payload, rut::u64 len, const char* path, rut::u32 path_len, rut::u8 expected);
+rut::u8 rut_helper_ws_json_int_at_path(const char* payload,
+                                       rut::u64 len,
+                                       const char* path,
+                                       rut::u32 path_len);
+rut::u8 rut_helper_ws_json_int_compare_at_path(const char* payload,
+                                               rut::u64 len,
+                                               const char* path,
+                                               rut::u32 path_len,
+                                               rut::i64 expected,
+                                               rut::u8 comparison);
 
 // Lexicographic string comparison. Returns <0, 0, >0 like strcmp.
 rut::i32 rut_helper_str_cmp(const char* a, rut::u32 a_len, const char* b, rut::u32 b_len);
