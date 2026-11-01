@@ -88,6 +88,31 @@ bool ws_json_string_matches_at_path(
     return matches;
 }
 
+bool ws_json_bool_at_path(const u8* payload, u64 len, Str path) {
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
+        return false;
+    json::Document& document = ws_json_document();
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    const bool kIsBool = kId != json::kNone && document.nodes[kId].kind == json::Kind::Boolean;
+    document.source = {};
+    return kIsBool;
+}
+
+bool ws_json_bool_equals_at_path(const u8* payload, u64 len, Str path, bool expected) {
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
+        return false;
+    json::Document& document = ws_json_document();
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    const bool kEqual = kId != json::kNone && document.nodes[kId].kind == json::Kind::Boolean &&
+                        document.raw(kId).eq(expected ? lit_str("true") : lit_str("false"));
+    document.source = {};
+    return kEqual;
+}
+
 bool ws_valid_json_payload(const u8* payload, u64 len) {
     return ws_json_has_path(payload, len, {});  // the empty pointer selects any valid JSON root
 }
