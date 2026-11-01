@@ -15,6 +15,7 @@
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
+#include "rut/runtime/jwt_hs256.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/signed_request.h"
 #include "rut/runtime/uuid.h"
@@ -1083,6 +1084,67 @@ extern "C" void rut_helper_hash(void* conn,
         }
     }
     rut_crypto_clear_v1(text, sizeof(text));
+}
+
+extern "C" void rut_helper_jwt_issue_hs256(void* conn,
+                                           void* arena,
+                                           const char* subject,
+                                           u32 subject_len,
+                                           const char* issuer,
+                                           u32 issuer_len,
+                                           const char* audience,
+                                           u32 audience_len,
+                                           const char* key,
+                                           u32 key_len,
+                                           i32 ttl_seconds,
+                                           u8* has_value,
+                                           const char** out_ptr,
+                                           u32* out_len) {
+    *has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (storage == nullptr && conn != nullptr)
+        storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    if (storage == nullptr || storage->backend.pool == nullptr) return;
+
+    struct timespec now{};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+        now.tv_nsec >= 1000000000)
+        return;
+
+    char token[kMaxJwtHs256TokenBytes];
+    u32 token_len = 0;
+    const bool issued = jwt_hs256_issue({key, key_len},
+                                        {subject, subject_len},
+                                        {issuer, issuer_len},
+                                        {audience, audience_len},
+                                        static_cast<i64>(now.tv_sec),
+                                        ttl_seconds,
+                                        token,
+                                        sizeof(token),
+                                        token_len);
+    if (!issued) {
+        rut_crypto_clear_v1(token, sizeof(token));
+        return;
+    }
+    if (token_len == 0 || token_len > kMaxJwtHs256TokenBytes ||
+        storage->space_used() > kHashRequestBudget - token_len ||
+        (storage->current == nullptr && !storage->init(storage->backend.pool))) {
+        rut_crypto_clear_v1(token, sizeof(token));
+        return;
+    }
+
+    auto* output = static_cast<char*>(storage->alloc(token_len));
+    if (output == nullptr) {
+        rut_crypto_clear_v1(token, sizeof(token));
+        return;
+    }
+    __builtin_memcpy(output, token, token_len);
+    rut_crypto_clear_v1(token, sizeof(token));
+    *has_value = 1;
+    *out_ptr = output;
+    *out_len = token_len;
 }
 
 extern "C" void rut_helper_uuid(

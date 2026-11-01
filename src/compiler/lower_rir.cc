@@ -1654,7 +1654,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         return v.value();
     }
     if (value.kind == MirValueKind::JsonOp || value.kind == MirValueKind::HashDigest) {
-        rir::ValueId args[3]{};
+        rir::ValueId args[5]{};
         for (u32 i = 0; i < value.args.len; ++i) {
             auto child = materialize_value(*value.args[i],
                                            mir,

@@ -891,6 +891,66 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     pool.destroy();
 }
 
+TEST(json_network, hs256_issue_helper_uses_request_arena_and_fails_closed_on_budget) {
+    SlicePool pool;
+    REQUIRE(pool.init(24));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char key[32];
+    for (char& byte : key) byte = 'k';
+    u8 has_value = 9;
+    const char* output = reinterpret_cast<const char*>(1);
+    u32 output_len = 99;
+    rut_helper_jwt_issue_hs256(nullptr,
+                               &arena,
+                               "alice",
+                               5,
+                               "issuer",
+                               6,
+                               "orders",
+                               6,
+                               key,
+                               sizeof(key),
+                               60,
+                               &has_value,
+                               &output,
+                               &output_len);
+    REQUIRE(has_value);
+    REQUIRE(output != nullptr);
+    CHECK_GT(output_len, 100u);
+    CHECK(reinterpret_cast<uintptr_t>(output) >= reinterpret_cast<uintptr_t>(pool.base));
+    CHECK(reinterpret_cast<uintptr_t>(output) <
+          reinterpret_cast<uintptr_t>(pool.base) +
+              static_cast<u64>(pool.count) * SlicePool::kSliceSize);
+
+    arena.reset();
+    while (arena.space_used() <= kHashRequestBudget) {
+        REQUIRE(arena.alloc(15 * 1024) != nullptr);
+    }
+    has_value = 9;
+    output = reinterpret_cast<const char*>(1);
+    output_len = 99;
+    rut_helper_jwt_issue_hs256(nullptr,
+                               &arena,
+                               "alice",
+                               5,
+                               "issuer",
+                               6,
+                               "orders",
+                               6,
+                               key,
+                               sizeof(key),
+                               60,
+                               &has_value,
+                               &output,
+                               &output_len);
+    CHECK_EQ(has_value, 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(output_len, 0u);
+    arena.destroy();
+    pool.destroy();
+}
+
 TEST(json_network, native_hs256_issue_round_trips_existing_decoder_and_claim_policy) {
     char key[32];
     for (char& byte : key) byte = 'k';

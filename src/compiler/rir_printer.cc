@@ -745,7 +745,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_i64(inst.imm.i32_val);
             for (u32 i = 0; i < inst.operand_count; ++i) {
                 buf.put_cstr(", ");
-                print_value_ref(buf, inst.operands[i]);
+                print_value_ref(buf, inst.operand(i));
             }
             break;
         case Opcode::CtxLoadSlotI32:
