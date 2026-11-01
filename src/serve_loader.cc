@@ -441,6 +441,19 @@ bool load_rut_program(const char* path,
                         result.source_path = {bytes, source.source_path.len};
                         break;
                     }
+                    case HirWsTextSource::JsonStringify: {
+                        result.source = WsTextSource::JsonStringify;
+                        if (source.source_path.len > json::kMaxBytes ||
+                            (!source.source_path.ptr && source.source_path.len))
+                            return false;
+                        char* bytes = out.rir.arena.alloc_array<char>(source.source_path.len + 1);
+                        if (!bytes) return false;
+                        for (u32 j = 0; j < source.source_path.len; j++)
+                            bytes[j] = source.source_path.ptr[j];
+                        bytes[source.source_path.len] = '\0';
+                        result.source_path = {bytes, source.source_path.len};
+                        break;
+                    }
                     default:
                         return false;
                 }

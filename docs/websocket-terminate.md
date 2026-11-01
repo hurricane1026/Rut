@@ -166,6 +166,13 @@ affix rewrite. The runtime copies the raw number token into the owned output sli
 during the synchronous callback; Text and Binary JSON inputs both produce Text.
 Missing/non-number values, parser-limit failures, and output overflow fail closed.
 
+`json.stringify(documentOrField)` binds the compact serialization of any JSON value
+using the ordinary JSON writer. Strings and object keys are escaped as JSON text;
+object member order and number lexemes are preserved. The alias supports the same
+literal string comparisons and predicates and can be the sole dynamic source in a
+fixed-affix rewrite. Serialization is bounded by the existing writer capacity, and
+the result is copied to owned output before asynchronous sending.
+
 JSON booleans can be unwrapped with `guard let enabled = json.bool(field) ...`;
 `json.bool(document)` checks a root Boolean. Both `true` and `false` are successful
 bindings, while missing fields, JSON null, and other JSON kinds fail. A Bool alias

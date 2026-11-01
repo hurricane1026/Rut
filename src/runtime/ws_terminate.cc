@@ -14,6 +14,25 @@ json::Document& ws_json_document() {
     thread_local json::Document document;
     return document;
 }
+
+bool ws_json_stringify_to_workspace(
+    json::Document& document, const u8* payload, u64 len, Str path, u32& output_len) {
+    output_len = 0;
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len)) {
+        document.source = {};
+        return false;
+    }
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    json::Writer encoded{document.other};
+    const bool kSerialized = kId != json::kNone && document.write(kId, encoded) && encoded.ok;
+    if (kSerialized) output_len = encoded.len;
+    // The source and output workspace are thread-local scratch, never callback-owned views.
+    document.source = {};
+    return kSerialized;
+}
 }  // namespace
 
 bool ws_json_has_path(const u8* payload, u64 len, Str path) {
@@ -97,6 +116,50 @@ bool ws_json_number_text_matches_at_path(
         }
     }
     document.source = {};
+    return matches;
+}
+
+bool ws_json_stringify_at_path(const u8* payload, u64 len, Str path) {
+    json::Document& document = ws_json_document();
+    u32 output_len = 0;
+    return ws_json_stringify_to_workspace(document, payload, len, path, output_len);
+}
+
+bool ws_json_stringify_matches_at_path(
+    const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation) {
+    json::Document& document = ws_json_document();
+    if (!expected.ptr && expected.len) {
+        document.source = {};
+        return false;
+    }
+    u32 output_len = 0;
+    if (!ws_json_stringify_to_workspace(document, payload, len, path, output_len)) return false;
+    const Str kActual{document.other, output_len};
+    bool matches = false;
+    switch (operation) {
+        case WsJsonStringMatch::Equal:
+            matches = kActual.len == expected.len &&
+                      (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
+            break;
+        case WsJsonStringMatch::Prefix:
+            matches = expected.len <= kActual.len &&
+                      (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
+            break;
+        case WsJsonStringMatch::Suffix:
+            matches =
+                expected.len <= kActual.len &&
+                (expected.len == 0 ||
+                 memcmp(kActual.ptr + kActual.len - expected.len, expected.ptr, expected.len) == 0);
+            break;
+        case WsJsonStringMatch::Contains:
+            matches = expected.len == 0 ||
+                      (expected.len <= kActual.len &&
+                       memmem(kActual.ptr, kActual.len, expected.ptr, expected.len) != nullptr);
+            break;
+        default:
+            matches = false;
+            break;
+    }
     return matches;
 }
 
@@ -420,6 +483,35 @@ bool emit_json_number_text_frame(u8* out,
     document.source = {};
     return emitted;
 }
+
+bool emit_json_stringify_frame(u8* out,
+                               u32 out_cap,
+                               u32* produced,
+                               const u8* payload,
+                               u64 len,
+                               Str path,
+                               Str prefix,
+                               Str suffix,
+                               u64 max_size,
+                               bool masked,
+                               u64& mask_rng) {
+    json::Document& document = ws_json_document();
+    u32 serialized_len = 0;
+    if (!ws_json_stringify_to_workspace(document, payload, len, path, serialized_len)) return false;
+    const u64 kOutputSize = static_cast<u64>(prefix.len) + serialized_len + suffix.len;
+    if (kOutputSize > kWsTerminateMessageCapacity || (max_size != 0 && kOutputSize > max_size))
+        return false;
+    return emit_frame(out,
+                      out_cap,
+                      produced,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(document.other),
+                      serialized_len,
+                      masked,
+                      mask_rng,
+                      prefix,
+                      suffix);
+}
 }  // namespace
 
 bool ws_valid_text_payload(Str text) {
@@ -430,9 +522,10 @@ bool ws_valid_text_payload(Str text) {
 bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
     const u64 literal_size = static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len;
     const bool kSourceValid =
-        rewrite.source <= WsTextSource::JsonNumberText &&
+        rewrite.source <= WsTextSource::JsonStringify &&
         ((rewrite.source == WsTextSource::JsonString ||
-          rewrite.source == WsTextSource::JsonNumberText)
+          rewrite.source == WsTextSource::JsonNumberText ||
+          rewrite.source == WsTextSource::JsonStringify)
              ? rewrite.source_path.len <= json::kMaxBytes &&
                    (rewrite.source_path.ptr || rewrite.source_path.len == 0)
              : rewrite.source_path.len == 0 && rewrite.source_path.ptr == nullptr);
@@ -515,8 +608,11 @@ WsInspectStatus ws_inspect(WsInspector& st,
         if (*produced != 0) {
             const u64 original_size = st.message_len + h.payload_len;
             auto rewritten_size = [original_size](const WsTextRewrite& rewrite) {
-                return static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len +
-                       (rewrite.source != WsTextSource::Literal ? original_size : 0);
+                const u64 kSourceSize = rewrite.source == WsTextSource::JsonStringify
+                                            ? json::kMaxBytes
+                                        : rewrite.source != WsTextSource::Literal ? original_size
+                                                                                  : 0;
+                return static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len + kSourceSize;
             };
             u64 data_size = rewritten_size(st.forward_text);
             if (original_size > data_size) data_size = original_size;
@@ -637,42 +733,64 @@ WsInspectStatus ws_inspect(WsInspector& st,
             if (!ws_valid_text_rewrite(rewrite, st.max_message_size) ||
                 (rewrite.source == WsTextSource::MessageText && msg_op != WsOpcode::Text) ||
                 output_size > kWsTerminateMessageCapacity ||
-                (st.max_message_size != 0 && output_size > st.max_message_size) ||
-                (rewrite.source == WsTextSource::JsonNumberText
-                     ? !emit_json_number_text_frame(out,
-                                                    out_cap,
-                                                    produced,
-                                                    msg_buf,
-                                                    total,
-                                                    rewrite.source_path,
-                                                    rewrite.prefix,
-                                                    rewrite.suffix,
-                                                    st.max_message_size,
-                                                    st.masked,
-                                                    st.mask_rng)
-                 : rewrite.source == WsTextSource::JsonString
-                     ? !emit_json_string_frame(out,
-                                               out_cap,
-                                               produced,
-                                               msg_buf,
-                                               total,
-                                               rewrite.source_path,
-                                               rewrite.prefix,
-                                               rewrite.suffix,
-                                               st.max_message_size,
-                                               st.masked,
-                                               st.mask_rng)
-                     : !emit_frame(out,
-                                   out_cap,
-                                   produced,
-                                   WsOpcode::Text,
-                                   msg_buf,
-                                   payload_size,
-                                   st.masked,
-                                   st.mask_rng,
-                                   rewrite.prefix,
-                                   rewrite.suffix)))
+                (st.max_message_size != 0 && output_size > st.max_message_size))
                 return WsInspectStatus::Error;
+            bool emitted = false;
+            switch (rewrite.source) {
+                case WsTextSource::JsonNumberText:
+                    emitted = emit_json_number_text_frame(out,
+                                                          out_cap,
+                                                          produced,
+                                                          msg_buf,
+                                                          total,
+                                                          rewrite.source_path,
+                                                          rewrite.prefix,
+                                                          rewrite.suffix,
+                                                          st.max_message_size,
+                                                          st.masked,
+                                                          st.mask_rng);
+                    break;
+                case WsTextSource::JsonString:
+                    emitted = emit_json_string_frame(out,
+                                                     out_cap,
+                                                     produced,
+                                                     msg_buf,
+                                                     total,
+                                                     rewrite.source_path,
+                                                     rewrite.prefix,
+                                                     rewrite.suffix,
+                                                     st.max_message_size,
+                                                     st.masked,
+                                                     st.mask_rng);
+                    break;
+                case WsTextSource::JsonStringify:
+                    emitted = emit_json_stringify_frame(out,
+                                                        out_cap,
+                                                        produced,
+                                                        msg_buf,
+                                                        total,
+                                                        rewrite.source_path,
+                                                        rewrite.prefix,
+                                                        rewrite.suffix,
+                                                        st.max_message_size,
+                                                        st.masked,
+                                                        st.mask_rng);
+                    break;
+                case WsTextSource::Literal:
+                case WsTextSource::MessageText:
+                    emitted = emit_frame(out,
+                                         out_cap,
+                                         produced,
+                                         WsOpcode::Text,
+                                         msg_buf,
+                                         payload_size,
+                                         st.masked,
+                                         st.mask_rng,
+                                         rewrite.prefix,
+                                         rewrite.suffix);
+                    break;
+            }
+            if (!emitted) return WsInspectStatus::Error;
         } else if (action == WsFrameAction::Close || policy_close) {
             const WsClosePolicy selected = policy_close
                                                ? st.close_policies[action_value - first_policy]

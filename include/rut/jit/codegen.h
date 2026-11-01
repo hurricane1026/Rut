@@ -67,7 +67,12 @@ struct WsLenGuardSpec {
                   //                                25=JsonNumberTextEqual,
                   //                                26=JsonNumberTextPrefix,
                   //                                27=JsonNumberTextSuffix,
-                  //                                28=JsonNumberTextContains
+                  //                                28=JsonNumberTextContains,
+                  //                                29=JsonStringifyValid,
+                  //                                30=JsonStringifyEqual,
+                  //                                31=JsonStringifyPrefix,
+                  //                                32=JsonStringifySuffix,
+                  //                                33=JsonStringifyContains
     u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
     u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
                   // FromClient: 1 (client→upstream leg)

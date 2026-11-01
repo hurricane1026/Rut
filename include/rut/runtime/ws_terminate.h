@@ -43,6 +43,9 @@ bool ws_json_string_matches_at_path(
 bool ws_json_number_text_at_path(const u8* payload, u64 len, Str path);
 bool ws_json_number_text_matches_at_path(
     const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation);
+bool ws_json_stringify_at_path(const u8* payload, u64 len, Str path);
+bool ws_json_stringify_matches_at_path(
+    const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation);
 bool ws_json_bool_at_path(const u8* payload, u64 len, Str path);
 bool ws_json_bool_equals_at_path(const u8* payload, u64 len, Str path, bool expected);
 bool ws_json_int_at_path(const u8* payload, u64 len, Str path);
@@ -86,7 +89,7 @@ struct WsClosePolicy {
     Str reason{};  // immutable route-owned UTF-8, at most 123 bytes
 };
 
-enum class WsTextSource : u8 { Literal, MessageText, JsonString, JsonNumberText };
+enum class WsTextSource : u8 { Literal, MessageText, JsonString, JsonNumberText, JsonStringify };
 
 // Immutable text output recipe. Literal replacement omits the input; affix recipes
 // surround one bounded dynamic source, if present, with route-owned UTF-8 views.
