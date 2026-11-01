@@ -841,7 +841,8 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     };
     const char* lifetime_token =
         "eyJhbGciOiJIUzI1NiJ9."
-        "eyJzdWIiOiJhbGljZSIsImlzcyI6Imlzc3VlciwiYXVkIjoiZ2F0ZXdheSIsImlhdCI6OTAwLCJleHAiOjExMDB9."
+        "eyJzdWIiOiJhbGljZSIsImlzcyI6Imlzc3VlciIsImF1ZCI6ImdhdGV3YXkiLCJpYXQiOjkwMCwiZXhwIjoxMTAwfQ"
+        "."
         "ioTapzc9b_9jxlQrsgD3HbDtf4GtxUTzewPKeKDH6ZM";
     const auto authenticated = decode(hs256_key.c_str(), lifetime_token);
     REQUIRE(authenticated.first);
