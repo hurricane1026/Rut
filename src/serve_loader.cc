@@ -1,7 +1,9 @@
 #include "rut/serve_loader.h"
 
+#include "rut/common/types.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/ast.h"
+#include "rut/compiler/diagnostic.h"
 #include "rut/compiler/hir.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/mir.h"
@@ -243,6 +245,26 @@ bool load_rut_program(const char* path,
         return false;
     }
     ir.hir = hir.value();
+#if RUT_ENABLE_WEBSOCKET
+    constexpr Str kWsPreludeDetail = lit_str(
+        "WebSocket message routes currently allow only compile-time constant let bindings before "
+        "websocket; request guards/effects are not executed");
+    // Keep a cheap publication boundary in the loader too: a malformed/future HIR producer must
+    // not turn an HTTP-only route feature into a silently omitted WebSocket prelude.
+    for (u32 i = 0; i < ir.hir->routes.len; i++) {
+        const HirRoute& route = ir.hir->routes[i];
+        if (!route.is_ws_terminate) continue;
+        if (route.guards.len != 0 || route.waits.len != 0 || route.for_loops.len != 0 ||
+            route.control.kind != HirControlKind::Direct || route.decorators.len != 0 ||
+            route.rate_limit.count != 0 || route.throttle_down_bps != 0 ||
+            route.http_cache_ttl != 0) {
+            err.stage = LoadStage::Analyze;
+            set_load_diag(
+                err, Diagnostic{FrontendError::UnsupportedSyntax, route.span, kWsPreludeDetail});
+            return false;
+        }
+    }
+#endif
     AccessLogSinkSpec loaded_access_log{};
     if (!copy_access_log_sink(*ir.hir, kSource, loaded_access_log)) return false;
     if (ir.hir->has_listener) {

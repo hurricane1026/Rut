@@ -4398,6 +4398,26 @@ TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific
 }
 
 #if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_terminate_rejects_unexecuted_http_guard) {
+    const std::string dir = "/tmp/rut_serve_loader_ws_prelude";
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { guard false else { return 403 }\n"
+                   "return websocket(backend) { message in message.forward() } }\n");
+    LoadedProgram program;
+    LoadError err;
+    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
+    CHECK(err.stage == LoadStage::Analyze);
+    CHECK(err.has_diag);
+    CHECK(err.diag.detail.eq(
+        lit_str("WebSocket message routes currently allow only compile-time constant let bindings "
+                "before websocket; request guards/effects are not executed")));
+    CHECK_EQ(program.config.route_count, 0u);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_terminate_route_registers_and_runs) {
     // End-to-end (Phase 4 D/E): a `websocket(x){ message in message.drop() }` route compiles, its
     // constant verdict is JIT'd, and it's published as a terminate route whose frame handler — when

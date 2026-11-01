@@ -104,6 +104,23 @@ bool load(Source& source, NativeProgram& p, u8 opt = 2) {
 }
 }  // namespace
 
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_terminate_http_guard_fails_before_native_publish) {
+    Source source;
+    REQUIRE(source.fd >= 0);
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\n"
+                      "route GET \"/ws\" { guard false else { return 403 }\n"
+                      "return websocket(backend) { message in message.forward() } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    char error[512]{};
+    CHECK_FALSE(load_native_program(source.path, *owner.p, error, sizeof(error), 2));
+    CHECK(strstr(error, "rut-compile failed") != nullptr);
+    CHECK_EQ(owner.p->config.route_count, 0u);
+}
+#endif
+
 TEST(native_program, upstream_tls_configuration_is_owned_after_compiler_exit) {
     Source source;
     REQUIRE(source.append(

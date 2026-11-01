@@ -837,6 +837,10 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // Conditions support !, &&, ||, parentheses and left-to-right short-circuiting.
 // ! binds tighter than comparisons; && binds tighter than ||.
 // At most 32 condition nodes (leaf predicates + binary operators); nesting is bounded.
+// A terminate route's HTTP prelude is not executed: before websocket, only
+// compile-time constant let bindings are supported. Request guards/effects,
+// decorators, and chains are rejected. Bare websocket passthrough routes
+// continue through the ordinary HTTP route pipeline.
 return websocket(chat) { message in
     guard !message.fromClient || !message.isText || !message.text.matches(re".*spam.*") else {
         message.drop()
