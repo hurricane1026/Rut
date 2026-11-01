@@ -509,6 +509,56 @@ func rotatingSignedRequest(_ config: SignedRequestRotation) -> Identity {
         req.uniqueHeader("Digest").or(""), req.body)
 }
 
+struct SignedRequestConsumer {
+    consumerId: str
+    keyId: str
+    key: str
+    credentialId: str
+}
+
+func validSignedRequestConsumers(_ first: SignedRequestConsumer,
+                                 _ second: SignedRequestConsumer) -> bool {
+    first.consumerId != "" && second.consumerId != "" &&
+        first.credentialId != "" && second.credentialId != "" &&
+        first.consumerId != second.consumerId &&
+        ((first.keyId == "" && first.key == "") ||
+         (first.keyId != "" && first.key != "")) &&
+        ((second.keyId == "" && second.key == "") ||
+         (second.keyId != "" && second.key != "")) &&
+        (first.key != "" || second.key != "") &&
+        (first.keyId == "" || second.keyId == "" || first.keyId != second.keyId)
+}
+
+func verifyMultiSignedRequest(_ first: SignedRequestConsumer,
+                              _ second: SignedRequestConsumer, _ method: Method,
+                              _ target: str, _ authorization: str, _ date: str,
+                              _ digest: str, _ body: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Signature")
+    let firstMatches = Crypto.signedRequestValid(method, target, authorization,
+        date, digest, body, first.keyId, first.key)
+    let secondMatches = Crypto.signedRequestValid(method, target, authorization,
+        date, digest, body, second.keyId, second.key)
+    guard firstMatches || secondMatches else { respond denied }
+    match firstMatches {
+        true => Identity(consumerId: first.consumerId, credentialId: first.credentialId, method: "signedRequest")
+        _ => Identity(consumerId: second.consumerId, credentialId: second.credentialId, method: "signedRequest")
+    }
+}
+
+// Each Consumer has one static credential. Empty key-id/key pairs disable a
+// slot; ambiguous Consumer or key-ID ownership is a configuration error.
+func multiSignedRequest(_ first: SignedRequestConsumer,
+                        _ second: SignedRequestConsumer) -> Identity {
+    guard validSignedRequestConsumers(first, second) else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Signature")
+    guard !req.chunked else { respond denied }
+    verifyMultiSignedRequest(first, second, req.method, req.path,
+        req.authorization.or(""), req.uniqueHeader("Date").or(""),
+        req.uniqueHeader("Digest").or(""), req.body)
+}
+
 struct WebhookRotation {
     currentKey: str
     previousKey: str

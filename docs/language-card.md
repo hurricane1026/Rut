@@ -1689,6 +1689,19 @@ matching credential ID is returned. Clearing the previous pair revokes it.
 This policy has no remote key refresh or replay store. See
 [`signed-request-rotation.rut`](../examples/signed-request-rotation.rut).
 
+`auth.SignedRequestConsumer` contains trusted `consumerId`, `keyId`, `key`,
+and `credentialId` strings. `auth.multiSignedRequest(first, second)` validates
+exactly two records before request verification: both Consumers and credential
+IDs must be nonempty, Consumer IDs must differ, each key-ID/key pair must both
+be empty or both nonempty, at least one key pair must be enabled, and enabled
+key IDs must differ. Invalid configuration returns 503. The policy rejects
+chunked requests, verifies both enabled credentials against one captured
+method, target, unique Authorization/Date/Digest values, and complete body,
+and returns the matching configured identity with method `signedRequest`.
+Verification failures return 401 with the Signature challenge. This is a
+bounded static policy, independent of one-Consumer key rotation. See
+[`multi-signed-request.rut`](../examples/multi-signed-request.rut).
+
 `auth.hmac(message, signature, key, consumerId, credentialId)` publishes an
 Identity only after verification. `auth.rotatingHmac(...)` evaluates current
 and previous slots, prefers current on a tie, and supports revocation by

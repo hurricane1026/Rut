@@ -1,0 +1,34 @@
+import "middleware/auth.rut"
+
+listen :8080
+upstream backend at "127.0.0.1:8081"
+
+// Configure each Consumer's key ID and secret from a protected source. Serve
+// signed routes over TLS and remove Authorization before forwarding upstream.
+route POST "/signed" {
+    let first = auth.SignedRequestConsumer(
+        consumerId: "orders-api",
+        keyId: env("ORDERS_SIGNED_KEY_ID"),
+        key: env("ORDERS_SIGNED_KEY"),
+        credentialId: "orders-signing-v1")
+    let second = auth.SignedRequestConsumer(
+        consumerId: "billing-api",
+        keyId: env("BILLING_SIGNED_KEY_ID"),
+        key: env("BILLING_SIGNED_KEY"),
+        credentialId: "billing-signing-v1")
+    let identity = auth.multiSignedRequest(first, second)
+
+    match identity.consumerId {
+        "orders-api" => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", identity.consumerId)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        "billing-api" => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", identity.consumerId)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => return 403
+    }
+}

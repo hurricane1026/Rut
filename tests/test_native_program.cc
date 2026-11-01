@@ -270,6 +270,59 @@ TEST(native_program, rotating_signed_request_survives_native_artifact_source_rem
     CHECK_EQ(invoke(owner.p->config.routes[2], revoked_request).status_code, 401u);
 }
 
+TEST(native_program, multi_signed_request_maps_two_consumers_after_source_removal) {
+    Source source;
+    const auto auth_path = (std::filesystem::path(__FILE__).parent_path().parent_path() /
+                            "examples/middleware/auth.rut")
+                               .string();
+    const std::string rut_source =
+        "import \"" + auth_path +
+        "\"\nroute POST \"/multi-first\" { let first = auth.SignedRequestConsumer(consumerId: "
+        "\"orders\", keyId: \"orders-kid\", key: \"orders-secret\", credentialId: "
+        "\"orders-credential\") let second = auth.SignedRequestConsumer(consumerId: \"billing\", "
+        "keyId: \"billing-kid\", key: \"billing-secret\", credentialId: \"billing-credential\") "
+        "let identity = auth.multiSignedRequest(first, second) guard identity.consumerId == "
+        "\"orders\" && identity.credentialId == \"orders-credential\" else { return 500 } return "
+        "204 }\n"
+        "route POST \"/multi-second\" { let first = auth.SignedRequestConsumer(consumerId: "
+        "\"orders\", keyId: \"orders-kid\", key: \"orders-secret\", credentialId: "
+        "\"orders-credential\") let second = auth.SignedRequestConsumer(consumerId: \"billing\", "
+        "keyId: \"billing-kid\", key: \"billing-secret\", credentialId: \"billing-credential\") "
+        "let identity = auth.multiSignedRequest(first, second) guard identity.consumerId == "
+        "\"billing\" && identity.credentialId == \"billing-credential\" else { return 500 } return "
+        "204 }\n";
+    REQUIRE(source.append(rut_source.data(), static_cast<u32>(rut_source.size())));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    REQUIRE_EQ(unlink(source.path), 0);
+
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    REQUIRE(now.tv_sec > 1000);
+    const std::string body("native\0multi", 12);
+    const std::string first_target = "/multi-first?artifact=source-free";
+    const auto first_headers = ::rut::test::signed_request::make_headers(
+        "POST", first_target, body, now.tv_sec, "orders-kid", "orders-secret");
+    const std::string first_request =
+        "POST " + first_target +
+        " HTTP/1.1\r\nHost: localhost\r\nAuthorization: " + first_headers.authorization +
+        "\r\nDate: " + first_headers.date + "\r\nDigest: " + first_headers.digest +
+        "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    CHECK_EQ(invoke(owner.p->config.routes[0], first_request).status_code, 204u);
+
+    const std::string second_target = "/multi-second?artifact=source-free";
+    const auto second_headers = ::rut::test::signed_request::make_headers(
+        "POST", second_target, body, now.tv_sec, "billing-kid", "billing-secret");
+    const std::string second_request =
+        "POST " + second_target +
+        " HTTP/1.1\r\nHost: localhost\r\nAuthorization: " + second_headers.authorization +
+        "\r\nDate: " + second_headers.date + "\r\nDigest: " + second_headers.digest +
+        "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    CHECK_EQ(invoke(owner.p->config.routes[1], second_request).status_code, 204u);
+}
+
 TEST(native_program, links_with_closed_stderr) {
     Source source;
     REQUIRE(source.append("route GET \"/\" { return 200 }\n"));
