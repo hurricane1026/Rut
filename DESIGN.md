@@ -2742,11 +2742,15 @@ and `guard let kind = json.string(field) ...` binds it only when that value is a
 JSON string. `json.string(document)` also checks a root JSON string. Missing
 fields, null, numbers, booleans, arrays and objects fail the string binding.
 The resulting alias can be compared with a string literal using `==` or `!=`
-in either operand order, including logical condition trees. These path aliases
-are compile-time metadata: every reached check reparses the full bounded message
-and retains no document node or borrowed string. Direct optional `json.get`
-values, nested `get`, strings used as Json, documents used as strings without
-`json.string`, dynamic paths and general value extraction are rejected. This
+in either operand order, or checked with `.isEmpty`, `.hasPrefix("literal")`,
+`.hasSuffix("literal")`, and `.contains("literal")`. Predicates compare decoded
+JSON string bytes exactly, with no Unicode normalization. Empty prefix, suffix,
+and contains literals match any valid string; parsing, field presence, and string
+type checks still happen first. These path aliases are compile-time metadata:
+every reached check reparses the full bounded message and retains no document
+node or borrowed string. Direct optional `json.get` values, nested `get`, strings
+used as Json, documents used as strings without `json.string`, dynamic paths,
+dynamic predicate arguments, and general value extraction are rejected. This
 uses the existing four-guard and 32-condition-node limits.
 
 The native/JIT helper validates the complete unmasked, reassembled payload with

@@ -5,6 +5,7 @@
 #include "rut/runtime/json.h"
 
 #include <openssl/rand.h>
+#include <string.h>
 
 namespace rut {
 
@@ -40,6 +41,11 @@ bool ws_json_string_at_path(const u8* payload, u64 len, Str path) {
 }
 
 bool ws_json_string_equals_at_path(const u8* payload, u64 len, Str path, Str expected) {
+    return ws_json_string_matches_at_path(payload, len, path, expected, WsJsonStringMatch::Equal);
+}
+
+bool ws_json_string_matches_at_path(
+    const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation) {
     if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
         (!path.ptr && path.len) || (!expected.ptr && expected.len))
         return false;
@@ -47,21 +53,39 @@ bool ws_json_string_equals_at_path(const u8* payload, u64 len, Str path, Str exp
     const bool kParsed =
         document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
-    bool equal = false;
+    bool matches = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::String) {
         json::Writer decoded{document.scratch};
-        if (document.string(kId, decoded) && decoded.len == expected.len) {
-            equal = true;
-            for (u32 i = 0; i < decoded.len; ++i) {
-                if (document.scratch[i] != expected.ptr[i]) {
-                    equal = false;
+        if (document.string(kId, decoded)) {
+            switch (operation) {
+                case WsJsonStringMatch::Equal:
+                    matches = decoded.len == expected.len &&
+                              (expected.len == 0 ||
+                               memcmp(document.scratch, expected.ptr, expected.len) == 0);
                     break;
-                }
+                case WsJsonStringMatch::Prefix:
+                    matches = expected.len <= decoded.len &&
+                              (expected.len == 0 ||
+                               memcmp(document.scratch, expected.ptr, expected.len) == 0);
+                    break;
+                case WsJsonStringMatch::Suffix:
+                    matches =
+                        expected.len <= decoded.len &&
+                        (expected.len == 0 || memcmp(document.scratch + decoded.len - expected.len,
+                                                     expected.ptr,
+                                                     expected.len) == 0);
+                    break;
+                case WsJsonStringMatch::Contains:
+                    matches = expected.len == 0 ||
+                              (expected.len <= decoded.len &&
+                               memmem(document.scratch, decoded.len, expected.ptr, expected.len) !=
+                                   nullptr);
+                    break;
             }
         }
     }
     document.source = {};
-    return equal;
+    return matches;
 }
 
 bool ws_valid_json_payload(const u8* payload, u64 len) {

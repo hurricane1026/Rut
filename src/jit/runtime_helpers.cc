@@ -18,6 +18,7 @@
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/uuid.h"
 #include "rut/runtime/webhook.h"
+#include "rut/runtime/ws_terminate.h"
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/random.h>
@@ -1960,6 +1961,22 @@ extern "C" u8 rut_helper_ws_json_string_equals_at_path(const char* payload,
                                          len,
                                          {path, path_len},
                                          {expected, expected_len})
+               ? 1u
+               : 0u;
+}
+
+extern "C" u8 rut_helper_ws_json_string_matches_at_path(const char* payload,
+                                                        u64 len,
+                                                        const char* path,
+                                                        u32 path_len,
+                                                        const char* expected,
+                                                        u32 expected_len,
+                                                        u8 operation) {
+    return ws_json_string_matches_at_path(reinterpret_cast<const u8*>(payload),
+                                          len,
+                                          {path, path_len},
+                                          {expected, expected_len},
+                                          static_cast<WsJsonStringMatch>(operation))
                ? 1u
                : 0u;
 }

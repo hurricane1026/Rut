@@ -873,10 +873,13 @@ return websocket(chat) { message in
 }
 // json.string(document) also checks a root JSON string. A get result must be
 // unwrapped before json.string; missing, null, number, bool, array and object fail.
-// String aliases support only literal == / != comparisons (either operand order).
+// String aliases support literal == / != plus isEmpty, hasPrefix, hasSuffix and
+// contains with string literals. The predicates compare decoded bytes exactly.
 // Bindings require fresh names and count toward the four-guard limit. Each reached
 // check reparses within the JSON bounds; no document or borrowed string survives.
-// Nested get, dynamic paths, arbitrary extraction and mutation remain unsupported.
+// Empty contains needles match every valid string; a failed/non-string JSON value
+// still fails its binding. Nested get, dynamic paths, arbitrary extraction and
+// mutation remain unsupported; no Unicode normalization is performed.
 
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
