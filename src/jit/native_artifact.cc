@@ -158,7 +158,7 @@ bool write_native_program(LoadedProgram& p, const char* output) {
         }
         if (route.ws_frame_handler) {
             char name[64];
-            // Terminate routes are appended in dense HIR order.
+            // WS handlers are emitted in dense HIR order and attached to routes in that order.
             u32 id = 0;
             for (u32 j = 0; j < i; j++)
                 if (c.routes[j].ws_frame_handler) id++;

@@ -5499,22 +5499,13 @@ TEST(frontend, parse_return_websocket_block_is_terminate) {
 
 TEST(frontend, websocket_terminate_rejects_unexecuted_http_prelude) {
     const char* detail =
-        "WebSocket message routes currently allow only compile-time constant let bindings "
-        "before websocket; request guards/effects are not executed";
+        "WebSocket message routes allow only compile-time constant lets and bounded request "
+        "guards before websocket; effects are not executed";
     struct Case {
         const char* source;
         const char* marker;
     };
     const Case cases[] = {
-        {"upstream ws\nroute GET \"/ws\" { guard false else { return 403 }\n"
-         "return websocket(ws) { message in message.forward() } }\n",
-         "guard false"},
-        {"upstream ws\nroute GET \"/ws\" { guard true else { return 403 }\n"
-         "return websocket(ws) { message in message.forward() } }\n",
-         "guard true"},
-        {"upstream ws\nroute GET \"/ws\" { guard let token = req.header(\"Authorization\") else "
-         "{ return 403 }\nreturn websocket(ws) { message in message.forward() } }\n",
-         "guard let token"},
         {"upstream ws\nroute GET \"/ws\" { let unused = req.header(\"Authorization\")\n"
          "return websocket(ws) { message in message.forward() } }\n",
          "req.header"},
@@ -5524,6 +5515,10 @@ TEST(frontend, websocket_terminate_rejects_unexecuted_http_prelude) {
         {"func helper() -> str => \"literal\"\nupstream ws\nroute GET \"/ws\" { "
          "let unused = helper()\nreturn websocket(ws) { message in message.forward() } }\n",
          "helper()\nreturn websocket"},
+        {"func helper() -> bool => true\nupstream ws\nroute GET \"/ws\" { "
+         "guard helper() else { return 403 }\nreturn websocket(ws) { message in message.forward() "
+         "} }\n",
+         "helper() else"},
         {"upstream ws\nroute GET \"/ws\" { if true { return 403 } else { return "
          "websocket(ws) { message in message.forward() } } }\n",
          "if true"},
@@ -7002,13 +6997,11 @@ TEST(frontend, analyze_rejects_websocket_non_len_guard) {
     CHECK(!hir);
 }
 
-TEST(frontend, build_mir_skips_ws_terminate_route) {
-    // A ws-terminate route compiles via the message-handler JIT path in the serve loader, NOT
-    // the HTTP MIR/RIR pipeline, so build_mir SKIPS it (rather than rejecting): a ws-only
-    // program produces a valid MIR module with zero HTTP functions.
+TEST(frontend, build_mir_includes_ws_terminate_http_route) {
+    // A ws-terminate route participates in HTTP admission before the message handler runs.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward() } "
-        "}\n";
+        "upstream ws\nroute GET \"/ws/:room\" { guard req.params.room == \"approved\" else { "
+        "return 403 } return websocket(ws) { message in message.forward() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7016,8 +7009,23 @@ TEST(frontend, build_mir_skips_ws_terminate_route) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);                      // build succeeds (the ws route is skipped, not rejected)
-    CHECK_EQ(mir->functions.len, 0u);  // no HTTP function emitted for the ws route
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK(mir->functions[0].path.eq(lit("/ws/:room")));
+    CHECK(hir->routes[0].is_ws_terminate);
+    CHECK_EQ(hir->routes[0].ws_handler.upstream_index,
+             hir->routes[0].control.direct_term.upstream_index);
+    bool saw_admission_failure = false;
+    bool saw_ws_forward = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const MirTerminator& term = mir->functions[0].blocks[bi].term;
+        saw_admission_failure |=
+            term.kind == MirTerminatorKind::ReturnStatus && term.status_code == 403;
+        saw_ws_forward |= term.kind == MirTerminatorKind::ForwardUpstream &&
+                          term.upstream_index == hir->routes[0].ws_handler.upstream_index;
+    }
+    CHECK(saw_admission_failure);
+    CHECK(saw_ws_forward);
 }
 
 TEST(frontend, analyze_accepts_websocket_forward_payload) {
@@ -10306,6 +10314,110 @@ route GET "/users" use chain access {
 }
 
 #if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_terminate_runs_bounded_http_admission_guards) {
+    const char* src = R"rut(
+upstream chat at "127.0.0.1:9000"
+route GET "/ws" {
+    let prefix = "["
+    guard req.method == GET && req.pathOnly == "/ws" else { return 404 }
+    guard let origin = req.uniqueHeader("Origin") else { return 403 }
+    guard origin == "https://allowed.example" || req.query("access").or("deny") == "allow"
+        else { return 403 }
+    return websocket(chat) { message in message.forward(prefix + message.text) }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir.value().routes.len, 1u);
+    const HirRoute& route = hir.value().routes[0];
+    CHECK(route.is_ws_terminate);
+    CHECK_EQ(route.guards.len, 3u);
+    CHECK_EQ(static_cast<u8>(route.control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(static_cast<u8>(route.control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ForwardUpstream));
+    CHECK_EQ(route.control.direct_term.upstream_index, route.ws_handler.upstream_index);
+}
+
+TEST(frontend, websocket_http_guard_binding_cannot_be_captured_by_message_handler) {
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { guard let origin = req.uniqueHeader(\"Origin\") "
+        "else { return 403 } return websocket(ws) { message in message.forward(origin) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, websocket_http_guard_limit_remains_eight) {
+    const char* eight = R"rut(
+upstream ws
+route GET "/ws" {
+    guard req.method == GET else { return 403 }
+    guard req.pathOnly == "/ws" else { return 403 }
+    guard req.uniqueHeader("Origin") != nil else { return 403 }
+    guard req.headerCount("Origin") == 1 else { return 403 }
+    guard req.header("X-Test").or("") == "" else { return 403 }
+    guard req.query("token").or("") == "" else { return 403 }
+    guard req.cookie("session").or("") == "" else { return 403 }
+    guard req.method == GET else { return 403 }
+    return websocket(ws) { message in message.forward() }
+}
+)rut";
+    auto lexed = lex(lit(eight));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir.value().routes[0].guards.len, 8u);
+
+    const char* nine = R"rut(
+upstream ws
+route GET "/ws" {
+    guard req.method == GET else { return 403 }
+    guard req.pathOnly == "/ws" else { return 403 }
+    guard req.uniqueHeader("Origin") != nil else { return 403 }
+    guard req.headerCount("Origin") == 1 else { return 403 }
+    guard req.header("X-Test").or("") == "" else { return 403 }
+    guard req.query("token").or("") == "" else { return 403 }
+    guard req.cookie("session").or("") == "" else { return 403 }
+    guard req.method == GET else { return 403 }
+    guard req.method == GET else { return 403 }
+    return websocket(ws) { message in message.forward() }
+}
+)rut";
+    lexed = lex(lit(nine));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, websocket_terminate_rejects_effectful_http_guard) {
+    const char* src = R"rut(
+upstream chat at "127.0.0.1:9000"
+func allowedOrigin() -> bool => true
+route GET "/ws" {
+    guard allowedOrigin() else { return 403 }
+    return websocket(chat) { message in message.forward() }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("WebSocket message routes allow only compile-time constant lets and bounded request "
+            "guards before websocket; effects are not executed")));
+}
+
 TEST(frontend, chain_after_rejects_websocket_terminate_routes) {
     const char* src = R"rut(
 upstream ws at "127.0.0.1:9000"
@@ -10325,8 +10437,8 @@ route GET "/ws" use chain access {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
-        lit("WebSocket message routes currently allow only compile-time constant let bindings "
-            "before websocket; request guards/effects are not executed")));
+        lit("WebSocket message routes allow only compile-time constant lets and bounded request "
+            "guards before websocket; effects are not executed")));
 }
 #endif
 

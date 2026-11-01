@@ -1259,10 +1259,9 @@ struct HirRoute {
     // @throttle decorator → client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
     u32 http_cache_ttl = 0;
-    // WebSocket terminate mode: when the route body is `websocket(x){...}`, this
-    // route has no HTTP terminator — `ws_handler` carries the message-handler
-    // verdict instead and `control` is unused. (Slice B; lowering rejects it
-    // until the JIT path lands.)
+    // WebSocket terminate mode: `control.direct_term` is the ordinary HTTP
+    // Direct ForwardUpstream to the configured WebSocket backend; `ws_handler`
+    // separately carries the post-101 message verdict handler.
     bool is_ws_terminate = false;
     HirWsHandler ws_handler{};
     // Timer route: the body is a `timer name, every: D {...}` background periodic

@@ -2603,12 +2603,19 @@ embedded NUL; an empty substring matches every message. It does not interpret
 regex metacharacters or normalize Unicode. Dynamic arguments and interpolation
 remain unsupported.
 The HTTP route prelude before a terminating `websocket(...) { message in ... }`
-is not executed by the terminate-route publisher. Such routes therefore allow
-only immutable compile-time `let` bindings before the WebSocket statement;
-request reads and guards, runtime effects or control flow, decorators, and
-chains are rejected at compile time. Bare `websocket(upstream)` passthrough
+runs as the ordinary request JIT handler before its final direct forward to the
+same WebSocket upstream. It permits immutable compile-time `let` bindings and
+up to eight bounded top-level request guards with static local failure
+responses. Guard-let bindings are visible only to subsequent HTTP guards and
+cannot be captured by the separate message handler or its rewrite expressions.
+Only existing request reads, literals, earlier bindings, comparisons, boolean
+operators, and `.or(literal)` are admitted. Helpers, effects, body reads,
+mutation, waits, loops, conditionals, decorators and chains remain compile-time
+errors until there is an execution path that can preserve their semantics. The
+four message guards remain independent. Bare `websocket(upstream)` passthrough
 routes remain ordinary HTTP routes and retain their normal guards and
-decorators.
+decorators. Origin is enforced only when a route adds a corresponding request
+guard; terminate mode does not add implicit Origin validation.
 The DSL exposes complete Text/Binary messages. Wire opcodes, FIN, masking,
 continuation frames and Ping/Pong/Close frames are runtime-internal details.
 The legacy `frame` binding and `.opcode` access are rejected; message type

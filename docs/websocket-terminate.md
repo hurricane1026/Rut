@@ -8,6 +8,8 @@ The DSL exposes complete WebSocket application messages. Wire frames belong to
 ```swift
 upstream chat at "127.0.0.1:9000"
 route GET "/ws" {
+    guard let origin = req.uniqueHeader("Origin") else { return 403 }
+    guard origin == "https://allowed.example" else { return 403 }
     return websocket(chat, maxMessageSize: 4kb) { message in
         guard message.len <= 2048 else { message.close(1009, "message too large") }
         guard !message.fromClient || !message.isText || message.text != "blocked" else {
@@ -19,7 +21,21 @@ route GET "/ws" {
 ```
 
 A bare `websocket(chat)` remains a transparent tunnel. The trailing block opts
-into message inspection and its bounded buffering costs.
+into message inspection and its bounded buffering costs. Before the terminating
+statement, the route can use the existing bounded HTTP guards for request
+admission. These guards run before the JIT handler forwards to the WebSocket
+upstream; a failed guard returns its static local response without connecting.
+`guard let` bindings are available to later HTTP guards only and cannot be
+captured by the message handler or its rewrite expressions.
+
+This slice allows immutable compile-time `let` bindings and at most eight
+top-level request guards before one final `websocket(...)` statement. Guard
+conditions use existing request reads (`method`, `path`, `pathOnly`, headers,
+query, cookies and route parameters), literals, prior bindings, comparisons,
+boolean operators, and `.or(literal)`. Failure branches must return a static
+status or response. Helpers, effects, request body reads, mutation, waits,
+loops, conditionals, decorators and chains remain unsupported. The message
+handler retains its independent four-guard limit.
 
 Terminate routes admit a 101 only when the request offered the exact `websocket`
 Upgrade token and the response selects exactly one `Upgrade: websocket` field,
@@ -29,7 +45,8 @@ rejected because terminate mode does not negotiate extensions. These checks
 apply only to terminate routes; bare passthrough routes retain generic Upgrade
 tunneling. This is a bounded WebSocket admission check, not full RFC 6455
 handshake validation: key/accept, version, subprotocol, and Origin are not
-validated here. An invalid terminate-mode 101 closes the connection before the
+validated here. Origin is not implicitly validated; add an HTTP guard when the
+route requires an Origin policy. An invalid terminate-mode 101 closes the connection before the
 101 is sent; the runtime does not synthesize a 502 or WebSocket Close frame.
 
 - `message.fromClient` identifies the sender: client or upstream.

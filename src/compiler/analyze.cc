@@ -106,8 +106,8 @@ constexpr Str kReqHeaderMutationOrderDetail = lit_str(
     "selected match arm");
 #if RUT_ENABLE_WEBSOCKET
 constexpr Str kWsPreludeDetail = lit_str(
-    "WebSocket message routes currently allow only compile-time constant let bindings before "
-    "websocket; request guards/effects are not executed");
+    "WebSocket message routes allow only compile-time constant lets and bounded request guards "
+    "before websocket; effects are not executed");
 
 static const AstExpr* ws_prelude_runtime_expr(const AstExpr& expr, u32 depth = 0) {
     // Keep pathological right-nested expressions from recursing without bound. Flat `+` chains
@@ -137,6 +137,122 @@ static const AstExpr* ws_prelude_runtime_expr(const AstExpr& expr, u32 depth = 0
         current = current->lhs;
     }
     return found;
+}
+
+static const AstExpr* ws_guard_disallowed_expr(const AstExpr& expr, u32 depth = 0) {
+    if (depth > 128) return &expr;
+    auto earlier = [](const AstExpr* current, const AstExpr* candidate) {
+        return candidate != nullptr &&
+                       (current == nullptr || candidate->span.start < current->span.start)
+                   ? candidate
+                   : current;
+    };
+    switch (expr.kind) {
+        case AstExprKind::BoolLit:
+        case AstExprKind::IntLit:
+        case AstExprKind::StrLit:
+        case AstExprKind::LitMethod:
+        case AstExprKind::Nil:
+        case AstExprKind::Ident:
+            return nullptr;
+        case AstExprKind::Field:
+            if (expr.lhs != nullptr && expr.lhs->kind == AstExprKind::Field &&
+                expr.lhs->lhs != nullptr && expr.lhs->lhs->kind == AstExprKind::Ident &&
+                expr.lhs->lhs->name.eq(lit_str("req")) && expr.lhs->name.eq(lit_str("params")) &&
+                expr.name.len != 0 && expr.rhs == nullptr && expr.args.len == 0)
+                return nullptr;
+            if (expr.lhs == nullptr || expr.lhs->kind != AstExprKind::Ident ||
+                !expr.lhs->name.eq(lit_str("req")) ||
+                !(expr.name.eq(lit_str("method")) || expr.name.eq(lit_str("path")) ||
+                  expr.name.eq(lit_str("pathOnly")) || expr.name.eq(lit_str("queryString")) ||
+                  expr.name.eq(lit_str("authorization")) || expr.name.eq(lit_str("host")) ||
+                  expr.name.eq(lit_str("userAgent")) || expr.name.eq(lit_str("origin")) ||
+                  expr.name.eq(lit_str("accept")) || expr.name.eq(lit_str("acceptLanguage")) ||
+                  expr.name.eq(lit_str("acceptEncoding")) ||
+                  expr.name.eq(lit_str("cacheControl")) || expr.name.eq(lit_str("contentType")) ||
+                  expr.name.eq(lit_str("ifModifiedSince")) || expr.name.eq(lit_str("referer")) ||
+                  expr.name.eq(lit_str("forwarded")) || expr.name.eq(lit_str("xForwardedFor")) ||
+                  expr.name.eq(lit_str("xForwardedProto")) || expr.name.eq(lit_str("xRealIp")) ||
+                  expr.name.eq(lit_str("xRequestId"))))
+                return &expr;
+            return nullptr;
+        case AstExprKind::MethodCall:
+            if (expr.lhs == nullptr || expr.args.len != 1 || expr.args[0] == nullptr) return &expr;
+            if (expr.name.eq(lit_str("or"))) {
+                const AstExpr& fallback = *expr.args[0];
+                if (fallback.kind != AstExprKind::BoolLit && fallback.kind != AstExprKind::IntLit &&
+                    fallback.kind != AstExprKind::StrLit && fallback.kind != AstExprKind::Nil &&
+                    fallback.kind != AstExprKind::LitMethod)
+                    return expr.args[0];
+                return ws_guard_disallowed_expr(*expr.lhs, depth + 1);
+            }
+            if (expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq(lit_str("req")) &&
+                (expr.name.eq(lit_str("header")) || expr.name.eq(lit_str("uniqueHeader")) ||
+                 expr.name.eq(lit_str("headerCount")) || expr.name.eq(lit_str("param")) ||
+                 expr.name.eq(lit_str("query")) || expr.name.eq(lit_str("cookie"))) &&
+                expr.args[0]->kind == AstExprKind::StrLit)
+                return nullptr;
+            return &expr;
+        case AstExprKind::Eq:
+        case AstExprKind::Lt:
+        case AstExprKind::Gt:
+        case AstExprKind::And:
+        case AstExprKind::Or:
+            break;
+        default:
+            return &expr;
+    }
+    const AstExpr* bad = nullptr;
+    if (expr.lhs != nullptr) bad = earlier(bad, ws_guard_disallowed_expr(*expr.lhs, depth + 1));
+    if (expr.rhs != nullptr) bad = earlier(bad, ws_guard_disallowed_expr(*expr.rhs, depth + 1));
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr)
+            bad = earlier(bad, ws_guard_disallowed_expr(*expr.args[i], depth + 1));
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr)
+            bad = earlier(bad, ws_guard_disallowed_expr(*expr.field_inits[i].value, depth + 1));
+    return bad;
+}
+
+static bool ws_http_guard_expr_allowed(const HirExpr& expr, u32 depth = 0) {
+    if (depth > 128) return false;
+    switch (expr.kind) {
+        case HirExprKind::BoolLit:
+        case HirExprKind::IntLit:
+        case HirExprKind::StrLit:
+        case HirExprKind::ConstMethod:
+        case HirExprKind::Nil:
+        case HirExprKind::LocalRef:
+        case HirExprKind::ReqHeaderCount:
+        case HirExprKind::ReqUniqueHeader:
+        case HirExprKind::ReqHeader:
+        case HirExprKind::ReqParam:
+        case HirExprKind::ReqCookie:
+        case HirExprKind::ReqQuery:
+        case HirExprKind::ReqQueryString:
+        case HirExprKind::ReqPath:
+        case HirExprKind::ReqPathOnly:
+        case HirExprKind::ReqMethod:
+            return expr.lhs == nullptr && expr.rhs == nullptr && expr.args.len == 0;
+        case HirExprKind::NoError:
+        case HirExprKind::HasValue:
+            return expr.lhs != nullptr && expr.rhs == nullptr && expr.args.len == 0 &&
+                   ws_http_guard_expr_allowed(*expr.lhs, depth + 1);
+        case HirExprKind::Eq:
+        case HirExprKind::Lt:
+        case HirExprKind::Gt:
+        case HirExprKind::Or:
+            return expr.lhs != nullptr && expr.rhs != nullptr &&
+                   ws_http_guard_expr_allowed(*expr.lhs, depth + 1) &&
+                   ws_http_guard_expr_allowed(*expr.rhs, depth + 1) && expr.args.len == 0;
+        case HirExprKind::IfElse:
+            return expr.lhs != nullptr && expr.rhs != nullptr && expr.args.len == 1 &&
+                   expr.args[0] != nullptr && ws_http_guard_expr_allowed(*expr.lhs, depth + 1) &&
+                   ws_http_guard_expr_allowed(*expr.rhs, depth + 1) &&
+                   ws_http_guard_expr_allowed(*expr.args[0], depth + 1);
+        default:
+            return false;
+    }
 }
 
 static bool ws_prelude_contains_terminate(const AstStatement* stmt, u32 depth = 0) {
@@ -11575,11 +11691,9 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     }
 
     // A `websocket(x) { ... }` terminate handler is only supported as the route's tail
-    // terminator (handled in analyze_control_stmt, which builds the HirWsHandler). Reaching
-    // analyze_term means it appears in a NESTED terminator position — a match arm, if/else
-    // branch, or guard-fail body — which Slice B does not support. Reject explicitly so it
-    // never falls through to the ForwardUpstream resolution below (which would silently
-    // compile a terminate route as a transparent passthrough tunnel, dropping the block).
+    // terminator (handled in analyze_control_stmt, which builds both the ordinary direct HTTP
+    // forward and the separate HirWsHandler). Reaching analyze_term means it appears in a nested
+    // terminator position, which this bounded admission slice does not support.
     if (stmt.kind == AstStmtKind::WsTerminate) {
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
     }
@@ -13525,6 +13639,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->ws_handler.upstream_index = upstream_index.value();
         route->ws_handler.max_message_size = stmt.ws_max_message_size;  // 0 = loader default
         route->ws_handler.span = stmt.span;
+        route->control.kind = HirControlKind::Direct;
+        route->control.direct_term.kind = HirTerminatorKind::ForwardUpstream;
+        route->control.direct_term.span = stmt.span;
+        route->control.direct_term.upstream_index = upstream_index.value();
 
         WsJsonBindings documents{};
         const AstStatement* body = stmt.then_stmt;
@@ -20604,12 +20722,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 si = 0; si < route_decl.statements.len; si++) {
                 const AstStatement* stmt = route_decl.statements[si];
                 if (stmt == nullptr || stmt->kind == AstStmtKind::WsTerminate) continue;
-                if (stmt->kind != AstStmtKind::Let) {
+                if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard) {
                     consider_disallowed_span(stmt->span);
                     continue;
                 }
-                if (const AstExpr* runtime_expr = ws_prelude_runtime_expr(stmt->expr))
-                    consider_disallowed_span(runtime_expr->span);
+                if (stmt->kind == AstStmtKind::Let) {
+                    if (const AstExpr* runtime_expr = ws_prelude_runtime_expr(stmt->expr))
+                        consider_disallowed_span(runtime_expr->span);
+                } else if (stmt->kind == AstStmtKind::Guard) {
+                    if (const AstExpr* bad = ws_guard_disallowed_expr(stmt->expr))
+                        consider_disallowed_span(bad->span);
+                }
             }
             if (has_disallowed_prelude)
                 return frontend_error(
@@ -21383,6 +21506,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 si = 0; si < route_decl.statements.len; si++) {
                 const AstStatement* stmt = route_decl.statements[si];
                 if (stmt == nullptr || stmt->kind == AstStmtKind::WsTerminate) continue;
+                if (stmt->kind == AstStmtKind::Guard) {
+                    if (const AstExpr* bad = ws_guard_disallowed_expr(stmt->expr))
+                        consider_disallowed_span(bad->span);
+                    continue;
+                }
                 if (stmt->kind != AstStmtKind::Let) {
                     consider_disallowed_span(stmt->span);
                     continue;
@@ -22436,8 +22564,28 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     disallowed_span = span;
                 }
             };
-            for (u32 gi = 0; gi < route.guards.len; gi++)
-                consider_disallowed_span(route.guards[gi].span);
+            auto static_http_failure = [](const HirTerminator& term) {
+                return term.kind == HirTerminatorKind::ReturnStatus &&
+                       term.source_kind == HirTerminatorSourceKind::Literal &&
+                       term.response_body_local_index == 0xffffffffu &&
+                       term.forward_set_path.len == 0 && term.forward_set_headers.len == 0 &&
+                       term.forward_request_policy_id == 0 &&
+                       term.forward_response_policy_id == 0 &&
+                       term.forward_failure_policy_id == 0 &&
+                       term.forward_timeout_failure_policy_id == 0;
+            };
+            for (u32 gi = 0; gi < route.guards.len; gi++) {
+                const HirGuard& guard = route.guards[gi];
+                bool fail_ok = guard.fail_kind == HirGuard::FailKind::Term
+                                   ? static_http_failure(guard.fail_term)
+                               : guard.fail_kind == HirGuard::FailKind::Body
+                                   ? guard.fail_body.body_kind == HirGuardBody::BodyKind::Direct &&
+                                         guard.fail_body.locals.len == 0 &&
+                                         static_http_failure(guard.fail_body.direct_term)
+                                   : false;
+                if (!ws_http_guard_expr_allowed(guard.cond) || !fail_ok)
+                    consider_disallowed_span(guard.span);
+            }
             for (u32 wi = 0; wi < route.waits.len; wi++)
                 consider_disallowed_span(route.waits[wi].span);
             for (u32 fi = 0; fi < route.for_loops.len; fi++)
@@ -22456,6 +22604,27 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             for (u32 li = 0; li < route.locals.len; li++) {
                 const HirLocal& local = route.locals[li];
+                const HirGuard* guard_binding = nullptr;
+                for (u32 gi = 0; gi < route.guards.len; gi++)
+                    if (route.guards[gi].span.start == local.span.start &&
+                        route.guards[gi].span.end == local.span.end)
+                        guard_binding = &route.guards[gi];
+                if (guard_binding != nullptr) {
+                    const HirExpr& init = local.init;
+                    ConstValue value{};
+                    const bool static_binding =
+                        !init.may_nil && !init.may_error &&
+                        const_eval_expr(init, route.locals.data, route.locals.len, &value, 0);
+                    const bool request_binding =
+                        init.kind == HirExprKind::ValueOf && init.lhs != nullptr &&
+                        guard_binding->cond.kind == HirExprKind::HasValue &&
+                        guard_binding->cond.lhs != nullptr &&
+                        guard_binding->cond.lhs->span.start == init.lhs->span.start &&
+                        guard_binding->cond.lhs->span.end == init.lhs->span.end &&
+                        ws_http_guard_expr_allowed(*init.lhs);
+                    if (!static_binding && !request_binding) consider_disallowed_span(local.span);
+                    continue;
+                }
                 ConstValue value{};
                 if (local.init.may_nil || local.init.may_error ||
                     known_value_state(local.init, route.locals.data, route.locals.len, 0) !=
@@ -22463,6 +22632,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     !const_eval_expr(local.init, route.locals.data, route.locals.len, &value, 0))
                     consider_disallowed_span(local.span);
             }
+            const HirTerminator& ws_forward = route.control.direct_term;
+            if (route.control.kind != HirControlKind::Direct ||
+                ws_forward.kind != HirTerminatorKind::ForwardUpstream ||
+                ws_forward.upstream_index != route.ws_handler.upstream_index ||
+                ws_forward.forward_set_path.len != 0 || ws_forward.forward_set_headers.len != 0 ||
+                ws_forward.forward_request_policy_id != 0 ||
+                ws_forward.forward_response_policy_id != 0 ||
+                ws_forward.forward_failure_policy_id != 0 ||
+                ws_forward.forward_timeout_failure_policy_id != 0)
+                consider_disallowed_span(route.ws_handler.span);
             if (has_disallowed_prelude)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, disallowed_span, kWsPreludeDetail);

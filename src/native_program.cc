@@ -568,6 +568,15 @@ bool load_native_program(const char* source,
         if (!fn) return fail("missing native handler symbol");
         memcpy(reinterpret_cast<u8*>(&c) + s.field, reinterpret_cast<const void*>(&fn), sizeof(fn));
     }
+    for (u32 i = 0; i < h.route_count; i++) {
+        const auto& route = c.routes[i];
+        if (!route.ws_terminate) continue;
+        if (route.ws_frame_handler == nullptr ||
+            (route.action != RouteAction::Proxy && route.action != RouteAction::JitHandler) ||
+            route.upstream_id >= c.upstream_count ||
+            (route.action == RouteAction::JitHandler && route.fn == nullptr))
+            return fail("invalid native WebSocket route");
+    }
     if (!out.arena.init(4096)) return fail("cannot allocate native program arena");
     out.regex_handles = out.arena.alloc_array<void*>(h.regex_count);
     if (h.regex_count && !out.regex_handles) return fail("cannot allocate regex handles");

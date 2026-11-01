@@ -4398,22 +4398,23 @@ TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific
 }
 
 #if RUT_ENABLE_WEBSOCKET
-TEST(serve_loader, websocket_terminate_rejects_unexecuted_http_guard) {
+TEST(serve_loader, websocket_terminate_rejects_effectful_http_guard) {
     const std::string dir = "/tmp/rut_serve_loader_ws_prelude";
     const std::string path =
         write_file(dir,
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
-                   "route GET \"/ws\" { guard false else { return 403 }\n"
+                   "func allowed() -> bool => true\n"
+                   "route GET \"/ws\" { guard allowed() else { return 403 }\n"
                    "return websocket(backend) { message in message.forward() } }\n");
     LoadedProgram program;
     LoadError err;
     CHECK_FALSE(load_rut_program(path.c_str(), program, err));
     CHECK(err.stage == LoadStage::Analyze);
     CHECK(err.has_diag);
-    CHECK(err.diag.detail.eq(
-        lit_str("WebSocket message routes currently allow only compile-time constant let bindings "
-                "before websocket; request guards/effects are not executed")));
+    CHECK(err.diag.detail.eq(lit_str(
+        "WebSocket message routes allow only compile-time constant lets and bounded request "
+        "guards before websocket; effects are not executed")));
     CHECK_EQ(program.config.route_count, 0u);
     program.destroy();
 }
@@ -4813,6 +4814,49 @@ TEST(serve_loader, websocket_terminate_empty_rewrite_and_invalid_config) {
     CHECK_FALSE(config.add_ws_terminate(
         "/c", 0, id.value(), route.ws_frame_handler, 4, 1000, {nullptr, 1}));
     CHECK_EQ(config.route_count, 0u);
+    program.destroy();
+}
+
+TEST(serve_loader, attach_ws_terminate_to_jit_is_exact_and_fail_atomic) {
+    const auto path = write_file(
+        "/tmp/rut_serve_loader_ws_attach_atomic",
+        "app.rut",
+        "upstream backend at \"127.0.0.1:9999\"\n"
+        "route GET \"/ws\" { return websocket(backend) { message in message.forward() } }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const RouteEntry& source_route = program.config.routes[0];
+    REQUIRE(source_route.fn);
+    REQUIRE(source_route.ws_frame_handler);
+
+    RouteConfig config;
+    const auto upstream = config.add_upstream("backend", 0x7f000001u, 9999);
+    REQUIRE(upstream.has_value());
+    REQUIRE(config.add_jit_handler(
+        "/ws", kRouteMethodGet, source_route.fn, false, ForwardPreflightMode::None, 0));
+    REQUIRE(config.add_proxy("/proxy", 'G', upstream.value()));
+    const auto handler = source_route.ws_frame_handler;
+    const u32 capacity = kWsTerminateMessageCapacity;
+    CHECK_FALSE(
+        config.attach_ws_terminate_to_jit(0, "/wrong", 'G', upstream.value(), handler, capacity));
+    CHECK_FALSE(
+        config.attach_ws_terminate_to_jit(0, "/ws", 'P', upstream.value(), handler, capacity));
+    CHECK_FALSE(
+        config.attach_ws_terminate_to_jit(1, "/proxy", 'G', upstream.value(), handler, capacity));
+    CHECK_FALSE(
+        config.attach_ws_terminate_to_jit(2, "/ws", 'G', upstream.value(), handler, capacity));
+    CHECK_FALSE(
+        config.attach_ws_terminate_to_jit(0, "/ws", 'G', upstream.value(), handler, capacity + 1));
+    CHECK_FALSE(config.routes[0].ws_terminate);
+    CHECK(config.routes[0].ws_frame_handler == nullptr);
+    CHECK(config.add_ws_terminate("/proxy", 'G', upstream.value(), handler, capacity));
+    REQUIRE_EQ(config.route_count, 3u);
+    CHECK(config.routes[2].action == RouteAction::Proxy);
+    CHECK(config.routes[2].ws_terminate);
+    CHECK(config.attach_ws_terminate_to_jit(0, "/ws", 'G', upstream.value(), handler, capacity));
+    CHECK(config.routes[0].ws_terminate);
+    CHECK(config.routes[0].ws_frame_handler == handler);
     program.destroy();
 }
 

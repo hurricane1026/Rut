@@ -105,19 +105,90 @@ bool load(Source& source, NativeProgram& p, u8 opt = 2) {
 }  // namespace
 
 #if RUT_ENABLE_WEBSOCKET
-TEST(native_program, websocket_terminate_http_guard_fails_before_native_publish) {
+TEST(native_program, websocket_terminate_http_guards_and_dual_handlers_survive_source_removal) {
     Source source;
     REQUIRE(source.fd >= 0);
     REQUIRE(
         source.append("upstream backend at \"127.0.0.1:9999\"\n"
-                      "route GET \"/ws\" { guard false else { return 403 }\n"
+                      "route GET \"/ws\" { guard let origin = req.uniqueHeader(\"Origin\") "
+                      "else { return 403 }\n"
+                      "guard origin == \"https://allowed.example\" else { return 403 }\n"
+                      "return websocket(backend) { message in message.forward() } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    char error[512]{};
+    REQUIRE(load_native_program(source.path, *owner.p, error, sizeof(error), 2));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& config = owner.p->config;
+    REQUIRE_EQ(config.route_count, 1u);
+    const RouteEntry& route = config.routes[0];
+    CHECK(route.action == RouteAction::JitHandler);
+    REQUIRE(route.fn);
+    CHECK(route.ws_terminate);
+    REQUIRE(route.ws_frame_handler);
+    CHECK_EQ(route.upstream_id, 0u);
+    const auto denied = invoke(route, "GET /ws HTTP/1.1\r\nHost: test\r\n\r\n");
+    CHECK(denied.action == jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(denied.status_code, 403u);
+    const auto allowed =
+        invoke(route, "GET /ws HTTP/1.1\r\nHost: test\r\nOrigin: https://allowed.example\r\n\r\n");
+    CHECK(allowed.action == jit::HandlerAction::Forward);
+    CHECK_EQ(allowed.upstream_id, route.upstream_id);
+}
+
+TEST(native_program, websocket_terminate_rejects_unsupported_http_prelude_before_publish) {
+    Source source;
+    REQUIRE(source.fd >= 0);
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\n"
+                      "func allowed() -> bool => true\n"
+                      "route GET \"/ws\" { guard allowed() else { return 403 }\n"
                       "return websocket(backend) { message in message.forward() } }\n"));
     Program owner;
     REQUIRE(owner.p);
     char error[512]{};
     CHECK_FALSE(load_native_program(source.path, *owner.p, error, sizeof(error), 2));
-    CHECK(strstr(error, "rut-compile failed") != nullptr);
     CHECK_EQ(owner.p->config.route_count, 0u);
+    CHECK_EQ(owner.p->library, nullptr);
+}
+
+TEST(native_program, websocket_dual_handlers_keep_mixed_http_timer_ordinals) {
+    Source source;
+    REQUIRE(source.append(
+        "upstream backend at \"127.0.0.1:9999\"\n"
+        "route GET \"/before\" { return 200 }\n"
+        "timer tick, every: 1s { }\n"
+        "route GET \"/ws-one\" { return websocket(backend) { message in message.drop() } }\n"
+        "route GET \"/middle\" { return 204 }\n"
+        "route GET \"/ws-two\" { return websocket(backend) { message in message.forward() } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& config = owner.p->config;
+    REQUIRE_EQ(config.route_count, 4u);
+    REQUIRE_EQ(config.timer_count, 1u);
+    auto route_path = [&](u32 index) {
+        return Str{config.routes[index].path, config.routes[index].path_len};
+    };
+    CHECK(route_path(0).eq(lit_str("/before")));
+    CHECK_FALSE(config.routes[0].ws_terminate);
+    CHECK(route_path(1).eq(lit_str("/ws-one")));
+    REQUIRE(config.routes[1].fn);
+    REQUIRE(config.routes[1].ws_frame_handler);
+    CHECK(config.routes[1].ws_terminate);
+    CHECK(route_path(2).eq(lit_str("/middle")));
+    CHECK_FALSE(config.routes[2].ws_terminate);
+    CHECK(route_path(3).eq(lit_str("/ws-two")));
+    REQUIRE(config.routes[3].fn);
+    REQUIRE(config.routes[3].ws_frame_handler);
+    CHECK(config.routes[3].ws_terminate);
+    CHECK(config.routes[1].ws_frame_handler(
+              nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("x"), 1, true) ==
+          WsFrameAction::Drop);
+    CHECK(config.routes[3].ws_frame_handler(
+              nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("x"), 1, true) ==
+          WsFrameAction::Forward);
 }
 #endif
 
