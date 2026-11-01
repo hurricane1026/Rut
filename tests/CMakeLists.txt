@@ -907,6 +907,12 @@ target_include_directories(test_public_key PRIVATE ${PROJECT_SOURCE_DIR}/testing
 add_test(NAME test_public_key COMMAND test_public_key)
 set_tests_properties(test_public_key PROPERTIES LABELS "unit")
 
+add_executable(test_signed_request test_signed_request.cc)
+target_link_libraries(test_signed_request rut_runtime)
+target_include_directories(test_signed_request PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_signed_request COMMAND test_signed_request)
+set_tests_properties(test_signed_request PROPERTIES LABELS "unit;auth")
+
 add_executable(test_webhook test_webhook.cc)
 target_link_libraries(test_webhook rut_runtime)
 target_include_directories(test_webhook PRIVATE ${PROJECT_SOURCE_DIR}/testing)

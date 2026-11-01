@@ -129,6 +129,7 @@ add_library(rut_runtime STATIC
     runtime/hash.cc
     runtime/auth.cc
     runtime/webhook.cc
+    runtime/signed_request.cc
     runtime/memory_http_cache_store.cc
     runtime/http_tokens.cc
     runtime/http_cache.cc
