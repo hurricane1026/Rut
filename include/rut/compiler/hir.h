@@ -1497,7 +1497,9 @@ struct HirModule {
     static constexpr u32 kMaxImports = 64;
     static constexpr u32 kMaxAliases = 64;
     static constexpr u32 kMaxTypeAliases = 64;
-    static constexpr u32 kMaxFunctions = 64;
+    // Imports merge their Rut helpers into one HIR module. Auth plus Crypto
+    // already exceeds the old 64-function limit; leave headroom for user helpers.
+    static constexpr u32 kMaxFunctions = 128;
     static constexpr u32 kMaxStructs = 64;
     static constexpr u32 kMaxVariants = 64;
     static constexpr u32 kMaxProtocols = 32;

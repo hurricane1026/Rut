@@ -25828,6 +25828,226 @@ TEST(jit, custom_header_keys_rotate_and_never_downgrade_presented_credentials) {
     rir.destroy();
 }
 
+TEST(jit, multi_header_key_binds_configured_consumer_and_strips_before_forwarding) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/multi-header-key-auth.rut";
+    const char* configurations[] = {
+        "auth.HeaderKeyConsumer(consumerId: \"alice\", key: \"alice-key\", credentialId: "
+        "\"alice-id\"), "
+        "auth.HeaderKeyConsumer(consumerId: \"bob\", key: \"bob-key\", credentialId: \"bob-id\")",
+        "auth.HeaderKeyConsumer(consumerId: \"alice\", key: \"\", credentialId: \"alice-id\"), "
+        "auth.HeaderKeyConsumer(consumerId: \"bob\", key: \"\", credentialId: \"bob-id\")",
+        "auth.HeaderKeyConsumer(consumerId: \"alice\", key: \"\", credentialId: \"alice-id\"), "
+        "auth.HeaderKeyConsumer(consumerId: \"bob\", key: \"bob-key\", credentialId: \"bob-id\")",
+        "auth.HeaderKeyConsumer(consumerId: \"alice\", key: \"same-key\", credentialId: "
+        "\"alice-id\"), "
+        "auth.HeaderKeyConsumer(consumerId: \"bob\", key: \"same-key\", credentialId: \"bob-id\")",
+        "auth.HeaderKeyConsumer(consumerId: \"\", key: \"alice-key\", credentialId: \"alice-id\"), "
+        "auth.HeaderKeyConsumer(consumerId: \"bob\", key: \"bob-key\", credentialId: \"bob-id\")",
+        "auth.HeaderKeyConsumer(consumerId: \"alice\", key: \"alice-key\", credentialId: \"\"), "
+        "auth.HeaderKeyConsumer(consumerId: \"bob\", key: \"bob-key\", credentialId: \"bob-id\")",
+        "auth.HeaderKeyConsumer(consumerId: \"alice\", key: \"alice-key\", credentialId: "
+        "\"alice-id\"), "
+        "auth.HeaderKeyConsumer(consumerId: \"alice\", key: \"bob-key\", credentialId: \"bob-id\")",
+    };
+    std::string source =
+        "import \"middleware/auth.rut\"\nimport Crypto\n"
+        "func sameConsumer(_ actual: str, _ expected: str) -> bool => Crypto.equal(actual, "
+        "expected)\n"
+        "upstream backend at \"127.0.0.1:8081\"\n";
+    const u32 config_count = sizeof(configurations) / sizeof(configurations[0]);
+    for (u32 i = 0; i < config_count; ++i) {
+        source += "route GET \"/config-" + std::to_string(i) + "\" {\n";
+        source +=
+            "    let identity = auth.multiHeaderKey(req.uniqueHeader(\"X-API-Key\").or(\"\"), " +
+            std::string(configurations[i]) + ")\n";
+        if (i == 2) {
+            source += R"rut(
+    guard sameConsumer(identity.consumerId, "bob") && identity.credentialId == "bob-id" && identity.method == "apiKey"
+        else { return 500 }
+    return 204
+}
+)rut";
+        } else {
+            source += R"rut(
+    guard sameConsumer(identity.consumerId, "alice") && identity.credentialId == "alice-id" && identity.method == "apiKey"
+        else { return 500 }
+    return 204
+}
+)rut";
+        }
+    }
+    source += R"rut(
+route GET "/bob-mapping" {
+    let identity = auth.multiHeaderKey(req.uniqueHeader("X-API-Key").or(""),
+        auth.HeaderKeyConsumer(consumerId: "alice", key: "alice-key", credentialId: "alice-id"),
+        auth.HeaderKeyConsumer(consumerId: "bob", key: "bob-key", credentialId: "bob-id"))
+    guard identity.consumerId == "bob" && identity.credentialId == "bob-id" && identity.method == "apiKey"
+        else { return 500 }
+    return 204
+}
+route GET "/alice-only" {
+    let identity = auth.multiHeaderKey(req.uniqueHeader("X-API-Key").or(""),
+        auth.HeaderKeyConsumer(consumerId: "alice", key: "alice-key", credentialId: "alice-id"),
+        auth.HeaderKeyConsumer(consumerId: "bob", key: "bob-key", credentialId: "bob-id"))
+    let allowed = auth.requireConsumer(identity, "alice")
+    let consumerId = allowed.consumerId
+    if consumerId == "alice" { return 204 } else { return 500 }
+}
+route GET "/strip" {
+    req.remove("X-API-Key")
+    let identity = auth.multiHeaderKey(req.uniqueHeader("X-API-Key").or(""),
+        auth.HeaderKeyConsumer(consumerId: "alice", key: "alice-key", credentialId: "alice-id"),
+        auth.HeaderKeyConsumer(consumerId: "bob", key: "bob-key", credentialId: "bob-id"))
+    match identity.consumerId {
+        "alice" => { req.set("X-Consumer-ID", identity.consumerId) return forward(backend, load_balance: .roundRobin) }
+        "bob" => { req.set("X-Consumer-ID", identity.consumerId) return forward(backend, load_balance: .roundRobin) }
+        _ => return 403
+    }
+}
+)rut";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    if (!ast)
+        std::fprintf(stderr,
+                     "multi-header-key parse: code %u at %u:%u: %.*s\n",
+                     static_cast<unsigned>(ast.error().code),
+                     ast.error().span.line,
+                     ast.error().span.col,
+                     ast.error().detail.len,
+                     ast.error().detail.ptr);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "multi-header-key HIR: code %u, %.*s at %u:%u\n",
+                     static_cast<unsigned>(hir.error().code),
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    CHECK(hir.value().functions.len > 64u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    Connection conn;
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    const auto check = [&](u32 route, const char* headers, u16 expected) {
+        const std::string name = "handler_route_" + std::to_string(route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+        REQUIRE(handler != nullptr);
+        conn.reset();
+        conn.json_arena.backend.pool = &pool;
+        const std::string request =
+            std::string("GET / HTTP/1.1\r\nHost: localhost\r\n") + headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.status_code == expected);
+        CHECK(result.action ==
+              (expected == 0 ? HandlerAction::Forward : HandlerAction::ReturnStatus));
+        if (expected == 401) {
+            REQUIRE(result.next_state != 0 && result.next_state <= rir.module.header_set_count);
+            const auto& set = rir.module.header_sets[result.next_state - 1];
+            REQUIRE_EQ(set.count, 1u);
+            CHECK(rir.module.header_keys[set.offset].eq(lit("WWW-Authenticate")));
+            CHECK(rir.module.header_values[set.offset].eq(lit("ApiKey")));
+        }
+    };
+    check(0, "X-API-Key: alice-key\r\n", 204);
+    check(config_count, "x-api-key: bob-key\r\n", 204);
+    check(0, "X-API-Key: Alice-key\r\n", 401);
+    check(0, "X-API-Key: alice\r\n", 401);
+    check(0, "X-API-Key: alice-key\r\nx-api-key: alice-key\r\n", 401);
+    check(0, "Authorization: Bearer alice-key\r\n", 401);
+    check(0, "", 401);
+    check(0, "X-API-Key: alice-key\r\nX-Consumer-ID: mallory\r\nX-Credential-ID: fake\r\n", 204);
+    check(1, "X-API-Key: alice-key\r\n", 503);
+    check(1, "", 503);
+    check(2, "X-API-Key: bob-key\r\n", 204);
+    check(2, "X-API-Key: alice-key\r\n", 401);
+    check(2, "", 401);
+    check(3, "X-API-Key: same-key\r\n", 503);
+    check(4, "X-API-Key: alice-key\r\n", 503);
+    check(5, "X-API-Key: alice-key\r\n", 503);
+    check(6, "X-API-Key: alice-key\r\n", 503);
+    check(config_count + 1,
+          "X-API-Key: alice-key\r\nX-Consumer-ID: mallory\r\nX-Credential-ID: fake\r\n",
+          204);
+    check(config_count + 1, "X-API-Key: bob-key\r\n", 403);
+    check(config_count + 1, "X-API-Key: wrong\r\nX-Consumer-ID: alice\r\n", 401);
+
+    const u32 strip_route = config_count + 2;
+    check(strip_route, "X-API-Key: alice-key\r\nX-Consumer-ID: mallory\r\n", 0);
+    CHECK_EQ(conn.req_header_override_count, 2u);
+    CHECK_EQ(conn.req_header_remove_mask, 1u);
+    u8 wire[512]{};
+    u32 wire_len = 0;
+    const std::string forwarded_request =
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-API-Key: alice-key\r\n"
+        "X-Consumer-ID: mallory\r\n\r\n";
+    REQUIRE(h2_prepare_forward_request(conn,
+                                       reinterpret_cast<const u8*>(forwarded_request.data()),
+                                       static_cast<u32>(forwarded_request.size()),
+                                       wire,
+                                       sizeof(wire),
+                                       &wire_len));
+    const char expected_forwarded[] =
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Consumer-ID: alice\r\n\r\n";
+    CHECK_EQ(wire_len, sizeof(expected_forwarded) - 1);
+    CHECK(__builtin_memcmp(wire, expected_forwarded, sizeof(expected_forwarded) - 1) == 0);
+    conn.json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, multi_header_key_example_compiles) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/multi-header-key-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    const std::string source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "multi-header-key example HIR: code %u, %.*s at %u:%u\n",
+                     static_cast<unsigned>(hir.error().code),
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, header_key_policies_example_compiles) {
     const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
                              "examples/header-key-policies-auth.rut";
