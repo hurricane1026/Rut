@@ -106,6 +106,15 @@ literal in either operand order. A comparison leaf accepts only the bare alias
 and one Bool literal. Each reached condition reparses the complete bounded
 message and shares the existing per-thread workspace.
 
+JSON integers can be unwrapped with `json.int(field)` or from a root with
+`json.int(document)`. Only exact signed 64-bit integer tokens are accepted;
+fractional and exponent notation, overflow, and non-number JSON kinds fail the
+binding. Integer aliases compare with Int literals using all six comparisons
+(`==`, `!=`, `<`, `<=`, `>`, `>=`) in either operand order, including under
+`!`, `&&`, and `||`. Leaves are restricted to one bare alias and one literal;
+arithmetic and alias-to-alias comparisons are unsupported. The signed 64-bit
+comparison bound is separate from the existing `u32` message and opcode bound.
+
 The parser limits remain 8 KiB input, 2048 nodes and depth 64; exceeding any limit
 fails validation. Duplicate decoded object keys are rejected. For Text-only
 validation, combine the condition with `message.isText`; ordinary payload text

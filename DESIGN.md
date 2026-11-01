@@ -2732,7 +2732,7 @@ invalid paths return nil. Literal escapes, including embedded NUL, are decoded.
 Bindings require fresh names (including no collision with route locals, `json`
 or `message`), become available only after their guard and stay inside this
 handler. A validated document alias supports `json.get` presence checks, while
-typed string and boolean bindings and literal comparisons are limited to the
+typed string, boolean, and integer bindings and literal comparisons are limited to the
 operations below.
 General document operations, arbitrary value extraction and rewriting remain
 unsupported. Each binding guard counts toward the four-source-guard limit.
@@ -2761,6 +2761,16 @@ JSON kind fail. Bool aliases support bare truth checks, `!`, short-circuit
 `&&`/`||`, and `==`/`!=` with a Bool literal on either side. Comparison leaves
 are limited to the bare alias and one Bool literal. They use the same bounded
 path metadata and per-thread reparsing workspace as string bindings.
+
+JSON integer fields can be unwrapped with `json.int(documentOrField)` after the
+same parse and optional presence guards. This accepts only exact signed 64-bit
+integer tokens: fractional/exponent forms, overflow, strings, booleans, null,
+and missing fields fail the binding. Integer aliases compare with an integer
+literal using `==`, `!=`, `<`, `<=`, `>`, or `>=` in either operand order, and
+those comparisons can be composed with `!`, `&&`, and `||`. Comparison leaves
+are limited to a bare alias and one literal; arithmetic and alias-to-alias
+comparisons are unsupported. The JSON integer threshold uses its own signed
+64-bit field, independent of the existing message-length bound.
 
 The native/JIT helper validates the complete unmasked, reassembled payload with
 the existing JSON parser and a bounded workspace per worker thread. It accepts

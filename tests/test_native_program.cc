@@ -383,6 +383,42 @@ route GET "/ws" { return websocket(backend) { message in
     REQUIRE_EQ(owner.p->config.routes[0].ws_close_policy_count, 3u);
 }
 
+TEST(native_program, websocket_json_i64_bounds_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/count") else { message.close(1008) }
+ guard let count = json.int(field) else { message.close(1003) }
+ guard count == -9223372036854775808 || count == 9223372036854775807 else { message.drop() }
+ message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const char* const payloads[] = {R"({"count":-9223372036854775808})",
+                                    R"({"count":9223372036854775807})",
+                                    R"({"count":2147483648})",
+                                    R"({"count":1.0})",
+                                    R"({"count":9223372036854775808})"};
+    const WsFrameAction expected[] = {WsFrameAction::Forward,
+                                      WsFrameAction::Forward,
+                                      WsFrameAction::Drop,
+                                      WsFrameAction::ClosePolicy2,
+                                      WsFrameAction::ClosePolicy2};
+    for (u32 i = 0; i < sizeof(payloads) / sizeof(payloads[0]); ++i) {
+        CHECK(handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(payloads[i]),
+                      strlen(payloads[i]),
+                      i % 2 == 0) == expected[i]);
+    }
+    REQUIRE_EQ(owner.p->config.routes[0].ws_close_policy_count, 3u);
+}
+
 TEST(native_program, websocket_json_validation_survives_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

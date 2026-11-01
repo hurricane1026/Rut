@@ -1997,6 +1997,25 @@ extern "C" u8 rut_helper_ws_json_bool_equals_at_path(
                : 0u;
 }
 
+extern "C" u8 rut_helper_ws_json_int_at_path(const char* payload,
+                                             u64 len,
+                                             const char* path,
+                                             u32 path_len) {
+    return ws_json_int_at_path(reinterpret_cast<const u8*>(payload), len, {path, path_len}) ? 1u
+                                                                                            : 0u;
+}
+
+extern "C" u8 rut_helper_ws_json_int_compare_at_path(
+    const char* payload, u64 len, const char* path, u32 path_len, i64 expected, u8 comparison) {
+    return ws_json_int_compare_at_path(reinterpret_cast<const u8*>(payload),
+                                       len,
+                                       {path, path_len},
+                                       expected,
+                                       static_cast<WsJsonIntComparison>(comparison))
+               ? 1u
+               : 0u;
+}
+
 extern "C" void rut_helper_json(void* conn,
                                 void* arena,
                                 u32 op,

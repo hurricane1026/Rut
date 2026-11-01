@@ -20766,7 +20766,7 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     auto empty = codegen_ws_handler(0, &node, 1, 0);
     REQUIRE(empty.ok);
     dispose_module(empty.mod, empty.ctx);
-    for (u8 accessor : {7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18}) {
+    for (u8 accessor : {7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}) {
         node.accessor = accessor;
         node.pattern_len = 4;
         CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
@@ -20782,6 +20782,20 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     node.bound = 2;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
     node.accessor = 19;
+    node.bound = 0;
+    node.int_bound = (-9223372036854775807LL - 1);
+    auto min_int = codegen_ws_handler(0, &node, 1, 0);
+    REQUIRE(min_int.ok);
+    dispose_module(min_int.mod, min_int.ctx);
+    node.accessor = 20;
+    node.int_bound = 9223372036854775807LL;
+    node.cmp = 2;
+    auto max_int = codegen_ws_handler(0, &node, 1, 0);
+    REQUIRE(max_int.ok);
+    dispose_module(max_int.mod, max_int.ctx);
+    node.cmp = 3;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.accessor = 21;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 

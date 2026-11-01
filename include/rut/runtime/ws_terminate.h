@@ -23,6 +23,7 @@ inline constexpr u32 kWsMaxCloseReasonBytes = kWsMaxControlPayload - 2;
 inline constexpr u32 kWsTerminateMessageCapacity = SlicePool::kSliceSize - kWsMaxHeaderSize;
 
 enum class WsJsonStringMatch : u8 { Equal, Prefix, Suffix, Contains };
+enum class WsJsonIntComparison : u8 { Lt, Gt, Eq };
 
 // Valid UTF-8 for a text message; an empty view is valid.
 bool ws_valid_text_payload(Str text);
@@ -37,6 +38,9 @@ bool ws_json_string_matches_at_path(
     const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation);
 bool ws_json_bool_at_path(const u8* payload, u64 len, Str path);
 bool ws_json_bool_equals_at_path(const u8* payload, u64 len, Str path, bool expected);
+bool ws_json_int_at_path(const u8* payload, u64 len, Str path);
+bool ws_json_int_compare_at_path(
+    const u8* payload, u64 len, Str path, i64 expected, WsJsonIntComparison comparison);
 
 // RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close message.
 // Accepts 1000–1003, 1007–1014, and 3000–4999; rejects the unassigned ranges (<1000,

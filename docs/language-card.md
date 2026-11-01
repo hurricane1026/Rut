@@ -893,6 +893,18 @@ return websocket(chat) { message in
 // on either side. Comparison leaves are limited to the bare alias and one literal.
 // json.bool(document) checks a root Bool. Missing/null/non-Bool values fail binding.
 
+// Signed 64-bit JSON integer range checks use exact integer tokens.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let field = json.get(document, "/count") else { message.close(1008) }
+    guard let count = json.int(field) else { message.close(1003) }
+    guard count >= 1 && count <= 1000 else { message.drop() }
+    message.forward()
+}
+// json.int(document) checks a root integer. Integer aliases compare to Int literals
+// with == / != / < / <= / > / >= in either order. No arithmetic or alias comparison;
+// fractions, exponents and values outside signed i64 fail the binding.
+
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
 // and the single-slice cap. General expressions/interpolation remain unsupported.
