@@ -7353,6 +7353,41 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
             }
         }
     }
+    if (cond.kind == AstExprKind::Field && cond.name.eq(lit_str("isEmpty")) && cond.lhs &&
+        cond.lhs->kind == AstExprKind::Ident) {
+        const WsJsonBinding* binding = ws_json_binding(documents, cond.lhs->name);
+        if (binding && binding->kind == WsJsonBinding::Kind::String) {
+            WsLenGuard g{};
+            g.accessor = WsLenGuard::Accessor::JsonStringEqual;
+            g.pattern = binding->path;
+            g.negate = negate;
+            g.verdict = verdict;
+            return g;
+        }
+    }
+    if (cond.kind == AstExprKind::MethodCall && cond.lhs && cond.lhs->kind == AstExprKind::Ident) {
+        const WsJsonBinding* binding = ws_json_binding(documents, cond.lhs->name);
+        const bool is_prefix = cond.name.eq(lit_str("hasPrefix"));
+        const bool is_suffix = cond.name.eq(lit_str("hasSuffix"));
+        const bool is_contains = cond.name.eq(lit_str("contains"));
+        if (binding && binding->kind == WsJsonBinding::Kind::String &&
+            (is_prefix || is_suffix || is_contains)) {
+            if (cond.args.len != 1 || !cond.args[0] || cond.args[0]->kind != AstExprKind::StrLit)
+                return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
+            auto decoded =
+                decoded_expression_string(cond.args[0]->str_value, mod, cond.args[0]->span);
+            if (!decoded) return core::make_unexpected(decoded.error());
+            WsLenGuard g{};
+            g.accessor = is_prefix   ? WsLenGuard::Accessor::JsonStringPrefix
+                         : is_suffix ? WsLenGuard::Accessor::JsonStringSuffix
+                                     : WsLenGuard::Accessor::JsonStringContains;
+            g.pattern = binding->path;
+            g.value = decoded.value();
+            g.negate = negate;
+            g.verdict = verdict;
+            return g;
+        }
+    }
     // Literal comparison is byte-exact, like ordinary string equality. Reuse the
     // expression decoder so escapes and embedded NULs have the same semantics.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {

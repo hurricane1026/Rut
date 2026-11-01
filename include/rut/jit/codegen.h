@@ -52,7 +52,10 @@ struct WsLenGuardSpec {
                   //                                7=TextPrefix, 8=TextSuffix, 9=TextContains,
                   //                                10=JsonValid, 11=JsonHasPath,
                   //                                12=JsonStringValid,
-                  //                                13=JsonStringEqual
+                  //                                13=JsonStringEqual,
+                  //                                14=JsonStringPrefix,
+                  //                                15=JsonStringSuffix,
+                  //                                16=JsonStringContains
     u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
     u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
                   // FromClient: 1 (client→upstream leg)
@@ -61,7 +64,7 @@ struct WsLenGuardSpec {
     // is authoritative).
     const char* pattern;
     u32 pattern_len;
-    const char* value = nullptr;  // JsonStringEqual: expected decoded string bytes.
+    const char* value = nullptr;  // JsonStringEqual/Prefix/Suffix/Contains: decoded bytes.
     u32 value_len = 0;
     u8 negate;    // invert this condition, including a compound subtree
     u32 lhs = 0;  // And/Or child indices, strictly less than the parent index

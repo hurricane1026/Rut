@@ -1107,7 +1107,10 @@ struct WsLenGuard {
         JsonValid,
         JsonHasPath,
         JsonStringValid,
-        JsonStringEqual
+        JsonStringEqual,
+        JsonStringPrefix,
+        JsonStringSuffix,
+        JsonStringContains
     };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
@@ -1116,7 +1119,8 @@ struct WsLenGuard {
     u32 bound = 0;  // Len: the byte literal message.len is compared to. Opcode: the WsOpcode value.
     // TextMatch/TextEqual/TextPrefix/TextSuffix/TextContains: regex or decoded literal, valid
     // through codegen. JsonHasPath/JsonStringValid: decoded JSON Pointer.
-    // JsonStringEqual: pattern is the pointer, value is the decoded expected string.
+    // JsonStringEqual/Prefix/Suffix/Contains: pattern is the pointer and value is the
+    // decoded expected string (empty for isEmpty).
     Str pattern{};
     Str value{};
     bool negate = false;  // invert this node's condition, including an entire subtree

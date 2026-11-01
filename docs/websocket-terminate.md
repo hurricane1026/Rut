@@ -84,13 +84,19 @@ return websocket(chat) { message in
 `json.string(document)` also checks a root JSON string. A `json.get` result must
 be unwrapped before it can be passed to `json.string`; missing values, JSON null,
 numbers, booleans, arrays and objects fail the string check. A string alias may
-only be compared with a string literal using `==` or `!=` in either operand
-order. Aliases are compile-time paths into the immutable message: each reached
-check reparses the bounded payload and retains no JSON node or borrowed string
-view. Only `json.get(document, literalPointer)` and
-`json.string(unwrappedValue)` are supported in these handlers; nested `get`,
-general extraction and dynamic paths remain unsupported. These bindings and
-comparisons use the existing four-guard and 32-condition-node limits.
+be compared with a literal using `==` or `!=` in either operand order, and
+supports `.isEmpty`, `.hasPrefix("literal")`, `.hasSuffix("literal")`, and
+`.contains("literal")`. Predicates compare the decoded JSON string bytes exactly;
+escape forms decode before matching, and Unicode is not normalized. An empty
+prefix, suffix, or contains needle matches every valid string. JSON type and
+parse checks still run before an empty predicate can match.
+
+Aliases are compile-time paths into the immutable message: each reached check
+reparses the bounded payload and retains no JSON node or borrowed string view.
+Only `json.get(document, literalPointer)` and `json.string(unwrappedValue)` are
+supported in these handlers; nested `get`, general extraction, dynamic paths,
+and dynamic predicate arguments remain unsupported. These bindings and
+predicates use the existing four-guard and 32-condition-node limits.
 
 The parser limits remain 8 KiB input, 2048 nodes and depth 64; exceeding any limit
 fails validation. Duplicate decoded object keys are rejected. For Text-only
