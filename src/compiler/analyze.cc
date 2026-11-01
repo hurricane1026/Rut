@@ -7258,7 +7258,7 @@ static Str ws_message_text_match_pattern(const AstExpr& cond) {
 }
 
 struct WsJsonBinding {
-    enum class Kind : u8 { Document, SelectedValue, String, Boolean };
+    enum class Kind : u8 { Document, SelectedValue, String, Boolean, Integer };
     Str name{};
     Str path{};
     Kind kind = Kind::Document;
@@ -7295,7 +7295,59 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
                                                              const HirModule& mod,
                                                              const HirRoute& route,
                                                              const WsJsonBindings& documents) {
-    // Reuse the ordinary optional-JSON syntax without materializing a document value.
+    // Integer aliases compare only with literal operands; their scalar value is never stored.
+    if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
+        const AstExpr* alias = nullptr;
+        const AstExpr* literal = nullptr;
+        if (cond.lhs->kind == AstExprKind::Ident && cond.rhs->kind == AstExprKind::IntLit) {
+            alias = cond.lhs;
+            literal = cond.rhs;
+        } else if (cond.rhs->kind == AstExprKind::Ident && cond.lhs->kind == AstExprKind::IntLit) {
+            alias = cond.rhs;
+            literal = cond.lhs;
+        }
+        if (alias && literal) {
+            const WsJsonBinding* binding = ws_json_binding(documents, alias->name);
+            if (binding && binding->kind == WsJsonBinding::Kind::Integer) {
+                WsLenGuard g{};
+                g.accessor = WsLenGuard::Accessor::JsonIntCompare;
+                g.pattern = binding->path;
+                g.cmp = WsLenGuard::Cmp::Eq;
+                g.int_bound = literal->int_value;
+                g.negate = negate;
+                g.verdict = verdict;
+                return g;
+            }
+        }
+    }
+    if ((cond.kind == AstExprKind::Lt || cond.kind == AstExprKind::Gt) && cond.lhs && cond.rhs) {
+        const AstExpr* alias = nullptr;
+        const AstExpr* literal = nullptr;
+        bool alias_on_left = false;
+        if (cond.lhs->kind == AstExprKind::Ident && cond.rhs->kind == AstExprKind::IntLit) {
+            alias = cond.lhs;
+            literal = cond.rhs;
+            alias_on_left = true;
+        } else if (cond.rhs->kind == AstExprKind::Ident && cond.lhs->kind == AstExprKind::IntLit) {
+            alias = cond.rhs;
+            literal = cond.lhs;
+        }
+        if (alias && literal) {
+            const WsJsonBinding* binding = ws_json_binding(documents, alias->name);
+            if (binding && binding->kind == WsJsonBinding::Kind::Integer) {
+                WsLenGuard g{};
+                g.accessor = WsLenGuard::Accessor::JsonIntCompare;
+                g.pattern = binding->path;
+                const bool is_less = cond.kind == AstExprKind::Lt;
+                g.cmp = (is_less == alias_on_left) ? WsLenGuard::Cmp::Lt : WsLenGuard::Cmp::Gt;
+                g.int_bound = literal->int_value;
+                g.negate = negate;
+                g.verdict = verdict;
+                return g;
+            }
+        }
+    }
+    // Reuse ordinary optional-JSON syntax without materializing a document value.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
         const AstExpr* call = cond.rhs->kind == AstExprKind::Nil   ? cond.lhs
                               : cond.lhs->kind == AstExprKind::Nil ? cond.rhs
@@ -13365,12 +13417,29 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         node.pattern = source->path;
                         binding.kind = WsJsonBinding::Kind::Boolean;
                         binding.path = source->path;
+                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
+                               gs->expr.lhs->kind == AstExprKind::Ident &&
+                               gs->expr.lhs->name.eq(lit_str("json")) &&
+                               gs->expr.name.eq(lit_str("int")) && gs->expr.args.len == 1 &&
+                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
+                        const WsJsonBinding* source =
+                            ws_json_binding(documents, gs->expr.args[0]->name);
+                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
+                                        source->kind != WsJsonBinding::Kind::SelectedValue))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  gs->span,
+                                                  lit_str("json.int message bindings require a "
+                                                          "validated JSON value alias"));
+                        node.accessor = WsLenGuard::Accessor::JsonIntValid;
+                        node.pattern = source->path;
+                        binding.kind = WsJsonBinding::Kind::Integer;
+                        binding.path = source->path;
                     } else {
-                        return frontend_error(
-                            FrontendError::UnsupportedSyntax,
-                            gs->span,
-                            lit_str("message guard bindings require json.parse, "
-                                    "json.get, json.string, or json.bool aliases"));
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              gs->span,
+                                              lit_str("message guard bindings require json.parse, "
+                                                      "json.get, json.string, json.bool, or "
+                                                      "json.int aliases"));
                     }
                     if (!route->ws_handler.len_guards.push(node) || !documents.push(binding))
                         return frontend_error(FrontendError::TooManyItems, gs->span);

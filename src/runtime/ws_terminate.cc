@@ -113,6 +113,48 @@ bool ws_json_bool_equals_at_path(const u8* payload, u64 len, Str path, bool expe
     return kEqual;
 }
 
+bool ws_json_int_at_path(const u8* payload, u64 len, Str path) {
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
+        return false;
+    json::Document& document = ws_json_document();
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    i64 value = 0;
+    const bool kIsInt = kId != json::kNone && document.nodes[kId].kind == json::Kind::Number &&
+                        json::integer(document.raw(kId), value);
+    document.source = {};
+    return kIsInt;
+}
+
+bool ws_json_int_compare_at_path(
+    const u8* payload, u64 len, Str path, i64 expected, WsJsonIntComparison comparison) {
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
+        return false;
+    json::Document& document = ws_json_document();
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    i64 value = 0;
+    bool matches = false;
+    if (kId != json::kNone && document.nodes[kId].kind == json::Kind::Number &&
+        json::integer(document.raw(kId), value)) {
+        switch (comparison) {
+            case WsJsonIntComparison::Lt:
+                matches = value < expected;
+                break;
+            case WsJsonIntComparison::Gt:
+                matches = value > expected;
+                break;
+            case WsJsonIntComparison::Eq:
+                matches = value == expected;
+                break;
+        }
+    }
+    document.source = {};
+    return matches;
+}
+
 bool ws_valid_json_payload(const u8* payload, u64 len) {
     return ws_json_has_path(payload, len, {});  // the empty pointer selects any valid JSON root
 }
