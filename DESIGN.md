@@ -8505,6 +8505,15 @@ untrusted kid header. Dynamic JWKS and live token/key revocation remain separate
 work; this profile is not a replacement for signature verification or a complete
 OIDC implementation. Exact behavior and bounds are in the language card.
 
+The native `jwt_claims_valid_with_lifetime` policy adds mandatory positive integer
+`iat`, `iat <= now < exp`, and inclusive maximum token-age and token-lifetime
+bounds to the existing strict profile. Its positive limits and ordered dates are
+checked before subtraction, so signed i64 extremes fail closed without overflow.
+This is a Rut-specific stricter profile; [RFC 7519 §4.1.6](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.6)
+defines `iat` as optional in general and does not impose these lifetime limits.
+The helper validates claims only and does not verify a signature. It currently
+has native C++ coverage only; there is no Rut API for this policy in this PR.
+
 ## Static JWT ID revocation
 
 After signature and issuer/audience/time validation, the ordinary Rut helper

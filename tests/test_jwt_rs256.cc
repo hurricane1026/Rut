@@ -226,7 +226,8 @@ TEST(jwt_rs256, configured_jwks_to_verified_claims_policy) {
     const Str signed_token = token_for(
         rsa,
         lit_str(R"({"alg":"RS256","kid":"untrusted","jku":"https://invalid/keys"})"),
-        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"scope":"read write"})"),
+        lit_str(
+            R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":50,"exp":200,"scope":"read write"})"),
         token);
     REQUIRE(signed_token.len > 0);
     RSA_free(rsa);
@@ -242,6 +243,12 @@ TEST(jwt_rs256, configured_jwks_to_verified_claims_policy) {
     tracking = true;
     CHECK(
         jwt_claims_valid(document, {payload, length}, lit_str("issuer"), lit_str("gateway"), 100));
+    CHECK(jwt_claims_valid_with_lifetime(
+        document, {payload, length}, lit_str("issuer"), lit_str("gateway"), 100, 50, 150));
+    CHECK(!jwt_claims_valid_with_lifetime(
+        document, {payload, length}, lit_str("issuer"), lit_str("gateway"), 100, 49, 150));
+    CHECK(!jwt_claims_valid_with_lifetime(
+        document, {payload, length}, lit_str("issuer"), lit_str("gateway"), 100, 50, 149));
     CHECK(jwt_has_scope(document, {payload, length}, lit_str("read")));
     CHECK(!jwt_has_scope(document, {payload, length}, lit_str("admin")));
     CHECK(

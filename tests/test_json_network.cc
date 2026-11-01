@@ -14,6 +14,7 @@
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/jwt_claims.h"
 #include "test.h"
 #include "test_helpers.h"
 #include <memory>
@@ -838,6 +839,29 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
         return signing_input + "." +
                b64url(std::string(reinterpret_cast<const char*>(digest), digest_len));
     };
+    const char* lifetime_token =
+        "eyJhbGciOiJIUzI1NiJ9."
+        "eyJzdWIiOiJhbGljZSIsImlzcyI6Imlzc3VlciIsImF1ZCI6ImdhdGV3YXkiLCJpYXQiOjkwMCwiZXhwIjoxMTAwfQ"
+        "."
+        "ioTapzc9b_9jxlQrsgD3HbDtf4GtxUTzewPKeKDH6ZM";
+    const auto authenticated = decode(hs256_key.c_str(), lifetime_token);
+    REQUIRE(authenticated.first);
+    json::Document authenticated_claims;
+    REQUIRE(authenticated_claims.parse(authenticated.second));
+    CHECK(jwt_claims_valid_with_lifetime(authenticated_claims,
+                                         authenticated.second,
+                                         lit_str("issuer"),
+                                         lit_str("gateway"),
+                                         1000,
+                                         100,
+                                         200));
+    CHECK(!jwt_claims_valid_with_lifetime(authenticated_claims,
+                                          authenticated.second,
+                                          lit_str("issuer"),
+                                          lit_str("gateway"),
+                                          1000,
+                                          99,
+                                          200));
     auto signed_header = [&](size_t target_size) {
         std::string header = R"({"alg":"HS256","x":""})";
         header.insert(header.size() - 2, target_size - header.size(), 'x');

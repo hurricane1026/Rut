@@ -74,6 +74,29 @@ bool jwt_claims_valid(
            (date(document, kIssuedAt, issued_at) && issued_at <= unix_seconds);
 }
 
+bool jwt_claims_valid_with_lifetime(json::Document& document,
+                                    Str claims,
+                                    Str issuer,
+                                    Str audience,
+                                    i64 unix_seconds,
+                                    i64 max_age_seconds,
+                                    i64 max_lifetime_seconds) {
+    if (max_age_seconds <= 0 || max_lifetime_seconds <= 0 ||
+        !jwt_claims_valid(document, claims, issuer, audience, unix_seconds))
+        return false;
+
+    i64 issued_at = 0;
+    i64 expires = 0;
+    if (!date(document, member(document, lit_str("iat")), issued_at) || issued_at <= 0 ||
+        !date(document, member(document, lit_str("exp")), expires) || expires <= 0 ||
+        issued_at > unix_seconds || unix_seconds >= expires || expires <= issued_at)
+        return false;
+
+    // Positivity and ordering above make both subtractions representable.
+    return unix_seconds - issued_at <= max_age_seconds &&
+           expires - issued_at <= max_lifetime_seconds;
+}
+
 bool jwt_has_scope(json::Document& document, Str claims, Str required) {
     const auto kTokenByte = [](unsigned char c) {
         return c == 0x21 || (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x7e);

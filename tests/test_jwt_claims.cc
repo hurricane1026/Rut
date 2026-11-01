@@ -41,6 +41,65 @@ TEST(jwt_claims, required_claims_and_time_boundaries) {
     CHECK(!valid(lit_str(R"({"sub":"a","iss":"issuer","aud":"gateway","exp":1001})"), -1));
 }
 
+TEST(jwt_claims, lifetime_policy_requires_iat_and_bounds_age_and_token_lifetime) {
+    json::Document scratch;
+    const auto valid = [&](Str claims, i64 now = 1000, i64 max_age = 100, i64 max_lifetime = 200) {
+        return jwt_claims_valid_with_lifetime(
+            scratch, claims, lit_str("issuer"), lit_str("gateway"), now, max_age, max_lifetime);
+    };
+    CHECK(
+        valid(lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":1000,"exp":1200})")));
+    CHECK(valid(lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":1100})")));
+    CHECK(
+        !valid(lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":899,"exp":1100})")));
+    CHECK(!valid(lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":1101})"),
+                 1000,
+                 100,
+                 200));
+
+    const Str invalid[] = {
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1100})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":0,"exp":1100})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":-1,"exp":1100})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":"900","exp":1100})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900.0,"exp":1100})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":9e2,"exp":1100})"),
+        lit_str(
+            R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":9223372036854775808,"exp":9223372036854775809})"),
+        lit_str(
+            R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":-9223372036854775809,"exp":1100})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":1000,"exp":1000})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":1001,"exp":1100})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":900})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"iat":900,"exp":1100})"),
+        lit_str(
+            R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":1100,"e\u0078p":1100})"),
+        lit_str("broken"),
+    };
+    for (Str claims : invalid) CHECK(!valid(claims));
+    const Str claims =
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":1100})");
+    CHECK(!valid(claims, 1000, 0, 200));
+    CHECK(!valid(claims, 1000, -1, 200));
+    CHECK(!valid(claims, 1000, 100, 0));
+    CHECK(!valid(claims, 1000, 100, -1));
+    CHECK(!valid(claims, 1100, 1000, 1000));
+    CHECK(!valid(claims, 0, 1000, 1000));
+    CHECK(!jwt_claims_valid_with_lifetime(
+        scratch, claims, lit_str("other"), lit_str("gateway"), 1000, 100, 200));
+    CHECK(!jwt_claims_valid_with_lifetime(
+        scratch, claims, lit_str("issuer"), lit_str("other"), 1000, 100, 200));
+    CHECK(!valid(lit_str(R"({"iss":"issuer","aud":"gateway","iat":900,"exp":1100})")));
+    CHECK(!valid(lit_str(
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":1100,"nbf":1001})")));
+
+    const Str extreme = lit_str(
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":1,"exp":9223372036854775807})");
+    CHECK(valid(extreme, 9223372036854775806, 9223372036854775805, 9223372036854775806));
+    CHECK(!valid(extreme, 9223372036854775807, 9223372036854775806, 9223372036854775806));
+    CHECK(valid(claims));
+}
+
 TEST(jwt_claims, audience_arrays_and_exact_decoded_string_comparison) {
     json::Document scratch;
     const auto valid = [&](Str value) {

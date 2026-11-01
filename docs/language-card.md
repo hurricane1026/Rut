@@ -1585,6 +1585,13 @@ example first calls `auth.jwtDocument(authorization, secret)`, which composes
 Then it calls the separate identity helper. Existing HS256/384/512 support is unchanged.
 See [examples/jwt-claims-auth.rut](../examples/jwt-claims-auth.rut).
 
+The native-only `jwt_claims_valid_with_lifetime` API additionally requires a
+positive integer `iat`, `iat <= now < exp`, and inclusive maximum token-age and
+token-lifetime limits. This is a stricter Rut policy choice; [RFC 7519 §4.1.6](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.6)
+does not make `iat` mandatory or define these bounds for every JWT. The helper
+checks claims only and does not verify signatures. No Rut-language surface is
+available for this policy yet.
+
 `auth.requireUnrevokedJwt(document, first, second)` rejects a verified JWT with
 an absent, non-string or empty `jti`, or an exact case-sensitive match to either
 nonempty configured revoked ID, with a Bearer `invalid_token` 401. Empty slots
