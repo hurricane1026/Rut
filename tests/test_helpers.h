@@ -313,13 +313,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
             case IoEventType::Timeout:
                 timer.tick([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
-                    if (c->ws_shutdown_deadline_armed) {
-                        this->close_conn(*c);
-                        return;
-                    }
-                    if (c->is_ws_tunnel || c->is_ws_terminate) {
-                        return;
-                    }
+                    if (ws_handle_timer_tick(this, *c)) return;
 #endif
                     // Mirror EpollEventLoop/IoUringEventLoop: a tick can
                     // represent either keepalive expiry (close) or a JIT
@@ -810,13 +804,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             case IoEventType::Timeout:
                 timer.tick([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
-                    if (c->ws_shutdown_deadline_armed) {
-                        this->close_conn(*c);
-                        return;
-                    }
-                    if (c->is_ws_tunnel || c->is_ws_terminate) {
-                        return;
-                    }
+                    if (ws_handle_timer_tick(this, *c)) return;
 #endif
                     // See SmallLoop: a tick resumes yielded JIT handlers and
                     // otherwise closes on keepalive expiry.

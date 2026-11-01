@@ -801,7 +801,8 @@ public:
     // Returns false if the heap is full — the caller falls back to the keepalive
     // wheel (throttle_resume re-checks the budget, so a coarse wake is safe).
     [[nodiscard]] bool arm_throttle_timer(Connection& conn, u64 delay_ns) {
-        timer.remove(&conn);  // precise timer owns the wakeup; off the keepalive wheel
+        if (!conn.ws_shutdown_deadline_armed)
+            timer.remove(&conn);  // precise timer owns the wakeup; off the keepalive wheel
         u64 deadline = kqueue_yield::monotonic_ns() + delay_ns;
         if (yield_heap.push(deadline, conn.handler_gen, conn.id)) {
             rearm_yield_timer();
@@ -922,14 +923,7 @@ public:
                             return;
                         }
 #if RUT_ENABLE_WEBSOCKET
-                        if (c->ws_shutdown_deadline_armed) {
-                            this->close_conn(*c);
-                            return;
-                        }
-                        if (c->is_ws_tunnel || c->is_ws_terminate) {
-                            // Quiet, healthy WebSockets have no idle timeout.
-                            return;
-                        }
+                        if (ws_handle_timer_tick(this, *c)) return;
 #endif
                         // A timer can now expire for two reasons:
                         //   (1) keepalive — close the connection (existing).

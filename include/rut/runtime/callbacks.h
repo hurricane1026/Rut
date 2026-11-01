@@ -286,6 +286,13 @@ void h2_proxy_timeout(Loop* loop, Connection& conn);
 template <typename Loop>
 void throttle_resume(Loop* loop, Connection& conn);
 
+#if RUT_ENABLE_WEBSOCKET
+// Handle a timer-wheel wake for a WebSocket: keep its shutdown deadline fixed,
+// resume throttled traffic, and continue to exempt quiet tunnels from idle close.
+template <typename Loop>
+bool ws_handle_timer_tick(Loop* loop, Connection& conn);
+#endif
+
 // Start one built-in active health-check probe to (upstream_idx, backend_idx):
 // connect a fresh socket, GET <hc_path>, parse the status, and feed the result
 // into the shared BackendHealth via record_backend_result. Invoked from the

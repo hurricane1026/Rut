@@ -7716,7 +7716,10 @@ public:
     // the connection is throttle_paused. Returns false on SQ pressure → caller
     // falls back to the keepalive wheel.
     [[nodiscard]] bool arm_throttle_timer(Connection& conn, u64 delay_ns) {
-        timer.remove(&conn);
+        if (!conn.ws_shutdown_deadline_armed)
+            timer.remove(&conn);
+        else if (conn.yield_timeout_armed)
+            return true;  // Reuse the existing kernel timespec owner.
         u32 ms = static_cast<u32>((delay_ns + 999'999ull) / 1'000'000ull);
         if (ms == 0) ms = 1;
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
@@ -8180,7 +8183,7 @@ public:
                     }
                     if (matching_generation && c.h2 && c.h2->grpc.timer_deadline_us) {
                         grpc_deadline_fired(this, c);
-                    } else if (c.throttle_paused && matching_generation) {
+                    } else if (c.fd >= 0 && c.throttle_paused && matching_generation) {
                         // @throttle pacing timer fired — resume the parked proxy
                         // pump (re-checks the byte budget; may re-park).
                         throttle_resume<IoUringEventLoop>(this, c);
@@ -8209,14 +8212,7 @@ public:
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
-                        if (c->ws_shutdown_deadline_armed) {
-                            this->close_conn(*c);
-                            return;
-                        }
-                        if (c->is_ws_tunnel || c->is_ws_terminate) {
-                            // Quiet, healthy WebSockets have no idle timeout.
-                            return;
-                        }
+                        if (ws_handle_timer_tick(this, *c)) return;
 #endif
                         // See epoll_event_loop.h: timer fires for keepalive,
                         // wait(ms), or wait-any timeout completion.

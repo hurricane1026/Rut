@@ -1,5 +1,7 @@
 #include "test_helpers.h"
-#include <memory>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 #ifdef __linux__
 #include "rut/runtime/iouring_event_loop.h"
@@ -11,6 +13,39 @@ using namespace rut;
 // NOLINTNEXTLINE(misc-include-cleaner)
 #if RUT_ENABLE_WEBSOCKET
 namespace {
+template <typename Loop>
+struct MmapLoopOwner {
+    Loop* loop = nullptr;
+    bool initialized = false;
+
+    MmapLoopOwner() {
+        // Placement construction writes into this mapping, so the pointee stays writable.
+        // NOLINTNEXTLINE(misc-const-correctness)
+        void* const kStorage =
+            mmap(nullptr, sizeof(Loop), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (kStorage != MAP_FAILED) loop = new (kStorage) Loop();
+    }
+
+    ~MmapLoopOwner() {
+        if (!loop) return;
+        if (initialized) loop->shutdown();
+        loop->~Loop();
+        munmap(loop, sizeof(Loop));
+    }
+
+    void mark_initialized() { initialized = true; }
+};
+
+struct SocketPairOwner {
+    int fds[2] = {-1, -1};
+
+    ~SocketPairOwner() {
+        for (const int kFd : fds) {
+            if (kFd >= 0) close(kFd);
+        }
+    }
+};
+
 // This test intentionally uses the shared runtime/mock aggregate from test_helpers.h.
 // NOLINTBEGIN(misc-include-cleaner)
 WsFrameAction ws_close_handler(void*, WsOpcode, const u8*, u64, bool) {
@@ -134,8 +169,11 @@ TEST(websocket, half_close_deadline_is_one_shot_and_normal_drain_reclaims_slot) 
 }
 
 TEST(websocket, async_deadline_retains_output_until_target_and_cancel_retire) {
-    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    MmapLoopOwner<EventLoop<AsyncMockBackend>> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
     REQUIRE(loop->init(0, -1, 0, 64).has_value());
+    owner.mark_initialized();
     auto* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     REQUIRE(loop->alloc_ws_terminate_bufs(*conn));
@@ -170,30 +208,34 @@ TEST(websocket, async_deadline_retains_output_until_target_and_cancel_retire) {
     CHECK_EQ(reused->id, kConnId);
     CHECK_FALSE(reused->ws_shutdown_deadline_armed);
     loop->free_conn(*reused);
-    loop->shutdown();
 }
 
 TEST(legacy_loop, ws_shutdown_deadline_preempts_proxy_timeout) {
-    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    MmapLoopOwner<EventLoop<MockBackend>> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
     REQUIRE(loop->init(0, -1).has_value());
+    owner.mark_initialized();
     auto* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     conn->fd = -1;
     conn->state = ConnState::Proxying;
     conn->proxy_resp_started = false;
     conn->is_ws_tunnel = true;
-    conn->ws_shutdown_deadline_armed = true;
-    loop->timer.add(conn, 1);
-    loop->dispatch(make_ev(0, IoEventType::Timeout, 2));
+    ws_arm_shutdown_deadline(loop, *conn);
+    for (u32 tick = 0; tick < kWsShutdownDrainTimeoutSeconds + 1; tick++)
+        loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
     CHECK_EQ(conn->state, ConnState::Idle);
     CHECK_EQ(conn->fd, -1);
     CHECK_EQ(loop->backend.count_ops(MockOp::Send), 0u);
-    loop->shutdown();
 }
 
 TEST(legacy_loop, quiet_websocket_remains_exempt_from_idle_timeout) {
-    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    MmapLoopOwner<EventLoop<MockBackend>> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
     REQUIRE(loop->init(0, -1).has_value());
+    owner.mark_initialized();
     auto* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     conn->fd = -1;
@@ -203,13 +245,174 @@ TEST(legacy_loop, quiet_websocket_remains_exempt_from_idle_timeout) {
     CHECK(conn->is_ws_tunnel);
     CHECK_FALSE(conn->ws_shutdown_deadline_armed);
     loop->free_conn(*conn);
-    loop->shutdown();
+}
+
+TEST(legacy_loop, throttled_websocket_wheel_wake_resumes_without_idle_close) {
+    MmapLoopOwner<EventLoop<MockBackend>> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
+    REQUIRE(loop->init(0, -1).has_value());
+    owner.mark_initialized();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = -1;
+    conn->upstream_fd = 43;
+    conn->is_ws_tunnel = true;
+    conn->throttle_paused = true;
+    conn->throttle_down_bps = 1;
+    conn->throttle_tat_ns = 0;  // Budget has recovered at the fallback wake.
+    loop->timer.add(conn, 1);
+
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+    CHECK_FALSE(conn->throttle_paused);
+    CHECK(conn->is_ws_tunnel);
+    CHECK_EQ(conn->fd, -1);
+    CHECK(loop->backend.count_ops(MockOp::Recv) > 0);
+    loop->free_conn(*conn);
+}
+
+TEST(legacy_loop, shutdown_deadline_bounds_repeated_throttle_fallback_wakes) {
+    MmapLoopOwner<EventLoop<MockBackend>> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
+    REQUIRE(loop->init(0, -1).has_value());
+    owner.mark_initialized();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = -1;
+    conn->is_ws_tunnel = true;
+    conn->throttle_paused = true;
+    conn->throttle_down_bps = 1;
+    conn->throttle_tat_ns = monotonic_ns() + 60'000'000'000ull;
+    loop->timer.add(conn, 1);  // Existing coarse fallback wake must be retained.
+    ws_arm_shutdown_deadline(loop, *conn);
+    REQUIRE(conn->ws_shutdown_deadline_armed);
+    CHECK_EQ(conn->ws_shutdown_started_tick, loop->timer.cursor);
+    CHECK_FALSE(conn->timer_node.empty());
+
+    for (u32 tick = 0; tick < kWsShutdownDrainTimeoutSeconds; tick++) {
+        loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+        CHECK_EQ(conn->fd, -1);
+        CHECK(conn->ws_shutdown_deadline_armed);
+    }
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+    CHECK_FALSE(conn->ws_shutdown_deadline_armed);
+    CHECK_EQ(conn->state, ConnState::Idle);
+}
+
+TEST(legacy_loop, recovered_throttle_send_keeps_original_shutdown_deadline) {
+    MmapLoopOwner<EventLoop<MockBackend>> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
+    REQUIRE(loop->init(0, -1).has_value());
+    owner.mark_initialized();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = -1;
+    conn->upstream_fd = 43;
+    conn->is_ws_tunnel = true;
+    conn->throttle_paused = true;
+    conn->throttle_down_bps = 1;
+    conn->throttle_pending_len = 1;
+    conn->throttle_tat_ns = monotonic_ns() + 60'000'000'000ull;
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    const u8 kPayload = 'x';
+    REQUIRE_EQ(conn->upstream_recv_buf.write(&kPayload, 1), 1u);
+    loop->timer.add(conn, 1);
+    ws_arm_shutdown_deadline(loop, *conn);
+
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 1));  // Early fallback wake.
+    CHECK(conn->throttle_paused);
+    conn->throttle_tat_ns = 0;  // Rate budget recovers before the shutdown deadline.
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+    CHECK_FALSE(conn->throttle_paused);
+    CHECK(conn->ws_upstream_send_pending);
+    CHECK(loop->backend.count_ops(MockOp::Send) > 0);
+    CHECK_FALSE(conn->timer_node.empty());
+    for (u32 tick = 0; tick < kWsShutdownDrainTimeoutSeconds - 3; tick++)
+        loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+    CHECK(conn->ws_shutdown_deadline_armed);
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+    CHECK_EQ(conn->state, ConnState::Idle);
+    CHECK_FALSE(conn->ws_shutdown_deadline_armed);
+}
+
+TEST(legacy_loop, shutdown_deadline_uses_unsigned_elapsed_ticks_across_wrap) {
+    MmapLoopOwner<EventLoop<MockBackend>> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
+    REQUIRE(loop->init(0, -1).has_value());
+    owner.mark_initialized();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = -1;
+    conn->is_ws_tunnel = true;
+    loop->timer.cursor = UINT32_MAX - 2;
+    ws_arm_shutdown_deadline(loop, *conn);
+    CHECK_EQ(conn->ws_shutdown_started_tick, UINT32_MAX - 2);
+
+    for (u32 tick = 0; tick < kWsShutdownDrainTimeoutSeconds + 1; tick++)
+        loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+    CHECK_EQ(conn->state, ConnState::Idle);
+    CHECK_FALSE(conn->ws_shutdown_deadline_armed);
 }
 
 #ifdef __linux__
-TEST(websocket, epoll_send_progress_does_not_extend_shutdown_deadline) {
-    auto loop = std::make_unique<EpollEventLoop>();
+TEST(websocket, precise_throttle_timer_preserves_wheel_shutdown_deadline) {
+    MmapLoopOwner<EpollEventLoop> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
     REQUIRE(loop->init(0, -1, 0, 64).has_value());
+    owner.mark_initialized();
+    SocketPairOwner socket_pair;
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, socket_pair.fds), 0);
+    const u8 kFill[4096]{};
+    while (send(socket_pair.fds[0], kFill, sizeof(kFill), MSG_NOSIGNAL) > 0) {
+    }
+    REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = socket_pair.fds[0];
+    socket_pair.fds[0] = -1;  // The loop owns this descriptor from here.
+    conn->is_ws_tunnel = true;
+    conn->throttle_paused = true;
+    conn->throttle_down_bps = 1;
+    conn->throttle_pending_len = 1;
+    conn->throttle_tat_ns = monotonic_ns() + 60'000'000'000ull;
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    const u8 kPayload = 'x';
+    REQUIRE_EQ(conn->upstream_recv_buf.write(&kPayload, 1), 1u);
+    REQUIRE(loop->arm_throttle_timer(*conn, 0));
+    ws_arm_shutdown_deadline(loop, *conn);
+    CHECK_FALSE(conn->timer_node.empty());
+    loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    CHECK(conn->ws_shutdown_deadline_armed);
+    conn->throttle_tat_ns = 0;  // The precise wake observes a recovered rate budget.
+    loop->drain_yield_heap();
+    CHECK_FALSE(conn->throttle_paused);
+    CHECK(conn->ws_upstream_send_pending);  // EAGAIN leaves the send blocked on EPOLLOUT.
+    CHECK_FALSE(conn->timer_node.empty());
+
+    for (u32 tick = 0; tick < kWsShutdownDrainTimeoutSeconds - 2; tick++) {
+        loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+        CHECK(conn->fd >= 0);
+    }
+    loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    CHECK_EQ(conn->state, ConnState::Idle);
+    CHECK_FALSE(conn->ws_shutdown_deadline_armed);
+}
+#endif
+
+#ifdef __linux__
+TEST(websocket, epoll_send_progress_does_not_extend_shutdown_deadline) {
+    MmapLoopOwner<EpollEventLoop> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
+    REQUIRE(loop->init(0, -1, 0, 64).has_value());
+    owner.mark_initialized();
     auto* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     conn->is_ws_tunnel = true;
@@ -226,13 +429,15 @@ TEST(websocket, epoll_send_progress_does_not_extend_shutdown_deadline) {
     loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
     CHECK_EQ(conn->state, ConnState::Idle);
     CHECK_FALSE(conn->ws_shutdown_deadline_armed);
-    loop->shutdown();
 }
 
 TEST(websocket, iouring_dispatch_expires_shutdown_deadline_before_http_yield) {
-    auto loop = std::make_unique<IoUringEventLoop>();
+    MmapLoopOwner<IoUringEventLoop> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
     if (!init_iouring_loop_with_retry(*loop, "websocket shutdown deadline", 64))
         SKIP("io_uring unavailable");
+    owner.mark_initialized();
     auto* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     conn->is_ws_tunnel = true;
@@ -252,7 +457,56 @@ TEST(websocket, iouring_dispatch_expires_shutdown_deadline_before_http_yield) {
     CHECK_EQ(conn->state, ConnState::Idle);
     CHECK_FALSE(conn->ws_shutdown_deadline_armed);
     CHECK_EQ(ws_yield_handler_calls, 0u);
-    loop->shutdown();
+}
+
+TEST(websocket, iouring_deadline_reuses_precise_throttle_owner_until_cancel_retires) {
+    MmapLoopOwner<IoUringEventLoop> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
+    if (!init_iouring_loop_with_retry(*loop, "WebSocket throttle deadline owner", 64))
+        SKIP("io_uring unavailable");
+    owner.mark_initialized();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = -1;
+    conn->is_ws_tunnel = true;
+    conn->throttle_paused = true;
+    conn->throttle_down_bps = 1;
+    conn->throttle_tat_ns = monotonic_ns() + 60'000'000'000ull;
+    REQUIRE(loop->arm_throttle_timer(*conn, 60'000'000'000ull));
+    ws_arm_shutdown_deadline(loop, *conn);
+    const u32 kOwnerGeneration = conn->yield_timer_gen;
+    const u32 kOwnerCount = conn->pending_ops;
+    const auto kOwnerTimespec = conn->yield_timespec;
+    REQUIRE(loop->arm_throttle_timer(*conn, 30'000'000'000ull));
+    CHECK_EQ(conn->yield_timer_gen, kOwnerGeneration);
+    CHECK_EQ(conn->pending_ops, kOwnerCount);
+    CHECK_EQ(conn->yield_timespec.tv_sec, kOwnerTimespec.tv_sec);
+    CHECK_EQ(conn->yield_timespec.tv_nsec, kOwnerTimespec.tv_nsec);
+
+    const u32 kConnId = conn->id;
+    loop->dispatch(make_ev(0, IoEventType::Timeout, kWsShutdownDrainTimeoutSeconds + 1));
+    CHECK_EQ(conn->fd, -1);
+    CHECK_EQ(conn->pending_ops, kOwnerCount + 1);  // Original timer plus close-path cancel.
+    const u64 kRetireByNs = monotonic_ns() + 1'000'000'000ull;
+    IoEvent events[8]{};
+    u32 retired_handlers = 0;
+    while (conn->pending_ops > 0 && monotonic_ns() < kRetireByNs) {
+        const u32 kCount = loop->backend.wait(
+            events, 8, loop->conns, loop->slots_initialized, /*wait_for_event=*/false);
+        for (u32 i = 0; i < kCount; i++) {
+            if (events[i].type == IoEventType::HandlerTimer) retired_handlers++;
+            loop->dispatch(events[i]);
+        }
+    }
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_EQ(retired_handlers, 2u);
+    CHECK_EQ(loop->active_count(), 0u);
+    auto* reused = loop->alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->id, kConnId);
+    CHECK_FALSE(reused->ws_shutdown_deadline_armed);
+    loop->free_conn(*reused);
 }
 #endif
 // NOLINTEND(misc-include-cleaner)

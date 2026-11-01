@@ -1261,14 +1261,7 @@ public:
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
-                        if (c->ws_shutdown_deadline_armed) {
-                            this->close_conn(*c);
-                            return;
-                        }
-                        if (c->is_ws_tunnel || c->is_ws_terminate) {
-                            // Quiet, healthy WebSockets have no idle timeout.
-                            return;
-                        }
+                        if (ws_handle_timer_tick(this, *c)) return;
 #endif
                         if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             respond_upstream_timeout(this, *c);  // upstream stalled → 504

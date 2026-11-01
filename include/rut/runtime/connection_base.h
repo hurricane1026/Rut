@@ -661,6 +661,9 @@ struct ConnectionBase {
     // A WebSocket that has started graceful shutdown gets one bounded drain
     // window. Ordinary tunnel traffic must not move this deadline.
     bool ws_shutdown_deadline_armed;
+    // TimerWheel cursor at the first shutdown transition. Unsigned subtraction
+    // keeps elapsed-tick checks correct across cursor wraparound.
+    u32 ws_shutdown_started_tick;
 
     // WebSocket TERMINATE mode (vs the passthrough tunnel above). Set from the matched
     // route at request time; `is_ws_terminate` is armed at the 101 transition once the
@@ -2049,6 +2052,7 @@ struct ConnectionBase {
         ws_client_eof = false;
         ws_upstream_eof = false;
         ws_shutdown_deadline_armed = false;
+        ws_shutdown_started_tick = 0;
         is_ws_terminate_route = false;
         is_ws_terminate = false;
         ws_handler = nullptr;
