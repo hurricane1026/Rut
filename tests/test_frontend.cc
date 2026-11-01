@@ -42703,6 +42703,46 @@ TEST(frontend, signed_request_rotation_example_compiles_with_fixed_environment) 
     rir.destroy();
 }
 
+TEST(frontend, multi_signed_request_example_compiles_with_fixed_environment) {
+    struct RestoreEnvironment {
+        const char* name;
+        bool was_set;
+        std::string value;
+        explicit RestoreEnvironment(const char* env_name) : name(env_name) {
+            const char* existing = getenv(name);
+            was_set = existing != nullptr;
+            if (was_set) value = existing;
+        }
+        ~RestoreEnvironment() {
+            if (was_set)
+                setenv(name, value.c_str(), 1);
+            else
+                unsetenv(name);
+        }
+    } orders_id("ORDERS_SIGNED_KEY_ID"), orders_key("ORDERS_SIGNED_KEY"),
+        billing_id("BILLING_SIGNED_KEY_ID"), billing_key("BILLING_SIGNED_KEY");
+    REQUIRE_EQ(setenv("ORDERS_SIGNED_KEY_ID", "orders-key", 1), 0);
+    REQUIRE_EQ(setenv("ORDERS_SIGNED_KEY", "orders-test-secret", 1), 0);
+    REQUIRE_EQ(setenv("BILLING_SIGNED_KEY_ID", "billing-key", 1), 0);
+    REQUIRE_EQ(setenv("BILLING_SIGNED_KEY", "billing-test-secret", 1), 0);
+    const auto example_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                              "examples/multi-signed-request.rut";
+    std::ifstream input(example_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), example_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, header_count_requires_literal_token_name_and_request_context) {
     const char* invalid[] = {
         R"rut(route GET "/" { let n = req.headerCount("") return 200 })rut",

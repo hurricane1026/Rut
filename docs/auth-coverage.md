@@ -17,7 +17,7 @@ whether a competing open-source edition includes them.
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper; exact top-level `groups` array authorization after verification | ES keys, remote JWKS refresh/cache, live and durable token revocation |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest`, static two-key `auth.rotatingSignedRequest`, and bounded two-Consumer `auth.multiSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
@@ -131,6 +131,14 @@ against one captured request, and returns the matched configured credential
 ID. Clearing the previous slot revokes it. This does not add dynamic key
 refresh or replay persistence. See
 [`signed-request-rotation.rut`](../examples/signed-request-rotation.rut).
+
+`auth.multiSignedRequest(first, second)` binds the same fixed profile to two
+distinct static Consumers. It rejects duplicate Consumer IDs, duplicate
+enabled key IDs, incomplete key pairs, missing metadata, and two disabled
+slots as configuration errors before reading the request. Both enabled
+credentials verify one captured request snapshot; the resulting identity uses
+the matched Consumer and credential IDs. See
+[`multi-signed-request.rut`](../examples/multi-signed-request.rut).
 
 ## Bounded multi-Consumer authentication
 

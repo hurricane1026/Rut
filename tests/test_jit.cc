@@ -24988,6 +24988,109 @@ route POST "/empty-meta" { let identity = auth.rotatingSignedRequest(config("cur
     rir.destroy();
 }
 
+TEST(jit, multi_signed_request_authenticates_two_distinct_consumers) {
+    const char* source = R"rut(
+import "middleware/auth.rut"
+func member(_ consumerId: str, _ keyId: str, _ key: str, _ credentialId: str) -> auth.SignedRequestConsumer =>
+    auth.SignedRequestConsumer(consumerId: consumerId, keyId: keyId, key: key, credentialId: credentialId)
+route POST "/first" {
+    let identity = auth.multiSignedRequest(member("orders", "orders-kid", "orders-secret", "orders-credential"),
+        member("billing", "billing-kid", "billing-secret", "billing-credential"))
+    guard identity.consumerId == "orders" && identity.credentialId == "orders-credential" && identity.method == "signedRequest" else { return 500 }
+    return 204
+}
+route POST "/second" {
+    let identity = auth.multiSignedRequest(member("orders", "orders-kid", "orders-secret", "orders-credential"),
+        member("billing", "billing-kid", "billing-secret", "billing-credential"))
+    guard identity.consumerId == "billing" && identity.credentialId == "billing-credential" && identity.method == "signedRequest" else { return 500 }
+    return 204
+}
+route POST "/first-only" {
+    let identity = auth.multiSignedRequest(member("orders", "orders-kid", "orders-secret", "orders-credential"),
+        member("billing", "", "", "billing-credential"))
+    guard identity.consumerId == "orders" && identity.credentialId == "orders-credential" else { return 500 }
+    return 204
+}
+route POST "/same-consumer" { let identity = auth.multiSignedRequest(member("orders", "orders-kid", "orders-secret", "one"), member("orders", "billing-kid", "billing-secret", "two")) return 204 }
+route POST "/same-kid" { let identity = auth.multiSignedRequest(member("orders", "shared-kid", "orders-secret", "one"), member("billing", "shared-kid", "billing-secret", "two")) return 204 }
+route POST "/half-pair" { let identity = auth.multiSignedRequest(member("orders", "orders-kid", "", "one"), member("billing", "", "", "two")) return 204 }
+route POST "/disabled" { let identity = auth.multiSignedRequest(member("orders", "", "", "one"), member("billing", "", "", "two")) return 204 }
+route POST "/empty-disabled-metadata" { let identity = auth.multiSignedRequest(member("orders", "orders-kid", "orders-secret", "one"), member("billing", "", "", "")) return 204 }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/multi-signed-request-test.rut";
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    bool body_trait = false;
+    for (u32 i = 0; i < rir.module.func_count; ++i)
+        body_trait |= rir_function_needs_req_body(rir.module.functions[i]);
+    CHECK(body_trait);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    const std::string body("multi\0signed", 12);
+    auto invoke = [&](u32 route,
+                      const std::string& target,
+                      const ::rut::test::signed_request::Headers& headers) {
+        const auto handler = reinterpret_cast<HandlerFn>(
+            engine.lookup(("handler_route_" + std::to_string(route)).c_str()));
+        CHECK(handler != nullptr);
+        if (handler == nullptr) return static_cast<u16>(0);
+        std::string request =
+            "POST " + target +
+            " HTTP/1.1\r\nHost: local\r\nAuthorization: " + headers.authorization +
+            "\r\nDate: " + headers.date + "\r\nDigest: " + headers.digest +
+            "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+        Connection conn;
+        conn.reset();
+        return HandlerResult::unpack(handler(&conn,
+                                             nullptr,
+                                             reinterpret_cast<const u8*>(request.data()),
+                                             static_cast<u32>(request.size()),
+                                             nullptr))
+            .status_code;
+    };
+    const std::string first_target = "/first?raw=a%2Fb";
+    const std::string second_target = "/second?raw=a%2Fb";
+    const auto first_headers = ::rut::test::signed_request::make_headers(
+        "POST", first_target, body, now.tv_sec, "orders-kid", "orders-secret");
+    const auto second_headers = ::rut::test::signed_request::make_headers(
+        "POST", second_target, body, now.tv_sec, "billing-kid", "billing-secret");
+    REQUIRE(!first_headers.authorization.empty());
+    REQUIRE(!second_headers.authorization.empty());
+    CHECK_EQ(invoke(0, first_target, first_headers), 204u);
+    CHECK_EQ(invoke(1, second_target, second_headers), 204u);
+    const std::string first_only_target = "/first-only?raw=a%2Fb";
+    const auto first_only_headers = ::rut::test::signed_request::make_headers(
+        "POST", first_only_target, body, now.tv_sec, "orders-kid", "orders-secret");
+    CHECK_EQ(invoke(2, first_only_target, first_only_headers), 204u);
+    const auto unknown = ::rut::test::signed_request::make_headers(
+        "POST", first_target, body, now.tv_sec, "unknown-kid", "orders-secret");
+    const auto wrong_secret = ::rut::test::signed_request::make_headers(
+        "POST", first_target, body, now.tv_sec, "orders-kid", "wrong-secret");
+    CHECK_EQ(invoke(0, first_target, unknown), 401u);
+    CHECK_EQ(invoke(0, first_target, wrong_secret), 401u);
+    CHECK_EQ(invoke(3, first_target, first_headers), 503u);
+    CHECK_EQ(invoke(4, first_target, first_headers), 503u);
+    CHECK_EQ(invoke(5, first_target, first_headers), 503u);
+    CHECK_EQ(invoke(6, first_target, first_headers), 503u);
+    CHECK_EQ(invoke(7, first_target, first_headers), 503u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, required_credentials_and_exact_consumer_union_fail_closed) {
     const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
                              "examples/multi-consumer-auth.rut";

@@ -8600,6 +8600,19 @@ configured credential ID; removing the previous pair revokes it. The same
 secret may be used with distinct key IDs. This remains static route
 configuration without remote key refresh or replay storage.
 
+`auth.SignedRequestConsumer` pairs one trusted Consumer ID, key ID, secret,
+and credential ID. `auth.multiSignedRequest(first, second)` accepts exactly two
+static Consumer records and validates both records before reading the request.
+Consumer and credential IDs must be nonempty, Consumer IDs must differ, each
+key-ID/secret pair must be jointly enabled or disabled, at least one pair must
+be enabled, and enabled key IDs must differ. Configuration errors return 503;
+request verification uses one captured set of method, target, singleton
+headers, and complete body for both slots. A match returns the exact configured
+Consumer and credential identity with method `signedRequest`; failure returns
+401 with a Signature challenge. This bounded policy is separate from key
+rotation for one Consumer and adds no dynamic registry or replay store. See
+[`multi-signed-request.rut`](examples/multi-signed-request.rut).
+
 ### Implemented generic digest and HMAC calls
 
 The six MD5/SHA-1/SHA-224/SHA-256/SHA-384/SHA-512 calls and their six HMAC
