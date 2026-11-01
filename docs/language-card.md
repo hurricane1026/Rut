@@ -1192,7 +1192,8 @@ hash:    md5/sha1/sha224/sha256/sha384/sha512(data) -> str? (lowercase hex)
          ⏳ fnv32 fnv64
 jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
          decode with json.decode/json.get). jwtVerifyRs256(tok, policy) -> Json?
-         (static JWKS + claims policy). ⏳ other RS/ES algorithms and jwtEncode
+         (static JWKS + claims policy). jwtHasGroup(claims, required) -> bool.
+         ⏳ other RS/ES algorithms and jwtEncode
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
 time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
@@ -1543,6 +1544,15 @@ response and `WWW-Authenticate: Bearer error="insufficient_scope"`, following
 Invalid authentication remains 401; an authenticated identity lacking the
 required scope is denied with 403. Validate dynamic policy configuration
 separately; an empty required token always returns false.
+
+`jwtHasGroup(claims: Json, required: str) -> bool` checks an exact,
+case-sensitive nonempty string in the top-level `groups` array. Every array
+entry must be a nonempty string; a malformed entry fails the whole check even
+after a match. Repeated array values are allowed. Use it only after signature
+verification and the required issuer, audience, and time checks. Authentication
+failures remain 401; a verified identity without the required group receives
+403. It does not authenticate a document or read client-supplied identity
+headers. See [examples/jwt-groups-auth.rut](../examples/jwt-groups-auth.rut).
 
 Literal `response(..., headers: {...})` values decode string escapes like
 ordinary expressions, including quoted challenge parameters. Decoded values
