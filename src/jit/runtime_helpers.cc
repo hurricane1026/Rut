@@ -1115,16 +1115,16 @@ extern "C" void rut_helper_jwt_issue_hs256(void* conn,
 
     char token[kMaxJwtHs256TokenBytes];
     u32 token_len = 0;
-    const bool issued = jwt_hs256_issue({key, key_len},
-                                        {subject, subject_len},
-                                        {issuer, issuer_len},
-                                        {audience, audience_len},
-                                        static_cast<i64>(now.tv_sec),
-                                        ttl_seconds,
-                                        token,
-                                        sizeof(token),
-                                        token_len);
-    if (!issued) {
+    const bool kIssued = jwt_hs256_issue({key, key_len},
+                                         {subject, subject_len},
+                                         {issuer, issuer_len},
+                                         {audience, audience_len},
+                                         static_cast<i64>(now.tv_sec),
+                                         ttl_seconds,
+                                         token,
+                                         sizeof(token),
+                                         token_len);
+    if (!kIssued) {
         rut_crypto_clear_v1(token, sizeof(token));
         return;
     }

@@ -10097,8 +10097,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
             auto value = analyze_expr(*expr.args[i], route, mod, locals, local_count, binding);
             if (!value) return value;
-            const HirTypeKind expected = i == 4 ? HirTypeKind::I32 : HirTypeKind::Str;
-            if (value->type != expected || value->may_nil || value->may_error)
+            const HirTypeKind kExpected = i == 4 ? HirTypeKind::I32 : HirTypeKind::Str;
+            if (value->type != kExpected || value->may_nil || value->may_error)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, expr.args[i]->span, kDetail);
             values[i] = value.value();
