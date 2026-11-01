@@ -5814,6 +5814,158 @@ route GET "/ws" { return websocket(ws) { message in
     }
 }
 
+TEST(frontend, websocket_json_bool_aliases_support_literal_comparisons) {
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let field = json.get(document, "/enabled") else { message.drop() }
+ guard let enabled = json.bool(field) else { message.drop() }
+ guard enabled == true && true == enabled && enabled == false && false == enabled &&
+       enabled != true && true != enabled && enabled != false && false != enabled else {
+  message.drop()
+ }
+ message.forward()
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& nodes = hir->routes[0].ws_handler.len_guards;
+    REQUIRE_EQ(nodes.len, 18u);
+    CHECK(nodes[0].accessor == WsLenGuard::Accessor::JsonValid);
+    CHECK(nodes[1].accessor == WsLenGuard::Accessor::JsonHasPath);
+    CHECK(nodes[2].accessor == WsLenGuard::Accessor::JsonBoolValid);
+    u32 literal_checks = 0;
+    u32 variants[2][2]{};
+    for (u32 i = 0; i < nodes.len; ++i) {
+        const auto& node = nodes[i];
+        if (node.accessor != WsLenGuard::Accessor::JsonBoolEqual) continue;
+        CHECK(node.pattern.eq(lit("/enabled")));
+        CHECK(node.bound <= 1);
+        variants[node.bound][node.negate ? 1 : 0]++;
+        literal_checks++;
+    }
+    CHECK_EQ(literal_checks, 8u);
+    CHECK_EQ(variants[1][0], 3u);
+    CHECK_EQ(variants[1][1], 3u);
+    CHECK_EQ(variants[0][0], 1u);
+    CHECK_EQ(variants[0][1], 1u);
+
+    const char* root_bool = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let enabled = json.bool(document) else { message.drop() }
+ guard enabled else { message.drop() }
+ message.forward()
+} })rut";
+    tokens = lex(lit(root_bool));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+
+    for (const char* invalid_guards :
+         {"guard enabled else { message.drop() }\n"
+          "guard let document = json.parse(message.text) else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let enabled = json.bool(json.get(document, \"/enabled\")) else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let enabled = json.bool(message.text) else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let field = json.get(document, \"/enabled\") else { message.drop() }\n"
+          "guard let enabled = json.bool(field) else { message.drop() }\n"
+          "guard enabled == message.fromClient else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let field = json.get(document, \"/enabled\") else { message.drop() }\n"
+          "guard let enabled = json.bool(field) else { message.drop() }\n"
+          "guard enabled == true + false else { message.drop() }"}) {
+        std::string invalid =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        invalid += invalid_guards;
+        invalid += "\nmessage.forward() } }\n";
+        tokens = lex({invalid.data(), static_cast<u32>(invalid.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, websocket_json_int_alias_uses_signed_i64_bounds) {
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let field = json.get(document, "/count") else { message.drop() }
+ guard let count = json.int(field) else { message.drop() }
+ guard count >= -9223372036854775808 && count <= 9223372036854775807 else {
+  message.drop()
+ }
+ message.forward()
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& nodes = hir->routes[0].ws_handler.len_guards;
+    REQUIRE_EQ(nodes.len, 6u);
+    CHECK(nodes[0].accessor == WsLenGuard::Accessor::JsonValid);
+    CHECK(nodes[1].accessor == WsLenGuard::Accessor::JsonHasPath);
+    CHECK(nodes[2].accessor == WsLenGuard::Accessor::JsonIntValid);
+    CHECK(nodes[3].accessor == WsLenGuard::Accessor::JsonIntCompare);
+    CHECK(nodes[3].cmp == WsLenGuard::Cmp::Lt);
+    CHECK(nodes[3].int_bound == (-9223372036854775807LL - 1));
+    CHECK(nodes[3].negate);
+    CHECK_EQ(nodes[3].bound, 0u);  // The u32 message/opcode bound stays independent.
+    CHECK(nodes[4].accessor == WsLenGuard::Accessor::JsonIntCompare);
+    CHECK(nodes[4].cmp == WsLenGuard::Cmp::Gt);
+    CHECK(nodes[4].int_bound == 9223372036854775807LL);
+    CHECK(nodes[4].negate);
+    CHECK(nodes[5].accessor == WsLenGuard::Accessor::And);
+
+    const char* root_int = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let count = json.int(document) else { message.drop() }
+ guard count == 9223372036854775807 else { message.drop() }
+ message.forward()
+} })rut";
+    tokens = lex(lit(root_int));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+
+    for (const char* invalid_guards :
+         {"guard count == 1 else { message.drop() }\n"
+          "guard let document = json.parse(message.text) else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let count = json.int(json.get(document, \"/count\")) else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let count = json.int(message.text) else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let field = json.get(document, \"/count\") else { message.drop() }\n"
+          "guard let count = json.int(field) else { message.drop() }\n"
+          "guard count == count else { message.drop() }",
+          "guard let document = json.parse(message.text) else { message.drop() }\n"
+          "guard let field = json.get(document, \"/count\") else { message.drop() }\n"
+          "guard let count = json.int(field) else { message.drop() }\n"
+          "guard count + 1 == 2 else { message.drop() }"}) {
+        std::string invalid =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        invalid += invalid_guards;
+        invalid += "\nmessage.forward() } }\n";
+        tokens = lex({invalid.data(), static_cast<u32>(invalid.size())});
+        REQUIRE(tokens);
+        ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
 TEST(frontend, websocket_json_parse_presence_conditions) {
     for (const char* condition : {"json.parse(message.text) != nil",
                                   "nil != json.parse(message.text)",

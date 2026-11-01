@@ -271,6 +271,147 @@ TEST(ws_terminate, json_string_lookup_decodes_and_reuses_bounded_workspace) {
                                                WsJsonStringMatch::Prefix));
 }
 
+TEST(ws_terminate, json_bool_lookup_accepts_false_and_reuses_bounded_workspace) {
+    const char* const kTrue = R"({"enabled":true})";
+    const char* const kFalse = R"({"enabled":false})";
+    const char* const kWrongKinds[] = {R"({"enabled":null})",
+                                       R"({"enabled":0})",
+                                       R"({"enabled":"true"})",
+                                       R"({"enabled":[]})",
+                                       R"({"enabled":{}})",
+                                       R"({})",
+                                       "{"};
+    CHECK(ws_json_bool_at_path(
+        reinterpret_cast<const u8*>(kTrue), strlen(kTrue), lit_str("/enabled")));
+    CHECK(ws_json_bool_at_path(
+        reinterpret_cast<const u8*>(kFalse), strlen(kFalse), lit_str("/enabled")));
+    CHECK(ws_json_bool_at_path(reinterpret_cast<const u8*>("true"), 4, {}));
+    CHECK(ws_json_bool_at_path(reinterpret_cast<const u8*>("false"), 5, {}));
+    CHECK_FALSE(ws_json_bool_at_path(reinterpret_cast<const u8*>("true"), 4, lit_str("/")));
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(kTrue), strlen(kTrue), lit_str("/enabled"), true));
+    CHECK_FALSE(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(kTrue), strlen(kTrue), lit_str("/enabled"), false));
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(kFalse), strlen(kFalse), lit_str("/enabled"), false));
+    CHECK_FALSE(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(kFalse), strlen(kFalse), lit_str("/enabled"), true));
+    for (const char* payload : kWrongKinds) {
+        CHECK_FALSE(ws_json_bool_at_path(
+            reinterpret_cast<const u8*>(payload), strlen(payload), lit_str("/enabled")));
+        CHECK_FALSE(ws_json_bool_equals_at_path(
+            reinterpret_cast<const u8*>(payload), strlen(payload), lit_str("/enabled"), false));
+    }
+    CHECK_FALSE(ws_json_bool_at_path(
+        reinterpret_cast<const u8*>(kTrue), 0x100000002ULL, lit_str("/enabled")));
+    CHECK_FALSE(ws_json_bool_at_path(nullptr, 1, lit_str("/enabled")));
+    CHECK_FALSE(
+        ws_json_bool_at_path(reinterpret_cast<const u8*>(kTrue), strlen(kTrue), {nullptr, 1}));
+
+    char reused[] = R"({"v":true })";
+    const u32 kLen = static_cast<u32>(strlen(reused));
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kLen, lit_str("/v"), true));
+    reused[5] = 'f';
+    reused[6] = 'a';
+    reused[7] = 'l';
+    reused[8] = 's';
+    reused[9] = 'e';  // Same address and length, opposite bool value.
+    CHECK(ws_json_bool_at_path(reinterpret_cast<const u8*>(reused), kLen, lit_str("/v")));
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kLen, lit_str("/v"), false));
+    reused[5] = 'n';
+    reused[6] = 'u';
+    reused[7] = 'l';
+    reused[8] = 'l';
+    reused[9] = ' ';
+    CHECK_FALSE(ws_json_bool_at_path(reinterpret_cast<const u8*>(reused), kLen, lit_str("/v")));
+    reused[5] = 't';
+    reused[6] = 'r';
+    reused[7] = 'u';
+    reused[8] = 'e';
+    reused[9] = ' ';
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kLen, lit_str("/v"), true));
+}
+
+TEST(ws_terminate, json_int_lookup_is_exact_signed64_and_reuses_bounded_workspace) {
+    const char* const kMin = "-9223372036854775808";
+    const char* const kMax = "9223372036854775807";
+    const char* const kInvalid[] = {"1.0",
+                                    "1e0",
+                                    "9223372036854775808",
+                                    "-9223372036854775809",
+                                    "true",
+                                    "null",
+                                    "\"1\"",
+                                    "[]",
+                                    "{}",
+                                    ""};
+    constexpr i64 kMinValue = (-9223372036854775807LL - 1);
+    constexpr i64 kMaxValue = 9223372036854775807LL;
+    CHECK(ws_json_int_at_path(reinterpret_cast<const u8*>(kMin), strlen(kMin), {}));
+    CHECK(ws_json_int_at_path(reinterpret_cast<const u8*>(kMax), strlen(kMax), {}));
+    CHECK(ws_json_int_compare_at_path(
+        reinterpret_cast<const u8*>(kMin), strlen(kMin), {}, kMinValue, WsJsonIntComparison::Eq));
+    CHECK(ws_json_int_compare_at_path(
+        reinterpret_cast<const u8*>(kMax), strlen(kMax), {}, kMaxValue, WsJsonIntComparison::Eq));
+    CHECK(ws_json_int_compare_at_path(
+        reinterpret_cast<const u8*>(kMin), strlen(kMin), {}, 0, WsJsonIntComparison::Lt));
+    CHECK(ws_json_int_compare_at_path(
+        reinterpret_cast<const u8*>(kMax), strlen(kMax), {}, 0, WsJsonIntComparison::Gt));
+    CHECK(ws_json_int_compare_at_path(
+        reinterpret_cast<const u8*>("-0"), 2, {}, 0, WsJsonIntComparison::Eq));
+    CHECK(ws_json_int_compare_at_path(
+        reinterpret_cast<const u8*>("2147483648"), 10, {}, 2147483647, WsJsonIntComparison::Gt));
+    for (const char* payload : kInvalid) {
+        CHECK_FALSE(ws_json_int_at_path(reinterpret_cast<const u8*>(payload), strlen(payload), {}));
+        CHECK_FALSE(ws_json_int_compare_at_path(
+            reinterpret_cast<const u8*>(payload), strlen(payload), {}, 0, WsJsonIntComparison::Eq));
+    }
+    const char* const kField = R"({"v":-9223372036854775808})";
+    CHECK(ws_json_int_compare_at_path(reinterpret_cast<const u8*>(kField),
+                                      strlen(kField),
+                                      lit_str("/v"),
+                                      kMinValue,
+                                      WsJsonIntComparison::Eq));
+    CHECK_FALSE(ws_json_int_at_path(reinterpret_cast<const u8*>("{}"), 2, lit_str("/v")));
+    CHECK_FALSE(ws_json_int_at_path(reinterpret_cast<const u8*>(kMin), 0x100000002ULL, {}));
+    CHECK_FALSE(ws_json_int_at_path(nullptr, 1, {}));
+    CHECK_FALSE(ws_json_int_at_path(reinterpret_cast<const u8*>(kMin), strlen(kMin), {nullptr, 1}));
+
+    char reused[] = R"({"v":1  })";
+    const u32 kLen = static_cast<u32>(strlen(reused));
+    CHECK(ws_json_int_compare_at_path(
+        reinterpret_cast<const u8*>(reused), kLen, lit_str("/v"), 1, WsJsonIntComparison::Eq));
+    reused[5] = '9';
+    CHECK(ws_json_int_compare_at_path(
+        reinterpret_cast<const u8*>(reused), kLen, lit_str("/v"), 9, WsJsonIntComparison::Eq));
+    reused[5] = 'x';
+    CHECK_FALSE(ws_json_int_at_path(reinterpret_cast<const u8*>(reused), kLen, lit_str("/v")));
+    reused[5] = '1';
+    CHECK(ws_json_int_at_path(reinterpret_cast<const u8*>(reused), kLen, lit_str("/v")));
+
+    char oversized[json::kMaxBytes + 1];
+    memset(oversized, ' ', sizeof(oversized));
+    oversized[0] = '1';
+    CHECK_FALSE(ws_json_int_at_path(reinterpret_cast<const u8*>(oversized), sizeof(oversized), {}));
+
+    char too_many_nodes[json::kMaxBytes];
+    u32 at = 0;
+    const char kPrefix[] = R"({"v":1,"a":[)";
+    memcpy(too_many_nodes, kPrefix, sizeof(kPrefix));
+    at += sizeof(kPrefix) - 1;
+    for (u32 i = 0; i < json::kMaxNodes; ++i) {
+        if (i != 0) too_many_nodes[at++] = ',';
+        too_many_nodes[at++] = '0';
+    }
+    too_many_nodes[at++] = ']';
+    too_many_nodes[at++] = '}';
+    CHECK_FALSE(
+        ws_json_int_at_path(reinterpret_cast<const u8*>(too_many_nodes), at, lit_str("/v")));
+}
+
 namespace {
 constexpr bool kMaskDirections[] = {false, true};
 

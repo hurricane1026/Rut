@@ -25,6 +25,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -5106,6 +5107,259 @@ route GET "/ws" { return websocket(backend) { message in
                                reinterpret_cast<const u8*>(R"({"topic":3})"),
                                strlen(R"({"topic":3})"),
                                true) == WsFrameAction::ClosePolicy2);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_json_bool_alias_comparison_truth_table) {
+    struct Case {
+        const char* condition;
+        bool accepts_true;
+        bool accepts_false;
+    };
+    const Case kCases[] = {{"enabled == true", true, false},
+                           {"true == enabled", true, false},
+                           {"enabled == false", false, true},
+                           {"false == enabled", false, true},
+                           {"enabled != true", false, true},
+                           {"true != enabled", false, true},
+                           {"enabled != false", true, false},
+                           {"false != enabled", true, false},
+                           {"enabled", true, false},
+                           {"!enabled", false, true},
+                           {"!!enabled", true, false},
+                           {"!(enabled == true)", false, true},
+                           {"enabled && !enabled", false, false},
+                           {"enabled || !enabled", true, true}};
+    for (u32 i = 0; i < sizeof(kCases) / sizeof(kCases[0]); ++i) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(backend) "
+            "{ message in\nguard let document = json.parse(message.text) else { "
+            "message.close(1007) }\n"
+            "guard let field = json.get(document, \"/enabled\") else { message.close(1008) }\n"
+            "guard let enabled = json.bool(field) else { message.close(1003) }\nguard ";
+        source += kCases[i].condition;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_json_bool_truth_table", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto& route = program.config.routes[0];
+        const auto handler = route.ws_frame_handler;
+        REQUIRE(handler);
+        for (const auto& [payload, expected] :
+             {std::pair{"{\"enabled\":true}", kCases[i].accepts_true},
+              std::pair{"{\"enabled\":false}", kCases[i].accepts_false}}) {
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(payload),
+                          strlen(payload),
+                          true) == (expected ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+        for (const char* payload : {R"({"enabled":null})",
+                                    R"({"enabled":0})",
+                                    R"({"enabled":"false"})",
+                                    R"({"enabled":[]})",
+                                    R"({"enabled":{}})"}) {
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(payload),
+                          strlen(payload),
+                          true) == WsFrameAction::ClosePolicy2);
+        }
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("{}"), 2, true) ==
+              WsFrameAction::ClosePolicy1);
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("{"), 1, true) ==
+              WsFrameAction::ClosePolicy0);
+        REQUIRE_EQ(route.ws_close_policy_count, 3u);
+        program.destroy();
+    }
+
+    const char* root_source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let enabled = json.bool(document) else { message.close(1003) }
+ guard enabled else { message.drop() }
+ message.forward()
+} }
+)rut";
+    auto path = write_file("/tmp/rut_ws_json_bool_root", "app.rut", root_source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("true"), 4, true) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("false"), 5, true) ==
+          WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("null"), 4, true) ==
+          WsFrameAction::ClosePolicy1);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_json_int_alias_uses_exact_signed64_comparisons) {
+    struct Case {
+        const char* condition;
+        bool accepts_min;
+        bool accepts_negative;
+        bool accepts_zero;
+        bool accepts_positive;
+        bool accepts_max;
+    };
+    const Case kCases[] = {{"count < 0", true, true, false, false, false},
+                           {"0 > count", true, true, false, false, false},
+                           {"count > 0", false, false, false, true, true},
+                           {"0 < count", false, false, false, true, true},
+                           {"count == 0", false, false, true, false, false},
+                           {"0 == count", false, false, true, false, false},
+                           {"count <= 0", true, true, true, false, false},
+                           {"0 >= count", true, true, true, false, false},
+                           {"count >= 0", false, false, true, true, true},
+                           {"0 <= count", false, false, true, true, true},
+                           {"count != 0", true, true, false, true, true},
+                           {"0 != count", true, true, false, true, true}};
+    const char* const kPayloads[] = {R"({"count":-9223372036854775808})",
+                                     R"({"count":-1})",
+                                     R"({"count":-0})",
+                                     R"({"count":1})",
+                                     R"({"count":9223372036854775807})"};
+    for (u32 c = 0; c < sizeof(kCases) / sizeof(kCases[0]); ++c) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(backend) "
+            "{ message in\nguard let document = json.parse(message.text) else { "
+            "message.close(1007) }\n"
+            "guard let field = json.get(document, \"/count\") else { message.close(1008) }\n"
+            "guard let count = json.int(field) else { message.close(1003) }\nguard ";
+        source += kCases[c].condition;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_json_int_comparisons", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto& route = program.config.routes[0];
+        const auto handler = route.ws_frame_handler;
+        REQUIRE(handler);
+        const bool expected[] = {kCases[c].accepts_min,
+                                 kCases[c].accepts_negative,
+                                 kCases[c].accepts_zero,
+                                 kCases[c].accepts_positive,
+                                 kCases[c].accepts_max};
+        for (u32 i = 0; i < sizeof(kPayloads) / sizeof(kPayloads[0]); ++i) {
+            for (bool from_client : {false, true}) {
+                for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+                    CHECK(handler(nullptr,
+                                  opcode,
+                                  reinterpret_cast<const u8*>(kPayloads[i]),
+                                  strlen(kPayloads[i]),
+                                  from_client) ==
+                          (expected[i] ? WsFrameAction::Forward : WsFrameAction::Drop));
+                }
+            }
+        }
+        for (const char* invalid : {R"({"count":1.0})",
+                                    R"({"count":1e0})",
+                                    R"({"count":9223372036854775808})",
+                                    R"({"count":-9223372036854775809})",
+                                    R"({"count":false})",
+                                    R"({"count":null})",
+                                    R"({"count":"1"})"}) {
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(invalid),
+                          strlen(invalid),
+                          true) == WsFrameAction::ClosePolicy2);
+        }
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("{}"), 2, true) ==
+              WsFrameAction::ClosePolicy1);
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("{"), 1, true) ==
+              WsFrameAction::ClosePolicy0);
+        REQUIRE_EQ(route.ws_close_policy_count, 3u);
+        program.destroy();
+    }
+
+    const char* range_source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/count") else { message.close(1008) }
+ guard let count = json.int(field) else { message.close(1003) }
+ guard count >= 1 && count <= 1000 else { message.drop() }
+ message.forward()
+} }
+)rut";
+    auto path = write_file("/tmp/rut_ws_json_int_range", "app.rut", range_source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const char* const kRangePayloads[] = {R"({"count":0})",
+                                          R"({"count":1})",
+                                          R"({"count":1000})",
+                                          R"({"count":1001})",
+                                          R"({"count":2147483648})",
+                                          R"({"count":9223372036854775807})"};
+    const WsFrameAction kRangeExpected[] = {WsFrameAction::Drop,
+                                            WsFrameAction::Forward,
+                                            WsFrameAction::Forward,
+                                            WsFrameAction::Drop,
+                                            WsFrameAction::Drop,
+                                            WsFrameAction::Drop};
+    for (u32 i = 0; i < sizeof(kRangePayloads) / sizeof(kRangePayloads[0]); ++i) {
+        CHECK(handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(kRangePayloads[i]),
+                      strlen(kRangePayloads[i]),
+                      true) == kRangeExpected[i]);
+    }
+    char reused[] = R"({"count":1 })";
+    const u32 kReusedLen = static_cast<u32>(strlen(reused));
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(reused), kReusedLen, true) ==
+          WsFrameAction::Forward);
+    reused[9] = '9';
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(reused), kReusedLen, true) ==
+          WsFrameAction::Forward);
+    reused[9] = 'x';
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(reused), kReusedLen, true) ==
+          WsFrameAction::ClosePolicy0);
+    {
+        WsInspector inspector;
+        inspector.close_policies = program.config.routes[0].ws_close_policies;
+        inspector.close_policy_count = program.config.routes[0].ws_close_policy_count;
+        const char* fragmented = R"({"count":42})";
+        const u32 size = static_cast<u32>(strlen(fragmented));
+        const u32 split = size / 2;
+        u8 frames[128];
+        u32 at = 0;
+        frames[at++] = 0x01;  // non-final Text
+        frames[at++] = static_cast<u8>(split);
+        memcpy(frames + at, fragmented, split);
+        at += split;
+        frames[at++] = 0x89;  // interleaved Ping
+        frames[at++] = 1;
+        frames[at++] = 'p';
+        frames[at++] = 0x80;  // final continuation
+        frames[at++] = static_cast<u8>(size - split);
+        memcpy(frames + at, fragmented + split, size - split);
+        at += size - split;
+        u8 output[128], message[128];
+        u32 consumed = 0, produced = 0;
+        CHECK(ws_inspect(inspector,
+                         frames,
+                         at,
+                         output,
+                         sizeof(output),
+                         message,
+                         sizeof(message),
+                         handler,
+                         nullptr,
+                         &consumed,
+                         &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(consumed, at);
+        CHECK_EQ(produced, size + 5);
+        CHECK(output[0] == 0x89 && output[2] == 'p');
+        CHECK(output[3] == 0x81 && output[4] == size);
+        CHECK(memcmp(output + 5, fragmented, size) == 0);
+    }
     program.destroy();
 }
 

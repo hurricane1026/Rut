@@ -2732,7 +2732,8 @@ invalid paths return nil. Literal escapes, including embedded NUL, are decoded.
 Bindings require fresh names (including no collision with route locals, `json`
 or `message`), become available only after their guard and stay inside this
 handler. A validated document alias supports `json.get` presence checks, while
-typed string bindings and literal comparisons are limited to the operations below.
+typed string, boolean, and integer bindings and literal comparisons are limited to the
+operations below.
 General document operations, arbitrary value extraction and rewriting remain
 unsupported. Each binding guard counts toward the four-source-guard limit.
 
@@ -2752,6 +2753,24 @@ node or borrowed string. Direct optional `json.get` values, nested `get`, string
 used as Json, documents used as strings without `json.string`, dynamic paths,
 dynamic predicate arguments, and general value extraction are rejected. This
 uses the existing four-guard and 32-condition-node limits.
+
+JSON booleans can be unwrapped with `json.bool(documentOrField)` after JSON
+parsing and, for a selected field, a `json.get` presence guard. Both JSON `true`
+and `false` are successful bindings; JSON null, missing fields, and every other
+JSON kind fail. Bool aliases support bare truth checks, `!`, short-circuit
+`&&`/`||`, and `==`/`!=` with a Bool literal on either side. Comparison leaves
+are limited to the bare alias and one Bool literal. They use the same bounded
+path metadata and per-thread reparsing workspace as string bindings.
+
+JSON integer fields can be unwrapped with `json.int(documentOrField)` after the
+same parse and optional presence guards. This accepts only exact signed 64-bit
+integer tokens: fractional/exponent forms, overflow, strings, booleans, null,
+and missing fields fail the binding. Integer aliases compare with an integer
+literal using `==`, `!=`, `<`, `<=`, `>`, or `>=` in either operand order, and
+those comparisons can be composed with `!`, `&&`, and `||`. Comparison leaves
+are limited to a bare alias and one literal; arithmetic and alias-to-alias
+comparisons are unsupported. The JSON integer threshold uses its own signed
+64-bit field, independent of the existing message-length bound.
 
 The native/JIT helper validates the complete unmasked, reassembled payload with
 the existing JSON parser and a bounded workspace per worker thread. It accepts
