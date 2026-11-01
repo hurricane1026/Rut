@@ -1118,7 +1118,12 @@ struct WsLenGuard {
         JsonIntCompare,
         JsonKindEqual,
         JsonCountValid,
-        JsonCountCompare
+        JsonCountCompare,
+        JsonNumberTextValid,
+        JsonNumberTextEqual,
+        JsonNumberTextPrefix,
+        JsonNumberTextSuffix,
+        JsonNumberTextContains
     };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
@@ -1148,7 +1153,7 @@ struct HirWsClosePolicy {
     u32 reason_expr = 0xffffffffu;
 };
 
-enum class HirWsTextSource : u8 { Literal, MessageText, JsonString };
+enum class HirWsTextSource : u8 { Literal, MessageText, JsonString, JsonNumberText };
 
 struct HirWsTextRewrite {
     u32 prefix_expr = 0xffffffffu;

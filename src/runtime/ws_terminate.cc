@@ -40,6 +40,66 @@ bool ws_json_string_at_path(const u8* payload, u64 len, Str path) {
     return kIsString;
 }
 
+bool ws_json_number_text_at_path(const u8* payload, u64 len, Str path) {
+    json::Document& document = ws_json_document();
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len)) {
+        document.source = {};
+        return false;
+    }
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    const bool kIsNumber = kId != json::kNone && document.nodes[kId].kind == json::Kind::Number;
+    document.source = {};
+    return kIsNumber;
+}
+
+bool ws_json_number_text_matches_at_path(
+    const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation) {
+    json::Document& document = ws_json_document();
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len) || (!expected.ptr && expected.len)) {
+        document.source = {};
+        return false;
+    }
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    bool matches = false;
+    if (kId != json::kNone && document.nodes[kId].kind == json::Kind::Number) {
+        const Str kActual = document.raw(kId);
+        switch (operation) {
+            case WsJsonStringMatch::Equal:
+                matches =
+                    kActual.len == expected.len &&
+                    (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
+                break;
+            case WsJsonStringMatch::Prefix:
+                matches =
+                    expected.len <= kActual.len &&
+                    (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
+                break;
+            case WsJsonStringMatch::Suffix:
+                matches = expected.len <= kActual.len &&
+                          (expected.len == 0 || memcmp(kActual.ptr + kActual.len - expected.len,
+                                                       expected.ptr,
+                                                       expected.len) == 0);
+                break;
+            case WsJsonStringMatch::Contains:
+                matches = expected.len == 0 ||
+                          (expected.len <= kActual.len &&
+                           memmem(kActual.ptr, kActual.len, expected.ptr, expected.len) != nullptr);
+                break;
+            default:
+                matches = false;
+                break;
+        }
+    }
+    document.source = {};
+    return matches;
+}
+
 bool ws_json_string_equals_at_path(const u8* payload, u64 len, Str path, Str expected) {
     return ws_json_string_matches_at_path(payload, len, path, expected, WsJsonStringMatch::Equal);
 }
@@ -317,6 +377,49 @@ bool emit_json_string_frame(u8* out,
     document.source = {};
     return emitted;
 }
+
+bool emit_json_number_text_frame(u8* out,
+                                 u32 out_cap,
+                                 u32* produced,
+                                 const u8* payload,
+                                 u64 len,
+                                 Str path,
+                                 Str prefix,
+                                 Str suffix,
+                                 u64 max_size,
+                                 bool masked,
+                                 u64& mask_rng) {
+    json::Document& document = ws_json_document();
+    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len)) {
+        document.source = {};
+        return false;
+    }
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    bool emitted = false;
+    if (kId != json::kNone && document.nodes[kId].kind == json::Kind::Number) {
+        const Str kLexeme = document.raw(kId);
+        const u64 kOutputSize = static_cast<u64>(prefix.len) + kLexeme.len + suffix.len;
+        if (kOutputSize <= kWsTerminateMessageCapacity &&
+            (max_size == 0 || kOutputSize <= max_size)) {
+            emitted = emit_frame(out,
+                                 out_cap,
+                                 produced,
+                                 WsOpcode::Text,
+                                 reinterpret_cast<const u8*>(kLexeme.ptr),
+                                 kLexeme.len,
+                                 masked,
+                                 mask_rng,
+                                 prefix,
+                                 suffix);
+        }
+    }
+    // The raw lexeme borrows the input message; its bytes have been copied into out.
+    document.source = {};
+    return emitted;
+}
 }  // namespace
 
 bool ws_valid_text_payload(Str text) {
@@ -327,8 +430,9 @@ bool ws_valid_text_payload(Str text) {
 bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
     const u64 literal_size = static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len;
     const bool kSourceValid =
-        rewrite.source <= WsTextSource::JsonString &&
-        (rewrite.source == WsTextSource::JsonString
+        rewrite.source <= WsTextSource::JsonNumberText &&
+        ((rewrite.source == WsTextSource::JsonString ||
+          rewrite.source == WsTextSource::JsonNumberText)
              ? rewrite.source_path.len <= json::kMaxBytes &&
                    (rewrite.source_path.ptr || rewrite.source_path.len == 0)
              : rewrite.source_path.len == 0 && rewrite.source_path.ptr == nullptr);
@@ -534,7 +638,19 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 (rewrite.source == WsTextSource::MessageText && msg_op != WsOpcode::Text) ||
                 output_size > kWsTerminateMessageCapacity ||
                 (st.max_message_size != 0 && output_size > st.max_message_size) ||
-                (rewrite.source == WsTextSource::JsonString
+                (rewrite.source == WsTextSource::JsonNumberText
+                     ? !emit_json_number_text_frame(out,
+                                                    out_cap,
+                                                    produced,
+                                                    msg_buf,
+                                                    total,
+                                                    rewrite.source_path,
+                                                    rewrite.prefix,
+                                                    rewrite.suffix,
+                                                    st.max_message_size,
+                                                    st.masked,
+                                                    st.mask_rng)
+                 : rewrite.source == WsTextSource::JsonString
                      ? !emit_json_string_frame(out,
                                                out_cap,
                                                produced,

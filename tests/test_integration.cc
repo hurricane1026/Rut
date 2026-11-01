@@ -19289,6 +19289,62 @@ static rut::WsFrameAction terminate_json_string_handler(
     return rut::WsFrameAction::ForwardText;
 }
 
+TEST(websocket_terminate_mock, json_number_text_output_is_owned_until_pending_send_completion) {
+    using namespace rut;
+    SmallLoop loop;
+    loop.setup();
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 10;
+    conn->upstream_fd = 11;
+    conn->is_ws_terminate = true;
+    conn->ws_handler = terminate_json_string_handler;
+    conn->ws_max_message_size = 128;
+    conn->ws_c2u.masked = false;
+    conn->ws_c2u.max_message_size = 128;
+    conn->ws_c2u.forward_text = {{"<", 1}, {">", 1}, {"/n", 2}, WsTextSource::JsonNumberText};
+    u8 ws_out[SlicePool::kSliceSize];
+    conn->ws_c2u_out = ws_out;
+    conn->ws_c2u_msg = loop.upstream_recv_storage[conn->id];
+    const char json_payload[] = R"({"n":1.2300e+999})";
+    u8 frame[64];
+    const u32 header_len =
+        ws_write_header(frame, WsOpcode::Binary, true, false, nullptr, sizeof(json_payload) - 1);
+    memcpy(frame + header_len, json_payload, sizeof(json_payload) - 1);
+    REQUIRE_EQ(conn->recv_buf.write(frame, header_len + sizeof(json_payload) - 1),
+               header_len + sizeof(json_payload) - 1);
+
+    REQUIRE(ws_try_send_client_to_upstream(&loop, *conn));
+    const MockOp* send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send != nullptr);
+    CHECK(send->send_buf == conn->ws_c2u_out);
+    const Str expected{"<1.2300e+999>", 13};
+    REQUIRE_EQ(send->send_len, expected.len + 2);
+    CHECK(memcmp(send->send_buf + 2, expected.ptr, expected.len) == 0);
+    u8 queued_copy[64];
+    memcpy(queued_copy, send->send_buf, send->send_len);
+
+    const char scratch_overwrite[] = R"({"n":2.7182818284590452353602874713527})";
+    CHECK(ws_json_number_text_at_path(reinterpret_cast<const u8*>(scratch_overwrite),
+                                      sizeof(scratch_overwrite) - 1,
+                                      lit_str("/n")));
+    memset(conn->ws_c2u_msg, 0xa5, kWsTerminateMessageCapacity);
+    CHECK(memcmp(send->send_buf, queued_copy, send->send_len) == 0);
+    CHECK(conn->ws_client_send_pending);
+    conn->on_upstream_send = &on_ws_client_to_upstream_sent<SmallLoop>;
+    IoEvent completion{};
+    completion.type = IoEventType::UpstreamSend;
+    completion.conn_id = conn->id;
+    completion.result = static_cast<i32>(send->send_len);
+    completion.upstream_episode = conn->upstream_episode;
+    loop.backend.inject(completion);
+    IoEvent delivered{};
+    REQUIRE_EQ(loop.backend.wait(&delivered, 1), 1u);
+    loop.dispatch(delivered);
+    CHECK_FALSE(conn->ws_client_send_pending);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+}
+
 TEST(websocket_terminate_mock, json_rewrite_output_is_owned_until_pending_send_completion) {
     using namespace rut;
     SmallLoop loop;

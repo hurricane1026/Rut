@@ -5821,6 +5821,8 @@ route GET "/ws" {
 }
 
 
+
+
 )rut";
     tokens = lex(lit(collision));
     REQUIRE(tokens);
@@ -5841,6 +5843,88 @@ route GET "/ws" {
         ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, websocket_json_number_text_aliases_preserve_typed_recipe) {
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/n") else { message.drop() }
+ guard let number = json.numberText(field) else { message.drop() }
+ guard number.hasPrefix("1.") && number != "1.0" && number.hasSuffix("0") &&
+       number.contains(".") && !number.isEmpty else { message.drop() }
+ message.forward("<" + number + ">")
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& handler = hir->routes[0].ws_handler;
+    bool found_valid = false;
+    bool found_prefix = false;
+    bool found_equal = false;
+    bool found_suffix = false;
+    bool found_contains = false;
+    for (u32 i = 0; i < handler.len_guards.len; i++) {
+        const auto& node = handler.len_guards[i];
+        found_valid |= node.accessor == WsLenGuard::Accessor::JsonNumberTextValid;
+        found_prefix |= node.accessor == WsLenGuard::Accessor::JsonNumberTextPrefix;
+        found_equal |= node.accessor == WsLenGuard::Accessor::JsonNumberTextEqual;
+        found_suffix |= node.accessor == WsLenGuard::Accessor::JsonNumberTextSuffix;
+        found_contains |= node.accessor == WsLenGuard::Accessor::JsonNumberTextContains;
+        if (node.accessor == WsLenGuard::Accessor::JsonNumberTextValid)
+            CHECK(node.pattern.eq(lit("/n")));
+    }
+    CHECK(found_valid);
+    CHECK(found_prefix);
+    CHECK(found_equal);
+    CHECK(found_suffix);
+    CHECK(found_contains);
+    CHECK(handler.has_forward_payload);
+    CHECK(handler.forward_payload.source == HirWsTextSource::JsonNumberText);
+    CHECK(handler.forward_payload.source_path.eq(lit("/n")));
+
+    const char* rejected[] = {
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let number = json.numberText(document) else { message.drop() }
+guard number > 1 else { message.drop() }
+message.forward())rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let number = json.numberText(document) else { message.drop() }
+guard let other = json.numberText(document) else { message.drop() }
+guard number == other else { message.drop() }
+message.forward())rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let number = json.numberText(document) else { message.drop() }
+message.forward(number + message.text))rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let field = json.get(document, "/n") else { message.drop() }
+message.forward(json.numberText(field)))rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let text = json.string(document) else { message.drop() }
+guard let number = json.numberText(text) else { message.drop() }
+message.forward(number))rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let number = json.numberText(document) else { message.forward(number) }
+message.forward())rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard number == "1" else { message.drop() }
+guard let number = json.numberText(document) else { message.drop() }
+message.forward())rut",
+    };
+    for (const char* body : rejected) {
+        std::string candidate =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        candidate += body;
+        candidate += " } }\n";
+        auto invalid_tokens = lex({candidate.data(), static_cast<u32>(candidate.size())});
+        REQUIRE(invalid_tokens);
+        auto invalid_ast = parse_file_heap(invalid_tokens.value());
+        REQUIRE(invalid_ast);
+        CHECK_FALSE(analyze_file_heap(invalid_ast.value()));
     }
 }
 
