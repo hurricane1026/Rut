@@ -881,6 +881,18 @@ return websocket(chat) { message in
 // still fails its binding. Nested get, dynamic paths, arbitrary extraction and
 // mutation remain unsupported; no Unicode normalization is performed.
 
+// JSON Bool fields are type-checked; false is a successfully unwrapped value.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let field = json.get(document, "/enabled") else { message.close(1008) }
+    guard let enabled = json.bool(field) else { message.close(1003) }
+    guard enabled else { message.drop() }
+    message.forward()
+}
+// A Bool alias supports bare truth, !, && / ||, and == / != with a Bool literal
+// on either side. Comparison leaves are limited to the bare alias and one literal.
+// json.bool(document) checks a root Bool. Missing/null/non-Bool values fail binding.
+
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
 // and the single-slice cap. General expressions/interpolation remain unsupported.

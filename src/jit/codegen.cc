@@ -2828,16 +2828,17 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 16 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 18 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
-        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 16) ||
+        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 18) ||
              guards[i].accessor == 3 || (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
             guards[i].pattern_len != 0 && !guards[i].pattern)
             return false;
         if (guards[i].accessor >= 13 && guards[i].accessor <= 16 && guards[i].value_len != 0 &&
             !guards[i].value)
             return false;
+        if (guards[i].accessor == 18 && guards[i].bound > 1) return false;
         if (guards[i].accessor == 4 || guards[i].accessor == 5) {
             const u32 children[2] = {guards[i].lhs, guards[i].rhs};
             for (u32 child : children) {
@@ -2970,6 +2971,32 @@ bool emit_ws_handler(LLVMModuleRef mod,
                 builder, json_ty, json_fn, args, match ? 7 : (equals ? 6 : 4), "json.string");
             cond = LLVMBuildICmp(
                 builder, LLVMIntNE, valid, LLVMConstInt(i8_ty, 0, 0), "json.string.matches");
+        } else if (guards[i].accessor == 17 || guards[i].accessor == 18) {
+            const bool equals = guards[i].accessor == 18;
+            LLVMTypeRef bool_params[4] = {ptr_ty, i64_ty, ptr_ty, i32_ty};
+            LLVMTypeRef equals_params[5] = {ptr_ty, i64_ty, ptr_ty, i32_ty, i8_ty};
+            LLVMTypeRef bool_ty =
+                LLVMFunctionType(i8_ty, equals ? equals_params : bool_params, equals ? 5 : 4, 0);
+            const char* helper = equals ? "rut_helper_ws_json_bool_equals_at_path"
+                                        : "rut_helper_ws_json_bool_at_path";
+            LLVMValueRef bool_fn = LLVMGetNamedFunction(mod, helper);
+            if (!bool_fn) bool_fn = LLVMAddFunction(mod, helper, bool_ty);
+            LLVMValueRef path = LLVMConstStringInContext(
+                ctx, guards[i].pattern ? guards[i].pattern : "", guards[i].pattern_len, 1);
+            LLVMValueRef path_global = LLVMAddGlobal(mod, LLVMTypeOf(path), "json.bool.path");
+            LLVMSetInitializer(path_global, path);
+            LLVMSetGlobalConstant(path_global, 1);
+            LLVMSetLinkage(path_global, LLVMPrivateLinkage);
+            LLVMSetUnnamedAddress(path_global, LLVMGlobalUnnamedAddr);
+            LLVMValueRef args[5] = {payload,
+                                    len,
+                                    path_global,
+                                    LLVMConstInt(i32_ty, guards[i].pattern_len, 0),
+                                    LLVMConstInt(i8_ty, guards[i].bound, 0)};
+            LLVMValueRef valid =
+                LLVMBuildCall2(builder, bool_ty, bool_fn, args, equals ? 5 : 4, "json.bool");
+            cond = LLVMBuildICmp(
+                builder, LLVMIntNE, valid, LLVMConstInt(i8_ty, 0, 0), "json.bool.matches");
         } else if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
             // Emit the pattern + db globals JIT finalization compiles & back-patches. The `ws<id>`
             // suffix keeps these distinct from the HTTP regex globals already in this module.

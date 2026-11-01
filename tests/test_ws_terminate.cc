@@ -271,6 +271,70 @@ TEST(ws_terminate, json_string_lookup_decodes_and_reuses_bounded_workspace) {
                                                WsJsonStringMatch::Prefix));
 }
 
+TEST(ws_terminate, json_bool_lookup_accepts_false_and_reuses_bounded_workspace) {
+    const char* const kTrue = R"({"enabled":true})";
+    const char* const kFalse = R"({"enabled":false})";
+    const char* const kWrongKinds[] = {R"({"enabled":null})",
+                                       R"({"enabled":0})",
+                                       R"({"enabled":"true"})",
+                                       R"({"enabled":[]})",
+                                       R"({"enabled":{}})",
+                                       R"({})",
+                                       "{"};
+    CHECK(ws_json_bool_at_path(
+        reinterpret_cast<const u8*>(kTrue), strlen(kTrue), lit_str("/enabled")));
+    CHECK(ws_json_bool_at_path(
+        reinterpret_cast<const u8*>(kFalse), strlen(kFalse), lit_str("/enabled")));
+    CHECK(ws_json_bool_at_path(reinterpret_cast<const u8*>("true"), 4, {}));
+    CHECK(ws_json_bool_at_path(reinterpret_cast<const u8*>("false"), 5, {}));
+    CHECK_FALSE(ws_json_bool_at_path(reinterpret_cast<const u8*>("true"), 4, lit_str("/")));
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(kTrue), strlen(kTrue), lit_str("/enabled"), true));
+    CHECK_FALSE(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(kTrue), strlen(kTrue), lit_str("/enabled"), false));
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(kFalse), strlen(kFalse), lit_str("/enabled"), false));
+    CHECK_FALSE(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(kFalse), strlen(kFalse), lit_str("/enabled"), true));
+    for (const char* payload : kWrongKinds) {
+        CHECK_FALSE(ws_json_bool_at_path(
+            reinterpret_cast<const u8*>(payload), strlen(payload), lit_str("/enabled")));
+        CHECK_FALSE(ws_json_bool_equals_at_path(
+            reinterpret_cast<const u8*>(payload), strlen(payload), lit_str("/enabled"), false));
+    }
+    CHECK_FALSE(ws_json_bool_at_path(
+        reinterpret_cast<const u8*>(kTrue), 0x100000002ULL, lit_str("/enabled")));
+    CHECK_FALSE(ws_json_bool_at_path(nullptr, 1, lit_str("/enabled")));
+    CHECK_FALSE(
+        ws_json_bool_at_path(reinterpret_cast<const u8*>(kTrue), strlen(kTrue), {nullptr, 1}));
+
+    char reused[] = R"({"v":true })";
+    const u32 kLen = static_cast<u32>(strlen(reused));
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kLen, lit_str("/v"), true));
+    reused[5] = 'f';
+    reused[6] = 'a';
+    reused[7] = 'l';
+    reused[8] = 's';
+    reused[9] = 'e';  // Same address and length, opposite bool value.
+    CHECK(ws_json_bool_at_path(reinterpret_cast<const u8*>(reused), kLen, lit_str("/v")));
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kLen, lit_str("/v"), false));
+    reused[5] = 'n';
+    reused[6] = 'u';
+    reused[7] = 'l';
+    reused[8] = 'l';
+    reused[9] = ' ';
+    CHECK_FALSE(ws_json_bool_at_path(reinterpret_cast<const u8*>(reused), kLen, lit_str("/v")));
+    reused[5] = 't';
+    reused[6] = 'r';
+    reused[7] = 'u';
+    reused[8] = 'e';
+    reused[9] = ' ';
+    CHECK(ws_json_bool_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kLen, lit_str("/v"), true));
+}
+
 namespace {
 constexpr bool kMaskDirections[] = {false, true};
 

@@ -1981,6 +1981,22 @@ extern "C" u8 rut_helper_ws_json_string_matches_at_path(const char* payload,
                : 0u;
 }
 
+extern "C" u8 rut_helper_ws_json_bool_at_path(const char* payload,
+                                              u64 len,
+                                              const char* path,
+                                              u32 path_len) {
+    return ws_json_bool_at_path(reinterpret_cast<const u8*>(payload), len, {path, path_len}) ? 1u
+                                                                                             : 0u;
+}
+
+extern "C" u8 rut_helper_ws_json_bool_equals_at_path(
+    const char* payload, u64 len, const char* path, u32 path_len, u8 expected) {
+    return ws_json_bool_equals_at_path(
+               reinterpret_cast<const u8*>(payload), len, {path, path_len}, expected != 0)
+               ? 1u
+               : 0u;
+}
+
 extern "C" void rut_helper_json(void* conn,
                                 void* arena,
                                 u32 op,

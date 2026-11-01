@@ -98,6 +98,14 @@ supported in these handlers; nested `get`, general extraction, dynamic paths,
 and dynamic predicate arguments remain unsupported. These bindings and
 predicates use the existing four-guard and 32-condition-node limits.
 
+JSON booleans can be unwrapped with `guard let enabled = json.bool(field) ...`;
+`json.bool(document)` checks a root Boolean. Both `true` and `false` are successful
+bindings, while missing fields, JSON null, and other JSON kinds fail. A Bool alias
+supports bare truth, `!`, short-circuit `&&`/`||`, and `==`/`!=` with a Bool
+literal in either operand order. A comparison leaf accepts only the bare alias
+and one Bool literal. Each reached condition reparses the complete bounded
+message and shares the existing per-thread workspace.
+
 The parser limits remain 8 KiB input, 2048 nodes and depth 64; exceeding any limit
 fails validation. Duplicate decoded object keys are rejected. For Text-only
 validation, combine the condition with `message.isText`; ordinary payload text

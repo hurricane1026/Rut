@@ -25,6 +25,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -5106,6 +5107,93 @@ route GET "/ws" { return websocket(backend) { message in
                                reinterpret_cast<const u8*>(R"({"topic":3})"),
                                strlen(R"({"topic":3})"),
                                true) == WsFrameAction::ClosePolicy2);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_json_bool_alias_comparison_truth_table) {
+    struct Case {
+        const char* condition;
+        bool accepts_true;
+        bool accepts_false;
+    };
+    const Case kCases[] = {{"enabled == true", true, false},
+                           {"true == enabled", true, false},
+                           {"enabled == false", false, true},
+                           {"false == enabled", false, true},
+                           {"enabled != true", false, true},
+                           {"true != enabled", false, true},
+                           {"enabled != false", true, false},
+                           {"false != enabled", true, false},
+                           {"enabled", true, false},
+                           {"!enabled", false, true},
+                           {"!!enabled", true, false},
+                           {"!(enabled == true)", false, true},
+                           {"enabled && !enabled", false, false},
+                           {"enabled || !enabled", true, true}};
+    for (u32 i = 0; i < sizeof(kCases) / sizeof(kCases[0]); ++i) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(backend) "
+            "{ message in\nguard let document = json.parse(message.text) else { "
+            "message.close(1007) }\n"
+            "guard let field = json.get(document, \"/enabled\") else { message.close(1008) }\n"
+            "guard let enabled = json.bool(field) else { message.close(1003) }\nguard ";
+        source += kCases[i].condition;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_json_bool_truth_table", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto& route = program.config.routes[0];
+        const auto handler = route.ws_frame_handler;
+        REQUIRE(handler);
+        for (const auto& [payload, expected] :
+             {std::pair{"{\"enabled\":true}", kCases[i].accepts_true},
+              std::pair{"{\"enabled\":false}", kCases[i].accepts_false}}) {
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(payload),
+                          strlen(payload),
+                          true) == (expected ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+        for (const char* payload : {R"({"enabled":null})",
+                                    R"({"enabled":0})",
+                                    R"({"enabled":"false"})",
+                                    R"({"enabled":[]})",
+                                    R"({"enabled":{}})"}) {
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(payload),
+                          strlen(payload),
+                          true) == WsFrameAction::ClosePolicy2);
+        }
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("{}"), 2, true) ==
+              WsFrameAction::ClosePolicy1);
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("{"), 1, true) ==
+              WsFrameAction::ClosePolicy0);
+        REQUIRE_EQ(route.ws_close_policy_count, 3u);
+        program.destroy();
+    }
+
+    const char* root_source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let enabled = json.bool(document) else { message.close(1003) }
+ guard enabled else { message.drop() }
+ message.forward()
+} }
+)rut";
+    auto path = write_file("/tmp/rut_ws_json_bool_root", "app.rut", root_source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("true"), 4, true) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("false"), 5, true) ==
+          WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("null"), 4, true) ==
+          WsFrameAction::ClosePolicy1);
     program.destroy();
 }
 
