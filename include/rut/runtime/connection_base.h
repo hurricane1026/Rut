@@ -47,6 +47,8 @@ enum class BodyMode : u8 {
     UntilClose,     // Read until EOF (HTTP/1.0)
 };
 
+enum class WsHandshakePhase : u8 { None, Prepared, Validated };
+
 // io_uring only: while a streamed request body is being forwarded upstream and
 // nothing consumes recv_buf, the downstream multishot recv is paused once fewer
 // than this many bytes of room remain (two provided buffers, see kProvidedBufSize
@@ -669,8 +671,13 @@ struct ConnectionBase {
     // route at request time; `is_ws_terminate` is armed at the 101 transition once the
     // per-direction inspection buffers are acquired. In terminate mode the data phase is
     // parsed/inspected/re-framed per message (ws_inspect) instead of spliced raw.
-    bool is_ws_terminate_route;     // matched route requested terminate (vs passthrough)
-    bool is_ws_terminate;           // active: 101 seen + inspection buffers acquired
+    bool is_ws_terminate_route;  // matched route requested terminate (vs passthrough)
+    bool is_ws_terminate;        // active: 101 seen + inspection buffers acquired
+    // Opening handshake facts are connection-owned across upstream I/O. The slice
+    // is CPU-only scratch and is never submitted to a kernel operation.
+    u8* ws_handshake_slice = nullptr;
+    u32 ws_handshake_offers_len = 0;
+    WsHandshakePhase ws_handshake_phase = WsHandshakePhase::None;
     WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
     const WsTextRewrite* ws_forward_texts = nullptr;
@@ -1285,6 +1292,8 @@ struct ConnectionBase {
 
     void copy_downstream_transport_state_from(const ConnectionBase& source) {
         downstream_completed_request_count = source.downstream_completed_request_count;
+        // Handshake owner/state stays local to each Connection; snapshots never
+        // transfer its SlicePool pointer.
     }
 
     // Per-connection HTTP/2 engine, lazily allocated from a per-shard pool when
@@ -1971,6 +1980,9 @@ struct ConnectionBase {
     void (*on_close)(void*, ConnectionBase&);
 
     void reset() {
+        // Loop retirement must release this CPU-only slice before slot reuse.
+        if (ws_handshake_slice != nullptr || ws_handshake_phase != WsHandshakePhase::None)
+            __builtin_trap();
         json_arena.destroy();
         jit_response_body = {};
         jit_response_body_valid = false;
@@ -2055,6 +2067,9 @@ struct ConnectionBase {
         ws_shutdown_started_tick = 0;
         is_ws_terminate_route = false;
         is_ws_terminate = false;
+        ws_handshake_slice = nullptr;
+        ws_handshake_offers_len = 0;
+        ws_handshake_phase = WsHandshakePhase::None;
         ws_handler = nullptr;
         ws_max_message_size = 0;
         ws_close_reason = {};

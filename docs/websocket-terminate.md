@@ -37,17 +37,40 @@ status or response. Helpers, effects, request body reads, mutation, waits,
 loops, conditionals, decorators and chains remain unsupported. The message
 handler retains its independent four-guard limit.
 
-Terminate routes admit a 101 only when the request offered the exact `websocket`
-Upgrade token and the response selects exactly one `Upgrade: websocket` field,
-includes an exact `Upgrade` token in its Connection fields, and has a complete,
-untruncated header block. A nonempty `Sec-WebSocket-Extensions` response is
-rejected because terminate mode does not negotiate extensions. These checks
-apply only to terminate routes; bare passthrough routes retain generic Upgrade
-tunneling. This is a bounded WebSocket admission check, not full RFC 6455
-handshake validation: key/accept, version, subprotocol, and Origin are not
-validated here. Origin is not implicitly validated; add an HTTP guard when the
-route requires an Origin policy. An invalid terminate-mode 101 closes the connection before the
-101 is sent; the runtime does not synthesize a 502 or WebSocket Close frame.
+After the route's HTTP guards pass, terminate mode validates the opening request
+before connecting to the selected upstream. The supported request shape is GET
+over HTTP/1.1 with exactly one non-empty Host, a `Connection` list containing the
+exact `Upgrade` token, an `Upgrade` list containing a bare exact `websocket` token
+(other valid `protocol-name[/protocol-version]` offers may coexist),
+one canonical standard Base64 `Sec-WebSocket-Key` encoding 16 bytes, and exactly
+one `Sec-WebSocket-Version: 13`. Key edge OWS is trimmed; internal whitespace,
+URL-safe Base64 and noncanonical padding are rejected. At most one
+`Content-Length: 0` is accepted; positive or duplicate Content-Length,
+Transfer-Encoding, `TE`, and `Expect` are rejected. These checks do not impose a
+DNS/authority grammar on Host. A missing, malformed or duplicate required field
+returns 400 and closes the client connection. A decimal Version from 0 through
+255 without leading zeroes is syntactically valid; one other than 13, when the
+rest of the request is valid, returns 426 with `Upgrade: websocket`, an
+`Upgrade` Connection option, `Sec-WebSocket-Version: 13`, and close semantics.
+Missing, duplicate, nonnumeric, out-of-range, or leading-zero Version returns
+400. Internal crypto or temporary-slice allocation failure returns 503. Any
+coalesced bytes after the parsed header remain WebSocket stream data.
+
+Request `Sec-WebSocket-Protocol` fields may repeat and their comma-separated
+tokens are combined. Tokens must be nonempty ASCII `tchar` values and unique with
+case-sensitive comparison. Before sending a backend 101 to the client, terminate
+mode requires one matching `Sec-WebSocket-Accept`, computed from the request key,
+and validates a selected protocol: it may be absent, but if present must be one
+single offered token. Response Upgrade must select exactly one
+`Upgrade: websocket` field, Connection must contain an exact `Upgrade` list item,
+and the header block must be complete and untruncated. A nonempty
+`Sec-WebSocket-Extensions` response is rejected because terminate mode does not
+negotiate extensions. A non-101 response follows ordinary HTTP forwarding.
+These terminate-only checks do not make the engine a full RFC 6455
+implementation; Origin remains explicit application policy. A failed backend
+101 closes before any 101 bytes are sent; the runtime does not synthesize a 502
+or WebSocket Close frame. Bare passthrough routes retain generic Upgrade
+tunneling.
 
 - `message.fromClient` identifies the sender: client or upstream.
 - `message.isText` / `message.isBinary` select application message types.

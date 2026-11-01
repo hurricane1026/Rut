@@ -67,6 +67,10 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     u8 send_storage[kMaxConns][kBufSize];
     u8 upstream_recv_storage[kMaxConns][kBufSize];
     u8 response_header_storage[kMaxConns][kBufSize];
+    alignas(64) u8 ws_handshake_storage[SlicePool::kSliceSize];
+    bool fail_ws_handshake_alloc = false;
+    bool ws_handshake_in_use = false;
+    u32 ws_handshake_free_calls = 0;
     u8 capture_storage[kMaxConns][CaptureEntry::kMaxHeaderLen];
 
     bool set_capture(CaptureRing* ring) {
@@ -129,6 +133,9 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         send_submit_attempts = 0;
         upstream_cc = nullptr;
         fail_response_header_alloc = false;
+        fail_ws_handshake_alloc = false;
+        ws_handshake_in_use = false;
+        ws_handshake_free_calls = 0;
         fail_next_recv_submit = false;
         fail_next_upstream_recv_submit = false;
         draining = false;
@@ -172,6 +179,19 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         return true;
     }
 
+    u8* alloc_ws_handshake_slice() {
+        if (fail_ws_handshake_alloc || ws_handshake_in_use) return nullptr;
+        ws_handshake_in_use = true;
+        return ws_handshake_storage;
+    }
+
+    void free_ws_handshake_slice(u8* slice) {
+        if (slice == nullptr) return;
+        if (slice != ws_handshake_storage || !ws_handshake_in_use) __builtin_trap();
+        ws_handshake_in_use = false;
+        ws_handshake_free_calls++;
+    }
+
     Connection* alloc_conn_impl() {
         if (free_top == 0) return nullptr;
         u32 id = free_stack[--free_top];
@@ -190,6 +210,10 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         u32 cid = c.id;
         timer.remove(&c);
         // MockBackend::kAsyncIo == false: sync backend, free immediately.
+        free_ws_handshake_slice(c.ws_handshake_slice);
+        c.ws_handshake_slice = nullptr;
+        c.ws_handshake_offers_len = 0;
+        c.ws_handshake_phase = WsHandshakePhase::None;
         c.reset();
         free_stack[free_top++] = cid;
     }

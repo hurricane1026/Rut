@@ -24,6 +24,7 @@
 #include "rut/runtime/tls_iouring.h"  // tls_fill_output / TlsFill for the io_uring-TLS proxy path
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
+#include "rut/runtime/ws_handshake.h"
 #include "rut/runtime/ws_terminate.h"  // ws_inspect for terminate-mode tunnels
 #include <ctime>
 
@@ -1548,6 +1549,159 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
 
+template <typename Loop>
+void on_response_sent(void* lp, Connection& conn, IoEvent ev);
+
+template <typename Loop>
+bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len);
+
+#if RUT_ENABLE_WEBSOCKET
+template <typename Loop>
+bool ws_retire_handshake_storage(Loop* loop, Connection& conn) {
+    if (conn.ws_handshake_slice == nullptr) {
+        if (conn.ws_handshake_phase != WsHandshakePhase::None ||
+            conn.ws_handshake_offers_len != 0) {
+            loop->close_conn(conn);
+            return false;
+        }
+        return true;
+    }
+    if constexpr (requires(Loop* candidate, u8* slice) {
+                      candidate->free_ws_handshake_slice(slice);
+                  }) {
+        loop->free_ws_handshake_slice(conn.ws_handshake_slice);
+        conn.ws_handshake_slice = nullptr;
+        conn.ws_handshake_offers_len = 0;
+        conn.ws_handshake_phase = WsHandshakePhase::None;
+        return true;
+    } else {
+        // An owner without its loop's release hook is an invalid runtime shape.
+        loop->close_conn(conn);
+        return false;
+    }
+}
+
+template <typename Loop>
+bool ws_prepare_handshake_before_forward(Loop* loop, Connection& conn) {
+    if (!conn.is_ws_terminate_route) return true;
+    if (conn.ws_handshake_phase != WsHandshakePhase::None || conn.ws_handshake_slice != nullptr ||
+        conn.ws_handshake_offers_len != 0) {
+        loop->close_conn(conn);
+        return false;
+    }
+    if (conn.req_header_end == 0 || conn.req_header_end > conn.recv_buf.len() ||
+        conn.req_header_end > conn.recv_buf.capacity()) {
+        conn.resp_status = 400;
+        conn.keep_alive = false;
+        format_static_response(conn, 400, false, false, ordinary_local_response_version(conn));
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()) && conn.fd >= 0)
+            loop->close_conn(conn);
+        return false;
+    }
+
+    auto reply = [&](u16 status, bool version_required) {
+        conn.resp_status = status;
+        conn.keep_alive = false;
+        if (version_required) {
+            static constexpr char kUpgrade[] = "websocket";
+            static constexpr char kUpgradeOption[] = "Upgrade";
+            static constexpr char kVersion[] = "13";
+            const ResponseHeaderKV headers[] = {
+                {"Upgrade", 7, kUpgrade, sizeof(kUpgrade) - 1},
+                {"Connection", 10, kUpgradeOption, sizeof(kUpgradeOption) - 1},
+                {"Sec-WebSocket-Version", 21, kVersion, 2}};
+            const char* reason = status_reason(status);
+            u32 reason_len = 0;
+            if (reason != nullptr)
+                while (reason[reason_len] != '\0') reason_len++;
+            if (!format_response_with_body_and_headers(conn,
+                                                       status,
+                                                       reason,
+                                                       reason_len,
+                                                       headers,
+                                                       sizeof(headers) / sizeof(headers[0]),
+                                                       false,
+                                                       true,
+                                                       true,
+                                                       false,
+                                                       false,
+                                                       ordinary_local_response_version(conn))) {
+                conn.resp_status = 503;
+                format_static_response(
+                    conn, 503, false, false, ordinary_local_response_version(conn));
+            }
+        } else {
+            format_static_response(conn,
+                                   status,
+                                   false,
+                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                                   ordinary_local_response_version(conn));
+        }
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()) && conn.fd >= 0)
+            loop->close_conn(conn);
+    };
+
+    if constexpr (requires(Loop* candidate) {
+                      candidate->alloc_ws_handshake_slice();
+                      candidate->free_ws_handshake_slice(static_cast<u8*>(nullptr));
+                  }) {
+        u32 validated_offers_len = 0;
+        const WsHandshakeRequestResult validation = ws_prepare_handshake(
+            conn.recv_buf.data(), conn.req_header_end, nullptr, 0, &validated_offers_len);
+        if (validation != WsHandshakeRequestResult::Ready) {
+            switch (validation) {
+                case WsHandshakeRequestResult::Ready:
+                    break;
+                case WsHandshakeRequestResult::BadRequest:
+                    reply(400, false);
+                    break;
+                case WsHandshakeRequestResult::VersionRequired:
+                    reply(426, true);
+                    break;
+                case WsHandshakeRequestResult::InternalError:
+                    reply(503, false);
+                    break;
+            }
+            return false;
+        }
+        u8* const slice = loop->alloc_ws_handshake_slice();
+        if (slice == nullptr) {
+            reply(503, false);
+            return false;
+        }
+        u32 offers_len = 0;
+        const WsHandshakeRequestResult result = ws_prepare_handshake(
+            conn.recv_buf.data(), conn.req_header_end, slice, SlicePool::kSliceSize, &offers_len);
+        if (result != WsHandshakeRequestResult::Ready) {
+            loop->free_ws_handshake_slice(slice);
+            switch (result) {
+                case WsHandshakeRequestResult::Ready:
+                    break;
+                case WsHandshakeRequestResult::BadRequest:
+                    reply(400, false);
+                    break;
+                case WsHandshakeRequestResult::VersionRequired:
+                    reply(426, true);
+                    break;
+                case WsHandshakeRequestResult::InternalError:
+                    reply(503, false);
+                    break;
+            }
+            return false;
+        }
+        conn.ws_handshake_slice = slice;
+        conn.ws_handshake_offers_len = offers_len;
+        conn.ws_handshake_phase = WsHandshakePhase::Prepared;
+        return true;
+    } else {
+        reply(503, false);
+        return false;
+    }
+}
+#endif
+
 // ── JIT handler dispatch ───────────────────────────────────────────
 // Route-matched JitHandler action → invoke the compiled handler and
 // translate JitDispatchOutcome into event-loop operations (send, forward,
@@ -2284,6 +2438,12 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
 
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
+#if RUT_ENABLE_WEBSOCKET
+    // The handshake owner is needed through the response decision. Every ordinary
+    // response completion (including a non-101 response) retires it here before
+    // a keep-alive request can begin.
+    if (!ws_retire_handshake_storage(loop, conn)) return;
+#endif
     const bool kOwnsRequestCompletion = conn.req_start_us != 0;
     const u32 kDurationUs = static_cast<u32>(monotonic_us() - conn.req_start_us);
 
@@ -3040,6 +3200,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 #endif
 
     if (route && route->action == RouteAction::Proxy) {
+#if RUT_ENABLE_WEBSOCKET
+        if (!ws_prepare_handshake_before_forward(loop, conn)) return;
+#endif
         if (route->upstream_id < config->upstream_count &&
             !config->upstreams[route->upstream_id].http2 &&
             try_http_cache_response(loop, conn, route->upstream_id))
@@ -4376,6 +4539,7 @@ void handle_jit_outcome(Loop* loop,
                 loop->close_conn(conn);
                 return;
             }
+            if (!ws_prepare_handshake_before_forward(loop, conn)) return;
 #endif
             if (!forward_load_balance_valid(conn.forward_load_balance)) {
                 loop->close_conn(conn);
@@ -11445,8 +11609,10 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 #if RUT_ENABLE_WEBSOCKET
     if (conn.is_ws_terminate_route) {
-        if (!conn.req_wants_upgrade || !conn.req_upgrade_is_websocket ||
-            !conn.resp_upgrade_is_websocket || !ws_arm_terminate(loop, conn)) {
+        if (conn.ws_handshake_phase != WsHandshakePhase::Validated ||
+            conn.ws_handshake_slice == nullptr || !conn.req_wants_upgrade ||
+            !conn.req_upgrade_is_websocket || !conn.resp_upgrade_is_websocket ||
+            !ws_retire_handshake_storage(loop, conn) || !ws_arm_terminate(loop, conn)) {
             close_conn_if_live(loop, conn);
             return;
         }
@@ -11564,77 +11730,6 @@ inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tle
     return false;
 }
 
-// HTTP list fields split on commas only; SP/HTAB trim the item ends but do not
-// turn malformed whitespace-separated text into multiple tokens.
-inline bool ws_value_has_exact_token(const char* value,
-                                     u32 value_len,
-                                     const char* token,
-                                     u32 token_len) {
-    auto lower = [](char ch) {
-        return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
-    };
-    u32 i = 0;
-    while (i <= value_len) {
-        u32 start = i;
-        while (i < value_len && value[i] != ',') i++;
-        u32 end = i;
-        while (start < end && (value[start] == ' ' || value[start] == '\t')) start++;
-        while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t')) end--;
-        if (end - start == token_len) {
-            bool equal = true;
-            for (u32 j = 0; j < token_len; j++) {
-                if (lower(value[start + j]) != lower(token[j])) {
-                    equal = false;
-                    break;
-                }
-            }
-            if (equal) return true;
-        }
-        if (i == value_len) break;
-        i++;
-    }
-    return false;
-}
-
-inline bool ws_terminate_response_admitted(const ParsedResponse& response) {
-    if (response.headers_truncated) return false;
-    u32 upgrade_fields = 0;
-    bool websocket_selected = false;
-    bool connection_upgrade = false;
-    for (u32 i = 0; i < response.header_count; i++) {
-        const Header& header = response.headers[i];
-        if (http_header_name_eq_ci(header.name.ptr, header.name.len, "upgrade", 7)) {
-            if (++upgrade_fields != 1) return false;
-            u32 start = 0;
-            u32 end = header.value.len;
-            while (start < end &&
-                   (header.value.ptr[start] == ' ' || header.value.ptr[start] == '\t'))
-                start++;
-            while (end > start &&
-                   (header.value.ptr[end - 1] == ' ' || header.value.ptr[end - 1] == '\t'))
-                end--;
-            websocket_selected =
-                end - start == 9 &&
-                http_header_name_eq_ci(header.value.ptr + start, 9, "websocket", 9);
-        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "connection", 10)) {
-            connection_upgrade |=
-                ws_value_has_exact_token(header.value.ptr, header.value.len, "upgrade", 7);
-        } else if (http_header_name_eq_ci(
-                       header.name.ptr, header.name.len, "sec-websocket-extensions", 24)) {
-            for (u32 j = 0; j < header.value.len; j++) {
-                if (header.value.ptr[j] != ' ' && header.value.ptr[j] != '\t') return false;
-            }
-        }
-    }
-    return upgrade_fields == 1 && websocket_selected && connection_upgrade;
-}
-
-inline bool ws_terminate_handshake_admitted(bool request_wants_upgrade,
-                                            bool request_offered_websocket,
-                                            const ParsedResponse& response) {
-    return request_wants_upgrade && request_offered_websocket &&
-           ws_terminate_response_admitted(response);
-}
 #endif  // RUT_ENABLE_WEBSOCKET
 
 inline bool response_policy_name_eq(Str name, const char* literal, u32 len) {
@@ -15171,11 +15266,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
 #if RUT_ENABLE_WEBSOCKET
-        if (conn.is_ws_terminate_route &&
-            !ws_terminate_handshake_admitted(
-                conn.req_wants_upgrade, conn.req_upgrade_is_websocket, resp)) {
-            loop->close_conn(conn);
-            return;
+        if (conn.is_ws_terminate_route) {
+            if (conn.ws_handshake_phase != WsHandshakePhase::Prepared ||
+                conn.ws_handshake_slice == nullptr ||
+                !ws_handshake_response_matches(
+                    resp, conn.ws_handshake_slice, conn.ws_handshake_offers_len)) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.ws_handshake_phase = WsHandshakePhase::Validated;
         }
 #endif
         // The 101 is authoritative for what was actually negotiated (the request's offer

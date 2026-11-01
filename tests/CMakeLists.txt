@@ -771,7 +771,8 @@ if(RUT_ENABLE_WEBSOCKET)
         add_test(NAME test_ws_upgrade_admission_e2e
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test_ws_upgrade_admission_e2e.py
-                --server $<TARGET_FILE:rut>)
+                --server $<TARGET_FILE:rut>
+                --compiler $<TARGET_FILE:rut-compile>)
         set_tests_properties(test_ws_upgrade_admission_e2e PROPERTIES
             LABELS "integration;network" RUN_SERIAL TRUE TIMEOUT 120)
     endif()

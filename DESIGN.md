@@ -2857,14 +2857,25 @@ re-read), each with its own buffer for natural backpressure.
   closed — a misbehaving or hostile backend cannot hijack the connection and
   have pipelined bytes forwarded raw.
 
-- **Terminate-mode admission.** Before sending a `101` on a terminate route,
-  the request must contain the exact `websocket` Upgrade token and the response
-  must contain one exact `Upgrade: websocket` field, a Connection `Upgrade`
-  token, and a complete untruncated header block. Nonempty response extensions
-  are rejected. Failure closes the connection before the `101` is sent; the
-  runtime does not synthesize a 502 or WebSocket Close frame. Bare passthrough
-  routes keep generic Upgrade behavior. This is a bounded admission check, not
-  full RFC 6455 handshake validation.
+- **Terminate-mode opening handshake.** After application HTTP guards pass and
+  before connecting upstream, the runtime requires GET over HTTP/1.1, one
+  nonempty Host field, exact comma-list Connection tokens and an Upgrade offer
+  containing a bare `websocket` token (other valid protocol/version offers may
+  coexist), one canonical Base64 key encoding 16 bytes, and one WebSocket Version.
+  One `Content-Length: 0` is
+  allowed; positive/duplicate Content-Length, Transfer-Encoding, `TE`, and
+  Expect fail with 400. A decimal Version from 0 through 255 without leading
+  zeroes but other than 13 gets 426 with `Upgrade: websocket`, a Connection
+  `Upgrade` option, and `Sec-WebSocket-Version: 13` plus close semantics. Other
+  malformed versions get 400. Repeated/comma-separated protocol offers are
+  combined after validation as unique case-sensitive ASCII tokens. Before
+  sending backend 101, the runtime checks one matching Accept and, if selected,
+  one protocol token from the offers, alongside the existing complete-header,
+  exact Upgrade/Connection, and no-extension checks. Invalid requests close with
+  400/426 before upstream connect; an invalid backend 101 closes before any 101
+  bytes are sent. Non-101 responses use ordinary HTTP forwarding. Origin stays
+  explicit application policy. Bare passthrough routes keep generic Upgrade
+  behavior. This supported subset is not full RFC 6455 conformance.
 
 - **Backpressure.** Each direction pauses its read while its paired send drains,
   so a slow peer applies TCP flow control to the fast one. Buffered bytes are

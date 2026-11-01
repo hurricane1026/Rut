@@ -857,11 +857,22 @@ return websocket(chat) { message in
     message.forward()
 }
 
-// Terminate-mode routes send a backend `101` to the client only for an exact
-// WebSocket offer/selection with an untruncated response, a Connection `Upgrade`
-// token, and no negotiated extensions. An invalid 101 closes before it is sent;
-// bare `websocket(chat)` passthrough keeps generic Upgrade behavior. This bounded
-// gate is not full RFC 6455 handshake validation.
+// After HTTP guards pass, terminate mode validates GET/HTTP/1.1, exactly one
+// non-empty Host, exact Connection token and an Upgrade offer containing bare
+// websocket (other valid protocol/version offers may coexist), one canonical
+// 16-byte Base64 key, and one WebSocket Version before connecting upstream.
+// One Content-Length: 0 is
+// allowed; positive/duplicate Content-Length, Transfer-Encoding, TE and Expect
+// are rejected with 400. A decimal Version from 0 to 255 without leading zeroes
+// but other than 13 gets 426 with Upgrade, Connection: Upgrade, and
+// Sec-WebSocket-Version: 13 (plus close semantics); malformed versions get 400.
+// Protocol offers may use repeated fields or
+// comma lists; nonempty ASCII tokens must be unique case-sensitively. A backend
+// 101 is sent only with one matching Accept, a selected protocol that was offered
+// (if any), exact Upgrade/Connection checks, a complete header, and no extensions.
+// Invalid 101 closes before send. Non-101 remains ordinary HTTP; Origin stays an
+// explicit application guard. Bare websocket(chat) passthrough keeps generic
+// Upgrade behavior. This bounded supported shape is not full RFC 6455 conformance.
 
 // The runtime bounds a graceful Close or clean-EOF drain to about five
 // seconds; a healthy quiet tunnel has no idle timeout.
