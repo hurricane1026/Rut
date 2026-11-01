@@ -1982,7 +1982,7 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
-    if (op > static_cast<u32>(json::Op::JwtVerifyRs256)) return;
+    if (op > static_cast<u32>(json::Op::JwtHasGroup)) return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
     json::Writer writer{bytes};
@@ -1991,6 +1991,9 @@ extern "C" void rut_helper_json(void* conn,
     const auto operation = static_cast<json::Op>(op);
     if (operation == json::Op::JwtHasScope) {
         scalar = jwt_has_scope(document, {a, a_len}, {b, b_len}) ? 1 : 0;
+        view = {"", 0};
+    } else if (operation == json::Op::JwtHasGroup) {
+        scalar = jwt_has_group(document, {a, a_len}, {b, b_len}) ? 1 : 0;
         view = {"", 0};
     } else if (operation == json::Op::JwtClaimsValid) {
         struct timespec now{};

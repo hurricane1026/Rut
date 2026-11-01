@@ -4145,7 +4145,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 
 | Feature Category | DSL Capability |
 |-----------------|----------------|
-| JWT auth | `jwtDecode(tok, secret)` built-in (HS256/384/512), `jwtVerifyRs256(tok, policy)` with trusted static JWKS; other RS/ES and `jwtEncode` are roadmap |
+| JWT auth | `jwtDecode(tok, secret)` built-in (HS256/384/512), `jwtVerifyRs256(tok, policy)` with trusted static JWKS, and `jwtHasGroup(claims, required)` for verified claims; other RS/ES and `jwtEncode` are roadmap |
 | HMAC auth | `hmacSha256()` built-in |
 | Basic auth | `base64` decode + string compare |
 | API key auth | header/query access + compare |
@@ -8392,7 +8392,7 @@ allow/deny rules to an already verified Identity. They return the original ident
 be chained; multiple allow checks are intersections. Authentication must run first,
 so missing/invalid credentials remain 401. Identity is a constructible ordinary
 struct, not a compiler-enforced proof of authentication. These helpers do not
-implement groups, roles, scopes, or a dynamic Consumer registry.
+provide a dynamic group/role registry or Consumer membership lifecycle.
 
 ### JWT claims policy over existing signature verification
 
@@ -8447,6 +8447,16 @@ response and `WWW-Authenticate: Bearer error="insufficient_scope"`, following
 Invalid authentication remains 401; an authenticated identity lacking the
 required scope is denied with 403. Validate dynamic policy configuration
 separately; an empty required token always returns false.
+
+`jwtHasGroup(claims: Json, required: str) -> bool` checks exact membership in
+the top-level nonempty `groups` array. Every element must be a nonempty JSON
+string; all entries are checked, so malformed trailing values fail closed.
+Matching is length-sensitive and case-sensitive, and repeated array values are
+allowed. Call it after authenticating the JWT and validating its issuer,
+audience, and time claims. It only reads the verified claims document and does
+not consume request identity headers. A missing required group is an
+authorization failure (403), while invalid authentication remains 401. See
+`examples/jwt-groups-auth.rut`.
 
 Literal `response(..., headers: {...})` values decode string escapes like
 ordinary expressions, including quoted challenge parameters. Decoded values

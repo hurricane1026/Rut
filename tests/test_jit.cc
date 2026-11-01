@@ -25459,6 +25459,122 @@ TEST(jit, consumer_group_deny_example_compiles) {
     rir.destroy();
 }
 
+TEST(jit, verified_jwt_groups_authenticate_before_authorizing) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-groups-auth.rut";
+    const char* source = R"rut(import "middleware/auth.rut"
+route GET "/orders" {
+    let claims = auth.jwtDocumentHs256(req.authorization.or(""), "jwt-groups-test-secret-abcdefghijklmnopqrstuvwxyz")
+    let identity = auth.jwtIdentity(claims, "https://issuer.example", "orders", "groups-test")
+    guard jwtHasGroup(claims, "orders:read") else { return 403 }
+    guard identity.consumerId == "alice" && identity.credentialId == "groups-test" else { return 500 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    const auto check = [&](const char* headers, u16 expected) {
+        arena.reset();
+        const std::string request =
+            std::string("GET /orders HTTP/1.1\r\nHost: localhost\r\n") + headers + "\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          &arena));
+        CHECK_EQ(result.status_code, expected);
+    };
+    const char* member =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwiYXVkIjoib3JkZXJzIiwic3ViIjoiYWxpY2UiLCJleHAiOj"
+        "QxMDI0NDQ4MDAsImdyb3VwcyI6WyJvcmRlcnM6cmVhZCIsImFkbWluIl19."
+        "ZbnMlhWaWwdjMduKYxhqMlq0wxTDs9SCoPPgE9chYHs";
+    const char* nonmember =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwiYXVkIjoib3JkZXJzIiwic3ViIjoiYWxpY2UiLCJleHAiOj"
+        "QxMDI0NDQ4MDAsImdyb3VwcyI6WyJhZG1pbiJdfQ."
+        "ENBYGQATxWdUWWHSTZU3h-a1w1XAnmYFn33KuvQaAbE";
+    const char* wrongIssuer =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL3dyb25nLmV4YW1wbGUiLCJhdWQiOiJvcmRlcnMiLCJzdWIiOiJhbGljZSIsImV4cCI6"
+        "NDEwMjQ0NDgwMCwiZ3JvdXBzIjpbIm9yZGVyczpyZWFkIl19."
+        "a18dRK2uXyuAQPuEanB1WAY_IaswjX6jFYYXZUwuyeQ";
+    check("", 401);
+    check("X-Consumer-ID: alice\r\nX-Consumer-Groups: orders:read\r\n", 401);
+    check("Authorization: Bearer invalid\r\nX-Consumer-ID: alice\r\n", 401);
+    check((std::string("Authorization: Bearer ") + member + "\r\nauthorization: Bearer " + member +
+           "\r\n")
+              .c_str(),
+          401);
+    check((std::string("Authorization: Bearer ") + wrongIssuer + "\r\n").c_str(), 401);
+    check((std::string("Authorization: Bearer ") + nonmember +
+           "\r\nX-Consumer-Groups: orders:read\r\n")
+              .c_str(),
+          403);
+    check((std::string("Authorization: Bearer ") + member +
+           "\r\nX-Consumer-ID: mallory\r\nX-Consumer-Groups: none\r\n")
+              .c_str(),
+          204);
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, jwt_groups_example_compiles) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-groups-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    for (const auto& binding :
+         {std::pair{"JWT_SECRET", "jwt-groups-test-secret-abcdefghijklmnopqrstuvwxyz"},
+          std::pair{"JWT_ISSUER", "https://issuer.example"},
+          std::pair{"JWT_AUDIENCE", "orders"}}) {
+        const std::string expression = std::string("env(\"") + binding.first + "\")";
+        const auto pos = source.find(expression);
+        REQUIRE(pos != std::string::npos);
+        source.replace(pos, expression.size(), std::string("\"") + binding.second + "\"");
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, rotating_jwt_secrets_preserve_claims_and_pin_algorithms) {
     using namespace jwt_secret_rotation_fixture;
     const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /

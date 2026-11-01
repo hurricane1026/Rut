@@ -1,0 +1,12 @@
+// Set JWT_SECRET (at least 32 bytes), JWT_ISSUER and JWT_AUDIENCE at load time.
+// Serve behind TLS. Group authorization uses only claims from a verified JWT.
+import "middleware/auth.rut"
+listen :8080
+
+route GET "/orders" {
+    let claims = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(claims, env("JWT_ISSUER"), env("JWT_AUDIENCE"), "orders-policy")
+    guard jwtHasGroup(claims, "orders:read") else { return response(403) }
+    let subject = identity.consumerId
+    return response(200, body: subject)
+}

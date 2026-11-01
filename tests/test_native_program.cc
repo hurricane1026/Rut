@@ -930,6 +930,7 @@ route GET "/" {
     REQUIRE(json::quote(fixture.policy, source_text));
     source_text.text(lit_str(R"rut() else { return 401 }
     guard jwtHasScope(claims, "read") else { return 403 }
+    guard jwtHasGroup(claims, "read") else { return 403 }
     return 200
 }
 )rut"));
@@ -952,7 +953,9 @@ route GET "/" {
     REQUIRE(pool.init(32));
     connection->json_arena.backend.pool = &pool;
     char token[4096];
-    Str signed_token = fixture.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
+    const auto member_claims = lit_str(
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800,"scope":"read write","groups":["read","admin"]})");
+    Str signed_token = fixture.sign(test::Rs256Fixture::header, member_claims, token);
     REQUIRE(signed_token.len);
     auto run = [&]() {
         char request[8192];
@@ -977,8 +980,12 @@ route GET "/" {
     CHECK_EQ(run(), 200u);
     token[signed_token.len - 4] = token[signed_token.len - 4] == 'a' ? 'b' : 'a';
     CHECK_EQ(run(), 401u);
-    signed_token = fixture.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
+    signed_token = fixture.sign(test::Rs256Fixture::header, member_claims, token);
     CHECK_EQ(run(), 200u);
+    const auto nonmember_claims = lit_str(
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800,"scope":"read write","groups":["admin"]})");
+    signed_token = fixture.sign(test::Rs256Fixture::header, nonmember_claims, token);
+    CHECK_EQ(run(), 403u);
     connection->json_arena.destroy();
     pool.destroy();
 }
