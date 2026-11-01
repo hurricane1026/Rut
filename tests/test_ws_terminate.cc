@@ -96,6 +96,7 @@ TEST(ws_terminate, json_string_lookup_decodes_and_reuses_bounded_workspace) {
                                      R"({"kind":"sub\u0073cribe","empty":"","nul":"a\u0000b"})",
                                      R"({"kind":null,"empty":3,"nul":false})",
                                      R"("root")"};
+    const char kExpectedNul[] = {'a', '\0', 'b'};
     CHECK(ws_json_string_at_path(
         reinterpret_cast<const u8*>(kPayloads[0]), strlen(kPayloads[0]), kPaths[0]));
     CHECK(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
@@ -108,7 +109,74 @@ TEST(ws_terminate, json_string_lookup_decodes_and_reuses_bounded_workspace) {
                                         lit_str("subscribe")));
     CHECK(ws_json_string_equals_at_path(
         reinterpret_cast<const u8*>(kPayloads[0]), strlen(kPayloads[0]), kPaths[1], lit_str("")));
-    const char kExpectedNul[] = {'a', '\0', 'b'};
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                         strlen(kPayloads[0]),
+                                         kPaths[0],
+                                         lit_str("sub"),
+                                         WsJsonStringMatch::Prefix));
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[1]),
+                                         strlen(kPayloads[1]),
+                                         kPaths[0],
+                                         lit_str("scribe"),
+                                         WsJsonStringMatch::Suffix));
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                         strlen(kPayloads[0]),
+                                         kPaths[0],
+                                         lit_str("bscr"),
+                                         WsJsonStringMatch::Contains));
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                         strlen(kPayloads[0]),
+                                         kPaths[2],
+                                         {kExpectedNul + 1, 1},
+                                         WsJsonStringMatch::Contains));
+    CHECK_FALSE(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                               strlen(kPayloads[0]),
+                                               kPaths[0],
+                                               lit_str("."),
+                                               WsJsonStringMatch::Contains));
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                         strlen(kPayloads[0]),
+                                         kPaths[0],
+                                         {nullptr, 0},
+                                         WsJsonStringMatch::Contains));
+    CHECK_FALSE(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[2]),
+                                               strlen(kPayloads[2]),
+                                               kPaths[0],
+                                               {nullptr, 0},
+                                               WsJsonStringMatch::Contains));
+    CHECK_FALSE(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                               strlen(kPayloads[0]),
+                                               kPaths[0],
+                                               lit_str("subscribes"),
+                                               WsJsonStringMatch::Prefix));
+    CHECK_FALSE(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                               strlen(kPayloads[0]),
+                                               kPaths[0],
+                                               lit_str("subscribes"),
+                                               WsJsonStringMatch::Suffix));
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): exercise invalid enum handling.
+    CHECK_FALSE(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                               strlen(kPayloads[0]),
+                                               kPaths[0],
+                                               lit_str("needle"),
+                                               static_cast<WsJsonStringMatch>(255)));
+    const char kEuroPayload[] = R"({"kind":"\u20ac"})";
+    const char kEuro[] = {char(0xe2), char(0x82), char(0xac)};
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kEuroPayload),
+                                         strlen(kEuroPayload),
+                                         kPaths[0],
+                                         {kEuro, sizeof(kEuro)},
+                                         WsJsonStringMatch::Equal));
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kEuroPayload),
+                                         strlen(kEuroPayload),
+                                         kPaths[0],
+                                         {kEuro, sizeof(kEuro)},
+                                         WsJsonStringMatch::Contains));
+    CHECK_FALSE(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                               strlen(kPayloads[0]),
+                                               lit_str("/missing"),
+                                               {nullptr, 0},
+                                               WsJsonStringMatch::Contains));
     CHECK(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
                                         strlen(kPayloads[0]),
                                         kPaths[2],
@@ -154,6 +222,21 @@ TEST(ws_terminate, json_string_lookup_decodes_and_reuses_bounded_workspace) {
         reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type"), lit_str("subscribe")));
     CHECK(ws_json_string_equals_at_path(
         reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type"), lit_str("different")));
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(reused),
+                                         kReusedLen,
+                                         lit_str("/type"),
+                                         lit_str("diff"),
+                                         WsJsonStringMatch::Prefix));
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(reused),
+                                         kReusedLen,
+                                         lit_str("/type"),
+                                         lit_str("rent"),
+                                         WsJsonStringMatch::Suffix));
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(reused),
+                                         kReusedLen,
+                                         lit_str("/type"),
+                                         lit_str("ffe"),
+                                         WsJsonStringMatch::Contains));
     reused[0] = 'x';
     reused[1] = ' ';
     memset(reused + 2, ' ', kReusedLen - 2);
@@ -163,6 +246,29 @@ TEST(ws_terminate, json_string_lookup_decodes_and_reuses_bounded_workspace) {
     memcpy(reused, kValidMessage, sizeof(kValidMessage));
     CHECK(ws_json_string_equals_at_path(
         reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type"), lit_str("subscribe")));
+
+    char long_payload[json::kMaxBytes];
+    char long_needle[1025];
+    long_payload[0] = '"';
+    memset(long_payload + 1, 'a', sizeof(long_payload) - 2);
+    long_payload[sizeof(long_payload) - 1] = '"';
+    memset(long_needle, 'a', sizeof(long_needle) - 1);
+    long_needle[sizeof(long_needle) - 1] = 'b';
+    CHECK_FALSE(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(long_payload),
+                                               sizeof(long_payload),
+                                               kPaths[3],
+                                               {long_needle, sizeof(long_needle)},
+                                               WsJsonStringMatch::Contains));
+    CHECK(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(long_payload),
+                                         sizeof(long_payload),
+                                         kPaths[3],
+                                         {long_needle, sizeof(long_needle) - 1},
+                                         WsJsonStringMatch::Contains));
+    CHECK_FALSE(ws_json_string_matches_at_path(reinterpret_cast<const u8*>(long_payload),
+                                               sizeof(long_payload),
+                                               kPaths[3],
+                                               {long_needle, sizeof(long_needle)},
+                                               WsJsonStringMatch::Prefix));
 }
 
 namespace {
