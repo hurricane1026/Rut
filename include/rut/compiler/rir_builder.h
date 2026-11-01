@@ -794,6 +794,29 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_signed_request_valid(ValueId method,
+                                              ValueId target,
+                                              ValueId authorization,
+                                              ValueId date,
+                                              ValueId digest,
+                                              ValueId body,
+                                              ValueId key_id,
+                                              ValueId key,
+                                              SourceLoc loc = {}) {
+        if (!val_has_type(method, TypeKind::Method) || !val_has_type(target, TypeKind::Str) ||
+            !val_has_type(authorization, TypeKind::Str) || !val_has_type(date, TypeKind::Str) ||
+            !val_has_type(digest, TypeKind::Str) || !val_has_type(body, TypeKind::Str) ||
+            !val_has_type(key_id, TypeKind::Str) || !val_has_type(key, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::SignedRequestValid, ty, loc));
+        const ValueId kOperands[] = {
+            method, target, authorization, date, digest, body, key_id, key};
+        auto stored = set_operands(inst, kOperands, 8);
+        if (!stored) return err(stored.error());
+        return vid;
+    }
+
     Result<ValueId> emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
             return err(RirError::InvalidState);

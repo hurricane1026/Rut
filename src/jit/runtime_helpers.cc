@@ -16,6 +16,7 @@
 #include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/signed_request.h"
 #include "rut/runtime/uuid.h"
 #include "rut/runtime/webhook.h"
 #include "rut/runtime/ws_terminate.h"
@@ -1162,6 +1163,77 @@ rut::u8 rut_helper_standard_webhook_valid(const char* id,
                                       {signature, signature_len},
                                       {body, body_len},
                                       {raw_key, raw_key_len});
+}
+
+rut::u8 rut_helper_signed_request_valid(rut::u8 method,
+                                        const char* target,
+                                        rut::u32 target_len,
+                                        const char* authorization,
+                                        rut::u32 authorization_len,
+                                        const char* date,
+                                        rut::u32 date_len,
+                                        const char* digest,
+                                        rut::u32 digest_len,
+                                        const char* body,
+                                        rut::u32 body_len,
+                                        const char* key_id,
+                                        rut::u32 key_id_len,
+                                        const char* key,
+                                        rut::u32 key_len) {
+    if (body_len > 16 * 1024) return 0;
+    const char* kMethod = nullptr;
+    u32 kMethodLen = 0;
+    switch (static_cast<HttpMethod>(method)) {
+        case HttpMethod::GET:
+            kMethod = "GET";
+            kMethodLen = 3;
+            break;
+        case HttpMethod::POST:
+            kMethod = "POST";
+            kMethodLen = 4;
+            break;
+        case HttpMethod::PUT:
+            kMethod = "PUT";
+            kMethodLen = 3;
+            break;
+        case HttpMethod::DELETE:
+            kMethod = "DELETE";
+            kMethodLen = 6;
+            break;
+        case HttpMethod::PATCH:
+            kMethod = "PATCH";
+            kMethodLen = 5;
+            break;
+        case HttpMethod::HEAD:
+            kMethod = "HEAD";
+            kMethodLen = 4;
+            break;
+        case HttpMethod::OPTIONS:
+            kMethod = "OPTIONS";
+            kMethodLen = 7;
+            break;
+        case HttpMethod::TRACE:
+            kMethod = "TRACE";
+            kMethodLen = 5;
+            break;
+        case HttpMethod::CONNECT:
+        case HttpMethod::Unknown:
+        default:
+            return 0;
+    }
+    timespec kNow{};
+    if (clock_gettime(CLOCK_REALTIME, &kNow) != 0 || kNow.tv_sec <= 0 || kNow.tv_nsec < 0 ||
+        kNow.tv_nsec >= 1000000000)
+        return 0;
+    return signed_request_hmac_sha256_valid({kMethod, kMethodLen},
+                                            {target, target_len},
+                                            {authorization, authorization_len},
+                                            {date, date_len},
+                                            {digest, digest_len},
+                                            {body, body_len},
+                                            {key_id, key_id_len},
+                                            {key, key_len},
+                                            static_cast<rut::i64>(kNow.tv_sec));
 }
 
 u8 rut_helper_hmac_sha256_matches(const char* message,

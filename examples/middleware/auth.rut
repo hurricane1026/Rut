@@ -439,6 +439,25 @@ func standardWebhook(_ id: str, _ timestamp: str, _ signature: str, _ body: str,
     Identity(consumerId: consumerId, credentialId: credentialId, method: "standardWebhook")
 }
 
+// APISIX-style fixed signed-request subprofile. Read every signed field from
+// this request; callers must remove Authorization before forwarding.
+func signedRequest(_ keyId: str, _ key: str,
+                   _ consumerId: str, _ credentialId: str) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Signature")
+    guard keyId != "" && key != "" && consumerId != "" && credentialId != "" else { respond 503 }
+    guard !req.chunked else { respond denied }
+    guard Crypto.signedRequestValid(req.method,
+                                    req.path,
+                                    req.authorization.or(""),
+                                    req.uniqueHeader("Date").or(""),
+                                    req.uniqueHeader("Digest").or(""),
+                                    req.body,
+                                    keyId,
+                                    key) else { respond denied }
+    Identity(consumerId: consumerId, credentialId: credentialId, method: "signedRequest")
+}
+
 struct WebhookRotation {
     currentKey: str
     previousKey: str

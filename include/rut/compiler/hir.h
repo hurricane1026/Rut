@@ -214,6 +214,7 @@ enum class HirExprKind : u8 {
     BasicMatches,
     HmacSha256Matches,
     StandardWebhookValid,
+    SignedRequestValid,
     HttpTokenListAllows,
     HttpOriginListAllows,
     HashDigest,

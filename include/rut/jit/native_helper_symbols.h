@@ -77,6 +77,7 @@
     X(rut_helper_http_token_list_allows)         \
     X(rut_helper_bearer_matches)                 \
     X(rut_helper_standard_webhook_valid)         \
+    X(rut_helper_signed_request_valid)           \
     X(rut_helper_hmac_sha256_matches)            \
     X(rut_helper_basic_matches)                  \
     X(rut_helper_str_constant_time_equal)        \

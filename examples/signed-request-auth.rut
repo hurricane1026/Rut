@@ -1,0 +1,25 @@
+import "middleware/auth.rut"
+
+listen :8080
+upstream backend at "127.0.0.1:8081"
+
+// Signatures use the exact origin-form request target, including its query.
+// Configure key bytes from a protected source and serve this route over TLS.
+route POST "/signed" {
+    let identity = auth.signedRequest(
+        env("SIGNED_REQUEST_KEY_ID"),
+        env("SIGNED_REQUEST_KEY"),
+        "orders-api",
+        "signing-key-v1")
+
+    // The verifier reads the original request. Remove credentials before
+    // forwarding, and publish only identity derived from trusted config.
+    match identity.consumerId {
+        "orders-api" => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", identity.consumerId)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => return 403
+    }
+}

@@ -1617,7 +1617,7 @@ static bool is_crypto_system_export(Str value) {
         lit_str("macSha256"),    lit_str("macSha384"),       lit_str("macSha512"),
         lit_str("equal"),        lit_str("hmacSha256Valid"), lit_str("webhookValid"),
         lit_str("jwtAny"),       lit_str("jwtHs256"),        lit_str("jwtHs384"),
-        lit_str("jwtHs512"),     lit_str("jwtRs256")};
+        lit_str("jwtHs512"),     lit_str("jwtRs256"),        lit_str("signedRequestValid")};
     for (Str name : exports)
         if (name.eq(value)) return true;
     return false;
@@ -1944,6 +1944,7 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"bool", 4})) return HirTypeKind::Bool;
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
+    if (name.eq({"Method", 6})) return HirTypeKind::Method;
     if (name.eq({"Json", 4})) return HirTypeKind::Json;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
     const u32 idx = find_variant_index(mod, name);
@@ -10359,6 +10360,39 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    if (expr.name.eq(lit_str("signedRequestHmacSha256Matches")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr Str kDetail = lit_str(
+            "signedRequestHmacSha256Matches expects method, target, authorization, date, digest, "
+            "body, keyId, and key as unwrapped values");
+        if (expr.args.len != 8)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr* values[8]{};
+        for (u32 i = 0; i < expr.args.len; ++i) {
+            if (expr.args[i] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            auto value = analyze_builtin_arg(*expr.args[i]);
+            if (!value) return core::make_unexpected(value.error());
+            const HirTypeKind expected = i == 0 ? HirTypeKind::Method : HirTypeKind::Str;
+            if (value->type != expected || value->may_nil || value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, kDetail);
+            if (!route->exprs.push(value.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            values[i] = &route->exprs[route->exprs.len - 1];
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::SignedRequestValid;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        out.lhs = values[0];
+        out.rhs = values[1];
+        for (u32 i = 2; i < 8; ++i)
+            if (!out.args.push(values[i]))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        return out;
+    }
+
     if (expr.name.eq(lit_str("jwtHasScope")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
@@ -14678,6 +14712,8 @@ func hmacSha256Valid(_ message: str, _ key: str, _ signature: str, _ prefix: str
     hmacSha256Matches(message, key, signature, prefix)
 func webhookValid(_ id: str, _ time: str, _ signature: str, _ body: str, _ key: str) -> bool =>
     standardWebhookValid(id, time, signature, body, key)
+func signedRequestValid(_ method: Method, _ target: str, _ authorization: str, _ date: str, _ digest: str, _ body: str, _ keyId: str, _ key: str) -> bool =>
+    signedRequestHmacSha256Matches(method, target, authorization, date, digest, body, keyId, key)
 func jwtAny(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret)
 func jwtHs256(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "HS256")
 func jwtHs384(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "HS384")

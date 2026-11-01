@@ -302,6 +302,9 @@ enum class Opcode : u8 {
     YieldForward,   // %r = yield.forward upstream
     JsonOp,
     RespBody,
+    // %r = auth.signed_request_valid(method, target, authorization, date,
+    //                               digest, body, key_id, key) → bool
+    SignedRequestValid,
 };
 
 // ── Instruction ─────────────────────────────────────────────────────

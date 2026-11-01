@@ -1,5 +1,6 @@
 #include "deferred_preflight_fixture.h"
 #include "fixtures/jwt_secret_rotation.h"
+#include "fixtures/signed_request.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
@@ -24735,6 +24736,131 @@ route POST "/" {
         CHECK(result.action == HandlerAction::ReturnStatus);
         CHECK(result.status_code == tc.status);
     }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, signed_request_policy_binds_method_query_headers_and_complete_body) {
+    const char* source = R"rut(
+import "middleware/auth.rut"
+route POST "/signed" {
+    let identity = auth.signedRequest("rut-test-key",
+        "signed-request-test-secret-32bytes", "orders", "signing-v1")
+    guard identity.consumerId == "orders" && identity.credentialId == "signing-v1" &&
+          identity.method == "signedRequest" else { return 500 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/signed-request-test.rut";
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    bool body_trait = false;
+    for (u32 i = 0; i < rir.module.func_count; ++i)
+        body_trait |= rir_function_needs_req_body(rir.module.functions[i]);
+    CHECK(body_trait);
+    bool signed_opcode = false;
+    for (u32 fi = 0; fi < rir.module.func_count; ++fi) {
+        const auto& fn = rir.module.functions[fi];
+        for (u32 bi = 0; bi < fn.block_count; ++bi) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ++ii) {
+                const auto& inst = block.insts[ii];
+                if (inst.op == Opcode::SignedRequestValid) {
+                    signed_opcode = true;
+                    CHECK_EQ(inst.operand_count, 8u);
+                }
+            }
+        }
+    }
+    CHECK(signed_opcode);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    REQUIRE(now.tv_sec > 1000);
+    const std::string target = "/signed?item=a%2Fb";
+    const std::string body("raw\0body", 8);
+    const auto good = ::rut::test::signed_request::make_headers("POST", target, body, now.tv_sec);
+    REQUIRE(!good.authorization.empty());
+    auto invoke = [&](const std::string& method,
+                      const std::string& request_target,
+                      const std::string& request_body,
+                      const ::rut::test::signed_request::Headers& headers,
+                      const std::string& duplicate = {}) {
+        std::string request = method + " " + request_target +
+                              " HTTP/1.1\r\nHost: localhost\r\nX-HTTP-Method-Override: GET\r\n"
+                              "X-Original-URL: /spoofed\r\nDate: " +
+                              headers.date + "\r\nDigest: " + headers.digest +
+                              "\r\nAuthorization: " + headers.authorization + "\r\n";
+        if (!duplicate.empty()) request += duplicate + "\r\n";
+        request += "Content-Length: " + std::to_string(request_body.size()) + "\r\n\r\n";
+        request.append(request_body);
+        Connection conn;
+        conn.reset();
+        const auto result =
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        return result.status_code;
+    };
+
+    CHECK_EQ(invoke("POST", target, body, good), 204u);
+    CHECK_EQ(invoke("GET", target, body, good), 401u);
+    CHECK_EQ(invoke("POST", "/signed?item=a/b", body, good), 401u);
+    CHECK_EQ(invoke("POST", target, std::string("raw\0bodx", 8), good), 401u);
+    CHECK_EQ(invoke("POST", target, body, good, "Date: Wed, 21 Oct 2015 07:28:00 GMT"), 401u);
+    CHECK_EQ(invoke("POST", target, body, good, "Digest: SHA-256=invalid"), 401u);
+    CHECK_EQ(invoke("POST", target, body, good, "Authorization: " + good.authorization), 401u);
+
+    const auto stale =
+        ::rut::test::signed_request::make_headers("POST", target, body, now.tv_sec - 600);
+    CHECK_EQ(invoke("POST", target, body, stale), 401u);
+    const auto future =
+        ::rut::test::signed_request::make_headers("POST", target, body, now.tv_sec + 600);
+    CHECK_EQ(invoke("POST", target, body, future), 401u);
+    const std::string oversized_body(16 * 1024 + 1, 'x');
+    const auto oversized =
+        ::rut::test::signed_request::make_headers("POST", target, oversized_body, now.tv_sec);
+    CHECK_EQ(invoke("POST", target, oversized_body, oversized), 401u);
+    const auto empty_body_headers =
+        ::rut::test::signed_request::make_headers("POST", target, "", now.tv_sec);
+    CHECK_EQ(invoke("POST", target, oversized_body, empty_body_headers), 401u);
+    const std::string oversized_prefix(16 * 1024, 'x');
+    const auto prefix_headers =
+        ::rut::test::signed_request::make_headers("POST", target, oversized_prefix, now.tv_sec);
+    CHECK_EQ(invoke("POST", target, oversized_body, prefix_headers), 401u);
+
+    const std::string ordered = good.authorization;
+    const size_t signature_start = ordered.find("signature=\"");
+    REQUIRE(signature_start != std::string::npos);
+    const size_t signature_value = signature_start + sizeof("signature=\"") - 1;
+    const size_t signature_end = ordered.find('"', signature_value);
+    REQUIRE(signature_end != std::string::npos);
+    const std::string signature = ordered.substr(signature_value, signature_end - signature_value);
+    auto reordered = good;
+    reordered.authorization =
+        "Signature signature=\"" + signature +
+        "\",headers=\"@request-target date digest\",algorithm=\"hmac-sha256\",keyId=\"" +
+        ::rut::test::signed_request::kKeyId + "\"";
+    CHECK_EQ(invoke("POST", target, body, reordered), 204u);
+
     engine.shutdown();
     rir.destroy();
 }

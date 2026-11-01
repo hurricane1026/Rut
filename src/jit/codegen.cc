@@ -114,6 +114,7 @@ struct Ctx {
     LLVMValueRef fn_basic_matches;
     LLVMValueRef fn_hmac_sha256_matches;
     LLVMValueRef fn_standard_webhook_valid;
+    LLVMValueRef fn_signed_request_valid;
     LLVMValueRef fn_str_constant_time_equal;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
@@ -614,6 +615,29 @@ struct Ctx {
                 LLVMAddFunction(llvm_mod, "rut_helper_standard_webhook_valid", ft);
         }
         return fn_standard_webhook_valid;
+    }
+    LLVMValueRef get_signed_request_valid() {
+        if (!fn_signed_request_valid) {
+            LLVMTypeRef params[] = {i8_ty,
+                                    ptr_ty,
+                                    i32_ty,
+                                    ptr_ty,
+                                    i32_ty,
+                                    ptr_ty,
+                                    i32_ty,
+                                    ptr_ty,
+                                    i32_ty,
+                                    ptr_ty,
+                                    i32_ty,
+                                    ptr_ty,
+                                    i32_ty,
+                                    ptr_ty,
+                                    i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 15, 0);
+            fn_signed_request_valid =
+                LLVMAddFunction(llvm_mod, "rut_helper_signed_request_valid", ft);
+        }
+        return fn_signed_request_valid;
     }
     LLVMValueRef get_basic_matches() {
         if (!fn_basic_matches) {
@@ -1493,6 +1517,27 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 inst.result,
                 LLVMBuildICmp(
                     c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "hmac.bool"));
+            break;
+        }
+        case rir::Opcode::SignedRequestValid: {
+            LLVMValueRef args[15];
+            args[0] = c.get_value(inst.operand(0));
+            for (u32 i = 1; i < 8; ++i) {
+                LLVMValueRef value = c.get_value(inst.operand(i));
+                args[1 + static_cast<size_t>(i - 1) * 2] =
+                    LLVMBuildExtractValue(c.builder, value, 0, "signed_request.ptr");
+                args[2 + static_cast<size_t>(i - 1) * 2] =
+                    LLVMBuildExtractValue(c.builder, value, 1, "signed_request.len");
+            }
+            LLVMValueRef fn = c.get_signed_request_valid();
+            LLVMValueRef result = LLVMBuildCall2(
+                c.builder, LLVMGlobalGetValueType(fn), fn, args, 15, "signed_request");
+            c.set_value(inst.result,
+                        LLVMBuildICmp(c.builder,
+                                      LLVMIntNE,
+                                      result,
+                                      LLVMConstInt(c.i8_ty, 0, 0),
+                                      "signed_request.bool"));
             break;
         }
         // ── String operations ──
@@ -2757,6 +2802,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_basic_matches = nullptr;
     c.fn_hmac_sha256_matches = nullptr;
     c.fn_standard_webhook_valid = nullptr;
+    c.fn_signed_request_valid = nullptr;
     c.fn_str_constant_time_equal = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;

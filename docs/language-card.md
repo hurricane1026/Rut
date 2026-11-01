@@ -1597,6 +1597,7 @@ return optional lowercase hex strings with request-owned storage:
 - `digestMd5`, `digestSha1`, `digestSha224`, `digestSha256`, `digestSha384`, `digestSha512` take one `str`.
 - `macMd5`, `macSha1`, `macSha224`, `macSha256`, `macSha384`, `macSha512` take key and data `str` values.
 - `equal(a, b)` compares bounded strings in constant time; `hmacSha256Valid(message, key, signature, prefix)` and `webhookValid(id, timestamp, signature, body, rawKey)` verify the profiles below.
+- `signedRequestValid(method, target, authorization, date, digest, body, keyId, key)` verifies the fixed signed-request subprofile below.
 - `jwtAny(token, secret)`, `jwtHs256`, `jwtHs384`, `jwtHs512`, and `jwtRs256(token, policy)` retain the existing JWT verification profiles and return optional `Json`.
 
 The existing global operations remain available for compatibility. The module
@@ -1636,6 +1637,30 @@ Empty keys disable individual slots, and two disabled slots or empty identity
 metadata return 503. Removing the previous key revokes that slot.
 See [standard-webhook-auth.rut](../examples/standard-webhook-auth.rut). The builtin
 uses dedicated HIR/MIR/RIR lowering and adds no keyword or dependency.
+
+`Crypto.signedRequestValid(method, target, authorization, date, digest, body,
+keyId, key)` and `auth.signedRequest(keyId, key, consumerId, credentialId)`
+implement a fixed native APISIX-style HMAC-SHA256 signed-request subprofile.
+The low-level `Crypto` call verifies only the values supplied to it; use the
+request-bound `auth.signedRequest` policy or reject unsupported framing and
+ensure the supplied body is complete yourself.
+`auth.signedRequest` reads the implicit request's actual `req.method`, original `req.path` including
+query, unique Authorization/Date/Digest fields, and complete `req.body`; it
+rejects chunked HTTP/1 bodies and requires the compiler/runtime body completion
+gate. Rut-exposed bodies are limited to 16 KiB; larger bodies fail closed. The
+native API independently supports up to 1 MiB bodies. Unknown, duplicate, or
+missing Authorization parameters, duplicate singleton headers, malformed
+canonical Date/Digest/signature values, stale or future dates, and unsupported
+methods fail with 401 and `WWW-Authenticate: Signature`. Empty trusted key or
+identity metadata returns 503. Identity fields come only from configuration;
+downstream authorization remains explicit and can return 403. Remove the
+Authorization field before forwarding credentials to an upstream. Freshness
+does not prevent replay. This is not full APISIX or Kong plugin compatibility
+or full HTTP Message Signatures, and does not add remote key discovery or
+replay storage. Host/authority and nonce are not signed; scope trusted keys to
+an endpoint or route, and use durable deduplication for replay-sensitive side
+effects. See
+[signed-request-auth.rut](../examples/signed-request-auth.rut).
 
 `auth.hmac(message, signature, key, consumerId, credentialId)` publishes an
 Identity only after verification. `auth.rotatingHmac(...)` evaluates current

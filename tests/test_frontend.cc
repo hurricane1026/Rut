@@ -42401,6 +42401,120 @@ route GET "/" { let value = standardWebhookValid("user") guard value == "user" e
     CHECK(analyze_file_heap(ast.value()));
 }
 
+TEST(frontend, signed_request_crypto_builtin_requires_method_and_seven_unwrapped_strings) {
+    const char* invalid[] = {
+        R"rut(import Crypto
+route GET "/" { let x = Crypto.signedRequestValid(GET, "/", "auth", "date", "digest", "body", "kid") return 200 })rut",
+        R"rut(import Crypto
+route GET "/" { let x = Crypto.signedRequestValid("GET", "/", "auth", "date", "digest", "body", "kid", "key") return 200 })rut",
+        R"rut(import Crypto
+route GET "/" { let x = Crypto.signedRequestValid(req.method, "/", req.authorization, "date", "digest", "body", "kid", "key") return 200 })rut",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    const char* too_many = R"rut(import Crypto
+route GET "/" { let x = Crypto.signedRequestValid(GET, "/", "auth", "date", "digest", "body", "kid", "key", "extra") return 200 })rut";
+    auto extra_tokens = lex(lit(too_many));
+    REQUIRE(extra_tokens);
+    CHECK(!parse_file_heap(extra_tokens.value()));
+
+    const char* valid = R"rut(
+import Crypto
+route POST "/" {
+    let accepted = Crypto.signedRequestValid(req.method,
+        req.path, req.authorization.or(""), req.uniqueHeader("Date").or(""),
+        req.uniqueHeader("Digest").or(""), req.body, "kid", "key")
+    return 200
+}
+)rut";
+    auto tokens = lex(lit(valid));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+
+    const char* method_parameter = R"rut(
+func acceptsMethod(_ method: Method) -> bool => method == GET
+route POST "/" {
+    guard acceptsMethod(req.method) && acceptsMethod(POST) else { return 500 }
+    return 200
+}
+)rut";
+    tokens = lex(lit(method_parameter));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+
+    const char* wrong_method_parameter = R"rut(
+func acceptsMethod(_ method: Method) -> bool => method == GET
+route GET "/" { guard acceptsMethod("GET") else { return 500 } return 200 }
+)rut";
+    tokens = lex(lit(wrong_method_parameter));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(!analyze_file_heap(ast.value()));
+
+    const char* shadow = R"rut(
+import Crypto
+func signedRequestHmacSha256Matches(_ method: Method, _ target: str,
+    _ authorization: str, _ date: str, _ digest: str, _ body: str,
+    _ keyId: str, _ key: str) -> bool => true
+route GET "/" {
+    guard Crypto.signedRequestValid(GET, "/", "", "", "", "", "kid", "key") else { return 401 }
+    return 200
+}
+)rut";
+    tokens = lex(lit(shadow));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, signed_request_example_compiles_with_fixed_test_environment) {
+    struct RestoreEnvironment {
+        const char* name;
+        bool was_set;
+        std::string value;
+        explicit RestoreEnvironment(const char* env_name) : name(env_name) {
+            const char* existing = getenv(name);
+            was_set = existing != nullptr;
+            if (was_set) value = existing;
+        }
+        ~RestoreEnvironment() {
+            if (was_set)
+                setenv(name, value.c_str(), 1);
+            else
+                unsetenv(name);
+        }
+    } restore_key_id("SIGNED_REQUEST_KEY_ID"), restore_key("SIGNED_REQUEST_KEY");
+    REQUIRE_EQ(setenv("SIGNED_REQUEST_KEY_ID", "rut-test-key", 1), 0);
+    REQUIRE_EQ(setenv("SIGNED_REQUEST_KEY", "signed-request-test-secret-32bytes", 1), 0);
+    const auto example_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                              "examples/signed-request-auth.rut";
+    std::ifstream input(example_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), example_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, header_count_requires_literal_token_name_and_request_context) {
     const char* invalid[] = {
         R"rut(route GET "/" { let n = req.headerCount("") return 200 })rut",

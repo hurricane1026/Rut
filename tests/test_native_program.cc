@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/signed_request.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
 #include "rut/jit/native_helper_symbols.h"
@@ -9,6 +10,8 @@
 #include "rut/runtime/ebpf_plan.h"
 #include "rut/runtime/slice_pool.h"
 #include "test.h"
+#include <filesystem>
+#include <string>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -85,6 +88,14 @@ jit::HandlerResult invoke(const RouteEntry& route, const char* request) {
                                                static_cast<u32>(strlen(request)),
                                                nullptr));
 }
+jit::HandlerResult invoke(const RouteEntry& route, const std::string& request) {
+    jit::HandlerCtx ctx{};
+    return jit::HandlerResult::unpack(route.fn(nullptr,
+                                               &ctx,
+                                               reinterpret_cast<const u8*>(request.data()),
+                                               static_cast<u32>(request.size()),
+                                               nullptr));
+}
 bool load(Source& source, NativeProgram& p, u8 opt = 2) {
     char error[512];
     bool ok = load_native_program(source.path, p, error, sizeof(error), opt);
@@ -150,6 +161,43 @@ TEST(native_program, code_and_views_survive_compiler_exit_and_source_removal) {
     REQUIRE_EQ(c.header_pool_used, 1u);
     CHECK((Str{c.header_keys[0].data, c.header_keys[0].len}.eq(lit_str("X-Native"))));
     CHECK((Str{c.header_values[0].data, c.header_values[0].len}.eq(lit_str("yes"))));
+}
+
+TEST(native_program, signed_request_helper_survives_native_artifact_source_removal) {
+    Source source;
+    const auto auth_path = (std::filesystem::path(__FILE__).parent_path().parent_path() /
+                            "examples/middleware/auth.rut")
+                               .string();
+    const std::string rut_source =
+        "import \"" + auth_path +
+        "\"\nroute POST \"/signed\" { let identity = auth.signedRequest(\"" +
+        ::rut::test::signed_request::kKeyId + "\", \"" + ::rut::test::signed_request::kSecret +
+        "\", \"orders\", \"key-v1\") "
+        "guard identity.consumerId == \"orders\" && identity.credentialId == \"key-v1\" else { "
+        "return 500 } "
+        "return 204 }\n";
+    REQUIRE(source.append(rut_source.data(), static_cast<u32>(rut_source.size())));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(owner.p->config.route_count, 1u);
+    REQUIRE_EQ(unlink(source.path), 0);
+
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    REQUIRE(now.tv_sec > 1000);
+    const std::string target = "/signed?artifact=source-free";
+    const std::string body("native\0body", 11);
+    const auto headers =
+        ::rut::test::signed_request::make_headers("POST", target, body, now.tv_sec);
+    REQUIRE(!headers.authorization.empty());
+    const std::string request =
+        "POST " + target +
+        " HTTP/1.1\r\nHost: localhost\r\nAuthorization: " + headers.authorization +
+        "\r\nDate: " + headers.date + "\r\nDigest: " + headers.digest +
+        "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    const auto result = invoke(owner.p->config.routes[0], request);
+    CHECK_EQ(result.status_code, 204u);
 }
 
 TEST(native_program, links_with_closed_stderr) {
