@@ -5907,6 +5907,13 @@ message.forward(json.numberText(field)))rut",
 guard let text = json.string(document) else { message.drop() }
 guard let number = json.numberText(text) else { message.drop() }
 message.forward(number))rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let number = json.numberText(document) else { message.forward(number) }
+message.forward())rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard number == "1" else { message.drop() }
+guard let number = json.numberText(document) else { message.drop() }
+message.forward())rut",
     };
     for (const char* body : rejected) {
         std::string candidate =

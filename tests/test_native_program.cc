@@ -606,6 +606,34 @@ route GET "/root-number" { return websocket(backend) { message in
     REQUIRE_EQ(root_route.ws_forward_text.source, WsTextSource::JsonNumberText);
     CHECK_EQ(root_route.ws_forward_text.source_path.len, 0u);
     CHECK(root_route.ws_forward_text.source_path.ptr != nullptr);
+    const char root_payload[] = "1.2300e+999";
+    u8 root_input[64]{}, root_output[128]{}, root_message[64]{};
+    root_input[0] = 0x82;
+    root_input[1] = static_cast<u8>(sizeof(root_payload) - 1);
+    memcpy(root_input + 2, root_payload, sizeof(root_payload) - 1);
+    WsInspector root_inspector;
+    root_inspector.forward_text = root_route.ws_forward_text;
+    root_inspector.forward_texts = root_route.ws_forward_texts;
+    root_inspector.forward_text_count = root_route.ws_forward_text_count;
+    root_inspector.max_message_size = root_route.ws_max_message_size;
+    used = 0;
+    produced = 0;
+    REQUIRE(ws_inspect(root_inspector,
+                       root_input,
+                       sizeof(root_payload) + 1,
+                       root_output,
+                       sizeof(root_output),
+                       root_message,
+                       sizeof(root_message),
+                       root_route.ws_frame_handler,
+                       nullptr,
+                       &used,
+                       &produced) == WsInspectStatus::Ok);
+    const char root_expected[] = "(1.2300e+999)";
+    REQUIRE_EQ(produced, sizeof(root_expected) - 1 + 2);
+    CHECK_EQ(root_output[0], 0x81u);
+    CHECK_EQ(root_output[1], sizeof(root_expected) - 1);
+    CHECK(memcmp(root_output + 2, root_expected, sizeof(root_expected) - 1) == 0);
 }
 
 TEST(native_program, websocket_json_string_predicates_survive_source_removal) {
