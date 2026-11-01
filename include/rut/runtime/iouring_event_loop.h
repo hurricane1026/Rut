@@ -2290,7 +2290,7 @@ public:
         c.send_armed = false;
         // These are generic terminal Send-dispatch side effects. Apply them
         // before either the TLS continuation or fail-closed error handling.
-        if (!c.throttle_paused &&
+        if (!c.throttle_paused && !c.ws_shutdown_deadline_armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
             c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
@@ -8208,6 +8208,16 @@ public:
                 if (ticks > max_ticks) ticks = max_ticks;
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
+#if RUT_ENABLE_WEBSOCKET
+                        if (c->ws_shutdown_deadline_armed) {
+                            this->close_conn(*c);
+                            return;
+                        }
+                        if (c->is_ws_tunnel || c->is_ws_terminate) {
+                            // Quiet, healthy WebSockets have no idle timeout.
+                            return;
+                        }
+#endif
                         // See epoll_event_loop.h: timer fires for keepalive,
                         // wait(ms), or wait-any timeout completion.
                         if (c->response_read_deadline_state == ResponseReadDeadlineState::Armed) {
@@ -8238,14 +8248,6 @@ public:
                                 respond_upstream_timeout<IoUringEventLoop>(this, *c);
                         } else if (c->throttle_paused) {
                             throttle_resume<IoUringEventLoop>(this, *c);
-#if RUT_ENABLE_WEBSOCKET
-                        } else if (c->is_ws_tunnel || c->is_ws_terminate) {
-                            // WebSocket tunnel/terminate: long-lived sessions
-                            // have no idle keepalive timeout — a quiet-but-
-                            // healthy WebSocket must not be reaped at the HTTP
-                            // keep-alive deadline (RFC 6455 liveness is
-                            // ping/pong, not idle close).
-#endif
                         } else {
                             this->close_conn(*c);
                         }
@@ -8816,7 +8818,7 @@ public:
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
-                        if (!conn.throttle_paused &&
+                        if (!conn.throttle_paused && !conn.ws_shutdown_deadline_armed &&
                             conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
                             conn.response_read_deadline_state !=
                                 ResponseReadDeadlineState::ExpiryPending &&

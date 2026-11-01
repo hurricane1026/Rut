@@ -1237,6 +1237,16 @@ public:
                             free_probe_conn(this, *c);
                             return;
                         }
+#if RUT_ENABLE_WEBSOCKET
+                        if (c->ws_shutdown_deadline_armed) {
+                            this->close_conn(*c);
+                            return;
+                        }
+                        if (c->is_ws_tunnel || c->is_ws_terminate) {
+                            // Quiet, healthy WebSockets have no idle timeout.
+                            return;
+                        }
+#endif
                         // A timer can now expire for two reasons:
                         //   (1) keepalive — close the connection (existing).
                         //   (2) a JIT handler yielded with wait(ms), or wait-any
@@ -1265,14 +1275,6 @@ public:
                             // @throttle: a new byte-rate window has opened — resume
                             // the parked client send.
                             throttle_resume<EpollEventLoop>(this, *c);
-#if RUT_ENABLE_WEBSOCKET
-                        } else if (c->is_ws_tunnel || c->is_ws_terminate) {
-                            // WebSocket tunnel/terminate: long-lived sessions
-                            // have no idle keepalive timeout — a quiet-but-
-                            // healthy WebSocket must not be reaped at the HTTP
-                            // keep-alive deadline (RFC 6455 liveness is
-                            // ping/pong, not idle close).
-#endif
                         } else {
                             this->close_conn(*c);
                         }
@@ -1335,7 +1337,7 @@ public:
                         break;
                     }
                     if (ev.aux == kEpollSendProgressAux && ev.type == IoEventType::Send) {
-                        if (!conn.throttle_paused)
+                        if (!conn.throttle_paused && !conn.ws_shutdown_deadline_armed)
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);
@@ -1357,7 +1359,8 @@ public:
                         // (least blast radius: no ConnState semantics touched, so
                         // the proxy-timeout 504 / traffic-capture paths that key off
                         // Proxying stay untouched for a probe with fd == -1).
-                        if (!conn.throttle_paused && !conn.is_health_probe) {
+                        if (!conn.throttle_paused && !conn.is_health_probe &&
+                            !conn.ws_shutdown_deadline_armed) {
                             timer.refresh(
                                 &conn,
                                 conn.h2 && (conn.h2->grpc.active || conn.h2->grpc.upstream) ? 1

@@ -312,6 +312,15 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
             }
             case IoEventType::Timeout:
                 timer.tick([this](Connection* c) {
+#if RUT_ENABLE_WEBSOCKET
+                    if (c->ws_shutdown_deadline_armed) {
+                        this->close_conn(*c);
+                        return;
+                    }
+                    if (c->is_ws_tunnel || c->is_ws_terminate) {
+                        return;
+                    }
+#endif
                     // Mirror EpollEventLoop/IoUringEventLoop: a tick can
                     // represent either keepalive expiry (close) or a JIT
                     // yield fallback (resume). schedule_yield_timer on
@@ -339,7 +348,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
                     auto& conn = conns[ev.conn_id];
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn, keepalive_timeout);
+                        if (!conn.ws_shutdown_deadline_armed)
+                            timer.refresh(&conn, keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn &&
                                yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
@@ -799,6 +809,15 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                 break;
             case IoEventType::Timeout:
                 timer.tick([this](Connection* c) {
+#if RUT_ENABLE_WEBSOCKET
+                    if (c->ws_shutdown_deadline_armed) {
+                        this->close_conn(*c);
+                        return;
+                    }
+                    if (c->is_ws_tunnel || c->is_ws_terminate) {
+                        return;
+                    }
+#endif
                     // See SmallLoop: a tick resumes yielded JIT handlers and
                     // otherwise closes on keepalive expiry.
                     if (c->pending_handler_fn &&
@@ -831,7 +850,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                     }
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn, keepalive_timeout);
+                        if (!conn.ws_shutdown_deadline_armed)
+                            timer.refresh(&conn, keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn &&
                                yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {

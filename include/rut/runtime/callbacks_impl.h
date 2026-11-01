@@ -10867,6 +10867,20 @@ constexpr bool ws_loop_async() {
     return loop_backend_async_io<Loop>();
 }
 
+// Bound graceful WebSocket shutdown even when either peer stops reading.
+// Reuse the connection's ordinary timer, replacing any idle arm. Refresh it
+// only on the first transition into drain/Close, never on later I/O progress.
+inline constexpr u32 kWsShutdownDrainTimeoutSeconds = 5;
+static_assert(kWsShutdownDrainTimeoutSeconds > 0 &&
+              kWsShutdownDrainTimeoutSeconds < TimerWheel::kSlots);
+
+template <typename Loop>
+void ws_arm_shutdown_deadline(Loop* loop, Connection& conn) {
+    if (conn.ws_shutdown_deadline_armed) return;
+    conn.ws_shutdown_deadline_armed = true;
+    loop->timer.refresh(&conn, kWsShutdownDrainTimeoutSeconds);
+}
+
 // Drive the bidirectional Close handshake: submit a Close frame on each peer's send slot
 // when it's idle (deferring on a busy slot), skip a peer that already half-closed, and
 // close once both slots' Close frames have drained. Idempotent — safe to call from the
@@ -10952,6 +10966,7 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                 // client echo, then close once both drain. The echo carries the code the
                 // inspector resolved (handler message.close(code), or 1000 for a peer close).
                 conn.ws_closing = true;
+                ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_upstream_inflight = true;
                 conn.ws_close_client_need = true;
                 conn.ws_echo_close_code = conn.ws_c2u.echo_close_code;
@@ -11030,6 +11045,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
                 // Close back too. Start the client slot in-flight + queue the upstream echo,
                 // carrying the code the inspector resolved (message.close(code), or 1000).
                 conn.ws_closing = true;
+                ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_client_inflight = true;
                 conn.ws_close_upstream_need = true;
                 conn.ws_echo_close_code = conn.ws_u2c.echo_close_code;
@@ -11098,6 +11114,7 @@ void ws_close_if_drained(Loop* loop, Connection& conn) {
 // can't spin) while preserving any pending send's EPOLLOUT so it still drains.
 template <typename Loop>
 bool ws_drain_pump(Loop* loop, Connection& conn) {
+    ws_arm_shutdown_deadline(loop, conn);
     if (!conn.ws_client_send_pending && conn.recv_buf.len() > 0)
         if (!ws_try_send_client_to_upstream(loop, conn)) return false;
     if (!conn.ws_upstream_send_pending && conn.upstream_recv_buf.len() > 0)

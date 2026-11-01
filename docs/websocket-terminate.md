@@ -41,6 +41,14 @@ The binding is `{ message in ... }`. The former `{ frame in ... }` syntax and
 `.opcode` comparisons are rejected. Use `isText` / `isBinary` for message types.
 There is no public FIN, mask, continuation, Ping or Pong accessor.
 
+Graceful shutdown has a one-shot five-second deadline, measured at the timer
+wheel's one-second resolution. It begins when a Close handshake or clean TCP EOF
+drain starts; later I/O progress and repeated EOF events do not extend it.
+Healthy quiet tunnels have no idle timeout. On expiry the runtime uses normal
+connection retirement, preserving asynchronous I/O buffer ownership until
+operations and cancellation completions retire; bytes that did not drain may be
+discarded.
+
 ## Bounded JSON validation
 
 `guard json.parse(message.text) != nil else { message.close(1007) }` rejects
