@@ -19284,6 +19284,67 @@ static rut::WsFrameAction terminate_test_handler(
     return rut::WsFrameAction::Forward;
 }
 
+static rut::WsFrameAction terminate_json_string_handler(
+    void*, rut::WsOpcode, const rut::u8*, rut::u64, bool) {
+    return rut::WsFrameAction::ForwardText;
+}
+
+TEST(websocket_terminate_mock, json_rewrite_output_is_owned_until_pending_send_completion) {
+    using namespace rut;
+    SmallLoop loop;
+    loop.setup();
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 10;
+    conn->upstream_fd = 11;
+    conn->is_ws_terminate = true;
+    conn->ws_handler = terminate_json_string_handler;
+    conn->ws_max_message_size = 128;
+    conn->ws_c2u.masked = false;
+    conn->ws_c2u.max_message_size = 128;
+    conn->ws_c2u.forward_text = {{"<", 1}, {">", 1}, {"/name", 5}, WsTextSource::JsonString};
+    u8 ws_out[SlicePool::kSliceSize];
+    conn->ws_c2u_out = ws_out;
+    conn->ws_c2u_msg = loop.upstream_recv_storage[conn->id];
+    const char json_payload[] = R"({"name":"queued\u0000\u20ac"})";
+    u8 frame[64];
+    const u32 header_len =
+        ws_write_header(frame, WsOpcode::Binary, true, false, nullptr, sizeof(json_payload) - 1);
+    memcpy(frame + header_len, json_payload, sizeof(json_payload) - 1);
+    REQUIRE_EQ(conn->recv_buf.write(frame, header_len + sizeof(json_payload) - 1),
+               header_len + sizeof(json_payload) - 1);
+
+    REQUIRE(ws_try_send_client_to_upstream(&loop, *conn));
+    const MockOp* send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send != nullptr);
+    CHECK(send->send_buf == conn->ws_c2u_out);
+    const Str expected{"<queued\0\xe2\x82\xac>", 12};
+    REQUIRE_EQ(send->send_len, expected.len + 2);
+    CHECK(memcmp(send->send_buf + 2, expected.ptr, expected.len) == 0);
+    u8 queued_copy[64];
+    memcpy(queued_copy, send->send_buf, send->send_len);
+
+    const char scratch_overwrite[] = R"("replace the decoder scratch with a longer value")";
+    CHECK_FALSE(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(scratch_overwrite),
+                                              sizeof(scratch_overwrite) - 1,
+                                              {},
+                                              lit_str("different")));
+    CHECK(memcmp(send->send_buf, queued_copy, send->send_len) == 0);
+    CHECK(conn->ws_client_send_pending);
+    conn->on_upstream_send = &on_ws_client_to_upstream_sent<SmallLoop>;
+    IoEvent completion{};
+    completion.type = IoEventType::UpstreamSend;
+    completion.conn_id = conn->id;
+    completion.result = static_cast<i32>(send->send_len);
+    completion.upstream_episode = conn->upstream_episode;
+    loop.backend.inject(completion);
+    IoEvent delivered{};
+    REQUIRE_EQ(loop.backend.wait(&delivered, 1), 1u);
+    loop.dispatch(delivered);
+    CHECK_FALSE(conn->ws_client_send_pending);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+}
+
 // End-to-end terminate mode: the gateway parses/reassembles/re-frames frames in both
 // directions (not a raw splice). Proves the handler's Forward/Drop verdicts take effect
 // over a real socket, and that Sec-WebSocket-Extensions is stripped from the upgrade.
@@ -19987,9 +20048,14 @@ static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc,
               };
         char second[8000];
         memset(second, 'S', sizeof(second));
-        const WsTextRewrite texts[] = {
-            {{replacement, sizeof(replacement)}, affix ? Str{"!\0", 2} : Str{}, affix},
-            {{second, sizeof(second)}, affix ? Str{"!\0", 2} : Str{}, affix}};
+        const WsTextRewrite texts[] = {{{replacement, sizeof(replacement)},
+                                        affix ? Str{"!\0", 2} : Str{},
+                                        {},
+                                        affix ? WsTextSource::MessageText : WsTextSource::Literal},
+                                       {{second, sizeof(second)},
+                                        affix ? Str{"!\0", 2} : Str{},
+                                        {},
+                                        affix ? WsTextSource::MessageText : WsTextSource::Literal}};
         if (branch) {
             handler = rewrite_client
                 ? +[](void*, WsOpcode, const u8*, u64 len, bool client) {

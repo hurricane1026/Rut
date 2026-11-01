@@ -7091,6 +7091,21 @@ static FrontendResult<HirWsClosePolicy> analyze_message_close_policy(const AstEx
 
 static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& mod, Span span);
 
+struct WsJsonBinding {
+    enum class Kind : u8 { Document, SelectedValue, String, Boolean, Integer, KindName, Count };
+    Str name{};
+    Str path{};
+    Kind kind = Kind::Document;
+};
+
+using WsJsonBindings = FixedVec<WsJsonBinding, HirWsHandler::kMaxLenGuards>;
+
+static const WsJsonBinding* ws_json_binding(const WsJsonBindings& bindings, Str name) {
+    for (u32 i = 0; i < bindings.len; ++i)
+        if (bindings[i].name.eq(name)) return &bindings[i];
+    return nullptr;
+}
+
 // Flatten bounded String concatenation around at most one message.text reference.
 // No arbitrary expression evaluation or message-time allocation is needed.
 static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
@@ -7098,21 +7113,41 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
                                                        const HirModule& mod,
                                                        std::string& prefix,
                                                        std::string& suffix,
-                                                       bool& include_payload,
+                                                       HirWsTextRewrite& rewrite,
+                                                       bool& after_source,
+                                                       const WsJsonBindings& documents,
                                                        u32& nodes,
                                                        u32 depth = 0) {
     if (depth >= HirWsHandler::kMaxConditionNodes || nodes++ >= HirWsHandler::kMaxConditionNodes)
         return frontend_error(FrontendError::TooManyItems, expr.span);
     if (expr.kind == AstExprKind::Add && expr.lhs && expr.rhs) {
-        auto left = analyze_message_text_parts(
-            *expr.lhs, route, mod, prefix, suffix, include_payload, nodes, depth + 1);
+        auto left = analyze_message_text_parts(*expr.lhs,
+                                               route,
+                                               mod,
+                                               prefix,
+                                               suffix,
+                                               rewrite,
+                                               after_source,
+                                               documents,
+                                               nodes,
+                                               depth + 1);
         if (!left) return left;
-        return analyze_message_text_parts(
-            *expr.rhs, route, mod, prefix, suffix, include_payload, nodes, depth + 1);
+        return analyze_message_text_parts(*expr.rhs,
+                                          route,
+                                          mod,
+                                          prefix,
+                                          suffix,
+                                          rewrite,
+                                          after_source,
+                                          documents,
+                                          nodes,
+                                          depth + 1);
     }
     if (ws_is_message_field(expr, {"text", 4})) {
-        if (include_payload) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        include_payload = true;
+        if (rewrite.source != HirWsTextSource::Literal)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        rewrite.source = HirWsTextSource::MessageText;
+        after_source = true;
         return {};
     }
     Str text{};
@@ -7121,28 +7156,39 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
         if (!decoded) return core::make_unexpected(decoded.error());
         text = decoded.value();
     } else if (expr.kind == AstExprKind::Ident) {
-        auto value = analyze_expr(expr, &route, mod, route.locals.data, route.locals.len, nullptr);
-        if (!value) return core::make_unexpected(value.error());
-        ConstValue known{};
-        if (value->type != HirTypeKind::Str || value->may_nil || value->may_error ||
-            !const_eval_expr(value.value(), route.locals.data, route.locals.len, &known, 0) ||
-            known.type != HirTypeKind::Str)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        text = known.str_value;
+        const WsJsonBinding* binding = ws_json_binding(documents, expr.name);
+        if (binding) {
+            if (binding->kind != WsJsonBinding::Kind::String ||
+                rewrite.source != HirWsTextSource::Literal)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            rewrite.source = HirWsTextSource::JsonString;
+            rewrite.source_path = binding->path;
+            after_source = true;
+            return {};
+        } else {
+            auto value =
+                analyze_expr(expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+            if (!value) return core::make_unexpected(value.error());
+            ConstValue known{};
+            if (value->type != HirTypeKind::Str || value->may_nil || value->may_error ||
+                !const_eval_expr(value.value(), route.locals.data, route.locals.len, &known, 0) ||
+                known.type != HirTypeKind::Str)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            text = known.str_value;
+        }
     } else {
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     }
     if (text.len > kWsTerminateMessageCapacity ||
         prefix.size() + suffix.size() + text.len > kWsTerminateMessageCapacity)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-    auto& part = include_payload ? suffix : prefix;
+    auto& part = after_source ? suffix : prefix;
     if (text.len != 0) part.append(text.ptr, text.len);
     return {};
 }
 
-static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(const AstExpr& call,
-                                                                        HirRoute& route,
-                                                                        const HirModule& mod) {
+static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(
+    const AstExpr& call, HirRoute& route, const HirModule& mod, const WsJsonBindings& documents) {
     if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
         !call.lhs->name.eq({"message", 7}) || !call.name.eq({"forward", 7}) || call.args.len != 1 ||
         !call.args[0])
@@ -7150,8 +7196,9 @@ static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(const As
     std::string prefix, suffix;
     HirWsTextRewrite result;
     u32 nodes = 0;
+    bool after_source = false;
     auto parts = analyze_message_text_parts(
-        *call.args[0], route, mod, prefix, suffix, result.include_payload, nodes);
+        *call.args[0], route, mod, prefix, suffix, result, after_source, documents, nodes);
     if (!parts) return core::make_unexpected(parts.error());
     if ((route.ws_handler.max_message_size != 0 &&
          prefix.size() + suffix.size() > route.ws_handler.max_message_size) ||
@@ -7180,12 +7227,13 @@ static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(const As
 
 static FrontendResult<WsVerdict> analyze_message_guard_verdict(const AstExpr& call,
                                                                HirRoute& route,
-                                                               const HirModule& mod) {
+                                                               const HirModule& mod,
+                                                               const WsJsonBindings& documents) {
     // Bare close retains its existing route-default policy. Explicit arguments
     // select a distinct policy, including an empty reason for close(code).
     if (call.args.len == 0) return analyze_bare_message_verdict(call);
     if (call.name.eq({"forward", 7})) {
-        auto payload = analyze_message_forward_payload(call, route, mod);
+        auto payload = analyze_message_forward_payload(call, route, mod, documents);
         if (!payload) return core::make_unexpected(payload.error());
         auto& texts = route.ws_handler.forward_payloads;
         const u32 index = texts.len;
@@ -7256,21 +7304,6 @@ static Str ws_message_text_match_pattern(const AstExpr& cond) {
         return Str{};
     if (!ws_is_message_field(*cond.lhs, {"text", 4})) return Str{};
     return cond.args[0]->str_value;
-}
-
-struct WsJsonBinding {
-    enum class Kind : u8 { Document, SelectedValue, String, Boolean, Integer, KindName, Count };
-    Str name{};
-    Str path{};
-    Kind kind = Kind::Document;
-};
-
-using WsJsonBindings = FixedVec<WsJsonBinding, HirWsHandler::kMaxLenGuards>;
-
-static const WsJsonBinding* ws_json_binding(const WsJsonBindings& bindings, Str name) {
-    for (u32 i = 0; i < bindings.len; ++i)
-        if (bindings[i].name.eq(name)) return &bindings[i];
-    return nullptr;
 }
 
 static bool ws_is_json_parse(const AstExpr& call, const HirModule& mod, const HirRoute& route) {
@@ -13417,6 +13450,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->ws_handler.max_message_size = stmt.ws_max_message_size;  // 0 = loader default
         route->ws_handler.span = stmt.span;
 
+        WsJsonBindings documents{};
         const AstStatement* body = stmt.then_stmt;
         if (body == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
         const AstExpr* default_call = nullptr;
@@ -13428,14 +13462,14 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::UnsupportedSyntax, body->span);
             if (stmt_count - 1 > HirWsHandler::kMaxLenGuards)
                 return frontend_error(FrontendError::TooManyItems, body->span);
-            WsJsonBindings documents{};
             for (u32 i = 0; i + 1 < stmt_count; i++) {  // all but the last are guards
                 const AstStatement* gs = body->block_stmts[i];
                 if (gs == nullptr || gs->kind != AstStmtKind::Guard || gs->else_stmt == nullptr ||
                     gs->else_stmt->kind != AstStmtKind::Expr)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           gs ? gs->span : body->span);
-                auto gv = analyze_message_guard_verdict(gs->else_stmt->expr, *route, mod);
+                auto gv =
+                    analyze_message_guard_verdict(gs->else_stmt->expr, *route, mod, documents);
                 if (!gv) return core::make_unexpected(gv.error());
                 if (gs->bind_value) {
                     // Document bindings are scoped aliases for this immutable message's JSON.
@@ -13599,7 +13633,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
             route->ws_handler.default_verdict = WsVerdict::Forward;
             if (call.args.len == 1) {
-                auto payload = analyze_message_forward_payload(call, *route, mod);
+                auto payload = analyze_message_forward_payload(call, *route, mod, documents);
                 if (!payload) return core::make_unexpected(payload.error());
                 route->ws_handler.has_forward_payload = true;
                 route->ws_handler.forward_payload = payload.value();

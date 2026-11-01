@@ -33,6 +33,8 @@ into message inspection and its bounded buffering costs.
 - `message.forward(text)` replaces one complete message. Fixed literals and
   compile-time-known route-local strings may surround one `message.text` reference
   using String `+`. Replacement output must fit the message and single-slice limits.
+  The same affix form may use one previously unwrapped `json.string` alias as its
+  dynamic source; this produces a Text message even when the input was Binary.
 - `message.drop()` discards the complete message.
 - `message.close(code, "reason")` requests connection shutdown. The runtime emits
   and drains Close frames to both peers. It does not expose raw frame creation.
@@ -105,6 +107,23 @@ Only `json.get(document, literalPointer)` and `json.string(unwrappedValue)` are
 supported in these handlers; nested `get`, general extraction, dynamic paths,
 and dynamic predicate arguments remain unsupported. These bindings and
 predicates use the existing four-guard and 32-condition-node limits.
+
+A successfully unwrapped string alias may also be the sole dynamic source of a
+`message.forward(...)` replacement, with fixed UTF-8 literals or route constants
+as prefix and suffix:
+
+```swift
+guard let name = json.string(field) else { message.drop() }
+message.forward("<" + name + ">")
+```
+
+Only aliases introduced by an earlier successful guard are visible. The
+replacement reparses the complete message and decodes the selected string during
+the synchronous callback, then copies the result and affixes into the direction's
+owned output slice. Decoder workspace and borrowed string views do not cross the
+callback or remain live during asynchronous sends. A valid JSON string from either
+a Text or Binary input is emitted as a Text message; parse, lookup, type, decoding,
+UTF-8, and output-size failures fail closed.
 
 JSON booleans can be unwrapped with `guard let enabled = json.bool(field) ...`;
 `json.bool(document)` checks a root Boolean. Both `true` and `false` are successful

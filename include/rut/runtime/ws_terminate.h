@@ -79,12 +79,16 @@ struct WsClosePolicy {
     Str reason{};  // immutable route-owned UTF-8, at most 123 bytes
 };
 
+enum class WsTextSource : u8 { Literal, MessageText, JsonString };
+
 // Immutable text output recipe. Literal replacement omits the input; affix recipes
-// include one complete Text message between route-owned UTF-8 prefix/suffix views.
+// surround one bounded dynamic source, if present, with route-owned UTF-8 views.
+// JSON paths and fixed strings are pinned with the route config until the send retires.
 struct WsTextRewrite {
     Str prefix{};
     Str suffix{};
-    bool include_payload = false;
+    Str source_path{};  // JSON Pointer only when source == JsonString; may be empty for root.
+    WsTextSource source = WsTextSource::Literal;
 };
 bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size);
 

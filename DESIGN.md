@@ -2640,27 +2640,39 @@ replacements or affix leaves. Their decoded bytes are copied into the same
 route-owned recipe as literals; request-derived, optional, and non-string values
 are rejected. Calls remain unsupported. Constant strings obey the same UTF-8,
 combined fixed-byte limit, and expression-node limits as literal leaves. The
-expression contains at most 32 nodes (literals or constant references, `+`, and at
-most one `message.text`); parentheses preserve concatenation order.
-Constant fragments are folded into immutable prefix/suffix views. Other fields,
-functions, repeated payload references, interpolation, binary replacement, and
-injection remain unsupported. Affix recipes require a Text message; selecting one
-for Binary input fails the tunnel, so opcode guards should retain or drop Binary
-messages first. Empty Text messages, embedded NUL, and Unicode are preserved.
+expression contains at most 32 nodes (literals or constant references, `+`, and
+at most one dynamic source): either `message.text` or one previously guard-unwrapped
+`json.string` alias. Parentheses preserve concatenation order. The JSON alias may
+come from the root document or one `json.get` selection; document, selected-value,
+kind-name, bool, integer, and count aliases are not output strings. A binding is
+visible only after its guard succeeds, including in later guard else branches;
+the binding being declared is unavailable in its own else branch. Constant
+fragments are folded into immutable prefix/suffix views. Other fields, functions,
+two aliases, combining an alias with `message.text`, interpolation, and injection
+remain unsupported. A `message.text` recipe requires Text input; a JSON string
+recipe can select a valid JSON string from Text or Binary input and emits Text.
+Empty values, embedded NUL, and Unicode are preserved without normalization.
 The final payload, including both affixes, must fit both bounds; overflow fails
 before a rewritten frame is emitted.
 
 The runtime reassembles and validates the original message before invoking the
 handler, writes replacement frames to the existing separate output slice, and
-pauses input while output drains. Both directions apply their normal WebSocket
-masking roles. Default and branch nonempty prefixes/suffixes use the existing bounded one-shot upstream
-receive on io_uring, so multiple CQEs cannot overflow receive storage before the
-inspection callback drains it. Literal bytes are copied into the loaded program's retained arena;
-native artifacts relocate that view, so neither mode retains temporary HIR views.
-The native artifact format version is 11 following the text-affix recipe layout change.
-Both prefix and suffix views are relocated. Encoding copies the prefix, original
-message, and suffix directly into the existing output slice, then masks that frame;
-no concatenation buffer or message-time allocation is introduced.
+pauses input while output drains. For a selected JSON string recipe, the inspector
+re-parses the complete message in its bounded thread-local JSON document, decodes
+the selected string into that document's scratch writer, and copies it with the
+fixed affixes directly into the output slice in the same synchronous call. Parse,
+selection, decode, UTF-8, or output-bound failure fails the tunnel closed. Neither
+the document source nor its scratch view is stored in a connection or sent
+asynchronously. Both directions apply their normal WebSocket masking roles.
+Default and branch nonempty prefixes/suffixes use the existing bounded one-shot
+upstream receive on io_uring, so multiple CQEs cannot overflow receive storage
+before the inspection callback drains it. Literal bytes and JSON Pointer paths are
+copied into the loaded program's retained arena; native artifacts relocate both
+views, so neither mode retains temporary HIR views. The native artifact format
+version is 12 following the dynamic-source recipe layout change. Encoding copies
+the prefix, dynamic source, and suffix directly into the existing output slice,
+then masks that frame; no concatenation buffer or message-time allocation is
+introduced.
 
 The examples in this section include planned syntax and actions. The current
 terminate implementation supports bounded reassembled text/binary messages,

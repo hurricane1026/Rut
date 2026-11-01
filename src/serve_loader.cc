@@ -10,6 +10,7 @@
 #include "rut/jit/codegen.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/compile_to_config.h"
+#include "rut/runtime/json.h"
 #include "rut/runtime/response_body_files.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/slice_pool.h"    // SlicePool::kSliceSize (terminate cap)
@@ -386,7 +387,31 @@ bool load_rut_program(const char* path,
                 return true;
             };
             auto retain_rewrite = [&](const HirWsTextRewrite& source, WsTextRewrite& result) {
-                result.include_payload = source.include_payload;
+                switch (source.source) {
+                    case HirWsTextSource::Literal:
+                        result.source = WsTextSource::Literal;
+                        if (source.source_path.ptr || source.source_path.len != 0) return false;
+                        break;
+                    case HirWsTextSource::MessageText:
+                        result.source = WsTextSource::MessageText;
+                        if (source.source_path.ptr || source.source_path.len != 0) return false;
+                        break;
+                    case HirWsTextSource::JsonString: {
+                        result.source = WsTextSource::JsonString;
+                        if (source.source_path.len > json::kMaxBytes ||
+                            (!source.source_path.ptr && source.source_path.len))
+                            return false;
+                        char* bytes = out.rir.arena.alloc_array<char>(source.source_path.len + 1);
+                        if (!bytes) return false;
+                        for (u32 j = 0; j < source.source_path.len; j++)
+                            bytes[j] = source.source_path.ptr[j];
+                        bytes[source.source_path.len] = '\0';
+                        result.source_path = {bytes, source.source_path.len};
+                        break;
+                    }
+                    default:
+                        return false;
+                }
                 return retain_forward_text(source.prefix_expr, result.prefix) &&
                        retain_forward_text(source.suffix_expr, result.suffix) &&
                        ws_valid_text_rewrite(result, max_msg);

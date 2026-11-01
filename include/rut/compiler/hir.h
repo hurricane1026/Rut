@@ -1148,10 +1148,13 @@ struct HirWsClosePolicy {
     u32 reason_expr = 0xffffffffu;
 };
 
+enum class HirWsTextSource : u8 { Literal, MessageText, JsonString };
+
 struct HirWsTextRewrite {
     u32 prefix_expr = 0xffffffffu;
     u32 suffix_expr = 0xffffffffu;
-    bool include_payload = false;
+    Str source_path{};  // JSON Pointer from a validated String alias, or empty root pointer
+    HirWsTextSource source = HirWsTextSource::Literal;
 };
 
 struct HirWsHandler {
@@ -1164,7 +1167,8 @@ struct HirWsHandler {
     FixedVec<HirWsClosePolicy, kMaxLenGuards> close_policies;
     FixedVec<HirWsTextRewrite, kMaxLenGuards> forward_payloads;
     // `message.forward(payload)` modify form: forward a rewritten message instead of the
-    // original. Prefix/suffix literals are stored in HirRoute.exprs.
+    // original. Prefix/suffix literals are stored in HirRoute.exprs; a JSON source path remains
+    // an immutable analysis string until the loader copies it into retained route storage.
     // The loader retains its bytes and emits a ForwardText default verdict.
     bool has_forward_payload = false;
     HirWsTextRewrite forward_payload{};

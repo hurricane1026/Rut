@@ -578,6 +578,145 @@ WsInspector make_state(bool masked) {
 
 }  // namespace
 
+TEST(ws_terminate, json_string_rewrite_decodes_copies_and_supports_both_roles) {
+    const WsTextRewrite recipe{{"<", 1}, {">", 1}, {"/a~1b/~0/name", 13}, WsTextSource::JsonString};
+    const char json_payload[] = R"({"a/b":{"~":{"name":"x\u0000\uD83D\uDE00"}}})";
+    const Str expected{"<x\0\xf0\x9f\x98\x80>", 8};
+    for (bool masked : kMaskDirections) {
+        auto st = make_state(masked);
+        st.forward_text = recipe;
+        st.max_message_size = 128;
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        u8 in[128], out[128], msg[128], decoded[128];
+        const u32 n = build(in,
+                            WsOpcode::Binary,
+                            true,
+                            masked,
+                            reinterpret_cast<const u8*>(json_payload),
+                            sizeof(json_payload) - 1);
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+        CHECK_EQ(used, n);
+        WsFrameHeader h{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(h.opcode == WsOpcode::Text);
+        CHECK_EQ(h.payload_len, expected.len);
+        CHECK(memcmp(decoded, expected.ptr, expected.len) == 0);
+        u8 original_output[128];
+        memcpy(original_output, out, produced);
+        const char overwrite[] = R"("overwrite the thread-local decoder scratch")";
+        CHECK_FALSE(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(overwrite),
+                                                  sizeof(overwrite) - 1,
+                                                  {},
+                                                  lit_str("not equal")));
+        CHECK(memcmp(out, original_output, produced) == 0);
+    }
+}
+
+TEST(ws_terminate, json_string_rewrite_fails_closed_for_invalid_values_and_bounds) {
+    const WsTextRewrite recipe{{"pre", 3}, {"!", 1}, {"/name", 5}, WsTextSource::JsonString};
+    const char* invalid[] = {"{", "{}", R"({"name":null})", R"({"name":4})"};
+    for (u32 i = 0; i < 5; i++) {
+        auto st = make_state(false);
+        st.forward_text = i == 4 ? WsTextRewrite{{"123456789012", 12},
+                                                 {"!!", 2},
+                                                 {"/name", 5},
+                                                 WsTextSource::JsonString}
+                                 : recipe;
+        st.max_message_size = i == 4 ? 16 : 64;
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        const char* payload = i < 4 ? invalid[i] : R"({"name":"abc"})";
+        u8 in[64], out[64], msg[64];
+        const u32 n = build(
+            in, WsOpcode::Text, true, false, reinterpret_cast<const u8*>(payload), strlen(payload));
+        u32 used = 0, produced = 0;
+        CHECK(ws_inspect(
+                  st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+              WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
+    }
+}
+
+TEST(ws_terminate, json_string_rewrite_handles_empty_root_and_fragmented_control_interleave) {
+    const WsTextRewrite root{{}, {}, {}, WsTextSource::JsonString};
+    for (bool masked : kMaskDirections) {
+        {
+            auto st = make_state(masked);
+            st.forward_text = root;
+            Recorder r;
+            r.verdict = WsFrameAction::ForwardText;
+            const char empty_json[] = "\"\"";
+            u8 in[32], out[64], msg[64], decoded[8];
+            const u32 n = build(in,
+                                WsOpcode::Text,
+                                true,
+                                masked,
+                                reinterpret_cast<const u8*>(empty_json),
+                                sizeof(empty_json) - 1);
+            u32 used = 0, produced = 0;
+            REQUIRE(
+                ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+            WsFrameHeader h{};
+            REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+            CHECK(h.opcode == WsOpcode::Text);
+            CHECK_EQ(h.payload_len, 0u);
+        }
+        {
+            auto st = make_state(masked);
+            st.forward_text = {{"<", 1}, {">", 1}, {"/name", 5}, WsTextSource::JsonString};
+            Recorder r;
+            r.verdict = WsFrameAction::ForwardText;
+            const char json_payload[] = R"({"name":"a"})";
+            const u32 split = 5;
+            u8 in[64], out[128], msg[64], decoded[64];
+            u32 used = 0, produced = 0;
+            u32 n = build(in,
+                          WsOpcode::Text,
+                          false,
+                          masked,
+                          reinterpret_cast<const u8*>(json_payload),
+                          split);
+            REQUIRE(
+                ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+            CHECK_EQ(produced, 0u);
+            const u32 first_consumed = used;
+            n = build(in, WsOpcode::Ping, true, masked, reinterpret_cast<const u8*>("p"), 1);
+            n += build(in + n,
+                       WsOpcode::Continuation,
+                       true,
+                       masked,
+                       reinterpret_cast<const u8*>(json_payload + split),
+                       sizeof(json_payload) - 1 - split);
+            used = 0;
+            produced = 0;
+            REQUIRE(
+                ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+            CHECK_EQ(used, n);
+            CHECK_GT(first_consumed, 0u);
+            WsFrameHeader h{};
+            const u32 ping = parse_one(out, produced, masked, &h, decoded);
+            REQUIRE(ping != 0);
+            CHECK(h.opcode == WsOpcode::Ping);
+            REQUIRE_EQ(parse_one(out + ping, produced - ping, masked, &h, decoded),
+                       produced - ping);
+            CHECK(h.opcode == WsOpcode::Text);
+            CHECK_EQ(h.payload_len, 3u);
+            CHECK(memcmp(decoded, "<a>", 3) == 0);
+            CHECK_EQ(r.calls, 1);
+        }
+    }
+}
+
 TEST(ws_terminate, fixed_text_rewrite_reassembles_and_preserves_control_frames) {
     const Str replacements[] = {{"", 0}, {"longer\0text", 11}};
     for (bool masked : kMaskDirections) {
@@ -1923,7 +2062,9 @@ TEST(ws_terminate, branch_text_waits_for_prior_output_drain) {
 
 TEST(ws_terminate, affix_rewrite_reassembles_preserves_control_and_masks_both_roles) {
     const WsTextRewrite recipes[] = {
-        {{"pre\0", 4}, {"\xe2\x82\xac", 3}, true}, {{}, {}, true}, {{}, {"end", 3}, true}};
+        {{"pre\0", 4}, {"\xe2\x82\xac", 3}, {}, WsTextSource::MessageText},
+        {{}, {}, {}, WsTextSource::MessageText},
+        {{}, {"end", 3}, {}, WsTextSource::MessageText}};
     for (bool masked : kMaskDirections) {
         for (u32 i = 0; i < 3; i++) {
             auto st = make_state(masked);
@@ -1972,7 +2113,7 @@ TEST(ws_terminate, affix_rewrite_rejects_binary_size_utf8_and_truncated_output) 
     const char bad[] = {static_cast<char>(0xff)};
     for (u32 invalid = 0; invalid < 6; invalid++) {
         auto st = make_state(false);
-        st.forward_text = {{"pre", 3}, {"end", 3}, true};
+        st.forward_text = {{"pre", 3}, {"end", 3}, {}, WsTextSource::MessageText};
         Recorder r;
         r.verdict = WsFrameAction::ForwardText;
         u32 cap = 128;
@@ -1985,7 +2126,7 @@ TEST(ws_terminate, affix_rewrite_rejects_binary_size_utf8_and_truncated_output) 
         char oversized[kWsTerminateMessageCapacity];
         memset(oversized, 'a', sizeof(oversized));
         if (invalid == 5) {
-            st.forward_text = {{oversized, sizeof(oversized)}, {}, true};
+            st.forward_text = {{oversized, sizeof(oversized)}, {}, {}, WsTextSource::MessageText};
         }
         const u8 input[] = {'x'};
         u8 in[32], out[128], msg[32];
@@ -2000,7 +2141,7 @@ TEST(ws_terminate, affix_rewrite_rejects_binary_size_utf8_and_truncated_output) 
 TEST(ws_terminate, affix_rewrite_accepts_exact_output_limit) {
     auto st = make_state(false);
     st.max_message_size = 5;
-    st.forward_text = {{"<", 1}, {">", 1}, true};
+    st.forward_text = {{"<", 1}, {">", 1}, {}, WsTextSource::MessageText};
     Recorder r;
     r.verdict = WsFrameAction::ForwardText;
     const u8 data[] = {'a', 'b', 'c'};
@@ -2018,7 +2159,7 @@ TEST(ws_terminate, affix_growth_waits_before_consuming_next_message) {
     auto st = make_state(false);
     char suffix[70];
     memset(suffix, 'r', sizeof(suffix));
-    st.forward_text = {{}, {suffix, sizeof(suffix)}, true};
+    st.forward_text = {{}, {suffix, sizeof(suffix)}, {}, WsTextSource::MessageText};
     Recorder r;
     r.verdict = WsFrameAction::ForwardText;
     const u8 data[] = {'x'};
@@ -2052,7 +2193,7 @@ TEST(ws_terminate, affix_rewrite_accepts_single_slice_limit_both_roles) {
     for (bool masked : kMaskDirections) {
         auto st = make_state(masked);
         st.max_message_size = kWsTerminateMessageCapacity;
-        st.forward_text = {{prefix, sizeof(prefix)}, {"!", 1}, true};
+        st.forward_text = {{prefix, sizeof(prefix)}, {"!", 1}, {}, WsTextSource::MessageText};
         Recorder r;
         r.verdict = WsFrameAction::ForwardText;
         const u8 data[] = {'x'};

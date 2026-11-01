@@ -884,6 +884,22 @@ return websocket(chat) { message in
 // still fails its binding. Nested get, dynamic paths, arbitrary extraction and
 // mutation remain unsupported; no Unicode normalization is performed.
 
+// Forward one previously guard-unwrapped JSON string alias, optionally with fixed
+// UTF-8 affixes. The value is decoded again only when this rewrite is selected.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let field = json.get(document, "/name") else { message.close(1008) }
+    guard let name = json.string(field) else { message.close(1003) }
+    message.forward("hello " + name + "!")
+}
+// json.string(document) may select a root string. A rewrite can use one previously
+// successful String alias or one message.text source, never both or two aliases.
+// Document/selected-value and other typed aliases, calls, and dynamic paths are
+// rejected. Fixed literals and compile-time route strings may surround the source.
+// Binary input may produce Text from a JSON string; message.text still requires Text.
+// The selected value is parsed and copied synchronously into the existing output
+// slice; no borrowed JSON document/string survives the callback.
+
 // JSON Bool fields are type-checked; false is a successfully unwrapped value.
 return websocket(chat) { message in
     guard let document = json.parse(message.text) else { message.close(1007) }

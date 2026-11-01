@@ -12,6 +12,7 @@
 #ifdef __linux__
 #include "rut/runtime/iouring_event_loop.h"
 #endif
+#include "rut/runtime/json.h"
 #include "rut/runtime/listener.h"
 #include "rut/runtime/route_method.h"
 #include "rut/serve_loader.h"
@@ -4745,8 +4746,9 @@ TEST(serve_loader, websocket_affix_rewrites_retain_independent_branch_and_defaul
     const auto id = config.add_upstream("b", 0x7f000001, 9999);
     REQUIRE(id.has_value());
     const char bad[] = {static_cast<char>(0xff)};
-    const WsTextRewrite invalid[] = {
-        {{"abc", 3}, {"de", 2}, true}, {{}, {bad, 1}, true}, {{}, {nullptr, 1}, true}};
+    const WsTextRewrite invalid[] = {{{"abc", 3}, {"de", 2}, {}, WsTextSource::MessageText},
+                                     {{}, {bad, 1}, {}, WsTextSource::MessageText},
+                                     {{}, {nullptr, 1}, {}, WsTextSource::MessageText}};
     for (auto rewrite : invalid) {
         CHECK_FALSE(config.add_ws_terminate(
             "/bad", 0, id.value(), route.ws_frame_handler, 4, 1000, rewrite));
@@ -7670,6 +7672,27 @@ TEST(serve_loader, websocket_guard_text_policies_reach_wire) {
     const char bad[] = {static_cast<char>(0xff)};
     for (Str text : {Str{bad, 1}, Str{nullptr, 1}, Str{"large", 5}}) {
         const WsTextRewrite rewrite{text};
+        CHECK_FALSE(cfg.add_ws_terminate("/bad",
+                                         0,
+                                         id.value(),
+                                         route.ws_frame_handler,
+                                         4,
+                                         1000,
+                                         {},
+                                         {},
+                                         nullptr,
+                                         0,
+                                         &rewrite,
+                                         1));
+    }
+    const WsTextRewrite invalid_recipes[] = {
+        {{}, {}, {}, static_cast<WsTextSource>(255)},
+        {{}, {}, {nullptr, 1}, WsTextSource::JsonString},
+        {{}, {}, {"x", json::kMaxBytes + 1}, WsTextSource::JsonString},
+        {{}, {}, {"x", 1}, WsTextSource::Literal},
+        {{}, {}, {"x", 1}, WsTextSource::MessageText},
+    };
+    for (const WsTextRewrite& rewrite : invalid_recipes) {
         CHECK_FALSE(cfg.add_ws_terminate("/bad",
                                          0,
                                          id.value(),
