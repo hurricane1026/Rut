@@ -305,6 +305,7 @@ enum class Opcode : u8 {
     // %r = auth.signed_request_valid(method, target, authorization, date,
     //                               digest, body, key_id, key) → bool
     SignedRequestValid,
+    JwtClaimsValidWithLifetime,
 };
 
 // ── Instruction ─────────────────────────────────────────────────────

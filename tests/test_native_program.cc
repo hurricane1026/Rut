@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/jwt_lifetime.h"
 #include "fixtures/signed_request.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
@@ -285,6 +286,58 @@ TEST(native_program, rotating_signed_request_survives_native_artifact_source_rem
         "\r\nDate: " + revoked_headers.date + "\r\nDigest: " + revoked_headers.digest +
         "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
     CHECK_EQ(invoke(owner.p->config.routes[2], revoked_request).status_code, 401u);
+}
+
+TEST(native_program, jwt_lifetime_policy_survives_native_artifact_source_removal) {
+    Source source;
+    const auto auth_path = (std::filesystem::path(__FILE__).parent_path().parent_path() /
+                            "examples/middleware/auth.rut")
+                               .string();
+    const std::string rut_source =
+        "import \"" + auth_path +
+        "\"\nroute GET \"/jwt\" { let verified = auth.jwtDocumentHs256(req.authorization.or(\"\"), "
+        "\"" +
+        ::rut::test::jwt_lifetime::kSecret +
+        "\") let identity = auth.jwtIdentityWithLifetime(verified, \"issuer\", \"gateway\", "
+        "\"age-policy\", 300, 7200) "
+        "guard identity.consumerId == \"alice\" && identity.credentialId == \"age-policy\" && "
+        "identity.method == \"jwt\" else { return 500 } return 204 }\n";
+    REQUIRE(source.append(rut_source.data(), static_cast<u32>(rut_source.size())));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(owner.p->config.route_count, 1u);
+    REQUIRE_EQ(unlink(source.path), 0);
+
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    REQUIRE(now.tv_sec > 1000);
+    const auto claims = ::rut::test::jwt_lifetime::claims(now.tv_sec - 30, now.tv_sec + 1800);
+    const auto token = ::rut::test::jwt_lifetime::make_token(claims);
+    REQUIRE(!token.empty());
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    jit::HandlerCtx ctx{};
+    const auto invoke_token = [&](const std::string& compact) {
+        arena.reset();
+        const std::string request =
+            "GET /jwt HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + compact + "\r\n\r\n";
+        return jit::HandlerResult::unpack(
+            owner.p->config.routes[0].fn(nullptr,
+                                         &ctx,
+                                         reinterpret_cast<const u8*>(request.data()),
+                                         static_cast<u32>(request.size()),
+                                         &arena));
+    };
+    CHECK_EQ(invoke_token(token).status_code, 204u);
+    const auto old_claims = ::rut::test::jwt_lifetime::claims(now.tv_sec - 400, now.tv_sec + 1800);
+    const auto old_token = ::rut::test::jwt_lifetime::make_token(old_claims);
+    REQUIRE(!old_token.empty());
+    CHECK_EQ(invoke_token(old_token).status_code, 401u);
+    arena.destroy();
+    pool.destroy();
 }
 
 TEST(native_program, links_with_closed_stderr) {

@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/jwt_lifetime.h"
 #include "fixtures/jwt_secret_rotation.h"
 #include "fixtures/signed_request.h"
 #include "framing_selection_preflight_fixture.h"
@@ -25721,6 +25722,92 @@ TEST(jit, consumer_group_deny_example_compiles) {
     JitEngine engine;
     REQUIRE(engine.init());
     REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, jwt_lifetime_identity_enforces_claim_age_and_lifetime) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-lifetime-auth.rut";
+    const char* source = R"rut(import "middleware/auth.rut"
+route GET "/jwt" {
+    let verified = auth.jwtDocumentHs256(req.authorization.or(""), "jwt-lifetime-test-secret-abcdefghijklmnopqrstuvwxyz")
+    let identity = auth.jwtIdentityWithLifetime(verified, "issuer", "gateway", "age-policy", 300, 7200)
+    guard identity.consumerId == "alice" && identity.credentialId == "age-policy" && identity.method == "jwt" else { return 500 }
+    return 204
+}
+route GET "/large" {
+    let verified = auth.jwtDocumentHs256(req.authorization.or(""), "jwt-lifetime-test-secret-abcdefghijklmnopqrstuvwxyz")
+    if jwtClaimsValidWithLifetime(verified, "issuer", "gateway", i64(4294967296), i64(4294967296)) {
+        return 204
+    } else { return 401 }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    auto large_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(large_handler);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const auto check_claims = [&](const std::string& claims, u16 expected) {
+        arena.reset();
+        const auto token = ::rut::test::jwt_lifetime::make_token(claims);
+        CHECK(!token.empty());
+        if (token.empty()) return;
+        const std::string request =
+            "GET /jwt HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\n\r\n";
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          &arena));
+        CHECK_EQ(result.status_code, expected);
+    };
+    timespec now{};
+    REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    REQUIRE(now.tv_sec > 1000);
+    const auto current = static_cast<std::int64_t>(now.tv_sec);
+    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 3600), 204);
+    check_claims(::rut::test::jwt_lifetime::claims(current - 400, current + 3600), 401);
+    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 8000), 401);
+    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 3600, "issuer", false),
+                 401);
+    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 3600, "wrong-issuer"),
+                 401);
+    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current - 1), 401);
+    arena.reset();
+    const auto large_token = ::rut::test::jwt_lifetime::make_token(
+        ::rut::test::jwt_lifetime::claims(current - 60, current + 3600));
+    const std::string large_request =
+        "GET /large HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + large_token +
+        "\r\n\r\n";
+    const auto large_result =
+        HandlerResult::unpack(large_handler(nullptr,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(large_request.data()),
+                                            static_cast<u32>(large_request.size()),
+                                            &arena));
+    CHECK_EQ(large_result.status_code, 204u);
+    arena.destroy();
+    pool.destroy();
     engine.shutdown();
     rir.destroy();
 }
