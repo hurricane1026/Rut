@@ -1260,17 +1260,13 @@ public:
                 if (ticks > max_ticks) ticks = max_ticks;  // clamp to wheel size
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
+#if RUT_ENABLE_WEBSOCKET
+                        if (ws_handle_timer_tick(this, *c)) return;
+#endif
                         if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             respond_upstream_timeout(this, *c);  // upstream stalled → 504
                         } else if (c->throttle_paused) {
                             throttle_resume(this, *c);  // @throttle: resume next window
-#if RUT_ENABLE_WEBSOCKET
-                        } else if (c->is_ws_tunnel || c->is_ws_terminate) {
-                            // WS tunnel/terminate: long-lived sessions have no
-                            // idle timeout — a quiet-but-healthy WebSocket must
-                            // not be reaped at the HTTP keep-alive deadline.
-                            // (RFC 6455 liveness is ping/pong, not idle close.)
-#endif
                         } else {
                             this->close_conn(*c);
                         }
@@ -1325,7 +1321,7 @@ public:
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
-                        if (!conn.throttle_paused)
+                        if (!conn.throttle_paused && !conn.ws_shutdown_deadline_armed)
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);

@@ -1210,6 +1210,9 @@ template void h2_proxy_timeout<NativeReactorEventLoop>(NativeReactorEventLoop*, 
 template void grpc_tick<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 template void grpc_deadline_fired<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 template void throttle_resume<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
+#if RUT_ENABLE_WEBSOCKET
+template bool ws_handle_timer_tick<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
+#endif
 // Active health-check probes are EPOLL ONLY this slice (IoUringEventLoop's sweep
 // re-arms deadlines but issues no probes), so only the epoll instantiation is
 // emitted. This pulls in the on_probe_* callbacks + free_probe_conn transitively.
@@ -1279,6 +1282,9 @@ template void grpc_tls_ready<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void grpc_tick<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void grpc_deadline_fired<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void throttle_resume<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+#if RUT_ENABLE_WEBSOCKET
+template bool ws_handle_timer_tick<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+#endif
 
 #endif
 

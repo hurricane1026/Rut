@@ -2819,6 +2819,13 @@ re-read), each with its own buffer for natural backpressure.
   `tcp_proxy`, but it is not required for WebSocket). On the level-triggered
   epoll backend the closing fd's read interest is dropped (so the FIN cannot spin
   the loop) while any pending send keeps its `EPOLLOUT` so it can finish draining.
+  Once a Close handshake or clean-EOF drain begins, a one-shot five-second
+  shutdown deadline bounds the drain (with the timer wheel's one-second
+  resolution). Socket progress and repeated EOF events do not extend it. A
+  healthy, quiet WebSocket has no idle timeout. If the shutdown deadline expires,
+  the runtime closes through the normal connection retirement path; buffered
+  bytes that did not drain by then may be discarded, while asynchronous I/O
+  buffers remain owned until their operations and cancellation completions retire.
 
 #### 3.4.9 Streaming Proxy
 

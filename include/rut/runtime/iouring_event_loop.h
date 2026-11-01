@@ -2290,7 +2290,7 @@ public:
         c.send_armed = false;
         // These are generic terminal Send-dispatch side effects. Apply them
         // before either the TLS continuation or fail-closed error handling.
-        if (!c.throttle_paused &&
+        if (!c.throttle_paused && !c.ws_shutdown_deadline_armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
             c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
@@ -7716,7 +7716,10 @@ public:
     // the connection is throttle_paused. Returns false on SQ pressure → caller
     // falls back to the keepalive wheel.
     [[nodiscard]] bool arm_throttle_timer(Connection& conn, u64 delay_ns) {
-        timer.remove(&conn);
+        if (!conn.ws_shutdown_deadline_armed)
+            timer.remove(&conn);
+        else if (conn.yield_timeout_armed)
+            return true;  // Reuse the existing kernel timespec owner.
         u32 ms = static_cast<u32>((delay_ns + 999'999ull) / 1'000'000ull);
         if (ms == 0) ms = 1;
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
@@ -8180,7 +8183,7 @@ public:
                     }
                     if (matching_generation && c.h2 && c.h2->grpc.timer_deadline_us) {
                         grpc_deadline_fired(this, c);
-                    } else if (c.throttle_paused && matching_generation) {
+                    } else if (c.fd >= 0 && c.throttle_paused && matching_generation) {
                         // @throttle pacing timer fired — resume the parked proxy
                         // pump (re-checks the byte budget; may re-park).
                         throttle_resume<IoUringEventLoop>(this, c);
@@ -8208,6 +8211,9 @@ public:
                 if (ticks > max_ticks) ticks = max_ticks;
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
+#if RUT_ENABLE_WEBSOCKET
+                        if (ws_handle_timer_tick(this, *c)) return;
+#endif
                         // See epoll_event_loop.h: timer fires for keepalive,
                         // wait(ms), or wait-any timeout completion.
                         if (c->response_read_deadline_state == ResponseReadDeadlineState::Armed) {
@@ -8238,14 +8244,6 @@ public:
                                 respond_upstream_timeout<IoUringEventLoop>(this, *c);
                         } else if (c->throttle_paused) {
                             throttle_resume<IoUringEventLoop>(this, *c);
-#if RUT_ENABLE_WEBSOCKET
-                        } else if (c->is_ws_tunnel || c->is_ws_terminate) {
-                            // WebSocket tunnel/terminate: long-lived sessions
-                            // have no idle keepalive timeout — a quiet-but-
-                            // healthy WebSocket must not be reaped at the HTTP
-                            // keep-alive deadline (RFC 6455 liveness is
-                            // ping/pong, not idle close).
-#endif
                         } else {
                             this->close_conn(*c);
                         }
@@ -8816,7 +8814,7 @@ public:
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
-                        if (!conn.throttle_paused &&
+                        if (!conn.throttle_paused && !conn.ws_shutdown_deadline_armed &&
                             conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
                             conn.response_read_deadline_state !=
                                 ResponseReadDeadlineState::ExpiryPending &&

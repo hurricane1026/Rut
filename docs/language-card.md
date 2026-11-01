@@ -847,6 +847,9 @@ return websocket(chat) { message in
     message.forward()
 }
 
+// The runtime bounds a graceful Close or clean-EOF drain to about five
+// seconds; a healthy quiet tunnel has no idle timeout.
+
 // Validate a complete message with the existing JSON parser. Only presence
 // comparisons and the document bindings shown below are supported here.
 // JSON null is a valid document, so json.parse("null") succeeds.

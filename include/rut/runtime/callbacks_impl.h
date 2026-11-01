@@ -1809,6 +1809,38 @@ void close_conn_after_complete_response(Loop* loop, Connection& conn) {
     loop->close_conn(conn);
 }
 
+template <typename Loop>
+bool ws_keep_shutdown_deadline(Loop* loop, Connection& conn);
+inline constexpr u32 kWsShutdownDrainTimeoutSeconds = 5;
+static_assert(kWsShutdownDrainTimeoutSeconds > 0 &&
+              kWsShutdownDrainTimeoutSeconds < TimerWheel::kSlots);
+
+inline u32 ws_shutdown_deadline_remaining(const Connection& conn, u32 cursor) {
+    const u32 kElapsed = cursor - conn.ws_shutdown_started_tick;
+    return kElapsed >= kWsShutdownDrainTimeoutSeconds ? 0
+                                                      : kWsShutdownDrainTimeoutSeconds - kElapsed;
+}
+
+template <typename Loop>
+void ws_arm_throttle_fallback(Loop* loop, Connection& conn) {
+    if constexpr (requires { loop->timer.refresh(&conn, 1u); }) {
+#if RUT_ENABLE_WEBSOCKET
+        if (conn.ws_shutdown_deadline_armed) {
+            const u32 kRemaining = ws_shutdown_deadline_remaining(conn, loop->timer.cursor);
+            if (kRemaining == 0) {
+                loop->close_conn(conn);
+                return;
+            }
+            loop->timer.refresh(&conn, kRemaining < 1u ? kRemaining : 1u);
+        } else {
+            loop->timer.refresh(&conn, 1u);
+        }
+#else
+        loop->timer.refresh(&conn, 1u);
+#endif
+    }
+}
+
 // @throttle read-side gate for the proxy body pump. Called at each point where
 // the proxy would read the next upstream chunk. If the token bucket has run ahead
 // of real time (the bytes sent so far "should" take until throttle_tat_ns at the
@@ -1844,9 +1876,7 @@ bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remain
         armed = loop->arm_throttle_timer(conn, kDelayNs);
     }
     if (!armed) {
-        if constexpr (requires { loop->timer.refresh(&conn, 1u); }) {
-            loop->timer.refresh(&conn, 1u);
-        }
+        ws_arm_throttle_fallback(loop, conn);
     }
     return true;
 }
@@ -1858,6 +1888,9 @@ bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remain
 // replay the buffered upstream bytes or re-arm the upstream recv.
 template <typename Loop>
 void throttle_resume(Loop* loop, Connection& conn) {
+#if RUT_ENABLE_WEBSOCKET
+    if (conn.ws_shutdown_deadline_armed && !ws_keep_shutdown_deadline(loop, conn)) return;
+#endif
     if (conn.throttle_down_bps != 0) {
         const u64 kNowNs = monotonic_ns();
         if (conn.throttle_tat_ns > kNowNs) {
@@ -1868,9 +1901,7 @@ void throttle_resume(Loop* loop, Connection& conn) {
                 armed = loop->arm_throttle_timer(conn, kDelayNs);
             }
             if (!armed) {
-                if constexpr (requires { loop->timer.refresh(&conn, 1u); }) {
-                    loop->timer.refresh(&conn, 1u);
-                }
+                ws_arm_throttle_fallback(loop, conn);
             }
             return;  // stay paused
         }
@@ -10867,6 +10898,52 @@ constexpr bool ws_loop_async() {
     return loop_backend_async_io<Loop>();
 }
 
+// Bound graceful WebSocket shutdown even when either peer stops reading.
+// Reuse the connection's ordinary timer, replacing any idle arm. Refresh it
+// only on the first transition into drain/Close, never on later I/O progress.
+template <typename Loop>
+bool ws_keep_shutdown_deadline(Loop* loop, Connection& conn) {
+    if (!conn.ws_shutdown_deadline_armed) return true;
+    const u32 kRemaining = ws_shutdown_deadline_remaining(conn, loop->timer.cursor);
+    if (kRemaining == 0) {
+        loop->close_conn(conn);
+        return false;
+    }
+    loop->timer.refresh(&conn, kRemaining);
+    return true;
+}
+
+template <typename Loop>
+void ws_arm_shutdown_deadline(Loop* loop, Connection& conn) {
+    if (conn.ws_shutdown_deadline_armed) return;
+    conn.ws_shutdown_deadline_armed = true;
+    conn.ws_shutdown_started_tick = loop->timer.cursor;
+    // Preserve an already-armed coarse throttle wake. A precise throttle timer
+    // has detached the wheel node, so it needs no extra one-second wake here.
+    const u32 kInitialDelay =
+        conn.throttle_paused && !conn.timer_node.empty() ? 1 : kWsShutdownDrainTimeoutSeconds;
+    loop->timer.refresh(&conn, kInitialDelay);
+}
+
+template <typename Loop>
+bool ws_handle_timer_tick(Loop* loop, Connection& conn) {
+    if (conn.ws_shutdown_deadline_armed) {
+        const u32 kRemaining = ws_shutdown_deadline_remaining(conn, loop->timer.cursor);
+        if (kRemaining == 0) {
+            loop->close_conn(conn);
+            return true;
+        }
+        loop->timer.refresh(&conn, kRemaining);
+        if (conn.throttle_paused) throttle_resume<Loop>(loop, conn);
+        return true;
+    }
+    if (conn.is_ws_tunnel || conn.is_ws_terminate) {
+        if (conn.throttle_paused) throttle_resume<Loop>(loop, conn);
+        return true;
+    }
+    return false;
+}
+
 // Drive the bidirectional Close handshake: submit a Close frame on each peer's send slot
 // when it's idle (deferring on a busy slot), skip a peer that already half-closed, and
 // close once both slots' Close frames have drained. Idempotent — safe to call from the
@@ -10952,6 +11029,7 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                 // client echo, then close once both drain. The echo carries the code the
                 // inspector resolved (handler message.close(code), or 1000 for a peer close).
                 conn.ws_closing = true;
+                ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_upstream_inflight = true;
                 conn.ws_close_client_need = true;
                 conn.ws_echo_close_code = conn.ws_c2u.echo_close_code;
@@ -11030,6 +11108,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
                 // Close back too. Start the client slot in-flight + queue the upstream echo,
                 // carrying the code the inspector resolved (message.close(code), or 1000).
                 conn.ws_closing = true;
+                ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_client_inflight = true;
                 conn.ws_close_upstream_need = true;
                 conn.ws_echo_close_code = conn.ws_u2c.echo_close_code;
@@ -11098,6 +11177,7 @@ void ws_close_if_drained(Loop* loop, Connection& conn) {
 // can't spin) while preserving any pending send's EPOLLOUT so it still drains.
 template <typename Loop>
 bool ws_drain_pump(Loop* loop, Connection& conn) {
+    ws_arm_shutdown_deadline(loop, conn);
     if (!conn.ws_client_send_pending && conn.recv_buf.len() > 0)
         if (!ws_try_send_client_to_upstream(loop, conn)) return false;
     if (!conn.ws_upstream_send_pending && conn.upstream_recv_buf.len() > 0)
