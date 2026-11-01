@@ -14,7 +14,7 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
+| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper | ES keys, remote JWKS refresh/cache, live and durable token revocation |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; durable delivery replay persistence |
@@ -90,6 +90,24 @@ The JIT request matrix checks both methods for both Consumers, exact identity
 mapping, cross-method confusion, duplicate Authorization, disabled slots,
 ambiguous ownership and bad metadata. Consumer authorization remains a separate
 step after verification.
+
+## Two-Consumer custom-header key policy
+
+`auth.multiHeaderKey(presented, first, second)` checks one raw singleton custom
+header key against two `auth.HeaderKeyConsumer(consumerId: ..., key: ...,
+credentialId: ...)` records. Consumer IDs must be nonempty and distinct, both
+credential IDs must be nonempty, at least one key must be enabled, and duplicate
+nonempty keys are rejected as ambiguous configuration with 503 before checking
+the request. Empty keys disable their slots. A missing, wrong, duplicate or
+otherwise unmatched key returns 401 with `WWW-Authenticate: ApiKey`; success
+publishes the matched configuration's identity metadata and method `apiKey`.
+The helper does not retry Authorization, query or body values. Authenticate
+before Consumer/group authorization, and call `req.remove("X-API-Key")` before
+forwarding when the upstream must not receive the key. The JIT matrix covers
+both Consumers, disabled/conflicting configurations, exact value matching,
+spoofed identity headers, duplicate fields, authorization order and removal
+from forwarded requests. See
+[the runnable example](../examples/multi-header-key-auth.rut).
 
 ## Required credentials and bounded authorization union
 

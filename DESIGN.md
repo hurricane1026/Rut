@@ -8265,6 +8265,17 @@ expression-string decoder and its owned HIR buffers. Request header validation
 runs on decoded bytes before lowering, preventing escaped CR/LF injection.
 Configuration remains static; CLI restart activates rotation/revocation changes.
 
+`auth.multiHeaderKey(presented, first, second)` applies the same singleton
+custom-header rule to a bounded pair of `auth.HeaderKeyConsumer` records. Each
+record supplies a nonempty Consumer ID and credential ID; the Consumer IDs must
+differ, empty keys disable slots, and at least one key must be enabled. Equal
+nonempty keys are an ambiguous configuration and return 503. A missing,
+duplicate or unknown key returns 401 with an ApiKey challenge. Success publishes
+the matched record's Consumer and credential IDs with method `apiKey`. Apply
+Consumer/group authorization afterward. The helper does not read identity
+headers, query values, body values or Authorization as fallbacks. See
+`examples/multi-header-key-auth.rut`.
+
 ### Custom-header API Key rotation and optional access
 
 `auth.rotatingHeaderKey` uses the existing constant-time equality operation for
