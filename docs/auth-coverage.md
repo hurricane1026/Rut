@@ -17,7 +17,7 @@ whether a competing open-source edition includes them.
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; two-ID static JWT revocation helper; exact top-level `groups` array authorization after verification | ES keys, remote JWKS refresh/cache, live and durable token revocation |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness | Kong/APISIX canonical signed request profile, body digest and mandatory signed fields, timestamp/nonce checks; durable delivery replay persistence |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; a fixed native APISIX-style HMAC-SHA256 signed-request subprofile | Full Kong/APISIX plugin compatibility, HTTP singleton extraction/integration, credential rotation/registry, nonce/replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
@@ -66,6 +66,52 @@ The Standard Webhooks identity middleware is integrated here; its freshness
 checks do not implement persistent replay protection. The bounded Consumer
 policy work from #924, required credentials from #925, and header-count
 primitive from #926 are already present in this main base.
+
+### Native signed-request HMAC-SHA256 subprofile
+
+`signed_request_hmac_sha256_valid` verifies a fixed native profile inspired by
+APISIX HMAC Authentication. It is a native C++ API only: HTTP header selection,
+singleton enforcement, and request method/target binding to the parsed request
+remain caller responsibilities. This API does not claim full APISIX or Kong
+plugin compatibility.
+
+The caller supplies the exact method, origin-form request target, singleton
+Authorization/Date/Digest values, exact raw body bytes, trusted key ID/secret,
+and trusted UTC epoch seconds. `Authorization` must contain exactly four
+quoted parameters, in any order:
+
+```text
+Signature keyId="...",algorithm="hmac-sha256",headers="@request-target date digest",signature="..."
+```
+
+Unknown, duplicate, missing, malformed, or trailing parameters fail closed.
+The only accepted method tokens are uppercase GET, POST, PUT, DELETE, PATCH,
+HEAD, OPTIONS, and TRACE; CONNECT is rejected because this profile signs only
+origin-form targets. The target must start with `/`, may include its original
+query bytes, and is never decoded or normalized; whitespace, controls, `#`,
+and targets over 8192 bytes are rejected.
+
+Date must be a canonical 29-byte IMF-fixdate in GMT with a valid calendar date
+and matching weekday. Its timestamp must be within 300 seconds of the supplied
+clock, inclusive. Digest is mandatory even for an empty body and must equal
+`SHA-256=` followed by canonical padded Base64 of SHA-256 over the exact raw
+body. The signature is canonical padded Base64 of the HMAC-SHA256 result over
+these exact bytes (each line ends in LF):
+
+```text
+trusted-key-id
+UPPERCASE-METHOD exact-origin-form-target
+date: exact-Date-value
+digest: SHA-256=canonical-padded-Base64-body-hash
+```
+
+Trusted key IDs are 1–128 visible ASCII bytes excluding quote, backslash, and
+comma; secrets are 1–4096 bytes; bodies are at most 1 MiB; Authorization is at
+most 4096 bytes. Verification uses fixed stack buffers and existing crypto
+primitives, with no heap allocation or retained input views. Freshness checks
+do not prevent replay; callers processing non-idempotent actions need durable
+replay state. PR1 provides native verification only; later HTTP integration is
+needed before this can be used as a Rut policy.
 
 ## Bounded multi-Consumer authentication
 
