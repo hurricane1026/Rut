@@ -350,6 +350,39 @@ route GET "/ws" { return websocket(backend) { message in
                   true) == WsFrameAction::ClosePolicy2);
 }
 
+TEST(native_program, websocket_json_false_boolean_alias_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/enabled") else { message.close(1008) }
+ guard let enabled = json.bool(field) else { message.close(1003) }
+ guard enabled == false else { message.drop() }
+ message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const char* payloads[] = {
+        R"({"enabled":false})", R"({"enabled":true})", R"({"enabled":null})", "{}", "{"};
+    const WsFrameAction expected[] = {WsFrameAction::Forward,
+                                      WsFrameAction::Drop,
+                                      WsFrameAction::ClosePolicy2,
+                                      WsFrameAction::ClosePolicy1,
+                                      WsFrameAction::ClosePolicy0};
+    for (u32 i = 0; i < sizeof(payloads) / sizeof(payloads[0]); ++i) {
+        CHECK(handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(payloads[i]),
+                      strlen(payloads[i]),
+                      true) == expected[i]);
+    }
+    REQUIRE_EQ(owner.p->config.routes[0].ws_close_policy_count, 3u);
+}
+
 TEST(native_program, websocket_json_validation_survives_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

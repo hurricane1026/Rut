@@ -35,6 +35,8 @@ bool ws_json_string_at_path(const u8* payload, u64 len, Str path);
 bool ws_json_string_equals_at_path(const u8* payload, u64 len, Str path, Str expected);
 bool ws_json_string_matches_at_path(
     const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation);
+bool ws_json_bool_at_path(const u8* payload, u64 len, Str path);
+bool ws_json_bool_equals_at_path(const u8* payload, u64 len, Str path, bool expected);
 
 // RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close message.
 // Accepts 1000–1003, 1007–1014, and 3000–4999; rejects the unassigned ranges (<1000,
