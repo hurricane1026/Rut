@@ -1503,7 +1503,7 @@ public:
 
     // Add a Proxy route that TERMINATES WebSocket upgrades: on a 101 the data phase is
     // frame-inspected and each message handed to `handler` (forward/drop/close), bounded
-    // by `max_message_size` (clamped to one buffer slice). Same failure modes as
+    // by `max_message_size` (at most one buffer slice). Same failure modes as
     // add_proxy() plus handler, size, UTF-8, and bounded-table validation. Policy
     // arrays are copied, but their text views must outlive the route configuration.
     bool add_ws_terminate(const char* path,
@@ -1535,7 +1535,7 @@ public:
         (void)forward_text_count;
         return false;
 #else
-        if (handler == nullptr || max_message_size == 0 ||
+        if (handler == nullptr || !ws_valid_message_capacity(max_message_size) ||
             !ws_valid_text_rewrite(forward_text, max_message_size))
             return false;
         // Fail closed on a close code the runtime would refuse to put on the wire, using the

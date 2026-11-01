@@ -5,6 +5,9 @@
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_method.h"
+#if RUT_ENABLE_WEBSOCKET
+#include "rut/runtime/ws_terminate.h"
+#endif
 #include <memory>
 
 namespace rut {
@@ -17,6 +20,7 @@ constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `patter
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
 constexpr Str kWsTrailingBlockDetail =
     lit_str("websocket trailing blocks require `{ message in ... }`");
+constexpr Str kWsMaxMessageSizeDetail = lit_str("single-slice maximum is 16370 bytes");
 constexpr Str kObjectCallArgDetail = lit_str("object literals are only allowed as call arguments");
 // The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
 // member names work); the parser rejects them in operator/operand positions.
@@ -2938,6 +2942,14 @@ struct Parser {
                     const u64 bytes = amount * mult;
                     if (bytes == 0 || bytes > 0xffffffffull)
                         return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
+                    if (bytes > kWsTerminateMessageCapacity) {
+                        const Span kValueSpan{num.value()->start,
+                                              unit.value()->end,
+                                              num.value()->line,
+                                              num.value()->col};
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, kValueSpan, kWsMaxMessageSizeDetail);
+                    }
                     ws_max_size = static_cast<u32>(bytes);
                 }
                 auto rparen = expect(TokenType::RParen);

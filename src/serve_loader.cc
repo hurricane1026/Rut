@@ -352,7 +352,8 @@ bool load_rut_program(const char* path,
 #if RUT_ENABLE_WEBSOCKET
     // Register each terminate route: look up its compiled verdict fn and publish a proxy +
     // message-handler route. The `maxMessageSize:` kwarg sets the cap when given; otherwise it
-    // defaults to the engine's single-slice cap. The runtime arm-time clamps either way.
+    // defaults to the engine's single-slice cap. The runtime rejects values outside the same
+    // single-slice bound.
     {
         constexpr u32 kWsDefaultMaxMessageSize = kWsTerminateMessageCapacity;
         u32 ws_n = 0;
@@ -371,6 +372,7 @@ bool load_rut_program(const char* path,
             const u32 max_msg = route.ws_handler.max_message_size != 0
                                     ? route.ws_handler.max_message_size
                                     : kWsDefaultMaxMessageSize;
+            if (!ws_valid_message_capacity(max_msg)) return false;
             auto retain_forward_text = [&](u32 index, Str& result) {
                 if (index >= route.exprs.len) return false;
                 const auto& expr = route.exprs[index];

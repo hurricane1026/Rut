@@ -4,6 +4,7 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/ebpf_plan.h"
 #include "rut/runtime/response_body_files.h"
+#include "rut/runtime/ws_terminate.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -522,6 +523,11 @@ bool load_native_program(const char* source,
     memcpy(static_cast<void*>(c.routes),
            static_cast<const void*>(routes),
            sizeof(RouteEntry) * h.route_count);
+    for (u32 i = 0; i < h.route_count; i++) {
+        const auto& route = c.routes[i];
+        if (route.ws_terminate && !ws_valid_message_capacity(route.ws_max_message_size))
+            return fail("invalid native WebSocket message limit");
+    }
     memcpy(reinterpret_cast<u8*>(&c) + native::metadata_offset(c), metadata, h.metadata_size);
     if (c.upstream_count > c.kMaxUpstreams || c.timer_count > c.kMaxTimers ||
         c.cache_instance_count > c.kMaxCacheInstances ||

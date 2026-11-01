@@ -37814,6 +37814,38 @@ TEST(legacy_loop, lazy_aux_buffers_handle_exhaustion_atomically) {
     loop->shutdown();
 }
 
+#if RUT_ENABLE_WEBSOCKET
+TEST(legacy_loop, ws_arm_terminate_rejects_invalid_limits_before_allocating) {
+    using Loop = EventLoop<MockBackend>;
+    MmapArena arena;
+    REQUIRE(arena.init(sizeof(Loop)).has_value());
+    auto* loop = arena.alloc_t<Loop>();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 available = loop->pool.available();
+    for (u32 size : {0u, kWsTerminateMessageCapacity + 1u, 0xffffffffu}) {
+        conn->ws_max_message_size = size;
+        CHECK_FALSE(ws_arm_terminate(loop, *conn));
+        CHECK_EQ(loop->pool.available(), available);
+        CHECK_EQ(conn->ws_c2u_msg, nullptr);
+        CHECK_EQ(conn->ws_u2c_msg, nullptr);
+        CHECK_EQ(conn->ws_c2u_out, nullptr);
+        CHECK_EQ(conn->ws_u2c_out, nullptr);
+    }
+    conn->ws_max_message_size = kWsTerminateMessageCapacity;
+    REQUIRE(ws_arm_terminate(loop, *conn));
+    CHECK_EQ(conn->ws_c2u.max_message_size, kWsTerminateMessageCapacity);
+    CHECK_EQ(conn->ws_u2c.max_message_size, kWsTerminateMessageCapacity);
+    conn->fd = -1;
+    loop->free_conn(*conn);
+    loop->shutdown();
+    loop->~Loop();
+    arena.destroy();
+}
+#endif
+
 TEST(legacy_async_loop, immediate_free_releases_all_lazy_buffers) {
     auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
     REQUIRE(loop->init(0, -1).has_value());

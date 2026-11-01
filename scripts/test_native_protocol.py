@@ -9,6 +9,7 @@ import selectors
 import signal
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -154,6 +155,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument("--compiler", type=Path, required=True)
+    parser.add_argument("--websocket-enabled", choices=("0", "1"), default="1")
     args = parser.parse_args()
     for arguments in (["--compile"], ["--compile", "--shards", "1"], ["--compile", ""]):
         result = subprocess.run([str(args.server.resolve()), *arguments],
@@ -190,6 +192,85 @@ def main():
         server = root / "rut"
         shutil.copy2(args.server, server)
         helper = root / "rut-compile"
+
+        if args.websocket_enabled == "1":
+            # Generate a real native artifact, then corrupt only its WebSocket route metadata.
+            # The copied server must reject this at the native load boundary before rebuilding
+            # the route dispatch index.
+            ws_source = root / "ws-limit.rut"
+            ws_source.write_text(
+                'upstream backend at "127.0.0.1:9999"\n'
+                'route GET "/ws-limit-contract" { return websocket(backend, '
+                'maxMessageSize: 16001b) { message in message.forward() } }\n'
+            )
+            ws_result = subprocess.run(
+                [str(args.compiler.resolve()), str(ws_source), "2"],
+                capture_output=True,
+                check=True,
+                timeout=15,
+            )
+            ws_data = ws_result.stdout
+            ws_offset = ws_data.find(b"\x7fELF" if sys.platform.startswith("linux") else b"\xcf\xfa\xed\xfe")
+            assert ws_offset > 0, "WebSocket compiler stream must contain a native image"
+            ws_header, ws_image = ws_data[:ws_offset], ws_data[ws_offset:]
+            native_magic = struct.pack("<Q", 0x5255544E41544956)
+            native_headers = [match.start() for match in re.finditer(re.escape(native_magic), ws_image)]
+            assert len(native_headers) == 1, native_headers
+            config_offset = native_headers[0]
+            assert config_offset + 32 <= len(ws_image)
+            native_version, config_struct_size = struct.unpack_from("<II", ws_image, config_offset + 8)
+            config_blob_size = struct.unpack_from("<Q", ws_image, config_offset + 16)[0]
+            metadata_size = struct.unpack_from("<I", ws_image, config_offset + 24)[0]
+            route_count = struct.unpack_from("<I", ws_image, config_offset + 28)[0]
+            assert native_version > 0 and config_struct_size > metadata_size > 0 and route_count == 1
+            config_end = config_offset + config_blob_size
+            assert config_blob_size >= 32 and config_end <= len(ws_image), (
+                config_offset,
+                config_blob_size,
+                len(ws_image),
+            )
+            config_blob = ws_image[config_offset:config_end]
+            path_marker = b"/ws-limit-contract\x00"
+            assert config_blob.count(path_marker) == 1, "native route metadata must contain its path once"
+            path_offset = config_blob.find(path_marker)
+            size_marker = struct.pack("<I", 16001)
+            size_offsets = [
+                match.start()
+                for match in re.finditer(re.escape(size_marker), config_blob)
+                if path_offset < match.start()
+            ]
+            assert len(size_offsets) == 1, (path_offset, size_offsets)
+            size_offset = config_offset + size_offsets[0]
+            for invalid_size in (0, 16371, 0xFFFFFFFF):
+                damaged = bytearray(ws_image)
+                before = bytes(damaged[size_offset : size_offset + 4])
+                damaged[size_offset : size_offset + 4] = struct.pack("<I", invalid_size)
+                changed = [index for index, pair in enumerate(zip(ws_image, damaged)) if pair[0] != pair[1]]
+                assert changed and min(changed) >= size_offset and max(changed) < size_offset + 4, changed
+                assert before == size_marker
+                frame_hex = (ws_header + damaged).hex()
+                helper.write_text(
+                    f"#!{sys.executable}\nimport os\n"
+                    f"view=memoryview(bytes.fromhex({frame_hex!r}))\n"
+                    "while view:\n"
+                    " written=os.write(1, view)\n"
+                    " view=view[written:]\n"
+                    "os._exit(0)\n"
+                )
+                helper.chmod(0o700)
+                run = subprocess.run(
+                    [str(server), "--compile", str(ws_source), "--shards", "1", "--no-pin"],
+                    capture_output=True,
+                    timeout=5,
+                )
+                diagnostic = run.stderr.decode()
+                assert run.returncode != 0 and "invalid native WebSocket message limit" in diagnostic, (
+                    invalid_size,
+                    diagnostic,
+                )
+                assert "cannot rebuild native route index" not in diagnostic, diagnostic
+            print(json.dumps({"case": "native WebSocket message limits fail before route dispatch rebuild"}))
+
         helper.write_text(f"#!{sys.executable}\nimport os\nos._exit(37)\n")
         helper.chmod(0o700)
         run = subprocess.run(

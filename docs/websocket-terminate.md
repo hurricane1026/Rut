@@ -25,6 +25,10 @@ into message inspection and its bounded buffering costs.
 - `message.isText` / `message.isBinary` select application message types.
 - `message.len` is the complete payload length in bytes, excluding frame headers
   and masking keys. The limit applies across all fragments of one message.
+- `maxMessageSize` defaults to 16370 bytes (16 KiB slice capacity minus the
+  maximum 14-byte WebSocket header). Explicit values from `1b` through `16370b`
+  are accepted. Larger values such as `16kb` or `64kb` are rejected; larger-message
+  buffering is not implemented.
 - `message.text` supports the bounded predicates and rewrite recipes documented
   in [the language card](language-card.md). Current predicates compare payload
   bytes; add `message.isText` to restrict them to Text messages.
@@ -156,7 +160,7 @@ Ping/Pong/Close frames bypass the application handler. Control frames may occur
 between fragments without creating an application message. Protocol errors and
 oversized messages fail the tunnel; user code cannot bypass these checks.
 
-Inspection currently uses bounded single-slice storage (approximately 16 KB),
+Inspection currently uses bounded single-slice storage (16370 bytes),
 with separate per-direction output buffers. `maxMessageSize` cannot lift that
 storage cap. Supporting larger messages requires a separate buffering design.
 
