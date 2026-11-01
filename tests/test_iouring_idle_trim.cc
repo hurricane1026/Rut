@@ -1156,9 +1156,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // each add one route view on the connection and one view per direction. Branch
     // close policies add bounded table views and the selected echo reason. Branch
     // text replacements add one table view on the connection and each inspector.
-    // Affix recipes also retain a suffix view and an include-payload flag.
+    // Affix recipes retain a suffix view and dynamic-source tag. JSON source paths increase
+    // WsTextRewrite from 40 to 56 bytes in three connection-owned recipes (+48 bytes total).
     // Keep the bounded layout explicit so future owner fields cannot grow it unnoticed.
-    CHECK_EQ(sizeof(Connection), 4504u);
+    CHECK_EQ(sizeof(Connection), 4552u);
 }
 
 TEST(iouring_idle_trim,
