@@ -275,6 +275,43 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, websocket_json_string_aliases_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/type") else { message.close(1008) }
+ guard let kind = json.string(field) else { message.close(1003) }
+ guard kind == "subscribe" else { message.drop() }
+ message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const char* accepted[] = {R"({"type":"subscribe"})", R"({"type":"sub\u0073cribe"})"};
+    for (const char* payload : accepted) {
+        CHECK(handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(payload),
+                      strlen(payload),
+                      true) == WsFrameAction::Forward);
+    }
+    CHECK(handler(nullptr,
+                  WsOpcode::Text,
+                  reinterpret_cast<const u8*>(R"({"type":null})"),
+                  strlen(R"({"type":null})"),
+                  true) == WsFrameAction::ClosePolicy2);
+    CHECK(handler(nullptr,
+                  WsOpcode::Text,
+                  reinterpret_cast<const u8*>(R"({"type":"publish"})"),
+                  strlen(R"({"type":"publish"})"),
+                  true) == WsFrameAction::Drop);
+    REQUIRE_EQ(owner.p->config.routes[0].ws_close_policy_count, 3u);
+}
+
 TEST(native_program, websocket_json_validation_survives_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

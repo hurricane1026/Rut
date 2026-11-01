@@ -2,6 +2,7 @@
 // reassembly + handler dispatch + re-framing, across both tunnel directions, forward/
 // drop/close, fragmentation, control pass-through, partial frames, and bounds.
 
+#include "rut/common/types.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/ws_frame.h"
 #include "rut/runtime/ws_terminate.h"
@@ -87,6 +88,81 @@ TEST(ws_terminate, json_field_presence_is_bounded_and_message_scoped) {
     CHECK(present({boundary, json::kMaxBytes}, lit_str("/name")));
     CHECK_FALSE(present({boundary, sizeof(boundary)}, lit_str("/name")));
     CHECK(present(payload, lit_str("/name")));
+}
+
+TEST(ws_terminate, json_string_lookup_decodes_and_reuses_bounded_workspace) {
+    const Str kPaths[] = {lit_str("/kind"), lit_str("/empty"), lit_str("/nul"), lit_str("")};
+    const char* const kPayloads[] = {R"({"kind":"subscribe","empty":"","nul":"a\u0000b"})",
+                                     R"({"kind":"sub\u0073cribe","empty":"","nul":"a\u0000b"})",
+                                     R"({"kind":null,"empty":3,"nul":false})",
+                                     R"("root")"};
+    CHECK(ws_json_string_at_path(
+        reinterpret_cast<const u8*>(kPayloads[0]), strlen(kPayloads[0]), kPaths[0]));
+    CHECK(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                        strlen(kPayloads[0]),
+                                        kPaths[0],
+                                        lit_str("subscribe")));
+    CHECK(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(kPayloads[1]),
+                                        strlen(kPayloads[1]),
+                                        kPaths[0],
+                                        lit_str("subscribe")));
+    CHECK(ws_json_string_equals_at_path(
+        reinterpret_cast<const u8*>(kPayloads[0]), strlen(kPayloads[0]), kPaths[1], lit_str("")));
+    const char kExpectedNul[] = {'a', '\0', 'b'};
+    CHECK(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                        strlen(kPayloads[0]),
+                                        kPaths[2],
+                                        {kExpectedNul, sizeof(kExpectedNul)}));
+    CHECK_FALSE(ws_json_string_at_path(
+        reinterpret_cast<const u8*>(kPayloads[2]), strlen(kPayloads[2]), kPaths[0]));
+    CHECK_FALSE(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(kPayloads[2]),
+                                              strlen(kPayloads[2]),
+                                              kPaths[0],
+                                              lit_str("subscribe")));
+    CHECK(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(kPayloads[3]),
+                                        strlen(kPayloads[3]),
+                                        kPaths[3],
+                                        lit_str("root")));
+    CHECK_FALSE(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                              0x100000002ULL,
+                                              kPaths[0],
+                                              lit_str("subscribe")));
+    CHECK_FALSE(ws_json_string_equals_at_path(reinterpret_cast<const u8*>(kPayloads[0]),
+                                              strlen(kPayloads[0]),
+                                              {nullptr, 1},
+                                              lit_str("subscribe")));
+    CHECK_FALSE(ws_json_string_equals_at_path(
+        reinterpret_cast<const u8*>(kPayloads[0]), strlen(kPayloads[0]), kPaths[0], {nullptr, 1}));
+
+    char reused[] = R"({"type":"subscribe"})";
+    const u32 kReusedLen = static_cast<u32>(strlen(reused));
+    CHECK(ws_json_has_path(reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type")));
+    CHECK(
+        ws_json_string_at_path(reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type")));
+    CHECK(ws_json_string_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type"), lit_str("subscribe")));
+    reused[9] = 'd';
+    reused[10] = 'i';
+    reused[11] = 'f';
+    reused[12] = 'f';
+    reused[13] = 'e';
+    reused[14] = 'r';
+    reused[15] = 'e';
+    reused[16] = 'n';
+    reused[17] = 't';  // Same address and size, different message.
+    CHECK_FALSE(ws_json_string_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type"), lit_str("subscribe")));
+    CHECK(ws_json_string_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type"), lit_str("different")));
+    reused[0] = 'x';
+    reused[1] = ' ';
+    memset(reused + 2, ' ', kReusedLen - 2);
+    CHECK_FALSE(
+        ws_json_string_at_path(reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type")));
+    const char kValidMessage[] = R"({"type":"subscribe"})";
+    memcpy(reused, kValidMessage, sizeof(kValidMessage));
+    CHECK(ws_json_string_equals_at_path(
+        reinterpret_cast<const u8*>(reused), kReusedLen, lit_str("/type"), lit_str("subscribe")));
 }
 
 namespace {

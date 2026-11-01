@@ -2731,9 +2731,23 @@ use zero-based indices. A present JSON null node counts as present; missing or
 invalid paths return nil. Literal escapes, including embedded NUL, are decoded.
 Bindings require fresh names (including no collision with route locals, `json`
 or `message`), become available only after their guard and stay inside this
-handler. They currently support only these presence checks; general document
-operations, value bindings, extraction and rewriting remain unsupported.
-The binding guard counts toward the four-source-guard limit.
+handler. A validated document alias supports `json.get` presence checks, while
+typed string bindings and literal comparisons are limited to the operations below.
+General document operations, arbitrary value extraction and rewriting remain
+unsupported. Each binding guard counts toward the four-source-guard limit.
+
+JSON aliases may be unwrapped one step further for string routing policies:
+`guard let field = json.get(document, "/type") ...` binds a selected Json value,
+and `guard let kind = json.string(field) ...` binds it only when that value is a
+JSON string. `json.string(document)` also checks a root JSON string. Missing
+fields, null, numbers, booleans, arrays and objects fail the string binding.
+The resulting alias can be compared with a string literal using `==` or `!=`
+in either operand order, including logical condition trees. These path aliases
+are compile-time metadata: every reached check reparses the full bounded message
+and retains no document node or borrowed string. Direct optional `json.get`
+values, nested `get`, strings used as Json, documents used as strings without
+`json.string`, dynamic paths and general value extraction are rejected. This
+uses the existing four-guard and 32-condition-node limits.
 
 The native/JIT helper validates the complete unmasked, reassembled payload with
 the existing JSON parser and a bounded workspace per worker thread. It accepts

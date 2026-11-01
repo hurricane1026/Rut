@@ -82,6 +82,8 @@
     X(rut_helper_str_constant_time_equal)       \
     X(rut_helper_ws_json_has_path)              \
     X(rut_helper_ws_json_valid)                 \
+    X(rut_helper_ws_json_string_at_path)        \
+    X(rut_helper_ws_json_string_equals_at_path) \
     X(rut_helper_str_contains)                  \
     X(rut_helper_str_eq)                        \
     X(rut_helper_str_cmp)                       \

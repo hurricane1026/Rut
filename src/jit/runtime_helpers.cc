@@ -1942,6 +1942,28 @@ extern "C" u8 rut_helper_ws_json_valid(const char* payload, u64 len) {
     return ws_valid_json_payload(reinterpret_cast<const u8*>(payload), len) ? 1u : 0u;
 }
 
+extern "C" u8 rut_helper_ws_json_string_at_path(const char* payload,
+                                                u64 len,
+                                                const char* path,
+                                                u32 path_len) {
+    return ws_json_string_at_path(reinterpret_cast<const u8*>(payload), len, {path, path_len}) ? 1u
+                                                                                               : 0u;
+}
+
+extern "C" u8 rut_helper_ws_json_string_equals_at_path(const char* payload,
+                                                       u64 len,
+                                                       const char* path,
+                                                       u32 path_len,
+                                                       const char* expected,
+                                                       u32 expected_len) {
+    return ws_json_string_equals_at_path(reinterpret_cast<const u8*>(payload),
+                                         len,
+                                         {path, path_len},
+                                         {expected, expected_len})
+               ? 1u
+               : 0u;
+}
+
 extern "C" void rut_helper_json(void* conn,
                                 void* arena,
                                 u32 op,

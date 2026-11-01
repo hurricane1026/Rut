@@ -64,11 +64,33 @@ A present field with value `null` passes `!= nil`; a missing or invalid pointer
 does not. Literal escapes, including embedded NUL, are supported. Mirrored
 comparisons and short-circuit conditions work as for other message guards.
 
-The document binding must use a fresh name, appears only after its guard and
-is limited to later `json.get` presence checks in the same handler. General JSON
-value extraction and mutation are not yet supported here. Bindings count toward
-the four-guard limit. Each reached check reparses the bounded complete payload;
-no parsed document or borrowed payload view is retained between callbacks.
+The document binding must use a fresh name and appears only after its guard.
+Bindings count toward the four-guard limit. Each reached check reparses the
+bounded complete payload; no parsed document or borrowed payload view is
+retained between callbacks.
+
+Unwrapped JSON values can also be decoded as strings for exact routing decisions:
+
+```swift
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let field = json.get(document, "/type") else { message.close(1008) }
+    guard let kind = json.string(field) else { message.close(1008) }
+    guard kind == "subscribe" else { message.drop() }
+    message.forward()
+}
+```
+
+`json.string(document)` also checks a root JSON string. A `json.get` result must
+be unwrapped before it can be passed to `json.string`; missing values, JSON null,
+numbers, booleans, arrays and objects fail the string check. A string alias may
+only be compared with a string literal using `==` or `!=` in either operand
+order. Aliases are compile-time paths into the immutable message: each reached
+check reparses the bounded payload and retains no JSON node or borrowed string
+view. Only `json.get(document, literalPointer)` and
+`json.string(unwrappedValue)` are supported in these handlers; nested `get`,
+general extraction and dynamic paths remain unsupported. These bindings and
+comparisons use the existing four-guard and 32-condition-node limits.
 
 The parser limits remain 8 KiB input, 2048 nodes and depth 64; exceeding any limit
 fails validation. Duplicate decoded object keys are rejected. For Text-only
