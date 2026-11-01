@@ -1,0 +1,36 @@
+import "middleware/auth.rut"
+
+listen :8080
+upstream backend at "127.0.0.1:8081"
+
+// Illustrative keys: replace with trusted configuration before deployment.
+// Read the one exact custom-header value and allow only the configured Consumers.
+route GET "/private" {
+    let identity = auth.multiHeaderKey(req.uniqueHeader("X-API-Key").or(""),
+        auth.HeaderKeyConsumer(consumerId: "alice", key: "alice-key", credentialId: "alice-key-id"),
+        auth.HeaderKeyConsumer(consumerId: "bob", key: "bob-key", credentialId: "bob-key-id"))
+    let allowed = auth.requireConsumer(identity, "alice")
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+// Strip the credential from forwarding after authentication reads the original request.
+route GET "/proxy" {
+    req.remove("X-API-Key")
+    let identity = auth.multiHeaderKey(req.uniqueHeader("X-API-Key").or(""),
+        auth.HeaderKeyConsumer(consumerId: "alice", key: "alice-key", credentialId: "alice-key-id"),
+        auth.HeaderKeyConsumer(consumerId: "bob", key: "bob-key", credentialId: "bob-key-id"))
+    match identity.consumerId {
+        "alice" => {
+            req.set("X-Consumer-ID", identity.consumerId)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        "bob" => {
+            req.set("X-Consumer-ID", identity.consumerId)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => return 403
+    }
+}
+
+route "/" { return 404 }
