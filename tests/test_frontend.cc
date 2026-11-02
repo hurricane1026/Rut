@@ -43172,6 +43172,21 @@ route GET "/" { let value = standardWebhookValid("user") guard value == "user" e
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     CHECK(analyze_file_heap(ast.value()));
+
+    const char* shadow = R"rut(
+import Crypto
+func jwtIssueHs256(_ subject: str, _ issuer: str, _ audience: str, _ key: str, _ ttl: i32) -> str => subject
+route GET "/" {
+    let local = jwtIssueHs256("shadow", "issuer", "orders", "key", 60)
+    let native = Crypto.issueJwtHs256("alice", "issuer", "orders", "01234567890123456789012345678901", 60)
+    return 200
+}
+)rut";
+    tokens = lex(lit(shadow));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
 }
 
 TEST(frontend, signed_request_crypto_builtin_requires_method_and_seven_unwrapped_strings) {
@@ -43247,6 +43262,36 @@ route GET "/" {
     tokens = lex(lit(shadow));
     REQUIRE(tokens);
     ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, hs256_issue_requires_typed_bounded_call_and_crypto_import_is_qualified) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { let t = jwtIssueHs256("s", "i", "a", "01234567890123456789012345678901") return 200 })rut",
+        R"rut(route GET "/" { let t = jwtIssueHs256("s", "i", "a", "k", "60") return 200 })rut",
+        R"rut(route GET "/" { let t = jwtIssueHs256("s", "i", "a", "k", 60, 1) return 200 })rut",
+        R"rut(route GET "/" { let t = jwtIssueHs256("s", "i", "a", "k", i64(60)) return 200 })rut",
+        R"rut(route GET "/" { let t = jwtIssueHs256("s", "i", "a", "k", 2147483648) return 200 })rut",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    const char* valid = R"rut(
+import Crypto
+route GET "/" {
+    let direct = jwtIssueHs256("alice", "issuer", "orders", "01234567890123456789012345678901", 60)
+    let qualified = Crypto.issueJwtHs256("alice", "issuer", "orders", "01234567890123456789012345678901", 60)
+    return 200
+}
+)rut";
+    auto tokens = lex(lit(valid));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     CHECK(analyze_file_heap(ast.value()));
 }

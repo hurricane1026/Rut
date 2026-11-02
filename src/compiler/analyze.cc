@@ -1778,14 +1778,17 @@ static FrontendResult<void> validate_import_namespace_bindings(
 }
 
 static bool is_crypto_system_export(Str value) {
-    const Str exports[] = {
-        lit_str("digestMd5"),    lit_str("digestSha1"),      lit_str("digestSha224"),
-        lit_str("digestSha256"), lit_str("digestSha384"),    lit_str("digestSha512"),
-        lit_str("macMd5"),       lit_str("macSha1"),         lit_str("macSha224"),
-        lit_str("macSha256"),    lit_str("macSha384"),       lit_str("macSha512"),
-        lit_str("equal"),        lit_str("hmacSha256Valid"), lit_str("webhookValid"),
-        lit_str("jwtAny"),       lit_str("jwtHs256"),        lit_str("jwtHs384"),
-        lit_str("jwtHs512"),     lit_str("jwtRs256"),        lit_str("signedRequestValid")};
+    const Str exports[] = {lit_str("digestMd5"),     lit_str("digestSha1"),
+                           lit_str("digestSha224"),  lit_str("digestSha256"),
+                           lit_str("digestSha384"),  lit_str("digestSha512"),
+                           lit_str("macMd5"),        lit_str("macSha1"),
+                           lit_str("macSha224"),     lit_str("macSha256"),
+                           lit_str("macSha384"),     lit_str("macSha512"),
+                           lit_str("equal"),         lit_str("hmacSha256Valid"),
+                           lit_str("webhookValid"),  lit_str("jwtAny"),
+                           lit_str("jwtHs256"),      lit_str("jwtHs384"),
+                           lit_str("jwtHs512"),      lit_str("jwtRs256"),
+                           lit_str("issueJwtHs256"), lit_str("signedRequestValid")};
     for (Str name : exports)
         if (name.eq(value)) return true;
     return false;
@@ -10083,6 +10086,39 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                             expr.span,
                             route);
     }
+    if (expr.name.eq(lit_str("jwtIssueHs256")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr Str kDetail = lit_str(
+            "jwtIssueHs256 expects subject, issuer, audience, key as unwrapped str values and "
+            "ttl as i32");
+        if (pipe_lhs != nullptr || expr.args.len != 5)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr values[5]{};
+        for (u32 i = 0; i < expr.args.len; ++i) {
+            if (expr.args[i] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            auto value = analyze_expr(*expr.args[i], route, mod, locals, local_count, binding);
+            if (!value) return value;
+            const HirTypeKind kExpected = i == 4 ? HirTypeKind::I32 : HirTypeKind::Str;
+            if (value->type != kExpected || value->may_nil || value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, kDetail);
+            values[i] = value.value();
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::JsonOp;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.int_value = static_cast<i64>(json::Op::JwtIssueHs256);
+        out.span = expr.span;
+        for (const auto& value : values) {
+            if (!route->exprs.push(value))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            if (!out.args.push(&route->exprs[route->exprs.len - 1]))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
+        return out;
+    }
     const auto copy_hir_shape = [](HirExpr* dst, const HirExpr& src) {
         dst->type = src.type;
         dst->generic_index = src.generic_index;
@@ -15117,6 +15153,8 @@ func jwtHs256(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "
 func jwtHs384(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "HS384")
 func jwtHs512(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "HS512")
 func jwtRs256(_ token: str, _ policy: str) -> Json => jwtVerifyRs256(token, policy)
+func issueJwtHs256(_ subject: str, _ issuer: str, _ audience: str, _ key: str, _ ttl: i32) =>
+    jwtIssueHs256(subject, issuer, audience, key, ttl)
 )rut";
 
 static FrontendResult<void> load_imported_modules(

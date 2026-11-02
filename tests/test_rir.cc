@@ -2585,3 +2585,38 @@ TEST(RirVerifier, JwtClaimsLifetimeChecksArityAndTypes) {
     CHECK(verify_function(fn).ok);
     ctx.destroy();
 }
+
+TEST(RirBuilder, JwtIssueHs256FiveOperandsUseOverflowStorageAndPrintSafely) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("jwt_issue"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    ValueId args[5];
+    for (u32 i = 0; i < 4; ++i) args[i] = V(b.emit_const_str(lit("value")));
+    args[4] = V(b.emit_const_i32(60));
+    auto result =
+        V(b.emit_json(static_cast<u32>(json::Op::JwtIssueHs256), TypeKind::Str, true, args, 5));
+    CHECK(fn->values[result.id].type->kind == TypeKind::Optional);
+    const auto& inst = fn->entry()->insts[5];
+    CHECK_EQ(inst.operand_count, 5u);
+    for (u32 i = 0; i < 5; ++i) CHECK_EQ(inst.operand(i).id, args[i].id);
+    CHECK_FALSE(
+        b.emit_json(static_cast<u32>(json::Op::JwtIssueHs256), TypeKind::Str, true, args, 4));
+    CHECK_FALSE(
+        b.emit_json(static_cast<u32>(json::Op::JwtIssueHs256), TypeKind::Str, true, nullptr, 5));
+    auto wrong = V(b.emit_const_i32(1));
+    args[0] = wrong;
+    CHECK_FALSE(
+        b.emit_json(static_cast<u32>(json::Op::JwtIssueHs256), TypeKind::Str, true, args, 5));
+    VOK(b.emit_ret_status(204));
+    char print_buf[4096];
+    PrintBuf pb;
+    pb.init(print_buf, sizeof(print_buf), -1);
+    print_function(pb, *fn);
+    CHECK(std::string(print_buf, pb.len).find("json.op") != std::string::npos);
+    CHECK(std::string(print_buf, pb.len).find("%4") != std::string::npos);
+    ctx.destroy();
+}
