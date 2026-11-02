@@ -2620,3 +2620,33 @@ TEST(RirBuilder, JwtIssueHs256FiveOperandsUseOverflowStorageAndPrintSafely) {
     CHECK(std::string(print_buf, pb.len).find("%4") != std::string::npos);
     ctx.destroy();
 }
+
+TEST(RirBuilder, JwtIssueHs256WithIdUsesSixOperandsAndValidatesTypes) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("jwt_issue_with_id"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    ValueId args[6];
+    for (u32 i = 0; i < 5; ++i) args[i] = V(b.emit_const_str(lit("value")));
+    args[5] = V(b.emit_const_i32(60));
+    auto result = V(
+        b.emit_json(static_cast<u32>(json::Op::JwtIssueHs256WithId), TypeKind::Str, true, args, 6));
+    CHECK(fn->values[result.id].type->kind == TypeKind::Optional);
+    const auto& inst = fn->entry()->insts[6];
+    CHECK_EQ(inst.operand_count, 6u);
+    for (u32 i = 0; i < 6; ++i) CHECK_EQ(inst.operand(i).id, args[i].id);
+    CHECK_FALSE(
+        b.emit_json(static_cast<u32>(json::Op::JwtIssueHs256WithId), TypeKind::Str, true, args, 5));
+    CHECK_FALSE(b.emit_json(
+        static_cast<u32>(json::Op::JwtIssueHs256WithId), TypeKind::Str, true, nullptr, 6));
+    const ValueId saved_id = args[3];
+    args[3] = args[5];
+    CHECK_FALSE(
+        b.emit_json(static_cast<u32>(json::Op::JwtIssueHs256WithId), TypeKind::Str, true, args, 6));
+    args[3] = saved_id;
+    VOK(b.emit_ret_status(204));
+    ctx.destroy();
+}

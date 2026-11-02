@@ -8999,6 +8999,16 @@ provided `jti` string under the same bounds and validation. Rut/JIT issuance
 with `jti` remains pending. Neither native API adds arbitrary claims, key
 identifiers, algorithm selection, dependencies or request allocations.
 
+`jwt_hs256_issue_with_id` and the Rut/JIT
+`jwtIssueHs256WithId(subject, issuer, audience, tokenId, key, ttl)` operation
+emit the same fixed profile with exactly one additional `jti` string. The ID
+uses the same UTF-8 validation, escaping and payload bound as other claim
+strings; the caller owns ID generation and uniqueness. `Crypto.issueJwtHs256WithId`
+is the qualified wrapper, and `auth.jwtForIdentityHs256WithId` copies the
+identity consumer ID into `sub`. Call the identity helper only after
+authentication. Static two-ID revocation checks remain a configuration
+snapshot and do not provide live revocation or replay protection.
+
 ### Fixed RS256 public JWK configuration
 
 The native configuration-only `RsaPublicKey::load_rs256_jwk` imports one public

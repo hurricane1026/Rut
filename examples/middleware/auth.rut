@@ -365,6 +365,12 @@ func jwtForIdentityHs256(_ identity: Identity, _ issuer: str, _ audience: str,
     _ key: str, _ ttl: i32) =>
     Crypto.issueJwtHs256(identity.consumerId, issuer, audience, key, ttl)
 
+// This helper uses consumerId as sub and the caller-provided request ID as jti.
+// Identity carries no authentication provenance; call only after authentication.
+func jwtForIdentityHs256WithId(_ identity: Identity, _ issuer: str, _ audience: str,
+    _ tokenId: str, _ key: str, _ ttl: i32) =>
+    Crypto.issueJwtHs256WithId(identity.consumerId, issuer, audience, tokenId, key, ttl)
+
 // Use only after signature and issuer/audience/time validation. Each configured
 // ID belongs to the same trusted issuer as the verified claims; empty slots are
 // disabled. Changing this static snapshot requires a configuration reload.

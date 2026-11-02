@@ -441,15 +441,20 @@ escaped. Claims and output are bounded to 8192 and 11004 bytes respectively.
 The native APIs use existing pinned static SHA-256 HMAC support, write only to
 caller-owned buffers, retain no views and reject buffer aliasing. The native
 `jwt_hs256_issue_with_id` adds exactly one caller-supplied `jti` string under
-the same validation and size bounds; ID uniqueness remains the caller’s
-responsibility. The Rut/JIT five-claim builtin samples realtime once and stores
-a successful token in the request JSON arena; failure returns nil.
+the same validation and size bounds; the caller is responsible for ID
+uniqueness. The Rut/JIT five-claim builtin samples realtime once and stores a
+successful token in the request JSON arena; failure returns nil.
 `Crypto.issueJwtHs256` is its qualified wrapper. `auth.jwtForIdentityHs256`
 uses `identity.consumerId` as `sub`, but Identity values carry no authentication
-provenance, so call it only after successful authentication. Tests cover strict
-claims round-trip, failures, tampering, zero allocations and JIT request-arena
-ownership. Rut/JIT issuance with `jti`, arbitrary claim sets and other signing
-algorithms are not part of this API.
+provenance, so call it only after successful authentication.
+
+The Rut/JIT `jwtIssueHs256WithId` and `Crypto.issueJwtHs256WithId` variant adds
+one caller-supplied `jti` string; `auth.jwtForIdentityHs256WithId` provides the
+same identity-based subject convenience. Issuance does not guarantee
+uniqueness or prevent replay. `auth.requireUnrevokedJwt` checks only its
+configured static two-ID snapshot. Tests cover strict claims round-trip,
+failures, tampering, zero allocations, and JIT request-arena ownership.
+Arbitrary claims and other signing algorithms are not supported.
 
 ## Asymmetric key ownership foundation
 

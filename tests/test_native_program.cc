@@ -36,6 +36,7 @@ TEST(native_program, helper_resolver_rejects_unlisted_symbols) {
     CHECK(find_native_helper(lit_str("rut_helper_hash_extra")) == nullptr);
     CHECK(find_native_helper({nullptr, 1}) == nullptr);
     CHECK(find_native_helper(lit_str("rut_helper_jwt_issue_hs256")) != nullptr);
+    CHECK(find_native_helper(lit_str("rut_helper_jwt_issue_hs256_with_id")) != nullptr);
 }
 namespace {
 struct Source {
@@ -303,6 +304,37 @@ TEST(native_program, jwt_issue_helper_survives_native_artifact_source_removal) {
         "else { return 501 } "
         "guard jwtClaimsValid(claims, \"issuer\", \"orders\") else { return 502 } "
         "return 204 }\n";
+    REQUIRE(source.append(rut_source, sizeof(rut_source) - 1));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(owner.p->config.route_count, 1u);
+    REQUIRE_EQ(unlink(source.path), 0);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    jit::HandlerCtx ctx{};
+    const char request[] = "GET /token HTTP/1.1\r\nHost: test\r\n\r\n";
+    const auto result = jit::HandlerResult::unpack(owner.p->config.routes[0].fn(
+        nullptr, &ctx, reinterpret_cast<const u8*>(request), sizeof(request) - 1, &arena));
+    CHECK_EQ(result.status_code, 204u);
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(native_program, jwt_issue_with_id_helper_survives_native_artifact_source_removal) {
+    Source source;
+    const char rut_source[] =
+        "route GET \"/token\" { let issued = jwtIssueHs256WithId(\"alice\", \"issuer\", "
+        "\"orders\", \"request-42\", \"01234567890123456789012345678901\", 60) "
+        "guard let token = issued else { return 503 } "
+        "guard let claims = jwtDecode(token, \"01234567890123456789012345678901\", \"HS256\") "
+        "else { return 501 } "
+        "guard jwtClaimsValid(claims, \"issuer\", \"orders\") else { return 502 } "
+        "guard let idJson = json.get(claims, \"/jti\") else { return 504 } "
+        "guard let tokenId = json.string(idJson) else { return 505 } "
+        "guard tokenId == \"request-42\" else { return 506 } return 204 }\n";
     REQUIRE(source.append(rut_source, sizeof(rut_source) - 1));
     Program owner;
     REQUIRE(owner.p);
