@@ -1160,6 +1160,172 @@ route GET "/identity" {
     pool.destroy();
 }
 
+TEST(json_network, hs256_jwt_lifetime_policy_gates_identity_and_clock) {
+    JsonProgram program;
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/jwt-claims-auth.rut";
+    REQUIRE(program.init(R"rut(
+import "middleware/auth.rut"
+route GET "/identity" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), "01234567890123456789012345678901")
+    let identity = auth.jwtIdentityWithLifetime(document, "issuer", "gateway", "jwt-credential", 100, 200)
+    guard identity.consumerId == "alice" && identity.credentialId == "jwt-credential" && identity.method == "jwt" else { return 500 }
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
+route GET "/age-limit" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), "01234567890123456789012345678901")
+    let identity = auth.jwtIdentityWithLifetime(document, "issuer", "gateway", "jwt-credential", 99, 200)
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
+route GET "/lifetime-limit" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), "01234567890123456789012345678901")
+    let identity = auth.jwtIdentityWithLifetime(document, "issuer", "gateway", "jwt-credential", 100, 200)
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
+route GET "/missing-iat" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), "01234567890123456789012345678901")
+    let identity = auth.jwtIdentityWithLifetime(document, "issuer", "gateway", "jwt-credential", 100, 200)
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
+route GET "/wrong-issuer" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), "01234567890123456789012345678901")
+    let identity = auth.jwtIdentityWithLifetime(document, "other-issuer", "gateway", "jwt-credential", 100, 200)
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
+route GET "/bad-config" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), "01234567890123456789012345678901")
+    let identity = auth.jwtIdentityWithLifetime(document, "issuer", "gateway", "jwt-credential", 0, 200)
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
+)rut",
+                         source_path.c_str()));
+    REQUIRE_EQ(program.config->route_count, 6u);
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    conn->json_arena.backend.pool = &pool;
+
+    const auto encode = [](const std::string& input) {
+        std::string output(4 * ((input.size() + 2) / 3) + 1, '\0');
+        const int count = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(output.data()),
+                                          reinterpret_cast<const unsigned char*>(input.data()),
+                                          static_cast<int>(input.size()));
+        output.resize(count);
+        for (char& c : output) {
+            if (c == '+')
+                c = '-';
+            else if (c == '/')
+                c = '_';
+        }
+        while (!output.empty() && output.back() == '=') output.pop_back();
+        return output;
+    };
+    const auto sign = [&](const char* claims) {
+        const std::string message = "eyJhbGciOiJIUzI1NiJ9." + encode(claims);
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned int digest_len = 0;
+        HMAC(EVP_sha256(),
+             "01234567890123456789012345678901",
+             32,
+             reinterpret_cast<const unsigned char*>(message.data()),
+             message.size(),
+             digest,
+             &digest_len);
+        return message + "." +
+               encode(std::string(reinterpret_cast<const char*>(digest), digest_len));
+    };
+    const std::string valid =
+        sign(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":1100})");
+    const std::string too_old =
+        sign(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":899,"exp":1100})");
+    const std::string too_long =
+        sign(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":1101})");
+    const std::string no_iat = sign(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":1100})");
+    std::string tampered = valid;
+    tampered.back() = tampered.back() == 'A' ? 'B' : 'A';
+    const char* route_paths[] = {"/identity",
+                                 "/age-limit",
+                                 "/lifetime-limit",
+                                 "/missing-iat",
+                                 "/wrong-issuer",
+                                 "/bad-config"};
+
+    auto run = [&](const char* path,
+                   const std::string& token,
+                   u32 status,
+                   const test_fault::SyscallFaultConfig& clock,
+                   bool invalid_token = false) {
+        u32 route_index = program.config->route_count;
+        for (u32 i = 0; i < program.config->route_count; ++i)
+            if (std::string(path) == route_paths[i]) route_index = i;
+        CHECK_LT(route_index, program.config->route_count);
+        if (route_index >= program.config->route_count) return std::string{};
+        const auto handler = program.handler(route_index);
+        const std::string request = std::string("GET ") + path +
+                                    " HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer " + token +
+                                    "\r\n\r\n";
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        const u32 written =
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size());
+        CHECK_EQ(written, request.size());
+        if (written != request.size()) return std::string{};
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        test_fault::ScopedSyscallFault fault(clock);
+        const auto outcome = invoke_jit_handler(
+            handler, conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        CHECK_EQ(outcome.status_code, status);
+        handle_jit_outcome(loop.get(), *conn, outcome, handler, true);
+        const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+        CHECK(wire.find("HTTP/1.1 " + std::to_string(status)) == 0);
+        if (status == 200)
+            CHECK(wire.ends_with("alice"));
+        else
+            CHECK(wire.find("alice") == std::string::npos);
+        if (status == 401) CHECK(wire.find("WWW-Authenticate: Bearer") != std::string::npos);
+        if (invalid_token) CHECK(wire.find("Bearer error=\"invalid_token\"") != std::string::npos);
+        return wire;
+    };
+    const auto good_clock = test_fault::fixed_clock_gettime(CLOCK_REALTIME, 1000, 0);
+    run("/identity", valid, 200, good_clock);
+    run("/age-limit", valid, 401, good_clock, true);
+    run("/lifetime-limit", too_long, 401, good_clock, true);
+    run("/identity", too_old, 401, good_clock, true);
+    run("/missing-iat", no_iat, 401, good_clock, true);
+    run("/wrong-issuer", valid, 401, good_clock, true);
+    run("/bad-config", valid, 503, good_clock);
+    run("/identity", tampered, 401, good_clock);
+    run("/identity", valid, 401, test_fault::fixed_clock_gettime(CLOCK_REALTIME, 0, 0), true);
+    run("/identity", valid, 401, test_fault::fixed_clock_gettime(CLOCK_REALTIME, -1, 0), true);
+    run("/identity", valid, 401, test_fault::fixed_clock_gettime(CLOCK_REALTIME, 1000, -1), true);
+    run("/identity",
+        valid,
+        401,
+        test_fault::fixed_clock_gettime(CLOCK_REALTIME, 1000, 1000000000),
+        true);
+    test_fault::SyscallFaultConfig clock_failure{};
+    clock_failure.clock_gettime_errno = EIO;
+    clock_failure.clock_gettime_failures = 1;
+    run("/identity", valid, 401, clock_failure, true);
+
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
 TEST(json_network, jwt_algorithm_middleware_rejects_empty_secret) {
     const std::string file = __FILE__;
     const std::string source_path =
@@ -1306,6 +1472,61 @@ route GET "/rs256" {
         test_fault::ScopedSyscallFault fault(clock);
         run(good, 401);
     }
+
+    JsonProgram lifetime_program;
+    REQUIRE(lifetime_program.init(R"rut(
+import "middleware/auth.rut"
+route GET "/rs256-lifetime" {
+    let configured = env("RUT_TEST_RS256_POLICY")
+    let policy = configured
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), policy)
+    let identity = auth.jwtIdentityWithLifetime(document, "issuer", "gateway", "rsa-credential", 100, 200)
+    guard identity.consumerId == "alice" && identity.credentialId == "rsa-credential" && identity.method == "jwt" else { return 500 }
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
+)rut",
+                                  source_path.c_str()));
+    CHECK_EQ(lifetime_program.config->rs256_configuration_count, 1u);
+    conn->shard_id = 0;
+    REQUIRE(lifetime_program.config->activate_rs256(0));
+    const auto run_lifetime = [&](const char* claims, u32 status) {
+        const Str signed_token = fixture.sign(test::Rs256Fixture::header, cstr(claims), token);
+        REQUIRE(signed_token.len > 0);
+        const std::string request =
+            "GET /rs256-lifetime HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer " +
+            std::string(signed_token.ptr, signed_token.len) + "\r\n\r\n";
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        conn->json_arena.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = lifetime_program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        test_fault::ScopedSyscallFault fixed_clock(
+            test_fault::fixed_clock_gettime(CLOCK_REALTIME, 1000, 0));
+        const auto outcome = invoke_jit_handler(lifetime_program.handler(),
+                                                conn,
+                                                *ctx,
+                                                conn->recv_buf.data(),
+                                                conn->recv_buf.len(),
+                                                nullptr);
+        CHECK_EQ(outcome.status_code, status);
+        handle_jit_outcome(loop.get(), *conn, outcome, lifetime_program.handler(), true);
+        const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+        CHECK(wire.find("HTTP/1.1 " + std::to_string(status)) == 0);
+        if (status == 200)
+            CHECK(wire.ends_with("alice"));
+        else
+            CHECK(wire.find("WWW-Authenticate: Bearer") != std::string::npos);
+    };
+    run_lifetime(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":1100})", 200);
+    run_lifetime(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":899,"exp":1100})", 401);
+    run_lifetime(R"({"sub":"alice","iss":"issuer","aud":"gateway","iat":900,"exp":1101})", 401);
     loop->free_conn(*conn);
     pool.destroy();
 }

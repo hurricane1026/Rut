@@ -1,5 +1,6 @@
 #include "deferred_preflight_fixture.h"
 #include "framing_selection_preflight_fixture.h"
+#include "rs256_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -42432,6 +42433,99 @@ TEST(frontend, jwt_claims_policy_requires_unwrapped_json_and_string_configuratio
         REQUIRE(ast);
         CHECK(!analyze_file_heap(ast.value()));
     }
+}
+
+TEST(frontend, jwt_lifetime_policy_accepts_i64_and_rejects_wrong_or_optional_types) {
+    const char* valid = R"rut(route GET "/" {
+    guard let doc = json.parse("{}") else { return 400 }
+    let age = time.nowMicros()
+    if jwtClaimsValidWithLifetime(doc, "issuer", "audience", age, i64(3600)) {
+        return 200
+    } else { return 401 }
+})rut";
+    auto tokens = lex(lit(valid));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+
+    const char* invalid[] = {
+        R"rut(route GET "/" { if jwtClaimsValidWithLifetime("{}", "issuer", "aud", i64(1), i64(2)) { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { if jwtClaimsValidWithLifetime(json.parse("{}"), "issuer", "aud", i64(1), i64(2)) { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtClaimsValidWithLifetime(doc, 1, "aud", i64(1), i64(2)) { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtClaimsValidWithLifetime(doc, "issuer", "aud", 1, i64(2)) { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } let age: i32 = 10 if jwtClaimsValidWithLifetime(doc, "issuer", "aud", age, i64(2)) { return 200 } else { return 401 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } let age = json.int(doc) if jwtClaimsValidWithLifetime(doc, "issuer", "aud", age, i64(2)) { return 200 } else { return 401 } })rut",
+    };
+    for (const char* source : invalid) {
+        auto bad_tokens = lex(lit(source));
+        REQUIRE(bad_tokens);
+        auto bad_ast = parse_file_heap(bad_tokens.value());
+        REQUIRE(bad_ast);
+        CHECK(!analyze_file_heap(bad_ast.value()));
+    }
+}
+
+TEST(frontend, jwt_lifetime_builtin_respects_user_shadowing) {
+    const char* source = R"rut(
+func jwtClaimsValidWithLifetime(_ claims: Json, _ issuer: str, _ audience: str, _ age: i32, _ lifetime: i32) -> bool => true
+route GET "/" {
+    guard let doc = json.parse("{}") else { return 400 }
+    if jwtClaimsValidWithLifetime(doc, "issuer", "aud", 1, 2) { return 200 } else { return 401 }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, jwt_lifetime_example_compiles_with_hs_and_rs256_policies) {
+    struct RestoreEnvironment {
+        const char* name;
+        bool was_set;
+        std::string value;
+        explicit RestoreEnvironment(const char* env_name) : name(env_name) {
+            const char* existing = getenv(name);
+            was_set = existing != nullptr;
+            if (was_set) value = existing;
+        }
+        ~RestoreEnvironment() {
+            if (was_set)
+                setenv(name, value.c_str(), 1);
+            else
+                unsetenv(name);
+        }
+    } hs_secret("JWT_LIFETIME_HS256_SECRET"), rs_policy("JWT_LIFETIME_RS256_POLICY");
+    REQUIRE_EQ(setenv("JWT_LIFETIME_HS256_SECRET", "jwt-lifetime-test-secret", 1), 0);
+    rut::test::Rs256Fixture fixture;
+    REQUIRE(fixture.init());
+    std::string policy(fixture.policy.ptr, fixture.policy.len);
+    const auto issuer = policy.find("\"issuer\":\"issuer\"");
+    REQUIRE(issuer != std::string::npos);
+    policy.replace(
+        issuer, sizeof("\"issuer\":\"issuer\"") - 1, "\"issuer\":\"https://issuer.example\"");
+    const auto audience = policy.find("\"audience\":\"gateway\"");
+    REQUIRE(audience != std::string::npos);
+    policy.replace(audience, sizeof("\"audience\":\"gateway\"") - 1, "\"audience\":\"orders\"");
+    REQUIRE_EQ(setenv("JWT_LIFETIME_RS256_POLICY", policy.c_str(), 1), 0);
+    const auto example_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                              "examples/jwt-lifetime-auth.rut";
+    std::ifstream input(example_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), example_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
 }
 
 TEST(frontend, jwt_scope_requires_unwrapped_json_and_one_string) {

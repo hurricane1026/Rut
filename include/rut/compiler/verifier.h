@@ -44,6 +44,7 @@ enum class VerifyIssueCode : u8 {
     InvalidForwardPreflight,
     InvalidHttpCachePolicy,
     InvalidPreRoutePolicyId,
+    InvalidJwtClaimsLifetime,
 };
 
 struct VerifyIssue {
@@ -752,6 +753,33 @@ inline VerifyResult verify_function(const Function* fn,
                 return verify_fail(
                     summary, VerifyIssueCode::TerminatorBeforeEnd, function_index, bi, ii);
             }
+        }
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const Instruction& inst = block.insts[ii];
+            if (inst.op != Opcode::JwtClaimsValidWithLifetime) continue;
+            auto exact_type = [&](ValueId id, TypeKind kind) {
+                if (id == kNoValue || id.id >= fn->value_count || fn->values == nullptr)
+                    return false;
+                const Type* type = fn->values[id.id].type;
+                return type != nullptr && type->kind == kind && type->inner == nullptr &&
+                       type->struct_def == nullptr;
+            };
+            bool valid = inst.operand_count == 5 && inst.extra_operands != nullptr &&
+                         inst.result != kNoValue && inst.result.id < fn->value_count &&
+                         exact_type(inst.result, TypeKind::Bool);
+            constexpr TypeKind kOperandTypes[] = {
+                TypeKind::Str, TypeKind::Str, TypeKind::Str, TypeKind::I64, TypeKind::I64};
+            if (valid) {
+                for (u32 oi = 0; oi < 5; ++oi) {
+                    if (!exact_type(inst.operand(oi), kOperandTypes[oi])) {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if (!valid)
+                return verify_fail(
+                    summary, VerifyIssueCode::InvalidJwtClaimsLifetime, function_index, bi, ii);
         }
 
         const Instruction& term = block.insts[block.inst_count - 1];
@@ -1604,6 +1632,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "UnreachableBlock";
         case VerifyIssueCode::InvalidForwardPreflight:
             return "InvalidForwardPreflight";
+        case VerifyIssueCode::InvalidJwtClaimsLifetime:
+            return "InvalidJwtClaimsLifetime";
     }
     return "Unknown";
 }

@@ -208,6 +208,14 @@ rut::u8 rut_helper_signed_request_valid(rut::u8 method,
                                         rut::u32 key_id_len,
                                         const char* key,
                                         rut::u32 key_len);
+rut::u8 rut_helper_jwt_claims_valid_with_lifetime(const char* claims,
+                                                  rut::u32 claims_len,
+                                                  const char* issuer,
+                                                  rut::u32 issuer_len,
+                                                  const char* audience,
+                                                  rut::u32 audience_len,
+                                                  rut::i64 max_age_seconds,
+                                                  rut::i64 max_lifetime_seconds);
 
 rut::u8 rut_helper_hmac_sha256_matches(const char* message,
                                        rut::u32 message_len,

@@ -341,6 +341,23 @@ func jwtIdentity(_ document: Json, _ issuer: str, _ audience: str, _ credentialI
     Identity(consumerId: subject.sub, credentialId: credentialId, method: "jwt")
 }
 
+// Pass a document only after signature verification. The shared claims policy
+// requires a positive iat and bounds both token age and exp-to-iat lifetime.
+func jwtIdentityWithLifetime(_ verifiedDoc: Json, _ issuer: str, _ audience: str,
+                             _ credentialId: str, _ maxAge: i32,
+                             _ maxLifetime: i32) -> Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard issuer != "" && audience != "" && credentialId != "" && maxAge > 0 &&
+        maxLifetime > 0 else { respond 503 }
+    guard jwtClaimsValidWithLifetime(
+        verifiedDoc, issuer, audience, i64(maxAge), i64(maxLifetime)) else {
+        respond denied
+    }
+    guard let subject = json.decode(JwtSubject, verifiedDoc) else { respond denied }
+    Identity(consumerId: subject.sub, credentialId: credentialId, method: "jwt")
+}
+
 // Use only after signature and issuer/audience/time validation. Each configured
 // ID belongs to the same trusted issuer as the verified claims; empty slots are
 // disabled. Changing this static snapshot requires a configuration reload.

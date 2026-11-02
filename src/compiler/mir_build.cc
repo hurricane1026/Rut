@@ -819,6 +819,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         expr.kind == HirExprKind::HttpTokenListAllows ||
         expr.kind == HirExprKind::StandardWebhookValid ||
         expr.kind == HirExprKind::SignedRequestValid ||
+        expr.kind == HirExprKind::JwtClaimsValidWithLifetime ||
         expr.kind == HirExprKind::HmacSha256Matches || expr.kind == HirExprKind::BearerMatches ||
         expr.kind == HirExprKind::BasicMatches || expr.kind == HirExprKind::ConstantTimeEqual ||
         expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
@@ -854,6 +855,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                 break;
             case HirExprKind::SignedRequestValid:
                 v.kind = MirValueKind::SignedRequestValid;
+                break;
+            case HirExprKind::JwtClaimsValidWithLifetime:
+                v.kind = MirValueKind::JwtClaimsValidWithLifetime;
                 break;
             case HirExprKind::HmacSha256Matches:
                 v.kind = MirValueKind::HmacSha256Matches;
@@ -918,13 +922,15 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.rhs = rhs_ptr;
         if (expr.kind == HirExprKind::StandardWebhookValid ||
             expr.kind == HirExprKind::SignedRequestValid ||
+            expr.kind == HirExprKind::JwtClaimsValidWithLifetime ||
             expr.kind == HirExprKind::HmacSha256Matches ||
             expr.kind == HirExprKind::HttpTokenListAllows ||
             expr.kind == HirExprKind::HttpOriginListAllows) {
-            for (u32 i = 0; i < (expr.kind == HirExprKind::SignedRequestValid     ? 6u
-                                 : expr.kind == HirExprKind::StandardWebhookValid ? 3u
-                                 : expr.kind == HirExprKind::HmacSha256Matches    ? 2u
-                                                                                  : 1u);
+            for (u32 i = 0; i < (expr.kind == HirExprKind::JwtClaimsValidWithLifetime ? 3u
+                                 : expr.kind == HirExprKind::SignedRequestValid       ? 6u
+                                 : expr.kind == HirExprKind::StandardWebhookValid     ? 3u
+                                 : expr.kind == HirExprKind::HmacSha256Matches        ? 2u
+                                                                                      : 1u);
                  ++i) {
                 auto signature = mir_value(*expr.args[i], module, fn, ctx);
                 if (!signature) return core::make_unexpected(signature.error());
