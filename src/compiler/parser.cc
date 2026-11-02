@@ -2908,10 +2908,25 @@ struct Parser {
                 // (mirrors @throttle's bandwidth parse). Only meaningful with a message-handler
                 // block (terminate); rejected on the bare passthrough form below.
                 u32 ws_max_size = 0;
-                if (cur().type == TokenType::Comma) {
+                bool ws_has_subprotocol = false;
+                while (cur().type == TokenType::Comma) {
                     pos++;  // consume `,`
                     auto kw = expect(TokenType::Ident);
-                    if (!kw || !kw.value()->text.eq({"maxMessageSize", 14}))
+                    if (!kw) return core::make_unexpected(kw.error());
+                    if (kw.value()->text.eq({"subprotocol", 11})) {
+                        if (ws_has_subprotocol)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(start));
+                        if (!expect(TokenType::Colon))
+                            return frontend_error(FrontendError::UnexpectedToken, span_from(start));
+                        auto value = expect(TokenType::StringLit);
+                        if (!value) return core::make_unexpected(value.error());
+                        ws_has_subprotocol = true;
+                        stmt.ws_subprotocol = value.value()->text;
+                        stmt.ws_subprotocol_span = span_from(*value.value());
+                        continue;
+                    }
+                    if (ws_max_size != 0 || !kw.value()->text.eq({"maxMessageSize", 14}))
                         return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
                     if (!expect(TokenType::Colon))
                         return frontend_error(FrontendError::UnexpectedToken, span_from(start));
@@ -2985,7 +3000,7 @@ struct Parser {
                 }
                 // Passthrough form (no block): maxMessageSize only governs terminate-mode
                 // reassembly, so it's meaningless here — reject rather than silently ignore it.
-                if (ws_max_size != 0)
+                if (ws_max_size != 0 || ws_has_subprotocol)
                     return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
                 stmt.kind = AstStmtKind::ForwardUpstream;
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};

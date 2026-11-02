@@ -874,6 +874,16 @@ return websocket(chat) { message in
 // explicit application guard. Bare websocket(chat) passthrough keeps generic
 // Upgrade behavior. This bounded supported shape is not full RFC 6455 conformance.
 
+// Require one case-sensitive subprotocol on a terminate route. The string literal
+// must decode to one nonempty ASCII HTTP token. Both named arguments may appear
+// in either order, once each. Missing client offers get 400 before upstream
+// connect. The backend receives only this offer and must select it in its 101;
+// omission or mismatch closes before sending 101. The option requires a block.
+return websocket(chat, subprotocol: "graphql-transport-ws", maxMessageSize: 4kb) { message in
+    message.forward()
+}
+// Omitting subprotocol keeps optional, backend-selected negotiation.
+
 // The runtime bounds a graceful Close or clean-EOF drain to about five
 // seconds; a healthy quiet tunnel has no idle timeout.
 

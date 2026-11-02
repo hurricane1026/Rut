@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/runtime/http_parser.h"
 
@@ -9,14 +10,32 @@ enum class WsHandshakeRequestResult : u8 { Ready, BadRequest, VersionRequired, I
 
 inline constexpr u32 kWsHandshakeAcceptLength = 28;
 
+// RFC 6455 subprotocol identifiers are nonempty, case-sensitive HTTP tokens.
+inline bool ws_valid_subprotocol(Str value) {
+    if (value.ptr == nullptr || value.len == 0) return false;
+    for (u32 i = 0; i < value.len; i++)
+        if (!is_http_tchar(static_cast<u8>(value.ptr[i]))) return false;
+    return true;
+}
+
 // Validate the bounded HTTP/1.1 opening request and write its expected Accept
 // plus canonical offered-protocol list into caller-owned SlicePool storage.
 // Request bytes are borrowed only for this synchronous call.
-WsHandshakeRequestResult ws_prepare_handshake(
-    const u8* request, u32 header_len, u8* storage, u32 storage_capacity, u32* out_offers_len);
+WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
+                                              u32 header_len,
+                                              u8* storage,
+                                              u32 storage_capacity,
+                                              u32* out_offers_len,
+                                              Str required_subprotocol = {});
 
 bool ws_handshake_response_matches(const ParsedResponse& response,
                                    const u8* storage,
-                                   u32 offers_len);
+                                   u32 offers_len,
+                                   Str required_subprotocol = {});
+
+// Restrict validated request protocol fields to one required offer, without growing
+// the header or touching the coalesced WebSocket bytes. Returns the new header length.
+// The input must already have passed ws_prepare_handshake with this policy.
+u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str required_subprotocol);
 
 }  // namespace rut

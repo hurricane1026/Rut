@@ -4419,6 +4419,27 @@ TEST(serve_loader, websocket_terminate_rejects_effectful_http_guard) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_subprotocol_is_owned_after_compiler_state_is_retired) {
+    const std::string dir = "/tmp/rut_serve_loader_ws_subprotocol";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend, "
+                                        "subprotocol: \"graphql\\u{2d}transport-ws\") "
+                                        "{ message in message.forward() } }\n");
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(program.config.route_count, 1u);
+    // load_rut_program has already retired its frontend AST/HIR storage. The
+    // handshake policy must be copied into the serving configuration's arena.
+    CHECK(program.config.routes[0].ws_subprotocol.eq(lit_str("graphql-transport-ws")));
+    CHECK(program.config.routes[0].ws_terminate);
+    program.destroy();
+    REQUIRE(std::filesystem::remove(path));
+    REQUIRE(std::filesystem::remove(dir));
+}
+
 TEST(serve_loader, websocket_terminate_route_registers_and_runs) {
     // End-to-end (Phase 4 D/E): a `websocket(x){ message in message.drop() }` route compiles, its
     // constant verdict is JIT'd, and it's published as a terminate route whose frame handler — when

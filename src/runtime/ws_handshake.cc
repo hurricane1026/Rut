@@ -221,8 +221,12 @@ bool request_upgrade_value_is_valid(Str value, bool* offers_websocket) {
 
 }  // namespace
 
-WsHandshakeRequestResult ws_prepare_handshake(
-    const u8* request, u32 header_len, u8* storage, u32 storage_capacity, u32* out_offers_len) {
+WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
+                                              u32 header_len,
+                                              u8* storage,
+                                              u32 storage_capacity,
+                                              u32* out_offers_len,
+                                              Str required_subprotocol) {
     if (request == nullptr || header_len == 0 || header_len > SlicePool::kSliceSize ||
         out_offers_len == nullptr ||
         (storage != nullptr && storage_capacity < kWsHandshakeAcceptLength + 1))
@@ -284,6 +288,25 @@ WsHandshakeRequestResult ws_prepare_handshake(
             version_number = version_number * 10 + static_cast<u32>(version.ptr[i] - '0');
     if (version_number > 255) return WsHandshakeRequestResult::BadRequest;
     if (version_number != 13) return WsHandshakeRequestResult::VersionRequired;
+    if (required_subprotocol.len != 0) {
+        if (!ws_valid_subprotocol(required_subprotocol))
+            return WsHandshakeRequestResult::BadRequest;
+        bool offered = false;
+        for (u32 i = 0; i < parsed.header_count; i++) {
+            const Header& header = parsed.headers[i];
+            if (!name_is(header.name, "sec-websocket-protocol", 22)) continue;
+            u32 start = 0;
+            for (;;) {
+                u32 end = start;
+                while (end < header.value.len && header.value.ptr[end] != ',') end++;
+                offered |=
+                    trim_ows({header.value.ptr + start, end - start}).eq(required_subprotocol);
+                if (end == header.value.len) break;
+                start = end + 1;
+            }
+        }
+        if (!offered) return WsHandshakeRequestResult::BadRequest;
+    }
     if (storage == nullptr) return WsHandshakeRequestResult::Ready;
     if (!encode_accept(key, storage, storage_capacity))
         return WsHandshakeRequestResult::InternalError;
@@ -294,8 +317,10 @@ WsHandshakeRequestResult ws_prepare_handshake(
 
 bool ws_handshake_response_matches(const ParsedResponse& response,
                                    const u8* storage,
-                                   u32 offers_len) {
+                                   u32 offers_len,
+                                   Str required_subprotocol) {
     if (storage == nullptr || offers_len > SlicePool::kSliceSize - kWsHandshakeAcceptLength ||
+        (required_subprotocol.len != 0 && !ws_valid_subprotocol(required_subprotocol)) ||
         response.header_count > kMaxHeaders || response.version != HttpVersion::Http11 ||
         response.status_code != 101 || response.headers_truncated)
         return false;
@@ -304,7 +329,7 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
     u32 protocol_count = 0;
     bool upgrade_ok = false;
     bool connection_upgrade = false;
-    bool protocol_ok = true;
+    bool protocol_ok = required_subprotocol.len == 0;
     for (u32 i = 0; i < response.header_count; i++) {
         const Header& header = response.headers[i];
         if (name_is(header.name, "upgrade", 7)) {
@@ -327,11 +352,65 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
             if (++protocol_count != 1) return false;
             const Str kValue = trim_ows(header.value);
             protocol_ok = protocol_token_valid(kValue) &&
-                          offered_protocol_exists(storage, offers_len, kValue);
+                          offered_protocol_exists(storage, offers_len, kValue) &&
+                          (required_subprotocol.len == 0 || kValue.eq(required_subprotocol));
         }
     }
     return upgrade_count == 1 && upgrade_ok && connection_upgrade && accept_count == 1 &&
            protocol_ok;
+}
+
+u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str required_subprotocol) {
+    if (request == nullptr || header_len > total_len || header_len < 4 ||
+        total_len > SlicePool::kSliceSize || !ws_valid_subprotocol(required_subprotocol))
+        return 0;
+    u32 read = 0;
+    u32 write = 0;
+    bool selected = false;
+    while (read < header_len) {
+        u32 end = read;
+        while (end + 1 < header_len && (request[end] != '\r' || request[end + 1] != '\n')) end++;
+        if (end + 1 >= header_len) return 0;
+        const u32 kNext = end + 2;
+        u32 colon = read;
+        while (colon < end && request[colon] != ':') colon++;
+        const bool kIsProtocol =
+            colon < end && http_header_name_eq_ci(reinterpret_cast<const char*>(request + read),
+                                                  colon - read,
+                                                  "sec-websocket-protocol",
+                                                  22);
+        if (kIsProtocol) {
+            bool contains = false;
+            u32 start = colon + 1;
+            while (start < end) {
+                u32 stop = start;
+                while (stop < end && request[stop] != ',') stop++;
+                contains |= trim_ows({reinterpret_cast<const char*>(request + start), stop - start})
+                                .eq(required_subprotocol);
+                start = stop + 1;
+            }
+            if (!selected && contains) {
+                static constexpr char kHeader[] = "Sec-WebSocket-Protocol:";
+                const u32 kLength = sizeof(kHeader) - 1 + required_subprotocol.len + 2;
+                if (kLength > kNext - read) return 0;
+                __builtin_memcpy(request + write, kHeader, sizeof(kHeader) - 1);
+                write += sizeof(kHeader) - 1;
+                __builtin_memcpy(
+                    request + write, required_subprotocol.ptr, required_subprotocol.len);
+                write += required_subprotocol.len;
+                request[write++] = '\r';
+                request[write++] = '\n';
+                selected = true;
+            }
+        } else {
+            __builtin_memmove(request + write, request + read, kNext - read);
+            write += kNext - read;
+        }
+        read = kNext;
+    }
+    if (!selected) return 0;
+    __builtin_memmove(request + write, request + header_len, total_len - header_len);
+    return write;
 }
 
 }  // namespace rut

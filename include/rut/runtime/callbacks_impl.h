@@ -1648,8 +1648,12 @@ bool ws_prepare_handshake_before_forward(Loop* loop, Connection& conn) {
                       candidate->free_ws_handshake_slice(static_cast<u8*>(nullptr));
                   }) {
         u32 validated_offers_len = 0;
-        const WsHandshakeRequestResult validation = ws_prepare_handshake(
-            conn.recv_buf.data(), conn.req_header_end, nullptr, 0, &validated_offers_len);
+        const WsHandshakeRequestResult validation = ws_prepare_handshake(conn.recv_buf.data(),
+                                                                         conn.req_header_end,
+                                                                         nullptr,
+                                                                         0,
+                                                                         &validated_offers_len,
+                                                                         conn.ws_subprotocol);
         if (validation != WsHandshakeRequestResult::Ready) {
             switch (validation) {
                 case WsHandshakeRequestResult::Ready:
@@ -1672,8 +1676,12 @@ bool ws_prepare_handshake_before_forward(Loop* loop, Connection& conn) {
             return false;
         }
         u32 offers_len = 0;
-        const WsHandshakeRequestResult result = ws_prepare_handshake(
-            conn.recv_buf.data(), conn.req_header_end, slice, SlicePool::kSliceSize, &offers_len);
+        const WsHandshakeRequestResult result = ws_prepare_handshake(conn.recv_buf.data(),
+                                                                     conn.req_header_end,
+                                                                     slice,
+                                                                     SlicePool::kSliceSize,
+                                                                     &offers_len,
+                                                                     conn.ws_subprotocol);
         if (result != WsHandshakeRequestResult::Ready) {
             loop->free_ws_handshake_slice(slice);
             switch (result) {
@@ -1690,6 +1698,22 @@ bool ws_prepare_handshake_before_forward(Loop* loop, Connection& conn) {
                     break;
             }
             return false;
+        }
+        if (conn.ws_subprotocol.len != 0) {
+            const u32 kOldHeader = conn.req_header_end;
+            const u32 kNewHeader = ws_restrict_subprotocol(
+                conn.recv_slice, kOldHeader, conn.recv_buf.len(), conn.ws_subprotocol);
+            if (kNewHeader == 0) {
+                loop->free_ws_handshake_slice(slice);
+                reply(503, false);
+                return false;
+            }
+            const u32 kRemoved = kOldHeader - kNewHeader;
+            conn.req_header_end = kNewHeader;
+            conn.recv_buf.set_len(conn.recv_buf.len() - kRemoved);
+            if (conn.req_initial_send_len != 0)
+                conn.req_initial_send_len =
+                    conn.req_initial_send_len > kRemoved ? conn.req_initial_send_len - kRemoved : 0;
         }
         conn.ws_handshake_slice = slice;
         conn.ws_handshake_offers_len = offers_len;
@@ -3189,6 +3213,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                           (route->action == RouteAction::JitHandler && route->fn != nullptr));
     conn.is_ws_terminate_route = ws_term;
     conn.ws_handler = ws_term ? route->ws_frame_handler : nullptr;
+    conn.ws_subprotocol = ws_term ? route->ws_subprotocol : Str{};
     conn.ws_max_message_size = ws_term ? route->ws_max_message_size : 0;
     conn.ws_close_code = ws_term ? route->ws_close_code : 1000;
     conn.ws_close_reason = ws_term ? route->ws_close_reason : Str{};
@@ -15269,8 +15294,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (conn.is_ws_terminate_route) {
             if (conn.ws_handshake_phase != WsHandshakePhase::Prepared ||
                 conn.ws_handshake_slice == nullptr ||
-                !ws_handshake_response_matches(
-                    resp, conn.ws_handshake_slice, conn.ws_handshake_offers_len)) {
+                !ws_handshake_response_matches(resp,
+                                               conn.ws_handshake_slice,
+                                               conn.ws_handshake_offers_len,
+                                               conn.ws_subprotocol)) {
                 loop->close_conn(conn);
                 return;
             }

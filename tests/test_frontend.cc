@@ -6455,6 +6455,60 @@ TEST(frontend, analyze_accepts_websocket_drop) {
              static_cast<u8>(WsVerdict::Drop));
 }
 
+TEST(frontend, websocket_required_subprotocol_is_decoded_and_order_independent) {
+    const char* options[] = {"subprotocol: \"graphql-transport-ws\"",
+                             "subprotocol: \"graphql-transport-ws\", maxMessageSize: 4kb",
+                             "maxMessageSize: 4kb, subprotocol: \"graphql-transport-ws\"",
+                             "subprotocol: \"graphql\\u{2d}transport-ws\""};
+    for (const char* option : options) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream ws\nroute GET \"/ws\" { return websocket(ws, %s) { message in "
+                 "message.forward() } }\n",
+                 option);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK(hir->routes[0].ws_handler.subprotocol.eq(lit_str("graphql-transport-ws")));
+    }
+}
+
+TEST(frontend, websocket_required_subprotocol_rejects_invalid_or_ambiguous_configuration) {
+    const char* options[] = {"subprotocol: \"\"",
+                             "subprotocol: \"chat,other\"",
+                             "subprotocol: \" chat\"",
+                             "subprotocol: \"chat/1\"",
+                             "subprotocol: \"chat\\r\\nInjected: yes\"",
+                             "subprotocol: \"chat\\0suffix\"",
+                             "subprotocol: \"\\u{80}\"",
+                             "subprotocol: \"chat\", subprotocol: \"other\"",
+                             "subprotocol: 1",
+                             "maxMessageSize: 4kb, maxMessageSize: 2kb",
+                             "subprotocol: required"};
+    for (const char* option : options) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream ws\nroute GET \"/ws\" { return websocket(ws, %s) { message in "
+                 "message.forward() } }\n",
+                 option);
+        auto tokens = lex(lit(source));
+        if (!tokens) continue;
+        auto ast = parse_file_heap(tokens.value());
+        if (!ast) continue;
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    const char* passthrough =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws, subprotocol: \"chat\") }\n";
+    auto tokens = lex(lit(passthrough));
+    REQUIRE(tokens);
+    CHECK_FALSE(parse_file_heap(tokens.value()));
+}
+
 TEST(frontend, analyze_accepts_websocket_max_message_size_kwarg) {
     // `websocket(ws, maxMessageSize: 4kb) { message in ... }` → ByteSize lexes as IntLit + unit
     // Ident; 4kb = 4096 bytes carried onto the handler.

@@ -678,6 +678,7 @@ struct ConnectionBase {
     u8* ws_handshake_slice = nullptr;
     u32 ws_handshake_offers_len = 0;
     WsHandshakePhase ws_handshake_phase = WsHandshakePhase::None;
+    Str ws_subprotocol{};           // immutable route-owned policy, pinned with request_config
     WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
     const WsTextRewrite* ws_forward_texts = nullptr;
@@ -2070,6 +2071,7 @@ struct ConnectionBase {
         ws_handshake_slice = nullptr;
         ws_handshake_offers_len = 0;
         ws_handshake_phase = WsHandshakePhase::None;
+        ws_subprotocol = {};
         ws_handler = nullptr;
         ws_max_message_size = 0;
         ws_close_reason = {};

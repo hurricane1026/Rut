@@ -15,8 +15,9 @@
 #include "rut/runtime/json.h"
 #include "rut/runtime/response_body_files.h"
 #if RUT_ENABLE_WEBSOCKET
-#include "rut/runtime/slice_pool.h"    // SlicePool::kSliceSize (terminate cap)
-#include "rut/runtime/ws_frame.h"      // kWsMaxHeaderSize
+#include "rut/runtime/slice_pool.h"  // SlicePool::kSliceSize (terminate cap)
+#include "rut/runtime/ws_frame.h"    // kWsMaxHeaderSize
+#include "rut/runtime/ws_handshake.h"
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn
 #endif
 
@@ -489,6 +490,17 @@ bool load_rut_program(const char* path,
                 result = {bytes, expr.str_value.len};
                 return true;
             };
+            Str subprotocol{};
+            if (route.ws_handler.subprotocol.len != 0) {
+                const Str kSource = route.ws_handler.subprotocol;
+                if (kSource.len > SlicePool::kSliceSize || !ws_valid_subprotocol(kSource))
+                    return false;
+                char* bytes = out.rir.arena.alloc_array<char>(kSource.len + 1);
+                if (bytes == nullptr) return false;
+                __builtin_memcpy(bytes, kSource.ptr, kSource.len);
+                bytes[kSource.len] = '\0';
+                subprotocol = {bytes, kSource.len};
+            }
             Str close_reason{};
             if (!retain_close_reason(route.ws_handler.close_reason_expr, close_reason))
                 return false;
@@ -518,7 +530,8 @@ bool load_rut_program(const char* path,
                     close_policies,
                     policy_count,
                     forward_texts,
-                    forward_text_count))
+                    forward_text_count,
+                    subprotocol))
                 return false;
             ws_n++;
             http_route_ordinal++;

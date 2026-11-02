@@ -116,6 +116,92 @@ TEST(websocket_upgrade_admission, opening_request_uses_rfc_accept_and_canonical_
     CHECK(ws_handshake_response_matches(response, storage, offers_len));
 }
 
+TEST(websocket_upgrade_admission, required_subprotocol_constrains_both_handshake_peers) {
+    static constexpr char kRequest[] =
+        "GET /ws HTTP/1.1\r\nHost: test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Protocol: old\r\nsEc-WeBsOcKeT-pRoToCoL:\tchat, other \t\r\n\r\n";
+    const Str required = lit_str("chat");
+    u8 storage[SlicePool::kSliceSize]{};
+    u32 offers_len = 0;
+    REQUIRE(ws_prepare_handshake(reinterpret_cast<const u8*>(kRequest),
+                                 sizeof(kRequest) - 1,
+                                 storage,
+                                 sizeof(storage),
+                                 &offers_len,
+                                 required) == WsHandshakeRequestResult::Ready);
+    CHECK(ws_prepare_handshake(reinterpret_cast<const u8*>(kRequest),
+                               sizeof(kRequest) - 1,
+                               nullptr,
+                               0,
+                               &offers_len,
+                               lit_str("Chat")) == WsHandshakeRequestResult::BadRequest);
+    CHECK(ws_prepare_handshake(reinterpret_cast<const u8*>(kRequest),
+                               sizeof(kRequest) - 1,
+                               nullptr,
+                               0,
+                               &offers_len,
+                               lit_str("missing")) == WsHandshakeRequestResult::BadRequest);
+    REQUIRE(ws_prepare_handshake(reinterpret_cast<const u8*>(kRequest),
+                                 sizeof(kRequest) - 1,
+                                 storage,
+                                 sizeof(storage),
+                                 &offers_len,
+                                 required) == WsHandshakeRequestResult::Ready);
+    const char* values[] = {"chat", "other", "Chat", "chat,other", ""};
+    for (const char* value : values) {
+        char response_bytes[512];
+        snprintf(response_bytes,
+                 sizeof(response_bytes),
+                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                 "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+                 "Sec-WebSocket-Protocol: %s\r\n\r\n",
+                 value);
+        ParsedResponse response{};
+        REQUIRE(parse_response(response_bytes, &response));
+        CHECK_EQ(ws_handshake_response_matches(response, storage, offers_len, required),
+                 strcmp(value, "chat") == 0);
+    }
+    ParsedResponse omitted{};
+    REQUIRE(
+        parse_response("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                       &omitted));
+    CHECK_FALSE(ws_handshake_response_matches(omitted, storage, offers_len, required));
+    CHECK(ws_handshake_response_matches(omitted, storage, offers_len));
+
+    // A matching token in a later physical field must survive compaction; the
+    // coalesced first frame is opaque, even when its payload resembles a header.
+    static constexpr char kTail[] =
+        "\x81\x1a"
+        "Sec-WebSocket-Protocol:other";
+    u8 request[1024];
+    memcpy(request, kRequest, sizeof(kRequest) - 1);
+    memcpy(request + sizeof(kRequest) - 1, kTail, sizeof(kTail) - 1);
+    const u32 header = ws_restrict_subprotocol(
+        request, sizeof(kRequest) - 1, sizeof(kRequest) + sizeof(kTail) - 2, required);
+    REQUIRE(header != 0);
+    CHECK(memcmp(request + header, kTail, sizeof(kTail) - 1) == 0);
+    HttpParser parser{};
+    ParsedRequest parsed{};
+    parser.reset();
+    REQUIRE(parser.parse(request, header, &parsed) == ParseStatus::Complete);
+    u32 count = 0;
+    for (u32 i = 0; i < parsed.header_count; i++) {
+        if (!http_header_name_eq_ci(parsed.headers[i].name.ptr,
+                                    parsed.headers[i].name.len,
+                                    "sec-websocket-protocol",
+                                    22))
+            continue;
+        count++;
+        CHECK(parsed.headers[i].value.eq(required));
+    }
+    CHECK_EQ(count, 1u);
+    CHECK_EQ(ws_restrict_subprotocol(request, header, header + sizeof(kTail) - 1, required),
+             header);
+}
+
 TEST(websocket_upgrade_admission, opening_request_shape_and_protocol_tokens_fail_closed) {
     const char* invalid[] = {
         "GET /ws HTTP/1.1\r\nHost: test\r\nConnection: Upgrade /1\r\n"
@@ -326,6 +412,33 @@ TEST(websocket_upgrade_admission, handshake_slice_is_owned_and_retired_once) {
     loop.close_conn(*conn);
     CHECK_EQ(loop.ws_handshake_free_calls, 2u);
     CHECK_FALSE(loop.ws_handshake_in_use);
+}
+
+TEST(websocket_upgrade_admission, required_protocol_rejects_before_allocation_and_is_reset) {
+    SmallLoop loop;
+    loop.setup();
+    loop.fail_ws_handshake_alloc = true;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 123;
+    conn->is_ws_terminate_route = true;
+    conn->ws_subprotocol = lit_str("chat");
+    static constexpr char kRequest[] =
+        "GET /ws HTTP/1.1\r\nHost: test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    conn->req_header_end = sizeof(kRequest) - 1;
+    CHECK_FALSE(ws_prepare_handshake_before_forward(&loop, *conn));
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_FALSE(loop.ws_handshake_in_use);
+    loop.close_conn(*conn);
+    conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    CHECK_EQ(conn->ws_subprotocol.len, 0u);
+    CHECK_EQ(conn->ws_subprotocol.ptr, nullptr);
+    loop.close_conn(*conn);
 }
 
 TEST(websocket_upgrade_admission, handshake_slice_pool_exhaustion_returns_503_before_connect) {
