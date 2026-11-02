@@ -11,6 +11,8 @@
 #include "rut/runtime/json.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/rs256_policy.h"
+#include "rut/runtime/slice_pool.h"
+#include "rut/runtime/ws_handshake.h"
 #include "rut/runtime/ws_terminate.h"  // ws_valid_close_code (shared close-code predicate)
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
 #include <hs.h>
@@ -13687,6 +13689,17 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->is_ws_terminate = true;
         route->ws_handler.upstream_index = upstream_index.value();
         route->ws_handler.max_message_size = stmt.ws_max_message_size;  // 0 = loader default
+        if (stmt.ws_subprotocol.ptr != nullptr) {
+            auto protocol =
+                decoded_expression_string(stmt.ws_subprotocol, mod, stmt.ws_subprotocol_span);
+            if (!protocol) return core::make_unexpected(protocol.error());
+            if (protocol->len > SlicePool::kSliceSize || !ws_valid_subprotocol(protocol.value()))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    stmt.ws_subprotocol_span,
+                    lit_str("subprotocol requires one nonempty ASCII HTTP token"));
+            route->ws_handler.subprotocol = protocol.value();
+        }
         route->ws_handler.span = stmt.span;
         route->control.kind = HirControlKind::Direct;
         route->control.direct_term.kind = HirTerminatorKind::ForwardUpstream;

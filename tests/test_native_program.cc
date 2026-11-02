@@ -106,6 +106,46 @@ bool load(Source& source, NativeProgram& p, u8 opt = 2) {
 }  // namespace
 
 #if RUT_ENABLE_WEBSOCKET
+
+TEST(native_program, websocket_required_subprotocol_survives_source_removal) {
+    Source source;
+    REQUIRE(source.fd >= 0);
+    REQUIRE(
+        source.append("upstream backend at \"127.0.0.1:9999\"\n"
+                      "route GET \"/ws\" { return websocket(backend, subprotocol: \"chat\") "
+                      "{ message in message.forward() } }\n"
+                      "route GET \"/other\" { return websocket(backend, subprotocol: \"other\") "
+                      "{ message in message.drop() } }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    const RouteEntry& route = owner.p->config.routes[0];
+    CHECK(route.ws_subprotocol.eq(lit_str("chat")));
+    CHECK(owner.p->config.routes[1].ws_subprotocol.eq(lit_str("other")));
+    CHECK(route.ws_frame_handler(nullptr, WsOpcode::Text, nullptr, 0, true) ==
+          WsFrameAction::Forward);
+    static constexpr char kRequest[] =
+        "GET /ws HTTP/1.1\r\nHost: test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Protocol: chat,other\r\n\r\n";
+    u8 storage[SlicePool::kSliceSize];
+    u32 offers_len = 0;
+    CHECK(ws_prepare_handshake(reinterpret_cast<const u8*>(kRequest),
+                               sizeof(kRequest) - 1,
+                               storage,
+                               sizeof(storage),
+                               &offers_len,
+                               route.ws_subprotocol) == WsHandshakeRequestResult::Ready);
+    CHECK(ws_prepare_handshake(reinterpret_cast<const u8*>(kRequest),
+                               sizeof(kRequest) - 1,
+                               storage,
+                               sizeof(storage),
+                               &offers_len,
+                               lit_str("missing")) == WsHandshakeRequestResult::BadRequest);
+}
+
 TEST(native_program, websocket_terminate_http_guards_and_dual_handlers_survive_source_removal) {
     Source source;
     REQUIRE(source.fd >= 0);

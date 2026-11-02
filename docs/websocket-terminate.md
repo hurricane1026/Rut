@@ -72,6 +72,35 @@ implementation; Origin remains explicit application policy. A failed backend
 or WebSocket Close frame. Bare passthrough routes retain generic Upgrade
 tunneling.
 
+### Required subprotocol
+
+Terminate routes can require one fixed subprotocol using a string literal:
+
+```swift
+return websocket(chat, subprotocol: "graphql-transport-ws", maxMessageSize: 4kb) { message in
+    message.forward()
+}
+```
+
+The value must decode to one nonempty ASCII HTTP token. It is case-sensitive;
+whitespace, comma lists, slash, control bytes, and non-ASCII characters are
+rejected at compile time. `subprotocol` and `maxMessageSize` may appear in either
+order, once each. The option requires a message-handler block.
+
+After HTTP admission guards, the client must offer the required token. Missing
+or mismatched offers return 400 and close without connecting upstream. The gateway
+replaces all request protocol fields with one field containing only the required
+token, preserving any coalesced first message. A backend 101 must select that exact
+token; omission, another token, lists, or duplicate selection fields close before
+any 101 bytes reach the client. Non-101 responses retain ordinary HTTP behavior.
+Omitting the option retains optional negotiation from the client's validated offers.
+
+The policy uses route-owned storage pinned across asynchronous handshake I/O.
+Native artifacts retain and relocate the same bytes; native format 15 requires
+matching compiler and serving binaries.
+
+## Application messages
+
 - `message.fromClient` identifies the sender: client or upstream.
 - `message.isText` / `message.isBinary` select application message types.
 - `message.len` is the complete payload length in bytes, excluding frame headers

@@ -251,6 +251,8 @@ struct AstStatement {
     // 0 when omitted (the loader then uses the engine default); explicit values fit one slice.
     // Carried to HirWsHandler.
     u32 ws_max_message_size = 0;
+    Str ws_subprotocol{};  // raw literal; null means omitted
+    Span ws_subprotocol_span{};
     bool is_const = false;
     bool has_type = false;
     AstTypeRef type{};

@@ -4,6 +4,8 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/ebpf_plan.h"
 #include "rut/runtime/response_body_files.h"
+#include "rut/runtime/slice_pool.h"
+#include "rut/runtime/ws_handshake.h"
 #include "rut/runtime/ws_terminate.h"
 
 #include <dlfcn.h>
@@ -571,6 +573,9 @@ bool load_native_program(const char* source,
     for (u32 i = 0; i < h.route_count; i++) {
         const auto& route = c.routes[i];
         if (!route.ws_terminate) continue;
+        if (route.ws_subprotocol.len > SlicePool::kSliceSize ||
+            (route.ws_subprotocol.len != 0 && !ws_valid_subprotocol(route.ws_subprotocol)))
+            return fail("invalid native WebSocket subprotocol");
         if (route.ws_frame_handler == nullptr ||
             (route.action != RouteAction::Proxy && route.action != RouteAction::JitHandler) ||
             route.upstream_id >= c.upstream_count ||

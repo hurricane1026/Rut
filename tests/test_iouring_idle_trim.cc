@@ -1162,7 +1162,8 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // phase, and alignment padding. Its scratch slice is retired before four WS
     // inspection slices are armed, so the six-slice ordinary reserve is unchanged.
     // Keep the bounded layout explicit so future owner fields cannot grow it unnoticed.
-    CHECK_EQ(sizeof(Connection), 4568u);
+    // Required subprotocol negotiation pins one additional route-owned Str (+16 bytes).
+    CHECK_EQ(sizeof(Connection), 4584u);
 }
 
 TEST(iouring_idle_trim,

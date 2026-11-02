@@ -643,7 +643,7 @@ def native_source_removal_scenario(server, compiler, backend_kind):
             route_file.write(
                 f'listen 127.0.0.1:0\n'
                 f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
-                'route GET "/ws" { return websocket(ws) { message in message.drop() } }\n'
+                'route GET "/ws" { return websocket(ws, subprotocol: "chat") { message in message.drop() } }\n'
             )
         emitted = subprocess.run([compiler, source, "2"], capture_output=True, check=True, timeout=30)
         with open(artifact, "wb") as artifact_file:
@@ -701,12 +701,12 @@ def native_source_removal_scenario(server, compiler, backend_kind):
             client.close()
 
             client = socket.create_connection(("127.0.0.1", port), timeout=3)
-            client.sendall(REQUEST)
+            client.sendall(REQUEST[:-2] + b"Sec-WebSocket-Protocol: other, chat\r\n\r\n")
             peer, _ = upstream.accept()
             peer.settimeout(3)
             if not recv_until(peer, b"\r\n\r\n").startswith(b"GET /ws "):
                 raise AssertionError("native valid opening handshake was not forwarded")
-            peer.sendall(WS_RESPONSE_HEADERS)
+            peer.sendall(WS_RESPONSE_HEADERS[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n")
             accepted = recv_until(client, b"\r\n\r\n")
             if not accepted.startswith(b"HTTP/1.1 101"):
                 raise AssertionError(f"native valid handshake did not receive 101: {accepted!r}")
@@ -788,12 +788,95 @@ def incomplete_upstream_101_header_close_scenario(server, backend_kind):
     return "pass", ""
 
 
+def subprotocol_scenario(server, backend_kind):
+    upstream = socket.socket()
+    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    upstream.bind(("127.0.0.1", 0))
+    upstream.listen(4)
+    upstream.settimeout(0.25)
+    with tempfile.TemporaryDirectory(prefix="rut-ws-subprotocol-") as temp:
+        path = os.path.join(temp, "route.rut")
+        with open(path, "w", encoding="utf-8") as source:
+            source.write(
+                f'listen 127.0.0.1:0\nupstream backend at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+                'route GET "/ws" { return websocket(backend, subprotocol: "chat") '
+                '{ message in message.forward() } }\n')
+        process, port, diagnostic = launch(server, path, backend_kind)
+        if process is None:
+            upstream.close()
+            text = diagnostic.decode(errors="replace")
+            if backend_kind == "io_uring" and "io_uring is unavailable" in text:
+                return "skip", text
+            raise AssertionError(f"subprotocol server failed: {text}")
+        try:
+            for offer in (b"", b"Sec-WebSocket-Protocol: Chat\r\n"):
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                    client.sendall(REQUEST[:-2] + offer + b"\r\n")
+                    if not recv_http_response(client).startswith(b"HTTP/1.1 400 "):
+                        raise AssertionError("missing/case-mismatched required offer was accepted")
+                    try:
+                        peer, _ = upstream.accept()
+                    except TimeoutError:
+                        pass
+                    else:
+                        peer.close()
+                        raise AssertionError("missing required subprotocol connected upstream")
+            for selection in (None, b"other", b"Chat", b"chat"):
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                    payload = b"COALESCED-SUBPROTOCOL-TAIL"
+                    request = (REQUEST[:-2] + b"Sec-WebSocket-Protocol: other\r\n"
+                               b"sec-websocket-protocol: chat, third\r\n\r\n")
+                    client.sendall(request + masked_frame(1, payload))
+                    peer, _ = upstream.accept()
+                    with peer:
+                        forwarded = recv_until(peer, b"\r\n\r\n")
+                        protocol_fields = [line.split(b":", 1)[1].strip()
+                                           for line in forwarded.split(b"\r\n")
+                                           if line.lower().startswith(b"sec-websocket-protocol:")]
+                        if protocol_fields != [b"chat"]:
+                            raise AssertionError(f"backend offer was not restricted: {forwarded!r}")
+                        if masked_frame(1, payload) in forwarded:
+                            raise AssertionError("coalesced data forwarded before validated 101")
+                        response = WS_RESPONSE_HEADERS[:-2]
+                        if selection is not None:
+                            response += b"Sec-WebSocket-Protocol: " + selection + b"\r\n"
+                        peer.sendall(response + b"\r\n")
+                        if selection != b"chat":
+                            client.settimeout(3)
+                            if client.recv(4096):
+                                raise AssertionError("mismatched backend 101 escaped")
+                            continue
+                        response = recv_http_response(client)
+                        if not response.startswith(b"HTTP/1.1 101 ") or \
+                                b"Sec-WebSocket-Protocol: chat\r\n" not in response:
+                            raise AssertionError(f"valid protocol not negotiated: {response!r}")
+                        if recv_client_frame(peer) != (1, payload, True):
+                            raise AssertionError("coalesced first message changed during header compaction")
+                        peer.sendall(b"\x81\x03ACK")
+                        if recv_client_frame(client) != (1, b"ACK", False):
+                            raise AssertionError("negotiated tunnel did not forward upstream message")
+        finally:
+            upstream.close()
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return "pass", ""
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True)
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
+        status, details = subprotocol_scenario(args.server, backend)
+        if status == "skip":
+            print(f"SKIP {backend}: {details.strip()}")
+        else:
+            print(f"PASS {backend} required subprotocol / zero-connect / offer restriction / 101 gate / tail")
         status, details = incomplete_upstream_101_header_close_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")

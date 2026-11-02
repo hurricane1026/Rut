@@ -2572,6 +2572,18 @@ post /api/orders {
 
 #### 3.4.8 WebSocket Proxying
 
+Terminate routes support a required subprotocol using
+`return websocket(chat, subprotocol: "graphql-transport-ws") { message in message.forward() }`.
+The string literal must decode to one nonempty, case-sensitive ASCII HTTP token.
+This argument and `maxMessageSize` may appear in either order, once each. HTTP
+admission guards run first; a missing client offer gets 400 before upstream connect.
+The upstream request is restricted to the one required offer, preserving coalesced
+message bytes. A backend 101 must select that exact token before any response bytes
+are sent. Without the option, the backend may select a validated offer or omit
+selection. Bare passthrough does not accept the option. The policy is route-owned
+and pinned across I/O, including after native relocation; compiler and serving
+binaries must agree on native format 15. See [terminate mode](docs/websocket-terminate.md).
+
 The `message.close(code, "reason")` verdict, final or in a guard else-branch, sends a fixed reason to both
 peers during the handler-initiated close handshake. The code follows the existing
 RFC 6455 validation; the reason must be a string literal containing valid UTF-8,

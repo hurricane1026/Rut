@@ -22,6 +22,7 @@
 #include "rut/runtime/route_select.h"  // path_has_param_segment
 #include "rut/runtime/route_trie.h"
 #include "rut/runtime/rs256_policy.h"
+#include "rut/runtime/ws_handshake.h"
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn (terminate-mode routes)
 #include <new>  // Existing std::nothrow allocations during configuration staging.
 
@@ -155,6 +156,7 @@ struct RouteEntry {
     bool ws_terminate = false;
     WsMessageHandlerFn ws_frame_handler = nullptr;
     u32 ws_max_message_size = 0;
+    Str ws_subprotocol{};  // empty = optional negotiation; otherwise required exact token
     // RFC 6455 status the handler's `message.close(code)` verdict puts on the wire (1000 default).
     WsClosePolicy ws_close_policies[kWsMaxClosePolicies]{};
     u32 ws_close_policy_count = 0;
@@ -1517,7 +1519,8 @@ public:
                           const WsClosePolicy* close_policies = nullptr,
                           u32 close_policy_count = 0,
                           const WsTextRewrite* forward_texts = nullptr,
-                          u32 forward_text_count = 0) {
+                          u32 forward_text_count = 0,
+                          Str subprotocol = {}) {
 #if !RUT_ENABLE_WEBSOCKET
         // The 101/tunnel path is compiled out in this build — a terminate route could
         // never enter terminate mode, so fail loud instead of publishing an unusable route.
@@ -1533,6 +1536,7 @@ public:
         (void)close_policy_count;
         (void)forward_texts;
         (void)forward_text_count;
+        (void)subprotocol;
         return false;
 #else
         if (!ws_terminate_metadata_valid(handler,
@@ -1543,7 +1547,8 @@ public:
                                          close_policies,
                                          close_policy_count,
                                          forward_texts,
-                                         forward_text_count))
+                                         forward_text_count,
+                                         subprotocol))
             return false;
         if (!add_proxy(path, method, upstream_id)) return false;
         auto& r = routes[route_count - 1];
@@ -1556,7 +1561,8 @@ public:
                                   close_policies,
                                   close_policy_count,
                                   forward_texts,
-                                  forward_text_count);
+                                  forward_text_count,
+                                  subprotocol);
         return true;
 #endif
     }
@@ -1576,7 +1582,8 @@ public:
                                     const WsClosePolicy* close_policies = nullptr,
                                     u32 close_policy_count = 0,
                                     const WsTextRewrite* forward_texts = nullptr,
-                                    u32 forward_text_count = 0) {
+                                    u32 forward_text_count = 0,
+                                    Str subprotocol = {}) {
 #if !RUT_ENABLE_WEBSOCKET
         (void)route_index;
         (void)path;
@@ -1591,6 +1598,7 @@ public:
         (void)close_policy_count;
         (void)forward_texts;
         (void)forward_text_count;
+        (void)subprotocol;
         return false;
 #else
         if (route_index >= route_count || path == nullptr || upstream_id >= upstream_count ||
@@ -1602,7 +1610,8 @@ public:
                                          close_policies,
                                          close_policy_count,
                                          forward_texts,
-                                         forward_text_count))
+                                         forward_text_count,
+                                         subprotocol))
             return false;
         RouteEntry& route = routes[route_index];
         const u8 method_key = route_method_key_from_legacy_char(method);
@@ -1626,7 +1635,8 @@ public:
                                   close_policies,
                                   close_policy_count,
                                   forward_texts,
-                                  forward_text_count);
+                                  forward_text_count,
+                                  subprotocol);
         return true;
 #endif
     }
@@ -1837,7 +1847,11 @@ private:
                                             const WsClosePolicy* close_policies,
                                             u32 close_policy_count,
                                             const WsTextRewrite* forward_texts,
-                                            u32 forward_text_count) {
+                                            u32 forward_text_count,
+                                            Str subprotocol) {
+        if (subprotocol.len > SlicePool::kSliceSize ||
+            (subprotocol.len != 0 && !ws_valid_subprotocol(subprotocol)))
+            return false;
         if (handler == nullptr || !ws_valid_message_capacity(max_message_size) ||
             !ws_valid_text_rewrite(forward_text, max_message_size) ||
             !ws_valid_close_code(close_code) || !ws_valid_close_reason(close_reason) ||
@@ -1864,10 +1878,12 @@ private:
                                           const WsClosePolicy* close_policies,
                                           u32 close_policy_count,
                                           const WsTextRewrite* forward_texts,
-                                          u32 forward_text_count) {
+                                          u32 forward_text_count,
+                                          Str subprotocol) {
         route.ws_terminate = true;
         route.ws_frame_handler = handler;
         route.ws_max_message_size = max_message_size;
+        route.ws_subprotocol = subprotocol;
         route.ws_close_code = close_code;
         route.ws_close_reason = close_reason;
         route.ws_close_policy_count = close_policy_count;

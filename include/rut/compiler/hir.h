@@ -1190,6 +1190,7 @@ struct HirWsHandler {
     // `maxMessageSize:` kwarg in bytes (0 = omitted → the loader uses the engine default). The
     // explicit values are validated against the single-slice payload capacity.
     u32 max_message_size = 0;
+    Str subprotocol{};  // decoded, validated required offer; empty means no policy
     u32 upstream_index = 0;
     Span span{};
 };
