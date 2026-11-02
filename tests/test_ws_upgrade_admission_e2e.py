@@ -4,6 +4,7 @@
 import argparse
 import os
 import select
+import shutil
 import socket
 import ssl
 import subprocess
@@ -26,7 +27,19 @@ MISSING_CONNECTION_RESPONSE = (
     b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"
     b"UNINSPECTED-WIRE-MARKER"
 )
-WS_RESPONSE_HEADERS = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n"
+WS_RESPONSE_HEADERS = (
+    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n"
+    b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+)
+BAD_ACCEPT_RESPONSE = (
+    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+    b"Sec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n"
+)
+UNSOLICITED_PROTOCOL_RESPONSE = (
+    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+    b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+    b"Sec-WebSocket-Protocol: chat\r\n\r\n"
+)
 
 
 def masked_frame(opcode, payload):
@@ -156,12 +169,22 @@ def scenario(server, backend_kind, terminate, response, expected):
         client = peer = None
         try:
             client = socket.create_connection(("127.0.0.1", port), timeout=3)
-            client.sendall(REQUEST + CLIENT_TAIL if expected == "reject" else REQUEST)
+            if expected == "reject":
+                client.sendall(REQUEST + CLIENT_TAIL)
+            elif expected == "drop":
+                client.sendall(REQUEST + masked_frame(1, b"DROP"))
+            else:
+                client.sendall(REQUEST)
             peer, _ = upstream.accept()
             forwarded_request = recv_until(peer, b"\r\n\r\n")
             if expected == "reject" and CLIENT_TAIL in forwarded_request:
                 raise AssertionError("client pipeline tail was forwarded before terminate admission")
-            peer.sendall(response)
+            if expected == "drop" and masked_frame(1, b"DROP") in forwarded_request:
+                raise AssertionError("coalesced WebSocket frame was forwarded before the 101")
+            split = max(1, len(response) // 2)
+            peer.sendall(response[:split])
+            time.sleep(0.01)
+            peer.sendall(response[split:])
             if expected == "reject":
                 client.settimeout(3)
                 received = client.recv(4096)
@@ -301,6 +324,35 @@ def admission_scenario(server, backend_kind):
             client.close()
             clients.remove(client)
 
+            # A valid terminate request may receive an ordinary HTTP response.
+            # Completing that response retires handshake scratch before the same
+            # keepalive connection takes the next ordinary forwarding route.
+            client = socket.create_connection(("127.0.0.1", port), timeout=3)
+            clients.append(client)
+            client.sendall(ws_upgrade_request(
+                b"Origin: https://allowed.example\r\n", connection=b"Upgrade, keep-alive"))
+            ws_peer, _ = ws_backend.accept()
+            peers.append(ws_peer)
+            recv_until(ws_peer, b"\r\n\r\n")
+            ws_peer.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK")
+            ordinary = recv_http_response(client)
+            if not ordinary.startswith(b"HTTP/1.1 200") or not ordinary.endswith(b"OK"):
+                raise AssertionError(f"non-101 terminate response was not ordinary HTTP: {ordinary!r}")
+            ws_peer.close()
+            peers.remove(ws_peer)
+            client.sendall(b"GET /next HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            normal_peer, _ = normal_backend.accept()
+            peers.append(normal_peer)
+            if not recv_until(normal_peer, b"\r\n\r\n").startswith(b"GET /next "):
+                raise AssertionError("ordinary route after terminate non-101 was not forwarded")
+            normal_peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+            ordinary = recv_http_response(client)
+            if not ordinary.startswith(b"HTTP/1.1 200"):
+                raise AssertionError("keepalive successor after terminate non-101 was lost")
+            client.close()
+            clients.remove(client)
+
             # Correct Origin reaches the upstream, permits 101, drops one message,
             # and rewrites the next before forwarding it.
             client = socket.create_connection(("127.0.0.1", port), timeout=3)
@@ -339,6 +391,80 @@ def admission_scenario(server, backend_kind):
                 client.close()
             ws_backend.close()
             normal_backend.close()
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return "pass", ""
+
+
+def handshake_request_scenario(server, backend_kind):
+    upstream = socket.socket()
+    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    upstream.bind(("127.0.0.1", 0))
+    upstream.listen(4)
+    upstream.settimeout(0.25)
+    source = (
+        f'listen 127.0.0.1:0\n'
+        f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+        'route GET "/ws" { return websocket(ws) { message in message.drop() } }\n'
+    )
+    with tempfile.TemporaryDirectory(prefix="rut-ws-handshake-") as temp:
+        path = os.path.join(temp, "route.rut")
+        with open(path, "w", encoding="utf-8") as route_file:
+            route_file.write(source)
+        process, port, diagnostic = launch(server, path, backend_kind)
+        if process is None:
+            upstream.close()
+            text = diagnostic.decode(errors="replace")
+            if backend_kind == "io_uring" and \
+                    "--backend io_uring requested, but io_uring is unavailable" in text:
+                return "skip", text
+            raise AssertionError(f"{backend_kind} server failed before listen:\n{text}")
+
+        cases = (
+            (b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", b"", 400, "missing Version"),
+            (b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+             b"Sec-WebSocket-Version: 12\r\n", b"", 426, "wrong Version"),
+            (b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+             b"Sec-WebSocket-Version: nope\r\n", b"", 400, "nonnumeric Version"),
+            (b"Sec-WebSocket-Version: 13\r\n", b"", 400, "missing Key"),
+            (b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+             b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+             b"Sec-WebSocket-Version: 13\r\n", b"", 400, "duplicate Key"),
+        )
+        try:
+            for fields, tail, status, label in cases:
+                client = socket.create_connection(("127.0.0.1", port), timeout=3)
+                try:
+                    request = (
+                        b"GET /ws HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
+                        b"Connection: Upgrade\r\n" + fields + b"\r\n" + tail)
+                    client.sendall(request + masked_frame(1, b"COALESCED-TAIL"))
+                    response = recv_http_response(client)
+                    if not response.startswith(f"HTTP/1.1 {status} ".encode()):
+                        raise AssertionError(f"{label} got unexpected response: {response!r}")
+                    if status == 426 and b"Sec-WebSocket-Version: 13\r\n" not in response:
+                        raise AssertionError("426 did not advertise the supported WebSocket version")
+                    if status == 426 and (
+                        b"Upgrade: websocket\r\n" not in response
+                        or b"Connection: Upgrade\r\n" not in response
+                        or b"Connection: close\r\n" not in response
+                    ):
+                        raise AssertionError("426 omitted upgrade challenge or close headers")
+                    try:
+                        peer, _ = upstream.accept()
+                    except TimeoutError:
+                        pass
+                    else:
+                        peer.close()
+                        raise AssertionError(f"{label} connected to the WebSocket upstream")
+                finally:
+                    client.close()
+        finally:
+            upstream.close()
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -416,11 +542,273 @@ def tls_passthrough_scenario(server, backend_kind):
     return "pass", ""
 
 
+def tls_terminate_handshake_scenario(server, backend_kind):
+    cert = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_cert.pem")
+    key = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_key.pem")
+    backend = socket.socket()
+    backend.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    backend.bind(("127.0.0.1", 0))
+    backend.listen(1)
+    backend.settimeout(0.5)
+    source = (
+        f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+        'route GET "/ws" { return websocket(ws) { message in message.drop() } }\n'
+    )
+    with tempfile.TemporaryDirectory(prefix="rut-ws-tls-terminate-") as temp:
+        path = os.path.join(temp, "route.rut")
+        with open(path, "w", encoding="utf-8") as route_file:
+            route_file.write(source)
+        process, port, diagnostic = launch(
+            server, path, backend_kind, ("0", "--tls-cert", cert, "--tls-key", key))
+        if process is None:
+            backend.close()
+            text = diagnostic.decode(errors="replace")
+            if backend_kind == "io_uring" and \
+                    "--backend io_uring requested, but io_uring is unavailable" in text:
+                return "skip", text
+            raise AssertionError(f"{backend_kind} TLS terminate failed before listen:\n{text}")
+
+        clients = []
+        peer = None
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.set_alpn_protocols(["http/1.1"])
+
+            raw = socket.create_connection(("127.0.0.1", port), timeout=3)
+            invalid_client = context.wrap_socket(raw, server_hostname="localhost")
+            clients.append(invalid_client)
+            invalid_client.sendall(
+                b"GET /ws HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                + masked_frame(1, b"COALESCED-TAIL"))
+            denied = recv_http_response(invalid_client)
+            if not denied.startswith(b"HTTP/1.1 400"):
+                raise AssertionError(f"TLS malformed handshake did not get 400: {denied!r}")
+            try:
+                peer, _ = backend.accept()
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("TLS malformed handshake connected upstream")
+            invalid_client.close()
+            clients.remove(invalid_client)
+
+            raw = socket.create_connection(("127.0.0.1", port), timeout=3)
+            valid_client = context.wrap_socket(raw, server_hostname="localhost")
+            clients.append(valid_client)
+            valid_client.sendall(REQUEST)
+            peer, _ = backend.accept()
+            peer.settimeout(3)
+            if not recv_until(peer, b"\r\n\r\n").startswith(b"GET /ws "):
+                raise AssertionError("TLS valid handshake request was not forwarded")
+            peer.sendall(WS_RESPONSE_HEADERS)
+            response = recv_until(valid_client, b"\r\n\r\n")
+            if not response.startswith(b"HTTP/1.1 101"):
+                raise AssertionError(f"TLS valid terminate handshake failed: {response!r}")
+            valid_client.sendall(masked_frame(1, b"DROP"))
+            peer.settimeout(0.25)
+            try:
+                leaked = peer.recv(4096)
+            except TimeoutError:
+                leaked = b""
+            if leaked:
+                raise AssertionError(f"TLS terminate DROP reached backend: {leaked!r}")
+        finally:
+            if peer is not None:
+                peer.close()
+            for client in clients:
+                client.close()
+            backend.close()
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return "pass", ""
+
+
+def native_source_removal_scenario(server, compiler, backend_kind):
+    upstream = socket.socket()
+    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    upstream.bind(("127.0.0.1", 0))
+    upstream.listen(1)
+    upstream.settimeout(0.5)
+    with tempfile.TemporaryDirectory(prefix="rut-ws-native-handshake-") as temp:
+        source = os.path.join(temp, "route.rut")
+        artifact = os.path.join(temp, "route.native")
+        with open(source, "w", encoding="utf-8") as route_file:
+            route_file.write(
+                f'listen 127.0.0.1:0\n'
+                f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+                'route GET "/ws" { return websocket(ws) { message in message.drop() } }\n'
+            )
+        emitted = subprocess.run([compiler, source, "2"], capture_output=True, check=True, timeout=30)
+        with open(artifact, "wb") as artifact_file:
+            artifact_file.write(emitted.stdout)
+        os.unlink(source)
+        native_server = os.path.join(temp, "rut")
+        compiler_wrapper = os.path.join(temp, "rut-compile")
+        shutil.copy2(server, native_server)
+        with open(compiler_wrapper, "w", encoding="utf-8") as wrapper:
+            wrapper.write(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                f"path = {artifact!r}\n"
+                "fd = os.open(path, os.O_RDONLY)\n"
+                "try:\n"
+                "    while True:\n"
+                "        chunk = os.read(fd, 65536)\n"
+                "        if not chunk:\n"
+                "            break\n"
+                "        view = memoryview(chunk)\n"
+                "        while view:\n"
+                "            count = os.write(1, view)\n"
+                "            view = view[count:]\n"
+                "finally:\n"
+                "    os.close(fd)\n"
+            )
+        os.chmod(compiler_wrapper, 0o700)
+        missing_source = os.path.join(temp, "deleted-source.rut")
+        process, port, diagnostic = launch(native_server, missing_source, backend_kind)
+        if process is None:
+            upstream.close()
+            text = diagnostic.decode(errors="replace")
+            if backend_kind == "io_uring" and \
+                    "--backend io_uring requested, but io_uring is unavailable" in text:
+                return "skip", text
+            raise AssertionError(f"{backend_kind} native WebSocket artifact failed:\n{text}")
+
+        client = None
+        peer = None
+        try:
+            client = socket.create_connection(("127.0.0.1", port), timeout=3)
+            client.sendall(
+                b"GET /ws HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                + masked_frame(1, b"COALESCED-TAIL"))
+            rejected = recv_http_response(client)
+            if not rejected.startswith(b"HTTP/1.1 400"):
+                raise AssertionError(f"native missing-Key request did not get 400: {rejected!r}")
+            try:
+                peer, _ = upstream.accept()
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("native missing-Key request connected upstream")
+            client.close()
+
+            client = socket.create_connection(("127.0.0.1", port), timeout=3)
+            client.sendall(REQUEST)
+            peer, _ = upstream.accept()
+            peer.settimeout(3)
+            if not recv_until(peer, b"\r\n\r\n").startswith(b"GET /ws "):
+                raise AssertionError("native valid opening handshake was not forwarded")
+            peer.sendall(WS_RESPONSE_HEADERS)
+            accepted = recv_until(client, b"\r\n\r\n")
+            if not accepted.startswith(b"HTTP/1.1 101"):
+                raise AssertionError(f"native valid handshake did not receive 101: {accepted!r}")
+        finally:
+            if peer is not None:
+                peer.close()
+            if client is not None:
+                client.close()
+            upstream.close()
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return "pass", ""
+
+
+def incomplete_upstream_101_header_close_scenario(server, backend_kind):
+    backend = socket.socket()
+    backend.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    backend.bind(("127.0.0.1", 0))
+    backend.listen(2)
+    backend.settimeout(2)
+    source = (
+        f'listen 127.0.0.1:0\n'
+        f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+        'route GET "/ws" { return websocket(ws) { message in message.drop() } }\n'
+    )
+    with tempfile.TemporaryDirectory(prefix="rut-ws-partial-101-") as temp:
+        path = os.path.join(temp, "route.rut")
+        with open(path, "w", encoding="utf-8") as route_file:
+            route_file.write(source)
+        process, port, diagnostic = launch(server, path, backend_kind)
+        if process is None:
+            backend.close()
+            text = diagnostic.decode(errors="replace")
+            if backend_kind == "io_uring" and \
+                    "--backend io_uring requested, but io_uring is unavailable" in text:
+                return "skip", text
+            raise AssertionError(f"{backend_kind} partial-101 server failed:\n{text}")
+        client = None
+        peer = None
+        try:
+            client = socket.create_connection(("127.0.0.1", port), timeout=3)
+            client.sendall(REQUEST)
+            peer, _ = backend.accept()
+            recv_until(peer, b"\r\n\r\n")
+            response = WS_RESPONSE_HEADERS
+            split = response.find(b"\r\n\r\n") // 2
+            peer.sendall(response[:split])
+            time.sleep(0.02)
+            client.close()
+            client = None
+            peer.sendall(response[split:])
+            peer.settimeout(3)
+            while peer.recv(4096):
+                pass
+
+            client = socket.create_connection(("127.0.0.1", port), timeout=3)
+            client.sendall(
+                b"GET /ws HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n")
+            response = recv_http_response(client)
+            if not response.startswith(b"HTTP/1.1 400"):
+                raise AssertionError(f"slot after partial 101 close was not reusable: {response!r}")
+        finally:
+            if peer is not None:
+                peer.close()
+            if client is not None:
+                client.close()
+            backend.close()
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return "pass", ""
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True)
+    parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
+        status, details = incomplete_upstream_101_header_close_scenario(args.server, backend)
+        if status == "skip":
+            print(f"SKIP {backend}: {details.strip()}")
+        else:
+            print(f"PASS {backend} incomplete 101-header client close / owner retirement / slot reuse")
+        status, details = native_source_removal_scenario(args.server, args.compiler, backend)
+        if status == "skip":
+            print(f"SKIP {backend}: {details.strip()}")
+        else:
+            print(f"PASS {backend} native source-removed artifact malformed400/zero-connect + valid101")
+        status, details = handshake_request_scenario(args.server, backend)
+        if status == "skip":
+            print(f"SKIP {backend}: {details.strip()}")
+        else:
+            print(f"PASS {backend} strict request shape / 400 / 426 / zero-connect")
         status, details = admission_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")
@@ -431,9 +819,16 @@ def main():
             print(f"SKIP {backend}: {details.strip()}")
         else:
             print(f"PASS {backend} TLS passthrough")
+        status, details = tls_terminate_handshake_scenario(args.server, backend)
+        if status == "skip":
+            print(f"SKIP {backend}: {details.strip()}")
+        else:
+            print(f"PASS {backend} TLS terminate bad-request/zero-connect + valid-101/drop")
         for terminate, response, expected in (
             (True, RAW_RESPONSE, "reject"),
             (True, MISSING_CONNECTION_RESPONSE, "reject"),
+            (True, BAD_ACCEPT_RESPONSE, "reject"),
+            (True, UNSOLICITED_PROTOCOL_RESPONSE, "reject"),
             (True, WS_RESPONSE_HEADERS, "drop"),
             (False, RAW_RESPONSE, "tunnel"),
         ):

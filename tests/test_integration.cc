@@ -19194,7 +19194,7 @@ struct WsFrameEchoServer {
             }
             const char k101[] =
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: "
-                "Upgrade\r\n\r\n";
+                "Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
             (void)send_all(client, k101, sizeof(k101) - 1);
             rut::u8 acc[8192];
             rut::u32 have = 0;
@@ -19464,7 +19464,7 @@ static rut::i32 ws_sweep_open_and_send_seg1(rut::u16 port,
     }
     const char kUpgrade[] =
         "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     errno = 0;
     if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1)) {
         ev->step = "send-upgrade";
@@ -19777,7 +19777,7 @@ TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
     REQUIRE(c >= 0);
     const char kUpgrade[] =
         "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
     char buf[1024];
     u32 n = recv_http_headers(c, buf, sizeof(buf));
@@ -19861,7 +19861,8 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     // Upgrade carrying Sec-WebSocket-Extensions — terminate mode must strip it.
     const char kUpgrade[] =
         "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Extensions: permessage-deflate\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: "
+        "permessage-deflate\r\n"
         "Sec-WebSocket-Version: 13\r\n\r\n";
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
     char buf[1024];
@@ -20027,7 +20028,8 @@ static void check_ws_close_reason_round_trip(rut::test::TestCase* _tc, bool bran
         set_socket_timeouts(client, 5);
         const char upgrade[] =
             "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: "
-            "Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+            "Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: "
+            "13\r\n\r\n";
         REQUIRE(send_all(client, upgrade, sizeof(upgrade) - 1));
         char response[1024];
         const u32 headers = recv_http_headers(client, response, sizeof(response));
@@ -20167,7 +20169,7 @@ static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc,
         set_socket_timeouts(client, 5);
         const char upgrade[] =
             "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
         REQUIRE(send_all(client, upgrade, sizeof(upgrade) - 1));
         char response[1024];
         const u32 headers = recv_http_headers(client, response, sizeof(response));
@@ -20306,7 +20308,7 @@ TEST(websocket_e2e, terminate_forwards_fragmented) {
     REQUIRE(c >= 0);
     const char kUpgrade[] =
         "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
     char buf[1024];
     u32 n = recv_http_headers(c, buf, sizeof(buf));
@@ -20377,7 +20379,7 @@ TEST(websocket_e2e, terminate_iouring) {
     set_socket_timeouts(c, 5);
     const char kUpgrade[] =
         "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
     char buf[1024];
     u32 n = recv_http_headers(c, buf, sizeof(buf));

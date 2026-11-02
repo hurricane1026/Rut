@@ -573,6 +573,11 @@ public:
         return true;
     }
 
+    u8* alloc_ws_handshake_slice() { return pool.alloc(); }
+    void free_ws_handshake_slice(u8* slice) {
+        if (slice) pool.free(slice);
+    }
+
     // --- CRTP implementations (no if constexpr — kqueue only) ---
 
     Connection* alloc_conn_impl() {
@@ -611,6 +616,10 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        free_ws_handshake_slice(c.ws_handshake_slice);
+        c.ws_handshake_slice = nullptr;
+        c.ws_handshake_offers_len = 0;
+        c.ws_handshake_phase = WsHandshakePhase::None;
         // Sync backend: kernel is done with buffers. Free immediately.
         if (c.recv_slice) pool.free(c.recv_slice);
         if (c.send_slice) pool.free(c.send_slice);

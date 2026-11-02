@@ -3038,6 +3038,11 @@ public:
         return true;
     }
 
+    u8* alloc_ws_handshake_slice() { return pool.alloc(); }
+    void free_ws_handshake_slice(u8* slice) {
+        if (slice) pool.free(slice);
+    }
+
     // Initialize TLS termination on a freshly accepted connection: create the
     // engine, allocate the ciphertext in/out slices, and point on_recv at the
     // TLS driver. Returns false (and rolls back) if the engine or pool fails.
@@ -3304,6 +3309,10 @@ public:
 
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
+        free_ws_handshake_slice(c.ws_handshake_slice);
+        c.ws_handshake_slice = nullptr;
+        c.ws_handshake_offers_len = 0;
+        c.ws_handshake_phase = WsHandshakePhase::None;
         timer.remove(&c);
         // A recv waiting for buffers must not re-arm on a reused slot.
         clear_deferred_recv(cid);

@@ -963,6 +963,11 @@ public:
         return true;
     }
 
+    u8* alloc_ws_handshake_slice() { return pool.alloc(); }
+    void free_ws_handshake_slice(u8* slice) {
+        if (slice) pool.free(slice);
+    }
+
     // Clear upstream fd mapping (no-op for legacy template — epoll/iouring
     // concrete loops handle their own fd maps).
     void clear_upstream_fd(u32 /*conn_id*/) {}
@@ -1007,6 +1012,11 @@ public:
         c.json_arena.destroy();
         u32 cid = c.id;
         timer.remove(&c);
+        // Handshake storage is CPU-only and never owned by a kernel operation.
+        free_ws_handshake_slice(c.ws_handshake_slice);
+        c.ws_handshake_slice = nullptr;
+        c.ws_handshake_offers_len = 0;
+        c.ws_handshake_phase = WsHandshakePhase::None;
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
         // kernel op), so reclaim them now regardless of the async deferred path below.
         if (c.ws_c2u_msg) {

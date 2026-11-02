@@ -759,6 +759,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_http2_conn.profraw ./build/tests/test_http2_conn
           LLVM_PROFILE_FILE=build/test_ws_frame.profraw ./build/tests/test_ws_frame
           LLVM_PROFILE_FILE=build/test_ws_terminate.profraw ./build/tests/test_ws_terminate
+          LLVM_PROFILE_FILE=build/test_ws_upgrade_admission.profraw ./build/tests/test_ws_upgrade_admission
           LLVM_PROFILE_FILE=build/test_http_tokens.profraw ./build/tests/test_http_tokens
           LLVM_PROFILE_FILE=build/test_http_cache.profraw ./build/tests/test_http_cache
 
@@ -781,9 +782,9 @@ jobs:
           # They are tested via conditional integration tests.
           #
           # test_traffic_capture / test_traffic_replay / test_sim /
-          # test_shard_control are not passed as --object because they
-          # instantiate callbacks_impl.h templates for test-only loop
-          # types; the union merge would incorrectly count those as
+          # test_shard_control / test_ws_upgrade_admission are not passed as
+          # --object because they instantiate callbacks_impl.h templates for
+          # test-only loop types; the union merge would incorrectly count those as
           # real production paths. They still run above for correctness
           # validation.
           LLVM_COV="$LLVM_COV" python3 scripts/coverage_report.py \
