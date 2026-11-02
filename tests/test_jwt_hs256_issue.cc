@@ -126,6 +126,10 @@ TEST(jwt_hs256_issue, fixed_profile_round_trips_signature_and_lifetime_claims) {
     REQUIRE(issued);
     CHECK_EQ(allocations, 0u);
     CHECK_GT(token_len, 0u);
+    CHECK((Str{token, token_len}.eq(
+        lit_str("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSBcIm9wc1wiIFxcIOmbqiIsImlz"
+                "cyI6Imlzc3Vlci5leGFtcGxlIiwiYXVkIjoib3JkZXJzIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3"
+                "MDAwMDM2MDB9._FET2abGSjCFAgD66bMo1mxVYCnV0Wil3HeFpMeE_V0"))));
 
     char payload[json::kMaxBytes];
     u32 payload_len = 0;
@@ -265,6 +269,173 @@ TEST(jwt_hs256_issue, enforces_escaped_payload_limit) {
     json::Document claims;
     CHECK(jwt_claims_valid_with_lifetime(
         claims, {payload, payload_length}, large_valid, large_valid, 1000, 1, 1));
+}
+
+TEST(jwt_hs256_issue, issues_jti_with_bounded_validation_and_verified_signature) {
+    char key[32];
+    for (char& byte : key) byte = 'i';
+    char token[kMaxJwtHs256TokenBytes];
+    u32 length = 0;
+    const Str id = lit_str("request \"42\" \\\\ 雪");
+    allocations = 0;
+    tracking = true;
+    const bool issued = jwt_hs256_issue_with_id({key, sizeof(key)},
+                                                lit_str("alice"),
+                                                lit_str("issuer"),
+                                                lit_str("orders"),
+                                                id,
+                                                1700000000,
+                                                60,
+                                                token,
+                                                sizeof(token),
+                                                length);
+    tracking = false;
+    CHECK(issued);
+    CHECK_EQ(allocations, 0u);
+    char payload[kMaxJwtHs256PayloadBytes];
+    u32 payload_len = 0;
+    CHECK(authenticate({token, length}, {key, sizeof(key)}, payload, sizeof(payload), payload_len));
+    CHECK((Str{payload, payload_len}.eq(
+        lit_str("{\"sub\":\"alice\",\"iss\":\"issuer\",\"aud\":\"orders\",\"jti\":\"request "
+                "\\\"42\\\" \\\\\\\\ 雪\",\"iat\":1700000000,\"exp\":1700000060}"))));
+    json::Document claims;
+    CHECK(jwt_claims_valid_with_lifetime(
+        claims, {payload, payload_len}, lit_str("issuer"), lit_str("orders"), 1700000000, 60, 60));
+    char tampered[kMaxJwtHs256TokenBytes];
+    for (u32 i = 0; i < length; ++i) tampered[i] = token[i];
+    tampered[length - 1] = tampered[length - 1] == 'A' ? 'B' : 'A';
+    CHECK(!authenticate(
+        {tampered, length}, {key, sizeof(key)}, payload, sizeof(payload), payload_len));
+
+    const char bad_utf8[] = {static_cast<char>(0xc0), static_cast<char>(0xaf)};
+    const char control[] = {'x', '\n'};
+    const char nul[] = {'x', '\0'};
+    const Str invalid[] = {{nullptr, 1},
+                           {"", 0},
+                           {bad_utf8, sizeof(bad_utf8)},
+                           {control, sizeof(control)},
+                           {nul, sizeof(nul)}};
+    for (Str bad : invalid) {
+        length = 99;
+        CHECK(!jwt_hs256_issue_with_id({key, sizeof(key)},
+                                       lit_str("s"),
+                                       lit_str("i"),
+                                       lit_str("a"),
+                                       bad,
+                                       1000,
+                                       1,
+                                       token,
+                                       sizeof(token),
+                                       length));
+        CHECK_EQ(length, 0u);
+    }
+    char oversized[json::kMaxBytes + 1];
+    for (char& byte : oversized) byte = 'x';
+    CHECK(!jwt_hs256_issue_with_id({key, sizeof(key)},
+                                   lit_str("s"),
+                                   lit_str("i"),
+                                   lit_str("a"),
+                                   {oversized, sizeof(oversized)},
+                                   1000,
+                                   1,
+                                   token,
+                                   sizeof(token),
+                                   length));
+    const u32 fixed_payload = static_cast<u32>(
+        lit_str(
+            "{\"sub\":\"s\",\"iss\":\"i\",\"aud\":\"a\",\"jti\":\"\",\"iat\":1000,\"exp\":1001}")
+            .len);
+    char boundary[kMaxJwtHs256PayloadBytes];
+    for (char& byte : boundary) byte = 'x';
+    const u32 exact_id_length = kMaxJwtHs256PayloadBytes - fixed_payload;
+    CHECK(jwt_hs256_issue_with_id({key, sizeof(key)},
+                                  lit_str("s"),
+                                  lit_str("i"),
+                                  lit_str("a"),
+                                  {boundary, exact_id_length},
+                                  1000,
+                                  1,
+                                  token,
+                                  sizeof(token),
+                                  length));
+    const u32 exact_capacity = length;
+    CHECK(jwt_hs256_issue_with_id({key, sizeof(key)},
+                                  lit_str("s"),
+                                  lit_str("i"),
+                                  lit_str("a"),
+                                  {boundary, exact_id_length},
+                                  1000,
+                                  1,
+                                  token,
+                                  exact_capacity,
+                                  length));
+    CHECK(!jwt_hs256_issue_with_id({key, sizeof(key)},
+                                   lit_str("s"),
+                                   lit_str("i"),
+                                   lit_str("a"),
+                                   {boundary, exact_id_length + 1},
+                                   1000,
+                                   1,
+                                   token,
+                                   sizeof(token),
+                                   length));
+    CHECK_EQ(length, 0u);
+    CHECK(!jwt_hs256_issue_with_id({key, sizeof(key)},
+                                   lit_str("s"),
+                                   lit_str("i"),
+                                   lit_str("a"),
+                                   id,
+                                   0x7fffffffffffffffLL,
+                                   1,
+                                   token,
+                                   sizeof(token),
+                                   length));
+    CHECK_EQ(length, 0u);
+    CHECK(jwt_hs256_issue_with_id({key, sizeof(key)},
+                                  lit_str("s"),
+                                  lit_str("i"),
+                                  lit_str("a"),
+                                  id,
+                                  1000,
+                                  1,
+                                  token,
+                                  sizeof(token),
+                                  length));
+    const u32 exact = length;
+    CHECK(!jwt_hs256_issue_with_id({key, sizeof(key)},
+                                   lit_str("s"),
+                                   lit_str("i"),
+                                   lit_str("a"),
+                                   id,
+                                   1000,
+                                   1,
+                                   token,
+                                   exact - 1,
+                                   length));
+    CHECK_EQ(length, 0u);
+    char aliased[32] = "identifier";
+    CHECK(!jwt_hs256_issue_with_id({key, sizeof(key)},
+                                   lit_str("s"),
+                                   lit_str("i"),
+                                   lit_str("a"),
+                                   {aliased, 10},
+                                   1000,
+                                   1,
+                                   aliased,
+                                   sizeof(aliased),
+                                   length));
+    CHECK_EQ(length, 0u);
+    u32 overlap[4] = {};
+    CHECK(!jwt_hs256_issue_with_id({key, sizeof(key)},
+                                   lit_str("s"),
+                                   lit_str("i"),
+                                   lit_str("a"),
+                                   {reinterpret_cast<char*>(&overlap[0]), 4},
+                                   1000,
+                                   1,
+                                   token,
+                                   sizeof(token),
+                                   overlap[0]));
 }
 
 int main(int argc, char** argv) {

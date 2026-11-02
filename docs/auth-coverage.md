@@ -438,15 +438,18 @@ It accepts only a 32–4096-byte HMAC key, nonempty valid UTF-8 claim strings,
 positive caller-supplied Unix seconds, and TTL 1–86400 seconds with checked
 expiry addition. NUL and ASCII controls reject; quotes and backslashes are
 escaped. Claims and output are bounded to 8192 and 11004 bytes respectively.
-The native API uses existing pinned static SHA-256 HMAC support, writes only to
-caller-owned buffers, retains no views and rejects buffer aliasing. The Rut/JIT
-builtin samples realtime once and stores a successful token in the request JSON
-arena; failure returns nil. `Crypto.issueJwtHs256` is its qualified wrapper.
-`auth.jwtForIdentityHs256` uses `identity.consumerId` as `sub`, but Identity
-values carry no authentication provenance, so call it only after a successful
-authentication policy. Tests cover strict claims round-trip, failures,
-tampering, zero allocations, and JIT request-arena ownership. Arbitrary claims
-and other signing algorithms are not supported.
+The native APIs use existing pinned static SHA-256 HMAC support, write only to
+caller-owned buffers, retain no views and reject buffer aliasing. The native
+`jwt_hs256_issue_with_id` adds exactly one caller-supplied `jti` string under
+the same validation and size bounds; ID uniqueness remains the caller’s
+responsibility. The Rut/JIT five-claim builtin samples realtime once and stores
+a successful token in the request JSON arena; failure returns nil.
+`Crypto.issueJwtHs256` is its qualified wrapper. `auth.jwtForIdentityHs256`
+uses `identity.consumerId` as `sub`, but Identity values carry no authentication
+provenance, so call it only after successful authentication. Tests cover strict
+claims round-trip, failures, tampering, zero allocations and JIT request-arena
+ownership. Rut/JIT issuance with `jti`, arbitrary claim sets and other signing
+algorithms are not part of this API.
 
 ## Asymmetric key ownership foundation
 

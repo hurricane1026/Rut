@@ -8972,13 +8972,17 @@ to caller storage, uses the existing pinned SHA-256 HMAC C ABI, and retains no
 input or output views. Output length is zeroed on failure; output bytes are
 unspecified. Output storage must not overlap the key or claim inputs, and the
 length must not overlap those spans or the output buffer. The Rut/JIT
-`jwtIssueHs256(subject, issuer, audience, key, ttl)` builtin uses this profile,
-samples realtime once, and stores successful output in the request-owned JSON
-arena. `Crypto.issueJwtHs256` is the qualified wrapper. The optional
+`jwtIssueHs256(subject, issuer, audience, key, ttl)` builtin uses this five-claim
+profile, samples realtime once, and stores successful output in the request-owned
+JSON arena. `Crypto.issueJwtHs256` is the qualified wrapper. The optional
 `auth.jwtForIdentityHs256` helper copies `identity.consumerId` into `sub`;
 Identity values carry no provenance, so use that helper only after successful
-authentication. These APIs add no arbitrary claims, key identifier, algorithm
-selection, dependency or request allocation.
+authentication.
+
+The native-only `jwt_hs256_issue_with_id` variant adds exactly one caller-
+provided `jti` string under the same bounds and validation. Rut/JIT issuance
+with `jti` remains pending. Neither native API adds arbitrary claims, key
+identifiers, algorithm selection, dependencies or request allocations.
 
 ### Fixed RS256 public JWK configuration
 

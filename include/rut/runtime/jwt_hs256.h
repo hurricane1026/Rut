@@ -26,4 +26,19 @@ inline constexpr u32 kMaxJwtHs256KeyBytes = 4096;
                                    u32 capacity,
                                    u32& output_len);
 
+// Same bounded native profile with one additional `jti` string claim. The ID
+// must be nonempty valid UTF-8 with no NUL/ASCII controls and shares the 8192
+// byte escaped-payload limit; uniqueness is the caller's responsibility.
+// Output must not overlap the ID, and output_len must not overlap its span.
+[[nodiscard]] bool jwt_hs256_issue_with_id(Str key,
+                                           Str subject,
+                                           Str issuer,
+                                           Str audience,
+                                           Str token_id,
+                                           i64 unix_seconds,
+                                           i64 ttl_seconds,
+                                           char* output,
+                                           u32 capacity,
+                                           u32& output_len);
+
 }  // namespace rut
