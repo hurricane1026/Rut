@@ -4943,6 +4943,123 @@ TEST(serve_loader, attach_ws_terminate_to_jit_is_exact_and_fail_atomic) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_nested_json_lookup_preserves_relative_pointer_semantics) {
+    struct Case {
+        const char* parent;
+        const char* child;
+        const char* payload;
+        bool present;
+    };
+    const Case cases[] = {
+        {"/payload", "/name", R"({"payload":{"name":null}})", true},
+        {"/payload", "/name", R"({"payload":{},"name":"sibling"})", false},
+        {"/payload", "", R"({"payload":null})", true},
+        {"", "/name", R"({"name":false})", true},
+        {"/items/0", "/name", R"({"items":[{"name":0}]})", true},
+        {"/items", "/01", R"({"items":[1,2]})", false},
+        {"/a~1b", "/~0/0/\\0", R"({"a/b":{"~":[{"\u0000":0}]}})", true},
+        {"/payload", "name", R"({"payload":{},"payloadname":1})", false},
+        {"/payload", "/~2", R"({"payload":{"~2":1}})", false},
+        {"/payload", "/", R"({"payload":{"":[]}})", true},
+        {"/payload", "/name", R"({"payload":null,"name":1})", false},
+        {"/payload", "/name", R"({"payload":"text"})", false},
+        {"/payload", "/name", R"({"payload":{"name":1},"payload":{}})", false},
+        {"/payload", "/name", "{", false},
+    };
+    for (const auto& c : cases) {
+        for (bool bind : {false, true}) {
+            std::string source =
+                "upstream ws at \"127.0.0.1:9999\"\n"
+                "route GET \"/ws\" { return websocket(ws) { message in\n"
+                "guard let document = json.parse(message.text) else { message.drop() }\n"
+                "guard let parent = json.get(document, \"";
+            source += c.parent;
+            source += "\") else { message.drop() }\nguard ";
+            if (bind) source += "let child = ";
+            source += "json.get(parent, \"";
+            source += c.child;
+            source +=
+                bind ? "\") else { message.drop() }\n" : "\") != nil else { message.drop() }\n";
+            source += "message.forward() } }\n";
+            const auto path =
+                write_file("/tmp/rut_ws_nested_json_lookup", "app.rut", source.c_str());
+            LoadedProgram program;
+            LoadError err;
+            REQUIRE(load_rut_program(path.c_str(), program, err));
+            REQUIRE_EQ(unlink(path.c_str()), 0);
+            const auto handler = program.config.routes[0].ws_frame_handler;
+            REQUIRE(handler);
+            for (bool client : {false, true}) {
+                for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                    CHECK(handler(nullptr,
+                                  op,
+                                  reinterpret_cast<const u8*>(c.payload),
+                                  strlen(c.payload),
+                                  client) ==
+                          (c.present ? WsFrameAction::Forward : WsFrameAction::Drop));
+                }
+            }
+            program.destroy();
+        }
+    }
+}
+
+TEST(serve_loader, websocket_nested_json_typed_rewrites_retain_composed_paths) {
+    const char* accessors[] = {"string", "numberText", "stringify"};
+    const char* payloads[] = {R"({"a/b":{"\u0000":"x\u0000\u20ac"}})",
+                              R"({"a/b":{"\u0000":-0.1200e+03}})",
+                              R"({"a/b":{"\u0000":{"x":true,"n":null}}})"};
+    const Str expected[] = {
+        {"[x\0\xe2\x82\xac]", 7}, lit_str("[-0.1200e+03]"), lit_str(R"([{"x":true,"n":null}])")};
+    for (u32 i = 0; i < 3; ++i) {
+        std::string source = R"rut(upstream ws at "127.0.0.1:9999"
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let parent = json.get(document, "/a~1b") else { message.close(1008) }
+ guard let child = json.get(parent, "/\0") else { message.close(1008) }
+ guard let text = json.)rut";
+        source += accessors[i];
+        source +=
+            "(child) else { message.close(1003) }\nmessage.forward(\"[\" + text + \"]\") } }\n";
+        const auto path = write_file("/tmp/rut_ws_nested_json_rewrite", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        REQUIRE_EQ(unlink(path.c_str()), 0);
+        const auto& route = program.config.routes[0];
+        CHECK(route.ws_forward_text.source_path.eq({"/a~1b/\0", 7}));
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            const u32 len = static_cast<u32>(strlen(payloads[i]));
+            u8 input[128]{}, output[128]{}, message[128]{};
+            input[0] = 0x80 | static_cast<u8>(op);
+            input[1] = static_cast<u8>(len);
+            memcpy(input + 2, payloads[i], len);
+            WsInspector inspector;
+            inspector.forward_text = route.ws_forward_text;
+            inspector.close_policies = route.ws_close_policies;
+            inspector.close_policy_count = route.ws_close_policy_count;
+            u32 used = 0, produced = 0;
+            CHECK(ws_inspect(inspector,
+                             input,
+                             len + 2,
+                             output,
+                             sizeof(output),
+                             message,
+                             sizeof(message),
+                             route.ws_frame_handler,
+                             nullptr,
+                             &used,
+                             &produced) == WsInspectStatus::Ok);
+            CHECK_EQ(used, len + 2);
+            REQUIRE_EQ(produced, expected[i].len + 2);
+            CHECK_EQ(output[0], 0x81u);
+            CHECK_EQ(output[1], expected[i].len);
+            CHECK(memcmp(output + 2, expected[i].ptr, expected[i].len) == 0);
+        }
+        program.destroy();
+    }
+}
+
 TEST(serve_loader, websocket_json_fields_use_bound_document_and_pointer) {
     const char* conditions[] = {"json.get(document, \"/name\") != nil",
                                 "nil != json.get(document, \"/name\")",

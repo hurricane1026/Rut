@@ -7287,6 +7287,27 @@ static const WsJsonBinding* ws_json_binding(const WsJsonBindings& bindings, Str 
     return nullptr;
 }
 
+// Resolve relative RFC 6901 paths at compile time. Earlier guards prove the
+// source exists; callbacks keep using one root-relative path and retain no nodes.
+static FrontendResult<Str> ws_json_get_path(const WsJsonBinding& source,
+                                            const AstExpr& pointer,
+                                            const HirModule& mod) {
+    auto path = decoded_expression_string(pointer.str_value, mod, pointer.span);
+    if (!path) return core::make_unexpected(path.error());
+    if (source.path.len > json::kMaxBytes || path->len > json::kMaxBytes - source.path.len)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              pointer.span,
+                              lit_str("combined message JSON pointer exceeds 8192 bytes"));
+    if (source.path.len == 0) return path.value();
+    if (path->len == 0) return source.path;
+    // An invalid relative pointer must still fail at runtime, rather than
+    // accidentally naming a sibling when appended to a valid source path.
+    if (path->ptr[0] != '/') return path.value();
+    std::string combined(source.path.ptr, source.path.len);
+    combined.append(path->ptr, path->len);
+    return intern_analysis_string(mod, std::move(combined));
+}
+
 // Flatten bounded String concatenation around at most one message.text reference.
 // No arbitrary expression evaluation or message-time allocation is needed.
 static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
@@ -7604,9 +7625,9 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
             call->args[1] && call->args[0]->kind == AstExprKind::Ident &&
             call->args[1]->kind == AstExprKind::StrLit) {
             const WsJsonBinding* document = ws_json_binding(documents, call->args[0]->name);
-            if (document && document->kind == WsJsonBinding::Kind::Document) {
-                auto path =
-                    decoded_expression_string(call->args[1]->str_value, mod, call->args[1]->span);
+            if (document && (document->kind == WsJsonBinding::Kind::Document ||
+                             document->kind == WsJsonBinding::Kind::SelectedValue)) {
+                auto path = ws_json_get_path(*document, *call->args[1], mod);
                 if (!path) return core::make_unexpected(path.error());
                 WsLenGuard g{};
                 g.accessor = WsLenGuard::Accessor::JsonHasPath;
@@ -13800,13 +13821,13 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                gs->expr.args[1]->kind == AstExprKind::StrLit) {
                         const WsJsonBinding* source =
                             ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || source->kind != WsJsonBinding::Kind::Document)
+                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
+                                        source->kind != WsJsonBinding::Kind::SelectedValue))
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   gs->span,
                                                   lit_str("json.get message bindings require a "
-                                                          "validated document alias"));
-                        auto path = decoded_expression_string(
-                            gs->expr.args[1]->str_value, mod, gs->expr.args[1]->span);
+                                                          "validated JSON value alias"));
+                        auto path = ws_json_get_path(*source, *gs->expr.args[1], mod);
                         if (!path) return core::make_unexpected(path.error());
                         node.accessor = WsLenGuard::Accessor::JsonHasPath;
                         node.pattern = path.value();

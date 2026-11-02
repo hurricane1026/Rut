@@ -852,14 +852,22 @@ route GET "/root" { return websocket(backend) { message in
 } }
 route GET "/second" { return websocket(backend) { message in
  guard let document = json.parse(message.text) else { message.close(1007) }
- guard let field = json.get(document, "/other/value") else { message.close(1008) }
+ guard let parent = json.get(document, "/other") else { message.close(1008) }
+ guard let field = json.get(parent, "/value") else { message.close(1008) }
  guard let encoded = json.stringify(field) else { message.close(1003) }
  message.forward(encoded)
+} }
+route GET "/nested-string" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let parent = json.get(document, "/a~1b") else { message.close(1008) }
+ guard let field = json.get(parent, "/~0/0") else { message.close(1008) }
+ guard let text = json.string(field) else { message.close(1003) }
+ message.forward("<" + text + ">")
 } })rut"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
-    REQUIRE_EQ(owner.p->config.route_count, 4u);
+    REQUIRE_EQ(owner.p->config.route_count, 5u);
     REQUIRE_EQ(unlink(source.path), 0);
 
     CHECK_EQ(owner.p->config.routes[0].ws_forward_text.source, WsTextSource::JsonStringify);
@@ -870,6 +878,7 @@ route GET "/second" { return websocket(backend) { message in
     CHECK(owner.p->config.routes[1].ws_forward_texts[0].source_path.eq(lit_str("/payload")));
     CHECK_EQ(owner.p->config.routes[3].ws_forward_text.source, WsTextSource::JsonStringify);
     CHECK(owner.p->config.routes[3].ws_forward_text.source_path.eq(lit_str("/other/value")));
+    CHECK(owner.p->config.routes[4].ws_forward_text.source_path.eq(lit_str("/a~1b/~0/0")));
 
     auto inspect = [&](u32 route_index, const char* payload, const char* expected) {
         const RouteEntry& route = owner.p->config.routes[route_index];
@@ -904,6 +913,7 @@ route GET "/second" { return websocket(backend) { message in
     inspect(1, R"({"payload":{"x":true,"n":-0}})", R"([{"x":true,"n":-0}])");
     inspect(2, R"(null)", "(null)");
     inspect(3, R"({"other":{"value":[1,2]}})", "[1,2]");
+    inspect(4, R"({"a/b":{"~":["hello"]}})", "<hello>");
 }
 
 TEST(native_program, websocket_json_string_predicates_survive_source_removal) {

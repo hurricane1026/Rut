@@ -196,10 +196,35 @@ parse checks still run before an empty predicate can match.
 
 Aliases are compile-time paths into the immutable message: each reached check
 reparses the bounded payload and retains no JSON node or borrowed string view.
-Only `json.get(document, literalPointer)` and `json.string(unwrappedValue)` are
-supported in these handlers; nested `get`, general extraction, dynamic paths,
+A `json.get` source may be the document or an earlier guard-unwrapped selected
+JSON value. Further `get` calls use literal RFC 6901 pointers relative to that
+value; each selection requires its own guard. General extraction, dynamic paths,
 and dynamic predicate arguments remain unsupported. These bindings and
 predicates use the existing four-guard and 32-condition-node limits.
+
+For example, select a nested name in two steps and forward its decoded text:
+
+```swift
+guard let document = json.parse(message.text) else { message.close(1007) }
+guard let payload = json.get(document, "/payload") else { message.close(1008) }
+guard let field = json.get(payload, "/name") else { message.close(1008) }
+guard let name = json.string(field) else { message.close(1003) }
+message.forward("hello " + name)
+```
+
+Presence conditions such as `json.get(payload, "/name") != nil` use the same
+relative lookup, including mirrored comparisons and logical conditions. An empty
+pointer selects the source value itself, including JSON null. Escaped tokens,
+array indices and embedded NUL retain the ordinary pointer semantics; invalid
+pointers and missing children fail the reached guard. Decoded String, Bool, Int
+and other typed aliases cannot be used as JSON containers. The binding being
+declared is unavailable in its own failure branch.
+
+The compiler folds each selection chain into an immutable root-relative pointer,
+with at most 8192 combined decoded pointer bytes. Runtime callbacks still reparse
+the complete bounded message and retain no selected node or borrowed view between
+calls. The existing four source guards and 32 condition nodes remain the limit;
+no native format or handler ABI change is required.
 
 A successfully unwrapped string alias may also be the sole dynamic source of a
 `message.forward(...)` replacement, with fixed UTF-8 literals or route constants

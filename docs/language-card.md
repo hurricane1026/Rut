@@ -918,8 +918,23 @@ return websocket(chat) { message in
 // Bindings require fresh names and count toward the four-guard limit. Each reached
 // check reparses within the JSON bounds; no document or borrowed string survives.
 // Empty contains needles match every valid string; a failed/non-string JSON value
-// still fails its binding. Nested get, dynamic paths, arbitrary extraction and
-// mutation remain unsupported; no Unicode normalization is performed.
+// still fails its binding. json.get accepts a previously guard-unwrapped Json
+// selection too; its literal pointer is relative to that value. Dynamic paths,
+// arbitrary extraction and mutation remain unsupported; no Unicode normalization occurs.
+
+// Select nested JSON values with separate optional guards. Empty pointers retain
+// the source value, including JSON null. Escaped tokens, indices and NUL work as
+// ordinary RFC 6901 pointers. Presence comparisons also accept selected Json aliases.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let payload = json.get(document, "/payload") else { message.close(1008) }
+    guard let field = json.get(payload, "/name") else { message.close(1008) }
+    guard let name = json.string(field) else { message.close(1003) }
+    message.forward("hello " + name)
+}
+// The chain folds at compile time into a root-relative path, capped at 8192 bytes.
+// Four guards and 32 condition nodes remain the limit. Typed scalar aliases cannot
+// be containers, and a binding is unavailable in its own failure branch.
 
 // Forward one previously guard-unwrapped JSON string alias, optionally with fixed
 // UTF-8 affixes. The value is decoded again only when this rewrite is selected.
