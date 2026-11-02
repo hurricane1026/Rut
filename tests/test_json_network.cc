@@ -891,6 +891,254 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     pool.destroy();
 }
 
+TEST(json_network, hs256_issue_helper_uses_request_arena_and_fails_closed_on_budget) {
+    SlicePool pool;
+    REQUIRE(pool.init(24));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char key[32];
+    for (char& byte : key) byte = 'k';
+    u8 has_value = 9;
+    const char* output = reinterpret_cast<const char*>(1);
+    u32 output_len = 99;
+    rut_helper_jwt_issue_hs256(nullptr,
+                               &arena,
+                               "alice",
+                               5,
+                               "issuer",
+                               6,
+                               "orders",
+                               6,
+                               key,
+                               sizeof(key),
+                               60,
+                               &has_value,
+                               &output,
+                               &output_len);
+    REQUIRE(has_value);
+    REQUIRE(output != nullptr);
+    CHECK_GT(output_len, 100u);
+    CHECK_LE(arena.space_allocated(), SlicePool::kSliceSize);
+    CHECK(reinterpret_cast<uintptr_t>(output) >= reinterpret_cast<uintptr_t>(pool.base));
+    CHECK(reinterpret_cast<uintptr_t>(output) <
+          reinterpret_cast<uintptr_t>(pool.base) +
+              static_cast<u64>(pool.count) * SlicePool::kSliceSize);
+
+    arena.reset();
+    has_value = 9;
+    output = reinterpret_cast<const char*>(1);
+    output_len = 99;
+    rut_helper_jwt_issue_hs256(nullptr,
+                               &arena,
+                               "alice",
+                               5,
+                               "issuer",
+                               6,
+                               "orders",
+                               6,
+                               key,
+                               sizeof(key) - 1,
+                               60,
+                               &has_value,
+                               &output,
+                               &output_len);
+    CHECK_EQ(has_value, 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(output_len, 0u);
+
+    has_value = 9;
+    output = reinterpret_cast<const char*>(1);
+    output_len = 99;
+    rut_helper_jwt_issue_hs256(nullptr,
+                               &arena,
+                               "alice",
+                               5,
+                               "issuer",
+                               6,
+                               "orders",
+                               6,
+                               key,
+                               sizeof(key),
+                               0,
+                               &has_value,
+                               &output,
+                               &output_len);
+    CHECK_EQ(has_value, 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(output_len, 0u);
+
+    test_fault::SyscallFaultConfig clock_failure{};
+    clock_failure.clock_gettime_errno = EIO;
+    clock_failure.clock_gettime_failures = 1;
+    {
+        test_fault::ScopedSyscallFault fault(clock_failure);
+        has_value = 9;
+        output = reinterpret_cast<const char*>(1);
+        output_len = 99;
+        rut_helper_jwt_issue_hs256(nullptr,
+                                   &arena,
+                                   "alice",
+                                   5,
+                                   "issuer",
+                                   6,
+                                   "orders",
+                                   6,
+                                   key,
+                                   sizeof(key),
+                                   60,
+                                   &has_value,
+                                   &output,
+                                   &output_len);
+    }
+    CHECK_EQ(has_value, 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(output_len, 0u);
+
+    arena.reset();
+    while (arena.space_used() <= kHashRequestBudget) {
+        REQUIRE(arena.alloc(15 * 1024) != nullptr);
+    }
+    has_value = 9;
+    output = reinterpret_cast<const char*>(1);
+    output_len = 99;
+    rut_helper_jwt_issue_hs256(nullptr,
+                               &arena,
+                               "alice",
+                               5,
+                               "issuer",
+                               6,
+                               "orders",
+                               6,
+                               key,
+                               sizeof(key),
+                               60,
+                               &has_value,
+                               &output,
+                               &output_len);
+    CHECK_EQ(has_value, 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(output_len, 0u);
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(json_network, issued_jwt_body_survives_http1_and_http2_send_paths) {
+    constexpr char kSource[] = R"rut(
+route GET "/issue" {
+    guard let token = jwtIssueHs256("alice", "issuer", "orders", "01234567890123456789012345678901", 60) else { return response(503) }
+    return response(200, body: token)
+}
+route POST "/validate" {
+    guard let token = bearerToken(req.authorization.or("")) else { return 401 }
+    guard let claims = jwtDecode(token, "01234567890123456789012345678901", "HS256") else { return 401 }
+    guard jwtClaimsValid(claims, "issuer", "orders") else { return 401 }
+    return 204
+}
+)rut";
+    JsonProgram program;
+    REQUIRE(program.init(kSource));
+    const auto verify_token = [&](Str token, SliceArena& arena) {
+        const std::string request = std::string("POST /validate HTTP/1.1\r\nHost: test\r\n") +
+                                    "Authorization: Bearer " + std::string(token.ptr, token.len) +
+                                    "\r\n\r\n";
+        const auto result = jit::HandlerResult::unpack(
+            program.handler(1)(nullptr,
+                               nullptr,
+                               reinterpret_cast<const u8*>(request.data()),
+                               static_cast<u32>(request.size()),
+                               &arena));
+        CHECK_EQ(result.status_code, 204u);
+    };
+
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(48));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn);
+    conn->json_arena.backend.pool = &pool;
+    const char request[] = "GET /issue HTTP/1.1\r\nHost: test\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+               sizeof(request) - 1);
+    capture_request_metadata(*conn);
+    conn->request_config = program.config.get();
+    auto* ctx = conn->reset_jit_ctx();
+    auto outcome = invoke_jit_handler(
+        program.handler(), conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+    CHECK_EQ(outcome.status_code, 200u);
+    handle_jit_outcome(&loop, *conn, outcome, program.handler(), false);
+    conn->json_arena.destroy();
+    Str h1_wire{reinterpret_cast<const char*>(conn->send_buf.data()), conn->send_buf.len()};
+    const char* h1_body_start = nullptr;
+    for (u32 i = 3; i < h1_wire.len; ++i) {
+        if (__builtin_memcmp(h1_wire.ptr + i - 3, "\r\n\r\n", 4) == 0) {
+            h1_body_start = h1_wire.ptr + i + 1;
+            break;
+        }
+    }
+    REQUIRE(h1_body_start != nullptr);
+    const Str h1_token{h1_body_start, static_cast<u32>(h1_wire.ptr + h1_wire.len - h1_body_start)};
+    CHECK_EQ(h1_token.ptr[0], 'e');
+    CHECK(h1_token.len > 100u);
+    SliceArena verify_arena;
+    REQUIRE(verify_arena.init(&pool));
+    verify_token(h1_token, verify_arena);
+    verify_arena.destroy();
+
+    REQUIRE(conn->json_arena.init(&pool));
+    conn->send_buf.reset();
+    conn->recv_buf.reset();
+    conn->protocol = ConnProtocol::Http2;
+    auto h2 = std::make_unique<Http2Conn>();
+    h2->init();
+    conn->h2 = h2.get();
+    conn->epoch_held = true;
+    h2->nstreams = 1;
+    h2->streams[0] = {1, Http2StreamState::HalfClosedRemote, 0, 0, true};
+    u8 wire[4096]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, wire, sizeof(wire), 0, false};
+    h2_invoke_emit(dispatch,
+                   1,
+                   &program.config->routes[0],
+                   nullptr,
+                   0,
+                   program.config.get(),
+                   reinterpret_cast<const u8*>(request),
+                   sizeof(request) - 1,
+                   false,
+                   true);
+    CHECK_FALSE(dispatch.overflow);
+    REQUIRE_EQ(h2->outbound_stream, 1u);
+    CHECK(h2->outbound_source == H2OutboundBodySource::JitDynamic);
+    CHECK(h2->outbound_body_len > 100u);
+    const u32 expected_h2_token_len = h2->outbound_body_len;
+    conn->json_arena.destroy();
+    std::unique_ptr<char[]> h2_token = std::make_unique<char[]>(expected_h2_token_len);
+    u32 h2_token_len = 0;
+    H2PumpStatus status{};
+    h2->conn_send_window = 65535;
+    h2->streams[0].send_window = 65535;
+    while (h2->outbound_stream != 0) {
+        const u32 sent = h2_pump_outbound(*h2, wire, sizeof(wire), status);
+        REQUIRE_GT(sent, 0u);
+        if (wire[3] == static_cast<u8>(Http2FrameType::Data)) {
+            const u32 frame_len =
+                (static_cast<u32>(wire[0]) << 16) | (static_cast<u32>(wire[1]) << 8) | wire[2];
+            REQUIRE(h2_token_len + frame_len <= expected_h2_token_len);
+            __builtin_memcpy(h2_token.get() + h2_token_len, wire + kFrameHeaderSize, frame_len);
+            h2_token_len += frame_len;
+        }
+        if (h2->outbound_final_staged) h2_clear_primary_outbound(*h2);
+    }
+    CHECK_EQ(h2_token_len, expected_h2_token_len);
+    REQUIRE(verify_arena.init(&pool));
+    verify_token({h2_token.get(), h2_token_len}, verify_arena);
+    verify_arena.destroy();
+    conn->h2 = nullptr;
+    loop.free_conn(*conn);
+    pool.destroy();
+}
+
 TEST(json_network, native_hs256_issue_round_trips_existing_decoder_and_claim_policy) {
     char key[32];
     for (char& byte : key) byte = 'k';

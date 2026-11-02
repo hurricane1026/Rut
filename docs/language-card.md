@@ -1284,8 +1284,9 @@ hash:    md5/sha1/sha224/sha256/sha384/sha512(data) -> str? (lowercase hex)
 jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
          decode with json.decode/json.get). jwtVerifyRs256(tok, policy) -> Json?
          (static JWKS + claims policy). jwtHasGroup(claims, required) -> bool.
-         Native-only fixed-profile HS256 jwt_hs256_issue is available;
-         ⏳ other RS/ES algorithms and DSL jwtEncode
+         Fixed-profile HS256 jwtIssueHs256(subject, issuer, audience, key,
+         ttl:i32) -> str?; Crypto.issueJwtHs256 qualified wrapper;
+         ⏳ other RS/ES algorithms and arbitrary-claims DSL jwtEncode
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
 time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
@@ -1853,14 +1854,18 @@ This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism
 Other asymmetric algorithms and remote JWKS refresh remain separate work;
 configured RS256 verification is described below.
 
-The native-only `jwt_hs256_issue` API emits a compact HS256 token with only
+The native `jwt_hs256_issue` API and Rut/JIT `jwtIssueHs256` builtin emit a
+compact HS256 token with only
 `sub`, `iss`, `aud`, `iat` and `exp`, and a fixed `alg=HS256`, `typ=JWT`
 header. It requires a 32–4096-byte key, nonempty valid UTF-8 claim strings,
 positive Unix time, and a 1–86400-second TTL with checked expiry addition.
 NUL and ASCII controls are rejected; quotes and backslashes are escaped.
-Payload and output are bounded to 8192 and 11004 bytes respectively. This is
-an internal C++ runtime API with caller-owned output and no retained views; Rut
-and JIT issuance syntax remains pending.
+Payload and output are bounded to 8192 and 11004 bytes respectively. The
+builtin samples realtime once per request and stores successful output in the
+request-owned JSON arena. The qualified `Crypto.issueJwtHs256` wrapper and
+`auth.jwtForIdentityHs256` helper use the same profile. `Identity` is
+constructible and carries no authentication provenance; call that helper only
+after successful authentication.
 
 ### Static HS JWT secret rotation
 
