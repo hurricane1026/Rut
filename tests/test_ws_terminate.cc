@@ -1128,31 +1128,84 @@ TEST(ws_terminate, json_string_rewrite_handles_empty_root_and_fragmented_control
     }
 }
 
-TEST(ws_terminate, fixed_text_rewrite_reassembles_and_preserves_control_frames) {
-    const Str replacements[] = {{"", 0}, {"longer\0text", 11}};
-    for (bool masked : kMaskDirections) {
-        for (Str replacement : replacements) {
+TEST(ws_terminate, fixed_replacement_reassembles_and_preserves_control_frames) {
+    const Str replacements[] = {{"", 0}, {"longer\0text", 11}, {"\x00\xff\x80", 3}};
+    const WsTextSource sources[] = {WsTextSource::Literal, WsTextSource::LiteralBinary};
+    for (WsTextSource source : sources) {
+        for (bool masked : kMaskDirections) {
+            for (Str replacement : replacements) {
+                if (source == WsTextSource::Literal && !ws_valid_text_payload(replacement))
+                    continue;
+                WsInspector st = make_state(masked);
+                st.forward_text = {replacement, {}, {}, source};
+                Recorder r;
+                r.verdict = WsFrameAction::ForwardText;
+                u8 in[128], out[128], msg[128], decoded[128];
+                u32 used = 0, produced = 0;
+                const u8 first[] = {'x'};
+                const u32 n = build(in, WsOpcode::Binary, false, masked, first, 1);
+                REQUIRE(ws_inspect(st,
+                                   in,
+                                   n,
+                                   out,
+                                   sizeof(out),
+                                   msg,
+                                   sizeof(msg),
+                                   record,
+                                   &r,
+                                   &used,
+                                   &produced) == WsInspectStatus::Ok);
+                CHECK_EQ(used, n);
+                CHECK_EQ(produced, 0u);
+                CHECK_EQ(r.calls, 0);
+                const u32 ping = build(in, WsOpcode::Ping, true, masked, first, 1);
+                const u32 continuation =
+                    build(in + ping, WsOpcode::Continuation, true, masked, first, 1);
+                REQUIRE(ws_inspect(st,
+                                   in,
+                                   ping + continuation,
+                                   out,
+                                   sizeof(out),
+                                   msg,
+                                   sizeof(msg),
+                                   record,
+                                   &r,
+                                   &used,
+                                   &produced) == WsInspectStatus::Ok);
+                CHECK_EQ(r.calls, 1);
+                CHECK_EQ(r.last_len, 2u);
+                CHECK(r.last_op == WsOpcode::Binary);
+                WsFrameHeader h{};
+                const u32 prefix = parse_one(out, produced, masked, &h, decoded);
+                REQUIRE(prefix != 0);
+                CHECK(h.opcode == WsOpcode::Ping);
+                CHECK_EQ(decoded[0], 'x');
+                REQUIRE(parse_one(out + prefix, produced - prefix, masked, &h, decoded) != 0);
+                CHECK(h.opcode ==
+                      (source == WsTextSource::LiteralBinary ? WsOpcode::Binary : WsOpcode::Text));
+                CHECK_EQ(h.payload_len, replacement.len);
+                CHECK(memcmp(decoded, replacement.ptr, replacement.len) == 0);
+            }
+        }
+    }
+}
+
+TEST(ws_terminate, fixed_replacement_retries_after_output_drain) {
+    const WsTextSource sources[] = {WsTextSource::Literal, WsTextSource::LiteralBinary};
+    for (WsTextSource source : sources) {
+        for (bool masked : kMaskDirections) {
             WsInspector st = make_state(masked);
-            st.forward_text = {replacement};
+            st.forward_text = {{"a longer replacement", 20}, {}, {}, source};
             Recorder r;
             r.verdict = WsFrameAction::ForwardText;
-            u8 in[128], out[128], msg[128], decoded[128];
+            u8 in[64], out[40], msg[64], decoded[64];
+            const u8 payload = 'x';
+            const u32 one = build(in, WsOpcode::Text, true, masked, &payload, 1);
+            const u32 two = build(in + one, WsOpcode::Text, true, masked, &payload, 1);
             u32 used = 0, produced = 0;
-            const u8 first[] = {'x'};
-            const u32 n = build(in, WsOpcode::Binary, false, masked, first, 1);
-            REQUIRE(
-                ws_inspect(
-                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
-                WsInspectStatus::Ok);
-            CHECK_EQ(used, n);
-            CHECK_EQ(produced, 0u);
-            CHECK_EQ(r.calls, 0);
-            const u32 ping = build(in, WsOpcode::Ping, true, masked, first, 1);
-            const u32 continuation =
-                build(in + ping, WsOpcode::Continuation, true, masked, first, 1);
             REQUIRE(ws_inspect(st,
                                in,
-                               ping + continuation,
+                               one + two,
                                out,
                                sizeof(out),
                                msg,
@@ -1161,64 +1214,27 @@ TEST(ws_terminate, fixed_text_rewrite_reassembles_and_preserves_control_frames) 
                                &r,
                                &used,
                                &produced) == WsInspectStatus::Ok);
+            CHECK_EQ(used, one);
             CHECK_EQ(r.calls, 1);
-            CHECK_EQ(r.last_len, 2u);
-            CHECK(r.last_op == WsOpcode::Binary);
             WsFrameHeader h{};
-            const u32 prefix = parse_one(out, produced, masked, &h, decoded);
-            REQUIRE(prefix != 0);
-            CHECK(h.opcode == WsOpcode::Ping);
-            CHECK_EQ(decoded[0], 'x');
-            REQUIRE(parse_one(out + prefix, produced - prefix, masked, &h, decoded) != 0);
-            CHECK(h.opcode == WsOpcode::Text);
-            CHECK_EQ(h.payload_len, replacement.len);
-            CHECK(memcmp(decoded, replacement.ptr, replacement.len) == 0);
+            REQUIRE(parse_one(out, produced, masked, &h, decoded) != 0);
+            CHECK_EQ(h.payload_len, 20u);
+            REQUIRE(ws_inspect(st,
+                               in + used,
+                               two,
+                               out,
+                               sizeof(out),
+                               msg,
+                               sizeof(msg),
+                               record,
+                               &r,
+                               &used,
+                               &produced) == WsInspectStatus::Ok);
+            CHECK_EQ(used, two);
+            CHECK_EQ(r.calls, 2);
+            REQUIRE(parse_one(out, produced, masked, &h, decoded) != 0);
+            CHECK(memcmp(decoded, st.forward_text.prefix.ptr, 20) == 0);
         }
-    }
-}
-
-TEST(ws_terminate, fixed_text_rewrite_retries_after_output_drain) {
-    for (bool masked : kMaskDirections) {
-        WsInspector st = make_state(masked);
-        st.forward_text = {"a longer replacement", 20};
-        Recorder r;
-        r.verdict = WsFrameAction::ForwardText;
-        u8 in[64], out[40], msg[64], decoded[64];
-        const u8 payload = 'x';
-        const u32 one = build(in, WsOpcode::Text, true, masked, &payload, 1);
-        const u32 two = build(in + one, WsOpcode::Text, true, masked, &payload, 1);
-        u32 used = 0, produced = 0;
-        REQUIRE(ws_inspect(st,
-                           in,
-                           one + two,
-                           out,
-                           sizeof(out),
-                           msg,
-                           sizeof(msg),
-                           record,
-                           &r,
-                           &used,
-                           &produced) == WsInspectStatus::Ok);
-        CHECK_EQ(used, one);
-        CHECK_EQ(r.calls, 1);
-        WsFrameHeader h{};
-        REQUIRE(parse_one(out, produced, masked, &h, decoded) != 0);
-        CHECK_EQ(h.payload_len, 20u);
-        REQUIRE(ws_inspect(st,
-                           in + used,
-                           two,
-                           out,
-                           sizeof(out),
-                           msg,
-                           sizeof(msg),
-                           record,
-                           &r,
-                           &used,
-                           &produced) == WsInspectStatus::Ok);
-        CHECK_EQ(used, two);
-        CHECK_EQ(r.calls, 2);
-        REQUIRE(parse_one(out, produced, masked, &h, decoded) != 0);
-        CHECK(memcmp(decoded, st.forward_text.prefix.ptr, 20) == 0);
     }
 }
 
@@ -1237,6 +1253,76 @@ TEST(ws_terminate, fixed_text_rewrite_fails_closed_on_invalid_output) {
         CHECK(ws_inspect(
                   st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
               WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
+    }
+}
+
+TEST(ws_terminate, binary_replacement_single_slice_limit_and_invalid_input) {
+    char bytes[kWsTerminateMessageCapacity];
+    memset(bytes, 0xff, sizeof(bytes));
+    for (bool masked : kMaskDirections) {
+        WsInspector st = make_state(masked);
+        st.max_message_size = sizeof(bytes);
+        st.forward_text = {{bytes, sizeof(bytes)}, {}, {}, WsTextSource::LiteralBinary};
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        u8 in[16], out[SlicePool::kSliceSize], msg[sizeof(bytes)], decoded[sizeof(bytes)];
+        const u32 n = build(in, WsOpcode::Binary, true, masked, nullptr, 0);
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(
+                    st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+                WsInspectStatus::Ok);
+        WsFrameHeader h{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(h.opcode == WsOpcode::Binary);
+        CHECK_EQ(h.payload_len, sizeof(bytes));
+        CHECK(memcmp(decoded, bytes, sizeof(bytes)) == 0);
+
+        // Binary output must not make malformed Text input acceptable.
+        const u32 bad_text =
+            build(in, WsOpcode::Text, true, masked, reinterpret_cast<const u8*>(bytes), 1);
+        CHECK(ws_inspect(st,
+                         in,
+                         bad_text,
+                         out,
+                         sizeof(out),
+                         msg,
+                         sizeof(msg),
+                         record,
+                         &r,
+                         &used,
+                         &produced) == WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
+        CHECK_EQ(r.calls, 1);
+    }
+}
+
+TEST(ws_terminate, binary_replacement_rejects_invalid_metadata_and_output_bounds) {
+    const char bytes[] = {'\0', static_cast<char>(0xff)};
+    for (u32 invalid = 0; invalid < 6; ++invalid) {
+        WsInspector st = make_state(false);
+        st.max_message_size = 2;
+        st.forward_text = {{bytes, sizeof(bytes)}, {}, {}, WsTextSource::LiteralBinary};
+        if (invalid == 0) st.forward_text.prefix = {nullptr, 1};
+        if (invalid == 1) st.forward_text.suffix = {nullptr, 1};
+        if (invalid == 2) st.forward_text.source_path = {"/x", 2};
+        if (invalid == 3) st.max_message_size = 1;
+        if (invalid == 4) st.forward_text.prefix = {bytes, kWsTerminateMessageCapacity + 1};
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        u8 input[] = {0x82, 0}, out[8], msg[8];
+        u32 used = 0, produced = 0;
+        CHECK(ws_inspect(st,
+                         input,
+                         sizeof(input),
+                         out,
+                         invalid == 5 ? 3 : sizeof(out),
+                         msg,
+                         sizeof(msg),
+                         record,
+                         &r,
+                         &used,
+                         &produced) == WsInspectStatus::Error);
         CHECK_EQ(produced, 0u);
     }
 }

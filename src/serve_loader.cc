@@ -402,12 +402,13 @@ bool load_rut_program(const char* path,
                                     ? route.ws_handler.max_message_size
                                     : kWsDefaultMaxMessageSize;
             if (!ws_valid_message_capacity(max_msg)) return false;
-            auto retain_forward_text = [&](u32 index, Str& result) {
+            auto retain_forward_text = [&](u32 index, Str& result, bool binary) {
                 if (index >= route.exprs.len) return false;
                 const auto& expr = route.exprs[index];
                 if (expr.kind != HirExprKind::StrLit || expr.str_value.len > max_msg ||
                     expr.str_value.len > kWsTerminateMessageCapacity ||
-                    !ws_valid_text_payload(expr.str_value))
+                    (binary ? (!expr.str_value.ptr && expr.str_value.len != 0)
+                            : !ws_valid_text_payload(expr.str_value)))
                     return false;
                 char* bytes = out.rir.arena.alloc_array<char>(expr.str_value.len + 1);
                 if (!bytes) return false;
@@ -420,6 +421,10 @@ bool load_rut_program(const char* path,
                 switch (source.source) {
                     case HirWsTextSource::Literal:
                         result.source = WsTextSource::Literal;
+                        if (source.source_path.ptr || source.source_path.len != 0) return false;
+                        break;
+                    case HirWsTextSource::LiteralBinary:
+                        result.source = WsTextSource::LiteralBinary;
                         if (source.source_path.ptr || source.source_path.len != 0) return false;
                         break;
                     case HirWsTextSource::MessageText:
@@ -458,8 +463,9 @@ bool load_rut_program(const char* path,
                     default:
                         return false;
                 }
-                return retain_forward_text(source.prefix_expr, result.prefix) &&
-                       retain_forward_text(source.suffix_expr, result.suffix) &&
+                const bool kBinary = source.source == HirWsTextSource::LiteralBinary;
+                return retain_forward_text(source.prefix_expr, result.prefix, kBinary) &&
+                       retain_forward_text(source.suffix_expr, result.suffix, kBinary) &&
                        ws_valid_text_rewrite(result, max_msg);
             };
             WsTextRewrite forward_text{};

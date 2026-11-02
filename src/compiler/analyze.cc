@@ -7383,13 +7383,20 @@ static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(
     HirWsTextRewrite result;
     u32 nodes = 0;
     bool after_source = false;
-    auto parts = analyze_message_text_parts(
-        *call.args[0], route, mod, prefix, suffix, result, after_source, documents, nodes);
-    if (!parts) return core::make_unexpected(parts.error());
+    const bool kBinary = call.args[0]->kind == AstExprKind::BytesLit;
+    if (kBinary) {
+        result.source = HirWsTextSource::LiteralBinary;
+        const Str kBytes = call.args[0]->str_value;
+        if (kBytes.len != 0) prefix.assign(kBytes.ptr, kBytes.len);
+    } else {
+        auto parts = analyze_message_text_parts(
+            *call.args[0], route, mod, prefix, suffix, result, after_source, documents, nodes);
+        if (!parts) return core::make_unexpected(parts.error());
+    }
     if ((route.ws_handler.max_message_size != 0 &&
          prefix.size() + suffix.size() > route.ws_handler.max_message_size) ||
-        !utf8_valid(reinterpret_cast<const u8*>(prefix.data()), prefix.size()) ||
-        !utf8_valid(reinterpret_cast<const u8*>(suffix.data()), suffix.size()))
+        (!kBinary && (!utf8_valid(reinterpret_cast<const u8*>(prefix.data()), prefix.size()) ||
+                      !utf8_valid(reinterpret_cast<const u8*>(suffix.data()), suffix.size()))))
         return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
     auto retain = [&](std::string text) -> FrontendResult<u32> {
         auto owned = intern_analysis_string(mod, std::move(text));

@@ -2657,6 +2657,21 @@ four guards may select an independent literal; the first failing guard wins. Bar
 `message.forward()` retains the original message even when the final verdict has a
 replacement. Close policies and text replacements use independent route tables.
 Control frames retain their existing relay behavior.
+Fixed Binary replacement is implemented as `message.forward(b"\x00\xff")`,
+in the final verdict or a guard else-branch. It reuses the existing exact-byte
+literal decoder and its 4096-byte decoded limit; it must also fit `maxMessageSize`.
+The adjacent `b"..."` form accepts raw bytes and the escapes `\n`, `\r`,
+`\t`, `\\`, `\"`, and `\xHH`; NUL is `\x00`. Empty and non-UTF-8 payloads are valid.
+Concatenation, variable references, Unicode escapes and interpolation are rejected.
+Text or Binary input becomes Binary output; ordinary string replacements still
+produce Text. Bare `forward()` keeps the original message, and control frames
+bypass the handler. Malformed Text input remains a protocol error before dispatch.
+The existing immutable rewrite recipe carries an additive Binary-literal source
+tag; its fields, action ABI, native layout, connection size and SlicePool budget
+are unchanged. Older native readers reject the unknown tag during validation.
+The loader copies decoded bytes into retained route storage; output framing copies
+those bytes into the owned send slice before asynchronous I/O.
+
 A terminate route defaults to a 16370-byte `maxMessageSize`: one 16 KiB slice minus
 the maximum 14-byte WebSocket header. Explicit limits must be from 1 through 16370
 bytes; larger values such as `16kb` are rejected until larger-message buffering is

@@ -48,6 +48,81 @@ def masked_frame(opcode, payload):
     return bytes((0x80 | opcode, 0x80 | len(payload))) + key + masked
 
 
+BINARY_HANDLER = r'''
+return websocket(ws) { message in
+    guard message.len != 0 else { message.forward(b"") }
+    guard message.text != "TEXT" else { message.forward("OK") }
+    guard message.text != "PASS" else { message.forward() }
+    guard message.text != "CLOSE" else { message.close(1000) }
+    message.forward(b"\x00\xff\x80")
+}
+'''
+
+
+def binary_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"binary replacement: {actual=!r}, {expected=!r}")
+
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, b"\x80"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\0\xff\x80", True))
+    client.sendall(masked_frame(1, b"") + masked_frame(1, b"TEXT") + masked_frame(1, b"PASS"))
+    expect(peer, (2, b"", True))
+    expect(peer, (1, b"OK", True))
+    expect(peer, (1, b"PASS", True))
+    peer.sendall(b"\x01\x01a\x8a\x01p\x80\x01b")
+    expect(client, (10, b"p", False))
+    expect(client, (2, b"\0\xff\x80", False))
+    peer.sendall(b"\x82\x04TEXT\x82\x04PASS")
+    expect(client, (1, b"OK", False))
+    expect(client, (2, b"PASS", False))
+    client.sendall(masked_frame(1, b"CLOSE"))
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
+def binary_replacement_scenario(server, backend_kind):
+    with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-binary-") as temp:
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(1)
+        upstream.settimeout(3)
+        path = os.path.join(temp, "route.rut")
+        with open(path, "w", encoding="utf-8") as route_file:
+            route_file.write(
+                f'listen 127.0.0.1:0\n'
+                f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+                'route GET "/ws" {\n' + BINARY_HANDLER + '}\n')
+        process, port, diagnostic = launch(server, path, backend_kind)
+        if process is None:
+            text = diagnostic.decode(errors="replace")
+            if backend_kind == "io_uring" and \
+                    "--backend io_uring requested, but io_uring is unavailable" in text:
+                return "skip", text
+            raise AssertionError(f"{backend_kind} binary replacement server failed:\n{text}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                client.sendall(REQUEST)
+                with upstream.accept()[0] as peer:
+                    peer.settimeout(3)
+                    recv_until(peer, b"\r\n\r\n")
+                    peer.sendall(WS_RESPONSE_HEADERS)
+                    if not recv_until(client, b"\r\n\r\n").startswith(b"HTTP/1.1 101"):
+                        raise AssertionError("binary replacement handshake failed")
+                    binary_exchange(client, peer)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return "pass", ""
+
+
 def recv_exact(sock, length):
     data = bytearray()
     while len(data) < length:
@@ -872,6 +947,11 @@ def main():
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
+        status, details = binary_replacement_scenario(args.server, backend)
+        if status == "skip":
+            print(f"SKIP {backend}: {details.strip()}")
+        else:
+            print(f"PASS {backend} binary message replacement")
         status, details = subprotocol_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")
