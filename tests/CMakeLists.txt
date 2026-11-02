@@ -1021,10 +1021,15 @@ target_include_directories(test_frontend PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
 )
-add_test(NAME test_frontend.shard_0_of_2
-    COMMAND test_frontend --shard-index=0 --shard-count=2)
-add_test(NAME test_frontend.shard_1_of_2
-    COMMAND test_frontend --shard-index=1 --shard-count=2)
+# Keep Debug CI frontend shards below the per-test timeout.
+add_test(NAME test_frontend.shard_0_of_4
+    COMMAND test_frontend --shard-index=0 --shard-count=4)
+add_test(NAME test_frontend.shard_1_of_4
+    COMMAND test_frontend --shard-index=1 --shard-count=4)
+add_test(NAME test_frontend.shard_2_of_4
+    COMMAND test_frontend --shard-index=2 --shard-count=4)
+add_test(NAME test_frontend.shard_3_of_4
+    COMMAND test_frontend --shard-index=3 --shard-count=4)
 if(RUT_SANITIZE)
     # Recent sanitizer CI runs completed shard 0 in 112.5s once and exceeded
     # 120s twice. The test-level timeout overrides the workflow timeout, so
@@ -1034,8 +1039,10 @@ else()
     set(_RUT_FRONTEND_TEST_TIMEOUT 120)
 endif()
 set_tests_properties(
-    test_frontend.shard_0_of_2
-    test_frontend.shard_1_of_2
+    test_frontend.shard_0_of_4
+    test_frontend.shard_1_of_4
+    test_frontend.shard_2_of_4
+    test_frontend.shard_3_of_4
     PROPERTIES
         LABELS "unit;compiler"
         RUN_SERIAL TRUE

@@ -7806,6 +7806,8 @@ TEST(serve_loader, websocket_guard_text_policies_reach_wire) {
         {{}, {}, {"x", json::kMaxBytes + 1}, WsTextSource::JsonString},
         {{}, {}, {nullptr, 1}, WsTextSource::JsonNumberText},
         {{}, {}, {"x", json::kMaxBytes + 1}, WsTextSource::JsonNumberText},
+        {{}, {}, {nullptr, 1}, WsTextSource::JsonStringify},
+        {{}, {}, {"x", json::kMaxBytes + 1}, WsTextSource::JsonStringify},
         {{}, {}, {"x", 1}, WsTextSource::Literal},
         {{}, {}, {"x", 1}, WsTextSource::MessageText},
     };

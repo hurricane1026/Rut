@@ -707,6 +707,82 @@ route GET "/root-number" { return websocket(backend) { message in
     CHECK(memcmp(root_output + 2, root_expected, sizeof(root_expected) - 1) == 0);
 }
 
+TEST(native_program, websocket_json_stringify_recipe_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/default" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let encoded = json.stringify(document) else { message.close(1003) }
+ message.forward("<" + encoded + ">")
+} }
+route GET "/else" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/payload") else { message.close(1008) }
+ guard let encoded = json.stringify(field) else { message.close(1003) }
+ guard encoded == "never" else { message.forward("[" + encoded + "]") }
+ message.forward()
+} }
+route GET "/root" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let encoded = json.stringify(document) else { message.close(1003) }
+ message.forward("(" + encoded + ")")
+} }
+route GET "/second" { return websocket(backend) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/other/value") else { message.close(1008) }
+ guard let encoded = json.stringify(field) else { message.close(1003) }
+ message.forward(encoded)
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(owner.p->config.route_count, 4u);
+    REQUIRE_EQ(unlink(source.path), 0);
+
+    CHECK_EQ(owner.p->config.routes[0].ws_forward_text.source, WsTextSource::JsonStringify);
+    CHECK_EQ(owner.p->config.routes[0].ws_forward_text.source_path.len, 0u);
+    CHECK(owner.p->config.routes[0].ws_forward_text.source_path.ptr != nullptr);
+    CHECK_EQ(owner.p->config.routes[1].ws_forward_text_count, 1u);
+    CHECK_EQ(owner.p->config.routes[1].ws_forward_texts[0].source, WsTextSource::JsonStringify);
+    CHECK(owner.p->config.routes[1].ws_forward_texts[0].source_path.eq(lit_str("/payload")));
+    CHECK_EQ(owner.p->config.routes[3].ws_forward_text.source, WsTextSource::JsonStringify);
+    CHECK(owner.p->config.routes[3].ws_forward_text.source_path.eq(lit_str("/other/value")));
+
+    auto inspect = [&](u32 route_index, const char* payload, const char* expected) {
+        const RouteEntry& route = owner.p->config.routes[route_index];
+        const u32 payload_len = static_cast<u32>(strlen(payload));
+        u8 input[256]{}, output[512]{}, message[256]{};
+        input[0] = 0x82;
+        input[1] = static_cast<u8>(payload_len);
+        memcpy(input + 2, payload, payload_len);
+        WsInspector inspector;
+        inspector.forward_text = route.ws_forward_text;
+        inspector.forward_texts = route.ws_forward_texts;
+        inspector.forward_text_count = route.ws_forward_text_count;
+        inspector.max_message_size = route.ws_max_message_size;
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(inspector,
+                           input,
+                           payload_len + 2,
+                           output,
+                           sizeof(output),
+                           message,
+                           sizeof(message),
+                           route.ws_frame_handler,
+                           nullptr,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, payload_len + 2);
+        CHECK_EQ(output[0], 0x81u);
+        CHECK_EQ(output[1], strlen(expected));
+        CHECK(memcmp(output + 2, expected, strlen(expected)) == 0);
+    };
+    inspect(0, R"({"b":2,"a":1.2300})", R"(<{"b":2,"a":1.2300}>)");
+    inspect(1, R"({"payload":{"x":true,"n":-0}})", R"([{"x":true,"n":-0}])");
+    inspect(2, R"(null)", "(null)");
+    inspect(3, R"({"other":{"value":[1,2]}})", "[1,2]");
+}
+
 TEST(native_program, websocket_json_string_predicates_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

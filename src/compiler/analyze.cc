@@ -7263,6 +7263,7 @@ struct WsJsonBinding {
         SelectedValue,
         String,
         NumberText,
+        JsonStringify,
         Boolean,
         Integer,
         KindName,
@@ -7334,12 +7335,14 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
         const WsJsonBinding* binding = ws_json_binding(documents, expr.name);
         if (binding) {
             if ((binding->kind != WsJsonBinding::Kind::String &&
-                 binding->kind != WsJsonBinding::Kind::NumberText) ||
+                 binding->kind != WsJsonBinding::Kind::NumberText &&
+                 binding->kind != WsJsonBinding::Kind::JsonStringify) ||
                 rewrite.source != HirWsTextSource::Literal)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-            rewrite.source = binding->kind == WsJsonBinding::Kind::String
-                                 ? HirWsTextSource::JsonString
-                                 : HirWsTextSource::JsonNumberText;
+            rewrite.source =
+                binding->kind == WsJsonBinding::Kind::String       ? HirWsTextSource::JsonString
+                : binding->kind == WsJsonBinding::Kind::NumberText ? HirWsTextSource::JsonNumberText
+                                                                   : HirWsTextSource::JsonStringify;
             rewrite.source_path = binding->path;
             after_source = true;
             return {};
@@ -7665,7 +7668,7 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
             }
         }
     }
-    // Typed string and number-text aliases only reach their exact byte-value comparisons.
+    // Typed string, number-text, and JSON-stringified aliases compare only to literals.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
         const AstExpr* alias = nullptr;
         const AstExpr* literal = nullptr;
@@ -7679,13 +7682,16 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
         if (alias && literal) {
             const WsJsonBinding* binding = ws_json_binding(documents, alias->name);
             if (binding && (binding->kind == WsJsonBinding::Kind::String ||
-                            binding->kind == WsJsonBinding::Kind::NumberText)) {
+                            binding->kind == WsJsonBinding::Kind::NumberText ||
+                            binding->kind == WsJsonBinding::Kind::JsonStringify)) {
                 auto decoded = decoded_expression_string(literal->str_value, mod, literal->span);
                 if (!decoded) return core::make_unexpected(decoded.error());
                 WsLenGuard g{};
                 g.accessor = binding->kind == WsJsonBinding::Kind::String
                                  ? WsLenGuard::Accessor::JsonStringEqual
-                                 : WsLenGuard::Accessor::JsonNumberTextEqual;
+                             : binding->kind == WsJsonBinding::Kind::NumberText
+                                 ? WsLenGuard::Accessor::JsonNumberTextEqual
+                                 : WsLenGuard::Accessor::JsonStringifyEqual;
                 g.pattern = binding->path;
                 g.value = decoded.value();
                 g.negate = negate;
@@ -7698,11 +7704,14 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
         cond.lhs->kind == AstExprKind::Ident) {
         const WsJsonBinding* binding = ws_json_binding(documents, cond.lhs->name);
         if (binding && (binding->kind == WsJsonBinding::Kind::String ||
-                        binding->kind == WsJsonBinding::Kind::NumberText)) {
+                        binding->kind == WsJsonBinding::Kind::NumberText ||
+                        binding->kind == WsJsonBinding::Kind::JsonStringify)) {
             WsLenGuard g{};
             g.accessor = binding->kind == WsJsonBinding::Kind::String
                              ? WsLenGuard::Accessor::JsonStringEqual
-                             : WsLenGuard::Accessor::JsonNumberTextEqual;
+                         : binding->kind == WsJsonBinding::Kind::NumberText
+                             ? WsLenGuard::Accessor::JsonNumberTextEqual
+                             : WsLenGuard::Accessor::JsonStringifyEqual;
             g.pattern = binding->path;
             g.negate = negate;
             g.verdict = verdict;
@@ -7716,7 +7725,8 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
         const bool is_contains = cond.name.eq(lit_str("contains"));
         if (binding &&
             (binding->kind == WsJsonBinding::Kind::String ||
-             binding->kind == WsJsonBinding::Kind::NumberText) &&
+             binding->kind == WsJsonBinding::Kind::NumberText ||
+             binding->kind == WsJsonBinding::Kind::JsonStringify) &&
             (is_prefix || is_suffix || is_contains)) {
             if (cond.args.len != 1 || !cond.args[0] || cond.args[0]->kind != AstExprKind::StrLit)
                 return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
@@ -7728,10 +7738,14 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
                 g.accessor = is_prefix   ? WsLenGuard::Accessor::JsonStringPrefix
                              : is_suffix ? WsLenGuard::Accessor::JsonStringSuffix
                                          : WsLenGuard::Accessor::JsonStringContains;
-            } else {
+            } else if (binding->kind == WsJsonBinding::Kind::NumberText) {
                 g.accessor = is_prefix   ? WsLenGuard::Accessor::JsonNumberTextPrefix
                              : is_suffix ? WsLenGuard::Accessor::JsonNumberTextSuffix
                                          : WsLenGuard::Accessor::JsonNumberTextContains;
+            } else {
+                g.accessor = is_prefix   ? WsLenGuard::Accessor::JsonStringifyPrefix
+                             : is_suffix ? WsLenGuard::Accessor::JsonStringifySuffix
+                                         : WsLenGuard::Accessor::JsonStringifyContains;
             }
             g.pattern = binding->path;
             g.value = decoded.value();
@@ -13745,6 +13759,23 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
                                gs->expr.lhs->kind == AstExprKind::Ident &&
                                gs->expr.lhs->name.eq(lit_str("json")) &&
+                               gs->expr.name.eq(lit_str("stringify")) && gs->expr.args.len == 1 &&
+                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
+                        const WsJsonBinding* source =
+                            ws_json_binding(documents, gs->expr.args[0]->name);
+                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
+                                        source->kind != WsJsonBinding::Kind::SelectedValue))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  gs->span,
+                                                  lit_str("json.stringify message bindings require "
+                                                          "a validated JSON value alias"));
+                        node.accessor = WsLenGuard::Accessor::JsonStringifyValid;
+                        node.pattern = source->path;
+                        binding.kind = WsJsonBinding::Kind::JsonStringify;
+                        binding.path = source->path;
+                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
+                               gs->expr.lhs->kind == AstExprKind::Ident &&
+                               gs->expr.lhs->name.eq(lit_str("json")) &&
                                gs->expr.name.eq(lit_str("bool")) && gs->expr.args.len == 1 &&
                                gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
                         const WsJsonBinding* source =
@@ -13816,7 +13847,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                             gs->span,
                             lit_str("message guard bindings require json.parse, "
                                     "json.get, json.string, json.numberText, json.bool, "
-                                    "json.int, json.kind, or json.count aliases"));
+                                    "json.stringify, json.int, json.kind, or json.count aliases"));
                     }
                     if (!route->ws_handler.len_guards.push(node) || !documents.push(binding))
                         return frontend_error(FrontendError::TooManyItems, gs->span);

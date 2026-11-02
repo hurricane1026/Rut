@@ -2683,12 +2683,23 @@ selected raw token is copied synchronously into the existing owned output slice;
 JSON numbers from Text or Binary messages become Text output. Parser and output
 bounds remain fail-closed.
 
+`json.stringify(documentOrField)` binds the ordinary compact serialization of any
+previously unwrapped JSON value. It follows `Document::write`: strings and object
+keys are escaped, member order and number lexemes are preserved, and the existing
+writer capacity bounds output. The alias supports the same literal string
+comparisons and predicates as a string alias and can be the sole rewrite source
+with fixed affixes. It has its own typed guard/source tag. The selected value is
+serialized and copied synchronously into the owned output slice; workspace views
+do not cross the callback.
+
 The runtime reassembles and validates the original message before invoking the
 handler, writes replacement frames to the existing separate output slice, and
 pauses input while output drains. For a selected JSON string recipe, the inspector
 re-parses the complete message in its bounded thread-local JSON document, decodes
 the selected string into that document's scratch writer, and copies it with the
-fixed affixes directly into the output slice in the same synchronous call. Parse,
+fixed affixes directly into the output slice in the same synchronous call. For a
+JSON stringify recipe, it writes the selected value into the document's `other`
+workspace and copies those bytes with the affixes in that same call. Parse,
 selection, decode, UTF-8, or output-bound failure fails the tunnel closed. Neither
 the document source nor its scratch view is stored in a connection or sent
 asynchronously. Both directions apply their normal WebSocket masking roles.
@@ -2697,7 +2708,7 @@ upstream receive on io_uring, so multiple CQEs cannot overflow receive storage
 before the inspection callback drains it. Literal bytes and JSON Pointer paths are
 copied into the loaded program's retained arena; native artifacts relocate both
 views, so neither mode retains temporary HIR views. The native artifact format
-version is 13 following the dynamic-source recipe tag extension. Encoding copies
+version is 14 following the JSON stringify recipe tag extension. Encoding copies
 the prefix, dynamic source, and suffix directly into the existing output slice,
 then masks that frame; no concatenation buffer or message-time allocation is
 introduced.

@@ -88,6 +88,8 @@
     X(rut_helper_ws_json_string_matches_at_path)      \
     X(rut_helper_ws_json_number_text_at_path)         \
     X(rut_helper_ws_json_number_text_matches_at_path) \
+    X(rut_helper_ws_json_stringify_at_path)           \
+    X(rut_helper_ws_json_stringify_matches_at_path)   \
     X(rut_helper_ws_json_bool_at_path)                \
     X(rut_helper_ws_json_bool_equals_at_path)         \
     X(rut_helper_ws_json_int_at_path)                 \

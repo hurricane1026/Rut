@@ -940,6 +940,18 @@ return websocket(chat) { message in
 // One prior alias may be the dynamic source with fixed UTF-8 affixes; its exact token
 // is copied synchronously to the owned output slice. Binary JSON also emits Text.
 
+// Bind the ordinary compact serialization of any JSON value, then use it for both
+// a literal predicate and a fixed-affix rewrite.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let encoded = json.stringify(document) else { message.close(1003) }
+    guard encoded.contains("\"ok\"") else { message.drop() }
+    message.forward("payload=" + encoded)
+}
+// Strings and object keys are escaped as JSON text; member order and number lexemes
+// are preserved. Serialization is bounded, and the result is copied to owned output
+// before asynchronous sending.
+
 // JSON Bool fields are type-checked; false is a successfully unwrapped value.
 return websocket(chat) { message in
     guard let document = json.parse(message.text) else { message.close(1007) }

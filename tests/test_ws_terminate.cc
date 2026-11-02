@@ -712,6 +712,173 @@ TEST(ws_terminate, json_number_text_fragment_with_ping_preserves_both_roles) {
     }
 }
 
+TEST(ws_terminate, json_stringify_uses_compact_document_writer_semantics) {
+    struct ValueCase {
+        const char* input;
+        const char* expected;
+    };
+    const ValueCase values[] = {{"null", "null"},
+                                {"false", "false"},
+                                {"-0", "-0"},
+                                {"\"a\\u0062\"", "\"ab\""},
+                                {"[]", "[]"},
+                                {"{}", "{}"},
+                                {"[1,{\"x\":\"y\"}]", "[1,{\"x\":\"y\"}]"}};
+    for (const auto& value : values) {
+        const u32 input_len = static_cast<u32>(strlen(value.input));
+        const u32 expected_len = static_cast<u32>(strlen(value.expected));
+        CHECK(ws_json_stringify_at_path(reinterpret_cast<const u8*>(value.input), input_len, {}));
+        CHECK(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(value.input),
+                                                input_len,
+                                                {},
+                                                {value.expected, expected_len},
+                                                WsJsonStringMatch::Equal));
+    }
+
+    const char input[] =
+        R"( { "k\u0065y" : [ true , null , -0, 1.2300e+999 ], "s" : "\b\u0061" } )";
+    const char expected[] = R"({"key":[true,null,-0,1.2300e+999],"s":"\u0008a"})";
+    const u32 input_len = sizeof(input) - 1;
+    const u32 expected_len = sizeof(expected) - 1;
+    CHECK(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(input),
+                                            input_len,
+                                            {},
+                                            {expected, expected_len},
+                                            WsJsonStringMatch::Equal));
+    CHECK(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(input),
+                                            input_len,
+                                            {},
+                                            lit_str("{\"key\""),
+                                            WsJsonStringMatch::Prefix));
+    CHECK(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(input),
+                                            input_len,
+                                            {},
+                                            lit_str("}"),
+                                            WsJsonStringMatch::Suffix));
+    CHECK(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(input),
+                                            input_len,
+                                            {},
+                                            lit_str("1.2300e+999"),
+                                            WsJsonStringMatch::Contains));
+    CHECK_FALSE(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(input),
+                                                  input_len,
+                                                  {},
+                                                  lit_str("{}"),
+                                                  WsJsonStringMatch::Equal));
+    CHECK(ws_json_stringify_matches_at_path(
+        reinterpret_cast<const u8*>(input), input_len, {}, {}, WsJsonStringMatch::Contains));
+    // An empty needle still executes the serializer and fails on invalid or oversized output.
+    CHECK_FALSE(ws_json_stringify_matches_at_path(
+        reinterpret_cast<const u8*>("{\"a\":1,\"a\":2}"), 13, {}, {}, WsJsonStringMatch::Contains));
+    CHECK_FALSE(ws_json_stringify_at_path(
+        reinterpret_cast<const u8*>(input), input_len, lit_str("/missing")));
+
+    const char selected[] = R"({"items":[0,{"x":1.2300}]})";
+    CHECK(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(selected),
+                                            sizeof(selected) - 1,
+                                            lit_str("/items/1"),
+                                            lit_str("{\"x\":1.2300}"),
+                                            WsJsonStringMatch::Equal));
+
+    char expanded[json::kMaxBytes];
+    u32 expanded_len = 0;
+    const char prefix[] = R"({"v":")";
+    memcpy(expanded, prefix, sizeof(prefix) - 1);
+    expanded_len += sizeof(prefix) - 1;
+    for (u32 i = 0; i < 1400; ++i) {
+        expanded[expanded_len++] = '\\';
+        expanded[expanded_len++] = 'b';
+    }
+    expanded[expanded_len++] = '"';
+    expanded[expanded_len++] = '}';
+    CHECK_FALSE(ws_json_stringify_at_path(
+        reinterpret_cast<const u8*>(expanded), expanded_len, lit_str("/v")));
+    CHECK_FALSE(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(expanded),
+                                                  expanded_len,
+                                                  lit_str("/v"),
+                                                  {},
+                                                  WsJsonStringMatch::Contains));
+    char oversized[json::kMaxBytes + 1];
+    memcpy(oversized, "null ", 5);
+    memset(oversized + 5, ' ', sizeof(oversized) - 5);
+    CHECK_FALSE(
+        ws_json_stringify_at_path(reinterpret_cast<const u8*>(oversized), sizeof(oversized), {}));
+}
+
+TEST(ws_terminate, json_stringify_rewrites_and_defers_fragmented_message_after_ping) {
+    const char payload[] = R"( { "v" : "small", "n":1.2300e+999 } )";
+    const char serialized[] = R"({"v":"small","n":1.2300e+999})";
+    const u32 payload_len = sizeof(payload) - 1;
+    const u32 split = payload_len / 2;
+    char large_prefix[8500];
+    memset(large_prefix, 'P', sizeof(large_prefix));
+    const u8 ping_payload[] = {'p'};
+    for (bool masked : kMaskDirections) {
+        auto st = make_state(masked);
+        st.max_message_size = 12000;
+        st.forward_text = {
+            {large_prefix, sizeof(large_prefix)}, {"!", 1}, {}, WsTextSource::JsonStringify};
+        Recorder recorder;
+        recorder.verdict = WsFrameAction::ForwardText;
+        u8 in[256], out[SlicePool::kSliceSize], retry_out[SlicePool::kSliceSize];
+        u8 message[json::kMaxBytes], decoded[SlicePool::kSliceSize];
+        u32 input_len =
+            build(in, WsOpcode::Binary, false, masked, reinterpret_cast<const u8*>(payload), split);
+        const u32 ping_len =
+            build(in + input_len, WsOpcode::Ping, true, masked, ping_payload, sizeof(ping_payload));
+        input_len += ping_len;
+        const u32 continuation_offset = input_len;
+        const u32 continuation_len = build(in + continuation_offset,
+                                           WsOpcode::Continuation,
+                                           true,
+                                           masked,
+                                           reinterpret_cast<const u8*>(payload + split),
+                                           payload_len - split);
+        input_len += continuation_len;
+
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           input_len,
+                           out,
+                           sizeof(out),
+                           message,
+                           sizeof(message),
+                           record,
+                           &recorder,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, continuation_offset);
+        CHECK_EQ(recorder.calls, 0u);
+        WsFrameHeader ping{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &ping, decoded), ping_len);
+        CHECK(ping.opcode == WsOpcode::Ping);
+        CHECK_EQ(decoded[0], static_cast<u8>('p'));
+
+        u32 retry_used = 0, retry_produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in + used,
+                           input_len - used,
+                           retry_out,
+                           sizeof(retry_out),
+                           message,
+                           sizeof(message),
+                           record,
+                           &recorder,
+                           &retry_used,
+                           &retry_produced) == WsInspectStatus::Ok);
+        CHECK_EQ(retry_used, continuation_len);
+        CHECK_EQ(recorder.calls, 1u);
+        WsFrameHeader text{};
+        REQUIRE_EQ(parse_one(retry_out, retry_produced, masked, &text, decoded), retry_produced);
+        CHECK(text.opcode == WsOpcode::Text);
+        CHECK_EQ(text.payload_len, sizeof(large_prefix) + sizeof(serialized) - 1 + 1);
+        CHECK(memcmp(decoded, large_prefix, sizeof(large_prefix)) == 0);
+        CHECK(memcmp(decoded + sizeof(large_prefix), serialized, sizeof(serialized) - 1) == 0);
+        CHECK_EQ(decoded[text.payload_len - 1], static_cast<u8>('!'));
+    }
+}
+
 TEST(ws_terminate, json_number_text_binding_and_rewrite_fail_closed) {
     const char* numbers[] = {"-0", "1.2300e+999", "92233720368547758081234567890"};
     for (const char* number : numbers) {
@@ -766,6 +933,13 @@ TEST(ws_terminate, json_number_text_binding_and_rewrite_fail_closed) {
         CHECK_FALSE(document.parse({bytes, len}));
         CHECK_FALSE(
             ws_json_number_text_at_path(reinterpret_cast<const u8*>(bytes), len, lit_str("/v")));
+        CHECK_FALSE(
+            ws_json_stringify_at_path(reinterpret_cast<const u8*>(bytes), len, lit_str("/v")));
+        CHECK_FALSE(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(bytes),
+                                                      len,
+                                                      lit_str("/v"),
+                                                      {},
+                                                      WsJsonStringMatch::Contains));
 
         auto bounded = make_state(false);
         bounded.forward_text = {{}, {}, lit_str("/v"), WsTextSource::JsonNumberText};
@@ -787,6 +961,23 @@ TEST(ws_terminate, json_number_text_binding_and_rewrite_fail_closed) {
                          &used,
                          &produced) == WsInspectStatus::Error);
         CHECK_EQ(produced, 0u);
+
+        auto stringify = make_state(false);
+        stringify.forward_text = {{}, {}, lit_str("/v"), WsTextSource::JsonStringify};
+        Recorder stringify_recorder;
+        stringify_recorder.verdict = WsFrameAction::ForwardText;
+        CHECK(ws_inspect(stringify,
+                         input,
+                         frame_len,
+                         output,
+                         sizeof(output),
+                         message,
+                         sizeof(message),
+                         record,
+                         &stringify_recorder,
+                         &used,
+                         &produced) == WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
     };
     char too_many_nodes[json::kMaxBytes];
     u32 nodes_len = 0;
@@ -804,6 +995,11 @@ TEST(ws_terminate, json_number_text_binding_and_rewrite_fail_closed) {
     const char within_depth[] = R"({"v":1,"a":[[0]]})";
     CHECK(ws_json_number_text_at_path(
         reinterpret_cast<const u8*>(within_depth), sizeof(within_depth) - 1, lit_str("/v")));
+    CHECK(ws_json_stringify_matches_at_path(reinterpret_cast<const u8*>(within_depth),
+                                            sizeof(within_depth) - 1,
+                                            lit_str("/v"),
+                                            lit_str("1"),
+                                            WsJsonStringMatch::Equal));
 
     char too_deep[json::kMaxBytes];
     u32 depth_len = 0;

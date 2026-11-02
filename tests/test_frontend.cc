@@ -5923,6 +5923,83 @@ message.forward())rut",
     }
 }
 
+TEST(frontend, websocket_json_stringify_alias_preserves_serialized_value_recipe) {
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/payload") else { message.drop() }
+ guard let encoded = json.stringify(field) else { message.drop() }
+ guard (encoded == "{}" || "{\"key\":0}" != encoded) && !encoded.isEmpty &&
+       encoded.hasPrefix("{") && encoded.hasSuffix("}") && encoded.contains("\"key\"") else {
+  message.drop()
+ }
+ message.forward("<" + encoded + ">")
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& handler = hir->routes[0].ws_handler;
+    bool found_valid = false;
+    bool found_equal = false;
+    bool found_prefix = false;
+    bool found_suffix = false;
+    bool found_contains = false;
+    for (u32 i = 0; i < handler.len_guards.len; i++) {
+        const auto& node = handler.len_guards[i];
+        found_valid |= node.accessor == WsLenGuard::Accessor::JsonStringifyValid;
+        found_equal |= node.accessor == WsLenGuard::Accessor::JsonStringifyEqual;
+        found_prefix |= node.accessor == WsLenGuard::Accessor::JsonStringifyPrefix;
+        found_suffix |= node.accessor == WsLenGuard::Accessor::JsonStringifySuffix;
+        found_contains |= node.accessor == WsLenGuard::Accessor::JsonStringifyContains;
+        if (node.accessor == WsLenGuard::Accessor::JsonStringifyValid ||
+            node.accessor == WsLenGuard::Accessor::JsonStringifyEqual)
+            CHECK(node.pattern.eq(lit("/payload")));
+    }
+    CHECK(found_valid);
+    CHECK(found_equal);
+    CHECK(found_prefix);
+    CHECK(found_suffix);
+    CHECK(found_contains);
+    CHECK(handler.forward_payload.source == HirWsTextSource::JsonStringify);
+    CHECK(handler.forward_payload.source_path.eq(lit("/payload")));
+
+    const char* rejected[] = {
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let field = json.get(document, "/payload") else { message.drop() }
+guard let encoded = json.stringify(field) else { message.forward(encoded) }
+message.forward())rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard encoded == "{}" else { message.drop() }
+guard let encoded = json.stringify(document) else { message.drop() }
+message.forward())rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let text = json.string(document) else { message.drop() }
+guard let encoded = json.stringify(text) else { message.drop() }
+message.forward(encoded))rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let field = json.get(document, "/payload") else { message.drop() }
+message.forward(json.stringify(field)))rut",
+        R"rut(guard let document = json.parse(message.text) else { message.drop() }
+guard let encoded = json.stringify(document) else { message.drop() }
+guard encoded > 1 else { message.drop() }
+message.forward())rut",
+    };
+    for (const char* body : rejected) {
+        std::string candidate =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
+        candidate += body;
+        candidate += " } }\n";
+        auto invalid_tokens = lex({candidate.data(), static_cast<u32>(candidate.size())});
+        REQUIRE(invalid_tokens);
+        auto invalid_ast = parse_file_heap(invalid_tokens.value());
+        REQUIRE(invalid_ast);
+        CHECK_FALSE(analyze_file_heap(invalid_ast.value()));
+    }
+}
+
 TEST(frontend, websocket_json_string_predicates_use_unwrapped_string_aliases) {
     const char* source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { message in

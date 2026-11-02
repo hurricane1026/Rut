@@ -20713,7 +20713,7 @@ TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     nodes[1].is_operand = false;  // child is another source guard
     CHECK_FALSE(codegen_ws_handler(0, nodes, 3, 0).ok);
     WsLenGuardSpec invalid_source{};
-    invalid_source.accessor = 29;
+    invalid_source.accessor = 34;
     CHECK_FALSE(codegen_ws_handler(0, &invalid_source, 1, 0).ok);
     invalid_source.accessor = 24;
     invalid_source.pattern = nullptr;
@@ -20826,6 +20826,89 @@ TEST(jit, websocket_json_number_text_guard_is_exact_and_typed) {
     long_path_engine.shutdown();
 }
 
+TEST(jit, websocket_json_stringify_guard_uses_compact_serializer) {
+    WsLenGuardSpec guards[4]{};
+    const u8 accessors[] = {29, 30, 31, 32, 33};
+    const char* expected[] = {nullptr, "{\"x\":1}", "{", "}", "\"x\":1"};
+    const u32 expected_len[] = {0, 7, 1, 1, 5};
+    for (u32 i = 0; i < 4; ++i) {
+        guards[i].accessor = accessors[i];
+        guards[i].pattern = "/payload";
+        guards[i].pattern_len = 8;
+        guards[i].value = expected[i];
+        guards[i].value_len = expected_len[i];
+        guards[i].verdict = static_cast<u8>(WsFrameAction::Drop);
+    }
+    CodegenResult generated = codegen_ws_handler(0, guards, 4, 35);
+    REQUIRE(generated.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(generated.mod, generated.ctx));
+    auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_35"));
+    REQUIRE(handler);
+    const char valid[] = R"({"payload":{"x":1}})";
+    CHECK_EQ(static_cast<u8>(handler(nullptr,
+                                     WsOpcode::Binary,
+                                     reinterpret_cast<const u8*>(valid),
+                                     sizeof(valid) - 1,
+                                     true)),
+             static_cast<u8>(WsFrameAction::Forward));
+    const char wrong[] = R"({"payload":{"x":2}})";
+    CHECK_EQ(static_cast<u8>(handler(nullptr,
+                                     WsOpcode::Binary,
+                                     reinterpret_cast<const u8*>(wrong),
+                                     sizeof(wrong) - 1,
+                                     true)),
+             static_cast<u8>(WsFrameAction::Drop));
+    const char missing[] = R"({"other":{}})";
+    CHECK_EQ(static_cast<u8>(handler(nullptr,
+                                     WsOpcode::Binary,
+                                     reinterpret_cast<const u8*>(missing),
+                                     sizeof(missing) - 1,
+                                     true)),
+             static_cast<u8>(WsFrameAction::Drop));
+
+    char expanded[3000];
+    u32 expanded_len = 0;
+    const char prefix[] = R"({"payload":")";
+    memcpy(expanded, prefix, sizeof(prefix) - 1);
+    expanded_len += sizeof(prefix) - 1;
+    for (u32 i = 0; i < 1400; ++i) {
+        expanded[expanded_len++] = '\\';
+        expanded[expanded_len++] = 'b';
+    }
+    expanded[expanded_len++] = '"';
+    expanded[expanded_len++] = '}';
+    CHECK_EQ(
+        static_cast<u8>(handler(
+            nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(expanded), expanded_len, true)),
+        static_cast<u8>(WsFrameAction::Drop));
+    engine.shutdown();
+
+    WsLenGuardSpec contains{};
+    contains.accessor = 33;
+    contains.pattern = "/payload";
+    contains.pattern_len = 8;
+    contains.value = "\"x\":1";
+    contains.value_len = 5;
+    contains.verdict = static_cast<u8>(WsFrameAction::Drop);
+    CodegenResult contains_generated = codegen_ws_handler(0, &contains, 1, 36);
+    REQUIRE(contains_generated.ok);
+    JitEngine contains_engine;
+    REQUIRE(contains_engine.init());
+    REQUIRE(contains_engine.compile(contains_generated.mod, contains_generated.ctx));
+    auto contains_handler =
+        reinterpret_cast<WsMessageHandlerFn>(contains_engine.lookup("ws_handler_36"));
+    REQUIRE(contains_handler);
+    CHECK_EQ(static_cast<u8>(contains_handler(nullptr,
+                                              WsOpcode::Binary,
+                                              reinterpret_cast<const u8*>(valid),
+                                              sizeof(valid) - 1,
+                                              true)),
+             static_cast<u8>(WsFrameAction::Forward));
+    contains_engine.shutdown();
+}
+
 TEST(jit, websocket_branch_policy_verdict_validation) {
     WsLenGuardSpec node{};
     node.accessor = 0;
@@ -20928,7 +21011,7 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     auto max_count = codegen_ws_handler(0, &node, 1, 0);
     REQUIRE(max_count.ok);
     dispose_module(max_count.mod, max_count.ctx);
-    node.accessor = 29;
+    node.accessor = 34;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 
