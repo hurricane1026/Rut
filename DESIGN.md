@@ -8996,8 +8996,8 @@ authentication.
 
 The native `jwt_hs256_issue_with_id` API adds exactly one caller-provided
 `jti` string under the same bounds and validation. The Rut/JIT wrappers for
-this six-claim profile are described below. Neither API adds arbitrary claims,
-key identifiers, algorithm selection, dependencies or request allocations.
+this six-claim profile are described below. Neither native API adds arbitrary
+claims, key identifiers, algorithm selection, dependencies or request allocations.
 
 `jwt_hs256_issue_with_id` and the Rut/JIT
 `jwtIssueHs256WithId(subject, issuer, audience, tokenId, key, ttl)` operation
