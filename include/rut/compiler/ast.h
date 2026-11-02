@@ -1033,6 +1033,7 @@ private:
     }
 
     void rebase_expr(const AstFile& other, AstExpr& expr) {
+        if (expr.kind == AstExprKind::BytesLit) rebase_response_body(other, expr.str_value);
         rebase_expr_ptr(other, expr.lhs);
         rebase_expr_ptr(other, expr.rhs);
         for (u32 i = 0; i < expr.type_args.len; i++) {
