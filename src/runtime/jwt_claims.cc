@@ -104,8 +104,8 @@ bool jwt_claims_valid_with_lifetime(json::Document& document,
 bool jwt_scope_token_valid(Str token) {
     if (token.ptr == nullptr || token.len == 0 || token.len > json::kMaxBytes) return false;
     for (u32 i = 0; i < token.len; ++i) {
-        const auto c = static_cast<unsigned char>(token.ptr[i]);
-        if (!scope_token_byte(c)) return false;
+        const auto kByte = static_cast<unsigned char>(token.ptr[i]);
+        if (!scope_token_byte(kByte)) return false;
     }
     return true;
 }
