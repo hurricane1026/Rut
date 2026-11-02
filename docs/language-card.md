@@ -1929,10 +1929,10 @@ request-owned JSON arena. The qualified `Crypto.issueJwtHs256` wrapper and
 is constructible and carries no authentication provenance; call that helper
 only after successful authentication.
 
-The native-only C++ API `jwt_hs256_issue_with_id` adds exactly one caller-
-provided `jti` string under the same bounds and validation rules, using
-caller-owned output and retaining no input or output views. Rut and JIT issuance
-with `jti` remains pending.
+The C++ API `jwt_hs256_issue_with_id` adds exactly one caller-provided `jti`
+string under the same bounds and validation rules, using caller-owned output
+and retaining no input or output views. Rut/JIT wrappers for this six-claim
+profile are described below.
 
 `jwt_hs256_issue_with_id` and the Rut/JIT
 `jwtIssueHs256WithId(subject, issuer, audience, tokenId, key, ttl)` variant add
