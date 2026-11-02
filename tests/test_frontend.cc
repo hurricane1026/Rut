@@ -7192,7 +7192,7 @@ TEST(frontend, analyze_accepts_websocket_forward_payload) {
 }
 
 TEST(frontend, analyze_rejects_websocket_forward_nonstring_payload) {
-    // The modify payload must be a Str (text-frame content). A non-Str arg is rejected.
+    // A replacement must be a supported String expression or exact-byte literal, not an Int.
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward(123) } "
         "}\n";
@@ -7202,6 +7202,167 @@ TEST(frontend, analyze_rejects_websocket_forward_nonstring_payload) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     CHECK(!hir);  // payload is not Str
+}
+
+TEST(frontend, websocket_binary_replacement_decodes_exact_bytes_and_keeps_text_distinct) {
+    const char* source = R"rut(
+upstream ws
+route GET "/ws" { return websocket(ws, maxMessageSize: 8b) { message in
+    guard message.len != 0 else { message.forward(b"") }
+    guard message.text != "text" else { message.forward("text") }
+    message.forward(b"\x00\xFF\x80\n\r\t\\\"")
+} }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    const auto& handler = route.ws_handler;
+    REQUIRE_EQ(handler.forward_payloads.len, 2u);
+    CHECK_EQ(handler.forward_payloads[0].source, HirWsTextSource::LiteralBinary);
+    CHECK_EQ(handler.forward_payloads[1].source, HirWsTextSource::Literal);
+    CHECK_EQ(handler.forward_payload.source, HirWsTextSource::LiteralBinary);
+    const Str expected{"\0\xff\x80\n\r\t\\\"", 8};
+    CHECK(route.exprs[handler.forward_payload.prefix_expr].str_value.eq(expected));
+    CHECK_EQ(route.exprs[handler.forward_payload.suffix_expr].str_value.len, 0u);
+}
+
+TEST(frontend, websocket_binary_ast_copy_move_owns_nonempty_and_empty_literals) {
+    const char source[] = R"rut(
+upstream ws
+route GET "/ws" { return websocket(ws) { message in
+    guard message.len != 0 else { message.forward(b"\x00\xff") }
+    message.forward(b"")
+} }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto original = parse_file_heap(tokens.value());
+    REQUIRE(original);
+
+    auto check_owned = [&](const AstFile& file, const AstFile& stale_source) {
+        REQUIRE_EQ(file.response_body_pool.len, 2u);
+        const AstStatement& route_stmt = *file.items[1].route.statements[0];
+        REQUIRE(route_stmt.then_stmt != nullptr);
+        const AstStatement& handler_stmt = *route_stmt.then_stmt;
+        REQUIRE_EQ(static_cast<u8>(handler_stmt.kind), static_cast<u8>(AstStmtKind::Block));
+        REQUIRE_EQ(handler_stmt.block_stmts.len, 2u);
+        const AstStatement& guard_stmt = *handler_stmt.block_stmts[0];
+        REQUIRE_EQ(static_cast<u8>(guard_stmt.kind), static_cast<u8>(AstStmtKind::Guard));
+        REQUIRE(guard_stmt.else_stmt != nullptr);
+        const Str nonempty = guard_stmt.else_stmt->expr.args[0]->str_value;
+        const AstStatement& trailing_stmt = *handler_stmt.block_stmts[1];
+        const Str empty = trailing_stmt.expr.args[0]->str_value;
+        REQUIRE_EQ(nonempty.len, 2u);
+        REQUIRE_EQ(empty.len, 0u);
+        CHECK(nonempty.ptr == reinterpret_cast<const char*>(&file.response_body_pool.data[0]));
+        CHECK(empty.ptr == reinterpret_cast<const char*>(&file.response_body_pool.data[2]));
+        const AstStatement& stale_block = *stale_source.items[1].route.statements[0]->then_stmt;
+        const AstStatement& stale_guard = *stale_block.block_stmts[0];
+        const AstStatement& stale_trailing = *stale_block.block_stmts[1];
+        CHECK(nonempty.ptr != stale_guard.else_stmt->expr.args[0]->str_value.ptr);
+        CHECK(empty.ptr != stale_trailing.expr.args[0]->str_value.ptr);
+        CHECK(static_cast<u8>(nonempty.ptr[0]) == 0);
+        CHECK(static_cast<u8>(nonempty.ptr[1]) == 0xff);
+    };
+
+    auto copy_constructed = std::make_unique<AstFile>(original.value());
+    check_owned(*copy_constructed, original.value());
+
+    const AstFile& copy_source = *copy_constructed;
+    auto move_constructed = std::make_unique<AstFile>(std::move(*copy_constructed));
+    check_owned(*move_constructed, copy_source);
+    check_owned(*move_constructed, original.value());
+
+    auto copy_assigned = std::make_unique<AstFile>();
+    *copy_assigned = original.value();
+    check_owned(*copy_assigned, original.value());
+
+    const AstFile& assignment_source = *copy_assigned;
+    auto move_assigned = std::make_unique<AstFile>();
+    *move_assigned = std::move(*copy_assigned);
+    check_owned(*move_assigned, assignment_source);
+    check_owned(*move_assigned, original.value());
+
+    auto surviving_copy = std::make_unique<AstFile>();
+    {
+        const char isolated_source[] =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+            "message.forward(b\"\\x00\\xff\") } }\n";
+        auto isolated_tokens = lex(lit(isolated_source));
+        REQUIRE(isolated_tokens);
+        auto isolated = parse_file_heap(isolated_tokens.value());
+        REQUIRE(isolated);
+        *surviving_copy = isolated.value();
+        isolated->response_body_pool.data[0] = 'x';
+    }
+    const AstStatement& surviving_route = *surviving_copy->items[1].route.statements[0];
+    const Str surviving_body = surviving_route.then_stmt->expr.args[0]->str_value;
+    REQUIRE_EQ(surviving_body.len, 2u);
+    CHECK(static_cast<u8>(surviving_body.ptr[0]) == 0);
+    CHECK(static_cast<u8>(surviving_body.ptr[1]) == 0xff);
+}
+
+TEST(frontend, websocket_binary_replacement_rejects_malformed_and_nonliteral_expressions) {
+    const char* expressions[] = {R"bytes(b"\0")bytes",
+                                 R"bytes(b"\x0")bytes",
+                                 R"bytes(b"\xgg")bytes",
+                                 R"bytes(b"\u{ff}")bytes",
+                                 R"bytes(b"\(message.len)")bytes",
+                                 R"bytes(b "abc")bytes",
+                                 R"bytes(b"a" + b"b")bytes",
+                                 R"bytes("a" + b"b")bytes",
+                                 R"bytes(message.text + b"b")bytes",
+                                 R"bytes(b"a", "b")bytes"};
+    for (const char* expr : expressions) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in message.forward(";
+        source += expr;
+        source += ") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        if (!tokens) continue;
+        auto ast = parse_file_heap(tokens.value());
+        if (ast) CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    // Byte literals are not implicitly Strings or arbitrary call arguments.
+    for (const char* source :
+         {"route GET \"/\" { let x = b\"a\"\n return 200 }\n",
+          "route GET \"/\" { return response(200, content_type: b\"text/plain\") }\n",
+          "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+          "message.close(1000, b\"reason\") } }\n"}) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        if (ast) CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, websocket_binary_replacement_enforces_decoded_literal_and_route_limits) {
+    for (u32 length : {4u, 5u, 4096u, 4097u}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws";
+        if (length < 100) source += ", maxMessageSize: 4b";
+        source += ") { message in message.forward(b\"";
+        for (u32 i = 0; i < length; ++i) source += "\\xff";
+        source += "\") } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        if (length == 4097) {
+            CHECK_FALSE(ast);
+            continue;
+        }
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_EQ(hir.has_value(), length != 5);
+        if (hir) {
+            const auto& route = hir->routes[0];
+            CHECK_EQ(route.exprs[route.ws_handler.forward_payload.prefix_expr].str_value.len,
+                     length);
+        }
+    }
 }
 
 TEST(frontend, analyze_websocket_rewrite_rejects_dynamic_and_oversize_text) {

@@ -1009,6 +1009,19 @@ return websocket(chat, maxMessageSize: 4kb) { message in
     message.forward("message replaced")
 }
 
+// Fixed Binary replacement reuses exact-byte literals. It accepts arbitrary bytes,
+// including NUL and invalid UTF-8, and emits Binary even for Text input.
+return websocket(chat, maxMessageSize: 4kb) { message in
+    guard message.fromClient else { message.forward() }
+    guard message.len != 0 else { message.forward(b"") }
+    message.forward(b"\x00\xff")
+}
+// A replacement must be one adjacent b"..." literal, at most 4096 decoded bytes,
+// and fit maxMessageSize. Supported escapes: \n, \r, \t, \\, \" and \xHH (NUL is \x00).
+// No byte concatenation, variables, Unicode escapes or interpolation are accepted.
+// Guard branches choose independent Text/Binary replacements; bare forward()
+// preserves the original type and payload. Invalid Text input is still rejected.
+
 // Terminate mode defaults to 16370 bytes (16 KiB slice minus the maximum 14-byte
 // WebSocket header). Explicit `maxMessageSize` values must be 1b through 16370b;
 // values such as 16kb or 64kb are rejected because larger-message buffering is not implemented.

@@ -119,6 +119,15 @@ matching compiler and serving binaries.
   using String `+`. Replacement output must fit the message and single-slice limits.
   The same affix form may use one previously unwrapped `json.string` alias as its
   dynamic source; this produces a Text message even when the input was Binary.
+- `message.forward(b"\x00\xff")` replaces one complete Text or Binary message
+  with Binary. One exact-byte literal is allowed, including an empty payload or
+  invalid UTF-8. It must fit both the existing 4096-byte decoded byte-literal cap
+  and `maxMessageSize`. The `b` must touch the opening quote; NUL is `\x00`.
+  Escapes are `\n`, `\r`, `\t`, `\\`, `\"` and `\xHH`. Concatenation, variables,
+  Unicode escapes and interpolation are unsupported. Guard branches can mix
+  Binary replacements, Text replacements and bare forwarding. Invalid Text input
+  still fails before the handler. Route-owned bytes survive source removal and
+  native relocation without enlarging connection state or reserving more slices.
 - `message.drop()` discards the complete message.
 - `message.close(code, "reason")` requests connection shutdown. The runtime emits
   and drains Close frames to both peers. It does not expose raw frame creation.

@@ -377,7 +377,7 @@ struct Parser {
         return owned;
     }
 
-    // `body: b"..."` for an ordinary `response(...)` body. Same exact-byte
+    // `b"..."` for response bodies and fixed WebSocket Binary replacements. Same exact-byte
     // escape grammar and bound as the other byte-string forms; the decoded
     // bytes are stored in the AstFile so they outlive the source buffer.
     FrontendResult<Str> parse_response_body_literal() {
@@ -807,6 +807,17 @@ struct Parser {
 
     FrontendResult<AstExpr> parse_call_arg() {
         if (cur().type == TokenType::LBrace) return parse_object_call_arg();
+        if (cur().type == TokenType::Ident && cur().text.eq({"b", 1}) &&
+            peek().type == TokenType::StringLit) {
+            const Token kStart = cur();
+            auto bytes = parse_response_body_literal();
+            if (!bytes) return core::make_unexpected(bytes.error());
+            AstExpr literal{};
+            literal.kind = AstExprKind::BytesLit;
+            literal.str_value = bytes.value();
+            literal.span = Span{kStart.start, prev().end, kStart.line, kStart.col};
+            return literal;
+        }
         return parse_expr();
     }
 

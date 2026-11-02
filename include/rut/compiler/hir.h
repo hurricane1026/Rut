@@ -1159,7 +1159,14 @@ struct HirWsClosePolicy {
     u32 reason_expr = 0xffffffffu;
 };
 
-enum class HirWsTextSource : u8 { Literal, MessageText, JsonString, JsonNumberText, JsonStringify };
+enum class HirWsTextSource : u8 {
+    Literal,
+    MessageText,
+    JsonString,
+    JsonNumberText,
+    JsonStringify,
+    LiteralBinary
+};
 
 struct HirWsTextRewrite {
     u32 prefix_expr = 0xffffffffu;

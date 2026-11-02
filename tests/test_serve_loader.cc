@@ -4737,6 +4737,68 @@ TEST(serve_loader, websocket_terminate_rewrites_fixed_text) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_binary_replacements_retain_bytes_and_select_mixed_branch_types) {
+    const auto path = write_file("/tmp/rut_ws_binary_replacement", "app.rut", R"rut(
+upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend, maxMessageSize: 4b) { message in
+    guard message.text != "a" else { message.forward(b"\x00\xFF") }
+    guard message.text != "b" else { message.forward("text") }
+    guard message.text != "c" else { message.forward() }
+    guard message.text != "d" else { message.forward(b"") }
+    message.forward(b"\x80\x00end")
+} }
+)rut");
+    // The default must fit the route limit too.
+    LoadedProgram invalid;
+    LoadError err;
+    CHECK_FALSE(load_rut_program(path.c_str(), invalid, err));
+    invalid.destroy();
+    const auto valid_path = write_file("/tmp/rut_ws_binary_replacement", "valid.rut", R"rut(
+upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend, maxMessageSize: 5b) { message in
+    guard message.text != "a" else { message.forward(b"\x00\xFF") }
+    guard message.text != "b" else { message.forward("text") }
+    guard message.text != "c" else { message.forward() }
+    guard message.text != "d" else { message.forward(b"") }
+    message.forward(b"\x80\x00end")
+} }
+)rut");
+    LoadedProgram program;
+    REQUIRE(load_rut_program(valid_path.c_str(), program, err));
+    REQUIRE_EQ(unlink(valid_path.c_str()), 0);
+    const auto& route = program.config.routes[0];
+    REQUIRE_EQ(route.ws_forward_text_count, 3u);
+    CHECK(route.ws_forward_text.source == WsTextSource::LiteralBinary);
+    const Str expected[] = {{"\0\xff", 2}, {"text", 4}, {"c", 1}, {}, {"\x80\0end", 5}};
+    for (u32 i = 0; i < 5; ++i) {
+        WsInspector st;
+        st.forward_text = route.ws_forward_text;
+        st.forward_texts = route.ws_forward_texts;
+        st.forward_text_count = route.ws_forward_text_count;
+        st.max_message_size = route.ws_max_message_size;
+        // Both Text and Binary inputs can be replaced by either output type.
+        const u8 input[] = {static_cast<u8>(i % 2 ? 0x82 : 0x81), 1, static_cast<u8>('a' + i)};
+        u8 out[32], msg[32];
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           sizeof(input),
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           route.ws_frame_handler,
+                           nullptr,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, sizeof(input));
+        REQUIRE_EQ(produced, 2u + expected[i].len);
+        CHECK_EQ(out[0], i == 1 || i == 2 ? 0x81u : 0x82u);
+        if (expected[i].len) CHECK(memcmp(out + 2, expected[i].ptr, expected[i].len) == 0);
+    }
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_affix_rewrites_retain_independent_branch_and_default_views) {
     const auto path =
         write_file("/tmp/rut_ws_affix",

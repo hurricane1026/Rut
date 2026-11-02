@@ -195,6 +195,9 @@ enum class AstExprKind : u8 {
     Or,
     Pipe,
     Wait,
+    // Exact bytes, currently accepted only by message.forward(b"...").
+    // Decoded into AstFile's shared bounded byte-literal storage.
+    BytesLit,
 };
 
 struct AstTypeRef {
@@ -683,8 +686,8 @@ struct AstFile {
     static constexpr u32 kFailurePolicyBodyPoolBytes =
         kMaxForwardFailurePolicies * kMaxFailurePolicyBodyLen;
     static constexpr u32 kStrictLocalResponseBodyPoolBytes = kMaxStrictLocalResponsePolicyBytes;
-    // Decoded bytes for `response(status, body: b"...")` exact-byte literals.
-    // One per route at the shared exact-byte literal bound.
+    // Shared decoded-byte storage for response bodies and WebSocket Binary literals.
+    // Each literal has the existing 4 KiB bound; identical byte sequences share entries.
     static constexpr u32 kResponseBodyPoolBytes = kMaxItems * kMaxStrictLocalResponseBodyLen;
     static constexpr u32 kRedirectPolicyBodyPoolBytes = kMaxRedirectPolicies * kMaxRedirectBodyLen;
     FixedVec<AstItem, kMaxItems> items;
@@ -1030,6 +1033,7 @@ private:
     }
 
     void rebase_expr(const AstFile& other, AstExpr& expr) {
+        if (expr.kind == AstExprKind::BytesLit) rebase_response_body(other, expr.str_value);
         rebase_expr_ptr(other, expr.lhs);
         rebase_expr_ptr(other, expr.rhs);
         for (u32 i = 0; i < expr.type_args.len; i++) {

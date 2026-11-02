@@ -1130,6 +1130,52 @@ TEST(native_program, websocket_rewrite_survives_compiler_exit_and_source_removal
     CHECK(memcmp(output + 2, "native\0text", 11) == 0);
 }
 
+TEST(native_program, websocket_binary_replacements_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+    guard message.text != "a" else { message.forward(b"\x00\xff") }
+    guard message.text != "b" else { message.forward("text") }
+    guard message.text != "c" else { message.forward() }
+    guard message.text != "d" else { message.forward(b"") }
+    message.forward(b"\x80\x00end")
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    REQUIRE_EQ(route.ws_forward_text_count, 3u);
+    const Str expected[] = {{"\0\xff", 2}, {"text", 4}, {"c", 1}, {}, {"\x80\0end", 5}};
+    for (u32 i = 0; i < 5; ++i) {
+        WsInspector st;
+        st.forward_text = route.ws_forward_text;
+        st.forward_texts = route.ws_forward_texts;
+        st.forward_text_count = route.ws_forward_text_count;
+        st.max_message_size = route.ws_max_message_size;
+        const u8 input[] = {0x82, 1, static_cast<u8>('a' + i)};
+        u8 out[32], msg[32];
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           sizeof(input),
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           route.ws_frame_handler,
+                           nullptr,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, sizeof(input));
+        REQUIRE_EQ(produced, 2u + expected[i].len);
+        CHECK_EQ(out[0], i == 1 ? 0x81u : 0x82u);
+        if (expected[i].len) CHECK(memcmp(out + 2, expected[i].ptr, expected[i].len) == 0);
+    }
+}
+
 TEST(native_program, websocket_affix_rewrites_survive_source_removal) {
     Source source;
     REQUIRE(source.append(

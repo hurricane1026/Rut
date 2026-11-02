@@ -522,16 +522,20 @@ bool ws_valid_text_payload(Str text) {
 bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
     const u64 literal_size = static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len;
     const bool kSourceValid =
-        rewrite.source <= WsTextSource::JsonStringify &&
+        rewrite.source <= WsTextSource::LiteralBinary &&
         ((rewrite.source == WsTextSource::JsonString ||
           rewrite.source == WsTextSource::JsonNumberText ||
           rewrite.source == WsTextSource::JsonStringify)
              ? rewrite.source_path.len <= json::kMaxBytes &&
                    (rewrite.source_path.ptr || rewrite.source_path.len == 0)
              : rewrite.source_path.len == 0 && rewrite.source_path.ptr == nullptr);
+    const bool kPayloadValid =
+        rewrite.source == WsTextSource::LiteralBinary
+            ? (rewrite.prefix.ptr || rewrite.prefix.len == 0) &&
+                  (rewrite.suffix.ptr || rewrite.suffix.len == 0)
+            : ws_valid_text_payload(rewrite.prefix) && ws_valid_text_payload(rewrite.suffix);
     return kSourceValid && literal_size <= kWsTerminateMessageCapacity &&
-           (max_size == 0 || literal_size <= max_size) && ws_valid_text_payload(rewrite.prefix) &&
-           ws_valid_text_payload(rewrite.suffix);
+           (max_size == 0 || literal_size <= max_size) && kPayloadValid;
 }
 
 bool ws_valid_close_reason(Str reason) {
@@ -610,8 +614,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
             auto rewritten_size = [original_size](const WsTextRewrite& rewrite) {
                 const u64 kSourceSize = rewrite.source == WsTextSource::JsonStringify
                                             ? json::kMaxBytes
-                                        : rewrite.source != WsTextSource::Literal ? original_size
-                                                                                  : 0;
+                                        : rewrite.source != WsTextSource::Literal &&
+                                                rewrite.source != WsTextSource::LiteralBinary
+                                            ? original_size
+                                            : 0;
                 return static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len + kSourceSize;
             };
             u64 data_size = rewritten_size(st.forward_text);
@@ -778,16 +784,19 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     break;
                 case WsTextSource::Literal:
                 case WsTextSource::MessageText:
-                    emitted = emit_frame(out,
-                                         out_cap,
-                                         produced,
-                                         WsOpcode::Text,
-                                         msg_buf,
-                                         payload_size,
-                                         st.masked,
-                                         st.mask_rng,
-                                         rewrite.prefix,
-                                         rewrite.suffix);
+                case WsTextSource::LiteralBinary:
+                    emitted =
+                        emit_frame(out,
+                                   out_cap,
+                                   produced,
+                                   rewrite.source == WsTextSource::LiteralBinary ? WsOpcode::Binary
+                                                                                 : WsOpcode::Text,
+                                   msg_buf,
+                                   payload_size,
+                                   st.masked,
+                                   st.mask_rng,
+                                   rewrite.prefix,
+                                   rewrite.suffix);
                     break;
             }
             if (!emitted) return WsInspectStatus::Error;

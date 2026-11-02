@@ -67,7 +67,7 @@ bool visit_views(RouteConfig& c, F f) {
     auto str = [&](Str& s) { return f(s.ptr, s.len); };
     for (u32 i = 0; i < c.route_count; i++) {
         auto rewrite = [&](WsTextRewrite& r) {
-            if (r.source > WsTextSource::JsonStringify || !str(r.prefix) || !str(r.suffix))
+            if (r.source > WsTextSource::LiteralBinary || !str(r.prefix) || !str(r.suffix))
                 return false;
             if (r.source == WsTextSource::JsonString || r.source == WsTextSource::JsonNumberText ||
                 r.source == WsTextSource::JsonStringify)
