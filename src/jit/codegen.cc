@@ -2894,10 +2894,10 @@ CodegenResult codegen(const rir::Module& rir_mod) {
                             result->inner->struct_def != nullptr)
                             return {nullptr, nullptr, false};
                         for (u32 oi = 0; oi < kExpectedCount; ++oi) {
-                            const rir::ValueId id = inst.operand(oi);
-                            if (id == rir::kNoValue || id.id >= fn.value_count)
+                            const rir::ValueId kId = inst.operand(oi);
+                            if (kId == rir::kNoValue || kId.id >= fn.value_count)
                                 return {nullptr, nullptr, false};
-                            const rir::Type* type = fn.values[id.id].type;
+                            const rir::Type* type = fn.values[kId.id].type;
                             const auto expected =
                                 oi == kStringCount ? rir::TypeKind::I32 : rir::TypeKind::Str;
                             if (type == nullptr || type->kind != expected ||
