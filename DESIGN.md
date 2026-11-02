@@ -9022,7 +9022,10 @@ authorize the scope. Wrong scope is 403; invalid signature or claims is 401.
 
 The runnable issuer and receiver examples are split between
 `examples/jwt-issue-auth.rut` and `examples/jwt-scope-authorization.rut` so each
-stays within current module limits; configure and run them as a pair.
+stays within current module limits. Configure both with the same `JWT_ISSUER`,
+`JWT_AUDIENCE` and `JWT_ISSUE_KEY`; the issuer listens on port 8080 and receiver
+on 8081. Keep trusted `JWT_ISSUE_SCOPE` and static revocation IDs configured
+for their respective handlers.
 
 ### Fixed RS256 public JWK configuration
 
