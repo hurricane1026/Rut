@@ -1211,6 +1211,73 @@ extern "C" void rut_helper_jwt_issue_hs256_with_id(void* conn,
     *out_len = token_len;
 }
 
+extern "C" void rut_helper_jwt_issue_hs256_with_id_and_scope(void* conn,
+                                                             void* arena,
+                                                             const char* subject,
+                                                             u32 subject_len,
+                                                             const char* issuer,
+                                                             u32 issuer_len,
+                                                             const char* audience,
+                                                             u32 audience_len,
+                                                             const char* token_id,
+                                                             u32 token_id_len,
+                                                             const char* scope,
+                                                             u32 scope_len,
+                                                             const char* key,
+                                                             u32 key_len,
+                                                             i32 ttl_seconds,
+                                                             u8* has_value,
+                                                             const char** out_ptr,
+                                                             u32* out_len) {
+    *has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (storage == nullptr && conn != nullptr)
+        storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    if (storage == nullptr || storage->backend.pool == nullptr) return;
+
+    struct timespec now{};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+        now.tv_nsec >= 1000000000)
+        return;
+
+    char token[kMaxJwtHs256TokenBytes];
+    u32 token_len = 0;
+    const bool kIssued = jwt_hs256_issue_with_id_and_scope({key, key_len},
+                                                           {subject, subject_len},
+                                                           {issuer, issuer_len},
+                                                           {audience, audience_len},
+                                                           {token_id, token_id_len},
+                                                           {scope, scope_len},
+                                                           static_cast<i64>(now.tv_sec),
+                                                           ttl_seconds,
+                                                           token,
+                                                           sizeof(token),
+                                                           token_len);
+    if (!kIssued) {
+        rut_crypto_clear_v1(token, sizeof(token));
+        return;
+    }
+    if (token_len == 0 || token_len > kMaxJwtHs256TokenBytes ||
+        storage->space_used() > kHashRequestBudget - token_len ||
+        (storage->current == nullptr && !storage->init(storage->backend.pool))) {
+        rut_crypto_clear_v1(token, sizeof(token));
+        return;
+    }
+
+    auto* output = static_cast<char*>(storage->alloc(token_len));
+    if (output == nullptr) {
+        rut_crypto_clear_v1(token, sizeof(token));
+        return;
+    }
+    __builtin_memcpy(output, token, token_len);
+    rut_crypto_clear_v1(token, sizeof(token));
+    *has_value = 1;
+    *out_ptr = output;
+    *out_len = token_len;
+}
+
 extern "C" void rut_helper_uuid(
     void* conn, void* arena, u8* has_value, const char** out_ptr, u32* out_len) {
     *has_value = 0;

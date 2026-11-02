@@ -1,5 +1,5 @@
-// Set API_KEY, CONSUMER_ID, JWT_ISSUER, JWT_AUDIENCE and JWT_ISSUE_KEY at load time.
-// Serve behind TLS. The route authenticates its API key before issuing a token.
+// Set API_KEY, CONSUMER_ID, JWT_ISSUER, JWT_AUDIENCE, JWT_ISSUE_SCOPE and
+// JWT_ISSUE_KEY at load time. Scope is trusted configuration. Serve behind TLS.
 import Crypto
 import "middleware/auth.rut"
 listen :8080
@@ -9,9 +9,9 @@ route POST "/token" {
         req.authorization.or(""), env("API_KEY"), env("CONSUMER_ID"), "api-key")
     let requestId = uuid()
     guard let tokenId = requestId else { return response(503) }
-    guard let token = auth.jwtForIdentityHs256WithId(
+    guard let token = auth.jwtForIdentityHs256WithIdAndScope(
         identity, env("JWT_ISSUER"), env("JWT_AUDIENCE"), tokenId,
-        env("JWT_ISSUE_KEY"), 900) else {
+        env("JWT_ISSUE_SCOPE"), env("JWT_ISSUE_KEY"), 900) else {
         return response(503)
     }
     return response(200, body: token)

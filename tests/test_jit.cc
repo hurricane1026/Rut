@@ -26199,6 +26199,85 @@ route GET "/qualified" {
     rir.destroy();
 }
 
+TEST(jit, fixed_profile_hs256_issue_with_id_and_scope_verifies_all_claims) {
+    const char* source = R"rut(
+import Crypto
+route GET "/direct" {
+    let issued = jwtIssueHs256WithIdAndScope("alice", "issuer", "orders", "request-73", "orders:read", "01234567890123456789012345678901", 90)
+    guard let token = issued else { return 501 }
+    guard let claims = jwtDecode(token, "01234567890123456789012345678901", "HS256") else { return 502 }
+    guard jwtClaimsValidWithLifetime(claims, "issuer", "orders", i64(3600), i64(3600)) else { return 503 }
+    guard let idJson = json.get(claims, "/jti") else { return 504 }
+    guard let tokenId = json.string(idJson) else { return 505 }
+    guard tokenId == "request-73" && jwtHasScope(claims, "orders:read") else { return 506 }
+    return 204
+}
+route GET "/qualified" {
+    let issued = Crypto.issueJwtHs256WithIdAndScope("alice", "issuer", "orders", "request-74", "orders:read", "01234567890123456789012345678901", 90)
+    guard let token = issued else { return 511 }
+    guard let claims = jwtDecode(token, "01234567890123456789012345678901", "HS256") else { return 512 }
+    guard jwtClaimsValidWithLifetime(claims, "issuer", "orders", i64(3600), i64(3600)) else { return 513 }
+    guard jwtHasScope(claims, "orders:read") else { return 514 }
+    return 204
+}
+route GET "/wrong-scope" {
+    guard let token = jwtIssueHs256WithIdAndScope("alice", "issuer", "orders", "request-75", "orders:read", "01234567890123456789012345678901", 90) else { return 521 }
+    guard let claims = jwtDecode(token, "01234567890123456789012345678901", "HS256") else { return 522 }
+    guard jwtClaimsValid(claims, "issuer", "orders") else { return 523 }
+    guard jwtHasScope(claims, "orders:write") else { return 403 }
+    return 204
+}
+route GET "/missing-scope" {
+    guard let token = jwtIssueHs256WithId("alice", "issuer", "orders", "request-76", "01234567890123456789012345678901", 90) else { return 531 }
+    guard let claims = jwtDecode(token, "01234567890123456789012345678901", "HS256") else { return 532 }
+    guard jwtClaimsValid(claims, "issuer", "orders") else { return 533 }
+    guard jwtHasScope(claims, "orders:read") else { return 403 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const char* paths[] = {"/direct", "/qualified", "/wrong-scope", "/missing-scope"};
+    const u16 statuses[] = {204, 204, 403, 403};
+    for (u32 i = 0; i < 4; ++i) {
+        char handler_name[] = "handler_route_0";
+        handler_name[14] = static_cast<char>('0' + i);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(handler_name));
+        REQUIRE(handler);
+        char request[128];
+        const int request_len = snprintf(
+            request, sizeof(request), "GET %s HTTP/1.1\r\nHost: localhost\r\n\r\n", paths[i]);
+        const auto result = HandlerResult::unpack(handler(nullptr,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(request),
+                                                          static_cast<u32>(request_len),
+                                                          &arena));
+        CHECK_EQ(result.status_code, statuses[i]);
+        arena.reset();
+    }
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, jwt_groups_example_compiles) {
     const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
                              "examples/jwt-groups-auth.rut";
@@ -28009,5 +28088,40 @@ TEST(jit, hs256_issue_with_id_codegen_rejects_malformed_sixth_operand) {
     fn->values[result.id].type = fn->values[args[0].id].type;
     CHECK_FALSE(codegen(tc.mod).ok);
     fn->values[result.id].type = original_result_type;
+    tc.destroy();
+}
+
+TEST(jit, hs256_issue_with_id_and_scope_codegen_rejects_malformed_seventh_operand) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("issue_with_id_scope_bad_rir"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    ValueId args[7];
+    for (u32 i = 0; i < 6; ++i) args[i] = V(b.emit_const_str(lit("value")));
+    args[6] = V(b.emit_const_i32(60));
+    auto result = V(b.emit_json(
+        static_cast<u32>(json::Op::JwtIssueHs256WithIdAndScope), TypeKind::Str, true, args, 7));
+    VOK(b.emit_ret_status(204));
+    auto& inst = fn->entry()->insts[7];
+    auto* overflow = inst.extra_operands;
+    inst.extra_operands = nullptr;
+    CHECK_FALSE(codegen(tc.mod).ok);
+    inst.extra_operands = overflow;
+    inst.operand_count = 6;
+    CHECK_FALSE(codegen(tc.mod).ok);
+    inst.operand_count = 7;
+    const auto saved_ttl = overflow[3];
+    overflow[3] = kNoValue;
+    CHECK_FALSE(codegen(tc.mod).ok);
+    overflow[3] = args[5];
+    CHECK_FALSE(codegen(tc.mod).ok);
+    overflow[3] = saved_ttl;
+    const Type* original_result = fn->values[result.id].type;
+    fn->values[result.id].type = fn->values[args[0].id].type;
+    CHECK_FALSE(codegen(tc.mod).ok);
+    fn->values[result.id].type = original_result;
     tc.destroy();
 }

@@ -1334,6 +1334,8 @@ jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
          ttl:i32) -> str?; Crypto.issueJwtHs256 qualified wrapper;
          jwtIssueHs256WithId(subject, issuer, audience, tokenId, key,
          ttl:i32) -> str?; Crypto.issueJwtHs256WithId qualified wrapper;
+         jwtIssueHs256WithIdAndScope(subject, issuer, audience, tokenId, scope,
+         key, ttl:i32) -> str?; Crypto.issueJwtHs256WithIdAndScope wrapper;
          ⏳ other RS/ES algorithms and arbitrary-claims DSL jwtEncode
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
@@ -1942,6 +1944,14 @@ strings. Issuance provides no ID uniqueness or replay protection.
 `auth.jwtForIdentityHs256WithId` uses `identity.consumerId` as `sub` and the
 provided token ID as `jti`; call it only after successful authentication,
 because Identity has no authentication provenance.
+
+`jwtIssueHs256WithIdAndScope` emits exactly `sub`, `iss`, `aud`, `jti`, `scope`,
+`iat` and `exp`. Scope must be one nonempty ASCII OAuth scope-token using the
+same character grammar as `jwtHasScope`; it comes from trusted issuer
+configuration, not request input. Invalid scopes fail issuance. The identity
+helper `auth.jwtForIdentityHs256WithIdAndScope` uses `identity.consumerId` as
+`sub` and should be called only after authentication. Validate signature,
+issuer/audience/lifetime and configured jti revocation before scope policy.
 
 ### Static HS JWT secret rotation
 

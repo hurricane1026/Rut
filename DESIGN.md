@@ -9009,6 +9009,21 @@ identity consumer ID into `sub`. Call the identity helper only after
 authentication. Static two-ID revocation checks remain a configuration
 snapshot and do not provide live revocation or replay protection.
 
+`jwt_hs256_issue_with_id_and_scope` and the Rut/JIT
+`jwtIssueHs256WithIdAndScope(subject, issuer, audience, tokenId, scope, key, ttl)`
+operation emit exactly seven claims: `sub`, `iss`, `aud`, `jti`, `scope`, `iat`
+and `exp`. Scope is one nonempty ASCII OAuth scope-token using the same grammar
+as `jwtHasScope`; spaces, quotes, backslashes, controls and non-ASCII bytes are
+rejected. The scope is issuer-provided trusted configuration, not request input.
+The identity helper is available only as a convenience after authentication;
+`Identity` itself carries no authentication provenance. Consumers should
+verify signature and issuer/audience/lifetime, check static ID revocation, then
+authorize the scope. Wrong scope is 403; invalid signature or claims is 401.
+
+The runnable issuer and receiver examples are split between
+`examples/jwt-issue-auth.rut` and `examples/jwt-scope-authorization.rut` so each
+stays within current module limits; configure and run them as a pair.
+
 ### Fixed RS256 public JWK configuration
 
 The native configuration-only `RsaPublicKey::load_rs256_jwk` imports one public

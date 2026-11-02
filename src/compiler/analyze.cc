@@ -1800,6 +1800,7 @@ static bool is_crypto_system_export(Str value) {
                            lit_str("jwtRs256"),
                            lit_str("issueJwtHs256"),
                            lit_str("issueJwtHs256WithId"),
+                           lit_str("issueJwtHs256WithIdAndScope"),
                            lit_str("signedRequestValid")};
     for (Str name : exports)
         if (name.eq(value)) return true;
@@ -10171,6 +10172,40 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
         return out;
     }
+
+    if (expr.name.eq(lit_str("jwtIssueHs256WithIdAndScope")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr Str kDetail = lit_str(
+            "jwtIssueHs256WithIdAndScope expects subject, issuer, audience, token ID, scope and "
+            "key as unwrapped str values and ttl as i32");
+        if (pipe_lhs != nullptr || expr.args.len != 7)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr values[7]{};
+        for (u32 i = 0; i < expr.args.len; ++i) {
+            if (expr.args[i] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            auto value = analyze_expr(*expr.args[i], route, mod, locals, local_count, binding);
+            if (!value) return value;
+            const HirTypeKind kExpected = i == 6 ? HirTypeKind::I32 : HirTypeKind::Str;
+            if (value->type != kExpected || value->may_nil || value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, kDetail);
+            values[i] = value.value();
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::JsonOp;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.int_value = static_cast<i64>(json::Op::JwtIssueHs256WithIdAndScope);
+        out.span = expr.span;
+        for (const auto& value : values) {
+            if (!route->exprs.push(value))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            if (!out.args.push(&route->exprs[route->exprs.len - 1]))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
+        return out;
+    }
     const auto copy_hir_shape = [](HirExpr* dst, const HirExpr& src) {
         dst->type = src.type;
         dst->generic_index = src.generic_index;
@@ -15210,6 +15245,9 @@ func issueJwtHs256(_ subject: str, _ issuer: str, _ audience: str, _ key: str, _
 func issueJwtHs256WithId(_ subject: str, _ issuer: str, _ audience: str,
                          _ tokenId: str, _ key: str, _ ttl: i32) =>
     jwtIssueHs256WithId(subject, issuer, audience, tokenId, key, ttl)
+func issueJwtHs256WithIdAndScope(_ subject: str, _ issuer: str, _ audience: str,
+                                 _ tokenId: str, _ scope: str, _ key: str, _ ttl: i32) =>
+    jwtIssueHs256WithIdAndScope(subject, issuer, audience, tokenId, scope, key, ttl)
 )rut";
 
 static FrontendResult<void> load_imported_modules(

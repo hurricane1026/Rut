@@ -43494,6 +43494,43 @@ route GET "/" {
     CHECK(analyze_file_heap(ast.value()));
 }
 
+TEST(frontend, hs256_issue_with_id_and_scope_requires_seven_unwrapped_operands) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { let t = jwtIssueHs256WithIdAndScope("s", "i", "a", "id", "read", "key") return 200 })rut",
+        R"rut(route GET "/" { let t = jwtIssueHs256WithIdAndScope("s", "i", "a", "id", "read", "key", 60, 1) return 200 })rut",
+        R"rut(route GET "/" { let t = jwtIssueHs256WithIdAndScope("s", "i", "a", "id", 1, "key", 60) return 200 })rut",
+        R"rut(route GET "/" { let t = jwtIssueHs256WithIdAndScope("s", "i", "a", req.header("X-ID"), "read", "key", 60) return 200 })rut",
+        R"rut(route GET "/" { let t = jwtIssueHs256WithIdAndScope("s", "i", "a", "id", "read", "key", "60") return 200 })rut",
+        R"rut(route GET "/" { let t = jwtIssueHs256WithIdAndScope("s", "i", "a", "id", "read", "key", i64(60)) return 200 })rut",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    const char* valid = R"rut(
+import Crypto
+func jwtIssueHs256WithIdAndScope(_ subject: str, _ issuer: str, _ audience: str,
+                                 _ tokenId: str, _ scope: str, _ key: str, _ ttl: i32) -> str => subject
+route GET "/" {
+    let shadow = jwtIssueHs256WithIdAndScope("x", "i", "a", "id", "scope", "key", 60)
+    let direct = jwtIssueHs256WithIdAndScope("alice", "issuer", "orders", "req-1", "orders:read",
+                                             "01234567890123456789012345678901", 60)
+    let qualified = Crypto.issueJwtHs256WithIdAndScope(
+        "alice", "issuer", "orders", "req-1", "orders:read",
+        "01234567890123456789012345678901", 60)
+    return 200
+}
+)rut";
+    auto tokens = lex(lit(valid));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}
+
 TEST(frontend, signed_request_example_compiles_with_fixed_test_environment) {
     struct RestoreEnvironment {
         const char* name;

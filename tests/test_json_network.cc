@@ -1029,8 +1029,9 @@ route GET "/issue" {
     let identity = auth.apiKey(req.authorization.or(""), "issue-secret", "alice", "api-key")
     let requestId = uuid()
     guard let tokenId = requestId else { return response(503) }
-    guard let token = auth.jwtForIdentityHs256WithId(
-        identity, "issuer", "orders", tokenId, "01234567890123456789012345678901", 900) else {
+    guard let token = auth.jwtForIdentityHs256WithIdAndScope(
+        identity, "issuer", "orders", tokenId, "orders:read",
+        "01234567890123456789012345678901", 900) else {
         return response(503)
     }
     return response(200, body: token)
@@ -1042,6 +1043,7 @@ route POST "/validate" {
     let claims = auth.jwtDocumentHs256(req.authorization.or(""), "01234567890123456789012345678901")
     guard jwtClaimsValidWithLifetime(claims, "issuer", "orders", i64(900), i64(900)) else { return 401 }
     let checked = auth.requireUnrevokedJwt(claims, "revoked-token-1", "revoked-token-2")
+    guard jwtHasScope(checked, "orders:read") else { return 403 }
     return 204
 }
 )rut";
@@ -1101,6 +1103,11 @@ route POST "/validate" {
     REQUIRE(verify_arena.init(&pool));
     verify_token(h1_token, verify_arena, 204);
 
+    char tampered[kMaxJwtHs256TokenBytes];
+    __builtin_memcpy(tampered, h1_token.ptr, h1_token.len);
+    tampered[h1_token.len - 1] = tampered[h1_token.len - 1] == 'A' ? 'B' : 'A';
+    verify_token({tampered, h1_token.len}, verify_arena, 401);
+
     char signing_key[32];
     const char kSigningKey[] = "01234567890123456789012345678901";
     for (u32 i = 0; i < sizeof(signing_key); ++i) signing_key[i] = kSigningKey[i];
@@ -1118,19 +1125,47 @@ route POST "/validate" {
                             sizeof(legacy_token),
                             legacy_token_len));
     verify_token({legacy_token, legacy_token_len}, verify_arena, 401);
+    char no_scope_token[kMaxJwtHs256TokenBytes];
+    u32 no_scope_token_len = 0;
+    REQUIRE(jwt_hs256_issue_with_id({signing_key, sizeof(signing_key)},
+                                    lit_str("alice"),
+                                    lit_str("issuer"),
+                                    lit_str("orders"),
+                                    lit_str("request-no-scope"),
+                                    static_cast<i64>(now.tv_sec),
+                                    60,
+                                    no_scope_token,
+                                    sizeof(no_scope_token),
+                                    no_scope_token_len));
+    verify_token({no_scope_token, no_scope_token_len}, verify_arena, 403);
+    char wrong_scope_token[kMaxJwtHs256TokenBytes];
+    u32 wrong_scope_token_len = 0;
+    REQUIRE(jwt_hs256_issue_with_id_and_scope({signing_key, sizeof(signing_key)},
+                                              lit_str("alice"),
+                                              lit_str("issuer"),
+                                              lit_str("orders"),
+                                              lit_str("request-wrong-scope"),
+                                              lit_str("orders:write"),
+                                              static_cast<i64>(now.tv_sec),
+                                              60,
+                                              wrong_scope_token,
+                                              sizeof(wrong_scope_token),
+                                              wrong_scope_token_len));
+    verify_token({wrong_scope_token, wrong_scope_token_len}, verify_arena, 403);
     for (Str revoked_id : {lit_str("revoked-token-1"), lit_str("revoked-token-2")}) {
         char revoked_token[kMaxJwtHs256TokenBytes];
         u32 revoked_token_len = 0;
-        REQUIRE(jwt_hs256_issue_with_id({signing_key, sizeof(signing_key)},
-                                        lit_str("alice"),
-                                        lit_str("issuer"),
-                                        lit_str("orders"),
-                                        revoked_id,
-                                        static_cast<i64>(now.tv_sec),
-                                        60,
-                                        revoked_token,
-                                        sizeof(revoked_token),
-                                        revoked_token_len));
+        REQUIRE(jwt_hs256_issue_with_id_and_scope({signing_key, sizeof(signing_key)},
+                                                  lit_str("alice"),
+                                                  lit_str("issuer"),
+                                                  lit_str("orders"),
+                                                  revoked_id,
+                                                  lit_str("orders:read"),
+                                                  static_cast<i64>(now.tv_sec),
+                                                  60,
+                                                  revoked_token,
+                                                  sizeof(revoked_token),
+                                                  revoked_token_len));
         verify_token({revoked_token, revoked_token_len}, verify_arena, 401);
     }
     verify_arena.destroy();
@@ -1266,6 +1301,91 @@ TEST(json_network, hs256_issue_with_id_helper_uses_request_arena_and_fails_close
                                        &output,
                                        &output_len);
     CHECK_EQ(has_value, 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(output_len, 0u);
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(json_network, hs256_issue_with_id_and_scope_helper_uses_request_arena_and_fails_closed) {
+    SlicePool pool;
+    REQUIRE(pool.init(24));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char key[32];
+    for (char& byte : key) byte = 's';
+    u8 has = 0;
+    const char* output = nullptr;
+    u32 output_len = 0;
+    rut_helper_jwt_issue_hs256_with_id_and_scope(nullptr,
+                                                 &arena,
+                                                 "alice",
+                                                 5,
+                                                 "issuer",
+                                                 6,
+                                                 "orders",
+                                                 6,
+                                                 "request-9",
+                                                 9,
+                                                 "orders:read",
+                                                 11,
+                                                 key,
+                                                 sizeof(key),
+                                                 60,
+                                                 &has,
+                                                 &output,
+                                                 &output_len);
+    REQUIRE_EQ(has, 1u);
+    REQUIRE(output != nullptr);
+    CHECK_GT(output_len, 100u);
+    CHECK(reinterpret_cast<uintptr_t>(output) >= reinterpret_cast<uintptr_t>(pool.base));
+
+    arena.reset();
+    has = 1;
+    output = reinterpret_cast<const char*>(1);
+    output_len = 99;
+    rut_helper_jwt_issue_hs256_with_id_and_scope(nullptr,
+                                                 &arena,
+                                                 "alice",
+                                                 5,
+                                                 "issuer",
+                                                 6,
+                                                 "orders",
+                                                 6,
+                                                 "request-9",
+                                                 9,
+                                                 "two words",
+                                                 10,
+                                                 key,
+                                                 sizeof(key),
+                                                 60,
+                                                 &has,
+                                                 &output,
+                                                 &output_len);
+    CHECK_EQ(has, 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(output_len, 0u);
+    arena.reset();
+    while (arena.space_used() <= kHashRequestBudget) REQUIRE(arena.alloc(15 * 1024) != nullptr);
+    rut_helper_jwt_issue_hs256_with_id_and_scope(nullptr,
+                                                 &arena,
+                                                 "alice",
+                                                 5,
+                                                 "issuer",
+                                                 6,
+                                                 "orders",
+                                                 6,
+                                                 "request-9",
+                                                 9,
+                                                 "orders:read",
+                                                 11,
+                                                 key,
+                                                 sizeof(key),
+                                                 60,
+                                                 &has,
+                                                 &output,
+                                                 &output_len);
+    CHECK_EQ(has, 0u);
     CHECK(output == nullptr);
     CHECK_EQ(output_len, 0u);
     arena.destroy();

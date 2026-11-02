@@ -1012,13 +1012,17 @@ struct Builder {
                               SourceLoc loc = {}) {
         const bool kJwtIssue = op == static_cast<u32>(json::Op::JwtIssueHs256);
         const bool kJwtIssueWithId = op == static_cast<u32>(json::Op::JwtIssueHs256WithId);
+        const bool kJwtIssueWithIdAndScope =
+            op == static_cast<u32>(json::Op::JwtIssueHs256WithIdAndScope);
         if ((kJwtIssue && count != 5) || (kJwtIssueWithId && count != 6) ||
-            (!kJwtIssue && !kJwtIssueWithId && count > 3) || (count != 0 && args == nullptr))
+            (kJwtIssueWithIdAndScope && count != 7) ||
+            (!kJwtIssue && !kJwtIssueWithId && !kJwtIssueWithIdAndScope && count > 3) ||
+            (count != 0 && args == nullptr))
             return err(RirError::InvalidState);
         for (u32 i = 0; i < count; ++i)
             if (!valid_val(args[i])) return err(RirError::InvalidState);
-        if (kJwtIssue || kJwtIssueWithId) {
-            const u32 kStringCount = kJwtIssueWithId ? 5u : 4u;
+        if (kJwtIssue || kJwtIssueWithId || kJwtIssueWithIdAndScope) {
+            const u32 kStringCount = kJwtIssueWithIdAndScope ? 6u : (kJwtIssueWithId ? 5u : 4u);
             for (u32 i = 0; i < kStringCount; ++i)
                 if (!val_has_type(args[i], TypeKind::Str)) return err(RirError::InvalidState);
             if (!val_has_type(args[kStringCount], TypeKind::I32) || result != TypeKind::Str ||

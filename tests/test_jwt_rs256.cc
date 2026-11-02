@@ -251,6 +251,12 @@ TEST(jwt_rs256, configured_jwks_to_verified_claims_policy) {
         document, {payload, length}, lit_str("issuer"), lit_str("gateway"), 100, 50, 149));
     CHECK(jwt_has_scope(document, {payload, length}, lit_str("read")));
     CHECK(!jwt_has_scope(document, {payload, length}, lit_str("admin")));
+    CHECK(jwt_scope_token_valid(lit_str("orders:read")));
+    CHECK_FALSE(jwt_scope_token_valid(lit_str("two words")));
+    CHECK_FALSE(jwt_scope_token_valid(lit_str("quoted\"")));
+    CHECK_FALSE(jwt_scope_token_valid(lit_str("back\\slash")));
+    const char non_ascii_scope[] = {static_cast<char>(0xc3), static_cast<char>(0xa9)};
+    CHECK_FALSE(jwt_scope_token_valid({non_ascii_scope, sizeof(non_ascii_scope)}));
     CHECK(
         !jwt_claims_valid(document, {payload, length}, lit_str("other"), lit_str("gateway"), 100));
     CHECK(!jwt_claims_valid(document, {payload, length}, lit_str("issuer"), lit_str("other"), 100));
