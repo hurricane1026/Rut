@@ -16,7 +16,7 @@ whether a competing open-source edition includes them.
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
-| JWT verification | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; native strict claims policy with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact top-level `groups` array authorization after verification | ES keys, remote JWKS refresh/cache, live and durable token revocation; lifetime policy has no Rut surface yet |
+| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; native strict claims policy with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact top-level `groups` array authorization after verification; fixed-profile native HS256 issuance | ES keys, remote JWKS refresh/cache, live and durable token revocation; Rut/JIT issuance, arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
@@ -428,6 +428,21 @@ window: this adds no timestamp policy, delivery-ID binding or durable replay
 store, and does not complete the signed-request/replay acceptance gates.
 HTTP/1 delivery in the example retains the current buffered-body profile:
 chunked requests are rejected with 400 at admission, before verification.
+
+## Native fixed-profile HS256 issuance
+
+`jwt_hs256_issue` emits a compact token with exactly `sub`, `iss`, `aud`, `iat`
+and `exp`, using the fixed `{"alg":"HS256","typ":"JWT"}` protected header.
+It accepts only a 32–4096-byte HMAC key, nonempty valid UTF-8 claim strings,
+positive caller-supplied Unix seconds, and TTL 1–86400 seconds with checked
+expiry addition. NUL and ASCII controls reject; quotes and backslashes are
+escaped. Claims and output are bounded to 8192 and 11004 bytes respectively.
+The API uses existing pinned static SHA-256 HMAC support, writes only to
+caller-owned buffers, retains no views and rejects buffer aliasing. Tests cover
+signature and strict claims round-trip through the existing HS256 decoder,
+string and boundary failures, tampering, and zero request allocations. Rut/JIT
+issuance syntax, arbitrary claim sets and other signing algorithms are not part
+of this native API.
 
 ## Asymmetric key ownership foundation
 

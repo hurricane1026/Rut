@@ -134,6 +134,7 @@ add_library(rut_runtime STATIC
     runtime/http_tokens.cc
     runtime/http_cache.cc
     runtime/rs256_policy.cc
+    runtime/jwt_hs256.cc
     runtime/jwt_rs256.cc
     runtime/jwt_claims.cc
     runtime/arena.cc

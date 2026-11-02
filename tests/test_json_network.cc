@@ -15,6 +15,7 @@
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/jwt_claims.h"
+#include "rut/runtime/jwt_hs256.h"
 #include "test.h"
 #include "test_helpers.h"
 #include <memory>
@@ -886,6 +887,53 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     const std::string oversized_token = b64url(oversized) + ".e30.AA";
     CHECK_FALSE(decode(hs256_key.c_str(), oversized_token.c_str()).first);
 
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(json_network, native_hs256_issue_round_trips_existing_decoder_and_claim_policy) {
+    char key[32];
+    for (char& byte : key) byte = 'k';
+    char token[kMaxJwtHs256TokenBytes];
+    u32 token_len = 0;
+    const Str issuer = lit_str("issuer.example");
+    const Str audience = lit_str("orders");
+    REQUIRE(jwt_hs256_issue({key, sizeof(key)},
+                            lit_str("alice"),
+                            issuer,
+                            audience,
+                            1700000000,
+                            3600,
+                            token,
+                            sizeof(token),
+                            token_len));
+
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 has_value = 0;
+    const char* decoded = nullptr;
+    u32 decoded_len = 0;
+    i64 number = 0;
+    rut_helper_json(nullptr,
+                    &arena,
+                    static_cast<u32>(json::Op::JwtDecodePinned),
+                    token,
+                    token_len,
+                    key,
+                    sizeof(key),
+                    "HS256",
+                    5,
+                    0,
+                    &has_value,
+                    &decoded,
+                    &decoded_len,
+                    &number);
+    REQUIRE(has_value);
+    json::Document claims;
+    CHECK(jwt_claims_valid_with_lifetime(
+        claims, {decoded, decoded_len}, issuer, audience, 1700000000, 3600, 3600));
     arena.destroy();
     pool.destroy();
 }

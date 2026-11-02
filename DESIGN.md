@@ -8923,6 +8923,25 @@ used. Issuer/audience storage must not overlap output or JSON workspace. The
 verifier and workspace remain shard-owned, with no new language surface or
 network access.
 
+### Fixed-profile native HS256 JWT issuance
+
+`jwt_hs256_issue` emits a compact HS256 token for exactly `sub`, `iss`, `aud`,
+`iat` and `exp`, with the fixed `{"alg":"HS256","typ":"JWT"}` protected
+header. The caller supplies a nonempty trusted subject, issuer and audience,
+the current positive Unix second, a TTL from 1 through 86400 seconds, an HMAC
+key from 32 through 4096 bytes, and caller-owned output storage. Addition is
+checked before computing `exp`. The key minimum follows RFC 7518 section 3.2.
+
+Claim strings must be nonempty valid UTF-8; NUL and ASCII controls are rejected,
+while quotes and backslashes are JSON-escaped. The fixed JSON payload is at
+most 8192 bytes and compact output at most 11004 bytes. The issuer writes only
+to caller storage, uses the existing pinned SHA-256 HMAC C ABI, and retains no
+input or output views. Output length is zeroed on failure; output bytes are
+unspecified. Output storage must not overlap the key or claim inputs, and the
+length must not overlap those spans or the output buffer. This native API adds
+no Rut/JIT surface, arbitrary claims support, key identifier, algorithm
+selection, dependency or request allocation.
+
 ### Fixed RS256 public JWK configuration
 
 The native configuration-only `RsaPublicKey::load_rs256_jwk` imports one public
