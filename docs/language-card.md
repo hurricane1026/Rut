@@ -1910,9 +1910,14 @@ NUL and ASCII controls are rejected; quotes and backslashes are escaped.
 Payload and output are bounded to 8192 and 11004 bytes respectively. The
 builtin samples realtime once per request and stores successful output in the
 request-owned JSON arena. The qualified `Crypto.issueJwtHs256` wrapper and
-`auth.jwtForIdentityHs256` helper use the same profile. `Identity` is
-constructible and carries no authentication provenance; call that helper only
-after successful authentication.
+`auth.jwtForIdentityHs256` helper use the same five-claim profile. `Identity`
+is constructible and carries no authentication provenance; call that helper
+only after successful authentication.
+
+The native-only C++ API `jwt_hs256_issue_with_id` adds exactly one caller-
+provided `jti` string under the same bounds and validation rules, using
+caller-owned output and retaining no input or output views. Rut and JIT issuance
+with `jti` remains pending.
 
 ### Static HS JWT secret rotation
 

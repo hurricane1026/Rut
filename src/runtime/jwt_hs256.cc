@@ -60,30 +60,36 @@ bool base64url_encode(const u8* input, u32 input_length, char* output, u32 capac
 
 }  // namespace
 
-bool jwt_hs256_issue(Str key,
-                     Str subject,
-                     Str issuer,
-                     Str audience,
-                     i64 unix_seconds,
-                     i64 ttl_seconds,
-                     char* output,
-                     u32 capacity,
-                     u32& output_len) {
+namespace {
+bool issue(Str key,
+           Str subject,
+           Str issuer,
+           Str audience,
+           Str token_id,
+           bool include_id,
+           i64 unix_seconds,
+           i64 ttl_seconds,
+           char* output,
+           u32 capacity,
+           u32& output_len) {
     output_len = 0;
     if (ranges_overlap(output, capacity, key.ptr, key.len) ||
         ranges_overlap(output, capacity, subject.ptr, subject.len) ||
         ranges_overlap(output, capacity, issuer.ptr, issuer.len) ||
         ranges_overlap(output, capacity, audience.ptr, audience.len) ||
+        (include_id && ranges_overlap(output, capacity, token_id.ptr, token_id.len)) ||
         ranges_overlap(&output_len, sizeof(output_len), output, capacity) ||
         ranges_overlap(&output_len, sizeof(output_len), key.ptr, key.len) ||
         ranges_overlap(&output_len, sizeof(output_len), subject.ptr, subject.len) ||
         ranges_overlap(&output_len, sizeof(output_len), issuer.ptr, issuer.len) ||
-        ranges_overlap(&output_len, sizeof(output_len), audience.ptr, audience.len))
+        ranges_overlap(&output_len, sizeof(output_len), audience.ptr, audience.len) ||
+        (include_id && ranges_overlap(&output_len, sizeof(output_len), token_id.ptr, token_id.len)))
         return false;
     if (!key.ptr || key.len < 32 || key.len > kMaxJwtHs256KeyBytes ||
         !valid_claim_string(subject) || !valid_claim_string(issuer) ||
-        !valid_claim_string(audience) || unix_seconds <= 0 || ttl_seconds <= 0 ||
-        ttl_seconds > 86400 || unix_seconds > 0x7fffffffffffffffLL - ttl_seconds || !output)
+        !valid_claim_string(audience) || (include_id && !valid_claim_string(token_id)) ||
+        unix_seconds <= 0 || ttl_seconds <= 0 || ttl_seconds > 86400 ||
+        unix_seconds > 0x7fffffffffffffffLL - ttl_seconds || !output)
         return false;
 
     char payload[kMaxJwtHs256PayloadBytes];
@@ -94,6 +100,10 @@ bool jwt_hs256_issue(Str key,
     if (!json::quote(issuer, claims)) return false;
     claims.text(lit_str(",\"aud\":"));
     if (!json::quote(audience, claims)) return false;
+    if (include_id) {
+        claims.text(lit_str(",\"jti\":"));
+        if (!json::quote(token_id, claims)) return false;
+    }
     claims.text(lit_str(",\"iat\":"));
     if (!append_positive_integer(claims, unix_seconds)) return false;
     claims.text(lit_str(",\"exp\":"));
@@ -156,6 +166,52 @@ bool jwt_hs256_issue(Str key,
     for (u32 i = 0; i < encoded_mac_length; ++i) output[token_length++] = encoded_mac[i];
     output_len = token_length;
     return true;
+}
+}  // namespace
+
+bool jwt_hs256_issue(Str key,
+                     Str subject,
+                     Str issuer,
+                     Str audience,
+                     i64 unix_seconds,
+                     i64 ttl_seconds,
+                     char* output,
+                     u32 capacity,
+                     u32& output_len) {
+    return issue(key,
+                 subject,
+                 issuer,
+                 audience,
+                 {},
+                 false,
+                 unix_seconds,
+                 ttl_seconds,
+                 output,
+                 capacity,
+                 output_len);
+}
+
+bool jwt_hs256_issue_with_id(Str key,
+                             Str subject,
+                             Str issuer,
+                             Str audience,
+                             Str token_id,
+                             i64 unix_seconds,
+                             i64 ttl_seconds,
+                             char* output,
+                             u32 capacity,
+                             u32& output_len) {
+    return issue(key,
+                 subject,
+                 issuer,
+                 audience,
+                 token_id,
+                 true,
+                 unix_seconds,
+                 ttl_seconds,
+                 output,
+                 capacity,
+                 output_len);
 }
 
 }  // namespace rut
