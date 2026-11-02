@@ -2712,6 +2712,21 @@ new binding remains unavailable in its own failure branch. Native layout and the
 handler ABI are unchanged. See the nested example in
 [terminate mode](docs/websocket-terminate.md).
 
+Direct optional extraction comparisons are also supported in message guards:
+`json.string(value) == "subscribe"`, `json.bool(value) == false`, and
+`json.int(value) == 42`, with `!=`, either operand order, nil comparisons, and
+logical condition composition. Sources are existing validated document or selected
+Json aliases. These leaves reuse the corresponding typed guard accessors and
+retained paths; they consume no separate typed-binding guard. A failed extraction
+is nil, so equality with false requires an actual Boolean false, while inequality
+with false includes nil. Exact signed i64 integer rules, string decoding, parser
+bounds, and earlier parse/presence guard failures are unchanged. The AST records
+parser-generated negation separately from explicit equality with false, preserving
+Optional Bool semantics and rejecting bare optional Bool negation. Direct integer
+ordering, mismatched literal types, call-to-call comparisons and optional method
+calls remain unsupported. Existing alias bindings are still needed for scalar
+ordering, string predicates and rewrites. Native format and helper ABI are unchanged.
+
 `json.numberText(documentOrField)` is a separate typed alias for one JSON Number.
 It exposes the original decimal lexeme as text, preserving negative zero, decimal
 trailing zeros, exponent spelling and arbitrary-size integer digits without a

@@ -936,6 +936,25 @@ return websocket(chat) { message in
 // Four guards and 32 condition nodes remain the limit. Typed scalar aliases cannot
 // be containers, and a binding is unavailable in its own failure branch.
 
+// Compare optional JSON scalar extraction directly, avoiding a typed-binding guard.
+// Sources must be validated document/selected Json aliases. Both operand orders,
+// ==/!= with a matching String/Bool/Int literal or nil, and !/&&/|| are supported.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let payload = json.get(document, "/payload") else { message.close(1008) }
+    guard let field = json.get(payload, "/enabled") else { message.close(1008) }
+    guard json.bool(field) == false else { message.drop() }
+    message.forward()
+}
+// json.string(field) == "subscribe" and json.int(field) == 42 work the same way.
+// Failed extraction is nil: == false requires actual false; != false also matches
+// nil. A parse/missing-field guard still fails first. json.int accepts only exact
+// signed i64 integer tokens; fraction/exponent/overflow is nil. String escapes and
+// comparisons retain the existing byte semantics. ==/!= nil tests extraction success.
+// Bare optional Bool/!json.bool(field), direct integer ordering, mismatched literal
+// types and call-to-call comparisons reject. Unwrap an alias for ordering, string
+// predicates or forwarding. The four-guard / 32-condition-node limits remain.
+
 // Forward one previously guard-unwrapped JSON string alias, optionally with fixed
 // UTF-8 affixes. The value is decoded again only when this rewrite is selected.
 return websocket(chat) { message in

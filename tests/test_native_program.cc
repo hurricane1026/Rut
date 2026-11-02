@@ -830,6 +830,84 @@ route GET "/root-number" { return websocket(backend) { message in
     CHECK(memcmp(root_output + 2, root_expected, sizeof(root_expected) - 1) == 0);
 }
 
+TEST(native_program, websocket_direct_json_scalar_guards_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"
+route GET "/nested" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let parent = json.get(document, "/payload") else { message.drop() }
+ guard let field = json.get(parent, "/enabled") else { message.drop() }
+ guard json.bool(field) == false else { message.drop() }
+ message.forward()
+} }
+route GET "/string" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard json.string(document) == "x\0" else { message.drop() }
+ message.forward()
+} }
+route GET "/int" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard json.int(document) == -9223372036854775808 else { message.drop() }
+ message.forward()
+} }
+route GET "/nil" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard json.int(document) == nil else { message.drop() }
+ message.forward()
+} }
+route GET "/not-false" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard json.bool(document) != false else { message.drop() }
+ message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 5u);
+    struct Case {
+        u32 route;
+        const char* payload;
+        bool accepted;
+    };
+    const Case cases[] = {
+        {0, R"({"payload":{"enabled":false}})", true},
+        {0, R"({"payload":{"enabled":true}})", false},
+        {0, R"({"payload":{"enabled":null}})", false},
+        {0, R"({"payload":{}})", false},
+        {1, R"("x\u0000")", true},
+        {1, R"("x")", false},
+        {1, "null", false},
+        {2, "-9223372036854775808", true},
+        {2, "-9223372036854775809", false},
+        {2, "-9223372036854775808.0", false},
+        {2, "null", false},
+        {3, "null", true},
+        {3, "1.0", true},
+        {3, "9223372036854775808", true},
+        {3, "1", false},
+        {3, "{", false},
+        {4, "true", true},
+        {4, "false", false},
+        {4, "null", true},
+        {4, "0", true},
+    };
+    for (const auto& c : cases) {
+        const auto handler = owner.p->config.routes[c.route].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(c.payload),
+                              strlen(c.payload),
+                              client) ==
+                      (c.accepted ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+    }
+}
+
 TEST(native_program, websocket_json_stringify_recipe_survives_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

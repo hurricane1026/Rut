@@ -121,6 +121,45 @@ def nested_json_exchange(client, peer):
     expect(client, (8, b"\x03\xeb", False))
 
 
+DIRECT_JSON_HANDLER = r"""
+return websocket(ws) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let parent = json.get(document, "/payload") else { message.close(1008) }
+    guard let field = json.get(parent, "/enabled") else { message.close(1008) }
+    guard json.bool(field) == false || json.string(field) == "allow" || json.int(field) == -7 else {
+        message.close(1008)
+    }
+    message.forward()
+}
+"""
+
+
+def direct_json_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"direct JSON scalar guard: {actual=!r}, {expected=!r}")
+
+    payload = b'{"payload":{"enabled":false}}'
+    first = bytearray(masked_frame(1, payload[:14]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, payload[14:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, payload, True))
+    text = b'{"payload":{"enabled":"allow"}}'
+    integer = b'{"payload":{"enabled":-7}}'
+    client.sendall(masked_frame(2, text) + masked_frame(1, integer))
+    expect(peer, (2, text, True))
+    expect(peer, (1, integer, True))
+    peer.sendall(bytes((0x02, 14)) + payload[:14] + b"\x8a\x01p" +
+                 bytes((0x80, len(payload) - 14)) + payload[14:])
+    expect(client, (10, b"p", False))
+    expect(client, (2, payload, False))
+    client.sendall(masked_frame(1, b'{"payload":{"enabled":null}}'))
+    expect(peer, (8, b"\x03\xf0", True))
+    expect(client, (8, b"\x03\xf0", False))
+
+
 def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, exchange=binary_exchange):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-binary-") as temp:
         upstream.bind(("127.0.0.1", 0))
@@ -1069,6 +1108,17 @@ def main():
                 print(f"SKIP {backend}: {details.strip()}")
             else:
                 print(f"PASS {backend} nested JSON projection native={native}")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, DIRECT_JSON_HANDLER, direct_json_exchange)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, DIRECT_JSON_HANDLER, direct_json_exchange)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} direct JSON scalar guards native={native}")
         status, details = subprotocol_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")

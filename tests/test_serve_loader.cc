@@ -4943,6 +4943,138 @@ TEST(serve_loader, attach_ws_terminate_to_jit_is_exact_and_fail_atomic) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_direct_json_scalar_comparisons_preserve_optional_truth_tables) {
+    // Every payload is valid JSON. Failed extraction is nil, not false or zero.
+    const char* payloads[] = {R"("ok")",
+                              R"("bad")",
+                              R"("")",
+                              "true",
+                              "false",
+                              "42",
+                              "-7",
+                              "1.0",
+                              "1e0",
+                              "9223372036854775807",
+                              "9223372036854775808",
+                              "null",
+                              "{}",
+                              "[]",
+                              R"("x\u0000\u20ac")"};
+    constexpr u32 kAll = (1u << 15) - 1;
+    constexpr u32 kStrings = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 14);
+    constexpr u32 kBools = (1u << 3) | (1u << 4);
+    constexpr u32 kInts = (1u << 5) | (1u << 6) | (1u << 9);
+    struct Case {
+        const char* condition;
+        u32 accepted;
+    };
+    const Case cases[] = {
+        {"json.string(document) == \"ok\"", 1u << 0},
+        {"\"ok\" != json.string(document)", kAll ^ (1u << 0)},
+        {"json.string(document) == \"\"", 1u << 2},
+        {"json.string(document) == \"x\\0\\u{20ac}\"", 1u << 14},
+        {"json.string(document) != nil", kStrings},
+        {"nil == json.string(document)", kAll ^ kStrings},
+        {"json.bool(document) == true", 1u << 3},
+        {"json.bool(document) == false", 1u << 4},
+        {"false == json.bool(document)", 1u << 4},
+        {"json.bool(document) != false", kAll ^ (1u << 4)},
+        {"false != json.bool(document)", kAll ^ (1u << 4)},
+        {"!(json.bool(document) == false)", kAll ^ (1u << 4)},
+        {"!(false == json.bool(document))", kAll ^ (1u << 4)},
+        {"!(json.bool(document) != false)", 1u << 4},
+        {"json.bool(document) == nil", kAll ^ kBools},
+        {"nil != json.bool(document)", kBools},
+        {"json.bool(document) != nil && json.bool(document) == false", 1u << 4},
+        {"json.bool(document) == nil || json.bool(document) == false", kAll ^ (1u << 3)},
+        {"json.int(document) == 42", 1u << 5},
+        {"-7 == json.int(document)", 1u << 6},
+        {"json.int(document) != 42", kAll ^ (1u << 5)},
+        {"json.int(document) == 9223372036854775807", 1u << 9},
+        {"json.int(document) == nil", kAll ^ kInts},
+        {"nil != json.int(document)", kInts},
+    };
+    for (const auto& c : cases) {
+        std::string source =
+            "upstream ws at \"127.0.0.1:9999\"\n"
+            "route GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.close(1007) }\nguard ";
+        source += c.condition;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        const auto path = write_file("/tmp/rut_ws_scalar_comparison", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (u32 i = 0; i < 15; ++i) {
+            for (bool from_client : {false, true}) {
+                for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+                    CHECK(handler(nullptr,
+                                  opcode,
+                                  reinterpret_cast<const u8*>(payloads[i]),
+                                  strlen(payloads[i]),
+                                  from_client) == ((c.accepted & (1u << i)) ? WsFrameAction::Forward
+                                                                            : WsFrameAction::Drop));
+                }
+            }
+        }
+        for (const char* malformed : {"{", "{}x", "{\"a\":1,\"a\":2}"}) {
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(malformed),
+                          strlen(malformed),
+                          true) == WsFrameAction::ClosePolicy0);
+        }
+        const std::string oversized = "\"" + std::string(8192, 'x') + "\"";
+        CHECK(handler(nullptr,
+                      WsOpcode::Binary,
+                      reinterpret_cast<const u8*>(oversized.data()),
+                      oversized.size(),
+                      false) == WsFrameAction::ClosePolicy0);
+        program.destroy();
+    }
+}
+
+TEST(serve_loader, websocket_direct_scalar_guards_use_nested_values_without_extra_bindings) {
+    const auto path = write_file("/tmp/rut_ws_nested_scalar", "app.rut", R"rut(
+upstream ws at "127.0.0.1:9999"
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let parent = json.get(document, "/a~1b") else { message.close(1008) }
+ guard let field = json.get(parent, "/~0/0") else { message.close(1008) }
+ guard !message.fromClient || (json.bool(field) != nil && json.bool(field) == false)
+       || json.string(field) == "subscribe" || json.int(field) == -7 else { message.drop() }
+ message.forward()
+} })rut");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    for (const char* value : {"false", "true", "null", "\"subscribe\"", "-7", "-7.0", "{}"}) {
+        const std::string payload = std::string("{\"a/b\":{\"~\":[") + value + "]}}";
+        const bool accepted = strcmp(value, "false") == 0 || strcmp(value, "-7") == 0 ||
+                              strcmp(value, "\"subscribe\"") == 0;
+        for (bool from_client : {false, true}) {
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(payload.data()),
+                          payload.size(),
+                          from_client) ==
+                  (!from_client || accepted ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+    }
+    // An absent child is handled by its presence guard before optional inequality.
+    const char* missing = R"({"a/b":{"~":[]}})";
+    CHECK(handler(nullptr,
+                  WsOpcode::Text,
+                  reinterpret_cast<const u8*>(missing),
+                  strlen(missing),
+                  false) == WsFrameAction::ClosePolicy2);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_nested_json_lookup_preserves_relative_pointer_semantics) {
     struct Case {
         const char* parent;

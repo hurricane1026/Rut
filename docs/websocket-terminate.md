@@ -226,6 +226,38 @@ the complete bounded message and retain no selected node or borrowed view betwee
 calls. The existing four source guards and 32 condition nodes remain the limit;
 no native format or handler ABI change is required.
 
+### Direct optional scalar comparisons
+
+`json.string(value)`, `json.bool(value)` and `json.int(value)` can appear directly
+in message guard comparisons. The argument must be a previously validated document
+or a guard-unwrapped selected Json value. Use `==` or `!=` with a literal of the
+matching type, or with `nil`; either operand order and the existing `!`, `&&`, `||`
+condition forms are supported. This avoids a separate typed-binding guard:
+
+```swift
+guard let document = json.parse(message.text) else { message.close(1007) }
+guard let payload = json.get(document, "/payload") else { message.close(1008) }
+guard let field = json.get(payload, "/enabled") else { message.close(1008) }
+guard json.bool(field) == false else { message.drop() }
+message.forward()
+```
+
+A failed extraction is nil. Thus `json.bool(field) == false` matches only a JSON
+Boolean false; JSON null and other kinds do not match. `json.bool(field) != false`
+also matches nil, as ordinary optional inequality does. `json.string(field) != nil`
+checks the JSON kind without retaining a decoded string. `json.int(field) == 42`
+compares only exact signed 64-bit integer tokens; fractional/exponent forms and
+overflow yield nil. Earlier parse and field-presence guards still run first.
+
+String literals use the same escape decoding and byte comparisons as typed
+string aliases. Integer literals must fit signed i64. Calls cannot be compared to
+other calls, variables, or mismatched literals, and direct optional integer
+ordering (`<`, `<=`, `>`, `>=`) remains unsupported. Unwrap an Int alias for
+ordering, or a String alias for string predicates and forwarding. Bare optional
+Bool calls and `!json.bool(value)` are rejected. All direct comparisons reuse
+existing guard accessors, condition-node limits, runtime workspaces and native
+helper symbols; they do not materialize values or change the native format.
+
 A successfully unwrapped string alias may also be the sole dynamic source of a
 `message.forward(...)` replacement, with fixed UTF-8 literals or route constants
 as prefix and suffix:

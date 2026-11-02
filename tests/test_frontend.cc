@@ -5817,6 +5817,135 @@ TEST(frontend, websocket_nested_json_paths_keep_bounds_types_and_scope) {
     }
 }
 
+TEST(frontend, websocket_json_scalar_calls_compare_with_literals_and_nil) {
+    struct Case {
+        const char* condition;
+        WsLenGuard::Accessor accessor;
+        bool negate;
+        i64 bound;
+    };
+    using A = WsLenGuard::Accessor;
+    const Case cases[] = {
+        {"json.string(field) == \"ok\"", A::JsonStringEqual, false, 0},
+        {"\"ok\" != json.string(field)", A::JsonStringEqual, true, 0},
+        {"json.string(field) != nil", A::JsonStringValid, false, 0},
+        {"nil == json.string(field)", A::JsonStringValid, true, 0},
+        {"json.bool(field) == false", A::JsonBoolEqual, false, 0},
+        {"false == json.bool(field)", A::JsonBoolEqual, false, 0},
+        {"json.bool(field) == true", A::JsonBoolEqual, false, 1},
+        {"false != json.bool(field)", A::JsonBoolEqual, true, 0},
+        {"!(json.bool(field) == false)", A::JsonBoolEqual, true, 0},
+        {"json.bool(field) != nil", A::JsonBoolValid, false, 0},
+        {"json.bool(field) == nil", A::JsonBoolValid, true, 0},
+        {"json.int(field) == -9223372036854775808",
+         A::JsonIntCompare,
+         false,
+         (-9223372036854775807LL - 1)},
+        {"9223372036854775807 != json.int(field)", A::JsonIntCompare, true, 9223372036854775807LL},
+        {"nil != json.int(field)", A::JsonIntValid, false, 0},
+        {"json.int(field) == nil", A::JsonIntValid, true, 0},
+    };
+    for (const auto& c : cases) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.drop() }\n"
+            "guard let parent = json.get(document, \"/payload\") else { message.drop() }\n"
+            "guard let field = json.get(parent, \"/value\") else { message.drop() }\nguard ";
+        source += c.condition;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& nodes = hir->routes[0].ws_handler.len_guards;
+        REQUIRE_EQ(nodes.len, 4u);
+        CHECK_EQ(nodes[3].accessor, c.accessor);
+        CHECK_EQ(nodes[3].negate, c.negate);
+        CHECK(nodes[3].pattern.eq(lit("/payload/value")));
+        if (c.accessor == A::JsonIntCompare) {
+            CHECK_EQ(nodes[3].int_bound, c.bound);
+            CHECK_EQ(nodes[3].cmp, WsLenGuard::Cmp::Eq);
+        } else if (c.accessor == A::JsonBoolEqual) {
+            CHECK_EQ(nodes[3].bound, static_cast<u32>(c.bound));
+        } else if (c.accessor == A::JsonStringEqual) {
+            CHECK(nodes[3].value.eq(lit("ok")));
+        }
+    }
+}
+
+TEST(frontend, websocket_json_scalar_calls_keep_optional_types_and_scope) {
+    for (const char* condition : {"json.bool(field)",
+                                  "!json.bool(field)",
+                                  "!!json.bool(field)",
+                                  "!json.bool(field) == false",
+                                  "json.bool(field) && true",
+                                  "json.bool(field) == 0",
+                                  "json.string(field) == false",
+                                  "json.string(field) == 42",
+                                  "json.int(field) == true",
+                                  "json.int(field) == \"42\"",
+                                  "json.int(field) < 42",
+                                  "json.int(field) >= 42",
+                                  "json.int(field) == json.int(field)",
+                                  "json.string(field).hasPrefix(\"x\")",
+                                  "json.string(field).isEmpty",
+                                  "json.string(field, 1) == \"x\"",
+                                  "json.bool(other) == false",
+                                  "json.string(json.get(document, \"/x\")) != nil",
+                                  "json.bool(message.text) == true",
+                                  "json.int(typed) == 1"}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.drop() }\n"
+            "guard let field = json.get(document, \"/value\") else { message.drop() }\nguard ";
+        source += condition;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let text = json.string(document) else { message.drop() }
+ guard json.string(text) != nil else { message.drop() }
+ message.forward()
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, parser_retains_negation_origin_for_optional_bool_comparisons) {
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard json.bool(document) == false else { message.drop() }
+ guard !(json.bool(document) == false) else { message.drop() }
+ guard json.bool(document) != false else { message.drop() }
+ message.forward()
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto& block = *ast->items[1].route.statements[0]->then_stmt;
+    CHECK_FALSE(block.block_stmts[1]->expr.is_synthesized_negation);
+    CHECK(block.block_stmts[2]->expr.is_synthesized_negation);
+    CHECK(block.block_stmts[3]->expr.is_synthesized_negation);
+    CHECK_FALSE(block.block_stmts[2]->expr.lhs->is_synthesized_negation);
+    auto copy = std::make_unique<AstFile>(ast.value());
+    const auto& copied = *copy->items[1].route.statements[0]->then_stmt;
+    CHECK_FALSE(copied.block_stmts[1]->expr.is_synthesized_negation);
+    CHECK(copied.block_stmts[2]->expr.is_synthesized_negation);
+}
+
 TEST(frontend, websocket_json_string_aliases_are_typed_and_bounded) {
     const char* source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { message in
