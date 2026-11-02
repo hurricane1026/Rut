@@ -43,6 +43,7 @@ enum class Op : u8 {
     JwtDecodePinned,
     JwtVerifyRs256,
     JwtHasGroup,
+    JwtIssueHs256,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

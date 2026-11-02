@@ -1772,6 +1772,76 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::JsonOp: {
+            if (static_cast<json::Op>(inst.imm.i32_val) == json::Op::JwtIssueHs256) {
+                LLVMValueRef output_has = LLVMBuildAlloca(c.builder, c.i8_ty, "jwt.issue.has");
+                LLVMValueRef output_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "jwt.issue.ptr");
+                LLVMValueRef output_len = LLVMBuildAlloca(c.builder, c.i32_ty, "jwt.issue.len");
+                LLVMTypeRef params[] = {c.ptr_ty,
+                                        c.ptr_ty,
+                                        c.ptr_ty,
+                                        c.i32_ty,
+                                        c.ptr_ty,
+                                        c.i32_ty,
+                                        c.ptr_ty,
+                                        c.i32_ty,
+                                        c.ptr_ty,
+                                        c.i32_ty,
+                                        c.i32_ty,
+                                        c.ptr_ty,
+                                        c.ptr_ty,
+                                        c.ptr_ty};
+                LLVMTypeRef type = LLVMFunctionType(c.void_ty, params, 14, 0);
+                LLVMValueRef helper =
+                    LLVMGetNamedFunction(c.llvm_mod, "rut_helper_jwt_issue_hs256");
+                if (!helper)
+                    helper = LLVMAddFunction(c.llvm_mod, "rut_helper_jwt_issue_hs256", type);
+                LLVMValueRef args[14] = {c.param_conn,
+                                         c.param_arena,
+                                         LLVMConstNull(c.ptr_ty),
+                                         LLVMConstInt(c.i32_ty, 0, 0),
+                                         LLVMConstNull(c.ptr_ty),
+                                         LLVMConstInt(c.i32_ty, 0, 0),
+                                         LLVMConstNull(c.ptr_ty),
+                                         LLVMConstInt(c.i32_ty, 0, 0),
+                                         LLVMConstNull(c.ptr_ty),
+                                         LLVMConstInt(c.i32_ty, 0, 0),
+                                         LLVMConstInt(c.i32_ty, 0, 0),
+                                         output_has,
+                                         output_ptr,
+                                         output_len};
+                for (u32 i = 0; i < 5; ++i) {
+                    LLVMValueRef value = c.get_value(inst.operand(i));
+                    if (i < 4) {
+                        args[2 + i * 2] = LLVMBuildExtractValue(c.builder, value, 0, "jwt.arg.ptr");
+                        args[3 + i * 2] = LLVMBuildExtractValue(c.builder, value, 1, "jwt.arg.len");
+                    } else {
+                        args[10] = value;
+                    }
+                }
+                LLVMBuildCall2(c.builder, type, helper, args, 14, "");
+                LLVMValueRef result =
+                    LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+                result =
+                    LLVMBuildInsertValue(c.builder,
+                                         result,
+                                         LLVMBuildLoad2(c.builder, c.i8_ty, output_has, "jwt.has"),
+                                         0,
+                                         "");
+                result =
+                    LLVMBuildInsertValue(c.builder,
+                                         result,
+                                         LLVMBuildLoad2(c.builder, c.ptr_ty, output_ptr, "jwt.ptr"),
+                                         1,
+                                         "");
+                result =
+                    LLVMBuildInsertValue(c.builder,
+                                         result,
+                                         LLVMBuildLoad2(c.builder, c.i32_ty, output_len, "jwt.len"),
+                                         2,
+                                         "");
+                c.set_value(inst.result, result);
+                break;
+            }
             LLVMTypeRef params[] = {c.ptr_ty,
                                     c.ptr_ty,
                                     c.i32_ty,
@@ -2809,6 +2879,29 @@ CodegenResult codegen(const rir::Module& rir_mod) {
             if (block.inst_count > 0 && block.insts == nullptr) return {nullptr, nullptr, false};
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
+                if (inst.op == rir::Opcode::JsonOp &&
+                    static_cast<json::Op>(inst.imm.i32_val) == json::Op::JwtIssueHs256) {
+                    if (inst.operand_count != 5 || inst.extra_operands == nullptr ||
+                        inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
+                        fn.values == nullptr)
+                        return {nullptr, nullptr, false};
+                    const rir::Type* result = fn.values[inst.result.id].type;
+                    if (result == nullptr || result->kind != rir::TypeKind::Optional ||
+                        result->inner == nullptr || result->inner->kind != rir::TypeKind::Str ||
+                        result->inner->inner != nullptr || result->struct_def != nullptr ||
+                        result->inner->struct_def != nullptr)
+                        return {nullptr, nullptr, false};
+                    for (u32 oi = 0; oi < 5; ++oi) {
+                        const rir::ValueId id = inst.operand(oi);
+                        if (id == rir::kNoValue || id.id >= fn.value_count)
+                            return {nullptr, nullptr, false};
+                        const rir::Type* type = fn.values[id.id].type;
+                        const auto expected = oi == 4 ? rir::TypeKind::I32 : rir::TypeKind::Str;
+                        if (type == nullptr || type->kind != expected || type->inner != nullptr ||
+                            type->struct_def != nullptr)
+                            return {nullptr, nullptr, false};
+                    }
+                }
                 if (inst.op != rir::Opcode::JwtClaimsValidWithLifetime) continue;
                 if (inst.operand_count != 5 || inst.extra_operands == nullptr ||
                     inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||

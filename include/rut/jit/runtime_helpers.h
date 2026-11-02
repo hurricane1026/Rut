@@ -160,6 +160,20 @@ void rut_helper_hash_publish(void* conn,
                              rut::u8* has_value,
                              const char** out_ptr,
                              rut::u32* out_len);
+void rut_helper_jwt_issue_hs256(void* conn,
+                                void* arena,
+                                const char* subject,
+                                rut::u32 subject_len,
+                                const char* issuer,
+                                rut::u32 issuer_len,
+                                const char* audience,
+                                rut::u32 audience_len,
+                                const char* key,
+                                rut::u32 key_len,
+                                rut::i32 ttl_seconds,
+                                rut::u8* has_value,
+                                const char** out_ptr,
+                                rut::u32* out_len);
 void rut_helper_uuid(
     void* conn, void* arena, rut::u8* has_value, const char** out_ptr, rut::u32* out_len);
 
