@@ -1,0 +1,25 @@
+import "middleware/auth.rut"
+
+listen :8080
+
+// JWT signing is checked before the claims lifetime policy. The same policy
+// applies to verified HS256 and RS256 claims.
+route GET "/orders/hs256" {
+    let verified = auth.jwtDocumentHs256(
+        req.authorization.or(""), env("JWT_LIFETIME_HS256_SECRET"))
+    let identity = auth.jwtIdentityWithLifetime(
+        verified, "https://issuer.example", "orders", "orders-hs256",
+        3600, 86400)
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
+
+route GET "/orders/rs256" {
+    let verified = auth.jwtDocumentRs256(
+        req.authorization.or(""), env("JWT_LIFETIME_RS256_POLICY"))
+    let identity = auth.jwtIdentityWithLifetime(
+        verified, "https://issuer.example", "orders", "orders-rs256",
+        3600, 86400)
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}

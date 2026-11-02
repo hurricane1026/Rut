@@ -817,6 +817,27 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_jwt_claims_valid_with_lifetime(ValueId claims,
+                                                        ValueId issuer,
+                                                        ValueId audience,
+                                                        ValueId max_age,
+                                                        ValueId max_lifetime,
+                                                        SourceLoc loc = {}) {
+        if (!val_has_type(claims, TypeKind::Str) || !val_has_type(issuer, TypeKind::Str) ||
+            !val_has_type(audience, TypeKind::Str) || !val_has_type(max_age, TypeKind::I64) ||
+            !val_has_type(max_lifetime, TypeKind::I64))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::JwtClaimsValidWithLifetime, ty, loc));
+        const ValueId kOperands[] = {claims, issuer, audience, max_age, max_lifetime};
+        auto stored = set_operands(inst, kOperands, 5);
+        if (!stored) {
+            rollback_emit({inst, vid});
+            return err(stored.error());
+        }
+        return vid;
+    }
+
     Result<ValueId> emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
             return err(RirError::InvalidState);

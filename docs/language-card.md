@@ -1628,12 +1628,26 @@ example first calls `auth.jwtDocument(authorization, secret)`, which composes
 Then it calls the separate identity helper. Existing HS256/384/512 support is unchanged.
 See [examples/jwt-claims-auth.rut](../examples/jwt-claims-auth.rut).
 
-The native-only `jwt_claims_valid_with_lifetime` API additionally requires a
+`jwtClaimsValidWithLifetime(claims, issuer, audience, maxAge, maxLifetime) -> bool`
+adds mandatory positive integer `iat`, `iat <= now < exp`, and inclusive maximum
+token-age and token-lifetime limits. The builtin takes nonoptional `i64` seconds
+and can use dynamic `i64` values; convert an `i32` explicitly with `i64(value)`.
+The helper samples CLOCK_REALTIME once and fails closed on an
+invalid clock or claims. It has the same strict issuer, audience, and expiry
+profile described above. The middleware
+`auth.jwtIdentityWithLifetime(verifiedClaims, issuer, audience, credentialId,
+maxAge, maxLifetime)` takes positive `i32` configuration limits, applies the
+policy to signature-verified JSON, decodes
+the typed subject and returns `Identity` with method `"jwt"`; invalid config
+returns 503 and invalid claims return 401 with Bearer `invalid_token`.
+As with `auth.jwtIdentity`, verify the signature first and pass only that
+verified document. See [examples/jwt-lifetime-auth.rut](../examples/jwt-lifetime-auth.rut).
+
+The native `jwt_claims_valid_with_lifetime` API additionally requires a
 positive integer `iat`, `iat <= now < exp`, and inclusive maximum token-age and
 token-lifetime limits. This is a stricter Rut policy choice; [RFC 7519 §4.1.6](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.6)
 does not make `iat` mandatory or define these bounds for every JWT. The helper
-checks claims only and does not verify signatures. No Rut-language surface is
-available for this policy yet.
+checks claims only and does not verify signatures.
 
 `auth.requireUnrevokedJwt(document, first, second)` rejects a verified JWT with
 an absent, non-string or empty `jti`, or an exact case-sensitive match to either

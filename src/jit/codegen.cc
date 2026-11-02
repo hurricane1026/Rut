@@ -115,6 +115,7 @@ struct Ctx {
     LLVMValueRef fn_hmac_sha256_matches;
     LLVMValueRef fn_standard_webhook_valid;
     LLVMValueRef fn_signed_request_valid;
+    LLVMValueRef fn_jwt_claims_valid_with_lifetime;
     LLVMValueRef fn_str_constant_time_equal;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
@@ -638,6 +639,15 @@ struct Ctx {
                 LLVMAddFunction(llvm_mod, "rut_helper_signed_request_valid", ft);
         }
         return fn_signed_request_valid;
+    }
+    LLVMValueRef get_jwt_claims_valid_with_lifetime() {
+        if (!fn_jwt_claims_valid_with_lifetime) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, i64_ty, i64_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 8, 0);
+            fn_jwt_claims_valid_with_lifetime =
+                LLVMAddFunction(llvm_mod, "rut_helper_jwt_claims_valid_with_lifetime", ft);
+        }
+        return fn_jwt_claims_valid_with_lifetime;
     }
     LLVMValueRef get_basic_matches() {
         if (!fn_basic_matches) {
@@ -1538,6 +1548,25 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                                       result,
                                       LLVMConstInt(c.i8_ty, 0, 0),
                                       "signed_request.bool"));
+            break;
+        }
+        case rir::Opcode::JwtClaimsValidWithLifetime: {
+            LLVMValueRef args[8];
+            for (u32 i = 0; i < 3; ++i) {
+                LLVMValueRef value = c.get_value(inst.operand(i));
+                const size_t kArgIndex = static_cast<size_t>(i) * 2;
+                args[kArgIndex] = LLVMBuildExtractValue(c.builder, value, 0, "jwt.claims.ptr");
+                args[kArgIndex + 1] = LLVMBuildExtractValue(c.builder, value, 1, "jwt.claims.len");
+            }
+            args[6] = c.get_value(inst.operand(3));
+            args[7] = c.get_value(inst.operand(4));
+            LLVMValueRef fn = c.get_jwt_claims_valid_with_lifetime();
+            LLVMValueRef result =
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 8, "jwt.age");
+            c.set_value(
+                inst.result,
+                LLVMBuildICmp(
+                    c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "jwt.age.bool"));
             break;
         }
         // ── String operations ──
@@ -2769,6 +2798,38 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 // ── Module Codegen ─────────────────────────────────────────────────
 
 CodegenResult codegen(const rir::Module& rir_mod) {
+    // This variadic RIR operation is emitted by the trusted builder, but keep
+    // direct/malformed module callers from indexing beyond its operand list.
+    if (rir_mod.func_count > 0 && rir_mod.functions == nullptr) return {nullptr, nullptr, false};
+    for (u32 fi = 0; fi < rir_mod.func_count; ++fi) {
+        const rir::Function& fn = rir_mod.functions[fi];
+        if (fn.block_count > 0 && fn.blocks == nullptr) return {nullptr, nullptr, false};
+        for (u32 bi = 0; bi < fn.block_count; ++bi) {
+            const rir::Block& block = fn.blocks[bi];
+            if (block.inst_count > 0 && block.insts == nullptr) return {nullptr, nullptr, false};
+            for (u32 ii = 0; ii < block.inst_count; ++ii) {
+                const rir::Instruction& inst = block.insts[ii];
+                if (inst.op != rir::Opcode::JwtClaimsValidWithLifetime) continue;
+                if (inst.operand_count != 5 || inst.extra_operands == nullptr ||
+                    inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
+                    fn.values == nullptr || fn.values[inst.result.id].type == nullptr ||
+                    fn.values[inst.result.id].type->kind != rir::TypeKind::Bool)
+                    return {nullptr, nullptr, false};
+                constexpr rir::TypeKind kOperandTypes[] = {rir::TypeKind::Str,
+                                                           rir::TypeKind::Str,
+                                                           rir::TypeKind::Str,
+                                                           rir::TypeKind::I64,
+                                                           rir::TypeKind::I64};
+                for (u32 oi = 0; oi < 5; ++oi) {
+                    const rir::ValueId kId = inst.operand(oi);
+                    if (kId == rir::kNoValue || kId.id >= fn.value_count ||
+                        fn.values[kId.id].type == nullptr ||
+                        fn.values[kId.id].type->kind != kOperandTypes[oi])
+                        return {nullptr, nullptr, false};
+                }
+            }
+        }
+    }
     static std::atomic<u32> next_regex_module_id{1};
     Ctx c{};
     c.llvm_ctx = LLVMContextCreate();
@@ -2803,6 +2864,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_hmac_sha256_matches = nullptr;
     c.fn_standard_webhook_valid = nullptr;
     c.fn_signed_request_valid = nullptr;
+    c.fn_jwt_claims_valid_with_lifetime = nullptr;
     c.fn_str_constant_time_equal = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
