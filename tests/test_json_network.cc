@@ -1023,31 +1023,47 @@ TEST(json_network, hs256_issue_helper_uses_request_arena_and_fails_closed_on_bud
 }
 
 TEST(json_network, issued_jwt_body_survives_http1_and_http2_send_paths) {
-    constexpr char kSource[] = R"rut(
+    constexpr char kIssueSource[] = R"rut(
+import "middleware/auth.rut"
 route GET "/issue" {
-    guard let token = jwtIssueHs256("alice", "issuer", "orders", "01234567890123456789012345678901", 60) else { return response(503) }
+    let identity = auth.apiKey(req.authorization.or(""), "issue-secret", "alice", "api-key")
+    let requestId = uuid()
+    guard let tokenId = requestId else { return response(503) }
+    guard let token = auth.jwtForIdentityHs256WithId(
+        identity, "issuer", "orders", tokenId, "01234567890123456789012345678901", 900) else {
+        return response(503)
+    }
     return response(200, body: token)
 }
+)rut";
+    constexpr char kValidateSource[] = R"rut(
+import "middleware/auth.rut"
 route POST "/validate" {
-    guard let token = bearerToken(req.authorization.or("")) else { return 401 }
-    guard let claims = jwtDecode(token, "01234567890123456789012345678901", "HS256") else { return 401 }
-    guard jwtClaimsValid(claims, "issuer", "orders") else { return 401 }
+    let claims = auth.jwtDocumentHs256(req.authorization.or(""), "01234567890123456789012345678901")
+    guard jwtClaimsValidWithLifetime(claims, "issuer", "orders", i64(900), i64(900)) else { return 401 }
+    let checked = auth.requireUnrevokedJwt(claims, "revoked-token-1", "revoked-token-2")
     return 204
 }
 )rut";
     JsonProgram program;
-    REQUIRE(program.init(kSource));
-    const auto verify_token = [&](Str token, SliceArena& arena) {
+    JsonProgram validation_program;
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/jwt-issue-auth.rut";
+    REQUIRE(program.init(kIssueSource, source_path.c_str()));
+    REQUIRE(validation_program.init(kValidateSource, source_path.c_str()));
+    const auto verify_token = [&](Str token, SliceArena& arena, u16 expected_status) {
+        arena.reset();
         const std::string request = std::string("POST /validate HTTP/1.1\r\nHost: test\r\n") +
                                     "Authorization: Bearer " + std::string(token.ptr, token.len) +
                                     "\r\n\r\n";
         const auto result = jit::HandlerResult::unpack(
-            program.handler(1)(nullptr,
-                               nullptr,
-                               reinterpret_cast<const u8*>(request.data()),
-                               static_cast<u32>(request.size()),
-                               &arena));
-        CHECK_EQ(result.status_code, 204u);
+            validation_program.handler()(nullptr,
+                                         nullptr,
+                                         reinterpret_cast<const u8*>(request.data()),
+                                         static_cast<u32>(request.size()),
+                                         &arena));
+        CHECK_EQ(result.status_code, expected_status);
     };
 
     SmallLoop loop;
@@ -1057,7 +1073,8 @@ route POST "/validate" {
     auto* conn = loop.alloc_conn();
     REQUIRE(conn);
     conn->json_arena.backend.pool = &pool;
-    const char request[] = "GET /issue HTTP/1.1\r\nHost: test\r\n\r\n";
+    const char request[] =
+        "GET /issue HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer issue-secret\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
                sizeof(request) - 1);
     capture_request_metadata(*conn);
@@ -1082,7 +1099,40 @@ route POST "/validate" {
     CHECK(h1_token.len > 100u);
     SliceArena verify_arena;
     REQUIRE(verify_arena.init(&pool));
-    verify_token(h1_token, verify_arena);
+    verify_token(h1_token, verify_arena, 204);
+
+    char signing_key[32];
+    const char kSigningKey[] = "01234567890123456789012345678901";
+    for (u32 i = 0; i < sizeof(signing_key); ++i) signing_key[i] = kSigningKey[i];
+    struct timespec now{};
+    REQUIRE_EQ(clock_gettime(CLOCK_REALTIME, &now), 0);
+    char legacy_token[kMaxJwtHs256TokenBytes];
+    u32 legacy_token_len = 0;
+    REQUIRE(jwt_hs256_issue({signing_key, sizeof(signing_key)},
+                            lit_str("alice"),
+                            lit_str("issuer"),
+                            lit_str("orders"),
+                            static_cast<i64>(now.tv_sec),
+                            60,
+                            legacy_token,
+                            sizeof(legacy_token),
+                            legacy_token_len));
+    verify_token({legacy_token, legacy_token_len}, verify_arena, 401);
+    for (Str revoked_id : {lit_str("revoked-token-1"), lit_str("revoked-token-2")}) {
+        char revoked_token[kMaxJwtHs256TokenBytes];
+        u32 revoked_token_len = 0;
+        REQUIRE(jwt_hs256_issue_with_id({signing_key, sizeof(signing_key)},
+                                        lit_str("alice"),
+                                        lit_str("issuer"),
+                                        lit_str("orders"),
+                                        revoked_id,
+                                        static_cast<i64>(now.tv_sec),
+                                        60,
+                                        revoked_token,
+                                        sizeof(revoked_token),
+                                        revoked_token_len));
+        verify_token({revoked_token, revoked_token_len}, verify_arena, 401);
+    }
     verify_arena.destroy();
 
     REQUIRE(conn->json_arena.init(&pool));
@@ -1132,10 +1182,93 @@ route POST "/validate" {
     }
     CHECK_EQ(h2_token_len, expected_h2_token_len);
     REQUIRE(verify_arena.init(&pool));
-    verify_token({h2_token.get(), h2_token_len}, verify_arena);
+    verify_token({h2_token.get(), h2_token_len}, verify_arena, 204);
     verify_arena.destroy();
     conn->h2 = nullptr;
     loop.free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, hs256_issue_with_id_helper_uses_request_arena_and_fails_closed) {
+    SlicePool pool;
+    REQUIRE(pool.init(24));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char key[32];
+    for (char& byte : key) byte = 'k';
+    u8 has_value = 9;
+    const char* output = reinterpret_cast<const char*>(1);
+    u32 output_len = 99;
+    rut_helper_jwt_issue_hs256_with_id(nullptr,
+                                       &arena,
+                                       "alice",
+                                       5,
+                                       "issuer",
+                                       6,
+                                       "orders",
+                                       6,
+                                       "request-42",
+                                       10,
+                                       key,
+                                       sizeof(key),
+                                       60,
+                                       &has_value,
+                                       &output,
+                                       &output_len);
+    REQUIRE(has_value);
+    REQUIRE(output != nullptr);
+    CHECK_GT(output_len, 100u);
+    CHECK(reinterpret_cast<uintptr_t>(output) >= reinterpret_cast<uintptr_t>(pool.base));
+    CHECK(reinterpret_cast<uintptr_t>(output) <
+          reinterpret_cast<uintptr_t>(pool.base) +
+              static_cast<u64>(pool.count) * SlicePool::kSliceSize);
+
+    arena.reset();
+    has_value = 9;
+    output = reinterpret_cast<const char*>(1);
+    output_len = 99;
+    rut_helper_jwt_issue_hs256_with_id(nullptr,
+                                       &arena,
+                                       "alice",
+                                       5,
+                                       "issuer",
+                                       6,
+                                       "orders",
+                                       6,
+                                       "",
+                                       0,
+                                       key,
+                                       sizeof(key),
+                                       60,
+                                       &has_value,
+                                       &output,
+                                       &output_len);
+    CHECK_EQ(has_value, 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(output_len, 0u);
+
+    arena.reset();
+    while (arena.space_used() <= kHashRequestBudget) REQUIRE(arena.alloc(15 * 1024) != nullptr);
+    rut_helper_jwt_issue_hs256_with_id(nullptr,
+                                       &arena,
+                                       "alice",
+                                       5,
+                                       "issuer",
+                                       6,
+                                       "orders",
+                                       6,
+                                       "request-42",
+                                       10,
+                                       key,
+                                       sizeof(key),
+                                       60,
+                                       &has_value,
+                                       &output,
+                                       &output_len);
+    CHECK_EQ(has_value, 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(output_len, 0u);
+    arena.destroy();
     pool.destroy();
 }
 

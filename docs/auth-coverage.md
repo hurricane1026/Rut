@@ -20,7 +20,7 @@ whether a competing open-source edition includes them.
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
-| JWT signing / re-signing | Pending | Trusted claim mapping, fixed algorithm, protected private keys, bounded lifetime and rotation |
+| JWT signing / re-signing | Fixed-profile five-claim HS256 issuance through native and Rut/JIT APIs; six-claim `jti` variant through native and Rut/JIT; static two-ID revocation helper | General token re-signing, arbitrary claims, non-HS256 signing, live or durable revocation |
 | Forward auth / OPA | Pending | Consume bounded external response, identity allowlist, strip spoofed identity, deny vs unavailable, timeout/cancellation/close in both backends |
 | OAuth2 introspection | Pending | RFC 7662 active/expiry/audience checks, authenticated TLS endpoint, bounded cache, invalidation and fail-closed outage policy |
 | OIDC login / session | Pending | Discovery validation, authorization-code + PKCE, state/nonce, redirect validation, ID-token verification, secure cookies, logout and refresh |
@@ -441,15 +441,20 @@ escaped. Claims and output are bounded to 8192 and 11004 bytes respectively.
 The native APIs use existing pinned static SHA-256 HMAC support, write only to
 caller-owned buffers, retain no views and reject buffer aliasing. The native
 `jwt_hs256_issue_with_id` adds exactly one caller-supplied `jti` string under
-the same validation and size bounds; ID uniqueness remains the caller’s
-responsibility. The Rut/JIT five-claim builtin samples realtime once and stores
-a successful token in the request JSON arena; failure returns nil.
+the same validation and size bounds; the caller is responsible for ID
+uniqueness. The Rut/JIT five-claim builtin samples realtime once and stores a
+successful token in the request JSON arena; failure returns nil.
 `Crypto.issueJwtHs256` is its qualified wrapper. `auth.jwtForIdentityHs256`
 uses `identity.consumerId` as `sub`, but Identity values carry no authentication
-provenance, so call it only after successful authentication. Tests cover strict
-claims round-trip, failures, tampering, zero allocations and JIT request-arena
-ownership. Rut/JIT issuance with `jti`, arbitrary claim sets and other signing
-algorithms are not part of this API.
+provenance, so call it only after successful authentication.
+
+The Rut/JIT `jwtIssueHs256WithId` and `Crypto.issueJwtHs256WithId` variant adds
+one caller-supplied `jti` string; `auth.jwtForIdentityHs256WithId` provides the
+same identity-based subject convenience. Issuance does not guarantee
+uniqueness or prevent replay. `auth.requireUnrevokedJwt` checks only its
+configured static two-ID snapshot. Tests cover strict claims round-trip,
+failures, tampering, zero allocations, and JIT request-arena ownership.
+Arbitrary claims and other signing algorithms are not supported.
 
 ## Asymmetric key ownership foundation
 

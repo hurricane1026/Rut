@@ -7,8 +7,11 @@ listen :8080
 route POST "/token" {
     let identity = auth.apiKey(
         req.authorization.or(""), env("API_KEY"), env("CONSUMER_ID"), "api-key")
-    guard let token = auth.jwtForIdentityHs256(
-        identity, env("JWT_ISSUER"), env("JWT_AUDIENCE"), env("JWT_ISSUE_KEY"), 900) else {
+    let requestId = uuid()
+    guard let tokenId = requestId else { return response(503) }
+    guard let token = auth.jwtForIdentityHs256WithId(
+        identity, env("JWT_ISSUER"), env("JWT_AUDIENCE"), tokenId,
+        env("JWT_ISSUE_KEY"), 900) else {
         return response(503)
     }
     return response(200, body: token)

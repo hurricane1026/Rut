@@ -1332,6 +1332,8 @@ jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
          (static JWKS + claims policy). jwtHasGroup(claims, required) -> bool.
          Fixed-profile HS256 jwtIssueHs256(subject, issuer, audience, key,
          ttl:i32) -> str?; Crypto.issueJwtHs256 qualified wrapper;
+         jwtIssueHs256WithId(subject, issuer, audience, tokenId, key,
+         ttl:i32) -> str?; Crypto.issueJwtHs256WithId qualified wrapper;
          ⏳ other RS/ES algorithms and arbitrary-claims DSL jwtEncode
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
@@ -1927,10 +1929,19 @@ request-owned JSON arena. The qualified `Crypto.issueJwtHs256` wrapper and
 is constructible and carries no authentication provenance; call that helper
 only after successful authentication.
 
-The native-only C++ API `jwt_hs256_issue_with_id` adds exactly one caller-
-provided `jti` string under the same bounds and validation rules, using
-caller-owned output and retaining no input or output views. Rut and JIT issuance
-with `jti` remains pending.
+The C++ API `jwt_hs256_issue_with_id` adds exactly one caller-provided `jti`
+string under the same bounds and validation rules, using caller-owned output
+and retaining no input or output views. Rut/JIT wrappers for this six-claim
+profile are described below.
+
+`jwt_hs256_issue_with_id` and the Rut/JIT
+`jwtIssueHs256WithId(subject, issuer, audience, tokenId, key, ttl)` variant add
+exactly one nonempty `jti` string claim. The ID follows the same UTF-8, control
+character, escaping, payload-size and output-lifetime rules as other claim
+strings. Issuance provides no ID uniqueness or replay protection.
+`auth.jwtForIdentityHs256WithId` uses `identity.consumerId` as `sub` and the
+provided token ID as `jti`; call it only after successful authentication,
+because Identity has no authentication provenance.
 
 ### Static HS JWT secret rotation
 
