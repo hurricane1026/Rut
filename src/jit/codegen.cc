@@ -1773,45 +1773,44 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
-            if (kJsonOp == json::Op::JwtIssueHs256 || kJsonOp == json::Op::JwtIssueHs256WithId) {
-                const bool kWithId = kJsonOp == json::Op::JwtIssueHs256WithId;
-                const u32 kStringCount = kWithId ? 5u : 4u;
-                const u32 kParamCount = kWithId ? 16u : 14u;
+            if (kJsonOp == json::Op::JwtIssueHs256 || kJsonOp == json::Op::JwtIssueHs256WithId ||
+                kJsonOp == json::Op::JwtIssueHs256WithIdAndScope) {
+                const bool kWithId = kJsonOp != json::Op::JwtIssueHs256;
+                const bool kWithScope = kJsonOp == json::Op::JwtIssueHs256WithIdAndScope;
+                const u32 kStringCount = kWithScope ? 6u : (kWithId ? 5u : 4u);
+                const u32 kTtlIndex = 2u + kStringCount * 2u;
+                const u32 kParamCount = kTtlIndex + 4u;
                 LLVMValueRef output_has = LLVMBuildAlloca(c.builder, c.i8_ty, "jwt.issue.has");
                 LLVMValueRef output_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "jwt.issue.ptr");
                 LLVMValueRef output_len = LLVMBuildAlloca(c.builder, c.i32_ty, "jwt.issue.len");
-                LLVMTypeRef params[16] = {c.ptr_ty,
-                                          c.ptr_ty,
-                                          c.ptr_ty,
-                                          c.i32_ty,
-                                          c.ptr_ty,
-                                          c.i32_ty,
-                                          c.ptr_ty,
-                                          c.i32_ty,
-                                          c.ptr_ty,
-                                          c.i32_ty,
-                                          kWithId ? c.ptr_ty : c.i32_ty,
-                                          kWithId ? c.i32_ty : c.ptr_ty,
-                                          kWithId ? c.i32_ty : c.ptr_ty,
-                                          c.ptr_ty,
-                                          c.ptr_ty,
-                                          c.ptr_ty};
+                LLVMTypeRef params[18]{};
+                params[0] = c.ptr_ty;
+                params[1] = c.ptr_ty;
+                for (u32 i = 0; i < kStringCount; ++i) {
+                    params[2 + i * 2] = c.ptr_ty;
+                    params[3 + i * 2] = c.i32_ty;
+                }
+                params[kTtlIndex] = c.i32_ty;
+                params[kTtlIndex + 1] = c.ptr_ty;
+                params[kTtlIndex + 2] = c.ptr_ty;
+                params[kTtlIndex + 3] = c.ptr_ty;
                 LLVMTypeRef type = LLVMFunctionType(c.void_ty, params, kParamCount, 0);
-                const char* helper_name =
-                    kWithId ? "rut_helper_jwt_issue_hs256_with_id" : "rut_helper_jwt_issue_hs256";
+                const char* helper_name = kWithScope
+                                              ? "rut_helper_jwt_issue_hs256_with_id_and_scope"
+                                              : (kWithId ? "rut_helper_jwt_issue_hs256_with_id"
+                                                         : "rut_helper_jwt_issue_hs256");
                 LLVMValueRef helper = LLVMGetNamedFunction(c.llvm_mod, helper_name);
                 if (!helper) helper = LLVMAddFunction(c.llvm_mod, helper_name, type);
-                LLVMValueRef args[16] = {c.param_conn, c.param_arena};
+                LLVMValueRef args[18] = {c.param_conn, c.param_arena};
                 for (u32 i = 0; i < kStringCount + 1; ++i) {
                     LLVMValueRef value = c.get_value(inst.operand(i));
                     if (i < kStringCount) {
                         args[2 + i * 2] = LLVMBuildExtractValue(c.builder, value, 0, "jwt.arg.ptr");
                         args[3 + i * 2] = LLVMBuildExtractValue(c.builder, value, 1, "jwt.arg.len");
                     } else {
-                        args[kWithId ? 12 : 10] = value;
+                        args[kTtlIndex] = value;
                     }
                 }
-                const u32 kTtlIndex = kWithId ? 12u : 10u;
                 args[kTtlIndex + 1] = output_has;
                 args[kTtlIndex + 2] = output_ptr;
                 args[kTtlIndex + 3] = output_len;
@@ -2880,9 +2879,13 @@ CodegenResult codegen(const rir::Module& rir_mod) {
                     const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
                     const bool kJwtIssue = kJsonOp == json::Op::JwtIssueHs256;
                     const bool kJwtIssueWithId = kJsonOp == json::Op::JwtIssueHs256WithId;
-                    if (kJwtIssue || kJwtIssueWithId) {
-                        const u32 kExpectedCount = kJwtIssueWithId ? 6u : 5u;
-                        const u32 kStringCount = kJwtIssueWithId ? 5u : 4u;
+                    const bool kJwtIssueWithIdAndScope =
+                        kJsonOp == json::Op::JwtIssueHs256WithIdAndScope;
+                    if (kJwtIssue || kJwtIssueWithId || kJwtIssueWithIdAndScope) {
+                        const u32 kExpectedCount =
+                            kJwtIssueWithIdAndScope ? 7u : (kJwtIssueWithId ? 6u : 5u);
+                        const u32 kStringCount =
+                            kJwtIssueWithIdAndScope ? 6u : (kJwtIssueWithId ? 5u : 4u);
                         if (inst.operand_count != kExpectedCount ||
                             inst.extra_operands == nullptr || inst.result == rir::kNoValue ||
                             inst.result.id >= fn.value_count || fn.values == nullptr)

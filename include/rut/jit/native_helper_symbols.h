@@ -41,6 +41,7 @@
     X(rut_helper_hash_publish)                        \
     X(rut_helper_jwt_issue_hs256)                     \
     X(rut_helper_jwt_issue_hs256_with_id)             \
+    X(rut_helper_jwt_issue_hs256_with_id_and_scope)   \
     X(rut_crypto_digest_v1)                           \
     X(rut_crypto_digest_hex_v1)                       \
     X(rut_crypto_digest_parts_v1)                     \

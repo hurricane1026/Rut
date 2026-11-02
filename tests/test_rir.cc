@@ -2650,3 +2650,33 @@ TEST(RirBuilder, JwtIssueHs256WithIdUsesSixOperandsAndValidatesTypes) {
     VOK(b.emit_ret_status(204));
     ctx.destroy();
 }
+
+TEST(RirBuilder, JwtIssueHs256WithIdAndScopeUsesSevenOperandsAndValidatesTypes) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("jwt_issue_with_id_and_scope"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    ValueId args[7];
+    for (u32 i = 0; i < 6; ++i) args[i] = V(b.emit_const_str(lit("value")));
+    args[6] = V(b.emit_const_i32(60));
+    auto result = V(b.emit_json(
+        static_cast<u32>(json::Op::JwtIssueHs256WithIdAndScope), TypeKind::Str, true, args, 7));
+    CHECK(fn->values[result.id].type->kind == TypeKind::Optional);
+    const auto& inst = fn->entry()->insts[7];
+    CHECK_EQ(inst.operand_count, 7u);
+    for (u32 i = 0; i < 7; ++i) CHECK_EQ(inst.operand(i).id, args[i].id);
+    CHECK_FALSE(b.emit_json(
+        static_cast<u32>(json::Op::JwtIssueHs256WithIdAndScope), TypeKind::Str, true, args, 6));
+    CHECK_FALSE(b.emit_json(
+        static_cast<u32>(json::Op::JwtIssueHs256WithIdAndScope), TypeKind::Str, true, nullptr, 7));
+    const ValueId saved_scope = args[4];
+    args[4] = args[6];
+    CHECK_FALSE(b.emit_json(
+        static_cast<u32>(json::Op::JwtIssueHs256WithIdAndScope), TypeKind::Str, true, args, 7));
+    args[4] = saved_scope;
+    VOK(b.emit_ret_status(204));
+    ctx.destroy();
+}

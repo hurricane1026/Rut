@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/jwt_claims.h"
 
 #include <stdint.h>
 
@@ -67,6 +68,8 @@ bool issue(Str key,
            Str audience,
            Str token_id,
            bool include_id,
+           Str scope,
+           bool include_scope,
            i64 unix_seconds,
            i64 ttl_seconds,
            char* output,
@@ -78,18 +81,21 @@ bool issue(Str key,
         ranges_overlap(output, capacity, issuer.ptr, issuer.len) ||
         ranges_overlap(output, capacity, audience.ptr, audience.len) ||
         (include_id && ranges_overlap(output, capacity, token_id.ptr, token_id.len)) ||
+        (include_scope && ranges_overlap(output, capacity, scope.ptr, scope.len)) ||
         ranges_overlap(&output_len, sizeof(output_len), output, capacity) ||
         ranges_overlap(&output_len, sizeof(output_len), key.ptr, key.len) ||
         ranges_overlap(&output_len, sizeof(output_len), subject.ptr, subject.len) ||
         ranges_overlap(&output_len, sizeof(output_len), issuer.ptr, issuer.len) ||
         ranges_overlap(&output_len, sizeof(output_len), audience.ptr, audience.len) ||
-        (include_id && ranges_overlap(&output_len, sizeof(output_len), token_id.ptr, token_id.len)))
+        (include_id &&
+         ranges_overlap(&output_len, sizeof(output_len), token_id.ptr, token_id.len)) ||
+        (include_scope && ranges_overlap(&output_len, sizeof(output_len), scope.ptr, scope.len)))
         return false;
     if (!key.ptr || key.len < 32 || key.len > kMaxJwtHs256KeyBytes ||
         !valid_claim_string(subject) || !valid_claim_string(issuer) ||
         !valid_claim_string(audience) || (include_id && !valid_claim_string(token_id)) ||
-        unix_seconds <= 0 || ttl_seconds <= 0 || ttl_seconds > 86400 ||
-        unix_seconds > 0x7fffffffffffffffLL - ttl_seconds || !output)
+        (include_scope && !jwt_scope_token_valid(scope)) || unix_seconds <= 0 || ttl_seconds <= 0 ||
+        ttl_seconds > 86400 || unix_seconds > 0x7fffffffffffffffLL - ttl_seconds || !output)
         return false;
 
     char payload[kMaxJwtHs256PayloadBytes];
@@ -103,6 +109,10 @@ bool issue(Str key,
     if (include_id) {
         claims.text(lit_str(",\"jti\":"));
         if (!json::quote(token_id, claims)) return false;
+    }
+    if (include_scope) {
+        claims.text(lit_str(",\"scope\":"));
+        if (!json::quote(scope, claims)) return false;
     }
     claims.text(lit_str(",\"iat\":"));
     if (!append_positive_integer(claims, unix_seconds)) return false;
@@ -184,6 +194,8 @@ bool jwt_hs256_issue(Str key,
                  audience,
                  {},
                  false,
+                 {},
+                 false,
                  unix_seconds,
                  ttl_seconds,
                  output,
@@ -206,6 +218,34 @@ bool jwt_hs256_issue_with_id(Str key,
                  issuer,
                  audience,
                  token_id,
+                 true,
+                 {},
+                 false,
+                 unix_seconds,
+                 ttl_seconds,
+                 output,
+                 capacity,
+                 output_len);
+}
+
+bool jwt_hs256_issue_with_id_and_scope(Str key,
+                                       Str subject,
+                                       Str issuer,
+                                       Str audience,
+                                       Str token_id,
+                                       Str scope,
+                                       i64 unix_seconds,
+                                       i64 ttl_seconds,
+                                       char* output,
+                                       u32 capacity,
+                                       u32& output_len) {
+    return issue(key,
+                 subject,
+                 issuer,
+                 audience,
+                 token_id,
+                 true,
+                 scope,
                  true,
                  unix_seconds,
                  ttl_seconds,

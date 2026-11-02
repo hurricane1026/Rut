@@ -31,6 +31,9 @@ bool jwt_claims_valid_with_lifetime(json::Document& scratch,
 // verify signatures or claims policy. Invalid documents/tokens fail closed.
 bool jwt_has_scope(json::Document& scratch, Str claims, Str required);
 
+// Validate one OAuth scope-token using the same ASCII grammar as jwt_has_scope.
+bool jwt_scope_token_valid(Str token);
+
 // Exact membership in a nonempty top-level JWT groups string array. Does not
 // verify signatures or claims policy. Every array entry must be a nonempty
 // string; malformed/invalid entries fail the whole check, even after a match.

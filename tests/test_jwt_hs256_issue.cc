@@ -438,6 +438,187 @@ TEST(jwt_hs256_issue, issues_jti_with_bounded_validation_and_verified_signature)
                                    overlap[0]));
 }
 
+TEST(jwt_hs256_issue, issues_jti_and_one_scope_with_verified_signature_without_allocations) {
+    char key[32];
+    for (char& byte : key) byte = 's';
+    const Str id = lit_str("request-17");
+    const Str scope = lit_str("orders:read");
+    char token[kMaxJwtHs256TokenBytes];
+    u32 length = 0;
+    allocations = 0;
+    tracking = true;
+    const bool issued = jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                                          lit_str("alice"),
+                                                          lit_str("issuer"),
+                                                          lit_str("orders"),
+                                                          id,
+                                                          scope,
+                                                          1700000000,
+                                                          900,
+                                                          token,
+                                                          sizeof(token),
+                                                          length);
+    tracking = false;
+    REQUIRE(issued);
+    CHECK_EQ(allocations, 0u);
+    char payload[kMaxJwtHs256PayloadBytes];
+    u32 payload_len = 0;
+    REQUIRE(
+        authenticate({token, length}, {key, sizeof(key)}, payload, sizeof(payload), payload_len));
+    CHECK((Str{payload, payload_len}.eq(
+        lit_str("{\"sub\":\"alice\",\"iss\":\"issuer\",\"aud\":\"orders\","
+                "\"jti\":\"request-17\",\"scope\":\"orders:read\","
+                "\"iat\":1700000000,\"exp\":1700000900}"))));
+    char tampered[kMaxJwtHs256TokenBytes];
+    __builtin_memcpy(tampered, token, length);
+    tampered[length - 1] = tampered[length - 1] == 'A' ? 'B' : 'A';
+    CHECK(!authenticate(
+        {tampered, length}, {key, sizeof(key)}, payload, sizeof(payload), payload_len));
+    json::Document claims;
+    REQUIRE(jwt_claims_valid_with_lifetime(claims,
+                                           {payload, payload_len},
+                                           lit_str("issuer"),
+                                           lit_str("orders"),
+                                           1700000000,
+                                           900,
+                                           900));
+    CHECK(jwt_has_scope(claims, {payload, payload_len}, scope));
+    CHECK(!jwt_has_scope(claims, {payload, payload_len}, lit_str("orders:write")));
+
+    char large_subject[json::kMaxBytes];
+    for (char& byte : large_subject) byte = 'x';
+    u32 low = 1;
+    u32 high = sizeof(large_subject);
+    u32 largest_valid = 0;
+    while (low <= high) {
+        const u32 mid = low + (high - low) / 2;
+        u32 trial_len = 0;
+        if (jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                              {large_subject, mid},
+                                              lit_str("issuer"),
+                                              lit_str("orders"),
+                                              id,
+                                              scope,
+                                              1700000000,
+                                              900,
+                                              token,
+                                              sizeof(token),
+                                              trial_len)) {
+            largest_valid = mid;
+            low = mid + 1;
+        } else {
+            if (mid == 0) break;
+            high = mid - 1;
+        }
+    }
+    CHECK_GT(largest_valid, 0u);
+    REQUIRE(jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                              {large_subject, largest_valid},
+                                              lit_str("issuer"),
+                                              lit_str("orders"),
+                                              id,
+                                              scope,
+                                              1700000000,
+                                              900,
+                                              token,
+                                              sizeof(token),
+                                              length));
+    CHECK_EQ(length, kMaxJwtHs256TokenBytes);
+    REQUIRE(
+        authenticate({token, length}, {key, sizeof(key)}, payload, sizeof(payload), payload_len));
+    CHECK_EQ(payload_len, kMaxJwtHs256PayloadBytes);
+    CHECK(!jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                             {large_subject, largest_valid},
+                                             lit_str("issuer"),
+                                             lit_str("orders"),
+                                             id,
+                                             scope,
+                                             1700000000,
+                                             900,
+                                             token,
+                                             kMaxJwtHs256TokenBytes - 1,
+                                             length));
+    CHECK_EQ(length, 0u);
+
+    const char invalid_non_ascii[] = {'r', static_cast<char>(0xc3), static_cast<char>(0xa9)};
+    const char control[] = {'r', '\n'};
+    const Str invalid_scopes[] = {lit_str(""),
+                                  lit_str("two words"),
+                                  lit_str("quote\""),
+                                  lit_str("slash\\"),
+                                  {control, sizeof(control)},
+                                  {invalid_non_ascii, sizeof(invalid_non_ascii)}};
+    for (Str bad : invalid_scopes) {
+        length = 99;
+        CHECK(!jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                                 lit_str("alice"),
+                                                 lit_str("issuer"),
+                                                 lit_str("orders"),
+                                                 id,
+                                                 bad,
+                                                 1700000000,
+                                                 900,
+                                                 token,
+                                                 sizeof(token),
+                                                 length));
+        CHECK_EQ(length, 0u);
+    }
+
+    length = 0;
+    CHECK(jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                            lit_str("alice"),
+                                            lit_str("issuer"),
+                                            lit_str("orders"),
+                                            id,
+                                            scope,
+                                            1700000000,
+                                            900,
+                                            token,
+                                            sizeof(token),
+                                            length));
+    const u32 token_size = length;
+    CHECK_GT(token_size, 0u);
+    CHECK(!jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                             lit_str("alice"),
+                                             lit_str("issuer"),
+                                             lit_str("orders"),
+                                             id,
+                                             scope,
+                                             1700000000,
+                                             900,
+                                             token,
+                                             token_size - 1,
+                                             length));
+    CHECK_EQ(length, 0u);
+    u32 scope_overlap[4] = {};
+    __builtin_memcpy(scope_overlap, "orders:read", 11);
+    CHECK(!jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                             lit_str("alice"),
+                                             lit_str("issuer"),
+                                             lit_str("orders"),
+                                             id,
+                                             {reinterpret_cast<char*>(scope_overlap), 11},
+                                             1700000000,
+                                             900,
+                                             token,
+                                             sizeof(token),
+                                             scope_overlap[0]));
+    CHECK_EQ(scope_overlap[0], 0u);
+    char overlap[32] = "orders:read";
+    CHECK(!jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                             lit_str("alice"),
+                                             lit_str("issuer"),
+                                             lit_str("orders"),
+                                             id,
+                                             {overlap, 11},
+                                             1700000000,
+                                             900,
+                                             overlap,
+                                             sizeof(overlap),
+                                             length));
+    CHECK_EQ(length, 0u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

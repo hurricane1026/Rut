@@ -27,6 +27,10 @@ bool date(json::Document& document, u32 node, i64& value) {
            json::integer(document.raw(node), value);
 }
 
+bool scope_token_byte(unsigned char c) {
+    return c == 0x21 || (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x7e);
+}
+
 }  // namespace
 
 bool jwt_claims_valid(
@@ -97,14 +101,19 @@ bool jwt_claims_valid_with_lifetime(json::Document& document,
            expires - issued_at <= max_lifetime_seconds;
 }
 
+bool jwt_scope_token_valid(Str token) {
+    if (token.ptr == nullptr || token.len == 0 || token.len > json::kMaxBytes) return false;
+    for (u32 i = 0; i < token.len; ++i) {
+        const auto kByte = static_cast<unsigned char>(token.ptr[i]);
+        if (!scope_token_byte(kByte)) return false;
+    }
+    return true;
+}
+
 bool jwt_has_scope(json::Document& document, Str claims, Str required) {
-    const auto kTokenByte = [](unsigned char c) {
-        return c == 0x21 || (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x7e);
-    };
     if (required.ptr == nullptr || required.len == 0 || required.len > json::kMaxBytes)
         return false;
-    for (u32 i = 0; i < required.len; ++i)
-        if (!kTokenByte(static_cast<unsigned char>(required.ptr[i]))) return false;
+    if (!jwt_scope_token_valid(required)) return false;
     if (claims.ptr == nullptr || !document.parse(claims) ||
         document.nodes[0].kind != json::Kind::Object)
         return false;
@@ -121,7 +130,7 @@ bool jwt_has_scope(json::Document& document, Str claims, Str required) {
             if (i == start) return false;
             found |= Str{document.scratch + start, i - start}.eq(required);
             start = i + 1;
-        } else if (!kTokenByte(static_cast<unsigned char>(document.scratch[i]))) {
+        } else if (!scope_token_byte(static_cast<unsigned char>(document.scratch[i]))) {
             return false;
         }
     }

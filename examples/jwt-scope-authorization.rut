@@ -1,0 +1,19 @@
+// Set JWT_ISSUE_KEY, JWT_ISSUER, JWT_AUDIENCE, REVOKED_TOKEN_ID_1 and
+// REVOKED_TOKEN_ID_2 at load time. This receiver listens on 8081; the paired
+// issuer listens on 8080. Serve both behind TLS.
+import "middleware/auth.rut"
+listen :8081
+
+route GET "/orders" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_ISSUE_KEY"))
+    guard jwtClaimsValidWithLifetime(
+        document, env("JWT_ISSUER"), env("JWT_AUDIENCE"), i64(900), i64(900)) else {
+        return response(401)
+    }
+    let checked = auth.requireUnrevokedJwt(
+        document, env("REVOKED_TOKEN_ID_1"), env("REVOKED_TOKEN_ID_2"))
+    guard jwtHasScope(checked, "orders:read") else {
+        return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})
+    }
+    return response(200)
+}
