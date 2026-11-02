@@ -2879,6 +2879,29 @@ CodegenResult codegen(const rir::Module& rir_mod) {
             if (block.inst_count > 0 && block.insts == nullptr) return {nullptr, nullptr, false};
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
+                if (inst.op == rir::Opcode::JsonOp &&
+                    static_cast<json::Op>(inst.imm.i32_val) == json::Op::JwtIssueHs256) {
+                    if (inst.operand_count != 5 || inst.extra_operands == nullptr ||
+                        inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
+                        fn.values == nullptr)
+                        return {nullptr, nullptr, false};
+                    const rir::Type* result = fn.values[inst.result.id].type;
+                    if (result == nullptr || result->kind != rir::TypeKind::Optional ||
+                        result->inner == nullptr || result->inner->kind != rir::TypeKind::Str ||
+                        result->inner->inner != nullptr || result->struct_def != nullptr ||
+                        result->inner->struct_def != nullptr)
+                        return {nullptr, nullptr, false};
+                    for (u32 oi = 0; oi < 5; ++oi) {
+                        const rir::ValueId id = inst.operand(oi);
+                        if (id == rir::kNoValue || id.id >= fn.value_count)
+                            return {nullptr, nullptr, false};
+                        const rir::Type* type = fn.values[id.id].type;
+                        const auto expected = oi == 4 ? rir::TypeKind::I32 : rir::TypeKind::Str;
+                        if (type == nullptr || type->kind != expected || type->inner != nullptr ||
+                            type->struct_def != nullptr)
+                            return {nullptr, nullptr, false};
+                    }
+                }
                 if (inst.op != rir::Opcode::JwtClaimsValidWithLifetime) continue;
                 if (inst.operand_count != 5 || inst.extra_operands == nullptr ||
                     inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||

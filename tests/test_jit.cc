@@ -27872,3 +27872,41 @@ route GET "/null" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, hs256_issue_codegen_rejects_malformed_rir_before_reading_overflow_operands) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("issue_bad_rir"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    ValueId args[5];
+    for (u32 i = 0; i < 4; ++i) args[i] = V(b.emit_const_str(lit("value")));
+    args[4] = V(b.emit_const_i32(60));
+    auto result =
+        V(b.emit_json(static_cast<u32>(json::Op::JwtIssueHs256), TypeKind::Str, true, args, 5));
+    VOK(b.emit_ret_status(204));
+    auto& inst = fn->entry()->insts[5];
+    auto* overflow = inst.extra_operands;
+    inst.extra_operands = nullptr;
+    CHECK_FALSE(codegen(tc.mod).ok);
+    inst.extra_operands = overflow;
+    inst.operand_count = 4;
+    CHECK_FALSE(codegen(tc.mod).ok);
+    inst.operand_count = 5;
+    auto saved = overflow[1];
+    overflow[1] = kNoValue;
+    CHECK_FALSE(codegen(tc.mod).ok);
+    overflow[1] = args[0];
+    CHECK_FALSE(codegen(tc.mod).ok);
+    overflow[1] = saved;
+    inst.operands[0] = args[4];
+    CHECK_FALSE(codegen(tc.mod).ok);
+    inst.operands[0] = args[0];
+    const Type* type = fn->values[result.id].type;
+    fn->values[result.id].type = fn->values[args[0].id].type;
+    CHECK_FALSE(codegen(tc.mod).ok);
+    fn->values[result.id].type = type;
+    tc.destroy();
+}
