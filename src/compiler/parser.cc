@@ -19,7 +19,7 @@ constexpr Str kEmptyBlockDetail = lit_str("empty block is not supported");
 constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `pattern => ...`");
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
 constexpr Str kWsTrailingBlockDetail =
-    lit_str("websocket trailing blocks require `{ message in ... }`");
+    lit_str("websocket trailing blocks require `{ name in ... }`");
 constexpr Str kWsMaxMessageSizeDetail = lit_str("single-slice maximum is 16370 bytes");
 constexpr Str kObjectCallArgDetail = lit_str("object literals are only allowed as call arguments");
 // The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
@@ -600,7 +600,7 @@ struct Parser {
     // parse_braced_stmt_body because message verdicts are **bare method-call statements**
     // (`message.forward()`), which the general statement parser (parse_stmt) deliberately
     // rejects — its only statements are keyword-led (let/guard/return/if/match/...). Slice B
-    // accepts only bare expression statements; guards/match over `message` are follow-up slices.
+    // accepts immutable lets, message guards and a final bare verdict.
     // Mirrors parse_braced_stmt_body's empty-block rejection and one-statement unwrap so analyze
     // sees the same body shape.
     FrontendResult<AstStatement> parse_ws_message_body(const Token& lbrace_tok) {
@@ -609,7 +609,11 @@ struct Parser {
         block.span = span_from(lbrace_tok);
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
             AstStatement st{};
-            if (cur().type == TokenType::KwGuard) {
+            if (cur().type == TokenType::KwLet) {
+                auto binding = parse_stmt();
+                if (!binding) return core::make_unexpected(binding.error());
+                st = binding.value();
+            } else if (cur().type == TokenType::KwGuard) {
                 // `guard <cond> else { <verdict> }` — a conditional verdict.
                 const Token gt = cur();
                 pos++;
@@ -2983,19 +2987,20 @@ struct Parser {
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.name = name.value()->text;
                 stmt.ws_max_message_size = ws_max_size;
-                // A trailing `{ message in ... }` block makes this TERMINATE mode (the gateway
+                // A trailing `{ name in ... }` block makes this TERMINATE mode (the gateway
                 // parses/inspects each message); a bare `websocket(x)` stays the passthrough
                 // ForwardUpstream tunnel. The block is the per-message handler; its
-                // body is stored on then_stmt (reused like For), parsed by the general
-                // statement parser (per-message verdicts are a follow-up slice).
+                // body is stored on then_stmt (reused like For) and parsed with message
+                // verdict statements in addition to ordinary let bindings.
                 if (cur().type == TokenType::LBrace) {
                     auto lbrace = expect(TokenType::LBrace);
                     if (!lbrace) return core::make_unexpected(lbrace.error());
-                    if (cur().type != TokenType::Ident || !cur().text.eq({"message", 7}))
+                    if (cur().type != TokenType::Ident)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(cur()),
                                               kWsTrailingBlockDetail);
-                    pos++;  // consume the fixed message-handler binding
+                    stmt.ws_parameter_name = cur().text;
+                    pos++;  // consume the callback parameter
                     if (cur().type != TokenType::KwIn)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(cur()),

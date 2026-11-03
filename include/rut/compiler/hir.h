@@ -1201,6 +1201,7 @@ struct HirWsTextRewrite {
 };
 
 struct HirWsHandler {
+    Str parameter_name = lit_str("message");  // analyzer-only lexical binding
     WsVerdict default_verdict = WsVerdict::Forward;
     // Postorder condition forest. Guard roots execute in source order before the
     // default verdict; the first failing guard's else verdict wins.

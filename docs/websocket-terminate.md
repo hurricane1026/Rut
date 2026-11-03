@@ -63,8 +63,8 @@ length/literal comparisons, text/literal equality and text regex matches.
 An imported helper works through the normal import namespace. HTTP reads and
 response effects cannot run inside a message predicate. The borrowed message
 has no storage carrier outside its synchronous callback, and comparing entire
-messages is rejected. Callback-local bindings, parameter renaming, general
-arithmetic and close-event values remain subsequent work.
+messages is rejected. General arithmetic and close-event values remain
+subsequent work.
 
 `message.kind` has type `WebSocketMessageKind`, whose cases are
 `WebSocketMessageKind.text` and `WebSocketMessageKind.binary`. `message.direction`
@@ -122,8 +122,56 @@ and generic `Eq` compare exact bytes in either operand order. Comparisons with
 `str`, implicit conversions, regex scans, ordering, concatenation and indexing
 are unsupported. Payload inspections currently lower literal equality, view
 reflexivity, count/literal comparisons and emptiness into the bounded condition
-forest. This step does not add dynamic payload replacement or callback-local
-bindings.
+forest. Dynamic payload replacement remains subsequent work.
+
+### Callback names and immutable bindings
+
+The trailing block accepts an ordinary identifier, such as `{ packet in ... }`.
+Only that parameter is bound; the spelling `message` has no implicit meaning in
+a block using another name. The parameter shadows an outer name, including a
+built-in namespace if it uses the same name. The value remains a complete
+`WebSocketMessage`, even when its parameter is named `frame`.
+
+```swift
+func identity<T>(_ value: T) -> T => value
+func size(_ bytes: Bytes) -> i32 => bytes.count
+
+return websocket(chat) { packet in
+    let msg: WebSocketMessage = identity(packet)
+    let payload: Bytes = msg.payload
+    let count: i32 = size(payload)
+    let client = msg.direction == WebSocketDirection.clientToUpstream
+    let allowed = count == 2 && payload == b"\x00\xff"
+    guard !client || allowed else { msg.drop() }
+    msg.forward()
+}
+```
+
+Callback `let` bindings use the common expression analyzer, declared-type checker
+and pure helper normalization. They currently accept infallible scalar literals,
+message aliases and projections, byte counts, equality, ordering of supported
+integer projections, and Boolean composition. Bindings are immutable and visible
+only after their declaration, through the remainder of this callback. Names
+must be fresh across callback lets, JSON guard aliases and captured admission
+constants; `json` is unavailable as a local let name. Optional values, HTTP reads
+or effects, regex scans and JSON operations cannot be let initializers in this
+slice. In particular, fallible scans/decodes keep their existing guard evaluation
+and short-circuit behavior. An unused initializer is still checked.
+
+Message aliases may receive verdicts. A borrowed text alias may feed the existing
+text rewrite or `json.parse` guard; JSON guard aliases retain their existing
+proof and scope rules. Close codes may use constant integer aliases, while close
+reasons and fixed Binary replacements retain their existing literal-only forms.
+None of these aliases allocate runtime storage, retain a message beyond the
+callback, or become HTTP route locals. Compile-time HTTP admission constants
+remain capturable; request-borrowed values do not.
+
+The ordinary eight-statement block limit includes lets, guards and the final
+verdict. The existing 16-local HTTP admission budget remains independent of the
+callback parameter and its at-most-seven lets. JSON guard aliases remain bounded
+by four guards; all source guards together still have a four-guard limit and a 32-node condition
+forest. This change does not add arbitrary local computation, nested blocks,
+conditionals or lifecycle callbacks.
 
 After the route's HTTP guards pass, terminate mode validates the opening request
 before connecting to the selected upstream. The supported request shape is GET

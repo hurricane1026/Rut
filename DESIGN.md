@@ -2834,9 +2834,8 @@ HTTP reads, state/header mutations and HTTP response effects cannot execute
 in the message phase; helpers with discarded statement effects are rejected
 as well. Message verdicts remain callback statements. This introduces neither
 an HTTP storage representation for messages nor permission to retain a message
-past its synchronous callback. Callback-local bindings, arbitrary parameter
-names, close-event values and the general expression/control-flow
-surface remain subsequent work; the borrowed type does not imply their support.
+past its synchronous callback. Close-event values and the general
+expression/control-flow surface remain subsequent work.
 
 The message also projects two nominal, closed domains: `kind` is
 `WebSocketMessageKind` (`text`, `binary`), and `direction` is `WebSocketDirection`
@@ -2874,8 +2873,35 @@ require a plain string carrier and i32 result. This is separate from the RIR
 `Bytes` kind used internally for fixed-size cryptographic outputs. No new
 runtime helper or allocation is needed. Message predicates lower payload count,
 emptiness and literal byte equality to existing length/raw-comparison nodes.
-Dynamic payload replacement, byte indexing/concatenation and callback-local
-bindings remain subsequent work.
+Dynamic payload replacement and byte indexing/concatenation remain subsequent work.
+
+The callback parameter uses an ordinary source identifier, recorded on the AST
+and analyzer-only handler metadata. Its spelling is not part of the runtime or
+native ABI. Callback-local `let` bindings share ordinary expression analysis,
+declared-type checking and function-expression normalization. A separate scratch
+route and function own their temporary HIR. The sole message parameter is local
+0; normalized immutable aliases refer to it or to infallible scalar computations.
+Supported initializers are scalar literals, message aliases/projections, byte
+counts, supported comparisons and Boolean composition, including helpers whose
+normalized bodies use these forms. Optional values, regex/JSON operations and
+HTTP reads/effects are rejected even when unused. Restricting substitution to
+infallible reads preserves eager-let semantics without introducing deferred
+fallible work or runtime storage. Predicates consume normalized HIR in the
+existing bounded lowerer; aliases never enter the HTTP route's local storage.
+Message aliases can receive verdicts, and text aliases can feed the existing
+text recipe and JSON parse guards. Fixed Binary output and close reasons keep
+their literal-only contracts; close codes accept constant integer aliases.
+
+The lexical scope includes compile-time admission constants and is discarded at
+the callback boundary. Locals require fresh names across lets, captures and JSON
+proof aliases; the `json` namespace cannot be a local let. The parameter may
+shadow an outer name or namespace. Reads of a previous fixed spelling such as
+`message` after parameter renaming are ordinary name lookups. The shared AST
+block limit remains eight statements. The 16-local HTTP admission budget stays
+independent of the message parameter and callback lets. Lets do not count toward the four source
+guards, whose combined condition forest remains bounded to 32 nodes. JSON proof
+aliases retain their separate bounded representation. Nested blocks, arbitrary
+computation/control flow, and lifecycle entry points are still subsequent work.
 
 ```swift
 return websocket(eventService, maxMessageSize: 4kb) { message in

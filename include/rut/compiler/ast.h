@@ -255,6 +255,7 @@ struct AstStatement {
     // WsTerminate only: the `maxMessageSize:` kwarg in bytes (`websocket(x, maxMessageSize: 8kb)`),
     // 0 when omitted (the loader then uses the engine default); explicit values fit one slice.
     // Carried to HirWsHandler.
+    Str ws_parameter_name{};  // callback-scoped parameter, WsTerminate only
     u32 ws_max_message_size = 0;
     Str ws_subprotocol{};  // raw literal; null means omitted
     Span ws_subprotocol_span{};

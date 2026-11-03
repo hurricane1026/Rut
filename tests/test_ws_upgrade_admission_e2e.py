@@ -252,6 +252,35 @@ return websocket(ws) { message in
 """
 
 
+CALLBACK_SCOPE_DECLARATIONS = r"""
+func identity<T>(_ value: T) -> T => value
+"""
+
+CALLBACK_BYTES_HANDLER = r"""
+return websocket(ws) { packet in
+    let msg: WebSocketMessage = identity(packet)
+    let payload: Bytes = msg.payload
+    let client = msg.direction == WebSocketDirection.clientToUpstream
+    let count: i32 = payload.count
+    guard !client || count == 2 else { msg.drop() }
+    guard !client || allowed(payload) else { msg.drop() }
+    msg.forward()
+}
+"""
+
+CALLBACK_JSON_HANDLER = r"""
+return websocket(ws) { event in
+    let packet = identity(event)
+    let payloadText: str = packet.text
+    guard let document = json.parse(payloadText) else { packet.close(1007) }
+    guard let parent = json.get(document, "/payload") else { packet.close(1008) }
+    guard let child = json.get(parent, "/name") else { packet.close(1008) }
+    guard let text = json.string(child) else { packet.close(1003) }
+    packet.forward("[" + text + "]")
+}
+"""
+
+
 def payload_bytes_exchange(client, peer):
     def expect(sock, expected):
         actual = recv_client_frame(sock)
@@ -1254,6 +1283,23 @@ def main():
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
+        for handler, exchange, declarations in (
+                (CALLBACK_BYTES_HANDLER, payload_bytes_exchange,
+                 PAYLOAD_BYTES_DECLARATIONS + CALLBACK_SCOPE_DECLARATIONS),
+                (CALLBACK_JSON_HANDLER, nested_json_exchange, CALLBACK_SCOPE_DECLARATIONS)):
+            for native in (False, True):
+                if native:
+                    status, details = native_binary_source_removal_scenario(
+                        args.server, args.compiler, backend, handler, exchange, declarations)
+                else:
+                    status, details = binary_replacement_scenario(
+                        args.server, backend, handler, exchange, declarations)
+                if status == "skip":
+                    print(f"SKIP {backend}: {details.strip()}")
+                else:
+                    if status != "pass":
+                        raise AssertionError(f"callback scope: {details}")
+                    print(f"PASS {backend} callback scope native={native}")
         for native in (False, True):
             if native:
                 status, details = native_binary_source_removal_scenario(

@@ -6228,6 +6228,71 @@ TEST(serve_loader, websocket_domain_types_compare_cases_in_both_operand_orders) 
     }
 }
 
+TEST(serve_loader, websocket_callback_scope_uses_helpers_and_borrowed_aliases) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func same<T: Eq>(_ left: T, _ right: T) -> bool => left == right
+func payloadSize(_ bytes: Bytes) -> i32 => bytes.count
+route GET "/bytes" {
+    let required = 2
+    return websocket(backend) { msg in
+        let alias: WebSocketMessage = identity(msg)
+        let bytes: Bytes = alias.payload
+        let marker: Bytes = b"\x00\xff"
+        let permitted: bool = payloadSize(bytes) == required && same(bytes, marker)
+        let client = alias.direction == WebSocketDirection.clientToUpstream
+        guard !client || permitted else { alias.drop() }
+        alias.forward()
+    }
+}
+route GET "/json" { return websocket(backend) { event in
+    let copy = identity(event)
+    let text: str = copy.text
+    guard let document = json.parse(text) else { copy.close(1007, "invalid JSON") }
+    let client = copy.fromClient
+    guard let field = json.get(document, "/name") else { copy.drop() }
+    guard let name = json.string(field) else { copy.drop() }
+    guard !client || name == "ok" else { copy.drop() }
+    copy.forward("[" + text + "]")
+} }
+)rut";
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_callback_scope").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 2u);
+    std::filesystem::remove_all(dir);
+    const auto binary = program.config.routes[0].ws_frame_handler;
+    const auto json = program.config.routes[1].ws_frame_handler;
+    REQUIRE(binary);
+    REQUIRE(json);
+    const Str payloads[] = {{"\0\xff", 2}, {"\xff\0", 2}, {"", 0}, {"\0\xff\0", 3}};
+    for (bool client : {true, false}) {
+        for (u32 i = 0; i < 4; ++i)
+            CHECK(binary(nullptr,
+                         WsOpcode::Binary,
+                         reinterpret_cast<const u8*>(payloads[i].ptr),
+                         payloads[i].len,
+                         client) ==
+                  (!client || i == 0 ? WsFrameAction::Forward : WsFrameAction::Drop));
+        const char* documents[] = {
+            "{\"name\":\"ok\"}", "{\"name\":\"no\"}", "{}", "{\"name\":1}", "broken"};
+        for (u32 i = 0; i < 5; ++i) {
+            const auto verdict = json(nullptr,
+                                      WsOpcode::Text,
+                                      reinterpret_cast<const u8*>(documents[i]),
+                                      static_cast<u32>(strlen(documents[i])),
+                                      client);
+            CHECK(verdict == (i == 4                            ? WsFrameAction::ClosePolicy0
+                              : (i == 0 || (i == 1 && !client)) ? WsFrameAction::ForwardText
+                                                                : WsFrameAction::Drop));
+        }
+    }
+    CHECK_EQ(program.config.routes[0].needs_req_body, false);
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_payload_bytes_share_helpers_with_dynamic_http_values) {
     const char* source = R"rut(upstream backend at "127.0.0.1:9999"
 func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b

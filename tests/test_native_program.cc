@@ -1800,6 +1800,65 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, websocket_callback_scope_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func same<T: Eq>(_ left: T, _ right: T) -> bool => left == right
+func payloadSize(_ bytes: Bytes) -> i32 => bytes.count
+route GET "/bytes" {
+    let required = 2
+    return websocket(backend) { msg in
+        let alias: WebSocketMessage = identity(msg)
+        let bytes: Bytes = alias.payload
+        let marker: Bytes = b"\x00\xff"
+        let permitted: bool = payloadSize(bytes) == required && same(bytes, marker)
+        let client = alias.direction == WebSocketDirection.clientToUpstream
+        guard !client || permitted else { alias.drop() }
+        alias.forward()
+    }
+}
+route GET "/json" { return websocket(backend) { event in
+    let copy = identity(event)
+    let text: str = copy.text
+    guard let document = json.parse(text) else { copy.close(1007, "invalid JSON") }
+    let client = copy.fromClient
+    guard let field = json.get(document, "/name") else { copy.drop() }
+    guard let name = json.string(field) else { copy.drop() }
+    guard !client || name == "ok" else { copy.drop() }
+    copy.forward("[" + text + "]")
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    const auto binary = owner.p->config.routes[0].ws_frame_handler;
+    const auto json = owner.p->config.routes[1].ws_frame_handler;
+    REQUIRE(binary);
+    REQUIRE(json);
+    const Str payloads[] = {{"\0\xff", 2}, {"\xff\0", 2}, {"", 0}};
+    for (bool client : {true, false}) {
+        for (u32 i = 0; i < 3; ++i)
+            CHECK(binary(nullptr,
+                         WsOpcode::Binary,
+                         reinterpret_cast<const u8*>(payloads[i].ptr),
+                         payloads[i].len,
+                         client) ==
+                  (!client || i == 0 ? WsFrameAction::Forward : WsFrameAction::Drop));
+        const char* documents[] = {"{\"name\":\"ok\"}", "{\"name\":\"no\"}", "{}", "broken"};
+        for (u32 i = 0; i < 4; ++i)
+            CHECK(json(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(documents[i]),
+                       static_cast<u32>(strlen(documents[i])),
+                       client) == (i == 3                            ? WsFrameAction::ClosePolicy0
+                                   : (i == 0 || (i == 1 && !client)) ? WsFrameAction::ForwardText
+                                                                     : WsFrameAction::Drop));
+    }
+}
+
 TEST(native_program, websocket_payload_bytes_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

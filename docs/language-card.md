@@ -885,9 +885,18 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // predicates support these fields, bool literals/equality (either order),
 // Boolean composition, len/literal comparisons, text/literal equality and
 // text.matches(re). Ordinary type checking is shared with HTTP helpers.
-// Other general expressions, callback-local lets and arbitrary parameter names
-// are not implemented yet. HTTP reads/effects and message verdicts in helpers
-// are rejected. Helpers cannot retain a message/payload past the callback.
+// The callback parameter may use any identifier; `message` is not implicitly
+// bound when another name is chosen. Immutable callback lets support typed scalar
+// literals/projections, message aliases, byte counts, comparisons and Boolean
+// composition, including pure helper results in that subset. Lets require fresh
+// names (json is reserved), and do not escape the callback. Text aliases can feed
+// json.parse guards and text rewrites; message aliases can receive verdicts.
+// Eight statements per block, including lets/guards/final verdict. Captured
+// compile-time HTTP values keep their separate 16-local admission budget.
+// The four-guard/32-condition-node limits remain. Optional, JSON and regex let
+// initializers and other general computation/control flow remain unsupported.
+// HTTP reads/effects and message verdicts in helpers are rejected. Helpers cannot
+// retain a message/payload past the callback.
 func allowedMessage(_ msg: WebSocketMessage) -> bool =>
     !msg.fromClient || (msg.isText == true && msg.len <= 2048)
 // Inside the callback: guard allowedMessage(message) else { message.drop() }
