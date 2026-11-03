@@ -2907,8 +2907,9 @@ Ordinary `if` / `else if` / `else` syntax now selects message verdicts. A
 nonterminal `if` must omit else and end its taken arm with a verdict; false falls
 through to the next statement. A terminal if-chain requires a final else and
 ends the callback on every path. Arms currently contain immutable infallible
-lets followed by a verdict or a complete nested conditional tree. Each nested
-path must terminate. Guards within an arm and `if let` are not supported. Branch locals use the same analyzer and helper
+lets, guards and early if statements followed by a verdict or a complete nested
+conditional tree. Every callback path must terminate. JSON optional bindings are
+supported in if-let conditions through the same resolver as guard-let. Branch locals use the same analyzer and helper
 normalization as callback locals, with lexical scope restored after each arm.
 Sibling arms may reuse names, and branch names never resolve a condition or
 leak into later statements. The full HTTP admission-local capacity is preserved
@@ -2949,6 +2950,26 @@ error exits. Encoded targets are compiler/JIT data and never become runtime
 verdicts. Source and native loading share this emission path; the serialized
 native format, message handler function ABI and retained recipe tables are
 unchanged. No runtime allocation or LLVM dependency is added to rut_runtime.
+
+Branch guard and if-let analysis share the existing bounded JSON proof resolver.
+An optional condition appends its presence test and exposes its alias only while
+analyzing the true arm, restoring the proof scope before the failure arm. Guard
+aliases are added after analyzing their failure verdict, so failure cannot read
+its not-yet-bound value. A branch saves/restores both ordinary and JSON binding
+scopes. This supports the existing parse/get/string/numberText/bool/int/stringify/
+kind/count subset, including false/zero/empty successful values and JSON null
+presence where the operation defines it. General optional helpers and shorthand
+bindings remain absent.
+
+A branch sequence tracks its entry and pending continuation edge. A guard's
+success edge or an early if's false edge is patched to the next source condition,
+or directly to the terminal verdict/default if no further condition follows.
+This prevents a successful final guard or absent early binding from entering a
+sibling arm. Nested failure verdicts terminate normally; reached extraction tests
+are evaluated once, with existing short-circuit and decode/scan error behavior.
+Each guard/if-let still consumes one of the four clauses and shares the 32-node
+budget. The parser reuses If's existing binding metadata and Swift if-let surface;
+no keyword, runtime allocation, JIT control tag, handler ABI or native format is added.
 
 ```swift
 return websocket(eventService, maxMessageSize: 4kb) { message in

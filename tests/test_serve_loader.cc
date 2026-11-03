@@ -6228,6 +6228,173 @@ TEST(serve_loader, websocket_domain_types_compare_cases_in_both_operand_orders) 
     }
 }
 
+TEST(serve_loader, websocket_branch_bindings_preserve_optional_presence_and_continuations) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/guard" { return websocket(backend) { msg in
+    if msg.fromClient {
+        guard let document = json.parse(msg.text) else { msg.close(1007) }
+        guard let field = json.get(document, "/name") else { msg.close(1008) }
+        guard let name = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + name + ">")
+    } else { msg.forward() }
+} }
+route GET "/iflet" { return websocket(backend) { msg in
+    if let document = json.parse(msg.text) {
+        if let field = json.get(document, "/flag") {
+            if let value = json.bool(field) {
+                guard value == false else { msg.forward("true") }
+                msg.forward("false")
+            } else { msg.forward("wrong") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+} }
+route GET "/continuation" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if let document = json.parse(msg.text) { msg.forward("json") }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/fallthrough" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isText { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/root-iflet" { return websocket(backend) { msg in
+    if let document = json.parse(msg.text) {
+        if let text = json.string(document) { msg.forward(text) }
+        else { msg.drop() }
+    }
+    msg.forward(b"\xff")
+} }
+)rut";
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_branch_bindings").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove_all(dir);
+    REQUIRE_EQ(program.config.route_count, 5u);
+    const auto guarded = program.config.routes[0].ws_frame_handler;
+    const auto optional = program.config.routes[1].ws_frame_handler;
+    const auto continuation = program.config.routes[2].ws_frame_handler;
+    const auto fallthrough = program.config.routes[3].ws_frame_handler;
+    const auto root = program.config.routes[4].ws_frame_handler;
+    REQUIRE(guarded);
+    REQUIRE(optional);
+    REQUIRE(continuation);
+    REQUIRE(fallthrough);
+    REQUIRE(root);
+    for (bool client : {false, true}) {
+        const char* documents[] = {
+            "{\"name\":\"ok\"}", "{\"name\":\"\"}", "{}", "{\"name\":false}", "broken"};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(guarded(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(documents[i]),
+                          static_cast<u32>(strlen(documents[i])),
+                          client) == (!client  ? WsFrameAction::Forward
+                                      : i < 2  ? WsFrameAction::ForwardTextPolicy0
+                                      : i == 2 ? WsFrameAction::ClosePolicy1
+                                      : i == 3 ? WsFrameAction::ClosePolicy2
+                                               : WsFrameAction::ClosePolicy0));
+        const char* flags[] = {
+            "{\"flag\":false}", "{\"flag\":true}", "{\"flag\":null}", "{}", "broken"};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(optional(nullptr,
+                           WsOpcode::Text,
+                           reinterpret_cast<const u8*>(flags[i]),
+                           static_cast<u32>(strlen(flags[i])),
+                           client) == (i == 0   ? WsFrameAction::ForwardTextPolicy1
+                                       : i == 1 ? WsFrameAction::ForwardTextPolicy0
+                                       : i == 2 ? WsFrameAction::ForwardTextPolicy2
+                                       : i == 3 ? WsFrameAction::ForwardTextPolicy3
+                                                : WsFrameAction::Close));
+        const u8 bad[] = {0xff, 0};
+        const char* json = "null";
+        const char* broken = "broken";
+        CHECK(continuation(nullptr, WsOpcode::Binary, bad, 2, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::ForwardText));
+        CHECK(continuation(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(json), 4, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        CHECK(
+            continuation(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, client) ==
+            (client ? WsFrameAction::Drop : WsFrameAction::ForwardText));
+        CHECK(fallthrough(nullptr, WsOpcode::Binary, bad, 2, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        CHECK(
+            fallthrough(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, client) ==
+            (client ? WsFrameAction::Drop : WsFrameAction::ForwardText));
+        const char* strings[] = {"\"\"", "null", "broken"};
+        for (u32 i = 0; i < 3; ++i)
+            CHECK(root(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(strings[i]),
+                       static_cast<u32>(strlen(strings[i])),
+                       client) == (i == 0   ? WsFrameAction::ForwardTextPolicy0
+                                   : i == 1 ? WsFrameAction::Drop
+                                            : WsFrameAction::ForwardText));
+    }
+    REQUIRE_EQ(program.config.routes[1].ws_forward_text_count, 4u);
+    CHECK_EQ(program.config.routes[1].ws_close_code, 1007u);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_branch_bindings_optional_extractors_test_presence_not_truthiness) {
+    struct Case {
+        const char* operation;
+        const char* value;
+        bool present;
+    };
+    const Case cases[] = {{"string", "\"\"", true},
+                          {"string", "null", false},
+                          {"bool", "false", true},
+                          {"bool", "0", false},
+                          {"int", "0", true},
+                          {"int", "1.5", false},
+                          {"numberText", "0", true},
+                          {"numberText", "false", false},
+                          {"stringify", "null", true},
+                          {"kind", "null", true},
+                          {"count", "[]", true},
+                          {"count", "0", false},
+                          {"get", "{\"v\":null}", true},
+                          {"get", "{}", false},
+                          {"parse", "null", true},
+                          {"parse", "broken", false}};
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_if_let_extractors").string();
+    for (const auto& test : cases) {
+        const bool parse = strcmp(test.operation, "parse") == 0;
+        std::string source =
+            "upstream ws at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(ws) { msg "
+            "in\n";
+        if (!parse)
+            source += "guard let document = json.parse(msg.text) else { msg.close(1007) }\n";
+        source += "if let value = json.";
+        source += test.operation;
+        source += parse                                ? "(msg.text)"
+                  : strcmp(test.operation, "get") == 0 ? "(document, \"/v\")"
+                                                       : "(document)";
+        source += " { msg.forward(\"present\") } else { msg.forward(\"missing\") } } }\n";
+        auto path = write_file(dir, "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : {false, true})
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(test.value),
+                          static_cast<u32>(strlen(test.value)),
+                          client) ==
+                  (test.present ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        program.destroy();
+    }
+    std::filesystem::remove_all(dir);
+}
+
 TEST(serve_loader, websocket_nested_if_routes_each_arm_and_skips_unreached_json) {
     const char* source = R"rut(upstream backend at "127.0.0.1:9999"
 func identity<T>(_ value: T) -> T => value

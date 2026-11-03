@@ -198,13 +198,14 @@ Conditions and reached `else if` clauses execute in source order. A selected
 verdict ends this callback immediately; later clauses are not evaluated.
 Existing `&&` / `||` short-circuit behavior and fail-closed scan errors are
 preserved. Conditions may call supported ordinary pure helpers or use earlier
-JSON guard aliases. They must have type `bool`; `if let` is not supported yet.
+JSON guard aliases. Boolean conditions must have type `bool`. JSON optional bindings also support
+`if let` as described below.
 
-Each arm contains infallible immutable lets followed by one message verdict
-or a complete nested `if` / `else` tree. Every nested path must end in a verdict. Branch-local names do not escape into the condition, later
+Each arm may contain infallible immutable lets, guards and early if statements,
+then a verdict or terminal nested `if` / `else` tree. Every callback path must
+end in a verdict. Branch-local names do not escape into the condition, later
 statements, sibling arms or later `else if` conditions. Sibling arms may reuse
-fresh names. Guards inside an arm, nested paths that fall through, loops and
-arbitrary expression execution remain unsupported. Every arm is
+fresh names. Loops and arbitrary expression execution remain unsupported. Every arm is
 checked, including an arm made unreachable by a constant condition.
 
 The eight-statement limit applies independently to the callback and each arm.
@@ -244,6 +245,51 @@ locals remain independent of all live callback/branch bindings. All arms remain
 statically checked, including unreachable ones. Target validation permits only
 forward root edges, forward continuation boundaries, the configured default or
 known verdicts; it rejects operand entry, self/backward edges and invalid tags.
+
+### Optional bindings and branch guards
+
+An arm may use ordinary Boolean `guard` conditions or the existing JSON
+`guard let` operations. A successful guard continues in that same arm; its
+failure verdict ends the callback. `if let name = expression` tests optional
+presence and introduces the successful value only in its true arm. A nonterminal
+if-let may exit early on success and continue on absence. `else if let` uses the
+same rules, and sibling arms may reuse a binding name after its previous scope ends.
+
+```swift
+return websocket(chat) { msg in
+    if let document = json.parse(msg.text) {
+        if let field = json.get(document, "/flag") {
+            if let flag = json.bool(field) {
+                guard flag == false else { msg.forward("true") }
+                msg.forward("false")
+            } else { msg.forward("wrong kind") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+}
+```
+
+The optional initializer subset is shared with message guard-let:
+`json.parse(message.text)` (including borrowed text aliases), `json.get` on a
+validated value alias with a literal pointer, and `json.string`, `numberText`,
+`bool`, `int`, `stringify`, `kind` or `count` on a validated value alias. These are
+proof aliases over the immutable message, using the existing JSON parser and
+root-relative paths. General optional helper results and initializer-less
+shorthand bindings remain unsupported.
+
+Presence is separate from truthiness: a valid `false`, `0`, empty string or empty
+collection count binds successfully. A JSON `null` node is present for parse,
+get, kind and stringify; type-specific extractors can still return no value.
+If-let names are unavailable in the failure arm or after the if statement.
+Guard-let names become available only after success, so a guard's failure verdict
+cannot use its new binding. Branch bindings cannot escape to sibling arms or
+later callback statements. Every arm is checked, including unreachable arms.
+
+Early if statements and guards inside an arm resume at the next statement in
+that arm, including a terminal verdict with no intervening predicate. They do
+not fall into a sibling arm or the callback's outer default. Guard, guard-let,
+if and if-let all share the existing four-clause and 32-node budgets; the
+per-block eight-statement limit and literal output limits are unchanged. This
+adds no runtime storage, helper, JIT control tag or native-format change.
 
 After the route's HTTP guards pass, terminate mode validates the opening request
 before connecting to the selected upstream. The supported request shape is GET

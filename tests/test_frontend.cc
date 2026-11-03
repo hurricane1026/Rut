@@ -5587,6 +5587,161 @@ TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
     CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ name in ... }`")));
 }
 
+TEST(frontend, websocket_branch_bindings_scope_guards_and_if_let_values) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/guard" { return websocket(backend) { msg in
+    if msg.fromClient {
+        guard let document = json.parse(msg.text) else { msg.close(1007) }
+        guard let field = json.get(document, "/name") else { msg.close(1008) }
+        guard let name = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + name + ">")
+    } else { msg.forward() }
+} }
+route GET "/iflet" { return websocket(backend) { msg in
+    if let document = json.parse(msg.text) {
+        if let field = json.get(document, "/flag") {
+            if let value = json.bool(field) {
+                guard value == false else { msg.forward("true") }
+                msg.forward("false")
+            } else { msg.forward("wrong") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+} }
+route GET "/continuation" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if let document = json.parse(msg.text) { msg.forward("json") }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/fallthrough" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isText { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/root-iflet" { return websocket(backend) { msg in
+    if let document = json.parse(msg.text) {
+        if let text = json.string(document) { msg.forward(text) }
+        else { msg.drop() }
+    }
+    msg.forward(b"\xff")
+} }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto copied = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*copied);
+    REQUIRE(hir);
+    copied.reset();
+    REQUIRE_EQ(hir->routes.len, 5u);
+    for (u32 i = 0; i < hir->routes.len; ++i) CHECK_EQ(hir->routes[i].locals.len, 0u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, websocket_branch_bindings_reject_scope_escape_wrong_types_and_phases) {
+    const char* bodies[] = {
+        "if let document = json.parse(msg.text) { msg.drop() } else { msg.forward(document) }",
+        "if let document = json.parse(msg.text) { msg.drop() } msg.forward(document)",
+        "if let document = json.parse(msg.text) { msg.drop() } else if let field = "
+        "json.get(document, \"/name\") { msg.drop() } else { msg.forward() }",
+        "if msg.isText { guard let document = json.parse(msg.text) else { msg.drop() } "
+        "msg.forward() } else { guard let field = json.get(document, \"/name\") else { msg.drop() "
+        "} msg.forward() }",
+        "if let value = msg.payload { msg.drop() } else { msg.forward() }",
+        "if let document = json.parse(req.body) { msg.drop() } else { msg.forward() }",
+        "if true { guard 1 else { msg.drop() } msg.forward() } else { msg.drop() }",
+        "if let document = json.parse(msg.text) { if let value = json.bool(document) { guard value "
+        "== \"false\" else { msg.drop() } msg.forward() } else { msg.drop() } } else { "
+        "msg.forward() }",
+        "if let document = json.parse(msg.text) { let document = msg msg.drop() } else { "
+        "msg.forward() }",
+        "if let document = json.parse(msg.text) { guard let document = json.parse(msg.text) else { "
+        "msg.drop() } msg.forward() } else { msg.drop() }",
+        "if let document = json.parse(msg.text) { guard let name = json.string(document) else { "
+        "msg.forward(name) } msg.forward(name) } else { msg.drop() }",
+        "if let json = json.parse(msg.text) { msg.drop() } else { msg.forward() }",
+        "if let msg = json.parse(msg.text) { msg.drop() } else { msg.forward() }",
+        "if false { guard let document = json.parse(req.body) else { msg.drop() } msg.forward() } "
+        "else { msg.forward() }",
+        "if let document = json.parse(msg.text) { guard msg.isText else { msg.drop() } } else { "
+        "msg.forward() }",
+    };
+    for (const char* body : bodies) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";
+        source += body;
+        source += " } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, websocket_branch_bindings_reuse_names_only_across_disjoint_scopes) {
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { msg in
+    if let document = json.parse(msg.text) {
+        if let text = json.string(document) { msg.forward(text) }
+        else { msg.drop() }
+    } else if let document = json.parse(msg.text) {
+        if let text = json.string(document) { msg.forward(text) }
+        else { msg.drop() }
+    } else { msg.forward() }
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 4u);
+}
+
+TEST(frontend, websocket_branch_bindings_share_clause_and_condition_node_limits) {
+    for (u32 count : {3u, 4u}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in if msg.fromClient {\n";
+        for (u32 i = 0; i < count; ++i)
+            source += "guard let document" + std::to_string(i) +
+                      " = json.parse(msg.text) else { msg.drop() }\n";
+        source += "msg.forward() } else { msg.drop() } } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_EQ(hir.has_value(), count == 3);
+        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+    }
+    for (u32 leaves : {15u, 16u}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in if let document = "
+            "json.parse(msg.text) {\n"
+            "guard msg.fromClient else { msg.drop() } guard msg.isText";
+        for (u32 i = 1; i < leaves; ++i) source += " || msg.isBinary";
+        source +=
+            " else { msg.drop() } guard json.get(document, \"/name\") != nil else { msg.drop() } "
+            "msg.forward() } else { msg.drop() } } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_EQ(hir.has_value(), leaves == 15);
+        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+    }
+}
+
 TEST(frontend, websocket_nested_if_preserves_typed_lexical_scope_and_forward_targets) {
     const char* source = R"rut(upstream backend at "127.0.0.1:9999"
 func identity<T>(_ value: T) -> T => value
@@ -5861,9 +6016,9 @@ TEST(frontend, websocket_if_rejects_scope_leaks_bad_types_and_incomplete_paths) 
         "if true { msg.drop() } else { let unused = req.path msg.forward() }",
         "if true { msg.drop() } else if false { let wrong: str = msg.len msg.forward() } else { "
         "msg.forward() }",
-        "if msg.isText { guard true else { msg.drop() } msg.forward() } else { msg.drop() }",
+        "if msg.isText { guard 1 else { msg.drop() } msg.forward() } else { msg.drop() }",
         "if msg.isText { if msg.fromClient { msg.drop() } } else { msg.forward() }",
-        "if let value = json.parse(msg.text) { msg.drop() } else { msg.forward() }",
+        "if let value = msg.payload { msg.drop() } else { msg.forward() }",
     };
     for (const char* body : bodies) {
         std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";

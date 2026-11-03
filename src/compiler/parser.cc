@@ -653,6 +653,14 @@ struct Parser {
             return frontend_error(FrontendError::TooManyItems, span_from(if_tok));
         AstStatement stmt{};
         stmt.kind = AstStmtKind::If;
+        if (take(TokenType::KwLet)) {
+            auto name = expect(TokenType::Ident);
+            if (!name) return core::make_unexpected(name.error());
+            stmt.name = name.value()->text;
+            stmt.bind_value = true;
+            auto eq = expect(TokenType::Eq);
+            if (!eq) return core::make_unexpected(eq.error());
+        }
         auto condition = parse_expr();
         if (!condition) return core::make_unexpected(condition.error());
         stmt.expr = condition.value();

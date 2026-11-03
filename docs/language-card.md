@@ -893,8 +893,8 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // json.parse guards and text rewrites; message aliases can receive verdicts.
 // Eight statements per block, including lets/guards/final verdict. Captured
 // compile-time HTTP values keep their separate 16-local admission budget.
-// The four-clause/32-condition-node limits remain. Optional, JSON and regex let
-// initializers remain unsupported. Bounded if/else verdict branches are supported:
+// The four-clause/32-condition-node limits remain. Optional, JSON and regex
+// ordinary-let initializers remain unsupported. Bounded if/else verdict branches are supported:
 // an if without else may exit early; a terminal if/else-if chain needs a final
 // else. Each arm allows lets followed by a verdict or complete nested if/else
 // tree, with its own lexical scope; every nested path must end in a verdict.
@@ -905,8 +905,14 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // independently of the final else's close policy. Nested arms evaluate each
 // parent condition once and skip sibling arms; an early nested tree's false path
 // resumes after the whole subtree. Both arms count toward the existing limits.
-// Guards inside arms, nested paths that fall through, if-let, loops and general
-// computation remain unsupported.
+// Arms may contain guards and early if statements before their terminal verdict.
+// JSON if-let and else-if-let support the same parse/get/scalar initializer subset
+// as guard-let. If-let names exist only in the true arm; guard-let names exist
+// after success within their current block, never in the failure verdict. Present
+// false, zero and empty string values bind successfully. Early-if false paths and
+// guard success paths resume within the same arm, including its terminal verdict.
+// General optional helpers, binding shorthand, loops and general computation
+// remain unsupported.
 // HTTP reads/effects and message verdicts in helpers are rejected. Helpers cannot
 // retain a message/payload past the callback.
 func allowedMessage(_ msg: WebSocketMessage) -> bool =>

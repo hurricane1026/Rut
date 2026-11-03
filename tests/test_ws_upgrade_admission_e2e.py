@@ -389,6 +389,93 @@ def nested_early_if_exchange(client, peer):
     expect(client, (8, b"\x03\xef", False))
 
 
+BRANCH_GUARD_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        guard let document = json.parse(msg.text) else { msg.close(1007) }
+        guard let field = json.get(document, "/name") else { msg.close(1008) }
+        guard let name = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + name + ">")
+    } else { msg.forward() }
+}
+"""
+
+IF_LET_HANDLER = r"""
+return websocket(ws) { msg in
+    if let document = json.parse(msg.text) {
+        if let field = json.get(document, "/flag") {
+            if let value = json.bool(field) {
+                guard value == false else { msg.forward("true") }
+                msg.forward("false")
+            } else { msg.forward("wrong") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+}
+"""
+
+BRANCH_CONTINUATION_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        if let document = json.parse(msg.text) { msg.forward("json") }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+}
+"""
+
+
+def branch_guard_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"branch guard: {actual=!r}, {expected=!r}")
+    data = b'{"name":"a\\u0000b"}'
+    first = bytearray(masked_frame(1, data[:9]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, data[9:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<a\0b>", True))
+    client.sendall(masked_frame(1, b'{"name":""}'))
+    expect(peer, (1, b"<>", True))
+    peer.sendall(b"\x82\x02\xff\x00")
+    expect(client, (2, b"\xff\x00", False))
+    client.sendall(masked_frame(1, b"broken"))
+    expect(peer, (8, b"\x03\xef", True))
+    expect(client, (8, b"\x03\xef", False))
+
+
+def if_let_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"if let: {actual=!r}, {expected=!r}")
+    for payload, expected in ((b'{"flag":false}', b"false"),
+                              (b'{"flag":true}', b"true"),
+                              (b'{"flag":null}', b"wrong"), (b"{}", b"missing")):
+        client.sendall(masked_frame(2, payload))
+        expect(peer, (1, expected, True))
+    peer.sendall(b'\x81\x0e{"flag":false}')
+    expect(client, (1, b"false", False))
+    client.sendall(masked_frame(1, b"broken"))
+    expect(peer, (8, b"\x03\xef", True))
+    expect(client, (8, b"\x03\xef", False))
+
+
+def branch_continuation_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"branch continuation: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(1, b"broken") + masked_frame(2, b"\xff\x00"))
+    expect(peer, (2, b"\x00\xff", True))
+    client.sendall(masked_frame(1, b"null"))
+    expect(peer, (1, b"json", True))
+    peer.sendall(b"\x82\x02\xff\x00")
+    expect(client, (1, b"server", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
 def payload_bytes_exchange(client, peer):
     def expect(sock, expected):
         actual = recv_client_frame(sock)
@@ -1392,6 +1479,9 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (BRANCH_GUARD_HANDLER, branch_guard_exchange, ""),
+                (IF_LET_HANDLER, if_let_exchange, ""),
+                (BRANCH_CONTINUATION_HANDLER, branch_continuation_exchange, ""),
                 (NESTED_IF_HANDLER, nested_if_exchange, CALLBACK_SCOPE_DECLARATIONS),
                 (NESTED_EARLY_IF_HANDLER, nested_early_if_exchange, ""),
                 (IF_MESSAGE_HANDLER, if_message_exchange, CALLBACK_SCOPE_DECLARATIONS),
@@ -1411,7 +1501,7 @@ def main():
                 else:
                     if status != "pass":
                         raise AssertionError(f"callback scope: {details}")
-                    print(f"PASS {backend} callback scope native={native}")
+                    print(f"PASS {backend} {exchange.__name__} native={native}")
         for native in (False, True):
             if native:
                 status, details = native_binary_source_removal_scenario(
