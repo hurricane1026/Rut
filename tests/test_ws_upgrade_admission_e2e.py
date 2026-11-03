@@ -424,6 +424,24 @@ return websocket(ws) { msg in
 """
 
 
+JSON_HELPER_DECLARATIONS = r"""
+func identity<T>(_ value: T) -> T => value
+func readDocument(_ msg: WebSocketMessage) -> Json => json.parse(identity(msg).text)
+func select(_ root: Json, _ pointer: str) -> Json => json.get(identity(root), pointer)
+func stringValue(_ value: Json) -> str => json.string(value)
+func flag(_ value: Json) -> bool => json.bool(value)
+"""
+
+HELPER_GUARD_HANDLER = (BRANCH_GUARD_HANDLER
+                        .replace("json.parse(msg.text)", "readDocument(msg)")
+                        .replace("json.get(document,", "select(document,")
+                        .replace("json.string(field)", "stringValue(identity(field))"))
+HELPER_IF_LET_HANDLER = (IF_LET_HANDLER
+                         .replace("json.parse(msg.text)", "readDocument(msg)")
+                         .replace("json.get(document,", "select(document,")
+                         .replace("json.bool(field)", "flag(identity(field))"))
+
+
 def branch_guard_exchange(client, peer):
     def expect(sock, expected):
         actual = recv_client_frame(sock)
@@ -1479,6 +1497,8 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (HELPER_GUARD_HANDLER, branch_guard_exchange, JSON_HELPER_DECLARATIONS),
+                (HELPER_IF_LET_HANDLER, if_let_exchange, JSON_HELPER_DECLARATIONS),
                 (BRANCH_GUARD_HANDLER, branch_guard_exchange, ""),
                 (IF_LET_HANDLER, if_let_exchange, ""),
                 (BRANCH_CONTINUATION_HANDLER, branch_continuation_exchange, ""),

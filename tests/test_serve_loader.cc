@@ -6341,6 +6341,83 @@ route GET "/root-iflet" { return websocket(backend) { msg in
     program.destroy();
 }
 
+TEST(serve_loader, websocket_json_helpers_imported_projections_keep_presence_and_paths) {
+    struct Case {
+        const char* operation;
+        const char* type;
+        const char* value;
+        bool present;
+    };
+    const Case cases[] = {{"string", "str", "\"\"", true},
+                          {"string", "str", "null", false},
+                          {"bool", "bool", "false", true},
+                          {"bool", "bool", "0", false},
+                          {"int", "", "0", true},
+                          {"int", "", "1.5", false},
+                          {"numberText", "str", "0", true},
+                          {"numberText", "str", "false", false},
+                          {"stringify", "str", "null", true},
+                          {"kind", "str", "null", true},
+                          {"count", "i32", "[]", true},
+                          {"count", "i32", "0", false}};
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_json_helpers").string();
+    for (const auto& test : cases) {
+        std::string helpers = R"rut(func identity<T>(_ value: T) -> T => value
+func document(_ msg: WebSocketMessage) -> Json => json.parse(identity(msg).text)
+func field(_ root: Json, _ pointer: str) -> Json => json.get(identity(root), pointer)
+func extract(_ value: Json))rut";
+        if (test.type[0] != '\0') {
+            helpers += " -> ";
+            helpers += test.type;
+        }
+        helpers += " => json.";
+        helpers += test.operation;
+        helpers += "(value)\n";
+        write_file(dir, "policy.rut", helpers.c_str());
+        const char* source = R"rut(import "policy.rut"
+upstream ws at "127.0.0.1:9999"
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = policy.document(msg) else { msg.close(1007) }
+    guard let child = policy.field(root, "/a~1b") else { msg.drop() }
+    guard let nested = policy.field(child, "/~0") else { msg.drop() }
+    if let value = policy.extract(policy.identity(nested)) { msg.forward("present") }
+    else { msg.forward("absent") }
+} })rut";
+        auto path = write_file(dir, "app.rut", source);
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        // Handler code and retained paths outlive both source files.
+        std::filesystem::remove(path);
+        std::filesystem::remove(dir + "/policy.rut");
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        std::string payload = "{\"a/b\":{\"~\":";
+        payload += test.value;
+        payload += "}}";
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(payload.data()),
+                              static_cast<u32>(payload.size()),
+                              client) == (test.present ? WsFrameAction::ForwardTextPolicy0
+                                                       : WsFrameAction::ForwardText));
+                const char* invalid[] = {"broken", "{}", "{\"a/b\":{}}"};
+                for (u32 j = 0; j < 3; ++j)
+                    CHECK(handler(nullptr,
+                                  op,
+                                  reinterpret_cast<const u8*>(invalid[j]),
+                                  static_cast<u32>(strlen(invalid[j])),
+                                  client) ==
+                          (j == 0 ? WsFrameAction::ClosePolicy0 : WsFrameAction::Drop));
+            }
+        }
+        program.destroy();
+    }
+    std::filesystem::remove_all(dir);
+}
+
 TEST(serve_loader, websocket_branch_bindings_optional_extractors_test_presence_not_truthiness) {
     struct Case {
         const char* operation;

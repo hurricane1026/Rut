@@ -273,8 +273,29 @@ The optional initializer subset is shared with message guard-let:
 validated value alias with a literal pointer, and `json.string`, `numberText`,
 `bool`, `int`, `stringify`, `kind` or `count` on a validated value alias. These are
 proof aliases over the immutable message, using the existing JSON parser and
-root-relative paths. General optional helper results and initializer-less
-shorthand bindings remain unsupported.
+root-relative paths. Ordinary pure helpers may wrap these same projections. They
+use the normal parameter types, type checking, generic identity helpers and
+import namespaces; JSON arguments must already be unwrapped. Pointer arguments
+must normalize to a compile-time string. Helper calls do not consume additional
+condition clauses and retain the same absence/wrong-kind behavior.
+
+```swift
+func document(_ msg: WebSocketMessage) -> Json => json.parse(msg.text)
+func field(_ value: Json, _ pointer: str) -> Json => json.get(value, pointer)
+func text(_ value: Json) -> str => json.string(value)
+// Inside the callback:
+guard let root = document(msg) else { msg.close(1007) }
+guard let selected = field(root, "/name") else { msg.drop() }
+if let name = text(selected) { msg.forward(name) }
+else { msg.drop() }
+```
+
+This helper subset normalizes to one parse/get/scalar projection over the same
+immutable message. Conditional helper returns, JSON mutation, dynamic pointers,
+HTTP reads/effects and other optional computations remain unsupported. A helper
+may accept the borrowed message or its text, or an earlier validated JSON alias;
+it cannot supply an unrelated JSON document. Initializer-less shorthand bindings
+remain unsupported.
 
 Presence is separate from truthiness: a valid `false`, `0`, empty string or empty
 collection count binds successfully. A JSON `null` node is present for parse,

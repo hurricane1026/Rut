@@ -911,8 +911,19 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // after success within their current block, never in the failure verdict. Present
 // false, zero and empty string values bind successfully. Early-if false paths and
 // guard success paths resume within the same arm, including its terminal verdict.
-// General optional helpers, binding shorthand, loops and general computation
-// remain unsupported.
+// Optional initializers may call pure helpers that normalize to these same JSON
+// projections, including imported helpers and generic identity on unwrapped
+// arguments. JSON arguments require earlier proof aliases; pointers must normalize
+// to compile-time strings. The source must remain this message or its borrowed
+// text. Conditional helper returns, JSON mutations, dynamic pointers, other
+// optional computations, binding shorthand, loops and general computation remain
+// unsupported.
+func messageDocument(_ msg: WebSocketMessage) -> Json => json.parse(msg.text)
+func jsonField(_ value: Json, _ pointer: str) -> Json => json.get(value, pointer)
+func jsonText(_ value: Json) -> str => json.string(value)
+// Inside callback: guard let doc = messageDocument(message) else { message.drop() }
+// guard let field = jsonField(doc, "/name") else { message.drop() }
+// if let text = jsonText(field) { message.forward(text) } else { message.drop() }
 // HTTP reads/effects and message verdicts in helpers are rejected. Helpers cannot
 // retain a message/payload past the callback.
 func allowedMessage(_ msg: WebSocketMessage) -> bool =>

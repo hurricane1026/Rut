@@ -1800,6 +1800,74 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, websocket_json_helpers_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func document(_ msg: WebSocketMessage) -> Json => json.parse(msg.text)
+func select(_ value: Json, _ pointer: str) -> Json => json.get(identity(value), pointer)
+func stringValue(_ value: Json) -> str => json.string(value)
+func flag(_ value: Json) -> bool => json.bool(value)
+route GET "/name" { return websocket(backend) { msg in
+    if msg.fromClient {
+        guard let root = document(msg) else { msg.close(1007) }
+        guard let field = select(root, "/a~1b") else { msg.drop() }
+        guard let text = stringValue(field) else { msg.drop() }
+        msg.forward("<" + text + ">")
+    } else { msg.forward() }
+} }
+route GET "/flag" { return websocket(backend) { msg in
+    if let root = document(identity(msg)) {
+        if let field = select(root, "/flag") {
+            if let value = flag(identity(field)) {
+                guard value == false else { msg.forward("true") }
+                msg.forward("false")
+            } else { msg.forward("wrong") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    const auto names = owner.p->config.routes[0].ws_frame_handler;
+    const auto flags = owner.p->config.routes[1].ws_frame_handler;
+    REQUIRE(names);
+    REQUIRE(flags);
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            const char* strings[] = {
+                "{\"a/b\":\"a\\u0000b\"}", "{\"a/b\":\"\"}", "{\"a/b\":false}", "{}", "broken"};
+            for (u32 j = 0; j < 5; ++j)
+                CHECK(names(nullptr,
+                            op,
+                            reinterpret_cast<const u8*>(strings[j]),
+                            static_cast<u32>(strlen(strings[j])),
+                            client) == (!client ? WsFrameAction::Forward
+                                        : j < 2 ? WsFrameAction::ForwardTextPolicy0
+                                        : j < 4 ? WsFrameAction::Drop
+                                                : WsFrameAction::ClosePolicy0));
+            const char* values[] = {
+                "{\"flag\":false}", "{\"flag\":true}", "{\"flag\":null}", "{}", "broken"};
+            const WsFrameAction actions[] = {WsFrameAction::ForwardTextPolicy1,
+                                             WsFrameAction::ForwardTextPolicy0,
+                                             WsFrameAction::ForwardTextPolicy2,
+                                             WsFrameAction::ForwardTextPolicy3,
+                                             WsFrameAction::Close};
+            for (u32 j = 0; j < 5; ++j)
+                CHECK(flags(nullptr,
+                            op,
+                            reinterpret_cast<const u8*>(values[j]),
+                            static_cast<u32>(strlen(values[j])),
+                            client) == actions[j]);
+        }
+    }
+    const auto& route = owner.p->config.routes[0];
+    CHECK(route.ws_forward_texts[0].source == WsTextSource::JsonString);
+}
+
 TEST(native_program, websocket_branch_bindings_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

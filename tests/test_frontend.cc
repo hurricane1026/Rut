@@ -5587,6 +5587,139 @@ TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
     CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ name in ... }`")));
 }
 
+TEST(frontend, websocket_json_helpers_use_typed_optional_projections) {
+    const char* source = R"rut(upstream ws
+func identity<T>(_ value: T) -> T => value
+func document(_ packet: WebSocketMessage) -> Json => json.parse(identity(packet).text)
+func select(_ value: Json, _ pointer: str) -> Json => json.get(identity(value), pointer)
+func name(_ value: Json) -> str => json.string(value)
+func flag(_ value: Json) -> bool => json.bool(value)
+route GET "/guard" { return websocket(ws) { msg in
+    let packet = identity(msg)
+    guard let root = document(packet) else { msg.close(1007) }
+    guard let field = select(root, "/a~1b") else { msg.drop() }
+    guard let text = name(field) else { msg.drop() }
+    msg.forward("<" + text + ">")
+} }
+route GET "/branch" { return websocket(ws) { msg in
+    if let root = document(msg) {
+        if let field = select(root, "/flag") {
+            if let value = flag(field) {
+                guard value == false else { msg.drop() }
+                msg.forward("false")
+            } else { msg.forward("wrong") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+} }
+route GET "/siblings" { return websocket(ws) { msg in
+    if let root = document(msg) { msg.forward("json") }
+    else if let root = document(identity(msg)) { msg.drop() }
+    else { msg.forward() }
+} }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto copied = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*copied);
+    REQUIRE(hir);
+    copied.reset();
+    REQUIRE_EQ(hir->routes.len, 3u);
+    for (const auto& route : hir->routes) CHECK_EQ(route.locals.len, 0u);
+    const auto& guarded = hir->routes[0].ws_handler;
+    REQUIRE_EQ(guarded.len_guards.len, 3u);
+    CHECK(guarded.len_guards[0].accessor == WsLenGuard::Accessor::JsonValid);
+    CHECK(guarded.len_guards[1].pattern.eq(lit("/a~1b")));
+    CHECK(guarded.len_guards[2].pattern.eq(lit("/a~1b")));
+    CHECK(guarded.forward_payload.source == HirWsTextSource::JsonString);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, websocket_json_helpers_share_all_scalar_and_pointer_projections) {
+    const char* operations[] = {
+        "string", "numberText", "stringify", "bool", "int", "kind", "count"};
+    const char* types[] = {"str", "str", "str", "bool", "", "str", "i32"};
+    for (u32 i = 0; i < 7; ++i) {
+        std::string source = "upstream ws\nfunc extract(_ value: Json)";
+        if (types[i][0] != '\0') {
+            source += " -> ";
+            source += types[i];
+        }
+        source += " => json.";
+        source += operations[i];
+        source += R"rut((value)
+func child(_ value: Json) -> Json => json.get(value, "/n\u{0}~0")
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let field = child(root) else { msg.drop() }
+    if let value = extract(field) { msg.forward() } else { msg.drop() }
+} })rut";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->routes[0].ws_handler.len_guards.len, 3u);
+        CHECK(hir->routes[0].ws_handler.len_guards[2].pattern.eq(Str{"/n\0~0", 5}));
+    }
+}
+
+TEST(frontend, websocket_json_helpers_reject_unproven_values_effects_and_nonprojections) {
+    const char* initializers[] = {"document(req.path)",
+                                  "document(\"{}\")",
+                                  "select(json.parse(msg.text))",
+                                  "changed(msg)",
+                                  "indirect(msg)",
+                                  "conditional(msg)",
+                                  "altered(root)",
+                                  "selectText(root, msg.text)",
+                                  "identity(msg.text)",
+                                  "identity(false)",
+                                  "identity(0)",
+                                  "select(missing)",
+                                  "readHttp(msg)",
+                                  "absent()"};
+    for (const char* initializer : initializers) {
+        std::string source = R"rut(upstream ws
+func identity<T>(_ value: T) -> T => value
+func document(_ text: str) -> Json => json.parse(text)
+func select(_ value: Json) -> Json => json.get(value, "/x")
+func selectText(_ value: Json, _ pointer: str) -> Json => json.get(value, pointer)
+func altered(_ value: Json) -> Json => json.remove(value, "/x")
+func conditional(_ msg: WebSocketMessage) -> Json {
+    if msg.fromClient { json.parse(msg.text) } else { nil }
+}
+func changed(_ msg: WebSocketMessage) -> Json {
+    guard msg.isText else { respond 403 }
+    json.parse(msg.text)
+}
+func indirect(_ msg: WebSocketMessage) -> Json {
+    let ignored = changed(msg)
+    json.parse(msg.text)
+}
+func readHttp(_ msg: WebSocketMessage) -> Json => json.parse(req.body)
+func absent() -> Json => nil
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    if let value = )rut";
+        source += initializer;
+        source += " { msg.forward() } else { msg.drop() } } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+}
+
 TEST(frontend, websocket_branch_bindings_scope_guards_and_if_let_values) {
     const char* source = R"rut(upstream backend at "127.0.0.1:9999"
 route GET "/guard" { return websocket(backend) { msg in

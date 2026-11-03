@@ -7457,23 +7457,29 @@ static const WsJsonBinding* ws_json_scalar_source(const AstExpr& call,
 
 // Resolve relative RFC 6901 paths at compile time. Earlier guards prove the
 // source exists; callbacks keep using one root-relative path and retain no nodes.
+static FrontendResult<Str> ws_json_append_path(Str source,
+                                               Str path,
+                                               Span span,
+                                               const HirModule& mod) {
+    if (source.len > json::kMaxBytes || path.len > json::kMaxBytes - source.len)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              span,
+                              lit_str("combined message JSON pointer exceeds 8192 bytes"));
+    if (source.len == 0) return path;
+    if (path.len == 0) return source;
+    // An invalid relative pointer must fail rather than name a sibling.
+    if (path.ptr[0] != '/') return path;
+    std::string combined(source.ptr, source.len);
+    combined.append(path.ptr, path.len);
+    return intern_analysis_string(mod, std::move(combined));
+}
+
 static FrontendResult<Str> ws_json_get_path(const WsJsonBinding& source,
                                             const AstExpr& pointer,
                                             const HirModule& mod) {
     auto path = decoded_expression_string(pointer.str_value, mod, pointer.span);
     if (!path) return core::make_unexpected(path.error());
-    if (source.path.len > json::kMaxBytes || path->len > json::kMaxBytes - source.path.len)
-        return frontend_error(FrontendError::UnsupportedSyntax,
-                              pointer.span,
-                              lit_str("combined message JSON pointer exceeds 8192 bytes"));
-    if (source.path.len == 0) return path.value();
-    if (path->len == 0) return source.path;
-    // An invalid relative pointer must still fail at runtime, rather than
-    // accidentally naming a sibling when appended to a valid source path.
-    if (path->ptr[0] != '/') return path.value();
-    std::string combined(source.path.ptr, source.path.len);
-    combined.append(path->ptr, path->len);
-    return intern_analysis_string(mod, std::move(combined));
+    return ws_json_append_path(source.path, path.value(), pointer.span, mod);
 }
 
 // Flatten bounded String concatenation around at most one message.text reference.
@@ -8504,173 +8510,207 @@ static FrontendResult<WsVerdict> analyze_ws_verdict_branch(const AstStatement& b
     return result;
 }
 
-// JSON proof aliases share one resolver in guard and if-let conditions.
+// The same projection table describes typed proof values and their bounded
+// presence tests. Helpers reach it only after ordinary type checking/inlining.
+struct WsJsonProjection {
+    WsJsonBinding::Kind kind;
+    json::Op op;
+    HirTypeKind type;
+    WsLenGuard::Accessor accessor;
+};
+static constexpr WsJsonProjection kWsJsonProjections[] = {
+    {WsJsonBinding::Kind::Document,
+     json::Op::Parse,
+     HirTypeKind::Json,
+     WsLenGuard::Accessor::JsonValid},
+    {WsJsonBinding::Kind::SelectedValue,
+     json::Op::Get,
+     HirTypeKind::Json,
+     WsLenGuard::Accessor::JsonHasPath},
+    {WsJsonBinding::Kind::String,
+     json::Op::AsString,
+     HirTypeKind::Str,
+     WsLenGuard::Accessor::JsonStringValid},
+    {WsJsonBinding::Kind::NumberText,
+     json::Op::AsNumber,
+     HirTypeKind::Str,
+     WsLenGuard::Accessor::JsonNumberTextValid},
+    {WsJsonBinding::Kind::JsonStringify,
+     json::Op::Stringify,
+     HirTypeKind::Str,
+     WsLenGuard::Accessor::JsonStringifyValid},
+    {WsJsonBinding::Kind::Boolean,
+     json::Op::AsBool,
+     HirTypeKind::Bool,
+     WsLenGuard::Accessor::JsonBoolValid},
+    {WsJsonBinding::Kind::Integer,
+     json::Op::AsInt,
+     HirTypeKind::I64,
+     WsLenGuard::Accessor::JsonIntValid},
+    {WsJsonBinding::Kind::KindName,
+     json::Op::KindName,
+     HirTypeKind::Str,
+     WsLenGuard::Accessor::JsonHasPath},
+    {WsJsonBinding::Kind::Count,
+     json::Op::Count,
+     HirTypeKind::I32,
+     WsLenGuard::Accessor::JsonCountValid},
+};
+
+// Materialize a proof only in analyzer scratch. It remains a borrowed message
+// projection, never an HTTP local or a runtime JSON object. Earlier guards have
+// established presence, so the reconstructed projection is nonoptional.
+static FrontendResult<HirExpr> ws_json_proof_value(const WsJsonBinding& binding,
+                                                   Span span,
+                                                   WsCallbackScope& scope) {
+    HirExpr receiver{};
+    receiver.kind = HirExprKind::LocalRef;
+    receiver.type = HirTypeKind::WebSocketMessage;
+    receiver.local_index = 0;
+    receiver.span = span;
+    if (!scope.route->exprs.push(receiver)) return frontend_error(FrontendError::OutOfMemory, span);
+    HirExpr text{};
+    text.kind = HirExprKind::WsMessageField;
+    text.type = HirTypeKind::Str;
+    text.str_value = lit_str("text");
+    text.lhs = &scope.route->exprs[scope.route->exprs.len - 1];
+    text.span = span;
+    auto value = make_json_op(json::Op::Parse,
+                              HirTypeKind::Json,
+                              false,
+                              &text,
+                              nullptr,
+                              nullptr,
+                              span,
+                              scope.route.get());
+    if (!value) return value;
+    if (binding.path.len != 0) {
+        HirExpr pointer{};
+        pointer.kind = HirExprKind::StrLit;
+        pointer.type = HirTypeKind::Str;
+        pointer.str_value = binding.path;
+        pointer.span = span;
+        value = make_json_op(json::Op::Get,
+                             HirTypeKind::Json,
+                             false,
+                             &value.value(),
+                             &pointer,
+                             nullptr,
+                             span,
+                             scope.route.get());
+        if (!value) return value;
+    }
+    if (binding.kind == WsJsonBinding::Kind::Document ||
+        binding.kind == WsJsonBinding::Kind::SelectedValue)
+        return value;
+    for (const auto& projection : kWsJsonProjections) {
+        if (projection.kind != binding.kind) continue;
+        return make_json_op(projection.op,
+                            projection.type,
+                            false,
+                            &value.value(),
+                            nullptr,
+                            nullptr,
+                            span,
+                            scope.route.get());
+    }
+    return frontend_error(FrontendError::UnsupportedSyntax, span);
+}
+
+// Only earlier proven, immutable message projections may supply Json arguments.
+// Mutations, fallback expressions and helper control flow cannot masquerade as
+// a root-relative projection. Bound depth independently of helper nesting.
+static FrontendResult<Str> ws_json_proof_path(const HirExpr& value,
+                                              const HirModule& mod,
+                                              u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes || value.type != HirTypeKind::Json ||
+        value.may_nil || value.may_error || value.kind != HirExprKind::JsonOp ||
+        value.args.len == 0 || !value.args[0])
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    if (value.int_value == static_cast<i64>(json::Op::Parse) && value.args.len == 1 &&
+        ws_typed_field(*value.args[0], lit_str("text")))
+        return Str{};
+    if (value.int_value != static_cast<i64>(json::Op::Get) || value.args.len != 2 ||
+        !value.args[1] || value.args[1]->kind != HirExprKind::StrLit)
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    auto source = ws_json_proof_path(*value.args[0], mod, depth + 1);
+    if (!source) return core::make_unexpected(source.error());
+    return ws_json_append_path(source.value(), value.args[1]->str_value, value.span, mod);
+}
+
+// JSON proof aliases share ordinary type checking with pure projection helpers.
 static FrontendResult<u32> analyze_ws_json_binding(const AstStatement& stmt,
                                                    WsVerdict verdict,
                                                    HirRoute& route,
                                                    const HirModule& mod,
                                                    WsJsonBindings& documents,
                                                    WsCallbackScope& scope) {
-    // Document bindings are scoped aliases for this immutable message's JSON.
-    // Reject collisions rather than resolving later expressions as an outer value.
     bool collision =
         stmt.name.eq(route.ws_handler.parameter_name) || stmt.name.eq(lit_str("json")) ||
         user_bound_ident_name(mod, scope.locals.data, scope.locals.len, nullptr, stmt.name);
-    for (u32 binding_index = 0; binding_index < documents.len; ++binding_index)
-        collision |= documents[binding_index].name.eq(stmt.name);
+    for (const auto& binding : documents) collision |= binding.name.eq(stmt.name);
     if (collision)
         return frontend_error(FrontendError::UnsupportedSyntax,
                               stmt.span,
                               lit_str("message guard bindings require a fresh name"));
-    WsJsonBinding binding{};
-    binding.name = stmt.name;
-    WsLenGuard node{};
-    node.verdict = verdict;
-    if (ws_is_json_parse(stmt.expr, mod, route, scope)) {
-        node.accessor = WsLenGuard::Accessor::JsonValid;
-        binding.kind = WsJsonBinding::Kind::Document;
-    } else if (stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs &&
-               stmt.expr.lhs->kind == AstExprKind::Ident &&
-               stmt.expr.lhs->name.eq(lit_str("json")) && stmt.expr.name.eq(lit_str("get")) &&
-               stmt.expr.args.len == 2 && stmt.expr.args[0] && stmt.expr.args[1] &&
-               stmt.expr.args[0]->kind == AstExprKind::Ident &&
-               stmt.expr.args[1]->kind == AstExprKind::StrLit) {
-        const WsJsonBinding* source = ws_json_binding(documents, stmt.expr.args[0]->name);
-        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                        source->kind != WsJsonBinding::Kind::SelectedValue))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("json.get message bindings require a "
-                                          "validated JSON value alias"));
-        auto path = ws_json_get_path(*source, *stmt.expr.args[1], mod);
-        if (!path) return core::make_unexpected(path.error());
-        node.accessor = WsLenGuard::Accessor::JsonHasPath;
-        node.pattern = path.value();
-        binding.kind = WsJsonBinding::Kind::SelectedValue;
-        binding.path = path.value();
-    } else if (stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs &&
-               stmt.expr.lhs->kind == AstExprKind::Ident &&
-               stmt.expr.lhs->name.eq(lit_str("json")) && stmt.expr.name.eq(lit_str("string")) &&
-               stmt.expr.args.len == 1 && stmt.expr.args[0] &&
-               stmt.expr.args[0]->kind == AstExprKind::Ident) {
-        const WsJsonBinding* source = ws_json_binding(documents, stmt.expr.args[0]->name);
-        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                        source->kind != WsJsonBinding::Kind::SelectedValue))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("json.string message bindings require "
-                                          "a validated JSON value alias"));
-        node.accessor = WsLenGuard::Accessor::JsonStringValid;
-        node.pattern = source->path;
-        binding.kind = WsJsonBinding::Kind::String;
-        binding.path = source->path;
-    } else if (stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs &&
-               stmt.expr.lhs->kind == AstExprKind::Ident &&
-               stmt.expr.lhs->name.eq(lit_str("json")) &&
-               stmt.expr.name.eq(lit_str("numberText")) && stmt.expr.args.len == 1 &&
-               stmt.expr.args[0] && stmt.expr.args[0]->kind == AstExprKind::Ident) {
-        const WsJsonBinding* source = ws_json_binding(documents, stmt.expr.args[0]->name);
-        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                        source->kind != WsJsonBinding::Kind::SelectedValue))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("json.numberText message bindings require "
-                                          "a validated JSON value alias"));
-        node.accessor = WsLenGuard::Accessor::JsonNumberTextValid;
-        node.pattern = source->path;
-        binding.kind = WsJsonBinding::Kind::NumberText;
-        binding.path = source->path;
-    } else if (stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs &&
-               stmt.expr.lhs->kind == AstExprKind::Ident &&
-               stmt.expr.lhs->name.eq(lit_str("json")) && stmt.expr.name.eq(lit_str("stringify")) &&
-               stmt.expr.args.len == 1 && stmt.expr.args[0] &&
-               stmt.expr.args[0]->kind == AstExprKind::Ident) {
-        const WsJsonBinding* source = ws_json_binding(documents, stmt.expr.args[0]->name);
-        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                        source->kind != WsJsonBinding::Kind::SelectedValue))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("json.stringify message bindings require "
-                                          "a validated JSON value alias"));
-        node.accessor = WsLenGuard::Accessor::JsonStringifyValid;
-        node.pattern = source->path;
-        binding.kind = WsJsonBinding::Kind::JsonStringify;
-        binding.path = source->path;
-    } else if (stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs &&
-               stmt.expr.lhs->kind == AstExprKind::Ident &&
-               stmt.expr.lhs->name.eq(lit_str("json")) && stmt.expr.name.eq(lit_str("bool")) &&
-               stmt.expr.args.len == 1 && stmt.expr.args[0] &&
-               stmt.expr.args[0]->kind == AstExprKind::Ident) {
-        const WsJsonBinding* source = ws_json_binding(documents, stmt.expr.args[0]->name);
-        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                        source->kind != WsJsonBinding::Kind::SelectedValue))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("json.bool message bindings require a "
-                                          "validated JSON value alias"));
-        node.accessor = WsLenGuard::Accessor::JsonBoolValid;
-        node.pattern = source->path;
-        binding.kind = WsJsonBinding::Kind::Boolean;
-        binding.path = source->path;
-    } else if (stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs &&
-               stmt.expr.lhs->kind == AstExprKind::Ident &&
-               stmt.expr.lhs->name.eq(lit_str("json")) && stmt.expr.name.eq(lit_str("int")) &&
-               stmt.expr.args.len == 1 && stmt.expr.args[0] &&
-               stmt.expr.args[0]->kind == AstExprKind::Ident) {
-        const WsJsonBinding* source = ws_json_binding(documents, stmt.expr.args[0]->name);
-        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                        source->kind != WsJsonBinding::Kind::SelectedValue))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("json.int message bindings require a "
-                                          "validated JSON value alias"));
-        node.accessor = WsLenGuard::Accessor::JsonIntValid;
-        node.pattern = source->path;
-        binding.kind = WsJsonBinding::Kind::Integer;
-        binding.path = source->path;
-    } else if (stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs &&
-               stmt.expr.lhs->kind == AstExprKind::Ident &&
-               stmt.expr.lhs->name.eq(lit_str("json")) && stmt.expr.name.eq(lit_str("kind")) &&
-               stmt.expr.args.len == 1 && stmt.expr.args[0] &&
-               stmt.expr.args[0]->kind == AstExprKind::Ident) {
-        const WsJsonBinding* source = ws_json_binding(documents, stmt.expr.args[0]->name);
-        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                        source->kind != WsJsonBinding::Kind::SelectedValue))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("json.kind message bindings require "
-                                          "a validated JSON value alias"));
-        node.accessor = WsLenGuard::Accessor::JsonHasPath;
-        node.pattern = source->path;
-        binding.kind = WsJsonBinding::Kind::KindName;
-        binding.path = source->path;
-    } else if (stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs &&
-               stmt.expr.lhs->kind == AstExprKind::Ident &&
-               stmt.expr.lhs->name.eq(lit_str("json")) && stmt.expr.name.eq(lit_str("count")) &&
-               stmt.expr.args.len == 1 && stmt.expr.args[0] &&
-               stmt.expr.args[0]->kind == AstExprKind::Ident) {
-        const WsJsonBinding* source = ws_json_binding(documents, stmt.expr.args[0]->name);
-        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                        source->kind != WsJsonBinding::Kind::SelectedValue))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("json.count message bindings require "
-                                          "a validated JSON value alias"));
-        node.accessor = WsLenGuard::Accessor::JsonCountValid;
-        node.pattern = source->path;
-        binding.kind = WsJsonBinding::Kind::Count;
-        binding.path = source->path;
-    } else {
-        return frontend_error(
-            FrontendError::UnsupportedSyntax,
-            stmt.span,
-            lit_str("message guard bindings require json.parse, "
-                    "json.get, json.string, json.numberText, json.bool, "
-                    "json.stringify, json.int, json.kind, or json.count aliases"));
+    const u32 kSavedLocals = scope.locals.len;
+    const auto kAnalyze = [&]() -> FrontendResult<HirExpr> {
+        for (const auto& binding : documents) {
+            auto value = ws_json_proof_value(binding, stmt.span, scope);
+            if (!value) return value;
+            HirLocal local{};
+            local.name = binding.name;
+            local.span = stmt.span;
+            local.ref_index = scope.locals.len;
+            local.type = value->type;
+            local.init = value.value();
+            if (!scope.locals.push(local))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
+        return analyze_ws_value(stmt.expr, scope, mod);
+    };
+    auto value = kAnalyze();
+    scope.locals.len = kSavedLocals;
+    if (!value) return core::make_unexpected(value.error());
+    if (value->kind != HirExprKind::JsonOp || !value->may_nil || value->may_error ||
+        value->args.len == 0 || !value->args[0])
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("message optional bindings require a JSON projection"));
+    for (const auto& projection : kWsJsonProjections) {
+        if (value->int_value != static_cast<i64>(projection.op)) continue;
+        WsJsonBinding binding{};
+        binding.name = stmt.name;
+        binding.kind = projection.kind;
+        WsLenGuard node{};
+        node.verdict = verdict;
+        node.accessor = projection.accessor;
+        if (projection.kind == WsJsonBinding::Kind::Document) {
+            if (value->args.len != 1 || !ws_typed_field(*value->args[0], lit_str("text")))
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+        } else {
+            auto path = ws_json_proof_path(*value->args[0], mod);
+            if (!path) return core::make_unexpected(path.error());
+            if (projection.kind == WsJsonBinding::Kind::SelectedValue) {
+                if (value->args.len != 2 || !value->args[1] ||
+                    value->args[1]->kind != HirExprKind::StrLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                path = ws_json_append_path(path.value(), value->args[1]->str_value, stmt.span, mod);
+                if (!path) return core::make_unexpected(path.error());
+            } else if (value->args.len != 1) {
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            }
+            binding.path = path.value();
+            node.pattern = path.value();
+        }
+        if (!route.ws_handler.len_guards.push(node) || !documents.push(binding))
+            return frontend_error(FrontendError::TooManyItems, stmt.span);
+        return route.ws_handler.len_guards.len - 1;
     }
-    if (!route.ws_handler.len_guards.push(node) || !documents.push(binding))
-        return frontend_error(FrontendError::TooManyItems, stmt.span);
-    return route.ws_handler.len_guards.len - 1;
+    return frontend_error(FrontendError::UnsupportedSyntax,
+                          stmt.span,
+                          lit_str("message optional bindings require parse/get/scalar JSON "
+                                  "projections, directly or through pure helpers"));
 }
 
 static FrontendResult<u32> analyze_ws_branch_guard(const AstStatement& stmt,

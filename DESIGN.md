@@ -2958,8 +2958,17 @@ aliases are added after analyzing their failure verdict, so failure cannot read
 its not-yet-bound value. A branch saves/restores both ordinary and JSON binding
 scopes. This supports the existing parse/get/string/numberText/bool/int/stringify/
 kind/count subset, including false/zero/empty successful values and JSON null
-presence where the operation defines it. General optional helpers and shorthand
-bindings remain absent.
+presence where the operation defines it. Optional initializers also accept pure
+helpers that normalize to the same parse/get/scalar projection. The analyzer
+materializes earlier proof aliases as nonoptional typed expressions in temporary
+scratch locals, runs ordinary type checking and helper normalization, then
+restores the local scope. Only projections rooted in this callback's borrowed
+message and compile-time pointer strings lower to the existing presence tests.
+Generic forwarding of unwrapped inputs and imported helper namespaces use their
+ordinary language semantics. No proof value escapes into HTTP/MIR storage.
+Conditional helper returns, JSON mutations, dynamic pointer expressions and other
+optional computations remain absent, as do initializer-less shorthand bindings.
+Helper calls introduce no additional condition clauses, runtime storage or ABI.
 
 A branch sequence tracks its entry and pending continuation edge. A guard's
 success edge or an early if's false edge is patched to the next source condition,
