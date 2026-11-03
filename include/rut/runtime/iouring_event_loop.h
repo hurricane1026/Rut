@@ -33,11 +33,13 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace rut {
@@ -736,11 +738,13 @@ public:
         while (is_running()) {
             retry_strict_upstream_retirement_cancels();
             retry_response_splice_cancels();
+            const bool fetch_busy =
+                config_ptr && *config_ptr && (*config_ptr)->rs256_fetch_busy(shard_id);
             const u32 kEventCount = backend.wait(events,
                                                  kMaxEventsPerWait,
                                                  conns,
                                                  slots_initialized,
-                                                 deferred_relay_read_count == 0);
+                                                 deferred_relay_read_count == 0 && !fetch_busy);
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -750,6 +754,13 @@ public:
             }
             relay_budget_calls = kRelayTurnMaxCalls;
             relay_budget_bytes = kRelayTurnMaxBytes;
+            if (fetch_busy && kEventCount == 0) {
+                // Advance nonblocking TLS state regularly on an idle shard
+                // without spinning while the fetch socket has no gateway slot.
+                struct timespec pause = {0, 10'000'000};
+                while (clock_nanosleep(CLOCK_MONOTONIC, 0, &pause, &pause) == EINTR) {
+                }
+            }
             dispatch_batch(events, kEventCount);
             rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
@@ -777,6 +788,7 @@ public:
                 }
             }
         }
+        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
     }
 
     // A close-path relay cancel can fail transiently when the SQ is full.  Keep
@@ -828,9 +840,11 @@ public:
     bool is_draining() const { return draining_.load(std::memory_order_acquire); }
 
     void poll_command() {
+        if (config_ptr && *config_ptr) (*config_ptr)->refresh_rs256(shard_id);
         if (!control) return;
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
         if (cfg && config_ptr) {
+            if (*config_ptr && *config_ptr != cfg) (*config_ptr)->cancel_rs256(shard_id);
             (void)cfg->activate_rs256(shard_id);
             *config_ptr = cfg;
             // A reload may repoint an upstream endpoint under the same

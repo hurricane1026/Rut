@@ -2,6 +2,11 @@
 // Supply a trusted JSON document with issuer, audience, approved kids and jwks:
 // {"issuer":"https://issuer.example","audience":"orders",
 //  "kids":["current","previous"],"jwks":{"keys":[...public RSA JWKs...]}}.
+// Optional policy controls: "revokedJtis":["compromised-id"], "issuedAfter":1700000000.
+// revokedJtis requires a nonempty jti; issuedAfter requires iat strictly after it.
+// Adopt replacement configuration to update revocation; old readers keep old policy.
+// Optional remoteJwks config pins IPv4, TLS hostname, CA, path and cache deadlines;
+// remote mode rejects until its first successful fetch. See docs/language-card.md.
 // Keys must explicitly declare alg=RS256. Never populate policy from a request.
 import "middleware/auth.rut"
 

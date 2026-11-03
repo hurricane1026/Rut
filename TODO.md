@@ -635,6 +635,11 @@ canonical spelling for common gateway tasks.
 
 ### M4：身份、安全与企业访问（清单 3、4）
 
+- [x] 静态 RS256 策略支持 `revokedJtis` 和 `issuedAfter`；验证通过后才发布 claims。
+- [x] 固定 IPv4、TLS 主机名与 CA 的有界远程 JWKS 获取、shard 独立缓存/刷新、
+  最大年龄拒绝和取消回收；只导入预先批准 kid，不按 Token 触发请求。
+- [ ] JWKS DNS/discovery、自动新 kid 准入、其他传输与缓存 profile 仍需验收。
+
 - [x] 通用 MD5、SHA-1/224/256/384/512 及对应 HMAC：固定函数名选择算法，
   返回 `str?` 小写 hex；输入有界、request arena 拥有结果；JWT/Webhook 共用底座。
 - [ ] Hash const-evaluation、SHA-3 等其他摘要族及独立编码/字符串提取能力。

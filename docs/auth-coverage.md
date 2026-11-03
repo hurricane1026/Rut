@@ -16,7 +16,7 @@ whether a competing open-source edition includes them.
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
-| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection and static rotation; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | ES keys, remote JWKS refresh/cache, live and durable token revocation; arbitrary claims and non-HS256 signing |
+| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and RS256 policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | ES keys, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
@@ -683,5 +683,60 @@ zero crypto allocations during warmed verification.
 
 See [the language card](language-card.md#rs256-with-a-configured-trust-policy)
 for exact bounds and [the runnable example](../examples/jwt-rs256-auth.rut).
-Remote key refresh, OAuth/OIDC and persistent revocation/replay state remain
-outside this implemented static resource-server profile.
+The bounded remote-JWKS and revocation-snapshot extensions are described below.
+OAuth/OIDC and persistent online revocation/replay state remain separate work.
+
+
+## Configuration-owned RS256 token revocation
+
+The trusted policy accepts optional `revokedJtis` (up to 64 distinct, nonempty
+IDs of at most 128 decoded bytes) and `issuedAfter` (positive i64 Unix seconds).
+Supplying `revokedJtis`, even `[]`, requires a bounded nonempty string `jti`;
+exact decoded matches reject. Supplying `issuedAfter` independently requires
+integer `iat` strictly later than the cutoff, in addition to the existing
+no-future-issuance rule. Configuration errors fail before activation. Signature,
+claims and revocation must all pass before claims or identity are published.
+
+Native tests cover escaped and binary IDs, exact case/prefix behavior, missing
+and malformed claims, duplicate decoded IDs, bounds, cutoff equality, zero
+observed warmed crypto allocations, independent shard rows, owned configuration
+bytes and old/new generations. HTTP/JIT tests check 401 Bearer challenges and no
+identity-body publication after revocation; native artifact tests apply the same
+policy after compiler exit and source removal.
+
+This is immutable snapshot revocation through the existing configuration/RCU
+lifecycle. It does not add an online mutation API, distributed persistence,
+remote JWKS refresh, or token replay protection. Old readers retain old policy;
+operators must durably retain and distribute the source revocation configuration.
+The complete JSON policy remains bounded to 8192 bytes. See the language card
+for syntax and rollout semantics.
+
+
+
+## Bounded remote JWKS refresh
+
+The existing compiled RS256 policy accepts a trusted `remoteJwks` endpoint with
+fixed IPv4, TLS hostname, CA, path, refresh interval, maximum cache age and total
+fetch timeout. The initial JWKS defines approved IDs but does not authenticate
+remote-mode requests before the first successful fetch. Only configured approved
+kids can be imported. A valid empty intersection immediately removes cached keys.
+There is no token-triggered fetch, DNS, discovery or redirect following.
+
+The reusable bounded HTTPS state machine and existing HTTP/chunk parsers accept
+200 JSON bodies with strict framing, byte limits and authenticated transport.
+Each shard prepares a separate verifier bank before replacing its cache. Failures
+retain old keys only until monotonic maximum age; no failed response renews it.
+Verification performs no I/O/import, and config adoption/shutdown cancel the
+retired task. TLS/socket ownership has no in-flight kernel buffer dependency.
+
+Unit tests cover fragmentation, framing ambiguity, media/size limits, TLS hostname
+and CA failures, timeout/cancel, cache expiry, HTTP/JSON failures, key replacement,
+authoritative removal and shard isolation. Real gateway tests are registered
+separately for epoll and io_uring; unavailable io_uring is explicitly skipped.
+They execute compiled native policy, fetch from a local certificate-authenticated
+HTTPS origin and verify rotation, empty-set removal, outage/malformed-response
+expiry, recovery and shutdown. See the language card for exact supported scope.
+
+This closes the fixed-endpoint/approved-kid refresh slice, not remote discovery,
+automatic new-kid admission, conditional revalidation, HTTP/2/compression,
+cross-node synchronization, online Token revocation, signing or JWE.

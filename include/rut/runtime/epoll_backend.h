@@ -247,7 +247,11 @@ struct EpollBackend {
 
     // Wait for events, perform I/O, return completion events.
     // conns + max_conns: connection table for recv into Connection::recv_buf.
-    u32 wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
+    u32 wait(IoEvent* events,
+             u32 max_events,
+             Connection* conns,
+             u32 max_conns,
+             u32 maintenance_timeout_ms = ~u32{0});
 
     // Shutdown and close fds.
     void shutdown();

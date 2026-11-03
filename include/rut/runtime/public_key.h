@@ -93,6 +93,9 @@ public:
     void reset();
     [[nodiscard]] bool valid() const { return count_ != 0; }
     [[nodiscard]] u32 size() const { return count_; }
+    Str kid_at(u32 index) const {
+        return index < count_ ? Str{ids_[index], lengths_[index]} : Str{};
+    }
 };
 
 // Shard-owned verification workspace. Initialize on the execution shard before

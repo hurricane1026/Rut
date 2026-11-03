@@ -8791,8 +8791,8 @@ invalid tokens to a challenged 401.
 `examples/jwt-claims-auth.rut` pins HS256 before checking issuer, audience,
 expiry and scopes. Signature verification does not replace claims policy.
 This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism;
-Other asymmetric algorithms and remote JWKS refresh remain separate work;
-configured RS256 verification is described below.
+Other asymmetric algorithms remain separate work; configured RS256 verification
+and its bounded remote-JWKS profile are described below.
 
 ### Static HS JWT secret rotation
 
@@ -9203,3 +9203,73 @@ scope before mapping subject to Identity; its credential ID names trusted
 configuration rather than a token claim. Static key rotation/revocation uses
 configuration replacement. Remote JWKS refresh, OIDC discovery/login, token
 revocation lists and replay tracking remain separate capabilities.
+
+
+### Configuration-owned RS256 token revocation
+
+The existing `Crypto.jwtRs256(token, policy)` static resource-server policy also
+accepts optional `revokedJtis` and `issuedAfter`. No new keyword or verification
+builtin is introduced. `revokedJtis` holds at most 64 distinct nonempty IDs of
+at most 128 decoded UTF-8 bytes each; its presence (even an empty array) requires
+a nonempty bounded string `jti`. Compare exact decoded bytes only after signature
+and issuer/audience/time validation. `issuedAfter` is a positive i64 Unix second
+and independently requires integer `iat > issuedAfter`; future `iat` remains
+invalid. Invalid types, bounds, duplicate decoded configuration IDs or duplicate
+JSON names reject the configuration. Omitting both controls preserves the existing
+profile. The complete policy text still has the 8192-byte limit.
+
+Revocation data belongs to the immutable configuration owner and is applied by
+the shared runtime verifier for JIT and native handlers before claims publication.
+Failure clears document validity/source/node count and output length. Verification
+uses caller scratch and no additional allocation. A replacement RCU generation
+changes revocation without removing signing keys; old in-flight readers keep their
+original trust policy. Distribute and persist the source configuration explicitly:
+this is snapshot revocation, not a mutable cross-shard/node store, replay prevention,
+OAuth revocation/introspection or remote JWKS refresh. See the language card for
+the executable contract and the auth ledger for remaining work.
+
+
+
+### Configuration-owned remote JWKS refresh
+
+An optional eight-field `remoteJwks` object extends the existing static RS256
+policy without a new language keyword, dependency or handler ABI. See the
+language card for exact syntax and bounds. A fixed IPv4 endpoint, CA file,
+certificate hostname and origin-form path define a trusted TLS GET. No Token
+field selects endpoints/algorithms or triggers refresh. Initial JWKS keys only
+establish the approved kid inventory in remote mode; no token verifies before
+the first authenticated successful fetch.
+
+`HttpsFetch` is a reusable bounded cold maintenance task. It reuses the pinned
+OpenSSL client, HTTP response parser and chunk decoder. Its connection proceeds
+through function-pointer callbacks with nonblocking sockets and no readiness
+waits; each maintenance call makes at most 16 steps. It owns all buffers and has
+no outstanding kernel buffer references, so cancellation closes its socket/TLS
+session directly for both epoll and io_uring. The public TLS interface uses opaque
+crypto handles, keeping OpenSSL headers out of configuration-only compiler units.
+
+`Rs256Policies` allocates remote workspaces before publication. Each shard loads
+its own TLS context at activation, then polls maintenance between handler batches.
+A fresh response imports only configured kids and warms a separate verifier bank
+before swapping the shard-local active bank. Verification is synchronous and
+retains no key references; published Json payloads remain request-owned. No active
+verifier is destroyed while a handler is executing. Static policies retain their
+existing verification path and do not read an additional maintenance clock.
+
+The HTTP profile accepts bounded 200 JSON/JWK-set responses with unambiguous
+length, chunked or authenticated close framing. Wrong certificates, redirects,
+compression, ambiguous/truncated/oversize messages and invalid keys never publish.
+A valid empty trusted-key intersection immediately removes prior keys. Failed
+refreshes preserve the last cache only within its monotonic maximum age; they do
+not renew it. Missing/expired caches and failed clocks reject. Refresh cadence and
+total connection timeout are explicit bounded configuration, independent of
+untrusted Cache-Control and token traffic.
+
+Both event-loop implementations poll this same task; the specialized epoll/kqueue
+loops use the same maintenance hook. Config replacement cancels the retiring shard's
+fetch while preserving its RCU-owned keys for existing readers until expiration;
+shutdown/destruction close resources. No blocking DNS/network operation, request-
+time key parsing, coroutine, virtual dispatch, external HTTP client library or
+cross-shard mutable cache is introduced. DNS/discovery, new-kid auto-admission,
+HTTP/2, conditional cache revalidation and distributed refresh coordination remain
+outside this bounded profile.

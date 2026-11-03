@@ -1024,3 +1024,228 @@ TEST(jwt_rs256,
     CHECK(
         !policies.verify(0, text, document, fixture.first, 100, payload, sizeof(payload), length));
 }
+
+static Str policy_with_revocation(SelectedKeyFixture& fixture, Str options, char* bytes) {
+    json::Writer writer{bytes, Rs256Policy::kMaxText};
+    writer.text(lit_str(
+        R"({"issuer":"issuer","audience":"gateway","kids":["current","previous"],"jwks":)"));
+    writer.text(fixture.configuration_view);
+    writer.text(options);
+    writer.put('}');
+    return writer.ok ? Str{bytes, writer.len} : Str{};
+}
+
+TEST(jwt_rs256, revocation_requires_verified_ids_and_strict_issued_after_before_publication) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    char bytes[8192];
+    const Str text = policy_with_revocation(
+        fixture, lit_str(R"(,"revokedJtis":["revoked","a\u0000b"],"issuedAfter":50)"), bytes);
+    REQUIRE(text.len);
+    Rs256Policies policies;
+    REQUIRE(policies.load(&text, 1));
+    REQUIRE(policies.activate(0));
+    REQUIRE(policies.activate(1));
+    const Str cases[] = {
+        lit_str(R"({"jti":"live","iat":51})"),
+        lit_str(R"({"jti":"Revoked","iat":51})"),
+        lit_str(R"({"jti":"revoked-prefix","iat":51})"),
+        lit_str(R"({"jti":"a","iat":51})"),
+        lit_str(R"({"jti":"revoked","iat":51})"),
+        lit_str(R"({"jti":"revo\u006bed","iat":51})"),
+        lit_str(R"({"jti":"a\u0000b","iat":51})"),
+        lit_str(R"({"jti":"live","iat":50})"),
+        lit_str(R"({"jti":"live","iat":49})"),
+        lit_str(R"({"jti":"live","iat":101})"),
+        lit_str(R"({"jti":"live"})"),
+        lit_str(R"({"iat":51})"),
+        lit_str(R"({"jti":"","iat":51})"),
+        lit_str(R"({"jti":null,"iat":51})"),
+        lit_str(R"({"jti":42,"iat":51})"),
+        lit_str(R"({"jti":[],"iat":51})"),
+        lit_str(R"({"jti":"live","iat":"51"})"),
+        lit_str(R"({"jti":"live","iat":51.0})"),
+        lit_str(R"({"jti":"live","iat":51,"j\u0074i":"other"})"),
+    };
+    json::Document document;
+    char payload[8192];
+    char token[4096];
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char claims[1024];
+        json::Writer writer{claims};
+        writer.text(lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,)"));
+        writer.text({cases[i].ptr + 1, cases[i].len - 1});
+        const Str signed_token = token_for(fixture.current.rsa,
+                                           lit_str(R"({"alg":"RS256","kid":"current"})"),
+                                           {claims, writer.len},
+                                           token);
+        REQUIRE(signed_token.len);
+        for (u32 shard = 0; shard < 2; ++shard) {
+            REQUIRE(document.parse(lit_str("{}")));
+            u32 length = 99;
+            allocations = 0;
+            tracking = true;
+            const bool accepted = policies.verify(
+                shard, text, document, signed_token, 100, payload, sizeof(payload), length);
+            tracking = false;
+            CHECK_EQ(allocations, 0u);
+            CHECK_EQ(accepted, i < 4);
+            CHECK_EQ(document.valid, accepted);
+            if (!accepted) {
+                CHECK_EQ(length, 0u);
+                CHECK_EQ(document.count, 0u);
+                CHECK_EQ(document.source.len, 0u);
+            }
+        }
+    }
+}
+
+TEST(jwt_rs256, revocation_configuration_rejects_malformed_duplicate_and_oversized_ids) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    const Str invalid[] = {
+        lit_str(R"(,"revokedJtis":null)"),
+        lit_str(R"(,"revokedJtis":{})"),
+        lit_str(R"(,"revokedJtis":[""])"),
+        lit_str(R"(,"revokedJtis":[1])"),
+        lit_str(R"(,"revokedJtis":["same","s\u0061me"])"),
+        lit_str(R"(,"revokedJtis":[],"revokedJtis":[])"),
+        lit_str(R"(,"issuedAfter":0)"),
+        lit_str(R"(,"issuedAfter":-1)"),
+        lit_str(R"(,"issuedAfter":1.0)"),
+        lit_str(R"(,"issuedAfter":"1")"),
+        lit_str(R"(,"issuedAfter":null)"),
+        lit_str(R"(,"issuedAfter":9223372036854775808)"),
+        lit_str(R"(,"issuedAfter":1,"issuedAfter":2)"),
+    };
+    char bytes[8192];
+    for (const Str options : invalid) {
+        const Str text = policy_with_revocation(fixture, options, bytes);
+        REQUIRE(text.len);
+        Rs256Policy policy;
+        CHECK(!policy.load(text));
+        CHECK(!policy.keys().valid());
+    }
+    const u32 counts[] = {64, 65};
+    for (u32 count : counts) {
+        char options[2048];
+        json::Writer writer{options, sizeof(options)};
+        writer.text(lit_str(R"(,"revokedJtis":[)"));
+        for (u32 i = 0; i < count; ++i) {
+            if (i) writer.put(',');
+            writer.put('"');
+            writer.put(static_cast<char>('A' + i / 26));
+            writer.put(static_cast<char>('a' + i % 26));
+            writer.put('"');
+        }
+        writer.put(']');
+        REQUIRE(writer.ok);
+        const Str text = policy_with_revocation(fixture, {options, writer.len}, bytes);
+        Rs256Policy policy;
+        CHECK_EQ(policy.load(text), count == 64);
+    }
+    const u32 lengths[] = {128, 129};
+    for (u32 length : lengths) {
+        char options[256];
+        json::Writer writer{options, sizeof(options)};
+        writer.text(lit_str(R"(,"revokedJtis":[")"));
+        for (u32 i = 0; i < length; ++i) writer.put('a');
+        writer.text(lit_str("\"]"));
+        const Str text = policy_with_revocation(fixture, {options, writer.len}, bytes);
+        Rs256Policy policy;
+        CHECK_EQ(policy.load(text), length == 128);
+    }
+}
+
+TEST(jwt_rs256, revocation_snapshots_preserve_old_readers_and_own_configuration) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    char old_bytes[8192], next_bytes[8192];
+    const Str old_text =
+        policy_with_revocation(fixture, lit_str(R"(,"revokedJtis":[])"), old_bytes);
+    const Str next_text =
+        policy_with_revocation(fixture, lit_str(R"(,"revokedJtis":["token-1"])"), next_bytes);
+    Rs256Policies old, next;
+    REQUIRE(old.load(&old_text, 1));
+    REQUIRE(next.load(&next_text, 1));
+    REQUIRE(old.activate(0));
+    REQUIRE(next.activate(0));
+    char token[4096], payload[8192];
+    const Str signed_token = token_for(
+        fixture.previous.rsa,
+        lit_str(R"({"alg":"RS256","kid":"previous"})"),
+        lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"jti":"token-1"})"),
+        token);
+    REQUIRE(signed_token.len);
+    json::Document document;
+    u32 length = 0;
+    CHECK(old.verify(0, old_text, document, signed_token, 100, payload, sizeof(payload), length));
+    CHECK(
+        !next.verify(0, next_text, document, signed_token, 100, payload, sizeof(payload), length));
+    CHECK(old.verify(0, old_text, document, signed_token, 100, payload, sizeof(payload), length));
+    // Caller-owned bytes may disappear; IDs and lookup text remain owned.
+    char saved[8192];
+    __builtin_memcpy(saved, next_text.ptr, next_text.len);
+    __builtin_memset(next_bytes, '!', next_text.len);
+    CHECK(!next.verify(
+        0, {saved, next_text.len}, document, signed_token, 100, payload, sizeof(payload), length));
+    CHECK_EQ(length, 0u);
+    CHECK(!document.valid);
+}
+
+TEST(jwt_rs256, optional_revocation_controls_are_independent_and_bound_decoded_jti_bytes) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    char bytes[8192];
+    const Str options[] = {
+        lit_str(""), lit_str(R"(,"revokedJtis":[])"), lit_str(R"(,"issuedAfter":50)")};
+    for (u32 control = 0; control < 3; ++control) {
+        const Str text = policy_with_revocation(fixture, options[control], bytes);
+        Rs256Policies policies;
+        REQUIRE(policies.load(&text, 1));
+        REQUIRE(policies.activate(0));
+        char token[4096], payload[8192];
+        json::Document document;
+        u32 length = 0;
+        const Str no_jti = token_for(
+            fixture.current.rsa,
+            lit_str(R"({"alg":"RS256","kid":"current"})"),
+            lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"iat":51})"),
+            token);
+        CHECK_EQ(policies.verify(0, text, document, no_jti, 100, payload, sizeof(payload), length),
+                 control != 1);
+        for (u32 size = 128; size <= 129; ++size) {
+            char claims[2048];
+            json::Writer writer{claims, sizeof(claims)};
+            writer.text(
+                lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"jti":")"));
+            // Escaped source length is irrelevant: apply the decoded-byte limit.
+            for (u32 i = 0; i < size; ++i) writer.text(lit_str("\\u0061"));
+            writer.text(lit_str("\"}"));
+            REQUIRE(writer.ok);
+            const Str value = token_for(fixture.current.rsa,
+                                        lit_str(R"({"alg":"RS256","kid":"current"})"),
+                                        {claims, writer.len},
+                                        token);
+            REQUIRE(value.len);
+            CHECK_EQ(
+                policies.verify(0, text, document, value, 100, payload, sizeof(payload), length),
+                control == 0 || (control == 1 && size == 128));
+        }
+    }
+}
+
+TEST(jwt_rs256, separate_jwks_import_does_not_inherit_failed_policy_extensions) {
+    SelectedKeyFixture fixture;
+    REQUIRE(fixture.init());
+    Rs256Policy policy;
+    CHECK(!policy.load(lit_str(
+        R"({"issuer":"issuer","audience":"gateway","revokedJtis":[],"issuedAfter":50,"kids":["current"],"jwks":{"keys":[]}})")));
+    const Str approved[] = {lit_str("current"), lit_str("previous")};
+    REQUIRE(policy.load_jwks(
+        fixture.configuration_view, lit_str("issuer"), lit_str("gateway"), approved, 2));
+    json::Document document;
+    REQUIRE(document.parse(kSelectedClaims));
+    CHECK(policy.permits(document));
+    CHECK(!policy.remote().enabled());
+}

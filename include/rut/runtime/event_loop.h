@@ -751,6 +751,7 @@ public:
                 }
             }
         }
+        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
     }
 
     void stop() { running_.store(false, std::memory_order_release); }
@@ -761,11 +762,13 @@ public:
     // Zero-cost when neither flag is set (two atomic loads, both predicted
     // not-taken).
     void poll_command() {
+        if (config_ptr && *config_ptr) (*config_ptr)->refresh_rs256(shard_id);
         if (!control) return;
         // Single atomic exchange per slot: read + clear in one op.
         // nullptr = no update; non-null = apply.
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
         if (cfg && config_ptr) {
+            if (*config_ptr && *config_ptr != cfg) (*config_ptr)->cancel_rs256(shard_id);
             (void)cfg->activate_rs256(shard_id);
             *config_ptr = cfg;
         }

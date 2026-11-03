@@ -762,6 +762,9 @@ jobs:
           LLVM_PROFILE_FILE=build/test_ws_upgrade_admission.profraw ./build/tests/test_ws_upgrade_admission
           LLVM_PROFILE_FILE=build/test_http_tokens.profraw ./build/tests/test_http_tokens
           LLVM_PROFILE_FILE=build/test_http_cache.profraw ./build/tests/test_http_cache
+          LLVM_PROFILE_FILE=build/test_https_fetch.profraw ./build/tests/test_https_fetch
+          LLVM_PROFILE_FILE=build/test_jwt_rs256.profraw ./build/tests/test_jwt_rs256
+          LLVM_PROFILE_FILE=build/test_public_key.profraw ./build/tests/test_public_key
 
       - name: Generate coverage report
         run: |
@@ -818,4 +821,7 @@ jobs:
             build/tests/test_simulate_engine \
             build/tests/test_route_trie \
             build/tests/test_route_art \
-            build/tests/test_route_select
+            build/tests/test_route_select \
+            build/tests/test_https_fetch \
+            build/tests/test_jwt_rs256 \
+            build/tests/test_public_key

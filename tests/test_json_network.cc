@@ -2627,3 +2627,89 @@ route "/partial" {
     loop->free_conn(*conn);
     pool.destroy();
 }
+
+TEST(json_network, rs256_revocation_rejects_before_identity_publication) {
+    test::Rs256Fixture fixture;
+    REQUIRE(fixture.init());
+    std::string policy(fixture.policy.ptr, fixture.policy.len - 1);
+    policy += R"(,"revokedJtis":["revoked"],"issuedAfter":50})";
+    char source[8192];
+    json::Writer writer{source, sizeof(source) - 1};
+    writer.text(lit_str(R"rut(import "middleware/auth.rut"
+route GET "/" {
+    let identity = auth.jwtIdentityRs256(req.authorization.or(""), )rut"));
+    REQUIRE(json::quote({policy.data(), static_cast<u32>(policy.size())}, writer));
+    writer.text(lit_str(R"rut(, "read", "issuer-rs256")
+    let user = identity.consumerId
+    return response(200, body: user)
+}
+)rut"));
+    REQUIRE(writer.ok);
+    source[writer.len] = '\0';
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/jwt-rs256-auth.rut";
+    JsonProgram program;
+    REQUIRE(program.init(source, source_path.c_str()));
+    REQUIRE(program.config->activate_rs256(0));
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    conn->json_arena.backend.pool = &pool;
+    const struct {
+        const char* extra;
+        u32 status;
+    } cases[] = {
+        {R"(,"jti":"live","iat":51)", 200},
+        {R"(,"jti":"revoked","iat":51)", 401},
+        {R"(,"jti":"live","iat":50)", 401},
+        {R"(,"jti":"live","iat":49)", 401},
+        {R"(,"jti":"live")", 401},
+        {R"(,"iat":51)", 401},
+        {R"(,"jti":null,"iat":51)", 401},
+        {R"(,"jti":"revo\u006bed","iat":51)", 401},
+        {R"(,"jti":"Revoked","iat":51)", 200},
+    };
+    for (const auto& item : cases) {
+        std::string claims(test::Rs256Fixture::claims.ptr, test::Rs256Fixture::claims.len - 1);
+        claims += item.extra;
+        claims += '}';
+        char token[4096];
+        const Str signed_token = fixture.sign(
+            test::Rs256Fixture::header, {claims.data(), static_cast<u32>(claims.size())}, token);
+        REQUIRE(signed_token.len);
+        const std::string request =
+            "GET / HTTP/1.1\r\nHost: test\r\nX-Consumer-ID: attacker\r\n"
+            "Authorization: Bearer " +
+            std::string(signed_token.ptr, signed_token.len) + "\r\n\r\n";
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        test_fault::ScopedSyscallFault clock(
+            test_fault::fixed_clock_gettime(CLOCK_REALTIME, 100, 0));
+        const auto result = invoke_jit_handler(
+            program.handler(), conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        CHECK_EQ(result.status_code, item.status);
+        handle_jit_outcome(loop.get(), *conn, result, program.handler(), true);
+        const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+        if (item.status == 200) {
+            CHECK(response.ends_with("alice"));
+        } else {
+            CHECK(response.find("alice") == std::string::npos);
+            CHECK(response.find("WWW-Authenticate: Bearer") != std::string::npos);
+            CHECK(!conn->jit_response_body_valid);
+        }
+    }
+    loop->free_conn(*conn);
+    pool.destroy();
+}

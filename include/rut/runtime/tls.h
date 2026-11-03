@@ -5,8 +5,14 @@
 #include "rut/common/upstream_tls.h"
 #include "rut/runtime/error.h"
 
-#include <openssl/bio.h>
-#include <openssl/types.h>
+// Public runtime interfaces need only opaque crypto handles. Keep vendored
+// OpenSSL headers out of compiler/configuration-only translation units.
+struct ssl_st;
+struct ssl_ctx_st;
+struct bio_method_st;
+using SSL = ssl_st;
+using SSL_CTX = ssl_ctx_st;
+using BIO_METHOD = bio_method_st;
 
 namespace rut {
 
