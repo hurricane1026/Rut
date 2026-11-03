@@ -16,6 +16,7 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/serve_loader.h"
 #endif
+#include "rut/runtime/auth.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/callbacks_impl.h"
@@ -7533,26 +7534,26 @@ TEST(tls, client_ca_configuration_requires_loadable_bundle_and_disables_resumpti
 TEST(auth, sha256_hex_pin_validator_checks_exact_ascii_form) {
     char lower[64];
     memset(lower, 'a', sizeof(lower));
-    CHECK_EQ(rut_helper_sha256_hex_valid(lower, sizeof(lower)), 1u);
-    CHECK_EQ(rut_helper_sha256_hex_valid(lower, 63), 0u);
+    CHECK(sha256_hex_format_valid(Str{lower, sizeof(lower)}));
+    CHECK_FALSE(sha256_hex_format_valid(Str{lower, 63}));
     char long_value[65];
     memset(long_value, 'a', sizeof(long_value));
-    CHECK_EQ(rut_helper_sha256_hex_valid(long_value, sizeof(long_value)), 0u);
+    CHECK_FALSE(sha256_hex_format_valid(Str{long_value, sizeof(long_value)}));
     char uppercase[64];
     memset(uppercase, 'A', sizeof(uppercase));
-    CHECK_EQ(rut_helper_sha256_hex_valid(uppercase, sizeof(uppercase)), 0u);
+    CHECK_FALSE(sha256_hex_format_valid(Str{uppercase, sizeof(uppercase)}));
     lower[17] = 'g';
-    CHECK_EQ(rut_helper_sha256_hex_valid(lower, sizeof(lower)), 0u);
+    CHECK_FALSE(sha256_hex_format_valid(Str{lower, sizeof(lower)}));
     lower[17] = '\0';
-    CHECK_EQ(rut_helper_sha256_hex_valid(lower, sizeof(lower)), 0u);
+    CHECK_FALSE(sha256_hex_format_valid(Str{lower, sizeof(lower)}));
     lower[17] = static_cast<char>(0x80);
-    CHECK_EQ(rut_helper_sha256_hex_valid(lower, sizeof(lower)), 0u);
+    CHECK_FALSE(sha256_hex_format_valid(Str{lower, sizeof(lower)}));
     memset(lower, 'a', sizeof(lower));
-    CHECK_EQ(rut_helper_sha256_hex_valid(lower, 64), 1u);
+    CHECK(sha256_hex_format_valid(Str{lower, 64}));
     char newline[65];
     memset(newline, 'a', 64);
     newline[64] = '\n';
-    CHECK_EQ(rut_helper_sha256_hex_valid(newline, sizeof(newline)), 0u);
+    CHECK_FALSE(sha256_hex_format_valid(Str{newline, sizeof(newline)}));
 }
 
 TEST(connection, verified_client_fingerprint_copies_for_h2_and_clears_on_reset) {

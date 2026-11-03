@@ -2531,12 +2531,7 @@ extern "C" void rut_helper_json(void* conn,
 }
 
 extern "C" u8 rut_helper_sha256_hex_valid(const char* value, u32 len) {
-    if (value == nullptr || len != 64) return 0;
-    for (u32 i = 0; i < 64; ++i) {
-        const char kByte = value[i];
-        if ((kByte < '0' || kByte > '9') && (kByte < 'a' || kByte > 'f')) return 0;
-    }
-    return 1;
+    return sha256_hex_format_valid(Str{value, len}) ? 1 : 0;
 }
 
 extern "C" void rut_helper_resp_body(

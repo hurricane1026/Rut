@@ -30,4 +30,7 @@ inline constexpr u32 kMaxHmacMessageBytes = 1024 * 1024;
 inline constexpr u32 kMaxHmacKeyBytes = 4096;
 bool hmac_sha256_matches(Str message, Str key, Str signature, Str prefix = {});
 
+// Exact 64-byte lowercase hexadecimal SHA-256 fingerprint format check.
+bool sha256_hex_format_valid(Str value);
+
 }  // namespace rut
