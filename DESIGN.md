@@ -8547,6 +8547,10 @@ into connection-owned storage. `req.tlsClientCertSha256` is `str?`: it is nil
 for cleartext and ordinary server-only TLS. Handshake verification and missing
 certificates fail before HTTP parsing. Session caching, tickets and renegotiation
 are disabled when client CA verification is configured.
+The fingerprint reserves 64 inline bytes in every connection slot, including
+cleartext and ordinary TLS slots (1 MiB per shard at the default 16,384 slots).
+The valid flag is absorbed by existing struct padding, so measured `Connection`
+growth is 64 bytes total.
 
 `Crypto.sha256HexValid(value)` checks exactly 64 lowercase ASCII hexadecimal
 bytes without allocation. `auth.pinnedMtlsIdentity(fingerprint, consumerId,

@@ -525,8 +525,10 @@ and key options and requires a client certificate during the TLS handshake.
 The verified peer certificate's DER SHA-256 fingerprint is exposed as
 `req.tlsClientCertSha256: str?`; it is nil on cleartext and ordinary
 server-only TLS. The fingerprint is connection-owned and contains 64 lowercase
-hexadecimal characters. `auth.pinnedMtlsIdentity` compares it to a static
-canonical pin with `Crypto.sha256HexValid`, returning 403 for a
+hexadecimal characters, with a fixed 64-byte inline slot cost even on cleartext
+and ordinary TLS connections.
+`auth.pinnedMtlsIdentity` compares it to a static canonical pin with
+`Crypto.sha256HexValid`, returning 403 for a
 missing/mismatched certificate and 503 for invalid pin configuration. The CA
 file is read at listener startup; replacing
 it requires listener restart. Route pin changes take effect for the next
