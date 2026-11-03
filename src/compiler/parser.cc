@@ -600,10 +600,10 @@ struct Parser {
     // parse_braced_stmt_body because message verdicts are **bare method-call statements**
     // (`message.forward()`), which the general statement parser (parse_stmt) deliberately
     // rejects — its only statements are keyword-led (let/guard/return/if/match/...). Slice B
-    // accepts immutable lets, message guards and a final bare verdict.
+    // accepts immutable lets, message guards and terminal if/else verdict branches.
     // Mirrors parse_braced_stmt_body's empty-block rejection and one-statement unwrap so analyze
     // sees the same body shape.
-    FrontendResult<AstStatement> parse_ws_message_body(const Token& lbrace_tok) {
+    FrontendResult<AstStatement> parse_ws_message_body(const Token& lbrace_tok, u32 depth = 0) {
         AstStatement block{};
         block.kind = AstStmtKind::Block;
         block.span = span_from(lbrace_tok);
@@ -620,6 +620,12 @@ struct Parser {
                 auto g = parse_ws_message_guard(gt);
                 if (!g) return core::make_unexpected(g.error());
                 st = g.value();
+            } else if (cur().type == TokenType::KwIf) {
+                const Token kIf = cur();
+                pos++;
+                auto branch = parse_ws_message_if(kIf, depth);
+                if (!branch) return core::make_unexpected(branch.error());
+                st = branch.value();
             } else {
                 auto expr = parse_expr();
                 if (!expr) return core::make_unexpected(expr.error());
@@ -640,6 +646,43 @@ struct Parser {
         block.span.end = rbrace.value()->end;
         if (block.block_stmts.len == 1) return *block.block_stmts[0];
         return block;
+    }
+
+    FrontendResult<AstStatement> parse_ws_message_if(const Token& if_tok, u32 depth) {
+        if (depth >= AstStatement::kMaxBlockStatements)
+            return frontend_error(FrontendError::TooManyItems, span_from(if_tok));
+        AstStatement stmt{};
+        stmt.kind = AstStmtKind::If;
+        auto condition = parse_expr();
+        if (!condition) return core::make_unexpected(condition.error());
+        stmt.expr = condition.value();
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+        auto body = parse_ws_message_body(*lbrace.value(), depth + 1);
+        if (!body) return core::make_unexpected(body.error());
+        auto then_ptr = alloc_stmt(body.value());
+        if (!then_ptr) return core::make_unexpected(then_ptr.error());
+        stmt.then_stmt = then_ptr.value();
+        stmt.span = Span{if_tok.start, body->span.end, if_tok.line, if_tok.col};
+        if (take(TokenType::KwElse)) {
+            AstStatement other{};
+            if (const Token* next_if = take(TokenType::KwIf)) {
+                auto branch = parse_ws_message_if(*next_if, depth + 1);
+                if (!branch) return core::make_unexpected(branch.error());
+                other = branch.value();
+            } else {
+                auto else_brace = expect(TokenType::LBrace);
+                if (!else_brace) return core::make_unexpected(else_brace.error());
+                auto branch = parse_ws_message_body(*else_brace.value(), depth + 1);
+                if (!branch) return core::make_unexpected(branch.error());
+                other = branch.value();
+            }
+            auto else_ptr = alloc_stmt(other);
+            if (!else_ptr) return core::make_unexpected(else_ptr.error());
+            stmt.else_stmt = else_ptr.value();
+            stmt.span.end = other.span.end;
+        }
+        return stmt;
     }
 
     // Parse a message-handler guard, including `guard let name = json.parse(message.text)`.

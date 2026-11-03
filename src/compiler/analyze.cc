@@ -7290,8 +7290,8 @@ struct WsCallbackScope {
     std::unique_ptr<HirRoute> route = std::make_unique<HirRoute>();
     std::unique_ptr<HirFunction> normalized = std::make_unique<HirFunction>();
     // Keep the existing admission capacity independent of the callback parameter
-    // and its at-most-seven lets in an eight-statement block.
-    FixedVec<HirLocal, HirRoute::kMaxLocals + AstStatement::kMaxBlockStatements> locals;
+    // and locals in both the callback and its current terminal branch.
+    FixedVec<HirLocal, HirRoute::kMaxLocals + 2 * AstStatement::kMaxBlockStatements> locals;
 };
 
 static FrontendResult<HirExpr> analyze_ws_value(const AstExpr& expr,
@@ -7634,10 +7634,12 @@ static FrontendResult<WsVerdict> analyze_message_guard_verdict(const AstExpr& ca
                                                                HirRoute& route,
                                                                const HirModule& mod,
                                                                const WsJsonBindings& documents,
-                                                               WsCallbackScope& scope) {
-    // Bare close retains its existing route-default policy. Explicit arguments
-    // select a distinct policy, including an empty reason for close(code).
-    if (call.args.len == 0) return analyze_bare_message_verdict(call, scope, mod);
+                                                               WsCallbackScope& scope,
+                                                               bool own_close_policy = false) {
+    // Guard bare closes retain their route-default policy. Conditional arms can
+    // request an independent policy even for close() without explicit arguments.
+    if (call.args.len == 0 && !(own_close_policy && call.name.eq(lit_str("close"))))
+        return analyze_bare_message_verdict(call, scope, mod);
     if (call.name.eq({"forward", 7})) {
         auto payload = analyze_message_forward_payload(call, route, mod, documents, scope);
         if (!payload) return core::make_unexpected(payload.error());
@@ -8390,6 +8392,145 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
         return frontend_error(FrontendError::TooManyItems, cond.span);
     return handler.len_guards.len - 1;
 }
+static FrontendResult<void> analyze_ws_binding(const AstStatement& stmt,
+                                               WsCallbackScope& scope,
+                                               const HirModule& mod,
+                                               const WsJsonBindings& documents) {
+    bool collision =
+        stmt.name.eq(lit_str("json")) ||
+        user_bound_ident_name(mod, scope.locals.data, scope.locals.len, nullptr, stmt.name);
+    for (u32 j = 0; j < documents.len; ++j) collision |= documents[j].name.eq(stmt.name);
+    if (collision)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("message bindings require a fresh name"));
+    auto value = analyze_ws_value(stmt.expr, scope, mod);
+    if (!value) return core::make_unexpected(value.error());
+    auto declared = apply_declared_type_to_expr(&value.value(), mod, stmt);
+    if (!declared) return core::make_unexpected(declared.error());
+    if (!ws_infallible_binding(value.value()))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("message lets require infallible scalar or message values"));
+    HirLocal local{};
+    local.name = stmt.name;
+    local.span = stmt.span;
+    local.ref_index = scope.locals.len;
+    local.type = value->type;
+    local.shape_index = value->shape_index;
+    local.init = value.value();
+    if (!scope.locals.push(local)) return frontend_error(FrontendError::TooManyItems, stmt.span);
+    return {};
+}
+
+static FrontendResult<void> analyze_ws_default_verdict(const AstExpr& call,
+                                                       HirRoute& route,
+                                                       const HirModule& mod,
+                                                       const WsJsonBindings& documents,
+                                                       WsCallbackScope& scope) {
+    auto receiver = ws_is_message_receiver(call, scope, mod);
+    if (!receiver) return core::make_unexpected(receiver.error());
+    if (!receiver.value()) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+
+    if (call.name.eq({"forward", 7})) {
+        if (call.args.len > 1)  // forward() or forward(payload, load_balance: .roundRobin)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        route.ws_handler.default_verdict = WsVerdict::Forward;
+        if (call.args.len == 1) {
+            auto payload = analyze_message_forward_payload(call, route, mod, documents, scope);
+            if (!payload) return core::make_unexpected(payload.error());
+            route.ws_handler.has_forward_payload = true;
+            route.ws_handler.forward_payload = payload.value();
+        }
+    } else if (call.name.eq({"drop", 4})) {
+        if (call.args.len != 0) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        route.ws_handler.default_verdict = WsVerdict::Drop;
+    } else if (call.name.eq({"close", 5})) {
+        auto policy = analyze_message_close_policy(call, route, mod, scope);
+        if (!policy) return core::make_unexpected(policy.error());
+        route.ws_handler.default_verdict = WsVerdict::Close;
+        route.ws_handler.close_code = policy->code;
+        route.ws_handler.close_reason_expr = policy->reason_expr;
+    } else {
+        return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+    }
+    return {};
+}
+
+// A terminal branch has immutable bindings followed by exactly one verdict.
+// Restore lexical scope even on failure; retained output bytes belong to the module.
+static FrontendResult<WsVerdict> analyze_ws_verdict_branch(const AstStatement& body,
+                                                           HirRoute& route,
+                                                           const HirModule& mod,
+                                                           const WsJsonBindings& documents,
+                                                           WsCallbackScope& scope,
+                                                           bool is_default) {
+    const u32 kSavedLocals = scope.locals.len;
+    const auto kAnalyze = [&]() -> FrontendResult<WsVerdict> {
+        const AstStatement* last = &body;
+        if (body.kind == AstStmtKind::Block) {
+            if (body.block_stmts.len == 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, body.span);
+            for (u32 i = 0; i + 1 < body.block_stmts.len; ++i) {
+                const auto* statement = body.block_stmts[i];
+                if (!statement || statement->kind != AstStmtKind::Let)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        statement ? statement->span : body.span,
+                        lit_str("message branches require lets followed by one verdict"));
+                auto binding = analyze_ws_binding(*statement, scope, mod, documents);
+                if (!binding) return core::make_unexpected(binding.error());
+            }
+            last = body.block_stmts[body.block_stmts.len - 1];
+        }
+        if (!last || last->kind != AstStmtKind::Expr)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  last ? last->span : body.span,
+                                  lit_str("message branches require a terminal verdict"));
+        if (is_default) {
+            auto verdict = analyze_ws_default_verdict(last->expr, route, mod, documents, scope);
+            if (!verdict) return core::make_unexpected(verdict.error());
+            return route.ws_handler.default_verdict;
+        }
+        // A branch-local close() means 1000, independently of an else close policy.
+        return analyze_message_guard_verdict(last->expr, route, mod, documents, scope, true);
+    };
+    auto result = kAnalyze();
+    scope.locals.len = kSavedLocals;
+    return result;
+}
+
+static FrontendResult<void> analyze_ws_if(const AstStatement& stmt,
+                                          HirRoute& route,
+                                          const HirModule& mod,
+                                          const WsJsonBindings& documents,
+                                          WsCallbackScope& scope,
+                                          bool terminal,
+                                          u32& conditional_count) {
+    if (stmt.kind != AstStmtKind::If || !stmt.then_stmt || stmt.bind_value ||
+        (terminal ? !stmt.else_stmt : stmt.else_stmt != nullptr))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("terminal message if requires else; earlier if must omit else"));
+    if (++conditional_count > HirWsHandler::kMaxLenGuards)
+        return frontend_error(FrontendError::TooManyItems, stmt.span);
+    auto verdict = analyze_ws_verdict_branch(*stmt.then_stmt, route, mod, documents, scope, false);
+    if (!verdict) return core::make_unexpected(verdict.error());
+    // Existing roots take a verdict when false. Invert the if condition so a
+    // true source condition terminates immediately; subsequent clauses stay lazy.
+    auto condition = analyze_message_condition(
+        stmt.expr, verdict.value(), route, mod, documents, scope, false, true);
+    if (!condition) return core::make_unexpected(condition.error());
+    if (!terminal) return {};
+    if (stmt.else_stmt->kind == AstStmtKind::If)
+        return analyze_ws_if(
+            *stmt.else_stmt, route, mod, documents, scope, true, conditional_count);
+    auto other = analyze_ws_verdict_branch(*stmt.else_stmt, route, mod, documents, scope, true);
+    if (!other) return core::make_unexpected(other.error());
+    return {};
+}
+
 #endif
 
 // Resolve an upstream by name; UnknownUpstream (at `span`) when absent. Shared by the route
@@ -14548,52 +14689,34 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         WsJsonBindings documents{};
         const AstStatement* body = stmt.then_stmt;
         if (body == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+        u32 conditional_count = 0;
         const AstExpr* default_call = nullptr;
         if (body->kind == AstStmtKind::Expr) {
             default_call = &body->expr;
+        } else if (body->kind == AstStmtKind::If) {
+            return analyze_ws_if(*body, *route, mod, documents, scope, true, conditional_count);
         } else if (body->kind == AstStmtKind::Block) {
             const u32 stmt_count = body->block_stmts.len;
             if (stmt_count == 0)
                 return frontend_error(FrontendError::UnsupportedSyntax, body->span);
-            u32 guard_count = 0;
             for (u32 i = 0; i + 1 < stmt_count; i++) {  // bindings and guards precede the verdict
                 const AstStatement* gs = body->block_stmts[i];
                 if (gs && gs->kind == AstStmtKind::Let) {
-                    bool collision =
-                        gs->name.eq(lit_str("json")) ||
-                        user_bound_ident_name(
-                            mod, scope.locals.data, scope.locals.len, nullptr, gs->name);
-                    for (u32 j = 0; j < documents.len; ++j)
-                        collision |= documents[j].name.eq(gs->name);
-                    if (collision)
-                        return frontend_error(FrontendError::UnsupportedSyntax,
-                                              gs->span,
-                                              lit_str("message bindings require a fresh name"));
-                    auto value = analyze_ws_value(gs->expr, scope, mod);
-                    if (!value) return core::make_unexpected(value.error());
-                    auto declared = apply_declared_type_to_expr(&value.value(), mod, *gs);
-                    if (!declared) return core::make_unexpected(declared.error());
-                    if (!ws_infallible_binding(value.value()))
-                        return frontend_error(
-                            FrontendError::UnsupportedSyntax,
-                            gs->span,
-                            lit_str("message lets require infallible scalar or message values"));
-                    HirLocal local{};
-                    local.name = gs->name;
-                    local.span = gs->span;
-                    local.ref_index = scope.locals.len;
-                    local.type = value->type;
-                    local.shape_index = value->shape_index;
-                    local.init = value.value();
-                    if (!scope.locals.push(local))
-                        return frontend_error(FrontendError::TooManyItems, gs->span);
+                    auto binding = analyze_ws_binding(*gs, scope, mod, documents);
+                    if (!binding) return core::make_unexpected(binding.error());
+                    continue;
+                }
+                if (gs && gs->kind == AstStmtKind::If) {
+                    auto branch =
+                        analyze_ws_if(*gs, *route, mod, documents, scope, false, conditional_count);
+                    if (!branch) return core::make_unexpected(branch.error());
                     continue;
                 }
                 if (gs == nullptr || gs->kind != AstStmtKind::Guard || gs->else_stmt == nullptr ||
                     gs->else_stmt->kind != AstStmtKind::Expr)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           gs ? gs->span : body->span);
-                if (++guard_count > HirWsHandler::kMaxLenGuards)
+                if (++conditional_count > HirWsHandler::kMaxLenGuards)
                     return frontend_error(FrontendError::TooManyItems, gs->span);
                 auto gv = analyze_message_guard_verdict(
                     gs->else_stmt->expr, *route, mod, documents, scope);
@@ -14778,6 +14901,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 }
             }
             const AstStatement* last = body->block_stmts[stmt_count - 1];
+            if (last && last->kind == AstStmtKind::If)
+                return analyze_ws_if(*last, *route, mod, documents, scope, true, conditional_count);
             if (last == nullptr || last->kind != AstStmtKind::Expr)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       last ? last->span : body->span);
@@ -14785,35 +14910,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         } else {
             return frontend_error(FrontendError::UnsupportedSyntax, body->span);
         }
-        const AstExpr& call = *default_call;
-        auto receiver = ws_is_message_receiver(call, scope, mod);
-        if (!receiver) return core::make_unexpected(receiver.error());
-        if (!receiver.value()) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-
-        if (call.name.eq({"forward", 7})) {
-            if (call.args.len > 1)  // forward() or forward(payload, load_balance: .roundRobin)
-                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-            route->ws_handler.default_verdict = WsVerdict::Forward;
-            if (call.args.len == 1) {
-                auto payload = analyze_message_forward_payload(call, *route, mod, documents, scope);
-                if (!payload) return core::make_unexpected(payload.error());
-                route->ws_handler.has_forward_payload = true;
-                route->ws_handler.forward_payload = payload.value();
-            }
-        } else if (call.name.eq({"drop", 4})) {
-            if (call.args.len != 0)
-                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-            route->ws_handler.default_verdict = WsVerdict::Drop;
-        } else if (call.name.eq({"close", 5})) {
-            auto policy = analyze_message_close_policy(call, *route, mod, scope);
-            if (!policy) return core::make_unexpected(policy.error());
-            route->ws_handler.default_verdict = WsVerdict::Close;
-            route->ws_handler.close_code = policy->code;
-            route->ws_handler.close_reason_expr = policy->reason_expr;
-        } else {
-            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-        }
-        return {};
+        return analyze_ws_default_verdict(*default_call, *route, mod, documents, scope);
     }
 #endif
 

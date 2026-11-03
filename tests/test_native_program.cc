@@ -1800,6 +1800,109 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, websocket_if_branches_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func allowed(_ bytes: Bytes) -> bool => bytes.count == 2 && bytes == b"\x00\xff"
+route GET "/branches" { return websocket(backend) { packet in
+    let msg = identity(packet)
+    if msg.fromClient && !allowed(msg.payload) { msg.drop() }
+    if msg.kind == WebSocketMessageKind.text {
+        let copy = msg
+        let text = copy.text
+        copy.forward("[" + text + "]")
+    } else if msg.payload == b"\x00\xff" {
+        let copy = msg
+        copy.forward(b"\xff\x00")
+    } else {
+        let copy = msg
+        copy.close(1008, "policy")
+    }
+} }
+route GET "/json" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let field = json.get(document, "/name") else { msg.close(1008) }
+    guard let name = json.string(field) else { msg.close(1003) }
+    if msg.fromClient && name == "deny" { msg.drop() }
+    else {
+        let prefix = "<"
+        msg.forward(prefix + name + ">")
+    }
+} }
+route GET "/close" { return websocket(backend) { msg in
+    if msg.fromClient { msg.close() }
+    else { msg.close(1008, "policy") }
+} }
+route GET "/optional" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    if json.bool(document) == false { msg.forward("false") }
+    else if json.bool(document) == true { msg.forward("true") }
+    else if json.bool(document) == nil { msg.forward("missing") }
+    else { msg.drop() }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& program = *owner.p;
+    REQUIRE_EQ(program.config.route_count, 4u);
+    const auto branches = program.config.routes[0].ws_frame_handler;
+    const auto json = program.config.routes[1].ws_frame_handler;
+    const auto close = program.config.routes[2].ws_frame_handler;
+    const auto optional = program.config.routes[3].ws_frame_handler;
+    REQUIRE(branches);
+    REQUIRE(json);
+    REQUIRE(close);
+    REQUIRE(optional);
+    REQUIRE_EQ(program.config.routes[0].ws_forward_text_count, 2u);
+    const Str payloads[] = {{"\0\xff", 2}, {"\xff\0", 2}, {"", 0}, {"ok", 2}};
+    for (bool client : {false, true}) {
+        for (u32 i = 0; i < 4; ++i) {
+            const auto action = branches(nullptr,
+                                         WsOpcode::Binary,
+                                         reinterpret_cast<const u8*>(payloads[i].ptr),
+                                         payloads[i].len,
+                                         client);
+            CHECK(action == (i == 0   ? WsFrameAction::ForwardTextPolicy1
+                             : client ? WsFrameAction::Drop
+                                      : WsFrameAction::Close));
+        }
+        const char* text = "hello";
+        CHECK(branches(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(text), 5, client) ==
+              (client ? WsFrameAction::Drop : WsFrameAction::ForwardTextPolicy0));
+        const char* documents[] = {
+            "{\"name\":\"ok\"}", "{\"name\":\"deny\"}", "{}", "{\"name\":false}", "broken"};
+        for (u32 i = 0; i < 5; ++i) {
+            const auto action = json(nullptr,
+                                     WsOpcode::Text,
+                                     reinterpret_cast<const u8*>(documents[i]),
+                                     static_cast<u32>(strlen(documents[i])),
+                                     client);
+            CHECK(action == (i == 0 || (i == 1 && !client) ? WsFrameAction::ForwardText
+                             : i == 1                      ? WsFrameAction::Drop
+                             : i == 2                      ? WsFrameAction::ClosePolicy1
+                             : i == 3                      ? WsFrameAction::ClosePolicy2
+                                                           : WsFrameAction::ClosePolicy0));
+        }
+        CHECK(close(nullptr, WsOpcode::Binary, nullptr, 0, client) ==
+              (client ? WsFrameAction::ClosePolicy0 : WsFrameAction::Close));
+        const char* values[] = {"false", "true", "null", "0", "{}", "[]"};
+        for (u32 i = 0; i < 6; ++i)
+            CHECK(optional(nullptr,
+                           WsOpcode::Text,
+                           reinterpret_cast<const u8*>(values[i]),
+                           static_cast<u32>(strlen(values[i])),
+                           client) == (i == 0   ? WsFrameAction::ForwardTextPolicy0
+                                       : i == 1 ? WsFrameAction::ForwardTextPolicy1
+                                                : WsFrameAction::ForwardTextPolicy2));
+    }
+    REQUIRE_EQ(program.config.routes[2].ws_close_policy_count, 1u);
+    CHECK_EQ(program.config.routes[2].ws_close_policies[0].code, 1000u);
+    CHECK_EQ(program.config.routes[2].ws_close_code, 1008u);
+}
+
 TEST(native_program, websocket_callback_scope_survives_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

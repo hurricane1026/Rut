@@ -281,6 +281,50 @@ return websocket(ws) { event in
 """
 
 
+IF_MESSAGE_HANDLER = r"""
+return websocket(ws) { packet in
+    let msg = identity(packet)
+    if msg.payload.isEmpty { msg.drop() }
+    if msg.fromClient && msg.isBinary { msg.forward(b"\x00\xff") }
+    if msg.text == "CLOSE" { msg.close() }
+    if msg.text.matches(re"allow[0-9]+") && msg.fromClient {
+        let text = msg.text
+        msg.forward("[" + text + "]")
+    } else {
+        msg.close(1008, "policy")
+    }
+}
+"""
+
+
+def if_message_exchange(client, peer, close_default=False):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"if verdict: {actual=!r}, {expected=!r}")
+
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(masked_frame(2, b"") + first + masked_frame(9, b"PING") +
+                   masked_frame(0, b"\x00"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\x00\xff", True))
+    client.sendall(masked_frame(1, b"allow12"))
+    expect(peer, (1, b"[allow12]", True))
+    if close_default:
+        peer.sendall(b"\x81\x04deny")
+        expected = b"\x03\xf0policy"
+    else:
+        client.sendall(masked_frame(1, b"CLOSE"))
+        expected = b"\x03\xe8"
+    expect(peer, (8, expected, True))
+    expect(client, (8, expected, False))
+
+
+def if_default_exchange(client, peer):
+    if_message_exchange(client, peer, close_default=True)
+
+
 def payload_bytes_exchange(client, peer):
     def expect(sock, expected):
         actual = recv_client_frame(sock)
@@ -1284,6 +1328,8 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (IF_MESSAGE_HANDLER, if_message_exchange, CALLBACK_SCOPE_DECLARATIONS),
+                (IF_MESSAGE_HANDLER, if_default_exchange, CALLBACK_SCOPE_DECLARATIONS),
                 (CALLBACK_BYTES_HANDLER, payload_bytes_exchange,
                  PAYLOAD_BYTES_DECLARATIONS + CALLBACK_SCOPE_DECLARATIONS),
                 (CALLBACK_JSON_HANDLER, nested_json_exchange, CALLBACK_SCOPE_DECLARATIONS)):

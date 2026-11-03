@@ -35,7 +35,7 @@ query, cookies and route parameters), literals, prior bindings, comparisons,
 boolean operators, and `.or(literal)`. Failure branches must return a static
 status or response. Helpers, effects, request body reads, mutation, waits,
 loops, conditionals, decorators and chains remain unsupported. The message
-handler retains its independent four-guard limit.
+handler retains its independent four-clause limit.
 
 The message callback receives a borrowed `WebSocketMessage`. Its Boolean
 fields are `fromClient`, `isText` and `isBinary`; `len` is an `i32` byte count
@@ -169,9 +169,53 @@ remain capturable; request-borrowed values do not.
 The ordinary eight-statement block limit includes lets, guards and the final
 verdict. The existing 16-local HTTP admission budget remains independent of the
 callback parameter and its at-most-seven lets. JSON guard aliases remain bounded
-by four guards; all source guards together still have a four-guard limit and a 32-node condition
-forest. This change does not add arbitrary local computation, nested blocks,
-conditionals or lifecycle callbacks.
+by the four-clause handler limit; all clauses share a 32-node condition forest. Arbitrary local computation, general nested blocks and lifecycle
+callbacks remain subsequent work.
+
+### Conditional verdicts
+
+Message callbacks accept the ordinary `if` / `else if` / `else` syntax with the
+same Boolean predicate forms as message guards. An `if` without `else` may
+precede later statements when its taken branch ends with a message verdict.
+A terminal `if` / `else if` chain must have a final `else`, so every path ends
+with a verdict. That complete chain must be the last statement of the callback.
+
+```swift
+return websocket(chat) { msg in
+    if msg.payload.isEmpty { msg.drop() }
+    if msg.fromClient && msg.kind == WebSocketMessageKind.binary {
+        msg.forward(b"\x00\xff")
+    } else if msg.text.matches(re"allowed[0-9]+") {
+        let text: str = msg.text
+        msg.forward("[" + text + "]")
+    } else {
+        msg.close(1008, "policy")
+    }
+}
+```
+
+Conditions and reached `else if` clauses execute in source order. A selected
+verdict ends this callback immediately; later clauses are not evaluated.
+Existing `&&` / `||` short-circuit behavior and fail-closed scan errors are
+preserved. Conditions may call supported ordinary pure helpers or use earlier
+JSON guard aliases. They must have type `bool`; `if let` is not supported yet.
+
+Each arm currently contains infallible immutable lets followed by exactly one
+message verdict. Branch-local names do not escape into the condition, later
+statements, sibling arms or later `else if` conditions. Sibling arms may reuse
+fresh names. Nested conditionals or guards inside an arm, nonterminal arms,
+loops and arbitrary expression execution remain unsupported. Every arm is
+checked, including an arm made unreachable by a constant condition.
+
+The eight-statement limit applies independently to the callback and each arm.
+Each `guard`, `if` or `else if` consumes one of the existing four conditional
+clauses; a final `else` consumes none. All clauses share the existing 32-node
+condition forest. Branch lets do not consume clause slots or reduce the
+16-local HTTP admission capacity. Branch close/forward recipes use the existing
+bounded policy tables; a branch `close()` selects 1000 with no reason, independent
+of a final else's close code/reason. Existing bare closes in guard-else statements
+keep their route-default behavior. No new runtime representation, helper or
+native format is introduced by these conditionals.
 
 After the route's HTTP guards pass, terminate mode validates the opening request
 before connecting to the selected upstream. The supported request shape is GET
@@ -304,7 +348,7 @@ does not. Literal escapes, including embedded NUL, are supported. Mirrored
 comparisons and short-circuit conditions work as for other message guards.
 
 The document binding must use a fresh name and appears only after its guard.
-Bindings count toward the four-guard limit. Each reached check reparses the
+Bindings count toward the four-clause limit. Each reached check reparses the
 bounded complete payload; no parsed document or borrowed payload view is
 retained between callbacks.
 
@@ -353,7 +397,7 @@ that synchronous callback. No decoded view escapes to asynchronous I/O. Patterns
 use the existing owned regex databases and scratch cache, including in native
 artifacts after source removal. A reached decode or scan error closes the tunnel
 before negation is applied; an error cannot become a successful negated match.
-The four-guard and 32-condition-node limits remain unchanged.
+The four-clause and 32-condition-node limits remain unchanged.
 
 Aliases are compile-time paths into the immutable message: each reached check
 reparses the bounded payload and retains no JSON node or borrowed string view.
@@ -361,7 +405,7 @@ A `json.get` source may be the document or an earlier guard-unwrapped selected
 JSON value. Further `get` calls use literal RFC 6901 pointers relative to that
 value; each selection requires its own guard. General extraction, dynamic paths,
 and dynamic predicate arguments remain unsupported. These bindings and
-predicates use the existing four-guard and 32-condition-node limits.
+predicates use the existing four-clause and 32-condition-node limits.
 
 For example, select a nested name in two steps and forward its decoded text:
 
@@ -480,7 +524,7 @@ signed i32. Both aliases support the existing logical condition forms; other
 extraction, arithmetic, and alias-to-alias comparisons remain unsupported.
 Because parse, optional path presence, typed binding, and comparison each use a
 source guard, a selected-field chain leaves room for either a kind policy or a
-count policy under the four-guard limit. A root document can bind both kind and
+count policy under the four-clause limit. A root document can bind both kind and
 count and combine their predicates within that limit because it needs no `get`
 presence guard. Every reached check reparses the bounded full message in the
 shared thread-local JSON workspace.

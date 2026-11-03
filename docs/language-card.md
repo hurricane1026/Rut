@@ -856,7 +856,7 @@ return forward(users, load_balance: .roundRobin, streaming: true)         // ⏳
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
-// Current terminate handlers: up to 4 guards over direction, text/binary message type,
+// Current terminate handlers: up to 4 guard/if clauses over direction, text/binary type,
 // message.len (< > == <= >= != integer literal, either side), text.matches(re),
 // text ==/!= string literal (either side), text.isEmpty, and
 // text.hasPrefix("literal"), text.hasSuffix("literal"), text.contains("literal").
@@ -893,8 +893,16 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // json.parse guards and text rewrites; message aliases can receive verdicts.
 // Eight statements per block, including lets/guards/final verdict. Captured
 // compile-time HTTP values keep their separate 16-local admission budget.
-// The four-guard/32-condition-node limits remain. Optional, JSON and regex let
-// initializers and other general computation/control flow remain unsupported.
+// The four-clause/32-condition-node limits remain. Optional, JSON and regex let
+// initializers remain unsupported. Bounded if/else verdict branches are supported:
+// an if without else may exit early; a terminal if/else-if chain needs a final
+// else. Each arm allows lets followed by one verdict, with its own lexical scope.
+// A whole if/else chain must be the callback tail. Conditions use the supported
+// bool/helper/JSON predicates. Later arms are lazy; all arms are type checked.
+// Each guard/if/else-if shares the same four-clause and 32-node budgets. The
+// eight-statement block limit applies to each arm too. Branch close() uses 1000
+// independently of the final else's close policy. Nested conditionals or guards
+// inside arms, if-let, loops and general computation remain unsupported.
 // HTTP reads/effects and message verdicts in helpers are rejected. Helpers cannot
 // retain a message/payload past the callback.
 func allowedMessage(_ msg: WebSocketMessage) -> bool =>

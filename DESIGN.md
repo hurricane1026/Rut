@@ -2624,7 +2624,7 @@ Only existing request reads, literals, earlier bindings, comparisons, boolean
 operators, and `.or(literal)` are admitted. Helpers, effects, body reads,
 mutation, waits, loops, conditionals, decorators and chains remain compile-time
 errors until there is an execution path that can preserve their semantics. The
-four message guards remain independent. Bare `websocket(upstream)` passthrough
+four message conditional clauses remain independent. Bare `websocket(upstream)` passthrough
 routes remain ordinary HTTP routes and retain their normal guards and
 decorators. Origin is enforced only when a route adds a corresponding request
 guard; terminate mode does not add implicit Origin validation.
@@ -2900,8 +2900,34 @@ shadow an outer name or namespace. Reads of a previous fixed spelling such as
 block limit remains eight statements. The 16-local HTTP admission budget stays
 independent of the message parameter and callback lets. Lets do not count toward the four source
 guards, whose combined condition forest remains bounded to 32 nodes. JSON proof
-aliases retain their separate bounded representation. Nested blocks, arbitrary
-computation/control flow, and lifecycle entry points are still subsequent work.
+aliases retain their separate bounded representation. General nested blocks,
+arbitrary computation, loops, and lifecycle entry points remain subsequent work.
+
+Ordinary `if` / `else if` / `else` syntax now selects message verdicts. A
+nonterminal `if` must omit else and end its taken arm with a verdict; false falls
+through to the next statement. A terminal if-chain requires a final else and
+ends the callback on every path. Arms currently contain immutable infallible
+lets followed by exactly one verdict; nested conditionals/guards within an arm
+and `if let` are not supported. Branch locals use the same analyzer and helper
+normalization as callback locals, with lexical scope restored after each arm.
+Sibling arms may reuse names, and branch names never resolve a condition or
+leak into later statements. The full HTTP admission-local capacity is preserved
+independently of locals in the callback and its current branch. All arms are
+checked even when a constant condition makes one unreachable.
+
+Each if/else-if condition lowers to one existing condition root with inverted
+polarity: its true source condition takes the root's false verdict. This makes
+ordered guard roots implement the branch chain without repeated condition
+execution, while preserving short-circuit predicates and scan-error exits.
+Each guard, if or else-if shares the four-clause budget, and all roots share the
+32-node forest. The shared eight-statement AST block limit applies per arm;
+the parser also bounds recursive if syntax before analysis. A complete if/else
+chain must be the callback tail. Branch verdicts reuse existing close/forward
+policy slots; a no-argument if-branch close receives its own 1000/empty policy
+so a final else's close policy cannot change it. Bare closes in existing guard
+else-statements retain their route-default contract. The default final else uses
+the existing default-verdict path, so neither native format nor runtime/JIT ABI
+changes. Close-event values and general control flow remain subsequent work.
 
 ```swift
 return websocket(eventService, maxMessageSize: 4kb) { message in
@@ -2939,7 +2965,7 @@ handler. A validated document alias supports `json.get` presence checks, while
 typed string, boolean, and integer bindings and literal comparisons are limited to the
 operations below.
 General document operations, arbitrary value extraction and rewriting remain
-unsupported. Each binding guard counts toward the four-source-guard limit.
+unsupported. Each binding guard counts toward the four-source-clause limit.
 
 JSON aliases may be unwrapped one step further for string routing policies:
 `guard let field = json.get(document, "/type") ...` binds a selected Json value,
@@ -2957,7 +2983,7 @@ node or borrowed string. Nested `get` accepts an earlier guard-unwrapped Json
 selection. Direct optional `json.get` values, strings used as Json, documents
 used as strings without `json.string`, dynamic paths,
 dynamic predicate arguments, and general value extraction are rejected. This
-uses the existing four-guard and 32-condition-node limits.
+uses the existing four-clause and 32-condition-node limits.
 
 JSON booleans can be unwrapped with `json.bool(documentOrField)` after JSON
 parsing and, for a selected field, a `json.get` presence guard. Both JSON `true`
