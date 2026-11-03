@@ -8638,6 +8638,85 @@ static FrontendResult<Str> ws_json_proof_path(const HirExpr& value,
     return ws_json_append_path(source.value(), value.args[1]->str_value, value.span, mod);
 }
 
+// One-sided optional helper branches lower to a lazy conjunction. Each reached
+// selector runs once; its rejected path returns absence without extracting JSON.
+// A successful binding still denotes one immutable projection, so differing
+// value-producing branches require a value-selection representation we do not have.
+static FrontendResult<u32> lower_ws_json_optional(const HirExpr& value,
+                                                  WsVerdict verdict,
+                                                  HirRoute& route,
+                                                  const HirModule& mod,
+                                                  WsJsonBinding& binding,
+                                                  bool is_operand = false,
+                                                  u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::TooManyItems, value.span);
+    if (!value.may_nil || value.may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    if (value.kind == HirExprKind::IfElse && value.lhs && value.rhs && value.args.len == 1 &&
+        value.args[0]) {
+        const bool kNilThen = value.rhs->kind == HirExprKind::Nil;
+        const bool kNilElse = value.args[0]->kind == HirExprKind::Nil;
+        if (kNilThen == kNilElse)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  value.span,
+                                  lit_str("message optional helpers require one JSON projection "
+                                          "and a nil alternative"));
+        auto condition = lower_ws_typed_condition(
+            *value.lhs, verdict, route.ws_handler, true, kNilThen, depth + 1);
+        if (!condition) return core::make_unexpected(condition.error());
+        auto present = lower_ws_json_optional(
+            kNilThen ? *value.args[0] : *value.rhs, verdict, route, mod, binding, true, depth + 1);
+        if (!present) return core::make_unexpected(present.error());
+        WsLenGuard node{};
+        node.accessor = WsLenGuard::Accessor::And;
+        node.verdict = verdict;
+        node.is_operand = is_operand;
+        node.lhs = condition.value();
+        node.rhs = present.value();
+        if (!route.ws_handler.len_guards.push(node))
+            return frontend_error(FrontendError::TooManyItems, value.span);
+        return route.ws_handler.len_guards.len - 1;
+    }
+    if (value.kind != HirExprKind::JsonOp || value.args.len == 0 || !value.args[0])
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              value.span,
+                              lit_str("message optional bindings require a JSON projection"));
+    for (const auto& projection : kWsJsonProjections) {
+        if (value.int_value != static_cast<i64>(projection.op)) continue;
+        binding.kind = projection.kind;
+        WsLenGuard node{};
+        node.verdict = verdict;
+        node.is_operand = is_operand;
+        node.accessor = projection.accessor;
+        if (projection.kind == WsJsonBinding::Kind::Document) {
+            if (value.args.len != 1 || !ws_typed_field(*value.args[0], lit_str("text")))
+                return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+        } else {
+            auto path = ws_json_proof_path(*value.args[0], mod);
+            if (!path) return core::make_unexpected(path.error());
+            if (projection.kind == WsJsonBinding::Kind::SelectedValue) {
+                if (value.args.len != 2 || !value.args[1] ||
+                    value.args[1]->kind != HirExprKind::StrLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+                path = ws_json_append_path(path.value(), value.args[1]->str_value, value.span, mod);
+                if (!path) return core::make_unexpected(path.error());
+            } else if (value.args.len != 1) {
+                return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+            }
+            binding.path = path.value();
+            node.pattern = path.value();
+        }
+        if (!route.ws_handler.len_guards.push(node))
+            return frontend_error(FrontendError::TooManyItems, value.span);
+        return route.ws_handler.len_guards.len - 1;
+    }
+    return frontend_error(FrontendError::UnsupportedSyntax,
+                          value.span,
+                          lit_str("message optional bindings require parse/get/scalar JSON "
+                                  "projections, directly or through pure helpers"));
+}
+
 // JSON proof aliases share ordinary type checking with pure projection helpers.
 static FrontendResult<u32> analyze_ws_json_binding(const AstStatement& stmt,
                                                    WsVerdict verdict,
@@ -8672,45 +8751,12 @@ static FrontendResult<u32> analyze_ws_json_binding(const AstStatement& stmt,
     auto value = kAnalyze();
     scope.locals.len = kSavedLocals;
     if (!value) return core::make_unexpected(value.error());
-    if (value->kind != HirExprKind::JsonOp || !value->may_nil || value->may_error ||
-        value->args.len == 0 || !value->args[0])
-        return frontend_error(FrontendError::UnsupportedSyntax,
-                              stmt.span,
-                              lit_str("message optional bindings require a JSON projection"));
-    for (const auto& projection : kWsJsonProjections) {
-        if (value->int_value != static_cast<i64>(projection.op)) continue;
-        WsJsonBinding binding{};
-        binding.name = stmt.name;
-        binding.kind = projection.kind;
-        WsLenGuard node{};
-        node.verdict = verdict;
-        node.accessor = projection.accessor;
-        if (projection.kind == WsJsonBinding::Kind::Document) {
-            if (value->args.len != 1 || !ws_typed_field(*value->args[0], lit_str("text")))
-                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-        } else {
-            auto path = ws_json_proof_path(*value->args[0], mod);
-            if (!path) return core::make_unexpected(path.error());
-            if (projection.kind == WsJsonBinding::Kind::SelectedValue) {
-                if (value->args.len != 2 || !value->args[1] ||
-                    value->args[1]->kind != HirExprKind::StrLit)
-                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-                path = ws_json_append_path(path.value(), value->args[1]->str_value, stmt.span, mod);
-                if (!path) return core::make_unexpected(path.error());
-            } else if (value->args.len != 1) {
-                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-            }
-            binding.path = path.value();
-            node.pattern = path.value();
-        }
-        if (!route.ws_handler.len_guards.push(node) || !documents.push(binding))
-            return frontend_error(FrontendError::TooManyItems, stmt.span);
-        return route.ws_handler.len_guards.len - 1;
-    }
-    return frontend_error(FrontendError::UnsupportedSyntax,
-                          stmt.span,
-                          lit_str("message optional bindings require parse/get/scalar JSON "
-                                  "projections, directly or through pure helpers"));
+    WsJsonBinding binding{};
+    binding.name = stmt.name;
+    auto root = lower_ws_json_optional(value.value(), verdict, route, mod, binding);
+    if (!root) return core::make_unexpected(root.error());
+    if (!documents.push(binding)) return frontend_error(FrontendError::TooManyItems, stmt.span);
+    return root.value();
 }
 
 static FrontendResult<u32> analyze_ws_branch_guard(const AstStatement& stmt,

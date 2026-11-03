@@ -291,8 +291,27 @@ else { msg.drop() }
 ```
 
 This helper subset normalizes to one parse/get/scalar projection over the same
-immutable message. Conditional helper returns, JSON mutation, dynamic pointers,
-HTTP reads/effects and other optional computations remain unsupported. A helper
+immutable message. Helpers may also return that projection conditionally, with
+`nil` on the other path. Conditions use the supported ordinary message predicates;
+nesting and Boolean `guard ... else { nil }` are supported. A nil-selected path
+skips extraction, and each reached selector executes once, in source order.
+
+```swift
+func clientDocument(_ msg: WebSocketMessage) -> Json {
+    guard msg.fromClient else { nil }
+    if msg.isText { json.parse(msg.text) } else { nil }
+}
+// Inside callback:
+if let root = clientDocument(msg) { msg.forward("client JSON") }
+else { msg.forward() }
+```
+
+There must be one value-producing projection path; alternatives return `nil`.
+Selectors and presence tests share the 32-node condition budget, while the
+caller's guard/if-let consumes one of the four source clauses. Different
+value-producing branches, optional-binding guards inside helpers, JSON mutation,
+dynamic pointers, HTTP reads/effects and other optional computations remain
+unsupported. A helper
 may accept the borrowed message or its text, or an earlier validated JSON alias;
 it cannot supply an unrelated JSON document. Initializer-less shorthand bindings
 remain unsupported.

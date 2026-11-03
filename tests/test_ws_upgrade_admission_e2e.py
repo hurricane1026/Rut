@@ -442,6 +442,48 @@ HELPER_IF_LET_HANDLER = (IF_LET_HANDLER
                          .replace("json.bool(field)", "flag(identity(field))"))
 
 
+OPTIONAL_CONDITION_DECLARATIONS = r"""
+func readClient(_ msg: WebSocketMessage) -> Json {
+    guard msg.fromClient else { nil }
+    if msg.isText { json.parse(msg.text) } else { nil }
+}
+"""
+
+OPTIONAL_CONDITION_HANDLER = r"""
+return websocket(ws) { msg in
+    if let root = readClient(msg) {
+        guard let field = json.get(root, "/name") else { msg.close(1008) }
+        guard let text = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + text + ">")
+    } else { msg.forward() }
+}
+"""
+
+
+def optional_condition_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"optional condition: {actual=!r}, {expected=!r}")
+    data = b'{"name":"a\\u0000b"}'
+    first = bytearray(masked_frame(1, data[:9]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, data[9:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<a\0b>", True))
+    client.sendall(masked_frame(1, b'{"name":""}'))
+    expect(peer, (1, b"<>", True))
+    client.sendall(masked_frame(2, b"\xff\x00"))
+    expect(peer, (2, b"\xff\x00", True))
+    client.sendall(masked_frame(1, b"broken"))
+    expect(peer, (1, b"broken", True))
+    peer.sendall(b"\x82\x02\xff\x00")
+    expect(client, (2, b"\xff\x00", False))
+    client.sendall(masked_frame(1, b'{"name":false}'))
+    expect(peer, (8, b"\x03\xeb", True))
+    expect(client, (8, b"\x03\xeb", False))
+
+
 def branch_guard_exchange(client, peer):
     def expect(sock, expected):
         actual = recv_client_frame(sock)
@@ -1497,6 +1539,8 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (OPTIONAL_CONDITION_HANDLER, optional_condition_exchange,
+                 OPTIONAL_CONDITION_DECLARATIONS),
                 (HELPER_GUARD_HANDLER, branch_guard_exchange, JSON_HELPER_DECLARATIONS),
                 (HELPER_IF_LET_HANDLER, if_let_exchange, JSON_HELPER_DECLARATIONS),
                 (BRANCH_GUARD_HANDLER, branch_guard_exchange, ""),

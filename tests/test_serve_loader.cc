@@ -6341,6 +6341,81 @@ route GET "/root-iflet" { return websocket(backend) { msg in
     program.destroy();
 }
 
+TEST(serve_loader, websocket_optional_conditions_select_reached_projection_only) {
+    const char* source = R"rut(upstream ws at "127.0.0.1:9999"
+func readClient(_ msg: WebSocketMessage) -> Json {
+    guard msg.fromClient else { nil }
+    if msg.isText { json.parse(msg.text) } else { nil }
+}
+func readServer(_ msg: WebSocketMessage) -> Json {
+    if msg.fromClient { nil } else { json.parse(msg.text) }
+}
+func selectedString(_ msg: WebSocketMessage, _ root: Json) -> str {
+    if msg.fromClient { json.string(root) } else { nil }
+}
+route GET "/client" { return websocket(ws) { msg in
+    if let root = readClient(msg) {
+        guard let field = json.get(root, "/name") else { msg.close(1008) }
+        guard let text = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + text + ">")
+    } else { msg.forward() }
+} }
+route GET "/server" { return websocket(ws) { msg in
+    if let root = readServer(msg) { msg.forward("json") }
+    else { msg.forward("absent") }
+} }
+route GET "/scalar" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    if let value = selectedString(msg, root) { msg.forward(value) }
+    else { msg.forward("absent") }
+} }
+)rut";
+    const auto dir =
+        (std::filesystem::temp_directory_path() / "rut_ws_optional_conditions").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    REQUIRE_EQ(program.config.route_count, 3u);
+    const auto client_doc = program.config.routes[0].ws_frame_handler;
+    const auto server_doc = program.config.routes[1].ws_frame_handler;
+    const auto scalar = program.config.routes[2].ws_frame_handler;
+    REQUIRE(client_doc);
+    REQUIRE(server_doc);
+    REQUIRE(scalar);
+    const char* names[] = {
+        "{\"name\":\"a\\u0000b\"}", "{\"name\":\"\"}", "{}", "{\"name\":false}", "broken"};
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (u32 j = 0; j < 5; ++j) {
+                const auto* data = reinterpret_cast<const u8*>(names[j]);
+                const u32 size = static_cast<u32>(strlen(names[j]));
+                CHECK(client_doc(nullptr, op, data, size, client) ==
+                      (!client || op == WsOpcode::Binary || j == 4 ? WsFrameAction::Forward
+                       : j < 2  ? WsFrameAction::ForwardTextPolicy0
+                       : j == 2 ? WsFrameAction::ClosePolicy0
+                                : WsFrameAction::ClosePolicy1));
+                CHECK(server_doc(nullptr, op, data, size, client) ==
+                      (!client && j != 4 ? WsFrameAction::ForwardTextPolicy0
+                                         : WsFrameAction::ForwardText));
+            }
+            const char* values[] = {"\"\"", "\"a\\u0000b\"", "null", "false", "broken"};
+            for (u32 j = 0; j < 5; ++j)
+                CHECK(scalar(nullptr,
+                             op,
+                             reinterpret_cast<const u8*>(values[j]),
+                             static_cast<u32>(strlen(values[j])),
+                             client) == (j == 4            ? WsFrameAction::ClosePolicy0
+                                         : client && j < 2 ? WsFrameAction::ForwardTextPolicy0
+                                                           : WsFrameAction::ForwardText));
+        }
+    }
+    CHECK(program.config.routes[0].ws_forward_texts[0].source_path.eq(lit_str("/name")));
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
 TEST(serve_loader, websocket_json_helpers_imported_projections_keep_presence_and_paths) {
     struct Case {
         const char* operation;
@@ -6414,6 +6489,69 @@ route GET "/ws" { return websocket(ws) { msg in
             }
         }
         program.destroy();
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, websocket_optional_conditions_keep_false_zero_empty_and_null_presence) {
+    struct Case {
+        const char* operation;
+        const char* value;
+        bool present;
+    };
+    const Case cases[] = {{"string", "\"\"", true},
+                          {"string", "null", false},
+                          {"bool", "false", true},
+                          {"bool", "0", false},
+                          {"int", "0", true},
+                          {"int", "1.5", false},
+                          {"numberText", "0", true},
+                          {"numberText", "false", false},
+                          {"stringify", "null", true},
+                          {"kind", "null", true},
+                          {"count", "[]", true},
+                          {"count", "0", false},
+                          {"get", "{\"v\":null}", true},
+                          {"get", "{}", false},
+                          {"parse", "null", true},
+                          {"parse", "broken", false}};
+    const auto dir =
+        (std::filesystem::temp_directory_path() / "rut_ws_optional_extractors").string();
+    for (const auto& test : cases) {
+        for (bool guard_binding : {false, true}) {
+            const bool parse = strcmp(test.operation, "parse") == 0;
+            std::string source =
+                "upstream ws at \"127.0.0.1:9999\"\nfunc conditional(_ msg: WebSocketMessage";
+            if (!parse) source += ", _ document: Json";
+            source += ") { if msg.fromClient { json.";
+            source += test.operation;
+            source += parse                                ? "(msg.text)"
+                      : strcmp(test.operation, "get") == 0 ? "(document, \"/v\")"
+                                                           : "(document)";
+            source += " } else { nil } }\nroute GET \"/ws\" { return websocket(ws) { msg in\n";
+            if (!parse)
+                source += "guard let document = json.parse(msg.text) else { msg.close(1007) }\n";
+            source += guard_binding ? "guard let value = " : "if let value = ";
+            source += parse ? "conditional(msg)" : "conditional(msg, document)";
+            source += guard_binding
+                          ? " else { msg.forward(\"missing\") }\nmsg.forward(\"present\") } }\n"
+                          : " { msg.forward(\"present\") } else { msg.forward(\"missing\") } } }\n";
+            auto path = write_file(dir, "app.rut", source.c_str());
+            LoadedProgram program;
+            LoadError err;
+            REQUIRE(load_rut_program(path.c_str(), program, err));
+            const auto handler = program.config.routes[0].ws_frame_handler;
+            REQUIRE(handler);
+            for (bool client : {false, true})
+                CHECK(handler(nullptr,
+                              WsOpcode::Text,
+                              reinterpret_cast<const u8*>(test.value),
+                              static_cast<u32>(strlen(test.value)),
+                              client) == ((client && test.present) != guard_binding
+                                              ? WsFrameAction::ForwardTextPolicy0
+                                              : WsFrameAction::ForwardText));
+            program.destroy();
+        }
     }
     std::filesystem::remove_all(dir);
 }

@@ -2966,9 +2966,19 @@ restores the local scope. Only projections rooted in this callback's borrowed
 message and compile-time pointer strings lower to the existing presence tests.
 Generic forwarding of unwrapped inputs and imported helper namespaces use their
 ordinary language semantics. No proof value escapes into HTTP/MIR storage.
-Conditional helper returns, JSON mutations, dynamic pointer expressions and other
-optional computations remain absent, as do initializer-less shorthand bindings.
-Helper calls introduce no additional condition clauses, runtime storage or ABI.
+One-sided conditional helper returns are lowered as lazy conjunctions of the
+selector and the remaining optional expression. Exactly one arm continues toward
+a JSON projection; the other is nil. A nil then-arm negates the selector, including
+its whole compound predicate. Nested selectors and Boolean helper guards retain
+source order and evaluate each reached selector once. Selector nodes and AND
+nodes are operands; only the final presence root is a source clause. All nodes
+share the existing 32-node budget, with one of four clauses per binding call.
+The alias is published only after the complete optional expression is lowered.
+
+Different value-producing alternatives, optional-binding guards inside helpers,
+JSON mutations, dynamic pointer expressions and other optional computations
+remain absent, as do initializer-less shorthand bindings. Helper calls add no
+runtime storage, native format or handler ABI.
 
 A branch sequence tracks its entry and pending continuation edge. A guard's
 success edge or an early if's false edge is patched to the next source condition,

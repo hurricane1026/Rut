@@ -1800,6 +1800,75 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, websocket_optional_conditions_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"
+func readClient(_ msg: WebSocketMessage) -> Json {
+    guard msg.fromClient else { nil }
+    if msg.isText { json.parse(msg.text) } else { nil }
+}
+func readServer(_ msg: WebSocketMessage) -> Json {
+    if msg.fromClient { nil } else { json.parse(msg.text) }
+}
+func selectedString(_ msg: WebSocketMessage, _ root: Json) -> str {
+    if msg.fromClient { json.string(root) } else { nil }
+}
+route GET "/client" { return websocket(ws) { msg in
+    if let root = readClient(msg) {
+        guard let field = json.get(root, "/name") else { msg.close(1008) }
+        guard let text = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + text + ">")
+    } else { msg.forward() }
+} }
+route GET "/server" { return websocket(ws) { msg in
+    if let root = readServer(msg) { msg.forward("json") }
+    else { msg.forward("absent") }
+} }
+route GET "/scalar" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    if let value = selectedString(msg, root) { msg.forward(value) }
+    else { msg.forward("absent") }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 3u);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    const auto server = owner.p->config.routes[1].ws_frame_handler;
+    const auto scalar = owner.p->config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    REQUIRE(server);
+    REQUIRE(scalar);
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            const char* values[] = {"{\"name\":\"\"}", "{\"name\":null}", "{}", "broken"};
+            for (u32 j = 0; j < 4; ++j) {
+                const auto* data = reinterpret_cast<const u8*>(values[j]);
+                const u32 size = static_cast<u32>(strlen(values[j]));
+                CHECK(handler(nullptr, op, data, size, client) ==
+                      (!client || op == WsOpcode::Binary || j == 3 ? WsFrameAction::Forward
+                       : j == 0 ? WsFrameAction::ForwardTextPolicy0
+                       : j == 1 ? WsFrameAction::ClosePolicy1
+                                : WsFrameAction::ClosePolicy0));
+                CHECK(server(nullptr, op, data, size, client) ==
+                      (!client && j != 3 ? WsFrameAction::ForwardTextPolicy0
+                                         : WsFrameAction::ForwardText));
+            }
+            const char* values2[] = {"\"\"", "\"ok\"", "null", "broken"};
+            for (u32 j = 0; j < 4; ++j)
+                CHECK(scalar(nullptr,
+                             op,
+                             reinterpret_cast<const u8*>(values2[j]),
+                             static_cast<u32>(strlen(values2[j])),
+                             client) == (j == 3            ? WsFrameAction::ClosePolicy0
+                                         : client && j < 2 ? WsFrameAction::ForwardTextPolicy0
+                                                           : WsFrameAction::ForwardText));
+        }
+    }
+}
+
 TEST(native_program, websocket_json_helpers_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
