@@ -15,6 +15,7 @@ whether a competing open-source edition includes them.
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
+| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison | CSPRNG salt generation, worker scheduling, Rut/JIT/native-program integration, user registry and password lifecycle |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and RS256 policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | ES keys, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
@@ -740,3 +741,47 @@ expiry, recovery and shutdown. See the language card for exact supported scope.
 This closes the fixed-endpoint/approved-kid refresh slice, not remote discovery,
 automatic new-kid admission, conditional revalidation, HTTP/2/compression,
 cross-node synchronization, online Token revocation, signing or JWE.
+
+## Native password-storage primitive
+
+`rut::password_hash` and `rut::password_verify` in
+[`password.h`](../include/rut/runtime/password.h) are synchronous native C++
+primitives for offline provisioning or an independently scheduled worker. They
+are **not exposed to Rut, JIT handlers, native-program helpers or Basic auth**.
+Do not invoke them on an event-loop shard: 600,000 HMAC rounds can block other
+connections. A bounded worker execution/cancellation contract is still required
+before request-path integration.
+
+The fixed profile is PBKDF2-HMAC-SHA256 (RFC 8018), 600,000 iterations, a
+16-byte caller-supplied salt and a 32-byte derived key. No dependency or
+language keyword is added: it reuses the existing stack-only HMAC and pinned
+static OpenSSL constant-time comparison/cleansing utilities. All scratch is
+stack-owned and derived-key/HMAC scratch is wiped before return.
+
+Passwords are 1–1024 exact bytes, including embedded NUL; there is no implicit
+truncation, Unicode normalization or NUL termination. The caller must generate
+a fresh cryptographically random salt per password. The deterministic test
+salt is exclusively a fixture, not an example production salt. Hashing does
+not generate entropy, enforce password strength or persist credentials.
+
+The 123-byte ASCII record (without a terminating NUL) is:
+
+```text
+$rut-pbkdf2-sha256$600000$<32 lowercase salt hex digits>$<64 lowercase key hex digits>
+```
+
+Only this exact profile is accepted: uppercase hex, alternate costs or
+algorithms, extra fields, embedded NUL and trailing bytes are rejected before
+performing the expensive derivation. The record is project-specific, not a
+claim of compatibility with PHC, modular crypt or another application's record
+format. `password_hash` sets the length to zero on failure and leaves the
+output buffer unchanged; `password_verify` returns false for invalid records
+and wrong passwords. Their timings differ for malformed and valid records;
+only the derived-key comparison is constant-time. Account enumeration, rate
+limits and uniform authentication responses belong to the future caller.
+
+The existing `test_hash` target includes independent Python `hashlib` PBKDF2
+vectors, binary and long-key passwords, rejection/buffer bounds, and incorrect
+password cases. User registration, password changes/resets, automatic rehash,
+pepper management, a durable user registry and session/JWT login flows remain
+unimplemented.

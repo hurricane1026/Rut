@@ -779,3 +779,12 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 **统一发布门槛**：聚焦编译器/JIT/运行时测试、受影响后端与协议互通测试、格式与
 静态检查；底座改动保持无 C++ 标准库链接约束、热路径无堆分配与 shard 归属。
 安全协议需标准测试向量，二进制解析需畸形输入/模糊测试；文档示例纳入编译执行验证。
+
+### Password storage and login
+
+- [x] Native off-shard PBKDF2-HMAC-SHA256 fixed-profile hash/verify primitives,
+  canonical bounded records, constant-time key comparison and independent vectors.
+- [ ] CSPRNG salt generation and bounded worker execution/cancellation before
+  exposing slow password verification to Rut/JIT/native-program handlers.
+- [ ] Durable user/credential lifecycle, registration, password change/reset,
+  rate limits, rehash migration and session/JWT login composition.

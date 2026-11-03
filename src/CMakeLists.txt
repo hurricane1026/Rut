@@ -127,6 +127,7 @@ target_link_libraries(rut_crypto PUBLIC rut_crypto_rsa_core)
 
 add_library(rut_runtime STATIC
     runtime/hash.cc
+    runtime/password.cc
     runtime/auth.cc
     runtime/webhook.cc
     runtime/signed_request.cc

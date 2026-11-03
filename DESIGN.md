@@ -9305,3 +9305,17 @@ time key parsing, coroutine, virtual dispatch, external HTTP client library or
 cross-shard mutable cache is introduced. DNS/discovery, new-kid auto-admission,
 HTTP/2, conditional cache revalidation and distributed refresh coordination remain
 outside this bounded profile.
+
+### Native password-storage foundation
+
+The native C++ `password_hash`/`password_verify` APIs implement one fixed,
+versioned PBKDF2-HMAC-SHA256 storage profile using existing stack-only HMAC:
+600,000 rounds, a caller-generated random 16-byte salt and a 32-byte key.
+Passwords are exact nonempty bytes up to 1024 bytes; output is a strict
+123-byte ASCII record. Derived keys and HMAC scratch are cleansed, with
+constant-time key comparison. This adds no language surface or dependency.
+These deliberately slow synchronous APIs belong off the shard event loop.
+Worker scheduling, Rut/JIT integration, salt generation, user persistence and
+account/password lifecycle remain future work; Basic auth retains its existing
+static credential contract. See [auth coverage](docs/auth-coverage.md#native-password-storage-primitive)
+for the full format, ownership, validation and failure contract.
