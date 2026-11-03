@@ -2535,6 +2535,46 @@ TEST(RirBuilder, StandardWebhookFiveOperands) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, StrLengthChecksCarrierArityAndResultType) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("bytes_count"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto bytes = V(b.emit_const_str({"\0\xff", 2}));
+    auto wrong = V(b.emit_const_i32(1));
+    CHECK_FALSE(b.emit_str_length(wrong));
+    auto result = V(b.emit_str_length(bytes));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(verify_function(fn).ok);
+    Instruction* op = nullptr;
+    for (u32 i = 0; i < fn->entry()->inst_count; ++i)
+        if (fn->entry()->insts[i].op == Opcode::StrLength) op = &fn->entry()->insts[i];
+    REQUIRE(op);
+    for (u32 count : {0u, 2u}) {
+        op->operand_count = count;
+        auto checked = verify_function(fn);
+        CHECK_FALSE(checked.ok);
+        CHECK(checked.issue.code == VerifyIssueCode::InvalidStrLength);
+    }
+    op->operand_count = 1;
+    op->operands[0] = wrong;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidStrLength);
+    op->operands[0] = bytes;
+    op->result = bytes;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidStrLength);
+    op->result = result;
+    CHECK(verify_function(fn).ok);
+    char output[1024];
+    PrintBuf print;
+    print.init(output, sizeof(output), -1);
+    print_function(print, *fn);
+    CHECK(std::string(output, print.len).find("str.length") != std::string::npos);
+    ctx.destroy();
+}
+
 TEST(RirVerifier, JwtClaimsLifetimeChecksArityAndTypes) {
     TestContext ctx;
     REQUIRE(ctx.init());

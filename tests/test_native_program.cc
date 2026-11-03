@@ -1800,6 +1800,68 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, websocket_payload_bytes_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func allowed(_ bytes: Bytes) -> bool =>
+    !bytes.isEmpty && bytes.count == 2 && same(bytes, b"\x00\xff")
+func choose(_ path: str) -> Bytes {
+    if path == "/yes" { b"\x00\xff" } else { b"" }
+}
+route GET "/http" {
+    let bytes = choose(req.path)
+    guard allowed(bytes) else { return 403 }
+    return 200
+}
+route POST "/body" {
+    guard allowed(req.bodyBytes) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(backend) { message in
+    guard allowed(message.payload) else { message.drop() }
+    message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 3u);
+    const auto http = owner.p->config.routes[0].fn;
+    REQUIRE(http);
+    const char* requests[] = {"GET /yes HTTP/1.1\r\nHost: test\r\n\r\n",
+                              "GET /no HTTP/1.1\r\nHost: test\r\n\r\n"};
+    for (u32 i = 0; i < 2; ++i) {
+        const auto result =
+            jit::HandlerResult::unpack(http(nullptr,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(requests[i]),
+                                            static_cast<u32>(strlen(requests[i])),
+                                            nullptr));
+        CHECK_EQ(result.status_code, i == 0 ? 200u : 403u);
+    }
+    REQUIRE(owner.p->config.routes[1].needs_req_body);
+    const auto body = owner.p->config.routes[1].fn;
+    REQUIRE(body);
+    const char body_request[] =
+        "POST /body HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\n\0\xff";
+    auto body_result = jit::HandlerResult::unpack(body(nullptr,
+                                                       nullptr,
+                                                       reinterpret_cast<const u8*>(body_request),
+                                                       sizeof(body_request) - 1,
+                                                       nullptr));
+    CHECK_EQ(body_result.status_code, 200u);
+    const auto handler = owner.p->config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    const Str payloads[] = {{"\0\xff", 2}, {"\xff\0", 2}, {"", 0}};
+    for (u32 i = 0; i < 3; ++i)
+        CHECK(handler(nullptr,
+                      WsOpcode::Binary,
+                      reinterpret_cast<const u8*>(payloads[i].ptr),
+                      payloads[i].len,
+                      true) == (i == 0 ? WsFrameAction::Forward : WsFrameAction::Drop));
+}
+
 TEST(native_program, websocket_message_type_guards_survive_compiler_exit) {
     Source source;
     REQUIRE(

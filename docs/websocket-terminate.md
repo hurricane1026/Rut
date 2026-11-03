@@ -93,6 +93,38 @@ identity helper can also return the borrowed `WebSocketMessage` within the same
 synchronous callback. Closed-case exhaustive matching and contextual `.case`
 inference are not introduced by these typed equality projections.
 
+### Borrowed payload bytes
+
+`message.payload` is a `Bytes` view over the complete reassembled payload for
+either Text or Binary messages. `.count` reports bytes as `i32`; `.isEmpty`
+is a Boolean property. Text payloads expose their encoded UTF-8 bytes, while
+Binary payloads may contain arbitrary octets. Reading the view does not copy
+or decode the payload. The view is valid only within the synchronous callback
+and its inlined helper calls. `message.text` retains its existing raw-string
+behavior, and `forward()` preserves the original message kind.
+
+```swift
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func isMarker(_ bytes: Bytes) -> bool =>
+    !bytes.isEmpty && bytes.count == 2 && same(bytes, b"\x00\xff")
+// In the callback:
+// guard !message.fromClient || isMarker(message.payload) else { message.drop() }
+```
+
+`Bytes` is a common language type: ordinary HTTP locals and helper return values
+can also hold byte literals or select between them at runtime. HTTP's
+`req.bodyBytes` supplies the real request body to the same Bytes helper, reusing
+`req.body`'s complete-body buffering, limits and request-scoped lifetime.
+Imported helpers retain their literal bytes after the imported AST disappears. Literals reuse
+the existing binary escape rules and 4096-byte decoded limit; the message view
+still spans the full single-slice payload, up to 16370 bytes. Equality/inequality
+and generic `Eq` compare exact bytes in either operand order. Comparisons with
+`str`, implicit conversions, regex scans, ordering, concatenation and indexing
+are unsupported. Payload inspections currently lower literal equality, view
+reflexivity, count/literal comparisons and emptiness into the bounded condition
+forest. This step does not add dynamic payload replacement or callback-local
+bindings.
+
 After the route's HTTP guards pass, terminate mode validates the opening request
 before connecting to the selected upstream. The supported request shape is GET
 over HTTP/1.1 with exactly one non-empty Host, a `Connection` list containing the

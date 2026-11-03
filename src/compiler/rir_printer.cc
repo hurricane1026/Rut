@@ -276,6 +276,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::StrHasPrefix:
             buf.put_cstr("str.has_prefix");
             break;
+        case Opcode::StrLength:
+            buf.put_cstr("str.length");
+            break;
         case Opcode::StrTrimPrefix:
             buf.put_cstr("str.trim_prefix");
             break;

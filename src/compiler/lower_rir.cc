@@ -2621,7 +2621,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!zero) return frontend_error(FrontendError::OutOfMemory, span);
         return zero.value();
     }
-    if (value.kind == MirValueKind::WidenI64) {
+    if (value.kind == MirValueKind::WidenI64 || value.kind == MirValueKind::BytesCount) {
         auto operand = materialize_value(*value.lhs,
                                          mir,
                                          variant_infos,
@@ -2636,7 +2636,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                          local_count,
                                          span);
         if (!operand) return core::make_unexpected(operand.error());
-        auto out = b.emit_sext_i64(operand.value(), {span.line, span.col});
+        auto out = value.kind == MirValueKind::BytesCount
+                       ? b.emit_str_length(operand.value(), {span.line, span.col})
+                       : b.emit_sext_i64(operand.value(), {span.line, span.col});
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }

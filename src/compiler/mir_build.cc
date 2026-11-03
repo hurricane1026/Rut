@@ -278,17 +278,18 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
 }
 
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
-    return kind == HirTypeKind::Bool                                 ? MirTypeKind::Bool
-           : (kind == HirTypeKind::I32 || is_ws_enum_type(kind))     ? MirTypeKind::I32
-           : kind == HirTypeKind::I64                                ? MirTypeKind::I64
-           : (kind == HirTypeKind::Str || kind == HirTypeKind::Json) ? MirTypeKind::Str
-           : kind == HirTypeKind::Method                             ? MirTypeKind::Method
-           : kind == HirTypeKind::ByteSize                           ? MirTypeKind::ByteSize
-           : kind == HirTypeKind::IP                                 ? MirTypeKind::IP
-           : kind == HirTypeKind::Variant                            ? MirTypeKind::Variant
-           : kind == HirTypeKind::Tuple                              ? MirTypeKind::Tuple
-           : kind == HirTypeKind::Struct                             ? MirTypeKind::Struct
-                                                                     : MirTypeKind::Unknown;
+    return kind == HirTypeKind::Bool                             ? MirTypeKind::Bool
+           : (kind == HirTypeKind::I32 || is_ws_enum_type(kind)) ? MirTypeKind::I32
+           : kind == HirTypeKind::I64                            ? MirTypeKind::I64
+           : (kind == HirTypeKind::Str || kind == HirTypeKind::Json || kind == HirTypeKind::Bytes)
+               ? MirTypeKind::Str
+           : kind == HirTypeKind::Method   ? MirTypeKind::Method
+           : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
+           : kind == HirTypeKind::IP       ? MirTypeKind::IP
+           : kind == HirTypeKind::Variant  ? MirTypeKind::Variant
+           : kind == HirTypeKind::Tuple    ? MirTypeKind::Tuple
+           : kind == HirTypeKind::Struct   ? MirTypeKind::Struct
+                                           : MirTypeKind::Unknown;
 }
 
 static bool expand_hir_flat_shape(const HirModule& module,
@@ -486,7 +487,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.int_value = expr.int_value;
         return v;
     }
-    if (expr.kind == HirExprKind::StrLit) {
+    if (expr.kind == HirExprKind::StrLit || expr.kind == HirExprKind::BytesLit) {
         v.kind = MirValueKind::StrConst;
         v.type = MirTypeKind::Str;
         v.str_value = expr.str_value;
@@ -956,13 +957,14 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.error_variant_index = expr.error_variant_index;
         return v;
     }
-    if (expr.kind == HirExprKind::WidenI64) {
+    if (expr.kind == HirExprKind::WidenI64 || expr.kind == HirExprKind::BytesCount) {
         auto operand = mir_value(*expr.lhs, module, fn, ctx);
         if (!operand) return core::make_unexpected(operand.error());
         if (!fn->values.push(operand.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
-        v.kind = MirValueKind::WidenI64;
-        v.type = MirTypeKind::I64;
+        v.kind = expr.kind == HirExprKind::BytesCount ? MirValueKind::BytesCount
+                                                      : MirValueKind::WidenI64;
+        v.type = expr.kind == HirExprKind::BytesCount ? MirTypeKind::I32 : MirTypeKind::I64;
         v.lhs = &fn->values[fn->values.len - 1];
         return v;
     }

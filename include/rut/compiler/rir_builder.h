@@ -845,6 +845,15 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_str_length(ValueId str, SourceLoc loc = {}) {
+        if (!val_has_type(str, TypeKind::Str)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::StrLength, ty, loc));
+        inst->operands[0] = str;
+        inst->operand_count = 1;
+        return vid;
+    }
+
     Result<ValueId> emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
             return err(RirError::InvalidState);

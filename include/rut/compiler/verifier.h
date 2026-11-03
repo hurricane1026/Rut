@@ -47,6 +47,7 @@ enum class VerifyIssueCode : u8 {
     InvalidPreRoutePolicyId,
     InvalidJwtClaimsLifetime,
     InvalidPasswordPrefix,
+    InvalidStrLength,
 };
 
 struct VerifyIssue {
@@ -761,6 +762,19 @@ inline VerifyResult verify_function(const Function* fn,
         }
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const Instruction& inst = block.insts[ii];
+            if (inst.op == Opcode::StrLength) {
+                const auto kExactType = [&](ValueId id, TypeKind kind) {
+                    if (id == kNoValue || id.id >= fn->value_count || fn->values == nullptr)
+                        return false;
+                    const Type* type = fn->values[id.id].type;
+                    return type != nullptr && type->kind == kind && type->inner == nullptr &&
+                           type->struct_def == nullptr;
+                };
+                if (inst.operand_count != 1 || !kExactType(inst.result, TypeKind::I32) ||
+                    !kExactType(inst.operand(0), TypeKind::Str))
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidStrLength, function_index, bi, ii);
+            }
             if (inst.op != Opcode::JwtClaimsValidWithLifetime) continue;
             auto exact_type = [&](ValueId id, TypeKind kind) {
                 if (id == kNoValue || id.id >= fn->value_count || fn->values == nullptr)
@@ -1641,6 +1655,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidPasswordPrefix";
         case VerifyIssueCode::InvalidJwtClaimsLifetime:
             return "InvalidJwtClaimsLifetime";
+        case VerifyIssueCode::InvalidStrLength:
+            return "InvalidStrLength";
     }
     return "Unknown";
 }

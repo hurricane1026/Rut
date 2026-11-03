@@ -807,6 +807,10 @@ struct Parser {
 
     FrontendResult<AstExpr> parse_call_arg() {
         if (cur().type == TokenType::LBrace) return parse_object_call_arg();
+        return parse_expr();
+    }
+
+    FrontendResult<AstExpr> parse_primary_atom() {
         if (cur().type == TokenType::Ident && cur().text.eq({"b", 1}) &&
             peek().type == TokenType::StringLit) {
             const Token kStart = cur();
@@ -818,10 +822,6 @@ struct Parser {
             literal.span = Span{kStart.start, prev().end, kStart.line, kStart.col};
             return literal;
         }
-        return parse_expr();
-    }
-
-    FrontendResult<AstExpr> parse_primary_atom() {
         const Token start = cur();
         AstExpr expr{};
         if (cur().type == TokenType::LBrace)

@@ -113,6 +113,7 @@ enum class MirValueKind : u8 {
     CacheSet,
     SignedRequestValid,
     JwtClaimsValidWithLifetime,
+    BytesCount,
 };
 
 enum class MirTypeKind : u8 {

@@ -410,6 +410,7 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
         case HirTypeKind::Str:
+        case HirTypeKind::Bytes:
         case HirTypeKind::Json:
         case HirTypeKind::Generic:
         case HirTypeKind::Unknown:
@@ -505,11 +506,12 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.tuple_len = tuple_len;
     shape.array_elem_shape_index =
         type == HirTypeKind::Array ? array_elem_shape_index : 0xffffffffu;
-    shape.is_concrete =
-        type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::I64 ||
-        type == HirTypeKind::Str || type == HirTypeKind::Json || type == HirTypeKind::Method ||
-        type == HirTypeKind::ByteSize || type == HirTypeKind::IP || type == HirTypeKind::Response ||
-        type == HirTypeKind::WebSocketMessage || is_ws_enum_type(type);
+    shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
+                        type == HirTypeKind::I64 || type == HirTypeKind::Str ||
+                        type == HirTypeKind::Json || type == HirTypeKind::Method ||
+                        type == HirTypeKind::ByteSize || type == HirTypeKind::IP ||
+                        type == HirTypeKind::Response || type == HirTypeKind::WebSocketMessage ||
+                        is_ws_enum_type(type) || type == HirTypeKind::Bytes;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -722,6 +724,7 @@ static bool hir_type_shape_satisfies_eq_constraint(const HirModule& mod,
         case HirTypeKind::I32:
         case HirTypeKind::I64:
         case HirTypeKind::Str:
+        case HirTypeKind::Bytes:
         case HirTypeKind::Method:
         case HirTypeKind::WebSocketMessageKind:
         case HirTypeKind::WebSocketDirection:
@@ -2140,6 +2143,7 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"bool", 4})) return HirTypeKind::Bool;
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
+    if (name.eq(lit_str("Bytes"))) return HirTypeKind::Bytes;
     if (name.eq({"Method", 6})) return HirTypeKind::Method;
     if (name.eq({"Json", 4})) return HirTypeKind::Json;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
@@ -8045,6 +8049,11 @@ static bool ws_typed_field(const HirExpr& expr, Str name) {
            expr.lhs->type == HirTypeKind::WebSocketMessage;
 }
 
+static bool ws_payload_count(const HirExpr& expr) {
+    return expr.kind == HirExprKind::BytesCount && expr.lhs &&
+           ws_typed_field(*expr.lhs, lit_str("payload"));
+}
+
 static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
                                                     WsVerdict verdict,
                                                     HirWsHandler& handler,
@@ -8071,6 +8080,14 @@ static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
     if (const_eval_expr(expr, nullptr, 0, &known, 0) && known.type == HirTypeKind::Bool) {
         node.accessor = WsLenGuard::Accessor::Constant;
         node.bound = known.bool_value ? 1u : 0u;
+        return kAppend(node);
+    }
+    if (expr.kind == HirExprKind::Eq && expr.lhs && expr.rhs &&
+        ws_typed_field(*expr.lhs, lit_str("payload")) &&
+        ws_typed_field(*expr.rhs, lit_str("payload"))) {
+        // This callback supplies a single immutable message; both views are its payload.
+        node.accessor = WsLenGuard::Accessor::Constant;
+        node.bound = 1;
         return kAppend(node);
     }
     if (expr.kind == HirExprKind::Eq && expr.lhs && expr.rhs && is_ws_enum_type(expr.lhs->type) &&
@@ -8162,7 +8179,8 @@ static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
                expr.lhs && expr.rhs) {
         const HirExpr* field = expr.lhs;
         const HirExpr* value = expr.rhs;
-        const bool kSwapped = field->kind != HirExprKind::WsMessageField;
+        const bool kSwapped =
+            field->kind != HirExprKind::WsMessageField && !ws_payload_count(*field);
         if (kSwapped) {
             field = expr.rhs;
             value = expr.lhs;
@@ -8170,7 +8188,8 @@ static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
         node.cmp = expr.kind == HirExprKind::Eq                 ? WsLenGuard::Cmp::Eq
                    : (expr.kind == HirExprKind::Lt) != kSwapped ? WsLenGuard::Cmp::Lt
                                                                 : WsLenGuard::Cmp::Gt;
-        if (ws_typed_field(*field, lit_str("len")) && value->kind == HirExprKind::IntLit) {
+        if ((ws_typed_field(*field, lit_str("len")) || ws_payload_count(*field)) &&
+            value->kind == HirExprKind::IntLit) {
             // The runtime's complete-message length is nonnegative and bounded.
             if (value->int_value < 0 || value->int_value > 0xffffffffLL) {
                 node.accessor = WsLenGuard::Accessor::Constant;
@@ -8183,6 +8202,10 @@ static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
             }
         } else if (expr.kind == HirExprKind::Eq && ws_typed_field(*field, lit_str("text")) &&
                    value->kind == HirExprKind::StrLit) {
+            node.accessor = WsLenGuard::Accessor::TextEqual;
+            node.pattern = value->str_value;
+        } else if (expr.kind == HirExprKind::Eq && ws_typed_field(*field, lit_str("payload")) &&
+                   value->kind == HirExprKind::BytesLit) {
             node.accessor = WsLenGuard::Accessor::TextEqual;
             node.pattern = value->str_value;
         } else {
@@ -8530,6 +8553,18 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.str_value = decoded.value();
         return out;
     }
+    if (expr.kind == AstExprKind::BytesLit) {
+        // The parser's decoded pool belongs to AstFile, not the source mmap.
+        // Retain it in the module before AST/import storage can disappear.
+        std::string bytes;
+        if (expr.str_value.len != 0) bytes.assign(expr.str_value.ptr, expr.str_value.len);
+        auto retained = intern_analysis_string(mod, std::move(bytes));
+        if (!retained) return core::make_unexpected(retained.error());
+        out.kind = HirExprKind::BytesLit;
+        out.type = HirTypeKind::Bytes;
+        out.str_value = retained.value();
+        return out;
+    }
     if (expr.kind == AstExprKind::ObjectLit) {
         return frontend_error(
             FrontendError::UnsupportedSyntax,
@@ -8753,9 +8788,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.type = HirTypeKind::Str;
                 return out;
             }
-            if (expr.name.eq({"body", 4})) {
+            if (expr.name.eq({"body", 4}) || expr.name.eq(lit_str("bodyBytes"))) {
                 out.kind = HirExprKind::ReqBody;
-                out.type = HirTypeKind::Str;
+                out.type =
+                    expr.name.eq(lit_str("bodyBytes")) ? HirTypeKind::Bytes : HirTypeKind::Str;
                 return out;
             }
             if (expr.name.eq({"keepAlive", 9})) {
@@ -8936,6 +8972,8 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.type = HirTypeKind::I32;
             else if (expr.name.eq(lit_str("text")))
                 out.type = HirTypeKind::Str;
+            else if (expr.name.eq(lit_str("payload")))
+                out.type = HirTypeKind::Bytes;
             else if (expr.name.eq(lit_str("kind")))
                 out.type = HirTypeKind::WebSocketMessageKind;
             else if (expr.name.eq(lit_str("direction")))
@@ -8950,6 +8988,31 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return out;
         }
 #endif
+        if (base->type == HirTypeKind::Bytes) {
+            if (base->may_nil || base->may_error ||
+                (!expr.name.eq(lit_str("count")) && !expr.name.eq(lit_str("isEmpty"))))
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            HirExpr count{};
+            count.kind = HirExprKind::BytesCount;
+            count.type = HirTypeKind::I32;
+            count.span = expr.span;
+            count.lhs = &route->exprs[route->exprs.len - 1];
+            if (expr.name.eq(lit_str("count"))) return count;
+            if (!route->exprs.push(count))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.kind = HirExprKind::Eq;
+            out.type = HirTypeKind::Bool;
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            HirExpr zero{};
+            zero.kind = HirExprKind::IntLit;
+            zero.type = HirTypeKind::I32;
+            if (!route->exprs.push(zero))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.rhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
         if (base->is_wait_result) {
             if (base->kind != HirExprKind::LocalRef)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -12825,6 +12888,20 @@ static bool const_eval_expr(
         out->str_value = expr.str_value;
         return true;
     }
+    if (expr.kind == HirExprKind::BytesLit) {
+        out->type = HirTypeKind::Bytes;
+        out->str_value = expr.str_value;
+        return true;
+    }
+    if (expr.kind == HirExprKind::BytesCount && expr.lhs) {
+        ConstValue bytes{};
+        if (!const_eval_expr(*expr.lhs, locals, local_count, &bytes, depth + 1) ||
+            bytes.type != HirTypeKind::Bytes)
+            return false;
+        out->type = HirTypeKind::I32;
+        out->int_value = bytes.str_value.len;
+        return true;
+    }
     if (expr.kind == HirExprKind::ConstMethod) {
         // Method literals (POST, GET, …) are compile-time constants;
         // fold them so `if const POST == GET { ... }` works.
@@ -12910,7 +12987,7 @@ static bool const_eval_expr(
                 out->bool_value = lhs.int_value == rhs.int_value;
                 return true;
             }
-            if (lhs.type == HirTypeKind::Str) {
+            if (lhs.type == HirTypeKind::Str || lhs.type == HirTypeKind::Bytes) {
                 out->bool_value = lhs.str_value.eq(rhs.str_value);
                 return true;
             }

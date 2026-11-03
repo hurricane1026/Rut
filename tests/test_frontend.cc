@@ -5255,7 +5255,8 @@ TEST(frontend, imported_json_generated_strings_survive_module_teardown) {
     // Escaped literal decoding and JSON-pointer field paths are synthesized
     // during analysis. They must live in the shared HIR store rather than the
     // imported module's owned_strings, which is destroyed before lowering.
-    const std::string dir = "/tmp/rut_import_json_strings_frontend";
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / "rut_import_json_strings_frontend").string();
     std::filesystem::remove_all(dir);
     REQUIRE(std::filesystem::create_directories(dir));
     {
@@ -7450,6 +7451,125 @@ route GET "/ws" { return websocket(ws) { message in
     REQUIRE(hir);
 }
 
+TEST(frontend, websocket_payload_bytes_share_types_with_http_values) {
+    const char* source = R"rut(upstream ws
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func size(_ bytes: Bytes) -> i32 => bytes.count
+func allowed(_ bytes: Bytes) -> bool =>
+    !bytes.isEmpty && size(bytes) == 2 && same(bytes, b"\x00\xff")
+func choose(_ path: str) -> Bytes {
+    if path == "/yes" { b"\x00\xff" } else { b"" }
+}
+route GET "/http" {
+    let bytes = choose(req.path)
+    guard allowed(bytes) else { return 403 }
+    return 200
+}
+route POST "/body" {
+    guard allowed(req.bodyBytes) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(ws) { message in
+    guard allowed(message.payload) else { message.drop() }
+    guard same(message.payload, message.payload) else { message.close() }
+    message.forward()
+} })rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->functions[1].params[0].type == HirTypeKind::Bytes);
+    ast.reset();
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.func_count, 3u);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::StrLength));
+    CHECK(function_has_op(rir.module.functions[1], rir::Opcode::ReqBody));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, payload_bytes_literals_outlive_the_decoded_ast_pool) {
+    const char* source = R"rut(func marker() -> Bytes => b"\x00\xff\x80"
+route GET "/" { guard marker().count == 3 else { return 403 } return 200 })rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].body.str_value.len, 3u);
+    const char expected[] = {'\0', static_cast<char>(0xff), static_cast<char>(0x80)};
+    REQUIRE(ast->response_body_pool.len >= 3u);
+    memset(ast->response_body_pool.data, 'x', ast->response_body_pool.len);
+    ast.reset();
+    CHECK(memcmp(hir->functions[0].body.str_value.ptr, expected, 3) == 0);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+}
+
+TEST(frontend, websocket_payload_bytes_reject_text_coercions_and_ordering) {
+    const char* conditions[] = {"true",
+                                "message.payload == \"x\"",
+                                "message.text == b\"x\"",
+                                "isText(message.payload)",
+                                "isBytes(message.text)",
+                                "message.payload.matches(re\"x\")",
+                                "message.payload < b\"x\"",
+                                "message.payload.count == false",
+                                "message.payload + b\"x\" == b\"x\"",
+                                "message.payload.isEmpty()",
+                                "message.payload.unknown",
+                                "isBytes(req.bodyBytes)"};
+    for (const char* condition : conditions) {
+        std::string source = R"rut(upstream ws
+func isText(_ text: str) -> bool => text == "x"
+func isBytes(_ bytes: Bytes) -> bool => bytes == b"x"
+route GET "/ws" { return websocket(ws) { message in guard )rut";
+        source += condition;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (std::strcmp(condition, "true") == 0)
+            REQUIRE(hir);
+        else
+            CHECK(!hir);
+    }
+}
+
+TEST(frontend, payload_bytes_imported_helpers_keep_decoded_literals_alive) {
+    const std::string dir = "/tmp/rut_ws_payload_bytes_import";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/policy.rut", std::ios::binary);
+        out << "func allowed(_ bytes: Bytes) -> bool => bytes == b\"\\x00\\xff\"\n";
+    }
+    const char* source = R"rut(import "policy.rut"
+upstream ws
+route GET "/ws" { return websocket(ws) { message in
+    guard policy.allowed(message.payload) else { message.drop() }
+    message.forward()
+} })rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    ast.reset();
+    const auto& guards = hir->routes[0].ws_handler.len_guards;
+    REQUIRE_EQ(guards.len, 1u);
+    CHECK(guards[0].pattern.eq({"\0\xff", 2}));
+}
+
 TEST(frontend, analyze_websocket_compound_conditions) {
     const char* src = R"(upstream ws
 route GET "/ws" { return websocket(ws) { message in
@@ -7861,10 +7981,9 @@ TEST(frontend, websocket_binary_replacement_rejects_malformed_and_nonliteral_exp
         auto ast = parse_file_heap(tokens.value());
         if (ast) CHECK_FALSE(analyze_file_heap(ast.value()));
     }
-    // Byte literals are not implicitly Strings or arbitrary call arguments.
+    // Bytes cannot supply text-only response metadata or close reasons.
     for (const char* source :
-         {"route GET \"/\" { let x = b\"a\"\n return 200 }\n",
-          "route GET \"/\" { return response(200, content_type: b\"text/plain\") }\n",
+         {"route GET \"/\" { return response(200, content_type: b\"text/plain\") }\n",
           "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
           "message.close(1000, b\"reason\") } }\n"}) {
         auto tokens = lex(lit(source));

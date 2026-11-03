@@ -1604,6 +1604,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         // ── String operations ──
+        case rir::Opcode::StrLength:
+            c.set_value(
+                inst.result,
+                LLVMBuildExtractValue(c.builder, c.get_value(inst.operand(0)), 1, "bytes.count"));
+            break;
         case rir::Opcode::BearerMatches:
         case rir::Opcode::BasicMatches:
         case rir::Opcode::StrConstantTimeEqual: {

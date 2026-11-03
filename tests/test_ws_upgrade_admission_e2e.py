@@ -230,6 +230,66 @@ route GET "/domain" {
 }
 """
 
+PAYLOAD_BYTES_DECLARATIONS = r"""
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func allowed(_ bytes: Bytes) -> bool =>
+    !bytes.isEmpty && bytes.count == 2 &&
+    (same(bytes, b"\x00\xff") || bytes == b"\xc3\xa9")
+func choose(_ marker: str) -> Bytes {
+    if marker == "yes" { b"\x00\xff" } else { b"" }
+}
+route POST "/bytes" {
+    guard allowed(req.bodyBytes) else { return 403 }
+    return 200
+}
+"""
+
+PAYLOAD_BYTES_HANDLER = r"""
+return websocket(ws) { message in
+    guard !message.fromClient || allowed(message.payload) else { message.drop() }
+    message.forward()
+}
+"""
+
+
+def payload_bytes_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"byte payload: {actual=!r}, {expected=!r}")
+
+    for data, status in ((b"\0\xff", b"200"), (b"", b"403"), (b"\xc3\xa9", b"200")):
+        with socket.create_connection(client.getpeername(), timeout=3) as http:
+            headers = (b"POST /bytes HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Length: " +
+                       str(len(data)).encode() + b"\r\n\r\n")
+            http.sendall(headers + data[:1])
+            if len(data) > 1:
+                http.settimeout(0.1)
+                try:
+                    early = http.recv(1)
+                except socket.timeout:
+                    early = None
+                if early is not None:
+                    raise AssertionError(f"bodyBytes policy ran before body completion: {early=!r}")
+                http.settimeout(3)
+                http.sendall(data[1:])
+            response = recv_http_response(http)
+            if not response.startswith(b"HTTP/1.1 " + status):
+                raise AssertionError(f"Bytes in HTTP: {data=!r}, {response=!r}")
+    first = bytearray(masked_frame(2, b"\0"))
+    first[0] &= 0x7F
+    client.sendall(masked_frame(2, b"") + masked_frame(2, b"\xff\0") + first +
+                   masked_frame(9, b"PING") + masked_frame(0, b"\xff"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\0\xff", True))
+    client.sendall(masked_frame(1, b"\xc3\xa9"))
+    expect(peer, (1, b"\xc3\xa9", True))
+    peer.sendall(b"\x82\x01\xff\x81\x00")
+    expect(client, (2, b"\xff", False))
+    expect(client, (1, b"", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
 
 def domain_message_exchange(client, peer):
     for kind, status in ((b"text", b"200"), (b"binary", b"403")):
@@ -1194,6 +1254,19 @@ def main():
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, PAYLOAD_BYTES_HANDLER,
+                    payload_bytes_exchange, PAYLOAD_BYTES_DECLARATIONS)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, PAYLOAD_BYTES_HANDLER,
+                    payload_bytes_exchange, PAYLOAD_BYTES_DECLARATIONS)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} Bytes payload shared with HTTP native={native}")
         for native in (False, True):
             if native:
                 status, details = native_binary_source_removal_scenario(

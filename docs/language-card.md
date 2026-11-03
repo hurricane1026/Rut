@@ -183,6 +183,16 @@ Domain types are first-class: `Duration ByteSize StatusCode Method IP CIDR Port
 MediaType Regex Time`. Numeric: `i8..i64 u8..u64 f32 f64`, `str`, `[T]`,
 tuples `(a, b)` — ⏳ `.0`/`.1` projection and `let (x, y) = pair` destructuring pending.
 
+`Bytes` is an immutable raw-byte view, distinct from `str`. Construct constants
+with the existing `b"\x00\xff"` literal syntax (at most 4096 decoded bytes per
+literal). `.count` is an `i32` byte count; `.isEmpty` is a Bool property.
+Equality, inequality and generic `Eq` compare exact bytes, including NUL and
+non-UTF-8 bytes. Helpers may accept/return Bytes, imports preserve its type,
+and ordinary HTTP locals can hold Bytes values. `req.bodyBytes` borrows the
+request body as Bytes under the same buffering/lifetime rules as `req.body`.
+There is no implicit text conversion, ordering, concatenation, indexing or
+regex API for Bytes.
+
 ```swift
 struct User {                 // fields: name: type — newline-separated, no commas
     id: str
@@ -254,6 +264,7 @@ req.queryAll("tags")         // ⏳ [str]
 req.cookie("session")        // str?
 req.body(User)               // typed parse, error-capable → guard let
 req.body                     // raw body as str
+req.bodyBytes                // raw body as Bytes; same request-body buffering rules
 req.bodyJson()               // dynamic Json, error-capable
 req.ctx.userId               // typed per-request context (user declares struct Ctx)
 
@@ -860,6 +871,10 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // by this callback, never constructed or stored as an HTTP/connection value.
 // Fields: fromClient/isText/isBinary: bool, len: i32 (payload bytes), text: str
 // (borrowed raw bytes, also available for Binary messages).
+// payload: Bytes — the complete payload for either message kind, borrowed only
+// during the synchronous callback. payload.count and payload.isEmpty use byte
+// semantics; compare with b"..." or pass to a Bytes helper. No UTF-8 decoding or
+// copy occurs when reading the view. Text messages expose their encoded bytes.
 // kind: WebSocketMessageKind (.text / .binary); direction: WebSocketDirection
 // (.clientToUpstream / .upstreamToClient). Spell cases with their full type name:
 // message.kind == WebSocketMessageKind.text. Both types support ==/!= and Eq
@@ -878,6 +893,8 @@ func allowedMessage(_ msg: WebSocketMessage) -> bool =>
 // Inside the callback: guard allowedMessage(message) else { message.drop() }
 func isTextKind(_ kind: WebSocketMessageKind) -> bool => kind == WebSocketMessageKind.text
 // Inside the callback: guard isTextKind(message.kind) else { message.drop() }
+func isMarker(_ bytes: Bytes) -> bool => bytes.count == 2 && bytes == b"\x00\xff"
+// Inside the callback: guard isMarker(message.payload) else { message.drop() }
 // A terminate route can run up to eight existing top-level HTTP guards before
 // websocket. These request reads and static failure responses run in the
 // ordinary JIT handler before it connects to the WebSocket upstream. A

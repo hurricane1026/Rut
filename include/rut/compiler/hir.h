@@ -250,6 +250,8 @@ enum class HirExprKind : u8 {
     // Built-in closed protocol enum. int_value is its language case index,
     // independent of the WebSocket wire opcode.
     ConstWsCase,
+    BytesLit,
+    BytesCount,
 };
 
 enum class HirTypeKind : u8 {
@@ -286,6 +288,9 @@ enum class HirTypeKind : u8 {
     WebSocketMessage,
     WebSocketMessageKind,
     WebSocketDirection,
+    // Raw octets. Runtime views use the existing pointer/length carrier;
+    // source typing keeps these separate from text and JSON.
+    Bytes,
 };
 
 constexpr bool is_ws_enum_type(HirTypeKind type) {

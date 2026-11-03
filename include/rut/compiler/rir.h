@@ -307,6 +307,8 @@ enum class Opcode : u8 {
     //                               digest, body, key_id, key) → bool
     SignedRequestValid,
     JwtClaimsValidWithLifetime,
+    // Length of the existing pointer/u32-length carrier, with no payload read.
+    StrLength,
 };
 
 // ── Instruction ─────────────────────────────────────────────────────

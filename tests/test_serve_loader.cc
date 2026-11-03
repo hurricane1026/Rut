@@ -46,6 +46,8 @@ std::string write_file(const std::string& dir, const char* name, const char* con
     const std::string path = dir + "/" + name;
     std::ofstream out(path, std::ios::binary);
     out << contents;
+    out.flush();
+    if (!out.good()) return {};
     out.close();
     return path;
 }
@@ -4420,7 +4422,8 @@ TEST(serve_loader, websocket_terminate_rejects_effectful_http_guard) {
 }
 
 TEST(serve_loader, websocket_subprotocol_is_owned_after_compiler_state_is_retired) {
-    const std::string dir = "/tmp/rut_serve_loader_ws_subprotocol";
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / "rut_serve_loader_ws_subprotocol").string();
     const std::string path = write_file(dir,
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
@@ -4738,7 +4741,9 @@ TEST(serve_loader, websocket_terminate_rewrites_fixed_text) {
 }
 
 TEST(serve_loader, websocket_binary_replacements_retain_bytes_and_select_mixed_branch_types) {
-    const auto path = write_file("/tmp/rut_ws_binary_replacement", "app.rut", R"rut(
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / "rut_ws_binary_replacement").string();
+    const auto path = write_file(dir, "app.rut", R"rut(
 upstream backend at "127.0.0.1:9999"
 route GET "/ws" { return websocket(backend, maxMessageSize: 4b) { message in
     guard message.text != "a" else { message.forward(b"\x00\xFF") }
@@ -4753,7 +4758,7 @@ route GET "/ws" { return websocket(backend, maxMessageSize: 4b) { message in
     LoadError err;
     CHECK_FALSE(load_rut_program(path.c_str(), invalid, err));
     invalid.destroy();
-    const auto valid_path = write_file("/tmp/rut_ws_binary_replacement", "valid.rut", R"rut(
+    const auto valid_path = write_file(dir, "valid.rut", R"rut(
 upstream backend at "127.0.0.1:9999"
 route GET "/ws" { return websocket(backend, maxMessageSize: 5b) { message in
     guard message.text != "a" else { message.forward(b"\x00\xFF") }
@@ -4971,7 +4976,10 @@ TEST(serve_loader, websocket_json_string_regex_matches_decoded_whole_values) {
             source += "guard ";
             source += conditions[c];
             source += " else { message.drop() }\nmessage.forward() } }\n";
-            const auto path = write_file("/tmp/rut_ws_json_regex", "app.rut", source.c_str());
+            const auto path =
+                write_file((std::filesystem::temp_directory_path() / "rut_ws_json_regex").string(),
+                           "app.rut",
+                           source.c_str());
             LoadedProgram program;
             LoadError err;
             REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5133,7 +5141,10 @@ TEST(serve_loader, websocket_direct_json_scalar_comparisons_preserve_optional_tr
 }
 
 TEST(serve_loader, websocket_direct_scalar_guards_use_nested_values_without_extra_bindings) {
-    const auto path = write_file("/tmp/rut_ws_nested_scalar", "app.rut", R"rut(
+    const auto path =
+        write_file((std::filesystem::temp_directory_path() / "rut_ws_nested_scalar").string(),
+                   "app.rut",
+                   R"rut(
 upstream ws at "127.0.0.1:9999"
 route GET "/ws" { return websocket(ws) { message in
  guard let document = json.parse(message.text) else { message.close(1007) }
@@ -5209,8 +5220,10 @@ TEST(serve_loader, websocket_nested_json_lookup_preserves_relative_pointer_seman
             source +=
                 bind ? "\") else { message.drop() }\n" : "\") != nil else { message.drop() }\n";
             source += "message.forward() } }\n";
-            const auto path =
-                write_file("/tmp/rut_ws_nested_json_lookup", "app.rut", source.c_str());
+            const auto path = write_file(
+                (std::filesystem::temp_directory_path() / "rut_ws_nested_json_lookup").string(),
+                "app.rut",
+                source.c_str());
             LoadedProgram program;
             LoadError err;
             REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5249,7 +5262,10 @@ route GET "/ws" { return websocket(ws) { message in
         source += accessors[i];
         source +=
             "(child) else { message.close(1003) }\nmessage.forward(\"[\" + text + \"]\") } }\n";
-        const auto path = write_file("/tmp/rut_ws_nested_json_rewrite", "app.rut", source.c_str());
+        const auto path = write_file(
+            (std::filesystem::temp_directory_path() / "rut_ws_nested_json_rewrite").string(),
+            "app.rut",
+            source.c_str());
         LoadedProgram program;
         LoadError err;
         REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -6207,6 +6223,117 @@ TEST(serve_loader, websocket_domain_types_compare_cases_in_both_operand_orders) 
                 CHECK(handler(nullptr, op, nullptr, 0, client) ==
                       (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
             }
+        }
+        program.destroy();
+    }
+}
+
+TEST(serve_loader, websocket_payload_bytes_share_helpers_with_dynamic_http_values) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func allowed(_ bytes: Bytes) -> bool =>
+    !bytes.isEmpty && bytes.count == 2 && (same(bytes, b"\x00\xff") || bytes == b"ok")
+func choose(_ path: str) -> Bytes {
+    if path == "/yes" { b"\x00\xff" } else { b"" }
+}
+route GET "/http" {
+    let bytes = choose(req.path)
+    guard allowed(bytes) else { return 403 }
+    return 200
+}
+route POST "/body" {
+    guard allowed(req.bodyBytes) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(backend) { message in
+    guard !message.fromClient || allowed(message.payload) else { message.drop() }
+    guard same(message.payload, message.payload) else { message.close() }
+    message.forward()
+} })rut";
+    auto path = write_file("/tmp/rut_ws_payload_bytes", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 3u);
+    const auto http = program.config.routes[0].fn;
+    REQUIRE(http);
+    const char* requests[] = {"GET /yes HTTP/1.1\r\nHost: test\r\n\r\n",
+                              "GET /no HTTP/1.1\r\nHost: test\r\n\r\n"};
+    for (u32 i = 0; i < 2; ++i) {
+        const auto result =
+            jit::HandlerResult::unpack(http(nullptr,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(requests[i]),
+                                            static_cast<u32>(strlen(requests[i])),
+                                            nullptr));
+        CHECK_EQ(result.status_code, i == 0 ? 200u : 403u);
+    }
+    REQUIRE(program.config.routes[1].needs_req_body);
+    const auto body = program.config.routes[1].fn;
+    REQUIRE(body);
+    const char body_request[] =
+        "POST /body HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\n\0\xff";
+    auto body_result = jit::HandlerResult::unpack(body(nullptr,
+                                                       nullptr,
+                                                       reinterpret_cast<const u8*>(body_request),
+                                                       sizeof(body_request) - 1,
+                                                       nullptr));
+    CHECK_EQ(body_result.status_code, 200u);
+    const auto handler = program.config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    struct Case {
+        WsOpcode op;
+        Str payload;
+        bool pass;
+    };
+    const Case cases[] = {{WsOpcode::Text, {"ok", 2}, true},
+                          {WsOpcode::Binary, {"\0\xff", 2}, true},
+                          {WsOpcode::Binary, {"\xff\0", 2}, false},
+                          {WsOpcode::Text, {"\0\0", 2}, false},
+                          {WsOpcode::Binary, {"", 0}, false},
+                          {WsOpcode::Text, {"okay", 4}, false}};
+    for (bool client : {false, true}) {
+        for (const auto& test : cases) {
+            CHECK(handler(nullptr,
+                          test.op,
+                          reinterpret_cast<const u8*>(test.payload.ptr),
+                          test.payload.len,
+                          client) ==
+                  (!client || test.pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+    }
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_payload_bytes_count_and_equality_cover_empty_and_large_values) {
+    const char* conditions[] = {"message.payload.isEmpty",
+                                "message.payload == b\"\"",
+                                "2 < message.payload.count",
+                                "message.payload.count >= 16370",
+                                "b\"\\x00\\xff\" != message.payload"};
+    char large[16370];
+    memset(large, 0xff, sizeof(large));
+    const Str payloads[] = {{"", 0}, {"\0\xff", 2}, {large, sizeof(large)}};
+    for (u32 i = 0; i < 5; ++i) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(backend) "
+            "{ message in guard ";
+        source += conditions[i];
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_payload_bytes_count", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (u32 j = 0; j < 3; ++j) {
+            const bool pass = i < 2 ? j == 0 : i < 4 ? j == 2 : j != 1;
+            const auto payload = payloads[j];
+            CHECK(handler(nullptr,
+                          WsOpcode::Binary,
+                          reinterpret_cast<const u8*>(payload.ptr),
+                          payload.len,
+                          true) == (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
         }
         program.destroy();
     }

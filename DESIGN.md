@@ -2852,6 +2852,31 @@ Text/Binary kinds; Ping/Pong/Close/Continuation remain runtime protocol events.
 The old Boolean properties remain supported. Contextual case inference and
 closed-case exhaustive matching are not part of this projection support.
 
+`message.payload` projects an immutable `Bytes` view of the complete payload,
+regardless of message kind. It borrows the runtime message buffer for the
+synchronous callback; helpers cannot retain it past that callback. The public
+type is distinct from `str`, supports byte-exact `Eq`, `.count: i32` and
+`.isEmpty: bool`, and uses the existing `b"..."` literals (4096 decoded bytes
+per literal). Text message views contain encoded UTF-8 bytes; Binary message
+views have no text-validity requirement. The existing `message.text` API is
+unchanged. Arbitrary-byte equality has no implicit text conversion or regex
+decoding, and count measures octets, including NUL and multi-byte encodings.
+
+The same Bytes type is usable in ordinary helper signatures, returns, imports
+and HTTP locals. `req.bodyBytes` is the typed byte projection of the existing
+request body read; it emits the same ReqBody operation, so complete-body
+buffering, rejection of unsupported body framing, size limits and request
+lifetimes remain those of `req.body`. HIR retains decoded literal bytes in
+module-owned storage, independent of the AST's response-body pool. After source type checking, MIR
+reuses the pointer/length string carrier and byte equality. RIR `str.length`
+extracts the i32 length without reading payload memory; its builder and verifier
+require a plain string carrier and i32 result. This is separate from the RIR
+`Bytes` kind used internally for fixed-size cryptographic outputs. No new
+runtime helper or allocation is needed. Message predicates lower payload count,
+emptiness and literal byte equality to existing length/raw-comparison nodes.
+Dynamic payload replacement, byte indexing/concatenation and callback-local
+bindings remain subsequent work.
+
 ```swift
 return websocket(eventService, maxMessageSize: 4kb) { message in
     guard message.len <= 2048 else { message.close(1009, "message too large") }

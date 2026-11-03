@@ -302,6 +302,42 @@ TEST(jit, helpers_sanity) {
     CHECK(__builtin_memcmp(out_ptr, "payload", 7) == 0);
 }
 
+TEST(jit, bytes_count_reads_the_full_raw_length_without_text_decoding) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("bytes_count"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto body = V(b.emit_req_body());
+    auto count = V(b.emit_str_length(body));
+    auto base = V(b.emit_const_i32(200));
+    auto status = V(b.emit_arith(Opcode::Add, base, count));
+    VOK(b.emit_ret_status(status));
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_bytes_count"));
+    REQUIRE(handler);
+    const char body_request[] =
+        "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n\0\xff\xc3\xa9";
+    auto result = HandlerResult::unpack(handler(nullptr,
+                                                nullptr,
+                                                reinterpret_cast<const u8*>(body_request),
+                                                sizeof(body_request) - 1,
+                                                nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    const char empty[] = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+    result = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(empty), sizeof(empty) - 1, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    engine.shutdown();
+    tc.destroy();
+}
+
 // Test: Simple handler that always returns 200.
 // RIR equivalent: return 200
 TEST(jit, return_200) {
