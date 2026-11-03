@@ -911,7 +911,8 @@ void EpollBackend::cancel_accept() {
     }
 }
 
-u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns) {
+u32 EpollBackend::wait(
+    IoEvent* events, u32 max_events, Connection* conns, u32 max_conns, u32 maintenance_timeout_ms) {
     if (max_events == 0) return 0;
 
     auto pop_pending = [&](Connection* pending_conns, u32 pending_max_conns) -> u32 {
@@ -947,7 +948,11 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             const bool probe_pending = pending_count > 0;
             i32 harvested;
             for (;;) {
-                harvested = epoll_wait(epoll_fd, ready, kReadyBatch, probe_pending ? 0 : -1);
+                const i32 timeout_ms = probe_pending ? 0
+                                       : maintenance_timeout_ms == ~u32{0}
+                                           ? -1
+                                           : static_cast<i32>(maintenance_timeout_ms);
+                harvested = epoll_wait(epoll_fd, ready, kReadyBatch, timeout_ms);
                 if (harvested >= 0) break;
                 if (errno == EINTR && !probe_pending) continue;
                 if (probe_pending) {

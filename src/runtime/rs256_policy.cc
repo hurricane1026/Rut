@@ -408,6 +408,14 @@ void Rs256Policies::cancel(u32 shard) {
         if (rows_[shard].remote[i]) rows_[shard].remote[i]->fetch.cancel();
 }
 
+bool Rs256Policies::fetch_busy(u32 shard) const {
+    if (!rows_ || shard >= kMaxShards || !rows_[shard].ready) return false;
+    const auto& row = rows_[shard];
+    for (u32 i = 0; i < count_; ++i)
+        if (row.remote[i] && row.remote[i]->fetch.state() == HttpsFetch::State::Busy) return true;
+    return false;
+}
+
 void Rs256Policies::destroy() {
     if (rows_) {
         for (u32 i = 0; i < kMaxShards; ++i) {

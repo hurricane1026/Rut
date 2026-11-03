@@ -410,7 +410,10 @@ public:
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, connection_capacity);
+            const bool fetch_busy =
+                config_ptr && *config_ptr && (*config_ptr)->rs256_fetch_busy(shard_id);
+            u32 n = backend.wait(
+                events, kMaxEventsPerWait, conns, connection_capacity, fetch_busy ? 10u : ~u32{0});
             dispatch_batch(events, n);
             poll_command();
             // poll_command may have installed a new config (hot reload); re-arm
@@ -443,6 +446,7 @@ public:
                 }
             }
         }
+        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
     }
 
     void stop() { running_.store(false, std::memory_order_release); }
@@ -484,7 +488,6 @@ public:
     }
 
     void shutdown() {
-        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
         for (u32 i = 0; i < connection_capacity; ++i) close_response_splice_pipe(conns[i]);
         backend.shutdown();
         h2_pool.destroy();

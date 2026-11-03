@@ -479,7 +479,8 @@ bool KqueueBackend::receive(Connection& conn, bool upstream, IoEvent& event) {
     return true;
 }
 
-u32 KqueueBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns) {
+u32 KqueueBackend::wait(
+    IoEvent* events, u32 max_events, Connection* conns, u32 max_conns, u32 maintenance_timeout_ms) {
     if (max_events == 0 || failure_code()) return 0;
     if (pending_count && pending_streak_ < kPendingBurstQuota)
         return pop_pending(events, conns, max_conns);
@@ -495,9 +496,15 @@ u32 KqueueBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 
     // and connection slots before the next wait, so never cache a stale batch.
     struct kevent64_s ready;
     const struct timespec zero{};
+    const struct timespec maintenance_timeout = {
+        static_cast<time_t>(maintenance_timeout_ms / 1000u),
+        static_cast<long>((maintenance_timeout_ms % 1000u) * 1000000u)};
+    const struct timespec* timeout = pending_count                       ? &zero
+                                     : maintenance_timeout_ms == ~u32{0} ? nullptr
+                                                                         : &maintenance_timeout;
     int n;
     do {
-        n = kevent64(kqueue_fd, nullptr, 0, &ready, 1, 0, pending_count ? &zero : nullptr);
+        n = kevent64(kqueue_fd, nullptr, 0, &ready, 1, 0, timeout);
     } while (n < 0 && errno == EINTR);
     pending_streak_ = 0;
     if (n < 0) {

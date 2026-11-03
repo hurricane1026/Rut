@@ -751,6 +751,7 @@ public:
                 }
             }
         }
+        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
     }
 
     void stop() { running_.store(false, std::memory_order_release); }
@@ -798,7 +799,6 @@ public:
     }
 
     void shutdown() {
-        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
         if constexpr (Backend::kAsyncIo) reclaim_pending();
         backend.shutdown();
         pool.destroy();

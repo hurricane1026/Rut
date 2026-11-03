@@ -79,6 +79,7 @@ public:
     // Shard maintenance only: never called from the verifier. No blocking DNS,
     // readiness waits, lazy initialization or token-triggered refresh.
     void maintain(u32 shard, u64 monotonic_ms = ~u64{0});
+    bool fetch_busy(u32 shard) const;
     void cancel(u32 shard);
     void destroy();
 

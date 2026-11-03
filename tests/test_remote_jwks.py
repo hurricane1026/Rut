@@ -59,7 +59,7 @@ def main():
         policy["remoteJwks"] = {"address": "127.0.0.1", "port": origin.server_port,
                                 "serverName": "localhost", "path": "/keys",
                                 "ca": str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
-                                "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 5}
+                                "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 1}
         literal = json.dumps(json.dumps(policy, separators=(",", ":")))
         source = ('import Crypto\nroute GET "/" { guard let claims = Crypto.jwtRs256('
                   'bearerToken(req.authorization.or("")).or(""), ' + literal +
@@ -124,10 +124,25 @@ def main():
                 with lock:
                     state.update(body=body, status=status)
 
+            def wait_for_origin_request(previous, limit=4):
+                deadline = time.monotonic() + limit
+                while time.monotonic() < deadline:
+                    with lock:
+                        if state["requests"] > previous:
+                            return
+                    time.sleep(0.01)
+                raise AssertionError("idle shard did not start the scheduled JWKS refresh")
+
             wait_status(fixture["a"], 200)
             assert request(fixture["b"]) == 401
+            with lock:
+                requests_before_refresh = state["requests"]
             publish(json.dumps(fixture["second"]["jwks"]).encode())
-            wait_status(fixture["b"], 200)
+            # No gateway request is made while the one-second refresh becomes
+            # due or while its TLS handshake/read advances on the idle shard.
+            wait_for_origin_request(requests_before_refresh)
+            time.sleep(0.1)
+            assert request(fixture["b"]) == 200, "idle refresh did not install the rotated key"
             assert request(fixture["a"]) == 401, "replaced key still authenticates"
             publish(b'{"keys":[]}')
             wait_status(fixture["b"], 401)

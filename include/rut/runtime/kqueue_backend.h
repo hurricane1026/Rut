@@ -63,7 +63,11 @@ struct KqueueBackend {
     void arm_yield_timer(u64 deadline_ns);
     void wake();
     i32 failure_code() const { return failure_.load(std::memory_order_acquire); }
-    u32 wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
+    u32 wait(IoEvent* events,
+             u32 max_events,
+             Connection* conns,
+             u32 max_conns,
+             u32 maintenance_timeout_ms = ~u32{0});
 
 private:
     // Paused downstream reads retain EOF detection without spinning on data.

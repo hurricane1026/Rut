@@ -322,7 +322,10 @@ public:
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running() && backend.failure_code() == 0) {
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
+            const bool fetch_busy =
+                config_ptr && *config_ptr && (*config_ptr)->rs256_fetch_busy(shard_id);
+            u32 n = backend.wait(
+                events, kMaxEventsPerWait, conns, kMaxConns, fetch_busy ? 10u : ~u32{0});
             dispatch_batch(events, n);
             poll_command();
             // poll_command may have installed a new config (hot reload); re-arm
@@ -358,6 +361,7 @@ public:
         // stop()/fatal-backend exits also own live sockets, TLS and pending
         // buffers. Release them before Shard tears down pools and config state.
         force_close_all();
+        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
     }
 
     void stop() {
@@ -402,7 +406,6 @@ public:
     }
 
     void shutdown() {
-        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
         backend.shutdown();
         h2_pool.destroy();
         pool.destroy();

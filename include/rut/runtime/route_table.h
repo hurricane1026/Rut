@@ -729,6 +729,7 @@ struct RouteConfig {
     void refresh_rs256(u32 shard) const {
         if (rs256) rs256->maintain(shard);
     }
+    bool rs256_fetch_busy(u32 shard) const { return rs256 && rs256->fetch_busy(shard); }
     void cancel_rs256(u32 shard) const {
         if (rs256) rs256->cancel(shard);
     }
