@@ -154,29 +154,30 @@ enum class Opcode : u8 {
     // ── Request access ──
     ReqHeaderCount,  // original case-insensitive field count; -1 on parse failure
     ReqUniqueHeader,
-    ReqHeader,            // %r = req.header "Name"        → Optional(str)
-    ReqParam,             // %r = req.param "id"           → str
-    ReqQuery,             // %r = req.query "name"         → Optional(str)
-    ReqQueryString,       // %r = req.queryString          → Optional(str)
-    ReqMethod,            // %r = req.method               → Method
-    ReqPath,              // %r = req.path                 → str
-    ReqPathOnly,          // %r = req.pathOnly             → str
-    ReqBody,              // %r = req.body                 → str
-    ReqKeepAlive,         // %r = req.keepAlive            → bool
-    ReqChunked,           // %r = req.chunked              → bool
-    ReqHasContentLength,  // %r = req.hasContentLength   → bool
-    ReqHttp10,            // %r = req.http10               → bool
-    ReqHttp11,            // %r = req.http11               → bool
-    ReqHttpVersion,       // %r = req.httpVersion          → str
-    ResumeEventKind,      // %r = ctx.resume_event_kind    → i32
-    ResumeEventResult,    // %r = ctx.resume_event_result → i32
-    CtxLoadSlotI32,       // %r = ctx.slot[i] if i < ctx.slot_count → i32
-                          // Otherwise reads current resume metadata:
-                          // even index slots read resume_event_kind,
-                          // odd index slots read resume_event_result.
-    ReqRemoteAddr,        // %r = req.remote_addr          → IP
-    ReqContentLength,     // %r = req.content_length       → ByteSize
-    ReqCookie,            // %r = req.cookie "name"        → Optional(str)
+    ReqHeader,               // %r = req.header "Name"        → Optional(str)
+    ReqParam,                // %r = req.param "id"           → str
+    ReqQuery,                // %r = req.query "name"         → Optional(str)
+    ReqQueryString,          // %r = req.queryString          → Optional(str)
+    ReqTlsClientCertSha256,  // %r = req.tlsClientCertSha256 → Optional(str)
+    ReqMethod,               // %r = req.method               → Method
+    ReqPath,                 // %r = req.path                 → str
+    ReqPathOnly,             // %r = req.pathOnly             → str
+    ReqBody,                 // %r = req.body                 → str
+    ReqKeepAlive,            // %r = req.keepAlive            → bool
+    ReqChunked,              // %r = req.chunked              → bool
+    ReqHasContentLength,     // %r = req.hasContentLength   → bool
+    ReqHttp10,               // %r = req.http10               → bool
+    ReqHttp11,               // %r = req.http11               → bool
+    ReqHttpVersion,          // %r = req.httpVersion          → str
+    ResumeEventKind,         // %r = ctx.resume_event_kind    → i32
+    ResumeEventResult,       // %r = ctx.resume_event_result → i32
+    CtxLoadSlotI32,          // %r = ctx.slot[i] if i < ctx.slot_count → i32
+                             // Otherwise reads current resume metadata:
+                             // even index slots read resume_event_kind,
+                             // odd index slots read resume_event_result.
+    ReqRemoteAddr,           // %r = req.remote_addr          → IP
+    ReqContentLength,        // %r = req.content_length       → ByteSize
+    ReqCookie,               // %r = req.cookie "name"        → Optional(str)
 
     // ── Request mutation ──
     ReqSetHeader,           // req.set_header "Name", %val

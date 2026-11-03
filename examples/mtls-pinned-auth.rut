@@ -1,0 +1,12 @@
+// Set MTLS_CLIENT_PIN to the lowercase SHA-256 DER fingerprint of the trusted
+// client certificate, plus MTLS_CONSUMER_ID and MTLS_CREDENTIAL_ID. Start with
+// --tls-cert SERVER_CERT --tls-key SERVER_KEY --tls-client-ca CLIENT_CA_BUNDLE.
+import "middleware/auth.rut"
+listen :8080
+
+route GET "/private" {
+    let pin = env("MTLS_CLIENT_PIN")
+    let identity = auth.pinnedMtlsIdentity(pin, env("MTLS_CONSUMER_ID"), env("MTLS_CREDENTIAL_ID"))
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}

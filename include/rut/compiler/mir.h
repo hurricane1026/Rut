@@ -53,6 +53,7 @@ enum class MirValueKind : u8 {
     ReqCookie,
     ReqQuery,
     ReqQueryString,
+    ReqTlsClientCertSha256,
     ReqPath,
     ReqPathOnly,
     ReqBody,

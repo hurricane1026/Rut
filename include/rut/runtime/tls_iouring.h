@@ -458,6 +458,11 @@ void tls_process(Self* loop, Connection& c) {
                 }
             }
         }
+        if (!tls_capture_verified_client_fingerprint(
+                c.tls_engine.ssl, c.tls_client_cert_sha256, c.tls_client_cert_sha256_valid)) {
+            loop->close_conn(c);
+            return;
+        }
         c.tls_handshake_complete = true;
         if constexpr (requires { loop->grpc_upstreams; }) {
             if (c.h2 && c.h2->grpc.upstream) {

@@ -105,4 +105,13 @@ bool hmac_sha256_matches(Str message, Str key, Str signature, Str prefix) {
                                              prefix.len) != 0;
 }
 
+bool sha256_hex_format_valid(Str value) {
+    if (value.ptr == nullptr || value.len != 64) return false;
+    for (u32 i = 0; i < value.len; ++i) {
+        const auto kByte = static_cast<u8>(value.ptr[i]);
+        if ((kByte < '0' || kByte > '9') && (kByte < 'a' || kByte > 'f')) return false;
+    }
+    return true;
+}
+
 }  // namespace rut

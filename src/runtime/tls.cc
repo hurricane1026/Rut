@@ -9,8 +9,11 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <openssl/bio.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/tls1.h>
+#include <openssl/types.h>
+#include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 #include <stdint.h>
@@ -145,9 +148,34 @@ AlpnProtocol tls_negotiated_protocol(SSL* ssl) {
     return AlpnProtocol::None;
 }
 
+bool tls_capture_verified_client_fingerprint(SSL* ssl, char out_hex[64], bool& out_valid) {
+    out_valid = false;
+    if (out_hex == nullptr) return false;
+    __builtin_memset(out_hex, 0, 64);
+    if (ssl == nullptr) return false;
+    if ((SSL_get_verify_mode(ssl) & SSL_VERIFY_FAIL_IF_NO_PEER_CERT) == 0) return true;
+    if (!SSL_is_init_finished(ssl) || SSL_get_verify_result(ssl) != X509_V_OK) return false;
+    X509* peer = SSL_get1_peer_certificate(ssl);
+    if (peer == nullptr) return false;
+    u8 digest[EVP_MAX_MD_SIZE]{};
+    unsigned digest_len = 0;
+    const bool kOk = X509_digest(peer, EVP_sha256(), digest, &digest_len) == 1 && digest_len == 32;
+    X509_free(peer);
+    if (!kOk) return false;
+    static constexpr char kHex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+        const size_t kOffset = i * 2;
+        out_hex[kOffset] = kHex[digest[i] >> 4];
+        out_hex[kOffset + 1] = kHex[digest[i] & 0x0f];
+    }
+    out_valid = true;
+    return true;
+}
+
 core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* cert_path,
                                                                    const char* key_path,
-                                                                   bool offer_h2) {
+                                                                   bool offer_h2,
+                                                                   const char* client_ca_path) {
     if (OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1)
         return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
 
@@ -189,6 +217,28 @@ core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* c
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     }
 
+    const bool kRequireClientCertificate = client_ca_path != nullptr;
+    if (kRequireClientCertificate) {
+        if (client_ca_path[0] == '\0' ||
+            SSL_CTX_load_verify_locations(ssl_ctx, client_ca_path, nullptr) != 1) {
+            SSL_CTX_free(ssl_ctx);
+            BIO_meth_free(bridge_bio_method);
+            BIO_meth_free(socket_bio_method);
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+        }
+        SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+        // This profile has startup-static CA trust and no session/renegotiation
+        // path that could inherit authentication from an earlier handshake.
+        SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_OFF);
+        SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION);
+        if (SSL_CTX_set_num_tickets(ssl_ctx, 0) != 1) {
+            SSL_CTX_free(ssl_ctx);
+            BIO_meth_free(bridge_bio_method);
+            BIO_meth_free(socket_bio_method);
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+        }
+    }
+
     auto* ctx = static_cast<TlsServerContext*>(malloc(sizeof(TlsServerContext)));
     if (!ctx) {
         SSL_CTX_free(ssl_ctx);
@@ -200,6 +250,7 @@ core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* c
     ctx->socket_bio_method = socket_bio_method;
     ctx->bridge_bio_method = bridge_bio_method;
     ctx->offer_h2 = offer_h2;
+    ctx->require_client_certificate = kRequireClientCertificate;
     // Register ALPN negotiation. arg = ctx so the callback can read offer_h2.
     // ctx outlives ssl_ctx (freed together in destroy_tls_server_context).
     SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_cb, ctx);

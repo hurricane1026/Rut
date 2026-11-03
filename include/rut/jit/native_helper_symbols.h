@@ -8,6 +8,7 @@
 #define RUT_NATIVE_HELPER_SYMBOLS(X)                  \
     X(rut_helper_req_path)                            \
     X(rut_helper_req_path_only)                       \
+    X(rut_helper_req_tls_client_cert_sha256)          \
     X(rut_helper_req_body)                            \
     X(rut_helper_req_http_version)                    \
     X(rut_helper_req_flag)                            \
@@ -42,6 +43,7 @@
     X(rut_helper_jwt_issue_hs256)                     \
     X(rut_helper_jwt_issue_hs256_with_id)             \
     X(rut_helper_jwt_issue_hs256_with_id_and_scope)   \
+    X(rut_helper_sha256_hex_valid)                    \
     X(rut_crypto_digest_v1)                           \
     X(rut_crypto_digest_hex_v1)                       \
     X(rut_crypto_digest_parts_v1)                     \

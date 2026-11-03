@@ -117,6 +117,17 @@ func apiKey(_ authorization: str, _ key: str, _ consumerId: str, _ credentialId:
     Identity(consumerId: consumerId, credentialId: credentialId, method: "apiKey")
 }
 
+// Map only the verified connection certificate identity. The pin is trusted
+// configuration, never a request header; rotate it with the compiled config.
+func pinnedMtlsIdentity(_ trustedSha256: str, _ consumerId: str,
+                        _ credentialId: str) -> Identity {
+    let denied = response(403)
+    guard Crypto.sha256HexValid(trustedSha256) && consumerId != "" && credentialId != "" else { respond 503 }
+    guard let presentedSha256 = req.tlsClientCertSha256 else { respond denied }
+    guard Crypto.equal(presentedSha256, trustedSha256) else { respond denied }
+    Identity(consumerId: consumerId, credentialId: credentialId, method: "mtls")
+}
+
 // Standard Basic authentication; credentials are the configured "user:password" bytes.
 func basic(_ authorization: str, _ credentials: str, _ consumerId: str, _ credentialId: str) -> Identity {
     let denied = response(401)

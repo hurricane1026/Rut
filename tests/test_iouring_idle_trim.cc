@@ -1163,7 +1163,9 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // inspection slices are armed, so the six-slice ordinary reserve is unchanged.
     // Keep the bounded layout explicit so future owner fields cannot grow it unnoticed.
     // Required subprotocol negotiation pins one additional route-owned Str (+16 bytes).
-    CHECK_EQ(sizeof(Connection), 4584u);
+    // Verified inbound mTLS identity adds 64 bytes per connection. Existing struct
+    // padding absorbs the valid flag, so the measured slot growth is exactly 64 bytes.
+    CHECK_EQ(sizeof(Connection), 4648u);
 }
 
 TEST(iouring_idle_trim,

@@ -28018,6 +28018,206 @@ route GET "/null" {
     rir.destroy();
 }
 
+TEST(jit, verified_mtls_fingerprint_is_connection_owned_and_pin_validated) {
+    const char* source = R"rut(
+import "middleware/auth.rut"
+route GET "/ok" {
+    let identity = auth.pinnedMtlsIdentity("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "client", "cert-v1")
+    return 204
+}
+route GET "/wrong-pin" {
+    let identity = auth.pinnedMtlsIdentity("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "client", "cert-v1")
+    return 204
+}
+route GET "/bad-config" {
+    let pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+    let identity = auth.pinnedMtlsIdentity(pin, "client", "cert-v1")
+    return 204
+}
+route GET "/uppercase-pin" {
+    let identity = auth.pinnedMtlsIdentity("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "client", "cert-v1")
+    return 204
+}
+route GET "/short-pin" {
+    let identity = auth.pinnedMtlsIdentity("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "client", "cert-v1")
+    return 204
+}
+route GET "/missing" {
+    guard let fingerprint = req.tlsClientCertSha256 else { return 403 }
+    return 204
+}
+route GET "/helper-missing" {
+    let identity = auth.pinnedMtlsIdentity("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "client", "cert-v1")
+    return 204
+}
+route GET "/forged" {
+    let identity = auth.pinnedMtlsIdentity("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "client", "cert-v1")
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/mtls-pinned-auth.rut";
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir::Instruction* kFingerprintInst = nullptr;
+    rir::Function* kFingerprintFn = nullptr;
+    rir::Instruction* kPinValidatorInst = nullptr;
+    rir::Function* kPinValidatorFn = nullptr;
+    for (u32 fi = 0; fi < rir.module.func_count; ++fi)
+        for (u32 bi = 0; bi < rir.module.functions[fi].block_count; ++bi)
+            for (u32 ii = 0; ii < rir.module.functions[fi].blocks[bi].inst_count; ++ii) {
+                auto& inst = rir.module.functions[fi].blocks[bi].insts[ii];
+                if (inst.op == rir::Opcode::ReqTlsClientCertSha256) {
+                    kFingerprintInst = &inst;
+                    kFingerprintFn = &rir.module.functions[fi];
+                }
+                if (inst.op == rir::Opcode::JsonOp &&
+                    inst.imm.i32_val == static_cast<i32>(json::Op::Sha256HexValid)) {
+                    kPinValidatorInst = &inst;
+                    kPinValidatorFn = &rir.module.functions[fi];
+                }
+            }
+    REQUIRE(kFingerprintInst != nullptr);
+    const rir::Instruction kSavedInst = *kFingerprintInst;
+    const auto check_invalid = [&]() { CHECK_FALSE(codegen(rir.module).ok); };
+    kFingerprintInst->operand_count = 1;
+    check_invalid();
+    *kFingerprintInst = kSavedInst;
+    kFingerprintInst->result = rir::kNoValue;
+    check_invalid();
+    *kFingerprintInst = kSavedInst;
+    kFingerprintInst->result.id = kFingerprintFn->value_count + 1;
+    check_invalid();
+    *kFingerprintInst = kSavedInst;
+    const rir::Type* kSavedType = kFingerprintFn->values[kSavedInst.result.id].type;
+    const rir::Type kWrongType{rir::TypeKind::Str, nullptr, nullptr};
+    kFingerprintFn->values[kSavedInst.result.id].type = &kWrongType;
+    check_invalid();
+    kFingerprintFn->values[kSavedInst.result.id].type = kSavedType;
+    REQUIRE(kPinValidatorInst != nullptr && kPinValidatorFn != nullptr);
+    const rir::Instruction kSavedValidatorInst = *kPinValidatorInst;
+    kPinValidatorInst->operand_count = 0;
+    check_invalid();
+    *kPinValidatorInst = kSavedValidatorInst;
+    kPinValidatorInst->result = rir::kNoValue;
+    check_invalid();
+    *kPinValidatorInst = kSavedValidatorInst;
+    kPinValidatorInst->result.id = kPinValidatorFn->value_count + 1;
+    check_invalid();
+    *kPinValidatorInst = kSavedValidatorInst;
+    const rir::Type* kSavedValidatorType =
+        kPinValidatorFn->values[kSavedValidatorInst.result.id].type;
+    const rir::Type kWrongValidatorType{rir::TypeKind::I32, nullptr, nullptr};
+    kPinValidatorFn->values[kSavedValidatorInst.result.id].type = &kWrongValidatorType;
+    check_invalid();
+    kPinValidatorFn->values[kSavedValidatorInst.result.id].type = kSavedValidatorType;
+    rir::ValueId kWrongValidatorOperand = rir::kNoValue;
+    for (u32 i = 0; i < kPinValidatorFn->value_count; ++i) {
+        const rir::Type* kType = kPinValidatorFn->values[i].type;
+        if (kType != nullptr && kType->kind != rir::TypeKind::Str) {
+            kWrongValidatorOperand.id = i;
+            break;
+        }
+    }
+    REQUIRE(kWrongValidatorOperand != rir::kNoValue);
+    kPinValidatorInst->operands[0] = kWrongValidatorOperand;
+    check_invalid();
+    *kPinValidatorInst = kSavedValidatorInst;
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    Connection conn{};
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls_client_cert_sha256_valid = true;
+    __builtin_memset(conn.tls_client_cert_sha256, 'a', sizeof(conn.tls_client_cert_sha256));
+    const char* paths[] = {"/ok",
+                           "/wrong-pin",
+                           "/bad-config",
+                           "/uppercase-pin",
+                           "/short-pin",
+                           "/missing",
+                           "/helper-missing",
+                           "/forged"};
+    const u16 statuses[] = {204, 403, 503, 503, 503, 204};
+    for (u32 i = 0; i < 6; ++i) {
+        char name[] = "handler_route_0";
+        name[14] = static_cast<char>('0' + i);
+        auto fn = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(fn);
+        char request[128];
+        const int kRequestLen = snprintf(
+            request, sizeof(request), "GET %s HTTP/1.1\r\nHost: localhost\r\n\r\n", paths[i]);
+        auto result = HandlerResult::unpack(fn(&conn,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(request),
+                                               static_cast<u32>(kRequestLen),
+                                               nullptr));
+        if (result.status_code != statuses[i])
+            fprintf(stderr,
+                    "mTLS JIT route %u %s returned %u expected %u\n",
+                    i,
+                    paths[i],
+                    result.status_code,
+                    statuses[i]);
+        CHECK_EQ(result.status_code, statuses[i]);
+    }
+    auto bad_config = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_2"));
+    REQUIRE(bad_config);
+    const char bad_config_request[] = "GET /bad-config HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    conn.tls_client_cert_sha256_valid = false;
+    auto invalid_config_result =
+        HandlerResult::unpack(bad_config(&conn,
+                                         nullptr,
+                                         reinterpret_cast<const u8*>(bad_config_request),
+                                         sizeof(bad_config_request) - 1,
+                                         nullptr));
+    CHECK_EQ(invalid_config_result.status_code, 503u);
+    conn.tls_client_cert_sha256_valid = false;
+    auto optional_missing = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_5"));
+    REQUIRE(optional_missing);
+    const char optional_missing_request[] = "GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto optional_missing_result = HandlerResult::unpack(
+        optional_missing(&conn,
+                         nullptr,
+                         reinterpret_cast<const u8*>(optional_missing_request),
+                         sizeof(optional_missing_request) - 1,
+                         nullptr));
+    CHECK_EQ(optional_missing_result.status_code, 403u);
+    auto missing = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_6"));
+    REQUIRE(missing);
+    const char request[] = "GET /helper-missing HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto result = HandlerResult::unpack(missing(
+        &conn, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+    CHECK_EQ(result.status_code, 403u);
+    auto forged = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_7"));
+    REQUIRE(forged);
+    conn.tls_active = false;
+    conn.tls_client_cert_sha256_valid = true;
+    const char forged_request[] =
+        "GET /forged HTTP/1.1\r\nHost: localhost\r\nX-TLS-Client-Cert-SHA256: "
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n";
+    result = HandlerResult::unpack(forged(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(forged_request),
+                                          sizeof(forged_request) - 1,
+                                          nullptr));
+    CHECK_EQ(result.status_code, 403u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, hs256_issue_codegen_rejects_malformed_rir_before_reading_overflow_operands) {
     TestContext tc;
     REQUIRE(tc.init());

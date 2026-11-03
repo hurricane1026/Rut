@@ -16,6 +16,7 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/serve_loader.h"
 #endif
+#include "rut/runtime/auth.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/callbacks_impl.h"
@@ -37,6 +38,7 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -46,8 +48,11 @@
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -182,6 +187,12 @@ AlpnProtocol scripted_alpn_negotiated(SSL* /*ssl*/) {
     return AlpnProtocol::None;
 }
 
+bool scripted_capture_client_fingerprint(SSL* /*ssl*/, char fingerprint[64], bool& valid) {
+    memset(fingerprint, 0, 64);
+    valid = false;
+    return true;
+}
+
 struct ScopedTlsHooks {
     explicit ScopedTlsHooks(ScriptedTlsState& state) {
         g_scripted_tls = &state;
@@ -189,7 +200,8 @@ struct ScopedTlsHooks {
                   scripted_ssl_read,
                   scripted_ssl_write,
                   scripted_ssl_get_error,
-                  scripted_alpn_negotiated};
+                  scripted_alpn_negotiated,
+                  scripted_capture_client_fingerprint};
         set_epoll_tls_hooks_for_test(&hooks_);
     }
 
@@ -525,6 +537,241 @@ static bool ssl_write_all(SSL* ssl, const char* data, u32 len) {
         sent += static_cast<u32>(n);
     }
     return true;
+}
+
+static bool test_certificate_sha256_hex(char out[65]) {
+    FILE* file = fopen(kTestCertPath, "rb");
+    if (!file) return false;
+    X509* cert = PEM_read_X509(file, nullptr, nullptr, nullptr);
+    fclose(file);
+    if (!cert) return false;
+    u8 digest[EVP_MAX_MD_SIZE]{};
+    unsigned length = 0;
+    const bool kOk = X509_digest(cert, EVP_sha256(), digest, &length) == 1 && length == 32;
+    X509_free(cert);
+    if (!kOk) return false;
+    static constexpr char kHex[] = "0123456789abcdef";
+    for (u32 i = 0; i < 32; ++i) {
+        out[i * 2] = kHex[digest[i] >> 4];
+        out[i * 2 + 1] = kHex[digest[i] & 0x0f];
+    }
+    out[64] = '\0';
+    return true;
+}
+
+static bool create_test_mtls_source(char out_path[512]) {
+    const auto sample = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                        "examples/mtls-pinned-auth.rut";
+    FILE* input = fopen(sample.c_str(), "rb");
+    if (!input) return false;
+    char source[4096];
+    const size_t source_len = fread(source, 1, sizeof(source), input);
+    const bool source_ok = !ferror(input) && feof(input) && source_len < sizeof(source);
+    fclose(input);
+    if (!source_ok) return false;
+    std::string path_template = sample.parent_path().string() + "/mtls-test-XXXXXX";
+    const i32 fd = mkstemp(path_template.data());
+    if (fd < 0) return false;
+    auto write_all = [fd](const char* bytes, size_t len) {
+        size_t written = 0;
+        while (written < len) {
+            const ssize_t amount = write(fd, bytes + written, len - written);
+            if (amount <= 0) return false;
+            written += static_cast<size_t>(amount);
+        }
+        return true;
+    };
+    static constexpr char kTestRoutes[] =
+        "\nroute GET \"/wrong-pin\" {\n"
+        "    let identity = auth.pinnedMtlsIdentity(\n"
+        "        \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\n"
+        "        env(\"MTLS_CONSUMER_ID\"), env(\"MTLS_CREDENTIAL_ID\"))\n"
+        "    let consumerId = identity.consumerId\n"
+        "    return response(200, body: consumerId)\n}\n"
+        "route GET \"/bad-config\" {\n"
+        "    let identity = auth.pinnedMtlsIdentity(\n"
+        "        \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n\",\n"
+        "        env(\"MTLS_CONSUMER_ID\"), env(\"MTLS_CREDENTIAL_ID\"))\n"
+        "    let consumerId = identity.consumerId\n"
+        "    return response(200, body: consumerId)\n}\n";
+    const bool ok = write_all(source, source_len) &&
+                    write_all(kTestRoutes, sizeof(kTestRoutes) - 1) &&
+                    snprintf(out_path, 512, "%s", path_template.c_str()) > 0;
+    close(fd);
+    if (!ok) unlink(path_template.c_str());
+    return ok;
+}
+
+static void set_socket_timeouts(i32 fd, i32 secs);
+static SSL_CTX* create_test_client_ctx();
+namespace {
+bool iouring_socket_live();
+}
+
+static bool write_test_client_certificate(bool expired,
+                                          bool trusted_issuer,
+                                          char cert_path[64],
+                                          char key_path[64]) {
+    strcpy(cert_path, "/tmp/rut-mtls-cert-XXXXXX");
+    strcpy(key_path, "/tmp/rut-mtls-key-XXXXXX");
+    const i32 cert_fd = mkstemp(cert_path);
+    const i32 key_fd = mkstemp(key_path);
+    if (cert_fd < 0 || key_fd < 0) {
+        if (cert_fd >= 0) close(cert_fd);
+        if (key_fd >= 0) close(key_fd);
+        return false;
+    }
+    FILE* cert_file = fdopen(cert_fd, "w");
+    FILE* key_file = fdopen(key_fd, "w");
+    EVP_PKEY* key =
+        trusted_issuer ? nullptr : EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "prime256v1");
+    if (trusted_issuer) {
+        FILE* input = fopen(kTestKeyPath, "r");
+        if (input) {
+            key = PEM_read_PrivateKey(input, nullptr, nullptr, nullptr);
+            fclose(input);
+        }
+    }
+    FILE* issuer_file = trusted_issuer ? fopen(kTestCertPath, "r") : nullptr;
+    X509* issuer = issuer_file ? PEM_read_X509(issuer_file, nullptr, nullptr, nullptr) : nullptr;
+    if (issuer_file) fclose(issuer_file);
+    X509* cert = issuer ? X509_dup(issuer) : X509_new();
+    bool ok = key && cert && cert_file && key_file;
+    if (ok && !issuer) {
+        ok = X509_set_version(cert, 2) == 1 &&
+             ASN1_INTEGER_set(X509_get_serialNumber(cert), 7) == 1 &&
+             X509_set_pubkey(cert, key) == 1;
+        X509_NAME* name = X509_get_subject_name(cert);
+        static const unsigned char common_name[] = "rut-mtls-untrusted";
+        ok = ok &&
+             X509_NAME_add_entry_by_txt(
+                 name, "CN", MBSTRING_ASC, common_name, sizeof(common_name) - 1, -1, 0) == 1 &&
+             X509_set_issuer_name(cert, name) == 1;
+    }
+    if (ok)
+        ok = X509_gmtime_adj(X509_getm_notBefore(cert), -3600) != nullptr &&
+             X509_gmtime_adj(X509_getm_notAfter(cert), 86400) != nullptr;
+    if (ok && expired)
+        ok = X509_gmtime_adj(X509_getm_notBefore(cert), -7200) != nullptr &&
+             X509_gmtime_adj(X509_getm_notAfter(cert), -3600) != nullptr;
+    ok = ok && X509_sign(cert, key, EVP_sha256()) > 0 && PEM_write_X509(cert_file, cert) == 1 &&
+         PEM_write_PrivateKey(key_file, key, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+    if (cert_file)
+        fclose(cert_file);
+    else
+        close(cert_fd);
+    if (key_file)
+        fclose(key_file);
+    else
+        close(key_fd);
+    X509_free(cert);
+    X509_free(issuer);
+    EVP_PKEY_free(key);
+    return ok;
+}
+
+static bool test_bytes_contain(const char* data, size_t len, const char* needle, size_t needle_len);
+
+static bool test_mtls_client_rejected(u16 port,
+                                      const char* cert_path,
+                                      const char* key_path,
+                                      int version) {
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    if (!client_ctx) return false;
+    bool ok = SSL_CTX_set_min_proto_version(client_ctx, version) == 1 &&
+              SSL_CTX_set_max_proto_version(client_ctx, version) == 1;
+    if (ok && cert_path != nullptr)
+        ok = key_path != nullptr &&
+             SSL_CTX_use_certificate_chain_file(client_ctx, cert_path) == 1 &&
+             SSL_CTX_use_PrivateKey_file(client_ctx, key_path, SSL_FILETYPE_PEM) == 1 &&
+             SSL_CTX_check_private_key(client_ctx) == 1;
+    i32 fd = ok ? connect_to(port) : -1;
+    if (fd < 0) ok = false;
+    SSL* ssl = ok ? SSL_new(client_ctx) : nullptr;
+    if (!ssl || SSL_set_fd(ssl, fd) != 1) ok = false;
+    if (ok) {
+        set_socket_timeouts(fd, 2);
+        errno = 0;
+        const i32 connect_rc = SSL_connect(ssl);
+        if (connect_rc == 1) {
+            static constexpr char kRequest[] =
+                "GET /private HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            errno = 0;
+            const i32 write_rc = SSL_write(ssl, kRequest, sizeof(kRequest) - 1);
+            if (write_rc == static_cast<i32>(sizeof(kRequest) - 1)) {
+                char response[256]{};
+                errno = 0;
+                const i32 read_rc = SSL_read(ssl, response, sizeof(response));
+                if (read_rc > 0) {
+                    fprintf(stderr,
+                            "mTLS rejected client got %d HTTP/TLS bytes for TLS=%x\n",
+                            read_rc,
+                            version);
+                    ok = false;
+                } else {
+                    const i32 error = SSL_get_error(ssl, read_rc);
+                    ok = error == SSL_ERROR_SSL || error == SSL_ERROR_ZERO_RETURN ||
+                         (error == SSL_ERROR_SYSCALL &&
+                          (errno == 0 || errno == ECONNRESET || errno == EPIPE));
+                    if (!ok)
+                        fprintf(stderr,
+                                "mTLS reject read was inconclusive TLS=%x error=%d errno=%d\n",
+                                version,
+                                error,
+                                errno);
+                }
+            } else if (write_rc <= 0) {
+                const i32 error = SSL_get_error(ssl, write_rc);
+                ok = error == SSL_ERROR_SSL || error == SSL_ERROR_ZERO_RETURN ||
+                     (error == SSL_ERROR_SYSCALL &&
+                      (errno == 0 || errno == ECONNRESET || errno == EPIPE));
+                if (!ok)
+                    fprintf(stderr,
+                            "mTLS reject write was inconclusive TLS=%x error=%d errno=%d\n",
+                            version,
+                            error,
+                            errno);
+            } else {
+                fprintf(stderr, "mTLS reject partial write TLS=%x bytes=%d\n", version, write_rc);
+                ok = false;
+            }
+        } else {
+            const i32 error = SSL_get_error(ssl, connect_rc);
+            ok = error == SSL_ERROR_SSL || error == SSL_ERROR_ZERO_RETURN ||
+                 (error == SSL_ERROR_SYSCALL &&
+                  (errno == 0 || errno == ECONNRESET || errno == EPIPE));
+            if (!ok)
+                fprintf(stderr,
+                        "mTLS reject handshake was inconclusive TLS=%x error=%d errno=%d\n",
+                        version,
+                        error,
+                        errno);
+        }
+    }
+    char ssl_state[128] = "no SSL object";
+    if (ssl) snprintf(ssl_state, sizeof(ssl_state), "%s", SSL_state_string_long(ssl));
+    if (!ok)
+        fprintf(stderr,
+                "mTLS rejection failed version=%x state=%s errno=%d openssl_error=%lu\n",
+                version,
+                ssl_state,
+                errno,
+                ERR_peek_last_error());
+    if (ssl) SSL_free(ssl);
+    if (fd >= 0) close(fd);
+    SSL_CTX_free(client_ctx);
+    return ok;
+}
+
+static bool test_bytes_contain(const char* data,
+                               size_t len,
+                               const char* needle,
+                               size_t needle_len) {
+    if (needle_len > len) return false;
+    for (size_t i = 0; i + needle_len <= len; ++i) {
+        if (memcmp(data + i, needle, needle_len) == 0) return true;
+    }
+    return false;
 }
 
 static void set_socket_timeouts(i32 fd, i32 secs) {
@@ -7269,6 +7516,409 @@ TEST(shard, serves_https_requests) {
     destroy_tls_server_context(tls_ctx.value());
 }
 
+TEST(tls, client_ca_configuration_requires_loadable_bundle_and_disables_resumption) {
+    auto missing = create_tls_server_context(
+        kTestCertPath, kTestKeyPath, false, "/definitely/missing/rut-client-ca.pem");
+    CHECK_FALSE(missing.has_value());
+    auto context = create_tls_server_context(kTestCertPath, kTestKeyPath, false, kTestCertPath);
+    REQUIRE(context.has_value());
+    CHECK(context.value()->require_client_certificate);
+    CHECK((SSL_CTX_get_verify_mode(context.value()->ssl_ctx) &
+           (SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT)) ==
+          (SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT));
+    CHECK_EQ(SSL_CTX_get_session_cache_mode(context.value()->ssl_ctx), SSL_SESS_CACHE_OFF);
+    CHECK_EQ(SSL_CTX_get_num_tickets(context.value()->ssl_ctx), 0u);
+    destroy_tls_server_context(context.value());
+}
+
+TEST(auth, sha256_hex_pin_validator_checks_exact_ascii_form) {
+    char lower[64];
+    memset(lower, 'a', sizeof(lower));
+    CHECK(sha256_hex_format_valid(Str{lower, sizeof(lower)}));
+    CHECK_FALSE(sha256_hex_format_valid(Str{lower, 63}));
+    char long_value[65];
+    memset(long_value, 'a', sizeof(long_value));
+    CHECK_FALSE(sha256_hex_format_valid(Str{long_value, sizeof(long_value)}));
+    char uppercase[64];
+    memset(uppercase, 'A', sizeof(uppercase));
+    CHECK_FALSE(sha256_hex_format_valid(Str{uppercase, sizeof(uppercase)}));
+    lower[17] = 'g';
+    CHECK_FALSE(sha256_hex_format_valid(Str{lower, sizeof(lower)}));
+    lower[17] = '\0';
+    CHECK_FALSE(sha256_hex_format_valid(Str{lower, sizeof(lower)}));
+    lower[17] = static_cast<char>(0x80);
+    CHECK_FALSE(sha256_hex_format_valid(Str{lower, sizeof(lower)}));
+    memset(lower, 'a', sizeof(lower));
+    CHECK(sha256_hex_format_valid(Str{lower, 64}));
+    char newline[65];
+    memset(newline, 'a', 64);
+    newline[64] = '\n';
+    CHECK_FALSE(sha256_hex_format_valid(Str{newline, sizeof(newline)}));
+}
+
+TEST(connection, verified_client_fingerprint_copies_for_h2_and_clears_on_reset) {
+    ConnectionBase downstream{};
+    ConnectionBase stream{};
+    downstream.tls_active = true;
+    downstream.tls_handshake_complete = true;
+    downstream.tls_client_cert_sha256_valid = true;
+    for (u32 i = 0; i < sizeof(downstream.tls_client_cert_sha256); ++i)
+        downstream.tls_client_cert_sha256[i] = static_cast<char>('a' + (i % 6));
+    stream.copy_downstream_transport_state_from(downstream);
+    CHECK(stream.tls_client_cert_sha256_valid);
+    CHECK_EQ(memcmp(stream.tls_client_cert_sha256,
+                    downstream.tls_client_cert_sha256,
+                    sizeof(stream.tls_client_cert_sha256)),
+             0);
+    stream.reset();
+    CHECK_FALSE(stream.tls_client_cert_sha256_valid);
+    for (char value : stream.tls_client_cert_sha256) CHECK_EQ(value, '\0');
+}
+
+TEST(shard, mtls_pinned_identity_uses_verified_connection_certificate_on_keepalive) {
+#if !RUT_ENABLE_JIT_TESTS
+    SKIP("mTLS identity route requires JIT-enabled integration tests");
+#else
+    char fingerprint[65]{};
+    REQUIRE(test_certificate_sha256_hex(fingerprint));
+    REQUIRE_EQ(setenv("MTLS_CLIENT_PIN", fingerprint, 1), 0);
+    REQUIRE_EQ(setenv("MTLS_CONSUMER_ID", "test-client", 1), 0);
+    REQUIRE_EQ(setenv("MTLS_CREDENTIAL_ID", "fixture-cert-v1", 1), 0);
+
+    LoadedProgram program;
+    LoadError load_error{};
+    char fixture_path[512]{};
+    REQUIRE(create_test_mtls_source(fixture_path));
+    const bool loaded = load_rut_program(fixture_path, program, load_error, jit::OptLevel::O0);
+    unlink(fixture_path);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath, false, kTestCertPath);
+    REQUIRE(tls_ctx.has_value());
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    REQUIRE_EQ(SSL_CTX_use_certificate_chain_file(client_ctx, kTestCertPath), 1);
+    REQUIRE_EQ(SSL_CTX_use_PrivateKey_file(client_ctx, kTestKeyPath, SSL_FILETYPE_PEM), 1);
+    REQUIRE_EQ(SSL_CTX_check_private_key(client_ctx), 1);
+    i32 fd = connect_to(port);
+    REQUIRE(fd >= 0);
+    set_socket_timeouts(fd, 2);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE_EQ(SSL_set_fd(ssl, fd), 1);
+    REQUIRE_EQ(SSL_connect(ssl), 1);
+    CHECK_FALSE(SSL_session_reused(ssl));
+    for (u32 i = 0; i < 2; ++i) {
+        const char request[] =
+            "GET /private HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+        REQUIRE(ssl_write_all(ssl, request, sizeof(request) - 1));
+        char response[4096]{};
+        const i32 received = SSL_read(ssl, response, sizeof(response));
+        CHECK(received > 0);
+        if (received > 0) {
+            CHECK(test_bytes_contain(response, static_cast<size_t>(received), "200 OK", 6));
+            CHECK(test_bytes_contain(response, static_cast<size_t>(received), "test-client", 11));
+        }
+    }
+    const char wrong_pin_request[] =
+        "GET /wrong-pin HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+    REQUIRE(ssl_write_all(ssl, wrong_pin_request, sizeof(wrong_pin_request) - 1));
+    char wrong_pin_response[4096]{};
+    const i32 wrong_pin_received = SSL_read(ssl, wrong_pin_response, sizeof(wrong_pin_response));
+    REQUIRE(wrong_pin_received > 0);
+    if (!test_bytes_contain(wrong_pin_response, static_cast<size_t>(wrong_pin_received), "403", 3))
+        fprintf(stderr,
+                "mTLS wrong-pin H1 got %d bytes: %.*s\n",
+                wrong_pin_received,
+                wrong_pin_received,
+                wrong_pin_response);
+    CHECK(
+        test_bytes_contain(wrong_pin_response, static_cast<size_t>(wrong_pin_received), "403", 3));
+    // A route pin update takes effect on the next request on an already verified TLS
+    // connection; the certificate fingerprint itself remains connection-owned.
+    static constexpr char kReplacementPin[] =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    REQUIRE_EQ(setenv("MTLS_CLIENT_PIN", kReplacementPin, 1), 0);
+    LoadedProgram replacement;
+    LoadError replacement_error{};
+    char replacement_path[512]{};
+    REQUIRE(create_test_mtls_source(replacement_path));
+    const bool replacement_loaded =
+        load_rut_program(replacement_path, replacement, replacement_error, jit::OptLevel::O0);
+    unlink(replacement_path);
+    char replacement_message[512]{};
+    if (!replacement_loaded)
+        format_load_error(replacement_error, replacement_message, sizeof(replacement_message));
+    REQUIRE_MSG(replacement_loaded, replacement_message);
+    REQUIRE(shard.reload_config(&replacement.config, 1));
+    REQUIRE_EQ(setenv("MTLS_CLIENT_PIN", fingerprint, 1), 0);
+    bool saw_new_pin_rejection = false;
+    for (u32 attempt = 0; attempt < 8 && !saw_new_pin_rejection; ++attempt) {
+        static constexpr char kRequest[] =
+            "GET /private HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+        REQUIRE(ssl_write_all(ssl, kRequest, sizeof(kRequest) - 1));
+        char response[4096]{};
+        const i32 received = SSL_read(ssl, response, sizeof(response));
+        REQUIRE_GT(received, 0);
+        saw_new_pin_rejection = test_bytes_contain(response, received, "403", 3);
+    }
+    CHECK(saw_new_pin_rejection);
+    SSL_SESSION* prior_session = SSL_get1_session(ssl);
+    REQUIRE(prior_session != nullptr);
+    i32 resumed_fd = connect_to(port);
+    REQUIRE(resumed_fd >= 0);
+    set_socket_timeouts(resumed_fd, 2);
+    SSL* resumed_ssl = SSL_new(client_ctx);
+    REQUIRE(resumed_ssl != nullptr);
+    REQUIRE_EQ(SSL_set_fd(resumed_ssl, resumed_fd), 1);
+    REQUIRE_EQ(SSL_set_session(resumed_ssl, prior_session), 1);
+    REQUIRE_EQ(SSL_connect(resumed_ssl), 1);
+    CHECK_FALSE(SSL_session_reused(resumed_ssl));
+    SSL_shutdown(resumed_ssl);
+    SSL_free(resumed_ssl);
+    close(resumed_fd);
+    SSL_SESSION_free(prior_session);
+    char rejected_cert[64]{};
+    char rejected_key[64]{};
+    REQUIRE(write_test_client_certificate(
+        /*expired=*/false, /*trusted_issuer=*/false, rejected_cert, rejected_key));
+    CHECK(test_mtls_client_rejected(port, rejected_cert, rejected_key, TLS1_2_VERSION));
+    CHECK(test_mtls_client_rejected(port, rejected_cert, rejected_key, TLS1_3_VERSION));
+    unlink(rejected_cert);
+    unlink(rejected_key);
+    REQUIRE(write_test_client_certificate(
+        /*expired=*/true, /*trusted_issuer=*/true, rejected_cert, rejected_key));
+    CHECK(test_mtls_client_rejected(port, rejected_cert, rejected_key, TLS1_2_VERSION));
+    CHECK(test_mtls_client_rejected(port, rejected_cert, rejected_key, TLS1_3_VERSION));
+    unlink(rejected_cert);
+    unlink(rejected_key);
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(fd);
+    SSL_CTX_free(client_ctx);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+
+    // Ordinary server-authenticated TLS leaves the client fingerprint nil.
+    tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    Shard<EpollEventLoop> ordinary_tls_shard;
+    lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 ordinary_tls_port = get_port(lfd);
+    REQUIRE(ordinary_tls_shard.init(0, lfd).has_value());
+    ordinary_tls_shard.route_config = &program.config;
+    ordinary_tls_shard.active_config = ordinary_tls_shard.route_config;
+    ordinary_tls_shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(ordinary_tls_shard.spawn(-1).has_value());
+    usleep(50000);
+    client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    REQUIRE_EQ(SSL_CTX_use_certificate_chain_file(client_ctx, kTestCertPath), 1);
+    REQUIRE_EQ(SSL_CTX_use_PrivateKey_file(client_ctx, kTestKeyPath, SSL_FILETYPE_PEM), 1);
+    fd = connect_to(ordinary_tls_port);
+    REQUIRE(fd >= 0);
+    set_socket_timeouts(fd, 2);
+    ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE_EQ(SSL_set_fd(ssl, fd), 1);
+    REQUIRE_EQ(SSL_connect(ssl), 1);
+    static constexpr char kOrdinaryTlsRequest[] =
+        "GET /private HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    REQUIRE(ssl_write_all(ssl, kOrdinaryTlsRequest, sizeof(kOrdinaryTlsRequest) - 1));
+    char ordinary_tls_response[4096]{};
+    const i32 ordinary_tls_received =
+        SSL_read(ssl, ordinary_tls_response, sizeof(ordinary_tls_response));
+    REQUIRE_GT(ordinary_tls_received, 0);
+    CHECK(test_bytes_contain(
+        ordinary_tls_response, static_cast<size_t>(ordinary_tls_received), "403", 3));
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(fd);
+    SSL_CTX_free(client_ctx);
+    ordinary_tls_shard.stop();
+    ordinary_tls_shard.join();
+    ordinary_tls_shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+
+    Shard<EpollEventLoop> cleartext_shard;
+    lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 cleartext_port = get_port(lfd);
+    REQUIRE(cleartext_shard.init(0, lfd).has_value());
+    cleartext_shard.route_config = &program.config;
+    cleartext_shard.active_config = cleartext_shard.route_config;
+    REQUIRE(cleartext_shard.spawn(-1).has_value());
+    usleep(50000);
+    fd = connect_to(cleartext_port);
+    REQUIRE(fd >= 0);
+    set_socket_timeouts(fd, 2);
+    static constexpr char kForgedCleartextRequest[] =
+        "GET /private HTTP/1.1\r\nHost: localhost\r\n"
+        "X-TLS-Client-Cert-SHA256: "
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE_EQ(write(fd, kForgedCleartextRequest, sizeof(kForgedCleartextRequest) - 1),
+               static_cast<ssize_t>(sizeof(kForgedCleartextRequest) - 1));
+    char cleartext_response[4096]{};
+    const i32 cleartext_received = read(fd, cleartext_response, sizeof(cleartext_response));
+    REQUIRE_GT(cleartext_received, 0);
+    CHECK(
+        test_bytes_contain(cleartext_response, static_cast<size_t>(cleartext_received), "403", 3));
+    close(fd);
+    cleartext_shard.stop();
+    cleartext_shard.join();
+    cleartext_shard.shutdown();
+    close(lfd);
+    replacement.destroy();
+    program.destroy();
+    unsetenv("MTLS_CLIENT_PIN");
+    unsetenv("MTLS_CONSUMER_ID");
+    unsetenv("MTLS_CREDENTIAL_ID");
+
+    // Required client certificates fail before any HTTP request is delivered.
+    tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath, false, kTestCertPath);
+    REQUIRE(tls_ctx.has_value());
+    Shard<EpollEventLoop> no_cert_shard;
+    lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 no_cert_port = get_port(lfd);
+    REQUIRE(no_cert_shard.init(0, lfd).has_value());
+    no_cert_shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(no_cert_shard.spawn(-1).has_value());
+    usleep(50000);
+    CHECK(test_mtls_client_rejected(no_cert_port, nullptr, nullptr, TLS1_2_VERSION));
+    CHECK(test_mtls_client_rejected(no_cert_port, nullptr, nullptr, TLS1_3_VERSION));
+    no_cert_shard.stop();
+    no_cert_shard.join();
+    no_cert_shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+#endif
+}
+
+TEST(shard, mtls_pinned_identity_and_client_rejection_iouring) {
+#if !RUT_ENABLE_JIT_TESTS
+    SKIP("mTLS identity route requires JIT-enabled integration tests");
+#else
+    struct ScopedIgnoreSigpipe {
+        struct sigaction previous{};
+        ScopedIgnoreSigpipe() {
+            struct sigaction ignored{};
+            ignored.sa_handler = SIG_IGN;
+            sigemptyset(&ignored.sa_mask);
+            (void)sigaction(SIGPIPE, &ignored, &previous);
+        }
+        ~ScopedIgnoreSigpipe() { (void)sigaction(SIGPIPE, &previous, nullptr); }
+    } ignore_sigpipe;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    char fingerprint[65]{};
+    REQUIRE(test_certificate_sha256_hex(fingerprint));
+    REQUIRE_EQ(setenv("MTLS_CLIENT_PIN", fingerprint, 1), 0);
+    REQUIRE_EQ(setenv("MTLS_CONSUMER_ID", "test-client", 1), 0);
+    REQUIRE_EQ(setenv("MTLS_CREDENTIAL_ID", "fixture-cert-v1", 1), 0);
+    LoadedProgram program;
+    LoadError load_error{};
+    char fixture_path[512]{};
+    REQUIRE(create_test_mtls_source(fixture_path));
+    const bool loaded = load_rut_program(fixture_path, program, load_error, jit::OptLevel::O0);
+    unlink(fixture_path);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath, false, kTestCertPath);
+    REQUIRE(tls_ctx.has_value());
+    Shard<IoUringEventLoop> shard;
+    i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    const u16 port = get_port(listener);
+    auto initialized = shard.init(0, listener);
+    if (!initialized) {
+        close(listener);
+        destroy_tls_server_context(tls_ctx.value());
+        program.destroy();
+        unsetenv("MTLS_CLIENT_PIN");
+        unsetenv("MTLS_CONSUMER_ID");
+        unsetenv("MTLS_CREDENTIAL_ID");
+        const Error error = initialized.error();
+        fprintf(stderr,
+                "mTLS HTTP/1 io_uring init failed errno=%d detail=%u\n",
+                error.code,
+                static_cast<unsigned>(io_uring_init_failure_detail(shard)));
+        SKIP("io_uring backend unavailable");
+    }
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    REQUIRE_EQ(SSL_CTX_use_certificate_chain_file(client_ctx, kTestCertPath), 1);
+    REQUIRE_EQ(SSL_CTX_use_PrivateKey_file(client_ctx, kTestKeyPath, SSL_FILETYPE_PEM), 1);
+    i32 fd = connect_to(port);
+    REQUIRE(fd >= 0);
+    set_socket_timeouts(fd, 2);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE_EQ(SSL_set_fd(ssl, fd), 1);
+    REQUIRE_EQ(SSL_connect(ssl), 1);
+    static constexpr char kRequest[] =
+        "GET /private HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    REQUIRE(ssl_write_all(ssl, kRequest, sizeof(kRequest) - 1));
+    char response[4096]{};
+    const i32 received = SSL_read(ssl, response, sizeof(response));
+    REQUIRE_GT(received, 0);
+    CHECK(test_bytes_contain(response, received, "200 OK", 6));
+    CHECK(test_bytes_contain(response, received, "test-client", 11));
+    // The io_uring server has already closed this Connection: close socket; avoid
+    // sending a TLS close-notify into a peer that has completed its close path.
+    SSL_free(ssl);
+    close(fd);
+    SSL_CTX_free(client_ctx);
+    char rejected_cert[64]{};
+    char rejected_key[64]{};
+    REQUIRE(write_test_client_certificate(false, false, rejected_cert, rejected_key));
+    CHECK(test_mtls_client_rejected(port, rejected_cert, rejected_key, TLS1_2_VERSION));
+    CHECK(test_mtls_client_rejected(port, rejected_cert, rejected_key, TLS1_3_VERSION));
+    unlink(rejected_cert);
+    unlink(rejected_key);
+    REQUIRE(write_test_client_certificate(true, true, rejected_cert, rejected_key));
+    CHECK(test_mtls_client_rejected(port, rejected_cert, rejected_key, TLS1_2_VERSION));
+    CHECK(test_mtls_client_rejected(port, rejected_cert, rejected_key, TLS1_3_VERSION));
+    unlink(rejected_cert);
+    unlink(rejected_key);
+    CHECK(test_mtls_client_rejected(port, nullptr, nullptr, TLS1_2_VERSION));
+    CHECK(test_mtls_client_rejected(port, nullptr, nullptr, TLS1_3_VERSION));
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(listener);
+    destroy_tls_server_context(tls_ctx.value());
+    program.destroy();
+    unsetenv("MTLS_CLIENT_PIN");
+    unsetenv("MTLS_CONSUMER_ID");
+    unsetenv("MTLS_CREDENTIAL_ID");
+#endif
+}
+
 TEST(tls, rejects_invalid_private_key_file) {
     auto tls_ctx = create_tls_server_context(kTestCertPath, kTestCertPath);
     CHECK(!tls_ctx.has_value());
@@ -9536,6 +10186,98 @@ bool h2_headers_end_stream_for_stream(const u8* buf, u32 len, u32 stream_id) {
     return false;
 }
 
+bool h2_stream_response_complete(const u8* buf, u32 len, u32 stream_id) {
+    for (u32 pos = 0; pos + kFrameHeaderSize <= len;) {
+        Http2FrameHeader h;
+        if (parse_frame_header(buf + pos, len - pos, &h) != ParseStatus::Complete ||
+            pos + kFrameHeaderSize + h.length > len)
+            break;
+        if (h.stream_id == stream_id &&
+            (h.type == static_cast<u8>(Http2FrameType::Headers) ||
+             h.type == static_cast<u8>(Http2FrameType::Data)) &&
+            (h.flags & http2_flag::kEndStream) != 0)
+            return true;
+        pos += kFrameHeaderSize + h.length;
+    }
+    return false;
+}
+
+u32 h2_stream_reset_error(const u8* buf, u32 len, u32 stream_id) {
+    for (u32 pos = 0; pos + kFrameHeaderSize <= len;) {
+        Http2FrameHeader h{};
+        if (parse_frame_header(buf + pos, len - pos, &h) != ParseStatus::Complete ||
+            pos + kFrameHeaderSize + h.length > len)
+            break;
+        if (h.type == static_cast<u8>(Http2FrameType::RstStream) && h.stream_id == stream_id &&
+            h.length == 4) {
+            const u8* p = buf + pos + kFrameHeaderSize;
+            return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) |
+                   (static_cast<u32>(p[2]) << 8) | p[3];
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return 0;
+}
+
+void dump_h2_tls_read_failure(const char* label,
+                              SSL* ssl,
+                              i32 read_result,
+                              i32 saved_errno,
+                              const u8* frames,
+                              u32 frames_len) {
+    const i32 ssl_error = SSL_get_error(ssl, read_result);
+    const unsigned long openssl_error = ERR_peek_last_error();
+    char openssl_message[256]{};
+    if (openssl_error != 0)
+        ERR_error_string_n(openssl_error, openssl_message, sizeof(openssl_message));
+    fprintf(stderr,
+            "%s SSL_read=%d ssl_error=%d errno=%d state=%s openssl=%s\n",
+            label,
+            read_result,
+            ssl_error,
+            saved_errno,
+            SSL_state_string_long(ssl),
+            openssl_message);
+    for (u32 pos = 0; pos + kFrameHeaderSize <= frames_len;) {
+        Http2FrameHeader h{};
+        if (parse_frame_header(frames + pos, frames_len - pos, &h) != ParseStatus::Complete ||
+            pos + kFrameHeaderSize + h.length > frames_len)
+            break;
+        const u8* payload = frames + pos + kFrameHeaderSize;
+        if (h.type == static_cast<u8>(Http2FrameType::RstStream) && h.length == 4) {
+            const u32 error = (static_cast<u32>(payload[0]) << 24) |
+                              (static_cast<u32>(payload[1]) << 16) |
+                              (static_cast<u32>(payload[2]) << 8) | payload[3];
+            fprintf(stderr,
+                    "  frame type=RST_STREAM stream=%u flags=%u len=%u error=%u\n",
+                    h.stream_id,
+                    h.flags,
+                    h.length,
+                    error);
+        } else if (h.type == static_cast<u8>(Http2FrameType::Goaway) && h.length >= 8) {
+            const u32 last_stream = (static_cast<u32>(payload[0]) << 24) |
+                                    (static_cast<u32>(payload[1]) << 16) |
+                                    (static_cast<u32>(payload[2]) << 8) | payload[3];
+            const u32 error = (static_cast<u32>(payload[4]) << 24) |
+                              (static_cast<u32>(payload[5]) << 16) |
+                              (static_cast<u32>(payload[6]) << 8) | payload[7];
+            fprintf(stderr,
+                    "  frame type=GOAWAY last_stream=%u len=%u error=%u\n",
+                    last_stream,
+                    h.length,
+                    error);
+        } else {
+            fprintf(stderr,
+                    "  frame type=%u stream=%u flags=%u len=%u\n",
+                    h.type,
+                    h.stream_id,
+                    h.flags,
+                    h.length);
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+}
+
 // Write preface + an empty client SETTINGS into out; return bytes written.
 u32 h2_client_prologue(u8* out) {
     u32 n = 0;
@@ -9551,6 +10293,16 @@ u32 h2_client_get(u8* out, u32 cap, u32 stream_id, const char* path, u32 path_le
     const hpack::Header hs[] = {
         {{":method", 7}, {"GET", 3}},
         {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {path, path_len}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    return http2_write_headers(out, cap, stream_id, hs, 4, /*end_stream=*/true);
+}
+
+u32 h2_client_get_tls(u8* out, u32 cap, u32 stream_id, const char* path, u32 path_len) {
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"https", 5}},
         {{":path", 5}, {path, path_len}},
         {{":authority", 10}, {"localhost", 9}},
     };
@@ -12027,6 +12779,363 @@ AlpnProtocol negotiate_alpn(bool server_offer_h2, const u8* client_protos, u32 c
 TEST(shard, negotiates_h2_via_alpn) {
     const u8 client[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
     CHECK(negotiate_alpn(/*server_offer_h2=*/true, client, sizeof(client)) == AlpnProtocol::H2);
+}
+
+template <typename Loop>
+static void requires_verified_client_certificate_with_h2_alpn_body(rut::test::TestCase* _tc) {
+#if !RUT_ENABLE_JIT_TESTS
+    SKIP("mTLS identity over HTTP/2 requires JIT-enabled tests");
+#else
+    char fingerprint[65]{};
+    REQUIRE(test_certificate_sha256_hex(fingerprint));
+    REQUIRE_EQ(setenv("MTLS_CLIENT_PIN", fingerprint, 1), 0);
+    REQUIRE_EQ(setenv("MTLS_CONSUMER_ID", "test-client", 1), 0);
+    REQUIRE_EQ(setenv("MTLS_CREDENTIAL_ID", "fixture-cert-v1", 1), 0);
+    LoadedProgram program;
+    LoadError load_error{};
+    char fixture_path[512]{};
+    REQUIRE(create_test_mtls_source(fixture_path));
+    const bool loaded = load_rut_program(fixture_path, program, load_error, jit::OptLevel::O0);
+    unlink(fixture_path);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    if constexpr (std::is_same_v<Loop, IoUringEventLoop>) {
+        if (!iouring_socket_live()) {
+            program.destroy();
+            unsetenv("MTLS_CLIENT_PIN");
+            unsetenv("MTLS_CONSUMER_ID");
+            unsetenv("MTLS_CREDENTIAL_ID");
+            SKIP("io_uring async socket operations unavailable");
+        }
+    }
+    auto tls_ctx =
+        create_tls_server_context(kTestCertPath, kTestKeyPath, /*offer_h2=*/true, kTestCertPath);
+    REQUIRE(tls_ctx.has_value());
+    Shard<Loop> shard;
+    i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    const u16 port = get_port(listener);
+    auto initialized = shard.init(0, listener);
+    if (!initialized) {
+        close(listener);
+        destroy_tls_server_context(tls_ctx.value());
+        if constexpr (std::is_same_v<Loop, IoUringEventLoop>) {
+            const Error error = initialized.error();
+            fprintf(stderr,
+                    "mTLS HTTP/2 io_uring init failed errno=%d detail=%u\n",
+                    error.code,
+                    static_cast<unsigned>(io_uring_init_failure_detail(shard)));
+            program.destroy();
+            unsetenv("MTLS_CLIENT_PIN");
+            unsetenv("MTLS_CONSUMER_ID");
+            unsetenv("MTLS_CREDENTIAL_ID");
+            SKIP("io_uring backend unavailable");
+        }
+        REQUIRE(initialized.has_value());
+    }
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    REQUIRE_EQ(SSL_CTX_use_certificate_chain_file(client_ctx, kTestCertPath), 1);
+    REQUIRE_EQ(SSL_CTX_use_PrivateKey_file(client_ctx, kTestKeyPath, SSL_FILETYPE_PEM), 1);
+    const u8 protocols[] = {2, 'h', '2'};
+    REQUIRE_EQ(SSL_CTX_set_alpn_protos(client_ctx, protocols, sizeof(protocols)), 0);
+    i32 fd = connect_to(port);
+    REQUIRE(fd >= 0);
+    set_socket_timeouts(fd, 2);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE_EQ(SSL_set_fd(ssl, fd), 1);
+    REQUIRE_EQ(SSL_connect(ssl), 1);
+    CHECK(tls_negotiated_protocol(ssl) == AlpnProtocol::H2);
+    CHECK_FALSE(SSL_session_reused(ssl));
+    u8 request_bytes[512];
+    u8 response_bytes[8192]{};
+    u32 response_len = 0;
+    const auto read_until_complete = [&](u32 stream_id) {
+        while (!h2_stream_response_complete(response_bytes, response_len, stream_id) &&
+               response_len < sizeof(response_bytes)) {
+            const i32 got =
+                SSL_read(ssl, response_bytes + response_len, sizeof(response_bytes) - response_len);
+            if (got <= 0) return false;
+            response_len += static_cast<u32>(got);
+        }
+        return h2_stream_response_complete(response_bytes, response_len, stream_id);
+    };
+    u32 request_len = h2_client_prologue(request_bytes);
+    request_len += h2_client_get_tls(
+        request_bytes + request_len, sizeof(request_bytes) - request_len, 1, "/private", 8);
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(request_bytes), request_len));
+    REQUIRE(read_until_complete(1));
+    CHECK_EQ(h2_status_for_stream(response_bytes, response_len, 1), 200u);
+    request_len = h2_client_get_tls(request_bytes, sizeof(request_bytes), 3, "/private", 8);
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(request_bytes), request_len));
+    REQUIRE(read_until_complete(3));
+    const u16 stream3_status = h2_status_for_stream(response_bytes, response_len, 3);
+    CHECK_EQ(stream3_status, 200u);
+    request_len = h2_client_get_tls(request_bytes, sizeof(request_bytes), 5, "/wrong-pin", 10);
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(request_bytes), request_len));
+    REQUIRE(read_until_complete(5));
+    const u16 stream5_status = h2_status_for_stream(response_bytes, response_len, 5);
+    if (stream3_status != 200u || stream5_status != 403u) {
+        fprintf(stderr,
+                "mTLS H2 response len=%u statuses=%u/%u/%u\n",
+                response_len,
+                h2_status_for_stream(response_bytes, response_len, 1),
+                stream3_status,
+                stream5_status);
+        for (u32 pos = 0; pos + kFrameHeaderSize <= response_len;) {
+            Http2FrameHeader h{};
+            if (parse_frame_header(response_bytes + pos, response_len - pos, &h) !=
+                    ParseStatus::Complete ||
+                pos + kFrameHeaderSize + h.length > response_len)
+                break;
+            fprintf(stderr,
+                    "mTLS H2 frame type=%u flags=%u stream=%u length=%u\n",
+                    h.type,
+                    h.flags,
+                    h.stream_id,
+                    h.length);
+            pos += kFrameHeaderSize + h.length;
+        }
+    }
+    CHECK_EQ(stream5_status, 403u);
+    CHECK(test_bytes_contain(
+        reinterpret_cast<const char*>(response_bytes), response_len, "test-client", 11));
+    request_len = h2_client_get_tls(request_bytes, sizeof(request_bytes), 7, "/private", 8);
+    request_len += h2_client_get_tls(
+        request_bytes + request_len, sizeof(request_bytes) - request_len, 9, "/private", 8);
+    request_len += h2_client_get_tls(
+        request_bytes + request_len, sizeof(request_bytes) - request_len, 11, "/wrong-pin", 10);
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(request_bytes), request_len));
+    const u64 concurrent_deadline_us = monotonic_us() + 5000000;
+    while (!(h2_stream_response_complete(response_bytes, response_len, 7) &&
+             h2_stream_reset_error(response_bytes, response_len, 9) != 0 &&
+             h2_stream_reset_error(response_bytes, response_len, 11) != 0) &&
+           response_len < sizeof(response_bytes)) {
+        REQUIRE(monotonic_us() < concurrent_deadline_us);
+        errno = 0;
+        const i32 got = SSL_read(ssl,
+                                 response_bytes + response_len,
+                                 static_cast<i32>(sizeof(response_bytes) - response_len));
+        const i32 saved_errno = errno;
+        if (got <= 0)
+            dump_h2_tls_read_failure(
+                "mTLS concurrent H2", ssl, got, saved_errno, response_bytes, response_len);
+        if (got <= 0) break;
+        response_len += static_cast<u32>(got);
+    }
+    CHECK(h2_stream_response_complete(response_bytes, response_len, 7));
+    CHECK_EQ(h2_stream_reset_error(response_bytes, response_len, 9), 7u);
+    CHECK_EQ(h2_stream_reset_error(response_bytes, response_len, 11), 7u);
+    CHECK_EQ(h2_status_for_stream(response_bytes, response_len, 7), 200u);
+    request_len = h2_client_get_tls(request_bytes, sizeof(request_bytes), 13, "/private", 8);
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(request_bytes), request_len));
+    const u64 retry_deadline_us = monotonic_us() + 5000000;
+    while (!h2_stream_response_complete(response_bytes, response_len, 13) &&
+           response_len < sizeof(response_bytes)) {
+        REQUIRE(monotonic_us() < retry_deadline_us);
+        errno = 0;
+        const i32 got = SSL_read(ssl,
+                                 response_bytes + response_len,
+                                 static_cast<i32>(sizeof(response_bytes) - response_len));
+        const i32 saved_errno = errno;
+        if (got <= 0)
+            dump_h2_tls_read_failure(
+                "mTLS retry H2", ssl, got, saved_errno, response_bytes, response_len);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+    }
+    CHECK_EQ(h2_status_for_stream(response_bytes, response_len, 13), 200u);
+    request_len = h2_client_get_tls(request_bytes, sizeof(request_bytes), 15, "/wrong-pin", 10);
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(request_bytes), request_len));
+    while (!h2_stream_response_complete(response_bytes, response_len, 15) &&
+           response_len < sizeof(response_bytes)) {
+        REQUIRE(monotonic_us() < retry_deadline_us + 5000000);
+        errno = 0;
+        const i32 got = SSL_read(ssl,
+                                 response_bytes + response_len,
+                                 static_cast<i32>(sizeof(response_bytes) - response_len));
+        const i32 saved_errno = errno;
+        if (got <= 0)
+            dump_h2_tls_read_failure(
+                "mTLS second retry H2", ssl, got, saved_errno, response_bytes, response_len);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+    }
+    CHECK_EQ(h2_status_for_stream(response_bytes, response_len, 15), 403u);
+    CHECK(test_bytes_contain(
+        reinterpret_cast<const char*>(response_bytes), response_len, "test-client", 11));
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(fd);
+    SSL_CTX_free(client_ctx);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(listener);
+    destroy_tls_server_context(tls_ctx.value());
+    program.destroy();
+    unsetenv("MTLS_CLIENT_PIN");
+    unsetenv("MTLS_CONSUMER_ID");
+    unsetenv("MTLS_CREDENTIAL_ID");
+#endif
+}
+
+TEST(shard, requires_verified_client_certificate_with_h2_alpn_epoll) {
+    requires_verified_client_certificate_with_h2_alpn_body<EpollEventLoop>(_tc);
+}
+
+TEST(shard, requires_verified_client_certificate_with_h2_alpn_iouring) {
+    requires_verified_client_certificate_with_h2_alpn_body<IoUringEventLoop>(_tc);
+}
+
+TEST(shard, plain_tls_http2_concurrent_dynamic_routes_baseline) {
+#if !RUT_ENABLE_JIT_TESTS
+    SKIP("dynamic Rut routes require JIT-enabled integration tests");
+#else
+    static constexpr char kSource[] =
+        "route GET \"/one\" {\n    let value = req.authorization.or(\"one\")\n"
+        "    return response(200, body: value)\n}\n"
+        "route GET \"/two\" {\n    let value = req.authorization.or(\"two\")\n"
+        "    return response(200, body: value)\n}\n"
+        "route GET \"/deny\" {\n    let value = req.authorization.or(\"deny\")\n"
+        "    return response(403, body: value)\n}\n";
+    char path[] = "/tmp/rut-mtls-plain-h2-XXXXXX";
+    const i32 source_fd = mkstemp(path);
+    REQUIRE(source_fd >= 0);
+    REQUIRE_EQ(write(source_fd, kSource, sizeof(kSource) - 1),
+               static_cast<ssize_t>(sizeof(kSource) - 1));
+    close(source_fd);
+    LoadedProgram program;
+    LoadError load_error{};
+    const bool loaded = load_rut_program(path, program, load_error, jit::OptLevel::O0);
+    unlink(path);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE_EQ(program.config.route_count, 3u);
+    for (u32 i = 0; i < program.config.route_count; ++i)
+        REQUIRE(program.config.routes[i].fn != nullptr);
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath, true);
+    REQUIRE(tls_ctx.has_value());
+    Shard<EpollEventLoop> shard;
+    i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    const u16 port = get_port(listener);
+    REQUIRE(shard.init(0, listener).has_value());
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    const u8 protocols[] = {2, 'h', '2'};
+    REQUIRE_EQ(SSL_CTX_set_alpn_protos(client_ctx, protocols, sizeof(protocols)), 0);
+    const i32 fd = connect_to(port);
+    REQUIRE(fd >= 0);
+    set_socket_timeouts(fd, 3);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE_EQ(SSL_set_fd(ssl, fd), 1);
+    REQUIRE_EQ(SSL_connect(ssl), 1);
+    CHECK(tls_negotiated_protocol(ssl) == AlpnProtocol::H2);
+    CHECK_FALSE(SSL_session_reused(ssl));
+    u8 request[1024];
+    u32 request_len = h2_client_prologue(request);
+    const auto append_dynamic_get =
+        [&](u32 stream_id, const char* path, u32 path_len, const char* auth) {
+            const u32 auth_len = static_cast<u32>(strlen(auth));
+            const hpack::Header headers[] = {
+                {{":method", 7}, {"GET", 3}},
+                {{":scheme", 7}, {"https", 5}},
+                {{":path", 5}, {path, path_len}},
+                {{":authority", 10}, {"localhost", 9}},
+                {{"authorization", 13}, {auth, auth_len}},
+            };
+            request_len += http2_write_headers(
+                request + request_len, sizeof(request) - request_len, stream_id, headers, 5, true);
+        };
+    append_dynamic_get(1, "/one", 4, "one");
+    append_dynamic_get(3, "/two", 4, "two");
+    append_dynamic_get(5, "/deny", 5, "deny");
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(request), request_len));
+    u8 response[8192]{};
+    u32 response_len = 0;
+    const u64 deadline_us = monotonic_us() + 5000000;
+    while (!(h2_stream_response_complete(response, response_len, 1) &&
+             h2_stream_reset_error(response, response_len, 3) != 0 &&
+             h2_stream_reset_error(response, response_len, 5) != 0) &&
+           response_len < sizeof(response)) {
+        REQUIRE(monotonic_us() < deadline_us);
+        errno = 0;
+        const i32 got = SSL_read(
+            ssl, response + response_len, static_cast<i32>(sizeof(response) - response_len));
+        const i32 saved_errno = errno;
+        if (got <= 0)
+            dump_h2_tls_read_failure(
+                "plain TLS concurrent H2", ssl, got, saved_errno, response, response_len);
+        if (got <= 0) break;
+        response_len += static_cast<u32>(got);
+    }
+    CHECK(h2_stream_response_complete(response, response_len, 1));
+    CHECK_EQ(h2_stream_reset_error(response, response_len, 3), 7u);
+    CHECK_EQ(h2_stream_reset_error(response, response_len, 5), 7u);
+    CHECK_EQ(h2_status_for_stream(response, response_len, 1), 200u);
+    CHECK(test_bytes_contain(reinterpret_cast<const char*>(response), response_len, "one", 3));
+    request_len = 0;
+    append_dynamic_get(7, "/two", 4, "two");
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(request), request_len));
+    const u64 retry_deadline_us = monotonic_us() + 5000000;
+    while (!h2_stream_response_complete(response, response_len, 7) &&
+           response_len < sizeof(response)) {
+        REQUIRE(monotonic_us() < retry_deadline_us);
+        errno = 0;
+        const i32 got = SSL_read(
+            ssl, response + response_len, static_cast<i32>(sizeof(response) - response_len));
+        const i32 saved_errno = errno;
+        if (got <= 0)
+            dump_h2_tls_read_failure(
+                "plain TLS retry H2", ssl, got, saved_errno, response, response_len);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+    }
+    CHECK_EQ(h2_status_for_stream(response, response_len, 7), 200u);
+    request_len = 0;
+    append_dynamic_get(9, "/deny", 5, "deny");
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(request), request_len));
+    while (!h2_stream_response_complete(response, response_len, 9) &&
+           response_len < sizeof(response)) {
+        REQUIRE(monotonic_us() < retry_deadline_us + 5000000);
+        errno = 0;
+        const i32 got = SSL_read(
+            ssl, response + response_len, static_cast<i32>(sizeof(response) - response_len));
+        const i32 saved_errno = errno;
+        if (got <= 0)
+            dump_h2_tls_read_failure(
+                "plain TLS second retry H2", ssl, got, saved_errno, response, response_len);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+    }
+    CHECK_EQ(h2_status_for_stream(response, response_len, 9), 403u);
+    CHECK(test_bytes_contain(reinterpret_cast<const char*>(response), response_len, "two", 3));
+    CHECK(test_bytes_contain(reinterpret_cast<const char*>(response), response_len, "deny", 4));
+    SSL_free(ssl);
+    close(fd);
+    SSL_CTX_free(client_ctx);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(listener);
+    destroy_tls_server_context(tls_ctx.value());
+    program.destroy();
+#endif
 }
 
 TEST(shard, downgrades_h2_client_when_server_offers_only_http11) {

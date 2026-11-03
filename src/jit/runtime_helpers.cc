@@ -10,6 +10,7 @@
 #include "rut/runtime/auth.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_base.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/http_parser.h"
@@ -132,6 +133,23 @@ void rut_helper_parse_unprime() {
 }
 
 // ── Request Access ─────────────────────────────────────────────────
+
+extern "C" void rut_helper_req_tls_client_cert_sha256(void* conn,
+                                                      u8* out_has,
+                                                      const char** out_ptr,
+                                                      u32* out_len) {
+    *out_has = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    if (conn == nullptr) return;
+    const auto* connection = static_cast<const ConnectionBase*>(conn);
+    if (!connection->tls_active || !connection->tls_handshake_complete ||
+        !connection->tls_client_cert_sha256_valid)
+        return;
+    *out_has = 1;
+    *out_ptr = connection->tls_client_cert_sha256;
+    *out_len = sizeof(connection->tls_client_cert_sha256);
+}
 
 void rut_helper_req_path(const u8* req_data, u32 req_len, const char** out_ptr, u32* out_len) {
     const ParseCache& pc = parse_cached(req_data, req_len);
@@ -2406,14 +2424,17 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
-    if (op > static_cast<u32>(json::Op::JwtHasGroup)) return;
+    if (op > static_cast<u32>(json::Op::Sha256HexValid)) return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
     json::Writer writer{bytes};
     Str view{};
     i64 scalar = 0;
     const auto operation = static_cast<json::Op>(op);
-    if (operation == json::Op::JwtHasScope) {
+    if (operation == json::Op::Sha256HexValid) {
+        scalar = rut_helper_sha256_hex_valid(a, a_len);
+        view = {"", 0};
+    } else if (operation == json::Op::JwtHasScope) {
         scalar = jwt_has_scope(document, {a, a_len}, {b, b_len}) ? 1 : 0;
         view = {"", 0};
     } else if (operation == json::Op::JwtHasGroup) {
@@ -2507,6 +2528,10 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = view.ptr;
     *out_len = view.len;
     *out_number = scalar;
+}
+
+extern "C" u8 rut_helper_sha256_hex_valid(const char* value, u32 len) {
+    return sha256_hex_format_valid(Str{value, len}) ? 1 : 0;
 }
 
 extern "C" void rut_helper_resp_body(

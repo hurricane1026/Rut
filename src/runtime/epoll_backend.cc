@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "epoll_tls_hooks.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/tls.h"
 
 #include <errno.h>
 #include <openssl/err.h>
@@ -46,7 +47,8 @@ EpollTlsHooks default_tls_hooks = {default_ssl_accept,
                                    default_ssl_read,
                                    default_ssl_write,
                                    default_ssl_get_error,
-                                   default_alpn_negotiated};
+                                   default_alpn_negotiated,
+                                   tls_capture_verified_client_fingerprint};
 
 const EpollTlsHooks* get_tls_hooks() {
     if (const EpollTlsHooks* hooks =
@@ -1131,6 +1133,23 @@ u32 EpollBackend::wait(
                         errno = 0;
                         i32 rc = get_tls_hooks()->ssl_accept(ssl);
                         if (rc == 1) {
+                            const auto kCapture = get_tls_hooks()->capture_client_fingerprint;
+                            if (!kCapture || !kCapture(ssl,
+                                                       conn.tls_client_cert_sha256,
+                                                       conn.tls_client_cert_sha256_valid)) {
+                                result = -EACCES;
+                                events[out] = {};
+                                events[out].conn_id = conn_id;
+                                events[out].type = recv_type;
+                                events[out].result = result;
+                                events[out].buf_id = 0;
+                                events[out].has_buf = 0;
+                                events[out].more = 0;
+                                events[out].aux = 0;
+                                events[out].upstream_episode = upstream_episode;
+                                out++;
+                                continue;
+                            }
                             conn.tls_handshake_complete = true;
                             // Fix the wire protocol from the ALPN result. Hook
                             // may be null in older test tables → keep Http11.
