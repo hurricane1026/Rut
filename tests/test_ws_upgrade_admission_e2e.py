@@ -85,7 +85,82 @@ def binary_exchange(client, peer):
     expect(client, (8, b"\x03\xe8", False))
 
 
-def binary_replacement_scenario(server, backend_kind):
+NESTED_JSON_HANDLER = r"""
+return websocket(ws) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let parent = json.get(document, "/payload") else { message.close(1008) }
+    guard let child = json.get(parent, "/name") else { message.close(1008) }
+    guard let text = json.string(child) else { message.close(1003) }
+    message.forward("[" + text + "]")
+}
+"""
+
+
+def nested_json_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"nested JSON projection: {actual=!r}, {expected=!r}")
+
+    payload = b'{"payload":{"name":"hello"}}'
+    first = bytearray(masked_frame(1, payload[:13]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, payload[13:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"[hello]", True))
+    client.sendall(masked_frame(2, b'{"payload":{"name":""}}') +
+                   masked_frame(1, b'{"payload":{"name":"x\\u0000\\u20ac"}}'))
+    expect(peer, (1, b"[]", True))
+    expect(peer, (1, b"[x\0\xe2\x82\xac]", True))
+    peer.sendall(bytes((0x02, 13)) + payload[:13] + b"\x8a\x01p" +
+                 bytes((0x80, len(payload) - 13)) + payload[13:])
+    expect(client, (10, b"p", False))
+    expect(client, (1, b"[hello]", False))
+    client.sendall(masked_frame(1, b'{"payload":{"name":false}}'))
+    expect(peer, (8, b"\x03\xeb", True))
+    expect(client, (8, b"\x03\xeb", False))
+
+
+DIRECT_JSON_HANDLER = r"""
+return websocket(ws) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let parent = json.get(document, "/payload") else { message.close(1008) }
+    guard let field = json.get(parent, "/enabled") else { message.close(1008) }
+    guard json.bool(field) == false || json.string(field) == "allow" || json.int(field) == -7 else {
+        message.close(1008)
+    }
+    message.forward()
+}
+"""
+
+
+def direct_json_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"direct JSON scalar guard: {actual=!r}, {expected=!r}")
+
+    payload = b'{"payload":{"enabled":false}}'
+    first = bytearray(masked_frame(1, payload[:14]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, payload[14:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, payload, True))
+    text = b'{"payload":{"enabled":"allow"}}'
+    integer = b'{"payload":{"enabled":-7}}'
+    client.sendall(masked_frame(2, text) + masked_frame(1, integer))
+    expect(peer, (2, text, True))
+    expect(peer, (1, integer, True))
+    peer.sendall(bytes((0x02, 14)) + payload[:14] + b"\x8a\x01p" +
+                 bytes((0x80, len(payload) - 14)) + payload[14:])
+    expect(client, (10, b"p", False))
+    expect(client, (2, payload, False))
+    client.sendall(masked_frame(1, b'{"payload":{"enabled":null}}'))
+    expect(peer, (8, b"\x03\xf0", True))
+    expect(client, (8, b"\x03\xf0", False))
+
+
+def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, exchange=binary_exchange):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-binary-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -95,7 +170,7 @@ def binary_replacement_scenario(server, backend_kind):
             route_file.write(
                 f'listen 127.0.0.1:0\n'
                 f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
-                'route GET "/ws" {\n' + BINARY_HANDLER + '}\n')
+                'route GET "/ws" {\n' + handler + '}\n')
         process, port, diagnostic = launch(server, path, backend_kind)
         if process is None:
             text = diagnostic.decode(errors="replace")
@@ -112,7 +187,7 @@ def binary_replacement_scenario(server, backend_kind):
                     peer.sendall(WS_RESPONSE_HEADERS)
                     if not recv_until(client, b"\r\n\r\n").startswith(b"HTTP/1.1 101"):
                         raise AssertionError("binary replacement handshake failed")
-                    binary_exchange(client, peer)
+                    exchange(client, peer)
         finally:
             process.terminate()
             try:
@@ -123,7 +198,8 @@ def binary_replacement_scenario(server, backend_kind):
     return "pass", ""
 
 
-def native_binary_source_removal_scenario(server, compiler, backend_kind):
+def native_binary_source_removal_scenario(server, compiler, backend_kind,
+                                         handler=BINARY_HANDLER, exchange=binary_exchange):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-native-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -133,7 +209,7 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind):
         with open(source, "w", encoding="utf-8") as route_file:
             route_file.write(
                 f'listen 127.0.0.1:0\nupstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
-                'route GET "/ws" { ' + BINARY_HANDLER + '}\n')
+                'route GET "/ws" { ' + handler + '}\n')
         emitted = subprocess.run([compiler, source, "2"], capture_output=True, check=True, timeout=30)
         with open(artifact, "wb") as artifact_file:
             artifact_file.write(emitted.stdout)
@@ -176,7 +252,7 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind):
                     peer.sendall(WS_RESPONSE_HEADERS)
                     if not recv_until(client, b"\r\n\r\n").startswith(b"HTTP/1.1 101"):
                         raise AssertionError("native artifact did not relay valid 101")
-                    binary_exchange(client, peer)
+                    exchange(client, peer)
         finally:
             process.terminate()
             try:
@@ -1021,6 +1097,28 @@ def main():
             print(f"SKIP {backend}: {details.strip()}")
         else:
             print(f"PASS {backend} native source-removed binary artifact")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, NESTED_JSON_HANDLER, nested_json_exchange)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, NESTED_JSON_HANDLER, nested_json_exchange)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} nested JSON projection native={native}")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, DIRECT_JSON_HANDLER, direct_json_exchange)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, DIRECT_JSON_HANDLER, direct_json_exchange)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} direct JSON scalar guards native={native}")
         status, details = subprotocol_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")

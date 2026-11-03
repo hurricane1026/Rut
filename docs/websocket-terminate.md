@@ -196,10 +196,67 @@ parse checks still run before an empty predicate can match.
 
 Aliases are compile-time paths into the immutable message: each reached check
 reparses the bounded payload and retains no JSON node or borrowed string view.
-Only `json.get(document, literalPointer)` and `json.string(unwrappedValue)` are
-supported in these handlers; nested `get`, general extraction, dynamic paths,
+A `json.get` source may be the document or an earlier guard-unwrapped selected
+JSON value. Further `get` calls use literal RFC 6901 pointers relative to that
+value; each selection requires its own guard. General extraction, dynamic paths,
 and dynamic predicate arguments remain unsupported. These bindings and
 predicates use the existing four-guard and 32-condition-node limits.
+
+For example, select a nested name in two steps and forward its decoded text:
+
+```swift
+guard let document = json.parse(message.text) else { message.close(1007) }
+guard let payload = json.get(document, "/payload") else { message.close(1008) }
+guard let field = json.get(payload, "/name") else { message.close(1008) }
+guard let name = json.string(field) else { message.close(1003) }
+message.forward("hello " + name)
+```
+
+Presence conditions such as `json.get(payload, "/name") != nil` use the same
+relative lookup, including mirrored comparisons and logical conditions. An empty
+pointer selects the source value itself, including JSON null. Escaped tokens,
+array indices and embedded NUL retain the ordinary pointer semantics; invalid
+pointers and missing children fail the reached guard. Decoded String, Bool, Int
+and other typed aliases cannot be used as JSON containers. The binding being
+declared is unavailable in its own failure branch.
+
+The compiler folds each selection chain into an immutable root-relative pointer,
+with at most 8192 combined decoded pointer bytes. Runtime callbacks still reparse
+the complete bounded message and retain no selected node or borrowed view between
+calls. The existing four source guards and 32 condition nodes remain the limit;
+no native format or handler ABI change is required.
+
+### Direct optional scalar comparisons
+
+`json.string(value)`, `json.bool(value)` and `json.int(value)` can appear directly
+in message guard comparisons. The argument must be a previously validated document
+or a guard-unwrapped selected Json value. Use `==` or `!=` with a literal of the
+matching type, or with `nil`; either operand order and the existing `!`, `&&`, `||`
+condition forms are supported. This avoids a separate typed-binding guard:
+
+```swift
+guard let document = json.parse(message.text) else { message.close(1007) }
+guard let payload = json.get(document, "/payload") else { message.close(1008) }
+guard let field = json.get(payload, "/enabled") else { message.close(1008) }
+guard json.bool(field) == false else { message.drop() }
+message.forward()
+```
+
+A failed extraction is nil. Thus `json.bool(field) == false` matches only a JSON
+Boolean false; JSON null and other kinds do not match. `json.bool(field) != false`
+also matches nil, as ordinary optional inequality does. `json.string(field) != nil`
+checks the JSON kind without retaining a decoded string. `json.int(field) == 42`
+compares only exact signed 64-bit integer tokens; fractional/exponent forms and
+overflow yield nil. Earlier parse and field-presence guards still run first.
+
+String literals use the same escape decoding and byte comparisons as typed
+string aliases. Integer literals must fit signed i64. Calls cannot be compared to
+other calls, variables, or mismatched literals, and direct optional integer
+ordering (`<`, `<=`, `>`, `>=`) remains unsupported. Unwrap an Int alias for
+ordering, or a String alias for string predicates and forwarding. Bare optional
+Bool calls and `!json.bool(value)` are rejected. All direct comparisons reuse
+existing guard accessors, condition-node limits, runtime workspaces and native
+helper symbols; they do not materialize values or change the native format.
 
 A successfully unwrapped string alias may also be the sole dynamic source of a
 `message.forward(...)` replacement, with fixed UTF-8 literals or route constants

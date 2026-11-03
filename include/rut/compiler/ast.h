@@ -223,6 +223,8 @@ struct AstExpr {
     AstExprKind kind = AstExprKind::BoolLit;
     Span span{};
     bool bool_value = false;
+    // Distinguish logical negation from Optional<Bool> equality with false.
+    bool is_synthesized_negation = false;
     i64 int_value = 0;
     Str str_value{};
     Str msg{};

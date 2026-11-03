@@ -2687,7 +2687,7 @@ combined fixed-byte limit, and expression-node limits as literal leaves. The
 expression contains at most 32 nodes (literals or constant references, `+`, and
 at most one dynamic source): either `message.text` or one previously guard-unwrapped
 `json.string` alias. Parentheses preserve concatenation order. The JSON alias may
-come from the root document or one `json.get` selection; document, selected-value,
+come from the root document or guard-unwrapped `json.get` selections; document, selected-value,
 kind-name, bool, integer, and count aliases are not output strings. A binding is
 visible only after its guard succeeds, including in later guard else branches;
 the binding being declared is unavailable in its own else branch. Constant
@@ -2698,6 +2698,34 @@ recipe can select a valid JSON string from Text or Binary input and emits Text.
 Empty values, embedded NUL, and Unicode are preserved without normalization.
 The final payload, including both affixes, must fit both bounds; overflow fails
 before a rewritten frame is emitted.
+
+`json.get` in a message guard accepts either a validated document or an earlier
+unwrapped selected Json value. A literal RFC 6901 pointer is relative to that
+source, including the empty pointer selecting the source itself. Binding and
+presence-check forms share this behavior. Chained selections are folded at compile
+time into retained root-relative pointer bytes, preserving escaped tokens, NUL,
+array index rules and invalid-pointer failures. The combined pointer is capped at
+8192 bytes, and each binding still counts against the existing four-guard limit.
+Each reached check reparses the bounded full message; no node or borrowed view is
+retained across callbacks. Typed scalar aliases are not Json containers, and the
+new binding remains unavailable in its own failure branch. Native layout and the
+handler ABI are unchanged. See the nested example in
+[terminate mode](docs/websocket-terminate.md).
+
+Direct optional extraction comparisons are also supported in message guards:
+`json.string(value) == "subscribe"`, `json.bool(value) == false`, and
+`json.int(value) == 42`, with `!=`, either operand order, nil comparisons, and
+logical condition composition. Sources are existing validated document or selected
+Json aliases. These leaves reuse the corresponding typed guard accessors and
+retained paths; they consume no separate typed-binding guard. A failed extraction
+is nil, so equality with false requires an actual Boolean false, while inequality
+with false includes nil. Exact signed i64 integer rules, string decoding, parser
+bounds, and earlier parse/presence guard failures are unchanged. The AST records
+parser-generated negation separately from explicit equality with false, preserving
+Optional Bool semantics and rejecting bare optional Bool negation. Direct integer
+ordering, mismatched literal types, call-to-call comparisons and optional method
+calls remain unsupported. Existing alias bindings are still needed for scalar
+ordering, string predicates and rewrites. Native format and helper ABI are unchanged.
 
 `json.numberText(documentOrField)` is a separate typed alias for one JSON Number.
 It exposes the original decimal lexeme as text, preserving negative zero, decimal
@@ -2827,8 +2855,9 @@ JSON string bytes exactly, with no Unicode normalization. Empty prefix, suffix,
 and contains literals match any valid string; parsing, field presence, and string
 type checks still happen first. These path aliases are compile-time metadata:
 every reached check reparses the full bounded message and retains no document
-node or borrowed string. Direct optional `json.get` values, nested `get`, strings
-used as Json, documents used as strings without `json.string`, dynamic paths,
+node or borrowed string. Nested `get` accepts an earlier guard-unwrapped Json
+selection. Direct optional `json.get` values, strings used as Json, documents
+used as strings without `json.string`, dynamic paths,
 dynamic predicate arguments, and general value extraction are rejected. This
 uses the existing four-guard and 32-condition-node limits.
 

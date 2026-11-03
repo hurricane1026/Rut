@@ -1368,6 +1368,7 @@ struct Parser {
         if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
         AstExpr expr{};
         expr.kind = AstExprKind::Eq;
+        expr.is_synthesized_negation = true;
         expr.lhs = lhs_ptr.value();
         expr.rhs = rhs_ptr.value();
         expr.span = operand.span;

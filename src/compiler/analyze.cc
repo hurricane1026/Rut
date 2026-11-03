@@ -7300,6 +7300,42 @@ static const WsJsonBinding* ws_json_binding(const WsJsonBindings& bindings, Str 
     return nullptr;
 }
 
+static const WsJsonBinding* ws_json_scalar_source(const AstExpr& call,
+                                                  const WsJsonBindings& bindings) {
+    if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
+        !call.lhs->name.eq(lit_str("json")) || call.args.len != 1 || !call.args[0] ||
+        call.args[0]->kind != AstExprKind::Ident ||
+        (!call.name.eq(lit_str("string")) && !call.name.eq(lit_str("bool")) &&
+         !call.name.eq(lit_str("int"))))
+        return nullptr;
+    const WsJsonBinding* source = ws_json_binding(bindings, call.args[0]->name);
+    return source && (source->kind == WsJsonBinding::Kind::Document ||
+                      source->kind == WsJsonBinding::Kind::SelectedValue)
+               ? source
+               : nullptr;
+}
+
+// Resolve relative RFC 6901 paths at compile time. Earlier guards prove the
+// source exists; callbacks keep using one root-relative path and retain no nodes.
+static FrontendResult<Str> ws_json_get_path(const WsJsonBinding& source,
+                                            const AstExpr& pointer,
+                                            const HirModule& mod) {
+    auto path = decoded_expression_string(pointer.str_value, mod, pointer.span);
+    if (!path) return core::make_unexpected(path.error());
+    if (source.path.len > json::kMaxBytes || path->len > json::kMaxBytes - source.path.len)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              pointer.span,
+                              lit_str("combined message JSON pointer exceeds 8192 bytes"));
+    if (source.path.len == 0) return path.value();
+    if (path->len == 0) return source.path;
+    // An invalid relative pointer must still fail at runtime, rather than
+    // accidentally naming a sibling when appended to a valid source path.
+    if (path->ptr[0] != '/') return path.value();
+    std::string combined(source.path.ptr, source.path.len);
+    combined.append(path->ptr, path->len);
+    return intern_analysis_string(mod, std::move(combined));
+}
+
 // Flatten bounded String concatenation around at most one message.text reference.
 // No arbitrary expression evaluation or message-time allocation is needed.
 static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
@@ -7535,6 +7571,47 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
                                                              const HirModule& mod,
                                                              const HirRoute& route,
                                                              const WsJsonBindings& documents) {
+    // Optional scalar equality: a failed extraction is nil. Negated equality
+    // therefore succeeds for a wrong JSON kind, unlike a prior typed binding.
+    if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
+        const AstExpr* call = cond.lhs;
+        const AstExpr* literal = cond.rhs;
+        const WsJsonBinding* source = ws_json_scalar_source(*call, documents);
+        if (!source) {
+            call = cond.rhs;
+            literal = cond.lhs;
+            source = ws_json_scalar_source(*call, documents);
+        }
+        if (source) {
+            const bool kString = call->name.eq(lit_str("string"));
+            const bool kBool = call->name.eq(lit_str("bool"));
+            WsLenGuard g{};
+            g.pattern = source->path;
+            g.negate = negate;
+            g.verdict = verdict;
+            if (literal->kind == AstExprKind::Nil) {
+                g.accessor = kString ? WsLenGuard::Accessor::JsonStringValid
+                             : kBool ? WsLenGuard::Accessor::JsonBoolValid
+                                     : WsLenGuard::Accessor::JsonIntValid;
+                g.negate = !negate;
+            } else if (kString && literal->kind == AstExprKind::StrLit) {
+                auto decoded = decoded_expression_string(literal->str_value, mod, literal->span);
+                if (!decoded) return core::make_unexpected(decoded.error());
+                g.accessor = WsLenGuard::Accessor::JsonStringEqual;
+                g.value = decoded.value();
+            } else if (kBool && literal->kind == AstExprKind::BoolLit) {
+                g.accessor = WsLenGuard::Accessor::JsonBoolEqual;
+                g.bound = literal->bool_value ? 1u : 0u;
+            } else if (!kString && !kBool && literal->kind == AstExprKind::IntLit) {
+                g.accessor = WsLenGuard::Accessor::JsonIntCompare;
+                g.cmp = WsLenGuard::Cmp::Eq;
+                g.int_bound = literal->int_value;
+            } else {
+                return frontend_error(FrontendError::UnsupportedSyntax, literal->span);
+            }
+            return g;
+        }
+    }
     // Integer aliases compare only with literal operands; their scalar value is never stored.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
         const AstExpr* alias = nullptr;
@@ -7617,9 +7694,9 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
             call->args[1] && call->args[0]->kind == AstExprKind::Ident &&
             call->args[1]->kind == AstExprKind::StrLit) {
             const WsJsonBinding* document = ws_json_binding(documents, call->args[0]->name);
-            if (document && document->kind == WsJsonBinding::Kind::Document) {
-                auto path =
-                    decoded_expression_string(call->args[1]->str_value, mod, call->args[1]->span);
+            if (document && (document->kind == WsJsonBinding::Kind::Document ||
+                             document->kind == WsJsonBinding::Kind::SelectedValue)) {
+                auto path = ws_json_get_path(*document, *call->args[1], mod);
                 if (!path) return core::make_unexpected(path.error());
                 WsLenGuard g{};
                 g.accessor = WsLenGuard::Accessor::JsonHasPath;
@@ -7881,8 +7958,13 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
     if (depth >= HirWsHandler::kMaxConditionNodes)
         return frontend_error(FrontendError::TooManyItems, cond.span);
     // The ordinary parser desugars !x, !=, <= and >= to (predicate == false).
+    // Explicit Optional<Bool> == false is an equality, not a logical negation:
+    // a non-Bool JSON value must fail it, and !Optional<Bool> stays unsupported.
+    const bool kOptionalBoolEquality = cond.lhs && cond.lhs->name.eq(lit_str("bool")) &&
+                                       ws_json_scalar_source(*cond.lhs, documents) &&
+                                       !cond.is_synthesized_negation;
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs &&
-        cond.rhs->kind == AstExprKind::BoolLit && !cond.rhs->bool_value) {
+        cond.rhs->kind == AstExprKind::BoolLit && !cond.rhs->bool_value && !kOptionalBoolEquality) {
         return analyze_message_condition(
             *cond.lhs, verdict, route, mod, documents, is_operand, !negate, depth + 1);
     }
@@ -13880,13 +13962,13 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                gs->expr.args[1]->kind == AstExprKind::StrLit) {
                         const WsJsonBinding* source =
                             ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || source->kind != WsJsonBinding::Kind::Document)
+                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
+                                        source->kind != WsJsonBinding::Kind::SelectedValue))
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   gs->span,
                                                   lit_str("json.get message bindings require a "
-                                                          "validated document alias"));
-                        auto path = decoded_expression_string(
-                            gs->expr.args[1]->str_value, mod, gs->expr.args[1]->span);
+                                                          "validated JSON value alias"));
+                        auto path = ws_json_get_path(*source, *gs->expr.args[1], mod);
                         if (!path) return core::make_unexpected(path.error());
                         node.accessor = WsLenGuard::Accessor::JsonHasPath;
                         node.pattern = path.value();
