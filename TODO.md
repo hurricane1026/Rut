@@ -790,7 +790,9 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   generation tokens, backpressure, cancellation and shutdown cleanup.
 - [x] Native completion FD and request deadline/cancel adapter, with idle FD
   wakeup, exact-deadline rejection, reset/reuse and descriptor lifecycle tests.
-- [ ] Gateway FD/timer registration, handler suspension/resumption, close hooks
-  and reload ownership before exposing verification to Rut/JIT/native programs.
+- [x] Optional native HTTP/1 gateway bridge using existing timer-yield resume,
+  connection/request generation fencing and shared terminal/close cancellation.
+- [ ] Rut/JIT/native-artifact exposure, HTTP/2 and automatic application worker
+  configuration/lifecycle; direct FD integration if needed beyond timer polling.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
   rate limits, rehash migration and session/JWT login composition.

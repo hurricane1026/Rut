@@ -62,6 +62,8 @@ public:
     // function-template thread_local) prevents unrelated loop instances on one
     // thread from sharing bucket state.
     RateLimiter rate_limiter{};
+    // Optional native HTTP/1 service; owner outlives run and all connections.
+    PasswordGateway* password_gateway = nullptr;
     // Set once after the kernel listener has been bound and before shard
     // threads accept connections. It is copied into each allocated connection.
     ListenerContext listener_context{};
@@ -75,6 +77,7 @@ public:
         return self().submit_connect_impl(c, addr, addr_len);
     }
     void close_conn(Connection& c) {
+        if (password_gateway) password_gateway->cancel(c.id);
         c.release_backend_active();
         if (c.on_close) {
             auto cleanup = c.on_close;
@@ -84,7 +87,10 @@ public:
         self().close_conn_impl(c);
     }
     Connection* alloc_conn() { return self().alloc_conn_impl(); }
-    void free_conn(Connection& c) { self().free_conn_impl(c); }
+    void free_conn(Connection& c) {
+        if (password_gateway) password_gateway->cancel(c.id);
+        self().free_conn_impl(c);
+    }
 
     // Lazily attach a pooled HTTP/2 engine to a connection (idempotent).
     // Returns false if the per-shard h2 pool is exhausted.

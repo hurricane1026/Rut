@@ -129,6 +129,7 @@ add_library(rut_runtime STATIC
     runtime/hash.cc
     runtime/password.cc
     runtime/password_worker.cc
+    runtime/password_gateway.cc
     runtime/auth.cc
     runtime/webhook.cc
     runtime/signed_request.cc

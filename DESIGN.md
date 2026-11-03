@@ -9343,3 +9343,18 @@ notifications before polling adapters; worker stop joins before closing pipe
 ends. No connection/request pointers cross threads. Rut/JIT integration still
 needs gateway FD/timer registration, request suspension/resumption and
 reload-safe worker ownership. See the auth ledger for exact lifecycle and limits.
+
+### Optional native HTTP/1 password bridge
+
+A caller-owned `PasswordGateway` may be bound to the shared loop before run.
+Trusted native handlers use `verify_password_for_request` under an invocation-
+local binding and yield the existing Timer kind while Pending (at most 10 ms,
+clamped to the original deadline). Worker entries use connection ID plus handler
+generation and copied input. Non-Timer terminal dispatch, timer scheduling
+failure, new request generation and the CRTP close path cancel abandoned work.
+POD TLS bindings are saved/restored across nested handler calls; no connection
+layout or packed handler ABI changes. Service ownership is independent of RCU
+configuration lifetime and remains with the loop's caller. This profile handles
+native HTTP/1 handlers only; compiler/loader exposure, HTTP/2 and automatic CLI
+configuration are still pending. See the auth coverage ledger for the lifecycle
+contract and disconnect-observation limits.

@@ -277,6 +277,12 @@ inline void build_probe_request(Connection& conn, const UpstreamTarget& target, 
 }
 
 template <typename Loop>
+PasswordGateway* request_password_gateway(Loop* loop) {
+    if constexpr (requires { loop->password_gateway; }) return loop->password_gateway;
+    return nullptr;
+}
+
+template <typename Loop>
 void free_probe_conn(Loop* loop, Connection& conn) {
     // Minimal teardown — close the probe socket (EPOLL_CTL_DEL first) and return
     // the slot. Never touches metrics/epoch/access-log/keepalive (the probe is
@@ -2777,6 +2783,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // Tag the request with a fresh generation so the yield-heap stale
     // filter can reliably reject entries left by a close+reuse even if
     // the new request's req_start_us lands in the same microsecond.
+    if (auto* passwords = request_password_gateway(loop)) passwords->cancel(conn.id);
     conn.handler_gen++;
     // A depth-1 successor with no bytes behind it keeps the dedicated
     // generation-token path. A successor the token path cannot carry -- one
@@ -3392,7 +3399,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                           *ctx,
                                           conn.recv_buf.data(),
                                           jit_request_len,
-                                          /*arena=*/nullptr);
+                                          /*arena=*/nullptr,
+                                          request_password_gateway(loop));
         handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive, route);
     } else {
         conn.resp_status = kStatusOK;
@@ -3472,7 +3480,8 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                                       *ctx,
                                       conn.recv_buf.data(),
                                       conn.recv_buf.len(),
-                                      /*arena=*/nullptr);
+                                      /*arena=*/nullptr,
+                                      request_password_gateway(loop));
     handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, conn.keep_alive);
 }
 
@@ -4065,6 +4074,9 @@ void handle_jit_outcome(Loop* loop,
                         jit::HandlerFn fn,
                         bool keep_alive,
                         const RouteEntry* selected_route) {
+    if (outcome.kind != JitDispatchOutcome::Kind::TimerYield) {
+        if (auto* passwords = request_password_gateway(loop)) passwords->cancel(conn.id);
+    }
     if (selected_route != nullptr &&
         selected_route->forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection) {
         const RouteConfig* config = conn.request_config;
@@ -4325,6 +4337,7 @@ void handle_jit_outcome(Loop* loop,
             conn.pending_yield_kind = jit::YieldKind::Timer;
             conn.transition_to_exec_handler_wait();
             if (loop->schedule_yield_timer(conn, outcome.timer_ms)) return;
+            if (auto* passwords = request_password_gateway(loop)) passwords->cancel(conn.id);
             // Couldn't schedule faithfully (SQ / heap catastrophically
             // pressured AND wait too long for the wheel fallback). Fail
             // the request rather than resume early and silently violate
@@ -5616,7 +5629,8 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
                                       *ctx,
                                       conn.recv_buf.data(),
                                       conn.recv_buf.len(),
-                                      /*arena=*/nullptr);
+                                      /*arena=*/nullptr,
+                                      request_password_gateway(loop));
     handle_jit_outcome<Loop>(loop, conn, outcome, fn, conn.keep_alive);
 }
 

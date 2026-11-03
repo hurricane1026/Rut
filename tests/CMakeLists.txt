@@ -433,6 +433,7 @@ set_tests_properties(test_exact_path_view PROPERTIES LABELS "unit")
 
 add_executable(test_network
     test_network.cc
+    test_password_gateway.cc
 )
 target_link_libraries(test_network rut_test_fault rut_runtime)
 target_include_directories(test_network PRIVATE
