@@ -64,7 +64,34 @@ An imported helper works through the normal import namespace. HTTP reads and
 response effects cannot run inside a message predicate. The borrowed message
 has no storage carrier outside its synchronous callback, and comparing entire
 messages is rejected. Callback-local bindings, parameter renaming, general
-arithmetic, domain enums and close-event values are not part of this step.
+arithmetic and close-event values remain subsequent work.
+
+`message.kind` has type `WebSocketMessageKind`, whose cases are
+`WebSocketMessageKind.text` and `WebSocketMessageKind.binary`. `message.direction`
+has type `WebSocketDirection`, with cases `WebSocketDirection.clientToUpstream`
+and `WebSocketDirection.upstreamToClient`. Both types support equality and
+generic `Eq`, including comparisons in either operand order. They cannot be
+mixed with one another, ordered, or implicitly converted to Bool, integers or
+strings. Case references currently use the fully qualified names above.
+Neither type exposes wire opcodes or control-frame cases. The existing Boolean
+properties retain their behavior.
+
+These are ordinary types for helper signatures and HTTP-local values, rather
+than selectors recognized only in a message guard:
+
+```swift
+func isTextKind(_ kind: WebSocketMessageKind) -> bool =>
+    kind == WebSocketMessageKind.text
+func fromClient(_ direction: WebSocketDirection) -> bool =>
+    direction == WebSocketDirection.clientToUpstream
+// Within the message callback:
+// guard !fromClient(message.direction) || isTextKind(message.kind) else { message.drop() }
+```
+
+The domains carry case identity; they do not borrow payload memory. A generic
+identity helper can also return the borrowed `WebSocketMessage` within the same
+synchronous callback. Closed-case exhaustive matching and contextual `.case`
+inference are not introduced by these typed equality projections.
 
 After the route's HTTP guards pass, terminate mode validates the opening request
 before connecting to the selected upstream. The supported request shape is GET

@@ -247,6 +247,9 @@ enum class HirExprKind : u8 {
     // A projection from a callback-scoped WebSocketMessage. lhs retains the
     // typed receiver through ordinary helper inlining; str_value names the field.
     WsMessageField,
+    // Built-in closed protocol enum. int_value is its language case index,
+    // independent of the WebSocket wire opcode.
+    ConstWsCase,
 };
 
 enum class HirTypeKind : u8 {
@@ -281,7 +284,13 @@ enum class HirTypeKind : u8 {
     // Borrowed complete Text/Binary message; only message callbacks supply values.
     // It has no HTTP/MIR storage representation and cannot outlive the callback.
     WebSocketMessage,
+    WebSocketMessageKind,
+    WebSocketDirection,
 };
+
+constexpr bool is_ws_enum_type(HirTypeKind type) {
+    return type == HirTypeKind::WebSocketMessageKind || type == HirTypeKind::WebSocketDirection;
+}
 
 inline constexpr u32 kMaxTupleSlots = 10;
 

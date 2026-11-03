@@ -6127,6 +6127,91 @@ TEST(serve_loader, websocket_typed_boolean_comparisons_and_constants) {
     }
 }
 
+TEST(serve_loader, websocket_domain_types_share_predicates_with_dynamic_http_values) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func identity<T>(_ value: T) -> T => value
+func isText(_ kind: WebSocketMessageKind) -> bool => same(kind, WebSocketMessageKind.text)
+func fromClient(_ direction: WebSocketDirection) -> bool =>
+    same(direction, WebSocketDirection.clientToUpstream)
+func classify(_ path: str) -> WebSocketMessageKind {
+    if path == "/text" { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+route GET "/http" {
+    let kind = classify(req.path)
+    guard isText(kind) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(backend) { message in
+    guard !fromClient(message.direction) || isText(identity(message).kind) else { message.drop() }
+    guard same(message.kind, message.kind) else { message.close() }
+    message.forward()
+} })rut";
+    auto path = write_file("/tmp/rut_ws_domain_types", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 2u);
+    const auto http = program.config.routes[0].fn;
+    const auto message = program.config.routes[1].ws_frame_handler;
+    REQUIRE(http);
+    REQUIRE(message);
+    const char* requests[] = {"GET /text HTTP/1.1\r\nHost: test\r\n\r\n",
+                              "GET /binary HTTP/1.1\r\nHost: test\r\n\r\n"};
+    for (u32 i = 0; i < 2; ++i) {
+        const auto result =
+            jit::HandlerResult::unpack(http(nullptr,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(requests[i]),
+                                            static_cast<u32>(strlen(requests[i])),
+                                            nullptr));
+        CHECK_EQ(result.status_code, i == 0 ? 200u : 403u);
+    }
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            CHECK(message(nullptr, op, reinterpret_cast<const u8*>("\0"), 1, client) ==
+                  (!client || op == WsOpcode::Text ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+    }
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_domain_types_compare_cases_in_both_operand_orders) {
+    const char* conditions[] = {"message.kind == WebSocketMessageKind.text",
+                                "WebSocketMessageKind.binary != message.kind",
+                                "message.direction == WebSocketDirection.clientToUpstream",
+                                "WebSocketDirection.upstreamToClient == message.direction",
+                                "message.kind == message.kind",
+                                "message.direction != message.direction",
+                                "WebSocketMessageKind.text != WebSocketMessageKind.binary",
+                                "WebSocketDirection.clientToUpstream == "
+                                "WebSocketDirection.upstreamToClient"};
+    for (u32 i = 0; i < 8; ++i) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+            "websocket(backend) { message in guard ";
+        source += conditions[i];
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_domain_cases", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                const bool pass = i < 2    ? op == WsOpcode::Text
+                                  : i == 2 ? client
+                                  : i == 3 ? !client
+                                           : i == 4 || i == 6;
+                CHECK(handler(nullptr, op, nullptr, 0, client) ==
+                      (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+        program.destroy();
+    }
+}
+
 TEST(serve_loader, websocket_json_root_kind_and_count_compose_within_guard_limit) {
     const char* source = R"rut(upstream backend at "127.0.0.1:9999"
 route GET "/ws" { return websocket(backend) { message in

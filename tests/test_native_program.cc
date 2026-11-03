@@ -1753,6 +1753,53 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, websocket_domain_types_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func isText(_ kind: WebSocketMessageKind) -> bool => same(kind, WebSocketMessageKind.text)
+func fromClient(_ direction: WebSocketDirection) -> bool =>
+    same(direction, WebSocketDirection.clientToUpstream)
+func classify(_ path: str) -> WebSocketMessageKind {
+    if path == "/text" { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+route GET "/http" {
+    let kind = classify(req.path)
+    guard isText(kind) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(backend) { message in
+    guard !fromClient(message.direction) || isText(message.kind) else { message.drop() }
+    message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    const char* requests[] = {"GET /text HTTP/1.1\r\nHost: test\r\n\r\n",
+                              "GET /binary HTTP/1.1\r\nHost: test\r\n\r\n"};
+    const auto http = owner.p->config.routes[0].fn;
+    REQUIRE(http);
+    for (u32 i = 0; i < 2; ++i) {
+        const auto result =
+            jit::HandlerResult::unpack(http(nullptr,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(requests[i]),
+                                            static_cast<u32>(strlen(requests[i])),
+                                            nullptr));
+        CHECK_EQ(result.status_code, i == 0 ? 200u : 403u);
+    }
+    const auto handler = owner.p->config.routes[1].ws_frame_handler;
+    REQUIRE(handler);
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            CHECK(handler(nullptr, op, nullptr, 0, client) ==
+                  (!client || op == WsOpcode::Text ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+    }
+}
+
 TEST(native_program, websocket_message_type_guards_survive_compiler_exit) {
     Source source;
     REQUIRE(

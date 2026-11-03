@@ -860,6 +860,12 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // by this callback, never constructed or stored as an HTTP/connection value.
 // Fields: fromClient/isText/isBinary: bool, len: i32 (payload bytes), text: str
 // (borrowed raw bytes, also available for Binary messages).
+// kind: WebSocketMessageKind (.text / .binary); direction: WebSocketDirection
+// (.clientToUpstream / .upstreamToClient). Spell cases with their full type name:
+// message.kind == WebSocketMessageKind.text. Both types support ==/!= and Eq
+// helpers, with no integer/string/Bool coercion or ordering. They also work as
+// ordinary helper parameters, return values and HTTP locals. They expose no
+// control-frame cases. Existing fromClient/isText/isBinary remain conveniences.
 // Pure helpers may accept the message or its scalar fields. Their inlined
 // predicates support these fields, bool literals/equality (either order),
 // Boolean composition, len/literal comparisons, text/literal equality and
@@ -870,6 +876,8 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 func allowedMessage(_ msg: WebSocketMessage) -> bool =>
     !msg.fromClient || (msg.isText == true && msg.len <= 2048)
 // Inside the callback: guard allowedMessage(message) else { message.drop() }
+func isTextKind(_ kind: WebSocketMessageKind) -> bool => kind == WebSocketMessageKind.text
+// Inside the callback: guard isTextKind(message.kind) else { message.drop() }
 // A terminate route can run up to eight existing top-level HTTP guards before
 // websocket. These request reads and static failure responses run in the
 // ordinary JIT handler before it connects to the WebSocket upstream. A

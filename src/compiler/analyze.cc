@@ -5,6 +5,7 @@
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
 #include "rut/compiler/ast.h"
+#include "rut/compiler/hir.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/es256_policy.h"
@@ -413,6 +414,8 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::Generic:
         case HirTypeKind::Unknown:
         case HirTypeKind::WebSocketMessage:
+        case HirTypeKind::WebSocketMessageKind:
+        case HirTypeKind::WebSocketDirection:
             return true;
         case HirTypeKind::Struct:
             return struct_index != 0xffffffffu;
@@ -505,7 +508,8 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.is_concrete =
         type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::I64 ||
         type == HirTypeKind::Str || type == HirTypeKind::Json || type == HirTypeKind::Method ||
-        type == HirTypeKind::ByteSize || type == HirTypeKind::IP || type == HirTypeKind::Response;
+        type == HirTypeKind::ByteSize || type == HirTypeKind::IP || type == HirTypeKind::Response ||
+        type == HirTypeKind::WebSocketMessage || is_ws_enum_type(type);
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -719,6 +723,8 @@ static bool hir_type_shape_satisfies_eq_constraint(const HirModule& mod,
         case HirTypeKind::I64:
         case HirTypeKind::Str:
         case HirTypeKind::Method:
+        case HirTypeKind::WebSocketMessageKind:
+        case HirTypeKind::WebSocketDirection:
         case HirTypeKind::ByteSize:
         case HirTypeKind::IP:
             return true;
@@ -2139,6 +2145,8 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
 #if RUT_ENABLE_WEBSOCKET
     if (name.eq(lit_str("WebSocketMessage"))) return HirTypeKind::WebSocketMessage;
+    if (name.eq(lit_str("WebSocketMessageKind"))) return HirTypeKind::WebSocketMessageKind;
+    if (name.eq(lit_str("WebSocketDirection"))) return HirTypeKind::WebSocketDirection;
 #endif
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
@@ -8059,6 +8067,44 @@ static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
     const auto kChild = [&](const HirExpr& value, bool invert = false) {
         return lower_ws_typed_condition(value, verdict, handler, true, invert, depth + 1);
     };
+    ConstValue known{};
+    if (const_eval_expr(expr, nullptr, 0, &known, 0) && known.type == HirTypeKind::Bool) {
+        node.accessor = WsLenGuard::Accessor::Constant;
+        node.bound = known.bool_value ? 1u : 0u;
+        return kAppend(node);
+    }
+    if (expr.kind == HirExprKind::Eq && expr.lhs && expr.rhs && is_ws_enum_type(expr.lhs->type) &&
+        expr.lhs->type == expr.rhs->type) {
+        // Both closed types have two cases. Compare their first-case predicates
+        // without exposing the wire opcode or coercing either type to an integer.
+        const auto kOperand = [&](const HirExpr& value) -> FrontendResult<u32> {
+            WsLenGuard operand{};
+            operand.is_operand = true;
+            operand.cmp = WsLenGuard::Cmp::Eq;
+            if (value.kind == HirExprKind::ConstWsCase && value.int_value >= 0 &&
+                value.int_value <= 1) {
+                operand.accessor = WsLenGuard::Accessor::Constant;
+                operand.bound = value.int_value == 0 ? 1u : 0u;
+            } else if (ws_typed_field(value, lit_str("kind"))) {
+                operand.accessor = WsLenGuard::Accessor::Opcode;
+                operand.bound = 1;
+            } else if (ws_typed_field(value, lit_str("direction"))) {
+                operand.accessor = WsLenGuard::Accessor::FromClient;
+                operand.bound = 1;
+            } else {
+                return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+            }
+            return kAppend(operand);
+        };
+        auto lhs = kOperand(*expr.lhs);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = kOperand(*expr.rhs);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        node.accessor = WsLenGuard::Accessor::BoolEqual;
+        node.lhs = lhs.value();
+        node.rhs = rhs.value();
+        return kAppend(node);
+    }
     // Ordinary Boolean equality, including mirrored and nested comparisons.
     if (expr.kind == HirExprKind::Eq && expr.lhs && expr.rhs &&
         expr.lhs->type == HirTypeKind::Bool && expr.rhs->type == HirTypeKind::Bool) {
@@ -8834,6 +8880,24 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                   lit_str("route has no such capture in req.params"));
         }
         if (expr.lhs->kind == AstExprKind::Ident) {
+#if RUT_ENABLE_WEBSOCKET
+            if (!user_bound_ident_name(mod, locals, local_count, binding, expr.lhs->name) &&
+                (expr.lhs->name.eq(lit_str("WebSocketMessageKind")) ||
+                 expr.lhs->name.eq(lit_str("WebSocketDirection")))) {
+                const bool kKind = expr.lhs->name.eq(lit_str("WebSocketMessageKind"));
+                const bool kFirst =
+                    expr.name.eq(kKind ? lit_str("text") : lit_str("clientToUpstream"));
+                const bool kSecond =
+                    expr.name.eq(kKind ? lit_str("binary") : lit_str("upstreamToClient"));
+                if (!kFirst && !kSecond)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+                out.kind = HirExprKind::ConstWsCase;
+                out.type =
+                    kKind ? HirTypeKind::WebSocketMessageKind : HirTypeKind::WebSocketDirection;
+                out.int_value = kFirst ? 0 : 1;
+                return out;
+            }
+#endif
             const u32 variant_index = [&]() {
                 for (u32 i = 0; i < mod.variants.len; i++) {
                     if (mod.variants[i].name.eq(expr.lhs->name)) return i;
@@ -8872,6 +8936,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.type = HirTypeKind::I32;
             else if (expr.name.eq(lit_str("text")))
                 out.type = HirTypeKind::Str;
+            else if (expr.name.eq(lit_str("kind")))
+                out.type = HirTypeKind::WebSocketMessageKind;
+            else if (expr.name.eq(lit_str("direction")))
+                out.type = HirTypeKind::WebSocketDirection;
             else
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             out.kind = HirExprKind::WsMessageField;
@@ -12764,6 +12832,11 @@ static bool const_eval_expr(
         out->int_value = expr.int_value;
         return true;
     }
+    if (expr.kind == HirExprKind::ConstWsCase) {
+        out->type = expr.type;
+        out->int_value = expr.int_value;
+        return true;
+    }
     if (expr.kind == HirExprKind::VariantCase) {
         out->type = HirTypeKind::Variant;
         out->variant_index = expr.variant_index;
@@ -12833,7 +12906,7 @@ static bool const_eval_expr(
                 return true;
             }
             if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::I64 ||
-                lhs.type == HirTypeKind::Method) {
+                lhs.type == HirTypeKind::Method || is_ws_enum_type(lhs.type)) {
                 out->bool_value = lhs.int_value == rhs.int_value;
                 return true;
             }

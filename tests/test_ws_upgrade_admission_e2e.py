@@ -212,6 +212,35 @@ return websocket(ws) { message in
 }
 """
 
+DOMAIN_MESSAGE_DECLARATIONS = r"""
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func accepted(_ text: str) -> bool => text.matches(re"o.k")
+func isText(_ kind: WebSocketMessageKind) -> bool => same(kind, WebSocketMessageKind.text)
+func fromClient(_ direction: WebSocketDirection) -> bool =>
+    same(direction, WebSocketDirection.clientToUpstream)
+func allowed(_ msg: WebSocketMessage) -> bool =>
+    !fromClient(msg.direction) || (isText(msg.kind) && msg.len <= 3 && accepted(msg.text))
+func classify(_ kind: str) -> WebSocketMessageKind {
+    if kind == "text" { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+route GET "/domain" {
+    let kind = classify(req.header("X-Kind").or(""))
+    guard isText(kind) else { return 403 }
+    return 200
+}
+"""
+
+
+def domain_message_exchange(client, peer):
+    for kind, status in ((b"text", b"200"), (b"binary", b"403")):
+        with socket.create_connection(client.getpeername(), timeout=3) as http:
+            http.sendall(b"GET /domain HTTP/1.1\r\nHost: test\r\nConnection: close\r\nX-Kind: " +
+                         kind + b"\r\n\r\n")
+            response = recv_http_response(http)
+            if not response.startswith(b"HTTP/1.1 " + status):
+                raise AssertionError(f"domain enum in HTTP: {kind=!r}, {response=!r}")
+    typed_message_exchange(client, peer)
+
 
 def typed_message_exchange(client, peer):
     def expect(sock, expected):
@@ -1165,6 +1194,19 @@ def main():
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, TYPED_MESSAGE_HANDLER,
+                    domain_message_exchange, DOMAIN_MESSAGE_DECLARATIONS)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, TYPED_MESSAGE_HANDLER,
+                    domain_message_exchange, DOMAIN_MESSAGE_DECLARATIONS)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} domain enum predicates shared with HTTP native={native}")
         for native in (False, True):
             if native:
                 status, details = native_binary_source_removal_scenario(

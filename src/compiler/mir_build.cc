@@ -1,5 +1,6 @@
 #include "rut/compiler/mir_build.h"
 
+#include "rut/compiler/hir.h"
 #include "rut/runtime/route_method.h"
 #include <memory>
 #include <vector>
@@ -278,7 +279,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
 
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
     return kind == HirTypeKind::Bool                                 ? MirTypeKind::Bool
-           : kind == HirTypeKind::I32                                ? MirTypeKind::I32
+           : (kind == HirTypeKind::I32 || is_ws_enum_type(kind))     ? MirTypeKind::I32
            : kind == HirTypeKind::I64                                ? MirTypeKind::I64
            : (kind == HirTypeKind::Str || kind == HirTypeKind::Json) ? MirTypeKind::Str
            : kind == HirTypeKind::Method                             ? MirTypeKind::Method
@@ -786,6 +787,12 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     if (expr.kind == HirExprKind::ConstMethod) {
         v.kind = MirValueKind::ConstMethod;
         v.type = MirTypeKind::Method;
+        v.int_value = expr.int_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ConstWsCase) {
+        v.kind = MirValueKind::IntConst;
+        v.type = MirTypeKind::I32;
         v.int_value = expr.int_value;
         return v;
     }

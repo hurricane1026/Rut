@@ -7353,6 +7353,103 @@ route GET "/ws" { return websocket(ws) { message in
     CHECK(hir->routes[0].ws_handler.len_guards.len != 0);
 }
 
+TEST(frontend, websocket_domain_types_use_normal_eq_and_function_types) {
+    const char* source = R"rut(upstream ws
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func identity<T>(_ value: T) -> T => value
+func isText(_ kind: WebSocketMessageKind) -> bool =>
+    same(kind, WebSocketMessageKind.text)
+func client(_ direction: WebSocketDirection) -> bool =>
+    direction == WebSocketDirection.clientToUpstream
+func classify(_ path: str) -> WebSocketMessageKind {
+    if path == "/text" { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+route GET "/http" {
+    let kind = classify(req.path)
+    guard isText(kind) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(ws) { message in
+    guard !client(message.direction) || isText(identity(message).kind) else { message.drop() }
+    guard same(message.kind, message.kind) else { message.close() }
+    guard WebSocketMessageKind.text != WebSocketMessageKind.binary else { message.close() }
+    message.forward()
+} })rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->functions[2].params[0].type == HirTypeKind::WebSocketMessageKind);
+    CHECK(hir->functions[3].params[0].type == HirTypeKind::WebSocketDirection);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, websocket_domain_types_reject_coercion_ordering_and_wire_cases) {
+    const char* conditions[] = {
+        "true",
+        "message.kind == 1",
+        "message.kind == \"text\"",
+        "message.kind == message.direction",
+        "message.direction == message.fromClient",
+        "message.kind",
+        "message.kind < WebSocketMessageKind.binary",
+        "message.direction > WebSocketDirection.clientToUpstream",
+        "WebSocketMessageKind.text + 1 == 1",
+        "isText(message.direction)",
+        "message.kind == WebSocketMessageKind.ping",
+        "message.kind == WebSocketMessageKind.close",
+        "message.direction == WebSocketDirection.client",
+    };
+    for (const char* condition : conditions) {
+        std::string source = R"rut(upstream ws
+func isText(_ kind: WebSocketMessageKind) -> bool => kind == WebSocketMessageKind.text
+route GET "/ws" { return websocket(ws) { message in guard )rut";
+        source += condition;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (std::strcmp(condition, "true") == 0)
+            REQUIRE(hir);
+        else
+            CHECK(!hir);
+    }
+}
+
+TEST(frontend, websocket_domain_types_preserve_identity_across_imports) {
+    const std::string dir = "/tmp/rut_ws_domain_type_import";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/policy.rut", std::ios::binary);
+        out << "func isClient(_ direction: WebSocketDirection) -> bool => "
+               "direction == WebSocketDirection.clientToUpstream\n"
+               "func isText(_ kind: WebSocketMessageKind) -> bool => "
+               "kind == WebSocketMessageKind.text\n";
+    }
+    const char* source = R"rut(import "policy.rut"
+upstream ws
+route GET "/ws" { return websocket(ws) { message in
+    guard !policy.isClient(message.direction) || policy.isText(message.kind)
+        else { message.drop() }
+    message.forward()
+} })rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
 TEST(frontend, analyze_websocket_compound_conditions) {
     const char* src = R"(upstream ws
 route GET "/ws" { return websocket(ws) { message in

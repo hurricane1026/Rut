@@ -2835,8 +2835,22 @@ in the message phase; helpers with discarded statement effects are rejected
 as well. Message verdicts remain callback statements. This introduces neither
 an HTTP storage representation for messages nor permission to retain a message
 past its synchronous callback. Callback-local bindings, arbitrary parameter
-names, domain enums, close-event values and the general expression/control-flow
+names, close-event values and the general expression/control-flow
 surface remain subsequent work; the borrowed type does not imply their support.
+
+The message also projects two nominal, closed domains: `kind` is
+`WebSocketMessageKind` (`text`, `binary`), and `direction` is `WebSocketDirection`
+(`clientToUpstream`, `upstreamToClient`). Fully qualified case references,
+`==`/`!=`, and generic `Eq` use the common analyzer. Their identity is preserved
+across imports, helper parameters/returns and ordinary HTTP locals. The types
+are distinct from each other and from Bool/integer/string values, and do not
+conform to `Ord`. Scalar storage after type checking uses the existing i32 MIR
+carrier; source-level integer operations or wire opcodes are not exposed.
+Message-phase lowering compares each domain's first-case predicate using the
+existing single-evaluation Boolean equality node. Complete messages have only
+Text/Binary kinds; Ping/Pong/Close/Continuation remain runtime protocol events.
+The old Boolean properties remain supported. Contextual case inference and
+closed-case exhaustive matching are not part of this projection support.
 
 ```swift
 return websocket(eventService, maxMessageSize: 4kb) { message in
