@@ -726,6 +726,12 @@ struct RouteConfig {
     bool activate_rs256(u32 shard) const {
         return rs256_configuration_count == 0 || (rs256 && rs256->activate(shard));
     }
+    void refresh_rs256(u32 shard) const {
+        if (rs256) rs256->maintain(shard);
+    }
+    void cancel_rs256(u32 shard) const {
+        if (rs256) rs256->cancel(shard);
+    }
 
     bool has_strict_local_response_policy_inventory() const {
         return strict_local_response_policy_count != 0 || strict_local_response_bytes_used != 0;

@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -828,9 +829,11 @@ public:
     bool is_draining() const { return draining_.load(std::memory_order_acquire); }
 
     void poll_command() {
+        if (config_ptr && *config_ptr) (*config_ptr)->refresh_rs256(shard_id);
         if (!control) return;
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
         if (cfg && config_ptr) {
+            if (*config_ptr && *config_ptr != cfg) (*config_ptr)->cancel_rs256(shard_id);
             (void)cfg->activate_rs256(shard_id);
             *config_ptr = cfg;
             // A reload may repoint an upstream endpoint under the same
@@ -860,6 +863,7 @@ public:
     }
 
     void shutdown() {
+        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
         close_deferred_idle_return_fds();
         reclaim_pending();
         if (idle_trim_pidfd >= 0) {

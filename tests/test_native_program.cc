@@ -1884,6 +1884,18 @@ route GET "/" {
     return 200
 }
 )rut"));
+    char revoked_bytes[8192];
+    json::Writer revoked{revoked_bytes};
+    revoked.text({fixture.policy.ptr, fixture.policy.len - 1});
+    revoked.text(lit_str(R"(,"revokedJtis":["revoked"],"issuedAfter":50})"));
+    REQUIRE(revoked.ok);
+    source_text.text(lit_str(R"rut(route GET "/revocation" {
+    guard let claims = Crypto.jwtRs256(bearerToken(req.authorization.or("")).or(""), )rut"));
+    REQUIRE(json::quote({revoked_bytes, revoked.len}, source_text));
+    source_text.text(lit_str(R"rut() else { return 401 }
+    return 200
+}
+)rut"));
     REQUIRE(source_text.ok);
     source_bytes[source_text.len] = '\0';
     Source source;
@@ -1893,7 +1905,7 @@ route GET "/" {
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     auto& config = owner.p->config;
-    REQUIRE_EQ(config.rs256_configuration_count, 1u);
+    REQUIRE_EQ(config.rs256_configuration_count, 2u);
     REQUIRE(config.rs256);
     auto* connection = owner.arena.alloc_t<ConnectionBase>();
     REQUIRE(connection);
@@ -1907,7 +1919,7 @@ route GET "/" {
         R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800,"scope":"read write","groups":["read","admin"]})");
     Str signed_token = fixture.sign(test::Rs256Fixture::header, member_claims, token);
     REQUIRE(signed_token.len);
-    auto run = [&]() {
+    auto run = [&](u32 route = 0) {
         char request[8192];
         const int count =
             snprintf(request,
@@ -1918,11 +1930,11 @@ route GET "/" {
         jit::HandlerCtx context{};
         connection->json_arena.reset();
         const auto result =
-            jit::HandlerResult::unpack(config.routes[0].fn(connection,
-                                                           &context,
-                                                           reinterpret_cast<const u8*>(request),
-                                                           static_cast<u32>(count),
-                                                           nullptr));
+            jit::HandlerResult::unpack(config.routes[route].fn(connection,
+                                                               &context,
+                                                               reinterpret_cast<const u8*>(request),
+                                                               static_cast<u32>(count),
+                                                               nullptr));
         return result.status_code;
     };
     CHECK_EQ(run(), 401u);
@@ -1936,6 +1948,25 @@ route GET "/" {
         R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800,"scope":"read write","groups":["admin"]})");
     signed_token = fixture.sign(test::Rs256Fixture::header, nonmember_claims, token);
     CHECK_EQ(run(), 403u);
+    const Str extras[] = {
+        lit_str(R"(,"jti":"live","iat":51)"),
+        lit_str(R"(,"jti":"revoked","iat":51)"),
+        lit_str(R"(,"jti":"live","iat":50)"),
+        lit_str(R"(,"jti":"live")"),
+        lit_str(R"(,"iat":51)"),
+    };
+    for (u32 i = 0; i < sizeof(extras) / sizeof(extras[0]); ++i) {
+        char claims_bytes[1024];
+        json::Writer claims{claims_bytes, sizeof(claims_bytes)};
+        claims.text({member_claims.ptr, member_claims.len - 1});
+        claims.text(extras[i]);
+        claims.put('}');
+        REQUIRE(claims.ok);
+        signed_token = fixture.sign(test::Rs256Fixture::header, {claims_bytes, claims.len}, token);
+        REQUIRE(signed_token.len);
+        CHECK_EQ(run(), 200u);  // The original policy has no revocation requirements.
+        CHECK_EQ(run(1), i == 0 ? 200u : 401u);
+    }
     connection->json_arena.destroy();
     pool.destroy();
 }

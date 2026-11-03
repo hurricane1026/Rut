@@ -1949,8 +1949,8 @@ invalid tokens to a challenged 401.
 `examples/jwt-claims-auth.rut` pins HS256 before checking issuer, audience,
 expiry and scopes. Signature verification does not replace claims policy.
 This adds no algorithm, keyword, dependency, allocation or key-refresh mechanism;
-Other asymmetric algorithms and remote JWKS refresh remain separate work;
-configured RS256 verification is described below.
+Other asymmetric algorithms remain separate work; configured RS256 verification
+and its bounded remote-JWKS profile are described below.
 
 The native `jwt_hs256_issue` API and Rut/JIT `jwtIssueHs256` builtin emit a
 compact HS256 token with only
@@ -2187,7 +2187,8 @@ or provide dynamic membership storage.
 `jwtVerifyRs256(token, policy) -> Json?` verifies RS256 and claims together.
 Both arguments are unwrapped `str`; policy must be compile-time configuration,
 including through inlined helpers. Use a literal, constant, or `env()` snapshot.
-A request-derived policy is a compile error. The JSON policy has exactly:
+A request-derived policy is a compile error. The JSON policy requires these four fields, with optional revocation and
+remote-JWKS controls described below:
 
 ```json
 {"issuer":"https://issuer.example","audience":"orders","kids":["current","previous"],"jwks":{"keys":[]}}
@@ -2225,6 +2226,105 @@ Key parsing runs during configuration loading; each shard activates independent
 verification scratch before serving, including reloads. Policy bytes and keys
 are retained through in-flight requests, for both JIT and native programs.
 Replace configuration to rotate/remove approved keys; old in-flight readers
-finish against their original policy. Remote JWKS fetching/cache/refresh, OIDC,
-revocation lists, replay prevention, other RSA/EC algorithms and JWT signing
-are not implemented by this API.
+finish against their original policy. The bounded remote-JWKS and revocation-snapshot extensions are described below.
+OIDC, online revocation, replay prevention, other RSA/EC algorithms and broader
+JWT signing policies remain separate work.
+
+
+### RS256 policy revocation snapshots
+
+Optional `revokedJtis` is a trusted array of at most 64 distinct, nonempty JWT
+IDs, each at most 128 decoded UTF-8 bytes. Its presence, including `[]`, requires
+every accepted token to carry a nonempty string `jti` within the same byte limit.
+Matching uses exact decoded, case-sensitive bytes; duplicate decoded IDs in the
+configuration are invalid. A matching token is rejected before claims/identity
+publication. Omitting the field preserves the existing optional `jti` behavior.
+
+Optional `issuedAfter` is a positive signed-64-bit integer Unix second. It
+requires an integer `iat` strictly greater than that cutoff; equality, an older
+issuance, or a missing `iat` rejects. The existing `iat <= now` rule still applies.
+It works independently of `revokedJtis` and can invalidate older tokens without
+removing their signing key. For example, add
+`"revokedJtis":["compromised-token-id"],"issuedAfter":1700000000` to the policy.
+Malformed controls reject the configuration, rather than disabling revocation.
+These are application policy controls over the registered `jti`/`iat` claims in
+[RFC 7519](https://www.rfc-editor.org/rfc/rfc7519.html), not an OAuth revocation endpoint.
+
+Revocation is an immutable configuration snapshot. Adopt a replacement configuration
+to update it; in-flight requests retain their old policy under the existing RCU
+rules. Every node must receive the new configuration before revocation is effective
+there. Persist and distribute the source policy through the configuration system;
+this API supplies no mutable denylist, background synchronization or replay store.
+Omitting an ID in a later snapshot permits it again until expiry unless another
+policy rejects it. Signature, issuer, audience, time and revocation checks must all
+succeed before any claims are returned; revocation failure is the usual nil/401.
+
+
+### Remote RS256 JWKS refresh
+
+The same compile-time `Crypto.jwtRs256(token, policy)` policy can include an
+optional `remoteJwks` object with exactly these eight required members:
+
+```json
+{"address":"192.0.2.10","port":443,"serverName":"issuer.example",
+ "ca":"/etc/rut/issuer-ca.pem","path":"/.well-known/jwks.json",
+ "refreshSeconds":60,"maxAgeSeconds":300,"timeoutSeconds":10}
+```
+
+The enclosing policy still requires `issuer`, `audience`, `kids` and `jwks`.
+The initial public JWKS validates the explicitly approved kid inventory; remote
+mode **rejects all tokens until its first successful authenticated fetch**. It
+never serves those initial keys as an offline cache. Endpoint fields are trusted
+configuration, never token/HTTP-request data. The address is a literal IPv4;
+there is no blocking DNS, discovery, redirect following or token-driven fetch.
+The CA file and TLS server name are mandatory and certificate verification cannot
+be disabled. Only HTTP/1.1 is offered over TLS; absent ALPN is allowed. HTTPS is
+implicit and cleartext endpoints are unavailable.
+
+`port` is 1–65535; `refreshSeconds` is 1–3600; `maxAgeSeconds` is 1–86400 and
+strictly greater than the refresh interval; `timeoutSeconds` is 1–60. Address,
+server name, CA path and request path are owned, bounded strings with no embedded
+NUL; paths start with `/` and cannot contain whitespace, controls, fragments or
+backslashes. The entire enclosing policy retains its 8192-byte bound. CA files
+are loaded at shard activation. Failure leaves that shard's RS256 policy row unavailable.
+
+Each shard owns its own bounded fetch and verification workspace. Between handler
+batches, a function-pointer state machine advances at most 16 nonblocking I/O
+steps per maintenance call. It never waits for readiness or retains a kernel I/O
+buffer. Progress follows gateway batch/timer wakeups, so a quiescent gateway can
+advance at one-second intervals; configure a timeout that allows several such
+steps. There is at most one outstanding request per policy per shard. Requests
+and unknown kids cannot trigger extra refreshes. No network I/O or key import
+occurs in the token verifier.
+
+The response must be status 200 with one `application/json` or
+`application/jwk-set+json` Content-Type. Headers are bounded to 8192 bytes, body
+to 8192 bytes, and total decoded HTTP wire bytes to 16384. Content-Length,
+chunked and authenticated TLS-close-delimited bodies are supported. Duplicate or
+conflicting framing, truncated headers, redirects, 304, compression, malformed
+chunks and unclean EOF are rejected. No ETag, Cache-Control-derived lifetime,
+HTTP/2 or compressed response handling is advertised by this profile.
+
+A fetched set contains at most 16 objects with distinct nonempty bounded kids.
+Only the intersection with the configured approved kids can become trusted;
+unknown keys never expand trust. Selected keys retain the strict RS256 public
+JWK profile. Preapprove future kids through replacement configuration before
+rotating to them. An otherwise valid empty intersection is authoritative removal
+and immediately denies all tokens, rather than falling back to old keys.
+
+A replacement verifier is completely prepared on the owning shard before its
+cache is switched. Signature/claims/revocation checks remain unchanged. Fetch,
+HTTP, JSON, key-import and activation failures retain the last successful cache
+only until its configured maximum age. Only successful validation of a fresh 200
+response renews that age. At exact expiry, before first success, after clock
+failure or after authoritative key removal, verification returns nil (the auth
+wrapper challenges with 401). A failed refresh never extends a lease. Age uses
+monotonic time; JWT claim dates still use realtime. There is no stale-forever or
+static-key fallback.
+
+Configuration adoption cancels the retired generation's fetch on its shard;
+shutdown and destruction also release pending TLS/socket resources. Existing
+claims documents own their payload bytes and do not borrow mutable key-cache
+storage. Retired generation readers retain that generation's own policy/cache
+and its expiration. Each shard refreshes independently; this API does not provide
+cross-node synchronization, OIDC discovery, online Token revocation or signing.
