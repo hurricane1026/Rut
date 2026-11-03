@@ -412,6 +412,7 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::Json:
         case HirTypeKind::Generic:
         case HirTypeKind::Unknown:
+        case HirTypeKind::WebSocketMessage:
             return true;
         case HirTypeKind::Struct:
             return struct_index != 0xffffffffu;
@@ -2136,6 +2137,9 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"Method", 6})) return HirTypeKind::Method;
     if (name.eq({"Json", 4})) return HirTypeKind::Json;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
+#if RUT_ENABLE_WEBSOCKET
+    if (name.eq(lit_str("WebSocketMessage"))) return HirTypeKind::WebSocketMessage;
+#endif
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
         variant_index = idx;
@@ -5763,6 +5767,11 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             function_index = req->function_index;
         }
         const auto& fn = mod.functions[function_index];
+        if (route != nullptr && route->is_ws_terminate &&
+            (fn.has_non_response_statement_effect || fn.respond_guards.len != 0))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("message predicates require pure helpers"));
         for (u32 i = 0; i < fn.params.len; i++) {
             if (fn.params[i].type == HirTypeKind::Response)
                 return frontend_error(
@@ -8021,6 +8030,145 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
     g->negate = negate;
     return g;
 }
+// The public type checker and helper inliner produce ordinary HIR. Only the
+// protocol reads and the final bounded predicate representation are WS-specific.
+static bool ws_typed_field(const HirExpr& expr, Str name) {
+    return expr.kind == HirExprKind::WsMessageField && expr.str_value.eq(name) && expr.lhs &&
+           expr.lhs->type == HirTypeKind::WebSocketMessage;
+}
+
+static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
+                                                    WsVerdict verdict,
+                                                    HirWsHandler& handler,
+                                                    bool is_operand,
+                                                    bool negate,
+                                                    u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::TooManyItems, expr.span);
+    if (expr.type != HirTypeKind::Bool || expr.may_nil || expr.may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    WsLenGuard node{};
+    node.verdict = verdict;
+    node.negate = negate;
+    node.is_operand = is_operand;
+    const auto kAppend = [&](const WsLenGuard& value) -> FrontendResult<u32> {
+        if (!handler.len_guards.push(value))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return handler.len_guards.len - 1;
+    };
+    const auto kChild = [&](const HirExpr& value, bool invert = false) {
+        return lower_ws_typed_condition(value, verdict, handler, true, invert, depth + 1);
+    };
+    // Ordinary Boolean equality, including mirrored and nested comparisons.
+    if (expr.kind == HirExprKind::Eq && expr.lhs && expr.rhs &&
+        expr.lhs->type == HirTypeKind::Bool && expr.rhs->type == HirTypeKind::Bool) {
+        const HirExpr* value = expr.lhs;
+        const HirExpr* literal = expr.rhs;
+        if (value->kind == HirExprKind::BoolLit) {
+            value = expr.rhs;
+            literal = expr.lhs;
+        }
+        if (literal->kind == HirExprKind::BoolLit)
+            return lower_ws_typed_condition(
+                *value, verdict, handler, is_operand, negate != !literal->bool_value, depth + 1);
+        // Keep equality as one node so each operand is evaluated exactly once.
+        auto a = kChild(*expr.lhs);
+        if (!a) return core::make_unexpected(a.error());
+        auto b = kChild(*expr.rhs);
+        if (!b) return core::make_unexpected(b.error());
+        node.accessor = WsLenGuard::Accessor::BoolEqual;
+        node.lhs = a.value();
+        node.rhs = b.value();
+        return kAppend(node);
+    }
+    if (expr.kind == HirExprKind::IfElse && expr.lhs && expr.rhs && expr.args.len == 1 &&
+        expr.args[0] &&
+        (expr.rhs->kind == HirExprKind::BoolLit || expr.args[0]->kind == HirExprKind::BoolLit)) {
+        // Shared HIR encodes &&/|| as lazy Boolean branches. A helper may
+        // also return if cond { false } else { predicate }, or its dual.
+        const bool kConstantThen = expr.rhs->kind == HirExprKind::BoolLit;
+        const bool kConstant = kConstantThen ? expr.rhs->bool_value : expr.args[0]->bool_value;
+        auto lhs = kChild(*expr.lhs, kConstantThen != kConstant);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = kChild(kConstantThen ? *expr.args[0] : *expr.rhs);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        node.accessor = kConstant ? WsLenGuard::Accessor::Or : WsLenGuard::Accessor::And;
+        node.lhs = lhs.value();
+        node.rhs = rhs.value();
+    } else if (expr.kind == HirExprKind::BoolLit) {
+        node.accessor = WsLenGuard::Accessor::Constant;
+        node.bound = expr.bool_value ? 1u : 0u;
+    } else if (ws_typed_field(expr, lit_str("fromClient"))) {
+        node.accessor = WsLenGuard::Accessor::FromClient;
+        node.cmp = WsLenGuard::Cmp::Eq;
+        node.bound = 1;
+    } else if (ws_typed_field(expr, lit_str("isText")) ||
+               ws_typed_field(expr, lit_str("isBinary"))) {
+        node.accessor = WsLenGuard::Accessor::Opcode;
+        node.cmp = WsLenGuard::Cmp::Eq;
+        node.bound = ws_typed_field(expr, lit_str("isText")) ? 1u : 2u;
+    } else if (expr.kind == HirExprKind::RegexMatch && expr.lhs &&
+               ws_typed_field(*expr.lhs, lit_str("text"))) {
+        node.accessor = WsLenGuard::Accessor::TextMatch;
+        node.pattern = expr.str_value;
+    } else if ((expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
+                expr.kind == HirExprKind::Gt) &&
+               expr.lhs && expr.rhs) {
+        const HirExpr* field = expr.lhs;
+        const HirExpr* value = expr.rhs;
+        const bool kSwapped = field->kind != HirExprKind::WsMessageField;
+        if (kSwapped) {
+            field = expr.rhs;
+            value = expr.lhs;
+        }
+        node.cmp = expr.kind == HirExprKind::Eq                 ? WsLenGuard::Cmp::Eq
+                   : (expr.kind == HirExprKind::Lt) != kSwapped ? WsLenGuard::Cmp::Lt
+                                                                : WsLenGuard::Cmp::Gt;
+        if (ws_typed_field(*field, lit_str("len")) && value->kind == HirExprKind::IntLit) {
+            // The runtime's complete-message length is nonnegative and bounded.
+            if (value->int_value < 0 || value->int_value > 0xffffffffLL) {
+                node.accessor = WsLenGuard::Accessor::Constant;
+                node.bound = node.cmp == WsLenGuard::Cmp::Lt   ? value->int_value > 0
+                             : node.cmp == WsLenGuard::Cmp::Gt ? value->int_value < 0
+                                                               : false;
+            } else {
+                node.accessor = WsLenGuard::Accessor::Len;
+                node.bound = static_cast<u32>(value->int_value);
+            }
+        } else if (expr.kind == HirExprKind::Eq && ws_typed_field(*field, lit_str("text")) &&
+                   value->kind == HirExprKind::StrLit) {
+            node.accessor = WsLenGuard::Accessor::TextEqual;
+            node.pattern = value->str_value;
+        } else {
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+    } else {
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    }
+    return kAppend(node);
+}
+
+static FrontendResult<u32> analyze_ws_typed_condition(const AstExpr& expr,
+                                                      WsVerdict verdict,
+                                                      HirWsHandler& handler,
+                                                      const HirModule& mod,
+                                                      bool is_operand,
+                                                      bool negate) {
+    // Keep analysis temporaries and any rejected HTTP effects out of the real route.
+    auto scratch = std::make_unique<HirRoute>();
+    scratch->is_ws_terminate = true;
+    HirLocal message{};
+    message.name = lit_str("message");
+    message.type = HirTypeKind::WebSocketMessage;
+    message.init.kind = HirExprKind::LocalRef;
+    message.init.type = message.type;
+    auto typed = analyze_expr(expr, scratch.get(), mod, &message, 1, nullptr);
+    if (!typed) return core::make_unexpected(typed.error());
+    if (scratch->locals.len != 0 || scratch->guards.len != 0)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    return lower_ws_typed_condition(typed.value(), verdict, handler, is_operand, negate);
+}
+
 // Store a bounded condition tree in postorder. Only roots are source guards; children
 // are evaluated by short-circuit branches in the message-handler JIT.
 static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
@@ -8063,7 +8211,17 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
         node.verdict = verdict;
     } else {
         auto leaf = analyze_message_guard_cond(cond, verdict, negate, mod, route, documents);
-        if (!leaf) return core::make_unexpected(leaf.error());
+        if (!leaf) {
+            if (leaf.error().code != FrontendError::UnsupportedSyntax)
+                return core::make_unexpected(leaf.error());
+            const u32 kSavedCount = handler.len_guards.len;
+            auto typed =
+                analyze_ws_typed_condition(cond, verdict, handler, mod, is_operand, negate);
+            if (typed) return typed;
+            handler.len_guards.len = kSavedCount;
+            if (leaf.error().detail.len != 0) return core::make_unexpected(leaf.error());
+            return core::make_unexpected(typed.error());
+        }
         node = leaf.value();
     }
     node.is_operand = is_operand;
@@ -8703,6 +8861,27 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         auto base = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!base) return core::make_unexpected(base.error());
+#if RUT_ENABLE_WEBSOCKET
+        if (base->type == HirTypeKind::WebSocketMessage) {
+            if (base->may_nil || base->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (expr.name.eq(lit_str("fromClient")) || expr.name.eq(lit_str("isText")) ||
+                expr.name.eq(lit_str("isBinary")))
+                out.type = HirTypeKind::Bool;
+            else if (expr.name.eq(lit_str("len")))
+                out.type = HirTypeKind::I32;
+            else if (expr.name.eq(lit_str("text")))
+                out.type = HirTypeKind::Str;
+            else
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            out.kind = HirExprKind::WsMessageField;
+            out.str_value = expr.name;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+#endif
         if (base->is_wait_result) {
             if (base->kind != HirExprKind::LocalRef)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -9773,6 +9952,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         adopt_int_literal_type(&lhs.value(), &rhs.value());
         const bool lhs_maybe_missing = lhs->may_nil || lhs->may_error;
         const bool rhs_maybe_missing = rhs->may_nil || rhs->may_error;
+        if (lhs->type == HirTypeKind::WebSocketMessage ||
+            rhs->type == HirTypeKind::WebSocketMessage)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("compare message fields, not borrowed messages"));
         if (expr.kind != AstExprKind::Eq && (lhs_maybe_missing || rhs_maybe_missing))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (lhs->type != rhs->type) {
@@ -11309,6 +11493,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
     if (fn_index == mod.functions.len) return fail_with_name(expr.span, "unknown function");
     const auto& fn = mod.functions[fn_index];
+    if (route != nullptr && route->is_ws_terminate &&
+        (fn.has_non_response_statement_effect || fn.respond_guards.len != 0))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("message predicates require pure helpers"));
     for (u32 i = 0; i < fn.params.len; i++) {
         if (fn.params[i].type == HirTypeKind::Response)
             return fail_call(

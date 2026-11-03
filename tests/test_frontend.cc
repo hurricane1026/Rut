@@ -7258,6 +7258,101 @@ TEST(frontend, analyze_accepts_websocket_text_match_guard_positive) {
     CHECK(!h.len_guards[0].negate);
 }
 
+TEST(frontend, websocket_message_concept_uses_common_types_and_helpers) {
+    const char* source = R"rut(upstream ws
+func accepted(_ text: str) -> bool => text.matches(re"ok")
+func bounded(_ size: i32) -> bool => size > 0 && size <= 8
+func allowed(_ msg: WebSocketMessage) -> bool =>
+    !msg.fromClient || (msg.isText == true && accepted(msg.text) && bounded(msg.len))
+route GET "/http" { guard accepted(req.path) else { return 403 } return 200 }
+route GET "/ws" { return websocket(ws) { message in
+    guard allowed(message) == true else { message.drop() }
+    guard false == (message.isBinary == message.isText) else { message.drop() }
+    message.forward()
+} }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 3u);
+    CHECK(hir->functions[2].params[0].type == HirTypeKind::WebSocketMessage);
+    REQUIRE_EQ(hir->routes.len, 2u);
+    CHECK(!hir->routes[0].is_ws_terminate);
+    CHECK(hir->routes[1].is_ws_terminate);
+    u32 roots = 0;
+    const auto& nodes = hir->routes[1].ws_handler.len_guards;
+    for (u32 i = 0; i < nodes.len; ++i)
+        if (!nodes[i].is_operand) ++roots;
+    CHECK_EQ(roots, 2u);
+}
+
+TEST(frontend, websocket_typed_predicates_reject_wrong_types_and_phases) {
+    const char* conditions[] = {"true",
+                                "message.isText == 1",
+                                "true == message.len",
+                                "message.text == message.fromClient",
+                                "message.len == message.isBinary",
+                                "message == message",
+                                "accepted(message)",
+                                "req.path == \"ok\"",
+                                "message.closeCode == 1000",
+                                "readHttp(message)",
+                                "admit(message)",
+                                "indirect(message)"};
+    for (const char* cond : conditions) {
+        std::string source = R"rut(upstream ws
+func accepted(_ text: str) -> bool => text == "ok"
+func readHttp(_ msg: WebSocketMessage) -> bool => req.path == "ok"
+func admit(_ msg: WebSocketMessage) -> bool {
+    guard msg.isText else { respond 403 }
+    true
+}
+func indirect(_ msg: WebSocketMessage) -> bool {
+    let ignored = admit(msg)
+    true
+}
+route GET "/ws" { return websocket(ws) { message in
+    guard )rut";
+        source += cond;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (std::strcmp(cond, "true") == 0)
+            REQUIRE(hir);  // Helper declarations themselves are valid.
+        else
+            CHECK(!hir);
+    }
+}
+
+TEST(frontend, websocket_message_helpers_import_through_normal_namespaces) {
+    const std::string dir = "/tmp/rut_ws_message_helper_import";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/policy.rut", std::ios::binary);
+        out << "func allowed(_ msg: WebSocketMessage) -> bool => msg.isText == true\n";
+    }
+    const char* source = R"rut(import "policy.rut"
+upstream ws
+route GET "/ws" { return websocket(ws) { message in
+    guard policy.allowed(message) else { message.drop() }
+    message.forward()
+} })rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK(hir->routes[0].ws_handler.len_guards.len != 0);
+}
+
 TEST(frontend, analyze_websocket_compound_conditions) {
     const char* src = R"(upstream ws
 route GET "/ws" { return websocket(ws) { message in

@@ -856,6 +856,20 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // Conditions support !, &&, ||, parentheses and left-to-right short-circuiting.
 // ! binds tighter than comparisons; && binds tighter than ||.
 // At most 32 condition nodes (leaf predicates + binary operators); nesting is bounded.
+// `message` has the built-in borrowed type WebSocketMessage. It is supplied only
+// by this callback, never constructed or stored as an HTTP/connection value.
+// Fields: fromClient/isText/isBinary: bool, len: i32 (payload bytes), text: str
+// (borrowed raw bytes, also available for Binary messages).
+// Pure helpers may accept the message or its scalar fields. Their inlined
+// predicates support these fields, bool literals/equality (either order),
+// Boolean composition, len/literal comparisons, text/literal equality and
+// text.matches(re). Ordinary type checking is shared with HTTP helpers.
+// Other general expressions, callback-local lets and arbitrary parameter names
+// are not implemented yet. HTTP reads/effects and message verdicts in helpers
+// are rejected. Helpers cannot retain a message/payload past the callback.
+func allowedMessage(_ msg: WebSocketMessage) -> bool =>
+    !msg.fromClient || (msg.isText == true && msg.len <= 2048)
+// Inside the callback: guard allowedMessage(message) else { message.drop() }
 // A terminate route can run up to eight existing top-level HTTP guards before
 // websocket. These request reads and static failure responses run in the
 // ordinary JIT handler before it connects to the WebSocket upstream. A

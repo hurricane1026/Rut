@@ -6048,6 +6048,85 @@ route GET "/ws" { return websocket(backend) { message in
     program.destroy();
 }
 
+TEST(serve_loader, websocket_typed_message_helpers_share_scalar_predicates_with_http) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func accepted(_ text: str) -> bool => text.matches(re"o.k")
+func allowed(_ msg: WebSocketMessage) -> bool =>
+    !msg.fromClient || (true == msg.isText && msg.len <= 3 && accepted(msg.text))
+route GET "/http" { guard accepted(req.path) else { return 403 } return 200 }
+route GET "/ws" { return websocket(backend) { message in
+    guard allowed(message) == true else { message.drop() }
+    guard false == (message.isText == message.isBinary) else { message.drop() }
+    message.forward()
+} }
+)rut";
+    auto path = write_file("/tmp/rut_ws_typed_helpers", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 2u);
+    const auto handler = program.config.routes[1].ws_frame_handler;
+    REQUIRE(handler);
+    const Str payloads[] = {{"o\0k", 3}, {"oak", 3}, {"no", 2}, {"", 0}, {"oaks", 4}};
+    const bool flags[] = {false, true};
+    const WsOpcode opcodes[] = {WsOpcode::Text, WsOpcode::Binary};
+    for (bool client : flags) {
+        for (WsOpcode op : opcodes) {
+            for (u32 i = 0; i < 5; ++i) {
+                const auto payload = payloads[i];
+                const bool pass = !client || (op == WsOpcode::Text && i < 2);
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(payload.ptr),
+                              payload.len,
+                              client) == (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+    }
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_typed_boolean_comparisons_and_constants) {
+    const char* conditions[] = {"message.isText == true",
+                                "true == message.isText",
+                                "false == message.isBinary",
+                                "(message.isText == true) != false",
+                                "message.isText == message.fromClient",
+                                "true",
+                                "false",
+                                "message.len > -1",
+                                "message.len < -1",
+                                "(message.fromClient && message.isText) == "
+                                "(message.isBinary || message.fromClient)"};
+    const bool flags[] = {false, true};
+    const WsOpcode opcodes[] = {WsOpcode::Text, WsOpcode::Binary};
+    for (u32 i = 0; i < 10; ++i) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+            "websocket(backend) { message in\nguard ";
+        source += conditions[i];
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_typed_bools", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : flags) {
+            for (WsOpcode op : opcodes) {
+                const bool text = op == WsOpcode::Text;
+                const bool pass = i < 4    ? text
+                                  : i == 4 ? text == client
+                                  : i == 9 ? (client && text) == (!text || client)
+                                           : i == 5 || i == 7;
+                CHECK(handler(nullptr, op, nullptr, 0, client) ==
+                      (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+        program.destroy();
+    }
+}
+
 TEST(serve_loader, websocket_json_root_kind_and_count_compose_within_guard_limit) {
     const char* source = R"rut(upstream backend at "127.0.0.1:9999"
 route GET "/ws" { return websocket(backend) { message in

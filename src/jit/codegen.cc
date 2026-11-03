@@ -3147,7 +3147,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 34 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 36 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
         if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 34) ||
@@ -3164,10 +3164,11 @@ bool emit_ws_handler(LLVMModuleRef mod,
         if ((guards[i].accessor == 24 || guards[i].accessor == 29) && guards[i].value_len != 0)
             return false;
         if (guards[i].accessor == 18 && guards[i].bound > 1) return false;
+        if (guards[i].accessor == 35 && guards[i].bound > 1) return false;
         if (guards[i].accessor == 23 &&
             (guards[i].int_bound < -2147483648LL || guards[i].int_bound > 2147483647LL))
             return false;
-        if (guards[i].accessor == 4 || guards[i].accessor == 5) {
+        if (guards[i].accessor == 4 || guards[i].accessor == 5 || guards[i].accessor == 36) {
             const u32 children[2] = {guards[i].lhs, guards[i].rhs};
             for (u32 child : children) {
                 if (child >= i || !guards[child].is_operand || ++parents[child] != 1) return false;
@@ -3215,6 +3216,32 @@ bool emit_ws_handler(LLVMModuleRef mod,
             yes = no;
             no = tmp;
         }
+        if (guards[i].accessor == 36) {
+            // Equality evaluates both operands once. Keep the LHS value in SSA
+            // while emitting the RHS, including its own short-circuit branches.
+            LLVMBasicBlockRef left_yes = LLVMAppendBasicBlockInContext(ctx, fn, "eq.left.yes");
+            LLVMBasicBlockRef left_no = LLVMAppendBasicBlockInContext(ctx, fn, "eq.left.no");
+            LLVMBasicBlockRef left_done = LLVMAppendBasicBlockInContext(ctx, fn, "eq.left.done");
+            self(self, guards[i].lhs, left_yes, left_no);
+            LLVMPositionBuilderAtEnd(builder, left_yes);
+            LLVMBuildBr(builder, left_done);
+            LLVMPositionBuilderAtEnd(builder, left_no);
+            LLVMBuildBr(builder, left_done);
+            LLVMPositionBuilderAtEnd(builder, left_done);
+            LLVMTypeRef bool_ty = LLVMInt1TypeInContext(ctx);
+            LLVMValueRef left = LLVMBuildPhi(builder, bool_ty, "eq.left");
+            LLVMValueRef values[2] = {LLVMConstInt(bool_ty, 1, 0), LLVMConstInt(bool_ty, 0, 0)};
+            LLVMBasicBlockRef blocks[2] = {left_yes, left_no};
+            LLVMAddIncoming(left, values, blocks, 2);
+            LLVMBasicBlockRef right_yes = LLVMAppendBasicBlockInContext(ctx, fn, "eq.right.yes");
+            LLVMBasicBlockRef right_no = LLVMAppendBasicBlockInContext(ctx, fn, "eq.right.no");
+            self(self, guards[i].rhs, right_yes, right_no);
+            LLVMPositionBuilderAtEnd(builder, right_yes);
+            LLVMBuildCondBr(builder, left, yes, no);
+            LLVMPositionBuilderAtEnd(builder, right_no);
+            LLVMBuildCondBr(builder, left, no, yes);
+            return;
+        }
         if (guards[i].accessor == 4 || guards[i].accessor == 5) {
             LLVMBasicBlockRef rhs = LLVMAppendBasicBlockInContext(ctx, fn, "guard.rhs");
             if (guards[i].accessor == 4)
@@ -3226,7 +3253,9 @@ bool emit_ws_handler(LLVMModuleRef mod,
             return;
         }
         LLVMValueRef cond;
-        if (guards[i].accessor == 11) {  // JsonHasPath: presence includes a JSON null node.
+        if (guards[i].accessor == 35) {
+            cond = LLVMConstInt(LLVMInt1TypeInContext(ctx), guards[i].bound, 0);
+        } else if (guards[i].accessor == 11) {  // JsonHasPath: presence includes a JSON null node.
             LLVMTypeRef json_params[4] = {ptr_ty, i64_ty, ptr_ty, i32_ty};
             LLVMTypeRef json_ty = LLVMFunctionType(i8_ty, json_params, 4, 0);
             LLVMValueRef json_fn = LLVMGetNamedFunction(mod, "rut_helper_ws_json_has_path");

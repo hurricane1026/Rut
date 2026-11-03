@@ -2818,6 +2818,26 @@ reassembled Text/Binary message. Its length is the complete payload byte count,
 and `fromClient` identifies the sender. Fragmentation and control frames are
 handled by the runtime; application policies do not observe wire frame boundaries.
 
+The callback parameter has the built-in borrowed type `WebSocketMessage`.
+Its `fromClient`, `isText` and `isBinary` fields have type `bool`, `len` has
+type `i32`, and `text` has type `str`. The last remains a raw-byte view of
+either message kind; it does not assert UTF-8 for Binary messages. Ordinary
+pure helpers can accept this type or its scalar projections, using the same
+type checker and function inliner as HTTP expressions. The WS predicate
+lowerer consumes the resulting HIR and emits the existing bounded condition
+forest, with no message object allocation or retained payload pointers.
+Supported helper predicates comprise Boolean literals/equality/composition,
+length comparisons against literals, text equality against literals, and
+whole-value regex matching. Both operand orders work for scalar equality.
+Non-Boolean conditions and mismatched operands are compile errors.
+HTTP reads, state/header mutations and HTTP response effects cannot execute
+in the message phase; helpers with discarded statement effects are rejected
+as well. Message verdicts remain callback statements. This introduces neither
+an HTTP storage representation for messages nor permission to retain a message
+past its synchronous callback. Callback-local bindings, arbitrary parameter
+names, domain enums, close-event values and the general expression/control-flow
+surface remain subsequent work; the borrowed type does not imply their support.
+
 ```swift
 return websocket(eventService, maxMessageSize: 4kb) { message in
     guard message.len <= 2048 else { message.close(1009, "message too large") }

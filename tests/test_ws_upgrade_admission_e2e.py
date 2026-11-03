@@ -198,7 +198,46 @@ def json_regex_exchange(client, peer):
     expect(client, (8, b"\x03\xeb", False))
 
 
-def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, exchange=binary_exchange):
+TYPED_MESSAGE_DECLARATIONS = r"""
+func accepted(_ text: str) -> bool => text.matches(re"o.k")
+func allowed(_ msg: WebSocketMessage) -> bool =>
+    !msg.fromClient || (true == msg.isText && msg.len <= 3 && accepted(msg.text))
+"""
+
+TYPED_MESSAGE_HANDLER = r"""
+return websocket(ws) { message in
+    guard allowed(message) == true else { message.drop() }
+    guard message.isText != message.isBinary else { message.close() }
+    message.forward()
+}
+"""
+
+
+def typed_message_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"typed message predicate: {actual=!r}, {expected=!r}")
+
+    # Predicate sees the complete message, while Ping bypasses application inspection.
+    first = bytearray(masked_frame(1, b"o"))
+    first[0] &= 0x7F
+    client.sendall(masked_frame(1, b"bad") + masked_frame(2, b"oak") + first +
+                   masked_frame(9, b"PING") + masked_frame(0, b"ak"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"oak", True))
+    client.sendall(masked_frame(1, b"o\0k"))
+    expect(peer, (1, b"o\0k", True))
+    # The same typed helper deliberately permits the upstream direction.
+    peer.sendall(b"\x82\x03bad\x81\x00")
+    expect(client, (2, b"bad", False))
+    expect(client, (1, b"", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
+                                exchange=binary_exchange, declarations=""):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-binary-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -208,7 +247,7 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, ex
             route_file.write(
                 f'listen 127.0.0.1:0\n'
                 f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
-                'route GET "/ws" {\n' + handler + '}\n')
+                + declarations + '\nroute GET "/ws" {\n' + handler + '}\n')
         process, port, diagnostic = launch(server, path, backend_kind)
         if process is None:
             text = diagnostic.decode(errors="replace")
@@ -237,7 +276,8 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, ex
 
 
 def native_binary_source_removal_scenario(server, compiler, backend_kind,
-                                         handler=BINARY_HANDLER, exchange=binary_exchange):
+                                         handler=BINARY_HANDLER, exchange=binary_exchange,
+                                         declarations=""):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-native-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -247,7 +287,7 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind,
         with open(source, "w", encoding="utf-8") as route_file:
             route_file.write(
                 f'listen 127.0.0.1:0\nupstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
-                'route GET "/ws" { ' + handler + '}\n')
+                + declarations + '\nroute GET "/ws" { ' + handler + '}\n')
         emitted = subprocess.run([compiler, source, "2"], capture_output=True, check=True, timeout=30)
         with open(artifact, "wb") as artifact_file:
             artifact_file.write(emitted.stdout)
@@ -1125,6 +1165,19 @@ def main():
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, TYPED_MESSAGE_HANDLER,
+                    typed_message_exchange, TYPED_MESSAGE_DECLARATIONS)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, TYPED_MESSAGE_HANDLER,
+                    typed_message_exchange, TYPED_MESSAGE_DECLARATIONS)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} typed message predicates native={native}")
         status, details = binary_replacement_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")

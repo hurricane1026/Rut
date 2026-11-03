@@ -244,6 +244,9 @@ enum class HirExprKind : u8 {
     // the value in rhs and echoes it (type I64).
     CacheGet,
     CacheSet,
+    // A projection from a callback-scoped WebSocketMessage. lhs retains the
+    // typed receiver through ordinary helper inlining; str_value names the field.
+    WsMessageField,
 };
 
 enum class HirTypeKind : u8 {
@@ -275,6 +278,9 @@ enum class HirTypeKind : u8 {
     // A bounded response builder local. It is consumed by `return <local>` and
     // does not have a runtime MIR carrier in the initial literal-only slice.
     Response,
+    // Borrowed complete Text/Binary message; only message callbacks supply values.
+    // It has no HTTP/MIR storage representation and cannot outlive the callback.
+    WebSocketMessage,
 };
 
 inline constexpr u32 kMaxTupleSlots = 10;
@@ -1131,7 +1137,9 @@ struct WsLenGuard {
         JsonStringifyPrefix,
         JsonStringifySuffix,
         JsonStringifyContains,
-        JsonStringRegex
+        JsonStringRegex,
+        Constant,
+        BoolEqual
     };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };

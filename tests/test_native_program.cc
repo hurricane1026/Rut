@@ -1716,6 +1716,43 @@ TEST(native_program, websocket_guard_close_policies_survive_source_removal) {
     }
 }
 
+TEST(native_program, websocket_typed_message_helpers_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func accepted(_ text: str) -> bool => text.matches(re"o.k")
+func allowed(_ msg: WebSocketMessage) -> bool =>
+    !msg.fromClient || (msg.isText == true && msg.len <= 3 && accepted(msg.text))
+route GET "/ws" { return websocket(backend) { message in
+    guard true else { message.close() }
+    guard allowed(message) else { message.drop() }
+    guard message.isText != message.isBinary else { message.close() }
+    message.forward()
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const Str payloads[] = {{"o\0k", 3}, {"oak", 3}, {"no", 2}, {"", 0}, {"oaks", 4}};
+    const bool flags[] = {false, true};
+    const WsOpcode opcodes[] = {WsOpcode::Text, WsOpcode::Binary};
+    for (bool client : flags) {
+        for (WsOpcode op : opcodes) {
+            for (u32 i = 0; i < 5; ++i) {
+                const auto payload = payloads[i];
+                const bool pass = !client || (op == WsOpcode::Text && i < 2);
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(payload.ptr),
+                              payload.len,
+                              client) == (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+    }
+}
+
 TEST(native_program, websocket_message_type_guards_survive_compiler_exit) {
     Source source;
     REQUIRE(

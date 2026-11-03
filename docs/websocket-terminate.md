@@ -37,6 +37,35 @@ status or response. Helpers, effects, request body reads, mutation, waits,
 loops, conditionals, decorators and chains remain unsupported. The message
 handler retains its independent four-guard limit.
 
+The message callback receives a borrowed `WebSocketMessage`. Its Boolean
+fields are `fromClient`, `isText` and `isBinary`; `len` is an `i32` byte count
+and `text` is a borrowed `str` over the payload, including Binary payloads.
+It is now possible to reuse ordinary pure helpers:
+
+```swift
+func accepted(_ text: str) -> bool => text.matches(re"allowed[0-9]+")
+func permitted(_ msg: WebSocketMessage) -> bool =>
+    !msg.fromClient || (msg.isText == true && msg.len <= 2048 && accepted(msg.text))
+
+route GET "/checked-ws" {
+    return websocket(chat) { message in
+        guard permitted(message) else { message.drop() }
+        message.forward()
+    }
+}
+```
+
+The same `accepted(str)` helper can be called from an ordinary HTTP route.
+These message predicates use ordinary scalar type checking and helper inlining,
+then lower to the bounded condition forest. Boolean literals and equality in
+either operand order are supported, as are nested Boolean comparisons,
+length/literal comparisons, text/literal equality and text regex matches.
+An imported helper works through the normal import namespace. HTTP reads and
+response effects cannot run inside a message predicate. The borrowed message
+has no storage carrier outside its synchronous callback, and comparing entire
+messages is rejected. Callback-local bindings, parameter renaming, general
+arithmetic, domain enums and close-event values are not part of this step.
+
 After the route's HTTP guards pass, terminate mode validates the opening request
 before connecting to the selected upstream. The supported request shape is GET
 over HTTP/1.1 with exactly one non-empty Host, a `Connection` list containing the

@@ -20978,6 +20978,9 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     node.accessor = 18;
     node.bound = 2;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.accessor = 36;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);  // Missing equality children.
+    node.accessor = 35;
     node.accessor = 19;
     node.bound = 0;
     node.int_bound = (-9223372036854775807LL - 1);
@@ -21030,8 +21033,22 @@ TEST(jit, websocket_json_regex_storage_validation) {
     auto cg = codegen_ws_handler(0, &node, 1, 0);
     REQUIRE(cg.ok);
     dispose_module(cg.mod, cg.ctx);
-    node.accessor = 35;
+    node.accessor = 37;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+}
+
+TEST(jit, websocket_constant_predicates_validate_boolean_values) {
+    WsLenGuardSpec node{};
+    node.accessor = 35;
+    node.verdict = 1;
+    node.bound = 2;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    for (u32 value : {0u, 1u}) {
+        node.bound = value;
+        auto cg = codegen_ws_handler(0, &node, 1, 0);
+        REQUIRE(cg.ok);
+        dispose_module(cg.mod, cg.ctx);
+    }
 }
 
 TEST(jit, websocket_json_regex_errors_close_before_negation) {
