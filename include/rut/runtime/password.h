@@ -18,6 +18,13 @@ inline constexpr u32 kPasswordRecordBytes = 123;
 // retained input views. The salt and record are public; do not log passwords.
 bool password_hash(Str password, Str salt, char* output, u32 capacity, u32& output_len);
 
+// Preferred creation overload: obtains a fresh salt from the OS CSPRNG.
+// One nonblocking getrandom read on Linux; getentropy on other supported hosts.
+// Entropy error, interruption or short read fails closed without writing output.
+// Same offline/worker-only, expensive synchronous contract as the explicit-salt
+// overload above. No fallback entropy, allocation, or retained views.
+bool password_hash(Str password, char* output, u32 capacity, u32& output_len);
+
 // Only accepts our canonical fixed-cost record, rejecting malformed/unsupported
 // records before doing the KDF. Constant-time derived-key comparison. Both an
 // invalid record and an incorrect password return false. Not a Basic helper.

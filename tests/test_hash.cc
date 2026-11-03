@@ -1,3 +1,4 @@
+#include "../src/runtime/password_internal.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/password.h"
 #include "test.h"
@@ -456,6 +457,72 @@ TEST(password, malformed_records_and_invalid_inputs) {
         lit_str("password"), {kPasswordSalt, 16}, output, sizeof(output) - 1, length));
     CHECK(length == 0);
     for (char c : output) CHECK(c == '!');
+}
+
+TEST(password, random_salt_failure_and_preflight) {
+    char output[kPasswordRecordBytes];
+    for (char& c : output) c = '!';
+    u32 length = 99;
+    u32 calls = 0;
+    auto entropy = [&](u8* bytes, u32 count) -> i32 {
+        ++calls;
+        for (u32 i = 0; i < count; ++i) bytes[i] = 42;
+        return -1;
+    };
+    CHECK(!detail::password_hash_random({}, output, sizeof(output), length, entropy));
+    CHECK(!detail::password_hash_random({nullptr, 3}, output, sizeof(output), length, entropy));
+    CHECK(!detail::password_hash_random(
+        lit_str("password"), nullptr, sizeof(output), length, entropy));
+    CHECK(!detail::password_hash_random(
+        lit_str("password"), output, sizeof(output) - 1, length, entropy));
+    char oversized[kPasswordMaxBytes + 1]{};
+    CHECK(!detail::password_hash_random(
+        {oversized, sizeof(oversized)}, output, sizeof(output), length, entropy));
+    CHECK(calls == 0);
+    CHECK(length == 0);
+    CHECK(!detail::password_hash_random(
+        lit_str("password"), output, sizeof(output), length, entropy));
+    CHECK(calls == 1);
+    // Partial writes followed by failure never produce a stored credential.
+    const i32 results[] = {-1, 0, 1, 15, 17};
+    for (i32 result : results) {
+        CHECK(!detail::password_hash_random(lit_str("password"),
+                                            output,
+                                            sizeof(output),
+                                            length,
+                                            [result](u8* bytes, u32 count) -> i32 {
+                                                for (u32 i = 0; i < count; ++i) bytes[i] = 9;
+                                                return result;
+                                            }));
+        CHECK(length == 0);
+        for (char c : output) CHECK(c == '!');
+    }
+}
+
+TEST(password, random_salt_success_and_system_entropy) {
+    char output[kPasswordRecordBytes + 1]{};
+    output[kPasswordRecordBytes] = '!';
+    u32 length = 0;
+    u32 calls = 0;
+    REQUIRE(detail::password_hash_random(lit_str("password"),
+                                         output,
+                                         kPasswordRecordBytes,
+                                         length,
+                                         [&](u8* bytes, u32 count) -> i32 {
+                                             ++calls;
+                                             for (u32 i = 0; i < count; ++i)
+                                                 bytes[i] = static_cast<u8>(i);
+                                             return static_cast<i32>(count);
+                                         }));
+    CHECK(calls == 1);
+    CHECK((Str{output, length}.eq(kPasswordRecord)));
+    CHECK(output[kPasswordRecordBytes] == '!');
+    // Real OS entropy smoke test. Verification also confirms salt serialization.
+    REQUIRE(password_hash(lit_str("password"), output, kPasswordRecordBytes, length));
+    REQUIRE(length == kPasswordRecordBytes);
+    CHECK(password_verify(lit_str("password"), {output, length}));
+    CHECK(output[kPasswordRecordBytes] == '!');
+    // Avoid probabilistic assertions about RNG distribution or uniqueness.
 }
 
 int main(int argc, char** argv) {

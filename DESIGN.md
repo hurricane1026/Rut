@@ -9310,12 +9310,16 @@ outside this bounded profile.
 
 The native C++ `password_hash`/`password_verify` APIs implement one fixed,
 versioned PBKDF2-HMAC-SHA256 storage profile using existing stack-only HMAC:
-600,000 rounds, a caller-generated random 16-byte salt and a 32-byte key.
+600,000 rounds, a random 16-byte salt and a 32-byte key. The preferred native
+overload generates the salt via the OS CSPRNG, using a single nonblocking
+`getrandom` read on Linux or `getentropy` on macOS; entropy error/interruption
+or short read fails closed without writing output. Trusted callers may still
+supply an explicit salt.
 Passwords are exact nonempty bytes up to 1024 bytes; output is a strict
 123-byte ASCII record. Derived keys and HMAC scratch are cleansed, with
 constant-time key comparison. This adds no language surface or dependency.
 These deliberately slow synchronous APIs belong off the shard event loop.
-Worker scheduling, Rut/JIT integration, salt generation, user persistence and
+Worker scheduling, Rut/JIT integration, user persistence and
 account/password lifecycle remain future work; Basic auth retains its existing
 static credential contract. See [auth coverage](docs/auth-coverage.md#native-password-storage-primitive)
 for the full format, ownership, validation and failure contract.

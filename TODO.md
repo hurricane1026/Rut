@@ -784,7 +784,9 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 
 - [x] Native off-shard PBKDF2-HMAC-SHA256 fixed-profile hash/verify primitives,
   canonical bounded records, constant-time key comparison and independent vectors.
-- [ ] CSPRNG salt generation and bounded worker execution/cancellation before
-  exposing slow password verification to Rut/JIT/native-program handlers.
+- [x] Native password hashing overload with OS CSPRNG salt generation,
+  deterministic entropy/failure tests and fail-closed output handling.
+- [ ] Bounded worker execution/cancellation before exposing slow password
+  verification to Rut/JIT/native-program handlers.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
   rate limits, rehash migration and session/JWT login composition.
