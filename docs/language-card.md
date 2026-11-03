@@ -919,9 +919,13 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // path; nesting and Boolean guard ... else { nil } are supported. Selectors use
 // supported message predicates, run once when reached and skip extraction on nil.
 // All selector/AND/presence nodes share the 32-node budget; one binding call still
-// consumes one of four clauses. Different value-producing alternatives, helper
-// optional-binding guards, JSON mutations, dynamic pointers, other optional
-// computations, binding shorthand, loops and general computation remain unsupported.
+// consumes one of four clauses. Helpers also support JSON guard-let / if-let
+// with nil failure paths. Successful bindings can feed later get/scalar calls or
+// be returned; presence proofs remain scoped to the success continuation and
+// distinguish JSON paths. Returning the unwrapped binding does not repeat its
+// presence check. Different value-producing alternatives, JSON mutations, dynamic
+// pointers, other optional computations, binding shorthand, loops and general
+// computation remain unsupported.
 func messageDocument(_ msg: WebSocketMessage) -> Json => json.parse(msg.text)
 func jsonField(_ value: Json, _ pointer: str) -> Json => json.get(value, pointer)
 func jsonText(_ value: Json) -> str => json.string(value)

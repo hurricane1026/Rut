@@ -8617,15 +8617,71 @@ static FrontendResult<HirExpr> ws_json_proof_value(const WsJsonBinding& binding,
     return frontend_error(FrontendError::UnsupportedSyntax, span);
 }
 
+// Helper inlining copies expression trees. Match only the concrete expression
+// forms accepted by the bounded message projection/selector lowerers, never an
+// arbitrary optional computation. No pointer identity or generated local survives.
+static bool ws_same_json_helper_expr(const HirExpr& a, const HirExpr& b, u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes || a.kind != b.kind || a.type != b.type ||
+        a.may_nil != b.may_nil || a.may_error != b.may_error)
+        return false;
+    const auto kKind = a.kind;
+    if (kKind != HirExprKind::BoolLit && kKind != HirExprKind::IntLit &&
+        kKind != HirExprKind::StrLit && kKind != HirExprKind::BytesLit &&
+        kKind != HirExprKind::ConstWsCase && kKind != HirExprKind::LocalRef &&
+        kKind != HirExprKind::WsMessageField && kKind != HirExprKind::BytesCount &&
+        kKind != HirExprKind::Eq && kKind != HirExprKind::Lt && kKind != HirExprKind::Gt &&
+        kKind != HirExprKind::Or && kKind != HirExprKind::IfElse && kKind != HirExprKind::JsonOp &&
+        kKind != HirExprKind::HasValue && kKind != HirExprKind::ValueOf &&
+        kKind != HirExprKind::RegexMatch && kKind != HirExprKind::Nil)
+        return false;
+    if (a.int_value != b.int_value || a.bool_value != b.bool_value ||
+        a.local_index != b.local_index || !a.str_value.eq(b.str_value) || a.args.len != b.args.len)
+        return false;
+    const auto kSame = [&](const HirExpr* lhs, const HirExpr* rhs) {
+        if (!lhs || !rhs) return lhs == rhs;
+        return ws_same_json_helper_expr(*lhs, *rhs, depth + 1);
+    };
+    if (!kSame(a.lhs, b.lhs) || !kSame(a.rhs, b.rhs)) return false;
+    for (u32 i = 0; i < a.args.len; ++i)
+        if (!kSame(a.args[i], b.args[i])) return false;
+    return true;
+}
+
+struct WsJsonHelperProof {
+    const HirExpr* source = nullptr;
+    WsJsonBinding binding{};
+};
+using WsJsonHelperProofs = FixedVec<WsJsonHelperProof, HirWsHandler::kMaxConditionNodes>;
+
+static const WsJsonBinding* ws_json_helper_proof(const HirExpr& source,
+                                                 const WsJsonHelperProofs& proofs) {
+    for (u32 i = proofs.len; i != 0; --i)
+        if (proofs[i - 1].source && ws_same_json_helper_expr(source, *proofs[i - 1].source))
+            return &proofs[i - 1].binding;
+    return nullptr;
+}
+
 // Only earlier proven, immutable message projections may supply Json arguments.
 // Mutations, fallback expressions and helper control flow cannot masquerade as
 // a root-relative projection. Bound depth independently of helper nesting.
 static FrontendResult<Str> ws_json_proof_path(const HirExpr& value,
                                               const HirModule& mod,
+                                              const WsJsonHelperProofs& proofs,
                                               u32 depth = 0) {
-    if (depth >= HirWsHandler::kMaxConditionNodes || value.type != HirTypeKind::Json ||
-        value.may_nil || value.may_error || value.kind != HirExprKind::JsonOp ||
-        value.args.len == 0 || !value.args[0])
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    if (value.kind == HirExprKind::ValueOf && value.lhs && value.type == HirTypeKind::Json &&
+        !value.may_nil && !value.may_error) {
+        const auto* proof = ws_json_helper_proof(*value.lhs, proofs);
+        if (proof && (proof->kind == WsJsonBinding::Kind::Document ||
+                      proof->kind == WsJsonBinding::Kind::SelectedValue))
+            return proof->path;
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              value.span,
+                              lit_str("message JSON input requires a reached binding proof"));
+    }
+    if (value.type != HirTypeKind::Json || value.may_nil || value.may_error ||
+        value.kind != HirExprKind::JsonOp || value.args.len == 0 || !value.args[0])
         return frontend_error(FrontendError::UnsupportedSyntax, value.span);
     if (value.int_value == static_cast<i64>(json::Op::Parse) && value.args.len == 1 &&
         ws_typed_field(*value.args[0], lit_str("text")))
@@ -8633,7 +8689,7 @@ static FrontendResult<Str> ws_json_proof_path(const HirExpr& value,
     if (value.int_value != static_cast<i64>(json::Op::Get) || value.args.len != 2 ||
         !value.args[1] || value.args[1]->kind != HirExprKind::StrLit)
         return frontend_error(FrontendError::UnsupportedSyntax, value.span);
-    auto source = ws_json_proof_path(*value.args[0], mod, depth + 1);
+    auto source = ws_json_proof_path(*value.args[0], mod, proofs, depth + 1);
     if (!source) return core::make_unexpected(source.error());
     return ws_json_append_path(source.value(), value.args[1]->str_value, value.span, mod);
 }
@@ -8647,12 +8703,12 @@ static FrontendResult<u32> lower_ws_json_optional(const HirExpr& value,
                                                   HirRoute& route,
                                                   const HirModule& mod,
                                                   WsJsonBinding& binding,
+                                                  WsJsonHelperProofs& proofs,
                                                   bool is_operand = false,
                                                   u32 depth = 0) {
     if (depth >= HirWsHandler::kMaxConditionNodes)
         return frontend_error(FrontendError::TooManyItems, value.span);
-    if (!value.may_nil || value.may_error)
-        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    if (value.may_error) return frontend_error(FrontendError::UnsupportedSyntax, value.span);
     if (value.kind == HirExprKind::IfElse && value.lhs && value.rhs && value.args.len == 1 &&
         value.args[0]) {
         const bool kNilThen = value.rhs->kind == HirExprKind::Nil;
@@ -8662,11 +8718,33 @@ static FrontendResult<u32> lower_ws_json_optional(const HirExpr& value,
                                   value.span,
                                   lit_str("message optional helpers require one JSON projection "
                                           "and a nil alternative"));
-        auto condition = lower_ws_typed_condition(
-            *value.lhs, verdict, route.ws_handler, true, kNilThen, depth + 1);
-        if (!condition) return core::make_unexpected(condition.error());
-        auto present = lower_ws_json_optional(
-            kNilThen ? *value.args[0] : *value.rhs, verdict, route, mod, binding, true, depth + 1);
+        const u32 kSavedProofs = proofs.len;
+        FrontendResult<u32> condition =
+            frontend_error(FrontendError::UnsupportedSyntax, value.span);
+        if (value.lhs->kind == HirExprKind::HasValue && value.lhs->lhs) {
+            WsJsonBinding selected{};
+            condition = lower_ws_json_optional(
+                *value.lhs->lhs, verdict, route, mod, selected, proofs, true, depth + 1);
+            if (!condition) return core::make_unexpected(condition.error());
+            if (kNilThen) {
+                route.ws_handler.len_guards[condition.value()].negate ^= true;
+            } else if (!proofs.push({value.lhs->lhs, selected})) {
+                return frontend_error(FrontendError::TooManyItems, value.span);
+            }
+        } else {
+            condition = lower_ws_typed_condition(
+                *value.lhs, verdict, route.ws_handler, true, kNilThen, depth + 1);
+            if (!condition) return core::make_unexpected(condition.error());
+        }
+        auto present = lower_ws_json_optional(kNilThen ? *value.args[0] : *value.rhs,
+                                              verdict,
+                                              route,
+                                              mod,
+                                              binding,
+                                              proofs,
+                                              true,
+                                              depth + 1);
+        proofs.len = kSavedProofs;
         if (!present) return core::make_unexpected(present.error());
         WsLenGuard node{};
         node.accessor = WsLenGuard::Accessor::And;
@@ -8674,6 +8752,24 @@ static FrontendResult<u32> lower_ws_json_optional(const HirExpr& value,
         node.is_operand = is_operand;
         node.lhs = condition.value();
         node.rhs = present.value();
+        if (!route.ws_handler.len_guards.push(node))
+            return frontend_error(FrontendError::TooManyItems, value.span);
+        return route.ws_handler.len_guards.len - 1;
+    }
+    if (value.kind == HirExprKind::ValueOf && value.lhs && !value.may_nil) {
+        const auto* proof = ws_json_helper_proof(*value.lhs, proofs);
+        if (!proof)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                value.span,
+                lit_str("message optional value requires a reached binding proof"));
+        binding.kind = proof->kind;
+        binding.path = proof->path;
+        WsLenGuard node{};
+        node.accessor = WsLenGuard::Accessor::Constant;
+        node.bound = 1;
+        node.verdict = verdict;
+        node.is_operand = is_operand;
         if (!route.ws_handler.len_guards.push(node))
             return frontend_error(FrontendError::TooManyItems, value.span);
         return route.ws_handler.len_guards.len - 1;
@@ -8693,7 +8789,7 @@ static FrontendResult<u32> lower_ws_json_optional(const HirExpr& value,
             if (value.args.len != 1 || !ws_typed_field(*value.args[0], lit_str("text")))
                 return frontend_error(FrontendError::UnsupportedSyntax, value.span);
         } else {
-            auto path = ws_json_proof_path(*value.args[0], mod);
+            auto path = ws_json_proof_path(*value.args[0], mod, proofs);
             if (!path) return core::make_unexpected(path.error());
             if (projection.kind == WsJsonBinding::Kind::SelectedValue) {
                 if (value.args.len != 2 || !value.args[1] ||
@@ -8753,7 +8849,10 @@ static FrontendResult<u32> analyze_ws_json_binding(const AstStatement& stmt,
     if (!value) return core::make_unexpected(value.error());
     WsJsonBinding binding{};
     binding.name = stmt.name;
-    auto root = lower_ws_json_optional(value.value(), verdict, route, mod, binding);
+    if (!value->may_nil || value->may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    WsJsonHelperProofs proofs{};
+    auto root = lower_ws_json_optional(value.value(), verdict, route, mod, binding, proofs);
     if (!root) return core::make_unexpected(root.error());
     if (!documents.push(binding)) return frontend_error(FrontendError::TooManyItems, stmt.span);
     return root.value();

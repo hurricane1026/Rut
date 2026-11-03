@@ -460,6 +460,47 @@ return websocket(ws) { msg in
 """
 
 
+HELPER_BINDING_DECLARATIONS = r"""
+func readSelected(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = json.get(root, "/name") else { nil }
+    guard let gate = json.get(root, "/gate") else { nil }
+    if let text = json.string(field) { text } else { nil }
+}
+"""
+
+HELPER_BINDING_HANDLER = r"""
+return websocket(ws) { msg in
+    if let text = readSelected(msg) { msg.forward("<" + text + ">") }
+    else { msg.forward("absent") }
+}
+"""
+
+
+def helper_binding_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"helper binding: {actual=!r}, {expected=!r}")
+    data = b'{"gate":null,"name":"a\\u0000b"}'
+    first = bytearray(masked_frame(1, data[:13]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, data[13:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<a\0b>", True))
+    for payload, expected in ((b'{"gate":false,"name":""}', b"<>"),
+                              (b'{"name":"lost"}', b"absent"),
+                              (b'{"gate":0,"name":false}', b"absent"),
+                              (b"\xff\x00", b"absent")):
+        client.sendall(masked_frame(2, payload))
+        expect(peer, (1, expected, True))
+    payload = b'{"gate":null,"name":"peer"}'
+    peer.sendall(bytes((0x81, len(payload))) + payload)
+    expect(client, (1, b"<peer>", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
 def optional_condition_exchange(client, peer):
     def expect(sock, expected):
         actual = recv_client_frame(sock)
@@ -1539,6 +1580,7 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (HELPER_BINDING_HANDLER, helper_binding_exchange, HELPER_BINDING_DECLARATIONS),
                 (OPTIONAL_CONDITION_HANDLER, optional_condition_exchange,
                  OPTIONAL_CONDITION_DECLARATIONS),
                 (HELPER_GUARD_HANDLER, branch_guard_exchange, JSON_HELPER_DECLARATIONS),

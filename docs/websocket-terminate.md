@@ -309,9 +309,31 @@ else { msg.forward() }
 There must be one value-producing projection path; alternatives return `nil`.
 Selectors and presence tests share the 32-node condition budget, while the
 caller's guard/if-let consumes one of the four source clauses. Different
-value-producing branches, optional-binding guards inside helpers, JSON mutation,
-dynamic pointers, HTTP reads/effects and other optional computations remain
-unsupported. A helper
+value-producing branches, JSON mutation, dynamic pointers, HTTP reads/effects and
+other optional computations remain unsupported.
+
+JSON helpers may use ordinary `guard let` and `if let` with nil failure paths,
+then return the successful binding or extract from it:
+
+```swift
+func messageName(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = json.get(root, "/name") else { nil }
+    if let text = json.string(field) { text } else { nil }
+}
+// Inside callback:
+if let name = messageName(msg) { msg.forward(name) }
+else { msg.drop() }
+```
+
+Bindings retain ordinary helper scope and typing. Each reached presence check
+establishes a proof only for its success continuation; returning its unwrapped
+value does not repeat the presence check. Later extraction must match that
+proven expression, including its JSON path, and JSON inputs remain rooted in the
+immutable message. False, zero, empty strings and supported null nodes are still
+present values. These helpers work through import namespaces, using the same
+32-node and four-source-clause budgets. Different value-producing alternatives
+and general optional computations remain unsupported. A helper
 may accept the borrowed message or its text, or an earlier validated JSON alias;
 it cannot supply an unrelated JSON document. Initializer-less shorthand bindings
 remain unsupported.

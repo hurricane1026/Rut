@@ -1800,6 +1800,136 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, websocket_helper_bindings_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func readName(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = json.get(identity(root), "/name") else { nil }
+    guard let value = json.string(field) else { nil }
+    value
+}
+func readFlag(_ msg: WebSocketMessage) -> bool {
+    if let root = json.parse(msg.text) {
+        if let field = json.get(root, "/flag") {
+            if let value = json.bool(field) { value } else { nil }
+        } else { nil }
+    } else { nil }
+}
+func readRoot(_ msg: WebSocketMessage) -> Json {
+    guard let root = json.parse(msg.text) else { nil }
+    root
+}
+func readNested(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let child = json.get(root, "/a~1b") else { nil }
+    guard let field = json.get(child, "/~0") else { nil }
+    if let value = json.string(field) { value } else { nil }
+}
+func readSecond(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let first = json.get(root, "/a") else { nil }
+    guard let second = json.get(root, "/b") else { nil }
+    json.string(second)
+}
+route GET "/name" { return websocket(ws) { msg in
+    if let text = readName(msg) { msg.forward("<" + text + ">") }
+    else { msg.forward("absent") }
+} }
+route GET "/flag" { return websocket(ws) { msg in
+    if let value = readFlag(msg) {
+        if value == false { msg.forward("false") } else { msg.forward("true") }
+    } else { msg.forward("absent") }
+} }
+route GET "/root" { return websocket(ws) { msg in
+    guard let root = readRoot(msg) else { msg.close(1007) }
+    guard let text = json.string(root) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/nested" { return websocket(ws) { msg in
+    guard let text = readNested(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/different" { return websocket(ws) { msg in
+    if let text = readSecond(msg) { msg.forward(text) }
+    else { msg.forward("absent") }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& program = *owner.p;
+    REQUIRE_EQ(program.config.route_count, 5u);
+    const auto name = program.config.routes[0].ws_frame_handler;
+    const auto flag = program.config.routes[1].ws_frame_handler;
+    const auto root = program.config.routes[2].ws_frame_handler;
+    const auto nested = program.config.routes[3].ws_frame_handler;
+    const auto different = program.config.routes[4].ws_frame_handler;
+    REQUIRE(name);
+    REQUIRE(flag);
+    REQUIRE(root);
+    REQUIRE(nested);
+    REQUIRE(different);
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            const char* names[] = {
+                "{\"name\":\"a\\u0000b\"}", "{\"name\":\"\"}", "{}", "{\"name\":false}", "broken"};
+            for (u32 j = 0; j < 5; ++j)
+                CHECK(name(nullptr,
+                           op,
+                           reinterpret_cast<const u8*>(names[j]),
+                           static_cast<u32>(strlen(names[j])),
+                           client) ==
+                      (j < 2 ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+            const char* flags[] = {
+                "{\"flag\":false}", "{\"flag\":true}", "{\"flag\":null}", "{}", "broken"};
+            for (u32 j = 0; j < 5; ++j)
+                CHECK(flag(nullptr,
+                           op,
+                           reinterpret_cast<const u8*>(flags[j]),
+                           static_cast<u32>(strlen(flags[j])),
+                           client) == (j == 0   ? WsFrameAction::ForwardTextPolicy0
+                                       : j == 1 ? WsFrameAction::ForwardTextPolicy1
+                                                : WsFrameAction::ForwardText));
+            const char* roots[] = {"\"\"", "\"ok\"", "null", "false", "broken"};
+            for (u32 j = 0; j < 5; ++j)
+                CHECK(root(nullptr,
+                           op,
+                           reinterpret_cast<const u8*>(roots[j]),
+                           static_cast<u32>(strlen(roots[j])),
+                           client) == (j < 2    ? WsFrameAction::ForwardText
+                                       : j == 4 ? WsFrameAction::ClosePolicy0
+                                                : WsFrameAction::Drop));
+            const char* paths[] = {"{\"a/b\":{\"~\":\"ok\"}}",
+                                   "{\"a/b\":{\"~\":\"\"}}",
+                                   "{}",
+                                   "{\"a/b\":{\"~\":false}}"};
+            for (u32 j = 0; j < 4; ++j)
+                CHECK(nested(nullptr,
+                             op,
+                             reinterpret_cast<const u8*>(paths[j]),
+                             static_cast<u32>(strlen(paths[j])),
+                             client) == (j < 2 ? WsFrameAction::ForwardText : WsFrameAction::Drop));
+            const char* different_paths[] = {"{\"a\":null,\"b\":\"second\"}",
+                                             "{\"a\":\"first\",\"b\":\"\"}",
+                                             "{\"b\":\"second\"}",
+                                             "{\"a\":null,\"b\":false}"};
+            for (u32 j = 0; j < 4; ++j)
+                CHECK(different(nullptr,
+                                op,
+                                reinterpret_cast<const u8*>(different_paths[j]),
+                                static_cast<u32>(strlen(different_paths[j])),
+                                client) ==
+                      (j < 2 ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        }
+    }
+    CHECK(program.config.routes[0].ws_forward_texts[0].source_path.eq(lit_str("/name")));
+    CHECK(program.config.routes[3].ws_forward_text.source_path.eq(lit_str("/a~1b/~0")));
+    CHECK(program.config.routes[4].ws_forward_texts[0].source_path.eq(lit_str("/b")));
+}
+
 TEST(native_program, websocket_optional_conditions_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"

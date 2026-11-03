@@ -2975,9 +2975,26 @@ nodes are operands; only the final presence root is a source clause. All nodes
 share the existing 32-node budget, with one of four clauses per binding call.
 The alias is published only after the complete optional expression is lowered.
 
-Different value-producing alternatives, optional-binding guards inside helpers,
-JSON mutations, dynamic pointer expressions and other optional computations
-remain absent, as do initializer-less shorthand bindings. Helper calls add no
+JSON guard-let and if-let inside helpers use the ordinary normalized HasValue /
+ValueOf expressions. Lowering a reached HasValue appends its bounded optional
+predicate and records its source expression with the resulting projection only
+for the success continuation. ValueOf must structurally match a live proof;
+helper inlining copies expression trees, so pointer identity is insufficient.
+Matching is restricted to the concrete projection/selector expression forms and
+bounded nesting. It compares operation, type, missing channels, literal/field
+values, receiver and operands, distinguishing otherwise-similar JSON paths.
+
+A proven Json ValueOf supplies that root-relative path to later get/scalar
+operations. Returning a proven binding emits a constant-present operand instead
+of repeating its extraction. Proof scopes are restored before leaving the
+continuation, including failed lowering. Proofs stay in bounded compiler scratch;
+no value storage, runtime operation or serialization field is introduced. A
+caller binding publishes only the final successful projection. Nil failure arms
+and the one-value-path restriction remain in force.
+
+Different value-producing alternatives, JSON mutations, dynamic pointer
+expressions and other optional computations remain absent, as do initializer-less
+shorthand bindings. Helper calls add no
 runtime storage, native format or handler ABI.
 
 A branch sequence tracks its entry and pending continuation edge. A guard's
