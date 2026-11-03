@@ -1,4 +1,5 @@
 #include "rut/runtime/hash.h"
+#include "rut/runtime/password.h"
 #include "test.h"
 
 using namespace rut;
@@ -366,6 +367,95 @@ TEST(hash, exact_public_capacity_limits) {
                 {},
                 false,
                 lit_str("12564a07eb1f09728e729910398fd87f"));
+}
+
+namespace {
+constexpr char kPasswordSalt[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+constexpr auto kPasswordRecord = lit_str(
+    "$rut-pbkdf2-sha256$600000$000102030405060708090a0b0c0d0e0f$"
+    "3bc37118e625093e9b79ed08930ea7af7389591233fdd92dddf369371e60dbc0");
+}  // namespace
+
+TEST(password, independent_pbkdf2_vectors) {
+    // Expected keys generated independently with Python hashlib.pbkdf2_hmac,
+    // SHA-256, 600000 iterations, 32-byte output and salt bytes 00..0f.
+    const Str passwords[] = {
+        lit_str("password"),
+        lit_str("p\0ass"),
+        lit_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")};
+    const Str keys[] = {
+        lit_str("3bc37118e625093e9b79ed08930ea7af7389591233fdd92dddf369371e60dbc0"),
+        lit_str("ca6e6d4f7568ea657b09ce12636e811a2567b66d62f4a38c9a0752e3977d3e5d"),
+        lit_str("41ff739e02993513386b70b4c6781e18f8be16f03ad67d744de353d9117fbba9")};
+    for (u32 i = 0; i < 3; ++i) {
+        char output[kPasswordRecordBytes + 1]{};
+        output[kPasswordRecordBytes] = '!';
+        u32 length = 999;
+        REQUIRE(
+            password_hash(passwords[i], {kPasswordSalt, 16}, output, kPasswordRecordBytes, length));
+        CHECK(length == kPasswordRecordBytes);
+        CHECK(output[kPasswordRecordBytes] == '!');
+        CHECK((Str{output + length - 64, 64}.eq(keys[i])));
+        CHECK(password_verify(passwords[i], {output, length}));
+    }
+    CHECK(!password_verify(lit_str("Password"), kPasswordRecord));
+    CHECK(!password_verify(lit_str("password!"), kPasswordRecord));
+}
+
+TEST(password, maximum_length_and_overlapping_buffers) {
+    char password[kPasswordMaxBytes];
+    for (char& c : password) c = 'x';
+    char output[kPasswordRecordBytes];
+    u32 length = 0;
+    REQUIRE(password_hash(
+        {password, sizeof(password)}, {kPasswordSalt, 16}, output, sizeof(output), length));
+    CHECK((Str{output + length - 64, 64}.eq(
+        lit_str("e7ca86fcdbb39bab2f02b6f9ef1225d6009bf5e88f5c1520d8d142bb2b331454"))));
+    CHECK(password_verify({password, sizeof(password)}, {output, length}));
+    // The native API stages output, so an overlapping salt is consumed first.
+    for (u32 j = 0; j < 16; ++j) output[j] = kPasswordSalt[j];
+    REQUIRE(password_hash(lit_str("password"), {output, 16}, output, sizeof(output), length));
+    CHECK((Str{output, length}.eq(kPasswordRecord)));
+}
+
+TEST(password, malformed_records_and_invalid_inputs) {
+    char record[kPasswordRecordBytes + 1];
+    for (u32 i = 0; i < kPasswordRecordBytes; ++i) record[i] = kPasswordRecord.ptr[i];
+    record[kPasswordRecordBytes] = 0;
+    CHECK(!password_verify(lit_str("password"), {nullptr, kPasswordRecordBytes}));
+    CHECK(!password_verify(lit_str("password"), {record, kPasswordRecordBytes - 1}));
+    CHECK(!password_verify(lit_str("password"), {record, kPasswordRecordBytes + 1}));
+    // Version, iteration count, separators, uppercase salt, invalid hash/NUL.
+    const u32 positions[] = {0, 5, 18, 25, 32, 58, 59, 122};
+    for (u32 pos : positions) {
+        const char saved = record[pos];
+        record[pos] = 'Z';
+        CHECK(!password_verify(lit_str("password"), {record, kPasswordRecordBytes}));
+        record[pos] = 0;
+        CHECK(!password_verify(lit_str("password"), {record, kPasswordRecordBytes}));
+        record[pos] = saved;
+    }
+    CHECK(!password_verify({}, kPasswordRecord));
+    CHECK(!password_verify({nullptr, 5}, kPasswordRecord));
+    char too_long[kPasswordMaxBytes + 1]{};
+    CHECK(!password_verify({too_long, sizeof(too_long)}, kPasswordRecord));
+    char output[kPasswordRecordBytes];
+    for (char& c : output) c = '!';
+    u32 length = 42;
+    CHECK(!password_hash({}, {kPasswordSalt, 16}, output, sizeof(output), length));
+    CHECK(length == 0);
+    CHECK(!password_hash({nullptr, 4}, {kPasswordSalt, 16}, output, sizeof(output), length));
+    CHECK(!password_hash(
+        {too_long, sizeof(too_long)}, {kPasswordSalt, 16}, output, sizeof(output), length));
+    CHECK(!password_hash(lit_str("password"), {nullptr, 16}, output, sizeof(output), length));
+    CHECK(!password_hash(lit_str("password"), {kPasswordSalt, 15}, output, sizeof(output), length));
+    CHECK(!password_hash(lit_str("password"), {}, output, sizeof(output), length));
+    CHECK(
+        !password_hash(lit_str("password"), {kPasswordSalt, 16}, nullptr, sizeof(output), length));
+    CHECK(!password_hash(
+        lit_str("password"), {kPasswordSalt, 16}, output, sizeof(output) - 1, length));
+    CHECK(length == 0);
+    for (char c : output) CHECK(c == '!');
 }
 
 int main(int argc, char** argv) {
