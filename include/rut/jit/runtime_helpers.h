@@ -322,6 +322,9 @@ rut::u8 rut_helper_ws_json_string_at_path(const char* payload,
                                           rut::u64 len,
                                           const char* path,
                                           rut::u32 path_len);
+// 0=no match, 1=match, 2=decode/scan error; callers close on error before negation.
+rut::u8 rut_helper_ws_json_string_regex_at_path(
+    const char* payload, rut::u64 len, const char* path, rut::u32 path_len, void* database);
 rut::u8 rut_helper_ws_json_string_equals_at_path(const char* payload,
                                                  rut::u64 len,
                                                  const char* path,

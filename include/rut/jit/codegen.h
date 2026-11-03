@@ -72,7 +72,8 @@ struct WsLenGuardSpec {
                   //                                30=JsonStringifyEqual,
                   //                                31=JsonStringifyPrefix,
                   //                                32=JsonStringifySuffix,
-                  //                                33=JsonStringifyContains
+                  //                                33=JsonStringifyContains,
+                  //                                34=JsonStringRegex (path + regex in value)
     u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
     u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
                   // FromClient: 1 (client→upstream leg)
@@ -81,7 +82,7 @@ struct WsLenGuardSpec {
     // is authoritative).
     const char* pattern;
     u32 pattern_len;
-    const char* value = nullptr;  // JSON string/number-text predicates: literal bytes.
+    const char* value = nullptr;  // JSON predicates: literal bytes; JsonStringRegex: regex literal.
     u32 value_len = 0;
     // JsonBoolEqual: expected bool, stored in `bound`.
     i64 int_bound = 0;  // JsonIntCompare: i64; JsonCountCompare: validated i32.

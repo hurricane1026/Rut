@@ -4943,6 +4943,102 @@ TEST(serve_loader, attach_ws_terminate_to_jit_is_exact_and_fail_atomic) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_json_string_regex_matches_decoded_whole_values) {
+    const char* conditions[] = {"text.matches(re\"topic[.][0-9]+\")",
+                                "!text.matches(re\"topic[.][0-9]+\")",
+                                "!message.fromClient || text.matches(re\"topic[.][0-9]+\")"};
+    const char* values[] = {R"("topic.12")",
+                            R"("topic\u002e12")",
+                            R"("x topic.12")",
+                            R"("topic.12x")",
+                            R"("")",
+                            "null",
+                            "false",
+                            "12"};
+    for (bool selected : {false, true}) {
+        for (u32 c = 0; c < 3; ++c) {
+            std::string source =
+                "upstream ws at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(ws) { "
+                "message in\n"
+                "guard let document = json.parse(message.text) else { message.close(1007) }\n";
+            if (selected)
+                source +=
+                    "guard let field = json.get(document, \"/a~1b/\\0\") else { "
+                    "message.close(1008) }\n";
+            source += selected
+                          ? "guard let text = json.string(field) else { message.close(1003) }\n"
+                          : "guard let text = json.string(document) else { message.close(1003) }\n";
+            source += "guard ";
+            source += conditions[c];
+            source += " else { message.drop() }\nmessage.forward() } }\n";
+            const auto path = write_file("/tmp/rut_ws_json_regex", "app.rut", source.c_str());
+            LoadedProgram program;
+            LoadError err;
+            REQUIRE(load_rut_program(path.c_str(), program, err));
+            REQUIRE_EQ(unlink(path.c_str()), 0);
+            const auto handler = program.config.routes[0].ws_frame_handler;
+            REQUIRE(handler);
+            for (u32 i = 0; i < 8; ++i) {
+                const std::string payload =
+                    selected ? std::string("{\"a/b\":{\"\\u0000\":") + values[i] + "}}"
+                             : std::string(values[i]);
+                for (bool client : {false, true}) {
+                    for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                        const bool matches = i < 2;
+                        const bool accepts = c == 0   ? matches
+                                             : c == 1 ? !matches
+                                                      : !client || matches;
+                        const auto expected = i >= 5    ? (selected ? WsFrameAction::ClosePolicy2
+                                                                    : WsFrameAction::ClosePolicy1)
+                                              : accepts ? WsFrameAction::Forward
+                                                        : WsFrameAction::Drop;
+                        CHECK(handler(nullptr,
+                                      op,
+                                      reinterpret_cast<const u8*>(payload.data()),
+                                      payload.size(),
+                                      client) == expected);
+                    }
+                }
+            }
+            const char* malformed = "{";
+            CHECK(
+                handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(malformed), 1, true) ==
+                WsFrameAction::ClosePolicy0);
+            program.destroy();
+        }
+    }
+}
+
+TEST(serve_loader, websocket_json_string_regex_handles_nul_unicode_and_raw_regex_together) {
+    const auto path = write_file("/tmp/rut_ws_json_regex_binary", "app.rut", R"rut(
+upstream ws at "127.0.0.1:9999"
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let text = json.string(document) else { message.drop() }
+ guard message.text.matches(re".+") && text.matches(re"a\x00€b") else { message.drop() }
+ message.forward(text)
+} })rut");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    for (const char* payload : {R"("a\u0000\u20acb")", R"("a\u0000€b")"}) {
+        CHECK(handler(nullptr,
+                      WsOpcode::Binary,
+                      reinterpret_cast<const u8*>(payload),
+                      strlen(payload),
+                      false) == WsFrameAction::ForwardText);
+    }
+    for (const char* payload : {R"("a€b")", R"("a\u0000€bc")", R"("a\u0000")"}) {
+        CHECK(handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(payload),
+                      strlen(payload),
+                      true) == WsFrameAction::Drop);
+    }
+    program.destroy();
+}
+
 TEST(serve_loader, websocket_direct_json_scalar_comparisons_preserve_optional_truth_tables) {
     // Every payload is valid JSON. Failed extraction is nil, not false or zero.
     const char* payloads[] = {R"("ok")",

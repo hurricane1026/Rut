@@ -2712,6 +2712,19 @@ new binding remains unavailable in its own failure branch. Native layout and the
 handler ABI are unchanged. See the nested example in
 [terminate mode](docs/websocket-terminate.md).
 
+A guard-unwrapped `json.string` alias additionally supports `.matches(re"pattern")`
+with the ordinary regex literal validation and full-value semantics. The subject
+is decoded UTF-8, including NUL, and follows the same no-normalization rule as
+literal predicates. Logical negation and short-circuit conjunction/disjunction
+use the existing bounded condition forest. The compiled guard retains its JSON
+Pointer and regex pattern separately; the existing JIT/native regex finalization
+owns each database. A synchronous scanner borrows only the current thread's JSON
+decoding workspace, and no view crosses asynchronous I/O. Decode and regex scan
+errors are distinct from a non-match and close before negation. Optional calls,
+Json/numberText/stringify and other scalar aliases remain unsupported as regex
+receivers. This extends guard accessors and the native helper symbol table without
+changing the message handler ABI or native artifact layout.
+
 Direct optional extraction comparisons are also supported in message guards:
 `json.string(value) == "subscribe"`, `json.bool(value) == false`, and
 `json.int(value) == 42`, with `!=`, either operand order, nil comparisons, and
@@ -2741,8 +2754,8 @@ bounds remain fail-closed.
 `json.stringify(documentOrField)` binds the ordinary compact serialization of any
 previously unwrapped JSON value. It follows `Document::write`: strings and object
 keys are escaped, member order and number lexemes are preserved, and the existing
-writer capacity bounds output. The alias supports the same literal string
-comparisons and predicates as a string alias and can be the sole rewrite source
+writer capacity bounds output. The alias supports literal string comparisons and `isEmpty`/`hasPrefix`/
+`hasSuffix`/`contains`, and can be the sole rewrite source
 with fixed affixes. It has its own typed guard/source tag. The selected value is
 serialized and copied synchronously into the owned output slice; workspace views
 do not cross the callback.

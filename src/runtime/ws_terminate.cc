@@ -59,6 +59,25 @@ bool ws_json_string_at_path(const u8* payload, u64 len, Str path) {
     return kIsString;
 }
 
+WsJsonStringScanResult ws_json_scan_string_at_path(
+    const u8* payload, u64 len, Str path, WsJsonStringScanner scanner, void* context) {
+    json::Document& document = ws_json_document();
+    if (!scanner || !payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len)) {
+        document.source = {};
+        return WsJsonStringScanResult::Error;
+    }
+    const bool kParsed =
+        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const u32 kId = kParsed ? document.pointer(path) : json::kNone;
+    json::Writer decoded{document.scratch};
+    const bool kDecoded = kId != json::kNone && document.nodes[kId].kind == json::Kind::String &&
+                          document.string(kId, decoded) && decoded.ok;
+    document.source = {};
+    if (!kDecoded) return WsJsonStringScanResult::Error;
+    return scanner(context, {document.scratch, decoded.len});
+}
+
 bool ws_json_number_text_at_path(const u8* payload, u64 len, Str path) {
     json::Document& document = ws_json_document();
     if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||

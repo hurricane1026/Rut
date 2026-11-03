@@ -1045,6 +1045,66 @@ route GET "/root-number" { return websocket(backend) { message in
     CHECK(memcmp(root_output + 2, root_expected, sizeof(root_expected) - 1) == 0);
 }
 
+TEST(native_program, websocket_json_string_regex_survives_source_removal_and_multiple_routes) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"
+route GET "/root" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let text = json.string(document) else { message.close(1003) }
+ guard text.matches(re"sub[0-9]+") && message.text.matches(re".+") else { message.drop() }
+ message.forward()
+} }
+route GET "/selected" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/a~1b/\0") else { message.close(1008) }
+ guard let text = json.string(field) else { message.close(1003) }
+ guard !text.matches(re"deny[0-9]+") else { message.drop() }
+ message.forward()
+} }
+route GET "/other" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/other") else { message.close(1008) }
+ guard let text = json.string(field) else { message.close(1003) }
+ guard text.matches(re"other[0-9]+") else { message.drop() }
+ message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 3u);
+    struct Case {
+        u32 route;
+        const char* payload;
+        WsFrameAction action;
+    };
+    const Case cases[] = {
+        {0, R"("sub12")", WsFrameAction::Forward},
+        {0, R"("sub\u0031\u0032")", WsFrameAction::Forward},
+        {0, R"("sub12suffix")", WsFrameAction::Drop},
+        {0, R"("other7")", WsFrameAction::Drop},
+        {1, R"({"a/b":{"\u0000":"deny7"}})", WsFrameAction::Drop},
+        {1, R"({"a/b":{"\u0000":"xdeny7"}})", WsFrameAction::Forward},
+        {1, R"({"a/b":{"\u0000":null}})", WsFrameAction::ClosePolicy2},
+        {1, R"({"a/b":{}})", WsFrameAction::ClosePolicy1},
+        {2, R"({"other":"other9"})", WsFrameAction::Forward},
+        {2, R"({"other":"sub12"})", WsFrameAction::Drop},
+    };
+    for (const auto& c : cases) {
+        const auto handler = owner.p->config.routes[c.route].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(c.payload),
+                              strlen(c.payload),
+                              client) == c.action);
+            }
+        }
+    }
+}
+
 TEST(native_program, websocket_direct_json_scalar_guards_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"

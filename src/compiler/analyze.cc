@@ -7910,6 +7910,29 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
             return g;
         }
     }
+    if (cond.kind == AstExprKind::MethodCall && cond.lhs && cond.lhs->kind == AstExprKind::Ident &&
+        cond.name.eq(lit_str("matches"))) {
+        const WsJsonBinding* binding = ws_json_binding(documents, cond.lhs->name);
+        if (binding && binding->kind == WsJsonBinding::Kind::String) {
+            if (cond.args.len != 1 || !cond.args[0] || cond.args[0]->kind != AstExprKind::RegexLit)
+                return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
+            const Str kPattern = cond.args[0]->str_value;
+#if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
+            std::string regex_error;
+            if (!validate_regex_literal(kPattern, &regex_error))
+                return frontend_error(FrontendError::InvalidRegex,
+                                      cond.args[0]->span,
+                                      intern_generated_name(regex_error));
+#endif
+            WsLenGuard g{};
+            g.accessor = WsLenGuard::Accessor::JsonStringRegex;
+            g.pattern = binding->path;
+            g.value = kPattern;
+            g.negate = negate;
+            g.verdict = verdict;
+            return g;
+        }
+    }
     // Literal comparison is byte-exact, like ordinary string equality. Reuse the
     // expression decoder so escapes and embedded NULs have the same semantics.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {

@@ -12,6 +12,58 @@
 
 using namespace rut;
 
+TEST(ws_terminate, json_string_scanner_is_synchronous_bounded_and_recovers) {
+    using Result = WsJsonStringScanResult;
+    struct Probe {
+        u32 calls = 0;
+        Str expected;
+        Result result = Result::Match;
+        bool correct = true;
+    };
+    Probe probe{0, {"a\0\xe2\x82\xac", 5}, Result::Match};
+    auto scan = [](void* context, Str decoded) -> Result {
+        auto& p = *static_cast<Probe*>(context);
+        ++p.calls;
+        p.correct &= decoded.eq(p.expected);
+        return p.result;
+    };
+    const char* payload = R"({"a/b":{"\u0000":"a\u0000\u20ac"}})";
+    const Str path{"/a~1b/\0", 7};
+    auto inspect = [&](const char* text, u64 len, Str at) {
+        return ws_json_scan_string_at_path(
+            reinterpret_cast<const u8*>(text), len, at, scan, &probe);
+    };
+    CHECK_EQ(inspect(payload, strlen(payload), path), Result::Match);
+    CHECK_EQ(probe.calls, 1u);
+    probe.result = Result::NoMatch;
+    CHECK_EQ(inspect(payload, strlen(payload), path), Result::NoMatch);
+    probe.result = Result::Error;
+    CHECK_EQ(inspect(payload, strlen(payload), path), Result::Error);
+    const char* invalid[] = {
+        "{", "{}", "null", "123", "false", "[]", "\"\\ud800\"", "{\"x\":1,\"x\":2}"};
+    for (const char* bad : invalid) {
+        CHECK_EQ(inspect(bad, strlen(bad), path), Result::Error);
+    }
+    CHECK_EQ(inspect(payload, strlen(payload), {nullptr, 1}), Result::Error);
+    CHECK_EQ(inspect(payload, strlen(payload), {"/x", json::kMaxBytes + 1}), Result::Error);
+    CHECK_EQ(inspect(nullptr, 0x100000001ULL, path), Result::Error);
+    CHECK_EQ(inspect(reinterpret_cast<const char*>(1), 0x100000001ULL, path), Result::Error);
+    CHECK_EQ(ws_json_scan_string_at_path(
+                 reinterpret_cast<const u8*>(payload), strlen(payload), path, nullptr, &probe),
+             Result::Error);
+    CHECK_EQ(probe.calls, 3u);
+    char oversized[json::kMaxBytes + 1]{};
+    CHECK_EQ(inspect(oversized, sizeof(oversized), {}), Result::Error);
+    probe.expected = {};
+    probe.result = Result::Match;
+    CHECK_EQ(inspect("\"\"", 2, {}), Result::Match);
+    CHECK_EQ(probe.calls, 4u);
+    probe.expected = {"a\0\xe2\x82\xac", 5};
+    CHECK_EQ(inspect(payload, strlen(payload), path), Result::Match);
+    CHECK_EQ(probe.calls, 5u);
+    CHECK(probe.correct);
+}
+
 TEST(ws_terminate, json_payload_validation_bounds_and_recovery) {
     auto valid = [](const char* text, u64 len) {
         return ws_valid_json_payload(reinterpret_cast<const u8*>(text), len);

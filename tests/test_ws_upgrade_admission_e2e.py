@@ -160,6 +160,44 @@ def direct_json_exchange(client, peer):
     expect(client, (8, b"\x03\xf0", False))
 
 
+JSON_REGEX_HANDLER = r"""
+return websocket(ws) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let field = json.get(document, "/name") else { message.close(1008) }
+    guard let name = json.string(field) else { message.close(1003) }
+    guard !name.matches(re"deny[0-9]+") else { message.drop() }
+    message.forward("<" + name + ">")
+}
+"""
+
+
+def json_regex_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"decoded JSON regex: {actual=!r}, {expected=!r}")
+
+    denied = b'{"name":"deny\\u0037"}'
+    first = bytearray(masked_frame(1, denied[:12]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, denied[12:]) +
+                   masked_frame(2, b'{"name":"allow12"}'))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<allow12>", True))
+    client.sendall(masked_frame(1, b'{"name":"xdeny7"}') +
+                   masked_frame(1, b'{"name":"deny\\u0000"}'))
+    expect(peer, (1, b"<xdeny7>", True))
+    expect(peer, (1, b"<deny\0>", True))
+    peer.sendall(bytes((0x02, 12)) + denied[:12] + b"\x8a\x01p" +
+                 bytes((0x80, len(denied) - 12)) + denied[12:] +
+                 b'\x82\x16{"name":"deny7suffix"}')
+    expect(client, (10, b"p", False))
+    expect(client, (1, b"<deny7suffix>", False))
+    client.sendall(masked_frame(2, b'{"name":false}'))
+    expect(peer, (8, b"\x03\xeb", True))
+    expect(client, (8, b"\x03\xeb", False))
+
+
 def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, exchange=binary_exchange):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-binary-") as temp:
         upstream.bind(("127.0.0.1", 0))
@@ -1119,6 +1157,17 @@ def main():
                 print(f"SKIP {backend}: {details.strip()}")
             else:
                 print(f"PASS {backend} direct JSON scalar guards native={native}")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, JSON_REGEX_HANDLER, json_regex_exchange)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, JSON_REGEX_HANDLER, json_regex_exchange)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} decoded JSON regex native={native}")
         status, details = subprotocol_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")

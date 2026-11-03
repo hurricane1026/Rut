@@ -28,6 +28,13 @@ constexpr bool ws_valid_message_capacity(u32 size) {
 
 enum class WsJsonStringMatch : u8 { Equal, Prefix, Suffix, Contains };
 enum class WsJsonIntComparison : u8 { Lt, Gt, Eq };
+enum class WsJsonStringScanResult : u8 { NoMatch, Match, Error };
+using WsJsonStringScanner = WsJsonStringScanResult (*)(void*, Str);
+
+// Decode in the existing thread-local workspace and scan synchronously. The
+// scanner must not retain the view or reenter JSON helpers using that workspace.
+WsJsonStringScanResult ws_json_scan_string_at_path(
+    const u8* payload, u64 len, Str path, WsJsonStringScanner scanner, void* context);
 
 // Valid UTF-8 for a text message; an empty view is valid.
 bool ws_valid_text_payload(Str text);

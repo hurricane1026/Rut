@@ -21016,6 +21016,85 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 
+TEST(jit, websocket_json_regex_storage_validation) {
+    WsLenGuardSpec node{};
+    node.accessor = 34;
+    node.verdict = 1;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.value_len = 2;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.value = "ok";
+    node.pattern_len = 1;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.pattern_len = 0;
+    auto cg = codegen_ws_handler(0, &node, 1, 0);
+    REQUIRE(cg.ok);
+    dispose_module(cg.mod, cg.ctx);
+    node.accessor = 35;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+}
+
+TEST(jit, websocket_json_regex_errors_close_before_negation) {
+    for (u8 negate : {0, 1}) {
+        WsLenGuardSpec node{};
+        node.accessor = 34;
+        node.verdict = 1;
+        node.negate = negate;
+        node.value = "ok";
+        node.value_len = 2;
+        auto cg = codegen_ws_handler(0, &node, 1, 0);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        const auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+        REQUIRE(handler);
+        const char* yes = "\"ok\"";
+        const char* no = "\"no\"";
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(yes), 4, true) ==
+              (negate ? WsFrameAction::Drop : WsFrameAction::Forward));
+        CHECK(handler(nullptr, WsOpcode::Binary, reinterpret_cast<const u8*>(no), 4, false) ==
+              (negate ? WsFrameAction::Forward : WsFrameAction::Drop));
+        for (const char* bad : {"{", "null", "false", "\"\\ud800\""}) {
+            CHECK(
+                handler(
+                    nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(bad), strlen(bad), true) ==
+                WsFrameAction::Close);
+        }
+        CHECK(handler(
+                  nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(1), 0x100000001ULL, true) ==
+              WsFrameAction::Close);
+        CHECK_EQ(rut_helper_ws_json_string_regex_at_path(yes, 4, nullptr, 0, nullptr), 2u);
+        engine.shutdown();
+    }
+}
+
+TEST(jit, websocket_json_regex_short_circuit_skips_decode_and_scan) {
+    WsLenGuardSpec nodes[3]{};
+    nodes[0].accessor = 2;  // !fromClient
+    nodes[0].bound = 0;
+    nodes[0].cmp = 2;  // Eq
+    nodes[0].is_operand = true;
+    nodes[1].accessor = 34;
+    nodes[1].value = "ok";
+    nodes[1].value_len = 2;
+    nodes[1].is_operand = true;
+    nodes[2].accessor = 5;  // !fromClient || regex
+    nodes[2].lhs = 0;
+    nodes[2].rhs = 1;
+    nodes[2].verdict = 1;
+    auto cg = codegen_ws_handler(0, nodes, 3, 0);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+    REQUIRE(handler);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(1), 4, false) ==
+          WsFrameAction::Forward);
+    engine.shutdown();
+}
+
 // Compile a `websocket(x){ message in message.<verdict>() }` program end-to-end through the
 // constant-verdict message-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup ->
 // CALL), and return the verdict the compiled function actually produces. Returns 255 on any

@@ -30,6 +30,7 @@
 #include <unistd.h>
 #endif
 #include <hs.h>
+#include <hs_common.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2018,16 +2019,16 @@ void rut_helper_regex_free(void* db) {
     free(handle);
 }
 
-u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
-    if (!s || !db) return 0;
+static u8 regex_match_result(const char* s, u32 s_len, void* db) {
+    if (!s || !db) return 2;
     auto* handle = static_cast<RegexHandle*>(db);
     hs_database_t* regex_db = nullptr;
-    if (!begin_regex_scan(handle, &regex_db)) return 0;
+    if (!begin_regex_scan(handle, &regex_db)) return 2;
     RegexScratchCache* cache = get_regex_scratch_cache();
     if (cache == nullptr) {
         end_regex_scan(handle);
         regex_runtime_error("unable to create thread-local scratch cache");
-        return 0;
+        return 2;
     }
     pthread_mutex_lock(&cache->mutex);
     hs_scratch_t* scratch = cache->get(handle);
@@ -2035,7 +2036,7 @@ u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
         pthread_mutex_unlock(&cache->mutex);
         end_regex_scan(handle);
         regex_runtime_error("scratch allocation failed");
-        return 0;
+        return 2;
     }
 
     RegexMatchCtx ctx{};
@@ -2043,7 +2044,12 @@ u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
     hs_error_t rc = hs_scan(regex_db, s, s_len, 0, scratch, on_full_regex_match, &ctx);
     pthread_mutex_unlock(&cache->mutex);
     end_regex_scan(handle);
-    return (rc == HS_SUCCESS || rc == HS_SCAN_TERMINATED) && ctx.matched ? 1 : 0;
+    if (rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED) return 2;
+    return ctx.matched ? 1 : 0;
+}
+
+u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
+    return regex_match_result(s, s_len, db) == 1 ? 1u : 0u;
 }
 
 u8 rut_helper_regex_backend_available() {
@@ -2275,6 +2281,19 @@ extern "C" u8 rut_helper_ws_json_has_path(const char* payload,
 
 extern "C" u8 rut_helper_ws_json_valid(const char* payload, u64 len) {
     return ws_valid_json_payload(reinterpret_cast<const u8*>(payload), len) ? 1u : 0u;
+}
+
+extern "C" u8 rut_helper_ws_json_string_regex_at_path(
+    const char* payload, u64 len, const char* path, u32 path_len, void* database) {
+    return static_cast<u8>(ws_json_scan_string_at_path(
+        reinterpret_cast<const u8*>(payload),
+        len,
+        {path, path_len},
+        [](void* context, Str decoded) {
+            return static_cast<WsJsonStringScanResult>(
+                regex_match_result(decoded.ptr, decoded.len, context));
+        },
+        database));
 }
 
 extern "C" u8 rut_helper_ws_json_string_at_path(const char* payload,

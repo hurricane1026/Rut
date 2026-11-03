@@ -194,6 +194,31 @@ escape forms decode before matching, and Unicode is not normalized. An empty
 prefix, suffix, or contains needle matches every valid string. JSON type and
 parse checks still run before an empty predicate can match.
 
+A guard-unwrapped `json.string` alias also supports `.matches(re"pattern")`,
+using the existing regular expression engine and whole-value matching:
+
+```swift
+guard let document = json.parse(message.text) else { message.close(1007) }
+guard let field = json.get(document, "/topic") else { message.close(1008) }
+guard let topic = json.string(field) else { message.close(1003) }
+guard !topic.matches(re"private[.][0-9]+") else { message.drop() }
+message.forward()
+```
+
+Matching uses decoded UTF-8 bytes, so `"topic\u002e12"` and `"topic.12"`
+have the same subject. Embedded NUL is preserved; use the ordinary regex escape
+`\x00` to match it. `!`, `&&` and `||` retain short-circuit semantics. Patterns
+must be regex literals and receive the existing compile-time validation. Optional
+extraction calls, Json values, `numberText`, `stringify` and other scalar aliases
+do not support this operation.
+
+The runtime decodes into its existing per-thread JSON workspace and scans during
+that synchronous callback. No decoded view escapes to asynchronous I/O. Patterns
+use the existing owned regex databases and scratch cache, including in native
+artifacts after source removal. A reached decode or scan error closes the tunnel
+before negation is applied; an error cannot become a successful negated match.
+The four-guard and 32-condition-node limits remain unchanged.
+
 Aliases are compile-time paths into the immutable message: each reached check
 reparses the bounded payload and retains no JSON node or borrowed string view.
 A `json.get` source may be the document or an earlier guard-unwrapped selected
@@ -286,8 +311,8 @@ Missing/non-number values, parser-limit failures, and output overflow fail close
 
 `json.stringify(documentOrField)` binds the compact serialization of any JSON value
 using the ordinary JSON writer. Strings and object keys are escaped as JSON text;
-object member order and number lexemes are preserved. The alias supports the same
-literal string comparisons and predicates and can be the sole dynamic source in a
+object member order and number lexemes are preserved. The alias supports literal string comparisons and the `isEmpty`, `hasPrefix`,
+`hasSuffix` and `contains` predicates, and can be the sole dynamic source in a
 fixed-affix rewrite. Serialization is bounded by the existing writer capacity, and
 the result is copied to owned output before asynchronous sending.
 

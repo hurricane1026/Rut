@@ -91,6 +91,7 @@
     X(rut_helper_ws_json_has_path)                    \
     X(rut_helper_ws_json_valid)                       \
     X(rut_helper_ws_json_string_at_path)              \
+    X(rut_helper_ws_json_string_regex_at_path)        \
     X(rut_helper_ws_json_string_equals_at_path)       \
     X(rut_helper_ws_json_string_matches_at_path)      \
     X(rut_helper_ws_json_number_text_at_path)         \

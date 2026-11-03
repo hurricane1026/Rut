@@ -5946,6 +5946,95 @@ route GET "/ws" { return websocket(ws) { message in
     CHECK(copied.block_stmts[2]->expr.is_synthesized_negation);
 }
 
+TEST(frontend, websocket_json_string_regex_uses_decoded_alias_path) {
+    for (bool nested : {false, true}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.drop() }\n";
+        if (nested)
+            source +=
+                "guard let field = json.get(document, \"/a~1b/\\0\") else { message.drop() }\n";
+        source += nested ? "guard let text = json.string(field) else { message.drop() }\n"
+                         : "guard let text = json.string(document) else { message.drop() }\n";
+        source +=
+            "guard !message.fromClient || !text.matches(re\"sub[0-9]+\") else { message.drop() }\n"
+            "message.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& nodes = hir->routes[0].ws_handler.len_guards;
+        bool found = false;
+        for (u32 i = 0; i < nodes.len; ++i) {
+            if (nodes[i].accessor != WsLenGuard::Accessor::JsonStringRegex) continue;
+            found = true;
+            CHECK(nodes[i].pattern.eq(nested ? Str{"/a~1b/\0", 7} : Str{}));
+            CHECK(nodes[i].value.eq(lit("sub[0-9]+")));
+            CHECK(nodes[i].negate);
+        }
+        CHECK(found);
+    }
+}
+
+TEST(frontend, websocket_json_string_regex_rejects_optional_and_non_string_sources) {
+    for (const char* expression : {"document.matches(re\"x\")",
+                                   "field.matches(re\"x\")",
+                                   "json.string(field).matches(re\"x\")",
+                                   "text.matches(\"x\")",
+                                   "text.matches(message.text)",
+                                   "text.matches(re\"x\", re\"y\")"}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.drop() }\n"
+            "guard let field = json.get(document, \"/name\") else { message.drop() }\n"
+            "guard let text = json.string(field) else { message.drop() }\nguard ";
+        source += expression;
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    for (const char* accessor : {"bool", "int", "numberText", "stringify", "kind", "count"}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
+            "guard let document = json.parse(message.text) else { message.drop() }\n"
+            "guard let value = json.";
+        source += accessor;
+        source +=
+            "(document) else { message.drop() }\n"
+            "guard value.matches(re\"x\") else { message.drop() }\nmessage.forward() } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+#if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
+TEST(frontend, websocket_json_string_regex_reports_invalid_pattern_span) {
+    const char* source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let text = json.string(document) else { message.drop() }
+ guard text.matches(re"[") else { message.drop() }
+ message.forward()
+} })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::InvalidRegex);
+    CHECK_EQ(hir.error().span.start, static_cast<u32>(strstr(source, "re\"[\"") + 3 - source));
+}
+#endif
+
 TEST(frontend, websocket_json_string_aliases_are_typed_and_bounded) {
     const char* source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { message in

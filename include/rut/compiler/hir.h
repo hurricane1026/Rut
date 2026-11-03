@@ -1130,7 +1130,8 @@ struct WsLenGuard {
         JsonStringifyEqual,
         JsonStringifyPrefix,
         JsonStringifySuffix,
-        JsonStringifyContains
+        JsonStringifyContains,
+        JsonStringRegex
     };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
@@ -1141,6 +1142,7 @@ struct WsLenGuard {
     // through codegen. JsonHasPath/JsonStringValid: decoded JSON Pointer.
     // JsonStringEqual/Prefix/Suffix/Contains: pattern is the pointer and value is the
     // decoded expected string (empty for isEmpty).
+    // JsonStringRegex: pattern is the pointer; value is the regex pattern contents.
     // JsonBoolValid/Equal: pattern is the JSON Pointer; bound is the expected bool for Equal.
     // JsonKindEqual: pattern is the JSON Pointer; value is an expected kind name.
     // JsonCountValid/Compare: pattern is the JSON Pointer; int_bound is a signed i32 literal.

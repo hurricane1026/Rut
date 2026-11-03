@@ -941,6 +941,22 @@ return websocket(chat) { message in
 // selection too; its literal pointer is relative to that value. Dynamic paths,
 // arbitrary extraction and mutation remain unsupported; no Unicode normalization occurs.
 
+// Match an unwrapped JSON string's decoded bytes with a regex literal. Matches
+// cover the whole value; use .* for substring rules. Escaped JSON characters,
+// Unicode and NUL are decoded before scanning, without normalization.
+return websocket(chat) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let field = json.get(document, "/topic") else { message.close(1008) }
+    guard let topic = json.string(field) else { message.close(1003) }
+    guard !topic.matches(re"private[.][0-9]+") else { message.drop() }
+    message.forward()
+}
+// !/&&/|| short-circuit. Patterns use existing compile-time regex validation.
+// Only guard-unwrapped json.string aliases support this operation; optional calls,
+// Json values, numberText/stringify and other scalar aliases reject. A reached
+// decoding/scan error closes before applying negation. The existing workspace,
+// regex database ownership, native relocation and guard/node limits are retained.
+
 // Select nested JSON values with separate optional guards. Empty pointers retain
 // the source value, including JSON null. Escaped tokens, indices and NUL work as
 // ordinary RFC 6901 pointers. Presence comparisons also accept selected Json aliases.

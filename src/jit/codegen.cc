@@ -3147,10 +3147,10 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 33 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 34 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
-        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 33) ||
+        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 34) ||
              guards[i].accessor == 3 || (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
             guards[i].pattern_len != 0 && !guards[i].pattern)
             return false;
@@ -3158,6 +3158,8 @@ bool emit_ws_handler(LLVMModuleRef mod,
              (guards[i].accessor >= 25 && guards[i].accessor <= 28) ||
              (guards[i].accessor >= 30 && guards[i].accessor <= 33)) &&
             guards[i].value_len != 0 && !guards[i].value)
+            return false;
+        if (guards[i].accessor == 34 && (!guards[i].value || guards[i].value_len == 0))
             return false;
         if ((guards[i].accessor == 24 || guards[i].accessor == 29) && guards[i].value_len != 0)
             return false;
@@ -3489,7 +3491,10 @@ bool emit_ws_handler(LLVMModuleRef mod,
                 LLVMBuildCall2(builder, ty, fn, args, kValidOnly ? 4 : 7, "json.stringify");
             cond = LLVMBuildICmp(
                 builder, LLVMIntNE, result, LLVMConstInt(i8_ty, 0, 0), "json.stringify.matches");
-        } else if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
+        } else if (guards[i].accessor == 3 || guards[i].accessor == 34) {
+            const bool kJsonString = guards[i].accessor == 34;
+            const char* pattern = kJsonString ? guards[i].value : guards[i].pattern;
+            const u32 kPatternLen = kJsonString ? guards[i].value_len : guards[i].pattern_len;
             // Emit the pattern + db globals JIT finalization compiles & back-patches. The `ws<id>`
             // suffix keeps these distinct from the HTTP regex globals already in this module.
             char pat_name[96];
@@ -3497,8 +3502,8 @@ bool emit_ws_handler(LLVMModuleRef mod,
             snprintf(pat_name, sizeof(pat_name), "__rut_regex_pattern_ws%u_%u", id, regex_seq);
             snprintf(db_name, sizeof(db_name), "__rut_regex_db_ws%u_%u", id, regex_seq);
             regex_seq++;
-            LLVMValueRef str_const = LLVMConstStringInContext(
-                ctx, guards[i].pattern, guards[i].pattern_len, /*DontNullTerminate=*/0);
+            LLVMValueRef str_const =
+                LLVMConstStringInContext(ctx, pattern, kPatternLen, /*DontNullTerminate=*/0);
             LLVMValueRef pat_global = LLVMAddGlobal(mod, LLVMTypeOf(str_const), pat_name);
             LLVMSetInitializer(pat_global, str_const);
             LLVMSetGlobalConstant(pat_global, 1);
@@ -3507,15 +3512,46 @@ bool emit_ws_handler(LLVMModuleRef mod,
             LLVMValueRef db_global = LLVMAddGlobal(mod, ptr_ty, db_name);
             LLVMSetLinkage(db_global, LLVMExternalLinkage);
 
-            LLVMValueRef rx_fn = LLVMGetNamedFunction(mod, "rut_helper_str_regex_match");
-            if (!rx_fn) rx_fn = LLVMAddFunction(mod, "rut_helper_str_regex_match", rx_fn_ty);
             LLVMValueRef db = LLVMBuildLoad2(builder, ptr_ty, db_global, "regex.db");
-            LLVMValueRef len32 = LLVMBuildTrunc(builder, len, i32_ty, "len32");
-            LLVMValueRef rx_args[3] = {payload, len32, db};
-            LLVMValueRef r = LLVMBuildCall2(builder, rx_fn_ty, rx_fn, rx_args, 3, "rx");
-            LLVMValueRef is_match =
-                LLVMBuildICmp(builder, LLVMIntNE, r, LLVMConstInt(i8_ty, 0, 0), "rx.m");
-            cond = is_match;
+            if (kJsonString) {
+                LLVMTypeRef json_params[5] = {ptr_ty, i64_ty, ptr_ty, i32_ty, ptr_ty};
+                LLVMTypeRef json_ty = LLVMFunctionType(i8_ty, json_params, 5, 0);
+                LLVMValueRef scan_fn =
+                    LLVMGetNamedFunction(mod, "rut_helper_ws_json_string_regex_at_path");
+                if (!scan_fn)
+                    scan_fn =
+                        LLVMAddFunction(mod, "rut_helper_ws_json_string_regex_at_path", json_ty);
+                LLVMValueRef path_bytes = LLVMConstStringInContext(
+                    ctx, guards[i].pattern ? guards[i].pattern : "", guards[i].pattern_len, 1);
+                LLVMValueRef path = LLVMAddGlobal(mod, LLVMTypeOf(path_bytes), "json.regex.path");
+                LLVMSetInitializer(path, path_bytes);
+                LLVMSetGlobalConstant(path, 1);
+                LLVMSetLinkage(path, LLVMPrivateLinkage);
+                LLVMSetUnnamedAddress(path, LLVMGlobalUnnamedAddr);
+                LLVMValueRef args[5] = {
+                    payload, len, path, LLVMConstInt(i32_ty, guards[i].pattern_len, 0), db};
+                LLVMValueRef result =
+                    LLVMBuildCall2(builder, json_ty, scan_fn, args, 5, "json.regex");
+                LLVMBasicBlockRef scanned = LLVMAppendBasicBlockInContext(ctx, fn, "json.regex.ok");
+                LLVMBasicBlockRef error =
+                    LLVMAppendBasicBlockInContext(ctx, fn, "json.regex.error");
+                LLVMValueRef valid = LLVMBuildICmp(
+                    builder, LLVMIntULE, result, LLVMConstInt(i8_ty, 1, 0), "json.regex.valid");
+                LLVMBuildCondBr(builder, valid, scanned, error);
+                LLVMPositionBuilderAtEnd(builder, error);
+                // Decode and regex resource errors close before applying logical negation.
+                LLVMBuildRet(builder, LLVMConstInt(i8_ty, 2, 0));  // WsFrameAction::Close
+                LLVMPositionBuilderAtEnd(builder, scanned);
+                cond = LLVMBuildICmp(
+                    builder, LLVMIntEQ, result, LLVMConstInt(i8_ty, 1, 0), "json.regex.matches");
+            } else {
+                LLVMValueRef rx_fn = LLVMGetNamedFunction(mod, "rut_helper_str_regex_match");
+                if (!rx_fn) rx_fn = LLVMAddFunction(mod, "rut_helper_str_regex_match", rx_fn_ty);
+                LLVMValueRef len32 = LLVMBuildTrunc(builder, len, i32_ty, "len32");
+                LLVMValueRef rx_args[3] = {payload, len32, db};
+                LLVMValueRef result = LLVMBuildCall2(builder, rx_fn_ty, rx_fn, rx_args, 3, "rx");
+                cond = LLVMBuildICmp(builder, LLVMIntNE, result, LLVMConstInt(i8_ty, 0, 0), "rx.m");
+            }
         } else if (guards[i].accessor >= 6) {  // TextEqual / TextPrefix / TextSuffix / TextContains
             // Check the full 64-bit length before reading a literal-sized view.
             // Prefix/suffix comparisons never read beyond a short message.
