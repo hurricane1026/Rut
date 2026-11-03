@@ -1603,6 +1603,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
+    if (value.kind == MirValueKind::ReqTlsClientCertSha256) {
+        auto v = b.emit_req_tls_client_cert_sha256({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
     if (value.kind == MirValueKind::ReqPath) {
         auto v = b.emit_req_path({span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);

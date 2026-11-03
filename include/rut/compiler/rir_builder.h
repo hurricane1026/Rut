@@ -593,6 +593,12 @@ struct Builder {
         return TRY(emit(Opcode::ReqQueryString, ty, loc)).vid;
     }
 
+    Result<ValueId> emit_req_tls_client_cert_sha256(SourceLoc loc = {}) {
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        return TRY(emit(Opcode::ReqTlsClientCertSha256, ty, loc)).vid;
+    }
+
     // ── Request mutation ────────────────────────────────────────────
 
     VoidResult emit_req_set_header(Str name, ValueId val, SourceLoc loc = {}) {

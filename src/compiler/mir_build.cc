@@ -696,6 +696,12 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.may_nil = true;
         return v;
     }
+    if (expr.kind == HirExprKind::ReqTlsClientCertSha256) {
+        v.kind = MirValueKind::ReqTlsClientCertSha256;
+        v.type = MirTypeKind::Str;
+        v.may_nil = true;
+        return v;
+    }
     if (expr.kind == HirExprKind::ReqPath) {
         v.kind = MirValueKind::ReqPath;
         v.type = MirTypeKind::Str;

@@ -19,6 +19,7 @@ inline constexpr u32 kMaxConstantTimeEqualBytes = 16 * 1024;
 extern "C" {
 
 // ── Request Access ─────────────────────────────────────────────────
+rut::u8 rut_helper_sha256_hex_valid(const char* value, rut::u32 len);
 
 // Extract request path from raw HTTP request.
 // Sets *out_ptr and *out_len to the path string (points into req_data).
@@ -33,6 +34,13 @@ void rut_helper_req_path_only(const rut::u8* req_data,
                               rut::u32 req_len,
                               const char** out_ptr,
                               rut::u32* out_len);
+
+// Expose only the immutable, verified handshake identity owned by this
+// downstream connection; absent for cleartext and ordinary server TLS.
+void rut_helper_req_tls_client_cert_sha256(void* conn,
+                                           rut::u8* out_has,
+                                           const char** out_ptr,
+                                           rut::u32* out_len);
 
 // Extract the declared request body bytes, bounded by Content-Length.
 // Returns an empty string if headers are incomplete, Content-Length is absent,

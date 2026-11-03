@@ -8524,6 +8524,46 @@ TEST(frontend, invalid_regex_literal_is_rejected_during_analysis) {
 }
 #endif
 
+TEST(frontend, request_tls_client_fingerprint_is_optional_and_auth_can_shadow) {
+    const char* source = R"rut(
+import Crypto
+import "middleware/auth.rut"
+func tlsClientCertSha256(_ value: str) -> str => value
+route GET "/" {
+    guard let fingerprint = req.tlsClientCertSha256 else { return 401 }
+    let shadow = tlsClientCertSha256(fingerprint)
+    let pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    let canonicalPin = Crypto.sha256HexValid(pin)
+    let identity = auth.pinnedMtlsIdentity(
+        pin, "consumer", "credential")
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/mtls-pinned-auth.rut";
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        fprintf(stderr,
+                "mTLS frontend analysis failed at %u:%u (%.*s) code=%u\n",
+                hir.error().span.line,
+                hir.error().span.col,
+                static_cast<int>(hir.error().detail.len),
+                hir.error().detail.ptr ? hir.error().detail.ptr : "",
+                static_cast<unsigned>(hir.error().code));
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir.module.func_count > 0);
+    rir.destroy();
+}
+
 TEST(frontend, regex_literal_is_only_valid_as_matches_pattern) {
     const char* src =
         "route GET \"/\" { guard re\".*\" == re\".*\" else { return 400 } return 200 }\n";

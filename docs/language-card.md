@@ -518,6 +518,23 @@ TLS is currently supported only with `.http2`. Files are loaded when a new
 pooled upstream session is established, and its TLS context remains alive until
 session teardown. TLS/configuration-file failures return UNAVAILABLE.
 
+### Inbound mTLS pinned identity
+
+The server accepts `--tls-client-ca PATH` with its existing TLS certificate
+and key options and requires a client certificate during the TLS handshake.
+The verified peer certificate's DER SHA-256 fingerprint is exposed as
+`req.tlsClientCertSha256: str?`; it is nil on cleartext and ordinary
+server-only TLS. The fingerprint is connection-owned and contains 64 lowercase
+hexadecimal characters. `auth.pinnedMtlsIdentity` compares it to a static
+canonical pin with `Crypto.sha256HexValid`, returning 403 for a
+missing/mismatched certificate and 503 for invalid pin configuration. The CA
+file is read at listener startup; replacing
+it requires listener restart. Route pin changes take effect for the next
+request while the connection fingerprint remains fixed. Session resumption,
+tickets and renegotiation are disabled for this profile. CRL/OCSP, SAN mapping
+and durable revocation are not provided. See
+[`mtls-pinned-auth.rut`](../examples/mtls-pinned-auth.rut).
+
 Upstream connections are shared per shard/config/upstream/backend and multiplex
 RPCs from different downstream clients. Incomplete HTTP/2 input promotes the
 connection's receive slice to 256 KiB when less than 16 KiB of tail space remains;

@@ -46,6 +46,7 @@ enum class Op : u8 {
     JwtIssueHs256,
     JwtIssueHs256WithId,
     JwtIssueHs256WithIdAndScope,
+    Sha256HexValid,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

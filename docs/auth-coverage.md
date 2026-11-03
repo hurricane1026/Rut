@@ -26,7 +26,7 @@ whether a competing open-source edition includes them.
 | OIDC login / session | Pending | Discovery validation, authorization-code + PKCE, state/nonce, redirect validation, ID-token verification, secure cookies, logout and refresh |
 | Gateway OAuth2 endpoints | Pending | Authorization/token grants, client authentication, consent/redirect binding, code single use, token expiry/revocation and persistent state |
 | Upstream OAuth token | Pending | Client credentials/token exchange, audience/scope, per-shard cache with bounded refresh coordination, cancellation and secret-safe logs |
-| mTLS identity | Pending full chain | Client cert verification, trust bundles, SAN/issuer mapping, expiry/revocation, verified identity to API authorization |
+| mTLS identity | Inbound mandatory client certificate verification with startup CA bundle; verified SHA-256 fingerprint exposed to Rut/JIT/native requests; static pinned identity helper; epoll and io_uring HTTP/1 and HTTP/2 loopback tests; TLS 1.2/1.3 valid, absent, wrong-CA and expired certificate cases; ordinary TLS and cleartext spoof-header rejection; keepalive/reset, pin RCU update, bounded HTTP/2 refusal/retry, and source-unlinked native artifact evidence | Dynamic identity mapping, CRL/OCSP and durable revocation |
 | LDAP | Pending | Direct LDAP protocol, TLS, bind/search escaping, limits/timeouts, credential hygiene; an HTTP bridge does not satisfy this row |
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
 | Keycloak / Casdoor | Pending | Explicit supported OIDC/OAuth2 or provider protocols and conformance fixtures, role mapping and outage behavior |

@@ -107,6 +107,104 @@ bool load(Source& source, NativeProgram& p, u8 opt = 2) {
 }
 }  // namespace
 
+TEST(native_program, mtls_pin_and_request_property_execute_after_source_removal) {
+    const char* names[] = {"MTLS_CLIENT_PIN", "MTLS_CONSUMER_ID", "MTLS_CREDENTIAL_ID"};
+    const char* values[] = {"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "test-client",
+                            "fixture-cert-v1"};
+    const bool had_values[] = {
+        getenv(names[0]) != nullptr, getenv(names[1]) != nullptr, getenv(names[2]) != nullptr};
+    std::string old_values[3];
+    for (u32 i = 0; i < 3; ++i) {
+        if (had_values[i]) old_values[i] = getenv(names[i]);
+        REQUIRE_EQ(setenv(names[i], values[i], 1), 0);
+    }
+    struct RestoreEnv {
+        const char** names;
+        const bool* had_values;
+        const std::string* old_values;
+        ~RestoreEnv() {
+            for (u32 i = 0; i < 3; ++i) {
+                if (had_values[i])
+                    (void)setenv(names[i], old_values[i].c_str(), 1);
+                else
+                    (void)unsetenv(names[i]);
+            }
+        }
+    } restore{names, had_values, old_values};
+
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/mtls-pinned-auth.rut";
+    FILE* input = fopen(source_path.c_str(), "rb");
+    REQUIRE(input != nullptr);
+    char source_bytes[4096];
+    const size_t source_len = fread(source_bytes, 1, sizeof(source_bytes), input);
+    const bool source_ok = !ferror(input) && feof(input);
+    fclose(input);
+    REQUIRE(source_ok);
+    REQUIRE_LT(source_len, sizeof(source_bytes));
+    std::string temp_template = source_path.parent_path().string() + "/mtls-native-XXXXXX";
+    const i32 source_fd = mkstemp(temp_template.data());
+    REQUIRE(source_fd >= 0);
+    u32 written = 0;
+    while (written < source_len) {
+        const ssize_t amount = write(source_fd, source_bytes + written, source_len - written);
+        REQUIRE_GT(amount, 0);
+        written += static_cast<u32>(amount);
+    }
+    static constexpr char kNegativeRoutes[] =
+        "\nroute GET \"/wrong-pin\" {\n"
+        "    let identity = auth.pinnedMtlsIdentity(\n"
+        "        \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\n"
+        "        env(\"MTLS_CONSUMER_ID\"), env(\"MTLS_CREDENTIAL_ID\"))\n"
+        "    let consumerId = identity.consumerId\n"
+        "    return response(200, body: consumerId)\n}\n"
+        "route GET \"/bad-config\" {\n"
+        "    let identity = auth.pinnedMtlsIdentity(\n"
+        "        \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n\",\n"
+        "        env(\"MTLS_CONSUMER_ID\"), env(\"MTLS_CREDENTIAL_ID\"))\n"
+        "    let consumerId = identity.consumerId\n"
+        "    return response(200, body: consumerId)\n}\n";
+    const ssize_t extra_written = write(source_fd, kNegativeRoutes, sizeof(kNegativeRoutes) - 1);
+    REQUIRE_EQ(extra_written, static_cast<ssize_t>(sizeof(kNegativeRoutes) - 1));
+    close(source_fd);
+    Program owner;
+    REQUIRE(owner.p != nullptr);
+    char error[512]{};
+    REQUIRE_MSG(
+        load_native_program(temp_template.c_str(), *owner.p, error, sizeof(error), 0, false),
+        error);
+    REQUIRE_EQ(unlink(temp_template.c_str()), 0);
+    auto& config = owner.p->config;
+    REQUIRE_EQ(config.route_count, 3u);
+    ConnectionBase conn{};
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls_client_cert_sha256_valid = true;
+    memset(conn.tls_client_cert_sha256, 'a', sizeof(conn.tls_client_cert_sha256));
+    const char* paths[] = {"/private", "/wrong-pin", "/bad-config"};
+    const u16 statuses[] = {200, 403, 503};
+    for (u32 i = 0; i < 3; ++i) {
+        REQUIRE(config.routes[i].fn != nullptr);
+        char request[128];
+        const int request_len = snprintf(
+            request, sizeof(request), "GET %s HTTP/1.1\r\nHost: localhost\r\n\r\n", paths[i]);
+        REQUIRE_GT(request_len, 0);
+        jit::HandlerCtx ctx{};
+        const auto result =
+            jit::HandlerResult::unpack(config.routes[i].fn(&conn,
+                                                           &ctx,
+                                                           reinterpret_cast<const u8*>(request),
+                                                           static_cast<u32>(request_len),
+                                                           nullptr));
+        CHECK_EQ(result.status_code, statuses[i]);
+        if (i == 0) {
+            CHECK(conn.jit_response_body_valid);
+            CHECK(conn.jit_response_body.eq(lit_str("test-client")));
+        }
+    }
+}
+
 #if RUT_ENABLE_WEBSOCKET
 
 TEST(native_program, websocket_required_subprotocol_survives_source_removal) {

@@ -17,6 +17,7 @@ struct EpollTlsHooks {
     // Negotiated ALPN protocol after handshake. May be null in test hook
     // tables that predate ALPN; callers must null-check and default to Http11.
     AlpnProtocol (*alpn_negotiated)(SSL* ssl);
+    bool (*capture_client_fingerprint)(SSL* ssl, char fingerprint[64], bool& valid);
 };
 
 }  // namespace rut

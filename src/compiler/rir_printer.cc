@@ -159,6 +159,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqQueryString:
             buf.put_cstr("req.queryString");
             break;
+        case Opcode::ReqTlsClientCertSha256:
+            buf.put_cstr("req.tlsClientCertSha256");
+            break;
         case Opcode::ReqMethod:
             buf.put_cstr("req.method");
             break;
@@ -733,6 +736,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ReqPathOnly:
         case Opcode::ReqBody:
         case Opcode::ReqQueryString:
+        case Opcode::ReqTlsClientCertSha256:
         case Opcode::ReqHttpVersion:
         case Opcode::ResumeEventKind:
         case Opcode::ResumeEventResult:

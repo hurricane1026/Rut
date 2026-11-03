@@ -8536,6 +8536,34 @@ bounded request-owned storage and validated before forwarding. Query/body creden
 removal and a general ordered middleware effect model remain separate work. See
 `examples/auth-proxy.rut` and the language card for current syntax.
 
+### Inbound mTLS pinned identity
+
+`--tls-client-ca PATH` enables mandatory client-certificate authentication for
+the downstream TLS listener and requires the existing server certificate/key
+options. The CA file is loaded at startup; an unreadable or invalid trust bundle
+prevents startup. After a successful TLS handshake, the runtime copies the
+verified peer certificate's DER SHA-256 fingerprint as 64 lowercase hex bytes
+into connection-owned storage. `req.tlsClientCertSha256` is `str?`: it is nil
+for cleartext and ordinary server-only TLS. Handshake verification and missing
+certificates fail before HTTP parsing. Session caching, tickets and renegotiation
+are disabled when client CA verification is configured.
+
+`Crypto.sha256HexValid(value)` checks exactly 64 lowercase ASCII hexadecimal
+bytes without allocation. `auth.pinnedMtlsIdentity(fingerprint, consumerId,
+credentialId)` uses it with nonempty metadata before comparing the pin with the
+verified connection value. Invalid pin configuration returns 503; missing or
+mismatched client identity returns 403, as the certificate pin is an
+authorization rule rather than an HTTP authentication challenge.
+This follows [RFC 9110 §15.5.4](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.4).
+Pin rotation follows route configuration RCU and
+applies to the next request; an established connection retains the certificate
+fingerprint captured at its handshake. Replacing the listener CA requires
+restarting the listener. This profile does not provide CRL/OCSP, dynamic
+certificate-to-identity mapping, or durable revocation. See
+[`mtls-pinned-auth.rut`](examples/mtls-pinned-auth.rut). OpenSSL verification
+and session options follow the [verify API](https://docs.openssl.org/3.5/man3/SSL_CTX_set_verify/)
+and [context options](https://docs.openssl.org/3.5/man3/SSL_CTX_set_options/).
+
 Compiler expression storage for HIR helpers/routes and MIR functions uses
 Arena-backed node pools. Nodes keep stable addresses across chunk growth; copies
 own their storage and rebase node references. Allocation/copy failure invalidates

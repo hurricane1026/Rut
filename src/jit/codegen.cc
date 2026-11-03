@@ -1449,6 +1449,39 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, opt);
             break;
         }
+        case rir::Opcode::ReqTlsClientCertSha256: {
+            LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty, c.ptr_ty};
+            LLVMTypeRef type = LLVMFunctionType(c.void_ty, params, 4, 0);
+            LLVMValueRef fn =
+                LLVMGetNamedFunction(c.llvm_mod, "rut_helper_req_tls_client_cert_sha256");
+            if (fn == nullptr)
+                fn = LLVMAddFunction(c.llvm_mod, "rut_helper_req_tls_client_cert_sha256", type);
+            LLVMValueRef has = LLVMBuildAlloca(c.builder, c.i8_ty, "tls_fingerprint.has");
+            LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "tls_fingerprint.ptr");
+            LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "tls_fingerprint.len");
+            LLVMValueRef args[] = {c.param_conn, has, ptr, len};
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 4, "");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.i8_ty, has, "tls_fingerprint.h"),
+                                       0,
+                                       "tls_fingerprint.opt.has");
+            opt =
+                LLVMBuildInsertValue(c.builder,
+                                     opt,
+                                     LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "tls_fingerprint.p"),
+                                     1,
+                                     "tls_fingerprint.opt.ptr");
+            opt =
+                LLVMBuildInsertValue(c.builder,
+                                     opt,
+                                     LLVMBuildLoad2(c.builder, c.i32_ty, len, "tls_fingerprint.l"),
+                                     2,
+                                     "tls_fingerprint.opt.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
         case rir::Opcode::ReqRemoteAddr: {
             LLVMValueRef args[] = {c.param_conn};
             LLVMValueRef v = LLVMBuildCall2(c.builder,
@@ -2875,8 +2908,37 @@ CodegenResult codegen(const rir::Module& rir_mod) {
             if (block.inst_count > 0 && block.insts == nullptr) return {nullptr, nullptr, false};
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
+                if (inst.op == rir::Opcode::ReqTlsClientCertSha256) {
+                    if (inst.operand_count != 0 || inst.result == rir::kNoValue ||
+                        inst.result.id >= fn.value_count || fn.values == nullptr)
+                        return {nullptr, nullptr, false};
+                    const rir::Type* result_type = fn.values[inst.result.id].type;
+                    if (result_type == nullptr || result_type->kind != rir::TypeKind::Optional ||
+                        result_type->inner == nullptr ||
+                        result_type->inner->kind != rir::TypeKind::Str ||
+                        result_type->inner->inner != nullptr ||
+                        result_type->struct_def != nullptr ||
+                        result_type->inner->struct_def != nullptr)
+                        return {nullptr, nullptr, false};
+                }
                 if (inst.op == rir::Opcode::JsonOp) {
                     const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+                    if (kJsonOp == json::Op::Sha256HexValid) {
+                        if (inst.operand_count != 1 || inst.extra_operands != nullptr ||
+                            inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
+                            fn.values == nullptr || fn.values[inst.result.id].type == nullptr ||
+                            fn.values[inst.result.id].type->kind != rir::TypeKind::Bool ||
+                            fn.values[inst.result.id].type->inner != nullptr ||
+                            fn.values[inst.result.id].type->struct_def != nullptr)
+                            return {nullptr, nullptr, false};
+                        const rir::ValueId kId = inst.operand(0);
+                        if (kId == rir::kNoValue || kId.id >= fn.value_count ||
+                            fn.values[kId.id].type == nullptr ||
+                            fn.values[kId.id].type->kind != rir::TypeKind::Str ||
+                            fn.values[kId.id].type->inner != nullptr ||
+                            fn.values[kId.id].type->struct_def != nullptr)
+                            return {nullptr, nullptr, false};
+                    }
                     const bool kJwtIssue = kJsonOp == json::Op::JwtIssueHs256;
                     const bool kJwtIssueWithId = kJsonOp == json::Op::JwtIssueHs256WithId;
                     const bool kJwtIssueWithIdAndScope =

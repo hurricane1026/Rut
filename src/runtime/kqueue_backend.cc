@@ -445,6 +445,11 @@ bool KqueueBackend::receive(Connection& conn, bool upstream, IoEvent& event) {
                 event = completion(id, type, tls_error(ssl, rc));
                 return true;
             }
+            if (!tls_capture_verified_client_fingerprint(
+                    ssl, conn.tls_client_cert_sha256, conn.tls_client_cert_sha256_valid)) {
+                event = completion(id, type, -EACCES);
+                return true;
+            }
             conn.tls_handshake_complete = true;
             if (tls_negotiated_protocol(ssl) == AlpnProtocol::H2)
                 conn.protocol = ConnProtocol::Http2;

@@ -1278,6 +1278,10 @@ struct ConnectionBase {
     bool keep_alive;
     bool tls_active;
     bool tls_handshake_complete;
+    // Verified inbound mTLS identity; fixed connection-owned storage survives
+    // keep-alive and H2 streams, and is cleared on connection-slot reset.
+    char tls_client_cert_sha256[64]{};
+    bool tls_client_cert_sha256_valid = false;
     // Active wire protocol. Defaults to Http11; set from the ALPN result once
     // the TLS handshake completes, or on detecting the cleartext h2c preface.
     ConnProtocol protocol;
@@ -1293,6 +1297,9 @@ struct ConnectionBase {
 
     void copy_downstream_transport_state_from(const ConnectionBase& source) {
         downstream_completed_request_count = source.downstream_completed_request_count;
+        __builtin_memcpy(
+            tls_client_cert_sha256, source.tls_client_cert_sha256, sizeof(tls_client_cert_sha256));
+        tls_client_cert_sha256_valid = source.tls_client_cert_sha256_valid;
         // Handshake owner/state stays local to each Connection; snapshots never
         // transfer its SlicePool pointer.
     }
@@ -2129,6 +2136,8 @@ struct ConnectionBase {
         keep_alive = false;
         tls_active = false;
         tls_handshake_complete = false;
+        __builtin_memset(tls_client_cert_sha256, 0, sizeof(tls_client_cert_sha256));
+        tls_client_cert_sha256_valid = false;
         protocol = ConnProtocol::Http11;
         downstream_completed_request_count = 0;
         h2 = nullptr;  // pool slot is released by free_conn_impl, not reset()

@@ -232,6 +232,7 @@ static bool ws_http_guard_expr_allowed(const HirExpr& expr, u32 depth = 0) {
         case HirExprKind::ReqCookie:
         case HirExprKind::ReqQuery:
         case HirExprKind::ReqQueryString:
+        case HirExprKind::ReqTlsClientCertSha256:
         case HirExprKind::ReqPath:
         case HirExprKind::ReqPathOnly:
         case HirExprKind::ReqMethod:
@@ -1791,6 +1792,7 @@ static bool is_crypto_system_export(Str value) {
                            lit_str("macSha384"),
                            lit_str("macSha512"),
                            lit_str("equal"),
+                           lit_str("sha256HexValid"),
                            lit_str("hmacSha256Valid"),
                            lit_str("webhookValid"),
                            lit_str("jwtAny"),
@@ -8523,6 +8525,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.may_nil = true;
                 return out;
             }
+            if (expr.name.eq({"tlsClientCertSha256", 19})) {
+                out.kind = HirExprKind::ReqTlsClientCertSha256;
+                out.type = HirTypeKind::Str;
+                out.may_nil = true;
+                return out;
+            }
             struct ReqHeaderAlias {
                 Str field;
                 Str header;
@@ -10920,6 +10928,24 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                             false,
                             &values[0],
                             &values[1],
+                            nullptr,
+                            expr.span,
+                            route);
+    }
+
+    if (expr.name.eq(lit_str("sha256HexFormatValid")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 1 || expr.args[0] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        auto value = analyze_builtin_arg(*expr.args[0]);
+        if (!value) return core::make_unexpected(value.error());
+        if (value->type != HirTypeKind::Str || value->may_nil || value->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        return make_json_op(json::Op::Sha256HexValid,
+                            HirTypeKind::Bool,
+                            false,
+                            &value.value(),
+                            nullptr,
                             nullptr,
                             expr.span,
                             route);
@@ -15311,6 +15337,7 @@ func macSha256(_ key: str, _ data: str) -> str => hmacSha256(key, data)
 func macSha384(_ key: str, _ data: str) -> str => hmacSha384(key, data)
 func macSha512(_ key: str, _ data: str) -> str => hmacSha512(key, data)
 func equal(_ a: str, _ b: str) -> bool => constantTimeEqual(a, b)
+func sha256HexValid(_ value: str) -> bool => sha256HexFormatValid(value)
 func hmacSha256Valid(_ message: str, _ key: str, _ signature: str, _ prefix: str) -> bool =>
     hmacSha256Matches(message, key, signature, prefix)
 func webhookValid(_ id: str, _ time: str, _ signature: str, _ body: str, _ key: str) -> bool =>
@@ -16981,6 +17008,7 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqCookie:
         case HirExprKind::ReqQuery:
         case HirExprKind::ReqQueryString:
+        case HirExprKind::ReqTlsClientCertSha256:
         case HirExprKind::ReqPath:
         case HirExprKind::ReqPathOnly:
         case HirExprKind::ReqBody:

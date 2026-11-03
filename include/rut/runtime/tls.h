@@ -27,6 +27,7 @@ struct TlsServerContext {
     // Whether the ALPN select callback advertises "h2". When false the server
     // only ever selects "http/1.1", so an h2-capable client downgrades.
     bool offer_h2;
+    bool require_client_certificate;
 };
 
 // One upstream session owns this context; no process-global mutable trust state.
@@ -47,9 +48,11 @@ bool tls_handshake_finished(SSL* ssl);
 
 // offer_h2: advertise HTTP/2 over ALPN. Leave false until the HTTP/2 data
 // path is wired, otherwise an h2 client would be handed to the HTTP/1 parser.
-core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* cert_path,
-                                                                   const char* key_path,
-                                                                   bool offer_h2 = false);
+core::Expected<TlsServerContext*, Error> create_tls_server_context(
+    const char* cert_path,
+    const char* key_path,
+    bool offer_h2 = false,
+    const char* client_ca_path = nullptr);
 void destroy_tls_server_context(TlsServerContext* ctx);
 core::Expected<SSL*, Error> create_tls_server_ssl(TlsServerContext* ctx, i32 fd);
 void destroy_tls_server_ssl(SSL* ssl);
@@ -63,5 +66,10 @@ AlpnProtocol alpn_pick(bool offer_h2, const u8* client_protos, u32 client_len);
 // Read the ALPN protocol negotiated on a completed handshake. None when the
 // handshake selected no ALPN protocol (plain HTTP/1.1).
 AlpnProtocol tls_negotiated_protocol(SSL* ssl);
+
+// Capture a verified peer certificate's SHA-256 DER fingerprint after a
+// successful required-client-certificate handshake. Returns true for ordinary
+// server TLS (out_valid=false) and false on any mTLS verification/capture error.
+bool tls_capture_verified_client_fingerprint(SSL* ssl, char out_hex[64], bool& out_valid);
 
 }  // namespace rut
