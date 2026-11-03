@@ -4,6 +4,7 @@
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
+#include "rut/common/ws_control_flow.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/hir.h"
 #include "rut/compiler/lexer.h"
@@ -7291,7 +7292,10 @@ struct WsCallbackScope {
     std::unique_ptr<HirFunction> normalized = std::make_unique<HirFunction>();
     // Keep the existing admission capacity independent of the callback parameter
     // and locals in both the callback and its current terminal branch.
-    FixedVec<HirLocal, HirRoute::kMaxLocals + 2 * AstStatement::kMaxBlockStatements> locals;
+    FixedVec<HirLocal,
+             HirRoute::kMaxLocals +
+                 (HirWsHandler::kMaxLenGuards + 1) * AstStatement::kMaxBlockStatements>
+        locals;
 };
 
 static FrontendResult<HirExpr> analyze_ws_value(const AstExpr& expr,
@@ -8500,6 +8504,108 @@ static FrontendResult<WsVerdict> analyze_ws_verdict_branch(const AstStatement& b
     return result;
 }
 
+// A nested arm still terminates on every path. Targets select a later root or
+// an action, rather than cloning its ancestor's predicates into each leaf.
+static FrontendResult<u32> analyze_ws_tree_branch(const AstStatement& body,
+                                                  HirRoute& route,
+                                                  const HirModule& mod,
+                                                  const WsJsonBindings& documents,
+                                                  WsCallbackScope& scope,
+                                                  bool default_tail,
+                                                  u32& conditional_count);
+
+static FrontendResult<u32> analyze_ws_tree_if(const AstStatement& stmt,
+                                              HirRoute& route,
+                                              const HirModule& mod,
+                                              const WsJsonBindings& documents,
+                                              WsCallbackScope& scope,
+                                              bool default_tail,
+                                              bool terminal,
+                                              u32& conditional_count) {
+    if (stmt.kind != AstStmtKind::If || !stmt.then_stmt || stmt.bind_value ||
+        (terminal ? !stmt.else_stmt : stmt.else_stmt != nullptr))
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    if (++conditional_count > HirWsHandler::kMaxLenGuards)
+        return frontend_error(FrontendError::TooManyItems, stmt.span);
+    auto root = analyze_message_condition(stmt.expr, WsVerdict::Drop, route, mod, documents, scope);
+    if (!root) return core::make_unexpected(root.error());
+    auto yes = analyze_ws_tree_branch(
+        *stmt.then_stmt, route, mod, documents, scope, false, conditional_count);
+    if (!yes) return core::make_unexpected(yes.error());
+    u32 no = ws_control_after(route.ws_handler.len_guards.len);
+    if (terminal) {
+        auto other = analyze_ws_tree_branch(
+            *stmt.else_stmt, route, mod, documents, scope, default_tail, conditional_count);
+        if (!other) return core::make_unexpected(other.error());
+        no = other.value();
+    }
+    auto& node = route.ws_handler.len_guards[root.value()];
+    node.pass_target = yes.value();
+    node.fail_target = no;
+    return root.value();
+}
+
+static FrontendResult<u32> analyze_ws_tree_branch(const AstStatement& body,
+                                                  HirRoute& route,
+                                                  const HirModule& mod,
+                                                  const WsJsonBindings& documents,
+                                                  WsCallbackScope& scope,
+                                                  bool default_tail,
+                                                  u32& conditional_count) {
+    const u32 kSavedLocals = scope.locals.len;
+    const auto kAnalyze = [&]() -> FrontendResult<u32> {
+        const AstStatement* last = &body;
+        if (body.kind == AstStmtKind::Block) {
+            if (body.block_stmts.len == 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, body.span);
+            for (u32 i = 0; i + 1 < body.block_stmts.len; ++i) {
+                const auto* statement = body.block_stmts[i];
+                if (!statement || statement->kind != AstStmtKind::Let)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          statement ? statement->span : body.span);
+                auto binding = analyze_ws_binding(*statement, scope, mod, documents);
+                if (!binding) return core::make_unexpected(binding.error());
+            }
+            last = body.block_stmts[body.block_stmts.len - 1];
+        }
+        if (!last) return frontend_error(FrontendError::UnsupportedSyntax, body.span);
+        if (last->kind == AstStmtKind::If)
+            return analyze_ws_tree_if(
+                *last, route, mod, documents, scope, default_tail, true, conditional_count);
+        if (last->kind != AstStmtKind::Expr)
+            return frontend_error(FrontendError::UnsupportedSyntax, last->span);
+        if (default_tail) {
+            auto verdict = analyze_ws_default_verdict(last->expr, route, mod, documents, scope);
+            if (!verdict) return core::make_unexpected(verdict.error());
+            return kWsControlDefault;
+        }
+        auto verdict =
+            analyze_message_guard_verdict(last->expr, route, mod, documents, scope, true);
+        if (!verdict) return core::make_unexpected(verdict.error());
+        return ws_control_return(static_cast<u8>(verdict.value()));
+    };
+    auto result = kAnalyze();
+    scope.locals.len = kSavedLocals;
+    return result;
+}
+
+static bool ws_if_needs_control_targets(const AstStatement& stmt) {
+    const auto kNested = [](const AstStatement* branch) {
+        if (!branch) return false;
+        if (branch->kind == AstStmtKind::If) return true;
+        if (branch->kind != AstStmtKind::Block) return false;
+        for (u32 i = 0; i < branch->block_stmts.len; ++i) {
+            const auto* statement = branch->block_stmts[i];
+            if (statement && statement->kind == AstStmtKind::If) return true;
+        }
+        return false;
+    };
+    if (kNested(stmt.then_stmt)) return true;
+    if (stmt.else_stmt && stmt.else_stmt->kind == AstStmtKind::If)
+        return ws_if_needs_control_targets(*stmt.else_stmt);
+    return kNested(stmt.else_stmt);
+}
+
 static FrontendResult<void> analyze_ws_if(const AstStatement& stmt,
                                           HirRoute& route,
                                           const HirModule& mod,
@@ -8513,6 +8619,12 @@ static FrontendResult<void> analyze_ws_if(const AstStatement& stmt,
             FrontendError::UnsupportedSyntax,
             stmt.span,
             lit_str("terminal message if requires else; earlier if must omit else"));
+    if (ws_if_needs_control_targets(stmt)) {
+        auto root = analyze_ws_tree_if(
+            stmt, route, mod, documents, scope, terminal, terminal, conditional_count);
+        if (!root) return core::make_unexpected(root.error());
+        return {};
+    }
     if (++conditional_count > HirWsHandler::kMaxLenGuards)
         return frontend_error(FrontendError::TooManyItems, stmt.span);
     auto verdict = analyze_ws_verdict_branch(*stmt.then_stmt, route, mod, documents, scope, false);

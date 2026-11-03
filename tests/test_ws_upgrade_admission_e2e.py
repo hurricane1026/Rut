@@ -325,6 +325,70 @@ def if_default_exchange(client, peer):
     if_message_exchange(client, peer, close_default=True)
 
 
+NESTED_IF_HANDLER = r"""
+return websocket(ws) { packet in
+    let msg = identity(packet)
+    if msg.fromClient {
+        if msg.payload.isEmpty { msg.drop() }
+        else {
+            if msg.kind == WebSocketMessageKind.binary { msg.forward(b"\xff\x00") }
+            else { msg.forward("<" + msg.text + ">") }
+        }
+    } else {
+        let prefix = "["
+        if msg.payload.isEmpty { msg.close() }
+        else { msg.forward(prefix + msg.text + "]") }
+    }
+}
+"""
+
+NESTED_EARLY_IF_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.forward(b"\x00\xff") }
+        else { msg.drop() }
+    }
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let name = json.string(document) else { msg.close(1003) }
+    msg.forward(name)
+}
+"""
+
+
+def nested_if_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"nested if: {actual=!r}, {expected=!r}")
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(masked_frame(2, b"") + first + masked_frame(9, b"PING") +
+                   masked_frame(0, b"\x00"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xff\x00", True))
+    client.sendall(masked_frame(1, b"hello"))
+    expect(peer, (1, b"<hello>", True))
+    peer.sendall(b"\x81\x05world")
+    expect(client, (1, b"[world]", False))
+    peer.sendall(b"\x81\x00")
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
+def nested_early_if_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"nested early if: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(1, b"broken") + masked_frame(2, b"\xff\x00"))
+    expect(peer, (2, b"\x00\xff", True))
+    peer.sendall(b'\x81\x07"allow"')
+    expect(client, (1, b"allow", False))
+    peer.sendall(b"\x81\x06broken")
+    expect(peer, (8, b"\x03\xef", True))
+    expect(client, (8, b"\x03\xef", False))
+
+
 def payload_bytes_exchange(client, peer):
     def expect(sock, expected):
         actual = recv_client_frame(sock)
@@ -1328,6 +1392,8 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (NESTED_IF_HANDLER, nested_if_exchange, CALLBACK_SCOPE_DECLARATIONS),
+                (NESTED_EARLY_IF_HANDLER, nested_early_if_exchange, ""),
                 (IF_MESSAGE_HANDLER, if_message_exchange, CALLBACK_SCOPE_DECLARATIONS),
                 (IF_MESSAGE_HANDLER, if_default_exchange, CALLBACK_SCOPE_DECLARATIONS),
                 (CALLBACK_BYTES_HANDLER, payload_bytes_exchange,

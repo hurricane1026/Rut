@@ -2907,8 +2907,8 @@ Ordinary `if` / `else if` / `else` syntax now selects message verdicts. A
 nonterminal `if` must omit else and end its taken arm with a verdict; false falls
 through to the next statement. A terminal if-chain requires a final else and
 ends the callback on every path. Arms currently contain immutable infallible
-lets followed by exactly one verdict; nested conditionals/guards within an arm
-and `if let` are not supported. Branch locals use the same analyzer and helper
+lets followed by a verdict or a complete nested conditional tree. Each nested
+path must terminate. Guards within an arm and `if let` are not supported. Branch locals use the same analyzer and helper
 normalization as callback locals, with lexical scope restored after each arm.
 Sibling arms may reuse names, and branch names never resolve a condition or
 leak into later statements. The full HTTP admission-local capacity is preserved
@@ -2922,12 +2922,33 @@ execution, while preserving short-circuit predicates and scan-error exits.
 Each guard, if or else-if shares the four-clause budget, and all roots share the
 32-node forest. The shared eight-statement AST block limit applies per arm;
 the parser also bounds recursive if syntax before analysis. A complete if/else
-chain must be the callback tail. Branch verdicts reuse existing close/forward
+chain must end its callback or branch block. Branch verdicts reuse existing close/forward
 policy slots; a no-argument if-branch close receives its own 1000/empty policy
 so a final else's close policy cannot change it. Bare closes in existing guard
 else-statements retain their route-default contract. The default final else uses
 the existing default-verdict path, so neither native format nor runtime/JIT ABI
 changes. Close-event values and general control flow remain subsequent work.
+
+Nested if trees preserve each ancestor's single evaluation using forward control
+edges on condition roots. `WsLenGuard` and the compiler/JIT `WsLenGuardSpec` append
+pass/fail targets. Unset targets retain the previous sequential guard contract.
+Explicit targets select a later root, a known terminal verdict, or the configured
+default. An early nested if uses a forward boundary on its false edge to skip its
+entire taken subtree before resuming later source statements. Branch compilation
+restores lexical locals before analyzing siblings; nested locals and sixteen
+admission constants have independent capacity bounded by the existing clause and
+block limits. Both arms are checked and count toward the four-condition and
+32-node budgets. A complete nested tree never duplicates parent predicates.
+
+The JIT validates forward-only root targets and continuation boundaries before
+emitting one block per root. It rejects operand entry, self/backward control edges,
+out-of-range indices, unknown verdicts/tags, and targets on operand nodes. The
+postorder predicate forest still requires each operand to have exactly one parent.
+Root edges do not change predicate short-circuit behavior or reached decode/scan
+error exits. Encoded targets are compiler/JIT data and never become runtime
+verdicts. Source and native loading share this emission path; the serialized
+native format, message handler function ABI and retained recipe tables are
+unchanged. No runtime allocation or LLVM dependency is added to rut_runtime.
 
 ```swift
 return websocket(eventService, maxMessageSize: 4kb) { message in

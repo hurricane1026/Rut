@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/common/ws_control_flow.h"
 
 // Forward declarations — avoid pulling LLVM headers into other code.
 using LLVMModuleRef = struct LLVMOpaqueModule*;
@@ -92,13 +93,18 @@ struct WsLenGuardSpec {
     u32 lhs = 0;        // And/Or child indices, strictly less than the parent index
     u32 rhs = 0;
     bool is_operand = false;
+    // Root-only forward control edges, encoded by common/ws_control_flow.h.
+    u32 pass_target = kWsControlNext;
+    u32 fail_target = kWsControlNext;
 };
 
 // Emit a WebSocket terminate-mode message handler into `mod`:
 //   i8 ws_handler_<id>(i8* ctx, i8 opcode, i8* payload, i64 len, i8 from_client)
-// matching WsMessageHandlerFn (WsFrameAction(*)(void*, WsOpcode, const u8*, u64, bool)). It checks
-// each guard root in order, with short-circuit &&/|| — the first FALSE root returns
-// its verdict — then returns `default_verdict`. Verdicts are WsFrameAction values
+// matching WsMessageHandlerFn (WsFrameAction(*)(void*, WsOpcode, const u8*, u64, bool)).
+// Unset control targets check roots in order: the first false root returns its
+// verdict, then the default verdict follows the last root. Explicit targets select
+// later roots, forward continuation boundaries, known verdicts or the default.
+// Predicate &&/|| remain lazy. Verdicts are WsFrameAction values
 // (Forward=0/Drop=1/Close=2/ForwardText=3/ClosePolicy0..3=4..7/ForwardTextPolicy0..3=8..11).
 // ForwardText is the default replacement; indexed branch policies use route-owned metadata. This
 // bypasses the RIR/MIR HTTP pipeline. Returns false on error.

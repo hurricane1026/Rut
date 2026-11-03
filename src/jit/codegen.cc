@@ -1,5 +1,6 @@
 #include "rut/jit/codegen.h"
 
+#include "rut/common/ws_control_flow.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
@@ -3144,7 +3145,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
                      const WsLenGuardSpec* guards,
                      u32 guard_count,
                      u32 id) {
-    if (!mod || !ctx || guard_count > WsLenGuardSpec::kMaxConditions ||
+    if (!mod || !ctx || default_verdict > 11 || guard_count > WsLenGuardSpec::kMaxConditions ||
         (guard_count != 0 && !guards))
         return false;
     // A bounded forest, in postorder: every operand has exactly one parent. Validate
@@ -3183,6 +3184,22 @@ bool emit_ws_handler(LLVMModuleRef mod,
     }
     for (u32 i = 0; i < guard_count; i++) {
         if (guards[i].is_operand && parents[i] != 1) return false;
+        const u32 kTargets[2] = {guards[i].pass_target, guards[i].fail_target};
+        for (const u32 kTargetValue : kTargets) {
+            if (kTargetValue == kWsControlNext) continue;
+            if (guards[i].is_operand) return false;
+            if (kTargetValue == kWsControlDefault) continue;
+            if (ws_control_is_return(kTargetValue)) {
+                const u32 kAction = ws_control_value(kTargetValue);
+                if (kAction == 3 || kAction > 11) return false;
+            } else if (ws_control_is_after(kTargetValue)) {
+                const u32 kBoundary = ws_control_value(kTargetValue);
+                if (kBoundary <= i || kBoundary > guard_count) return false;
+            } else if (kTargetValue <= i || kTargetValue >= guard_count ||
+                       guards[kTargetValue].is_operand) {
+                return false;
+            }
+        }
     }
     LLVMTypeRef i8_ty = LLVMInt8TypeInContext(ctx);
     LLVMTypeRef i64_ty = LLVMInt64TypeInContext(ctx);
@@ -3661,17 +3678,41 @@ bool emit_ws_handler(LLVMModuleRef mod,
         }
         LLVMBuildCondBr(builder, cond, yes, no);
     };
-    // Only roots are source guards. Preserve first-failing-guard verdict order.
-    for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].is_operand) continue;
-        LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(ctx, fn, "cont");
-        LLVMBasicBlockRef els = LLVMAppendBasicBlockInContext(ctx, fn, "else");
-        emit_condition(emit_condition, i, cont, els);
-        LLVMPositionBuilderAtEnd(builder, els);
-        LLVMBuildRet(builder, LLVMConstInt(i8_ty, guards[i].verdict, /*SignExtend=*/0));
-        LLVMPositionBuilderAtEnd(builder, cont);
+    // Conditions retain their postorder operand trees. Root control edges are
+    // strictly forward, so nested arms never re-evaluate a parent or form loops.
+    LLVMBasicBlockRef blocks[WsLenGuardSpec::kMaxConditions]{};
+    LLVMBasicBlockRef default_block = LLVMAppendBasicBlockInContext(ctx, fn, "default");
+    for (u32 i = 0; i < guard_count; ++i)
+        if (!guards[i].is_operand) blocks[i] = LLVMAppendBasicBlockInContext(ctx, fn, "condition");
+    const auto kNext = [&](u32 start) {
+        for (u32 i = start; i < guard_count; ++i)
+            if (blocks[i]) return blocks[i];
+        return default_block;
+    };
+    const auto kTarget = [&](u32 target, u32 source, bool pass) {
+        if (target == kWsControlNext && pass) return kNext(source + 1);
+        if (target == kWsControlDefault) return default_block;
+        if (ws_control_is_after(target)) return kNext(ws_control_value(target));
+        if (target == kWsControlNext || ws_control_is_return(target)) {
+            LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(ctx, fn, "verdict");
+            LLVMPositionBuilderAtEnd(builder, done);
+            const u32 kAction =
+                target == kWsControlNext ? guards[source].verdict : ws_control_value(target);
+            LLVMBuildRet(builder, LLVMConstInt(i8_ty, kAction, 0));
+            return done;
+        }
+        return blocks[target];
+    };
+    LLVMBuildBr(builder, kNext(0));
+    for (u32 i = 0; i < guard_count; ++i) {
+        if (!blocks[i]) continue;
+        const auto kYes = kTarget(guards[i].pass_target, i, true);
+        const auto kNo = kTarget(guards[i].fail_target, i, false);
+        LLVMPositionBuilderAtEnd(builder, blocks[i]);
+        emit_condition(emit_condition, i, kYes, kNo);
     }
-    LLVMBuildRet(builder, LLVMConstInt(i8_ty, default_verdict, /*SignExtend=*/0));
+    LLVMPositionBuilderAtEnd(builder, default_block);
+    LLVMBuildRet(builder, LLVMConstInt(i8_ty, default_verdict, 0));
     LLVMDisposeBuilder(builder);
     return true;
 }

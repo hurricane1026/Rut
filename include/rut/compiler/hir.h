@@ -13,6 +13,7 @@
 #include "rut/common/types.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/common/wait_limits.h"
+#include "rut/common/ws_control_flow.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/node_pool.h"
@@ -1114,7 +1115,8 @@ enum class WsVerdict : u8 {
 
 // Message-handler condition nodes. Leaf nodes inspect message length, opcode,
 // direction or payload predicates; And/Or nodes combine earlier child nodes. Only roots
-// are source guards and yield their else verdict when false.
+// are source conditional clauses. Unset control targets yield their else verdict
+// when false and continue to the next root when true.
 struct WsLenGuard {
     enum class Accessor : u8 {
         Len,
@@ -1177,6 +1179,9 @@ struct WsLenGuard {
     u32 rhs = 0;
     bool is_operand = false;              // only roots execute as source-level guards
     WsVerdict verdict = WsVerdict::Drop;  // yielded when the guard fails
+    // Root-only forward targets; Next preserves legacy sequential guard behavior.
+    u32 pass_target = kWsControlNext;
+    u32 fail_target = kWsControlNext;
 };
 
 struct HirWsClosePolicy {
@@ -1203,8 +1208,8 @@ struct HirWsTextRewrite {
 struct HirWsHandler {
     Str parameter_name = lit_str("message");  // analyzer-only lexical binding
     WsVerdict default_verdict = WsVerdict::Forward;
-    // Postorder condition forest. Guard roots execute in source order before the
-    // default verdict; the first failing guard's else verdict wins.
+    // Postorder condition forest with forward-only root control targets. Unset
+    // targets preserve ordered guards before the default verdict.
     static constexpr u32 kMaxLenGuards = 4;
     static constexpr u32 kMaxConditionNodes = 32;
     FixedVec<WsLenGuard, kMaxConditionNodes> len_guards;

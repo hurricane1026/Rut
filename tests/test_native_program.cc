@@ -1800,6 +1800,103 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, websocket_nested_if_preserves_control_targets_after_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+route GET "/nested" { return websocket(backend) { packet in
+    let msg = identity(packet)
+    if msg.fromClient {
+        let payload: Bytes = msg.payload
+        if payload.isEmpty { msg.drop() }
+        else {
+            if msg.kind == WebSocketMessageKind.binary { msg.forward(b"\xff\x00") }
+            else { msg.forward("<" + msg.text + ">") }
+        }
+    } else {
+        let prefix = "["
+        if msg.payload.isEmpty { msg.close() }
+        else { msg.forward(prefix + msg.text + "]") }
+    }
+} }
+route GET "/early" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.forward(b"\x00\xff") }
+        else { msg.drop() }
+    }
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let name = json.string(document) else { msg.close(1003) }
+    msg.forward(name)
+} }
+route GET "/json" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    if msg.fromClient {
+        if json.bool(document) == false { msg.forward("false") }
+        else if json.bool(document) == true { msg.forward("true") }
+        else { msg.drop() }
+    } else { msg.close(1008, "policy") }
+} }
+route GET "/close" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.close() }
+        else { msg.close(1003, "text") }
+    } else { msg.close(1008, "policy") }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& program = *owner.p;
+    REQUIRE_EQ(program.config.route_count, 4u);
+    const auto nested = program.config.routes[0].ws_frame_handler;
+    const auto early = program.config.routes[1].ws_frame_handler;
+    const auto json = program.config.routes[2].ws_frame_handler;
+    const auto close = program.config.routes[3].ws_frame_handler;
+    REQUIRE(nested);
+    REQUIRE(early);
+    REQUIRE(json);
+    REQUIRE(close);
+    const u8 bad[] = {0xff, 0};
+    const char* text = "hello";
+    for (bool client : {false, true}) {
+        CHECK(nested(nullptr, WsOpcode::Binary, bad, 2, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        CHECK(nested(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(text), 5, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::ForwardText));
+        CHECK(nested(nullptr, WsOpcode::Binary, nullptr, 0, client) ==
+              (client ? WsFrameAction::Drop : WsFrameAction::ClosePolicy0));
+        CHECK(close(nullptr, WsOpcode::Binary, nullptr, 0, client) ==
+              (client ? WsFrameAction::ClosePolicy0 : WsFrameAction::Close));
+        CHECK(close(nullptr, WsOpcode::Text, nullptr, 0, client) ==
+              (client ? WsFrameAction::ClosePolicy1 : WsFrameAction::Close));
+        const char* values[] = {"false", "true", "null", "{}", "broken"};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(json(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(values[i]),
+                       static_cast<u32>(strlen(values[i])),
+                       client) == (i == 4    ? WsFrameAction::ClosePolicy0
+                                   : !client ? WsFrameAction::Close
+                                   : i == 0  ? WsFrameAction::ForwardTextPolicy0
+                                   : i == 1  ? WsFrameAction::ForwardTextPolicy1
+                                             : WsFrameAction::Drop));
+    }
+    const char* allowed = "\"allow\"";
+    const char* broken = "broken";
+    CHECK(early(nullptr, WsOpcode::Binary, bad, 2, true) == WsFrameAction::ForwardTextPolicy0);
+    CHECK(early(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, true) ==
+          WsFrameAction::Drop);
+    CHECK(early(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(allowed), 7, false) ==
+          WsFrameAction::ForwardText);
+    CHECK(early(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, false) ==
+          WsFrameAction::ClosePolicy0);
+    REQUIRE_EQ(program.config.routes[3].ws_close_policy_count, 2u);
+    CHECK_EQ(program.config.routes[3].ws_close_policies[0].code, 1000u);
+    CHECK_EQ(program.config.routes[3].ws_close_policies[1].code, 1003u);
+    CHECK_EQ(program.config.routes[3].ws_close_code, 1008u);
+}
+
 TEST(native_program, websocket_if_branches_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"

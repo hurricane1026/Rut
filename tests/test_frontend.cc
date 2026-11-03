@@ -5587,6 +5587,166 @@ TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
     CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ name in ... }`")));
 }
 
+TEST(frontend, websocket_nested_if_preserves_typed_lexical_scope_and_forward_targets) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+route GET "/nested" { return websocket(backend) { packet in
+    let msg = identity(packet)
+    if msg.fromClient {
+        let payload: Bytes = msg.payload
+        if payload.isEmpty { msg.drop() }
+        else {
+            if msg.kind == WebSocketMessageKind.binary { msg.forward(b"\xff\x00") }
+            else { msg.forward("<" + msg.text + ">") }
+        }
+    } else {
+        let prefix = "["
+        if msg.payload.isEmpty { msg.close() }
+        else { msg.forward(prefix + msg.text + "]") }
+    }
+} }
+route GET "/early" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.forward(b"\x00\xff") }
+        else { msg.drop() }
+    }
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let name = json.string(document) else { msg.close(1003) }
+    msg.forward(name)
+} }
+route GET "/json" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    if msg.fromClient {
+        if json.bool(document) == false { msg.forward("false") }
+        else if json.bool(document) == true { msg.forward("true") }
+        else { msg.drop() }
+    } else { msg.close(1008, "policy") }
+} }
+route GET "/close" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.close() }
+        else { msg.close(1003, "text") }
+    } else { msg.close(1008, "policy") }
+} }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto copied = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*copied);
+    REQUIRE(hir);
+    copied.reset();
+    REQUIRE_EQ(hir->routes.len, 4u);
+    for (u32 ri = 0; ri < hir->routes.len; ++ri) {
+        const auto& route = hir->routes[ri];
+        CHECK_EQ(route.locals.len, 0u);
+        u32 roots = 0;
+        for (u32 i = 0; i < route.ws_handler.len_guards.len; ++i) {
+            const auto& node = route.ws_handler.len_guards[i];
+            if (node.is_operand) continue;
+            ++roots;
+            for (u32 target : {node.pass_target, node.fail_target}) {
+                if (target == kWsControlNext || target == kWsControlDefault ||
+                    ws_control_is_return(target) || ws_control_is_after(target))
+                    continue;
+                CHECK(target > i);
+                REQUIRE(target < route.ws_handler.len_guards.len);
+                CHECK_FALSE(route.ws_handler.len_guards[target].is_operand);
+            }
+        }
+        CHECK(roots <= HirWsHandler::kMaxLenGuards);
+    }
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, websocket_nested_if_bindings_keep_admission_capacity_at_four_levels) {
+    std::string source =
+        "upstream ws\nfunc identity<T>(_ value: T) -> T => value\nroute GET \"/ws\" {\n";
+    for (u32 i = 0; i < 16; ++i) source += "let captured" + std::to_string(i) + " = true\n";
+    source += "return websocket(ws) { msg in\n";
+    for (u32 level = 0; level < 4; ++level) {
+        for (u32 i = 0; i < 6; ++i)
+            source += "let value" + std::to_string(level) + "_" + std::to_string(i) +
+                      " = identity(msg)\n";
+        source += "if msg.isText {\n";
+    }
+    source += "msg.forward()\n";
+    for (u32 level = 0; level < 4; ++level) source += "} else { msg.drop() }\n";
+    source += "} }\n";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].locals.len, 16u);
+}
+
+TEST(frontend, websocket_nested_if_rejects_incomplete_paths_effects_and_scope_leaks) {
+    const char* bodies[] = {
+        "if msg.isText { if msg.fromClient { msg.drop() } } else { msg.forward() }",
+        "if msg.isText { if msg.fromClient { let inner = msg inner.drop() } else { inner.forward() "
+        "} } else { msg.forward() }",
+        "if msg.isText { if msg.fromClient { let inner = msg inner.drop() } else { msg.drop() } } "
+        "else { inner.forward() }",
+        "if msg.isText { if msg.fromClient { msg.drop() } else { let bad: str = msg.len "
+        "msg.forward() } } else { msg.forward() }",
+        "if false { if true { let unused = req.bodyBytes msg.drop() } else { msg.drop() } } else { "
+        "msg.forward() }",
+        "if msg.fromClient { if msg.isText { msg.drop() } else { msg.forward() } msg.forward() } "
+        "else { msg.forward() }",
+    };
+    for (const char* body : bodies) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";
+        source += body;
+        source += " } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, websocket_nested_if_shares_four_clause_and_thirty_two_node_budgets) {
+    for (u32 count : {4u, 5u}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";
+        for (u32 i = 0; i < count; ++i) source += "if msg.isText { ";
+        source += "msg.forward() ";
+        for (u32 i = 0; i < count; ++i) source += "} else { msg.drop() } ";
+        source += "} }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_EQ(hir.has_value(), count == 4);
+        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+    }
+    for (u32 leaves : {15u, 16u}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";
+        source += "guard msg.len == 2 else { msg.drop() } if msg.fromClient { if msg.isText";
+        for (u32 i = 1; i < leaves; ++i) source += " || msg.isBinary";
+        source +=
+            " { msg.forward() } else { msg.drop() } } else { if msg.isBinary { msg.drop() } else { "
+            "msg.forward() } } } }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_EQ(hir.has_value(), leaves == 15);
+        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+    }
+}
+
 TEST(frontend, websocket_if_uses_typed_concepts_and_branch_local_aliases) {
     const char* source = R"rut(upstream backend at "127.0.0.1:9999"
 func identity<T>(_ value: T) -> T => value
@@ -5702,8 +5862,7 @@ TEST(frontend, websocket_if_rejects_scope_leaks_bad_types_and_incomplete_paths) 
         "if true { msg.drop() } else if false { let wrong: str = msg.len msg.forward() } else { "
         "msg.forward() }",
         "if msg.isText { guard true else { msg.drop() } msg.forward() } else { msg.drop() }",
-        "if msg.isText { if msg.fromClient { msg.drop() } else { msg.forward() } } else { "
-        "msg.forward() }",
+        "if msg.isText { if msg.fromClient { msg.drop() } } else { msg.forward() }",
         "if let value = json.parse(msg.text) { msg.drop() } else { msg.forward() }",
     };
     for (const char* body : bodies) {

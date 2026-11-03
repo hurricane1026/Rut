@@ -178,7 +178,7 @@ Message callbacks accept the ordinary `if` / `else if` / `else` syntax with the
 same Boolean predicate forms as message guards. An `if` without `else` may
 precede later statements when its taken branch ends with a message verdict.
 A terminal `if` / `else if` chain must have a final `else`, so every path ends
-with a verdict. That complete chain must be the last statement of the callback.
+with a verdict. That complete chain must be the last statement of its callback or branch block.
 
 ```swift
 return websocket(chat) { msg in
@@ -200,11 +200,11 @@ Existing `&&` / `||` short-circuit behavior and fail-closed scan errors are
 preserved. Conditions may call supported ordinary pure helpers or use earlier
 JSON guard aliases. They must have type `bool`; `if let` is not supported yet.
 
-Each arm currently contains infallible immutable lets followed by exactly one
-message verdict. Branch-local names do not escape into the condition, later
+Each arm contains infallible immutable lets followed by one message verdict
+or a complete nested `if` / `else` tree. Every nested path must end in a verdict. Branch-local names do not escape into the condition, later
 statements, sibling arms or later `else if` conditions. Sibling arms may reuse
-fresh names. Nested conditionals or guards inside an arm, nonterminal arms,
-loops and arbitrary expression execution remain unsupported. Every arm is
+fresh names. Guards inside an arm, nested paths that fall through, loops and
+arbitrary expression execution remain unsupported. Every arm is
 checked, including an arm made unreachable by a constant condition.
 
 The eight-statement limit applies independently to the callback and each arm.
@@ -216,6 +216,34 @@ bounded policy tables; a branch `close()` selects 1000 with no reason, independe
 of a final else's close code/reason. Existing bare closes in guard-else statements
 keep their route-default behavior. No new runtime representation, helper or
 native format is introduced by these conditionals.
+
+Nested arms use forward control targets on the existing condition roots. The
+parent condition executes once; its selected arm runs without evaluating the
+sibling arm. An early outer `if` whose taken arm is a complete nested tree may
+precede later guards or a verdict. Its false path skips the entire taken subtree
+before continuing. A branch's condition cannot see that branch's later lets.
+
+```swift
+return websocket(chat) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.forward(b"\x00\xff") }
+        else { msg.drop() }
+    }
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let text = json.string(document) else { msg.close(1003) }
+    msg.forward(text)
+}
+```
+
+Here client Binary messages bypass both JSON checks; client Text messages are
+dropped. Upstream messages skip the client subtree and reach the JSON guards.
+The four-clause and 32-condition-node budgets count the complete source tree,
+including both arms, without duplicating ancestor predicates. Each nested block
+keeps its own eight-statement bound and lexical scope. The sixteen HTTP admission
+locals remain independent of all live callback/branch bindings. All arms remain
+statically checked, including unreachable ones. Target validation permits only
+forward root edges, forward continuation boundaries, the configured default or
+known verdicts; it rejects operand entry, self/backward edges and invalid tags.
 
 After the route's HTTP guards pass, terminate mode validates the opening request
 before connecting to the selected upstream. The supported request shape is GET

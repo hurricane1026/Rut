@@ -896,13 +896,17 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // The four-clause/32-condition-node limits remain. Optional, JSON and regex let
 // initializers remain unsupported. Bounded if/else verdict branches are supported:
 // an if without else may exit early; a terminal if/else-if chain needs a final
-// else. Each arm allows lets followed by one verdict, with its own lexical scope.
-// A whole if/else chain must be the callback tail. Conditions use the supported
+// else. Each arm allows lets followed by a verdict or complete nested if/else
+// tree, with its own lexical scope; every nested path must end in a verdict.
+// A complete if/else chain must end its current block. Conditions use supported
 // bool/helper/JSON predicates. Later arms are lazy; all arms are type checked.
 // Each guard/if/else-if shares the same four-clause and 32-node budgets. The
 // eight-statement block limit applies to each arm too. Branch close() uses 1000
-// independently of the final else's close policy. Nested conditionals or guards
-// inside arms, if-let, loops and general computation remain unsupported.
+// independently of the final else's close policy. Nested arms evaluate each
+// parent condition once and skip sibling arms; an early nested tree's false path
+// resumes after the whole subtree. Both arms count toward the existing limits.
+// Guards inside arms, nested paths that fall through, if-let, loops and general
+// computation remain unsupported.
 // HTTP reads/effects and message verdicts in helpers are rejected. Helpers cannot
 // retain a message/payload past the callback.
 func allowedMessage(_ msg: WebSocketMessage) -> bool =>

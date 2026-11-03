@@ -20771,6 +20771,99 @@ TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
 }
 
+TEST(jit, websocket_forward_control_targets_keep_nested_conditions_lazy) {
+    WsLenGuardSpec guards[4]{};
+    guards[0].accessor = 2;
+    guards[0].cmp = 2;
+    guards[0].bound = 1;
+    guards[0].pass_target = 1;
+    guards[0].fail_target = ws_control_after(3);
+    guards[1].accessor = 1;
+    guards[1].cmp = 2;
+    guards[1].bound = 2;
+    guards[1].pass_target = ws_control_return(0);
+    guards[1].fail_target = 2;
+    guards[2].accessor = 34;
+    guards[2].pattern = "";
+    guards[2].value = "allow";
+    guards[2].value_len = 5;
+    guards[2].pass_target = ws_control_return(1);
+    guards[2].fail_target = ws_control_return(4);
+    guards[3].accessor = 0;
+    guards[3].cmp = 2;
+    guards[3].bound = 2;
+    guards[3].pass_target = kWsControlDefault;
+    guards[3].fail_target = ws_control_return(1);
+    auto generated = codegen_ws_handler(3, guards, 4, 61);
+    REQUIRE(generated.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(generated.mod, generated.ctx));
+    auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_61"));
+    REQUIRE(handler);
+    const u8 bad[] = {0xff, 0};
+    CHECK(handler(nullptr, WsOpcode::Binary, bad, 1, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, bad, 2, false) == WsFrameAction::ForwardText);
+    CHECK(handler(nullptr, WsOpcode::Binary, bad, 1, false) == WsFrameAction::Drop);
+    const char* allowed = "\"allow\"";
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(allowed), 7, true) ==
+          WsFrameAction::Drop);
+    const char* other = "\"other\"";
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(other), 7, true) ==
+          WsFrameAction::ClosePolicy0);
+    const char* invalid = "broken";
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(invalid), 6, true) ==
+          WsFrameAction::Close);  // reached decode errors cannot become a policy branch
+}
+
+TEST(jit, websocket_control_targets_reject_cycles_operands_and_unknown_actions) {
+    WsLenGuardSpec nodes[4]{};
+    nodes[0].accessor = 35;
+    nodes[0].bound = 1;
+    nodes[1].accessor = 35;
+    nodes[1].bound = 1;
+    nodes[1].is_operand = true;
+    nodes[2].accessor = 35;
+    nodes[2].bound = 0;
+    nodes[2].is_operand = true;
+    nodes[3].accessor = 4;
+    nodes[3].lhs = 1;
+    nodes[3].rhs = 2;
+    const auto valid = [&]() {
+        auto generated = codegen_ws_handler(0, nodes, 4, 0);
+        CHECK(generated.ok);
+        if (generated.ok) dispose_module(generated.mod, generated.ctx);
+    };
+    valid();
+    for (u32 target : {0u,
+                       1u,
+                       4u,
+                       0x20000000u,
+                       0x80000100u,
+                       ws_control_return(3),
+                       ws_control_return(12),
+                       ws_control_return(255),
+                       ws_control_after(0),
+                       ws_control_after(5)}) {
+        nodes[0].pass_target = target;
+        CHECK_FALSE(codegen_ws_handler(0, nodes, 4, 0).ok);
+    }
+    nodes[0].pass_target = 3;
+    valid();
+    nodes[0].pass_target = ws_control_after(1);  // boundary may precede operand nodes
+    valid();
+    nodes[0].pass_target = ws_control_after(4);  // no later root means the default verdict
+    valid();
+    nodes[0].pass_target = kWsControlNext;
+    nodes[1].fail_target = kWsControlDefault;
+    CHECK_FALSE(codegen_ws_handler(0, nodes, 4, 0).ok);
+    nodes[1].fail_target = kWsControlNext;
+    nodes[3].fail_target = 0;
+    CHECK_FALSE(codegen_ws_handler(0, nodes, 4, 0).ok);
+    nodes[3].fail_target = kWsControlNext;
+    CHECK_FALSE(codegen_ws_handler(12, nodes, 4, 0).ok);
+}
+
 TEST(jit, websocket_json_number_text_guard_is_exact_and_typed) {
     WsLenGuardSpec guards[2]{};
     guards[0].accessor = 24;

@@ -327,6 +327,8 @@ bool load_rut_program(const char* path,
                 guards[g].lhs = h.len_guards[g].lhs;
                 guards[g].rhs = h.len_guards[g].rhs;
                 guards[g].is_operand = h.len_guards[g].is_operand;
+                guards[g].pass_target = h.len_guards[g].pass_target;
+                guards[g].fail_target = h.len_guards[g].fail_target;
             }
             if (!jit::emit_ws_handler(cg.mod,
                                       cg.ctx,
