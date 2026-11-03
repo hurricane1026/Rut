@@ -15,7 +15,7 @@ whether a competing open-source edition includes them.
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
-| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison | Worker scheduling, Rut/JIT/native-program integration, user registry and password lifecycle |
+| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker | Event-loop wakeups and Rut/JIT/native-program integration, user registry and password lifecycle |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and RS256 policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | ES keys, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
@@ -749,8 +749,8 @@ cross-node synchronization, online Token revocation, signing or JWE.
 primitives for offline provisioning or an independently scheduled worker. They
 are **not exposed to Rut, JIT handlers, native-program helpers or Basic auth**.
 Do not invoke them on an event-loop shard: 600,000 HMAC rounds can block other
-connections. A bounded worker execution/cancellation contract is still required
-before request-path integration.
+connections. `PasswordWorker` now supplies a bounded native verification worker; event-loop
+wakeups and handler resumption are still required before request-path integration.
 
 The fixed profile is PBKDF2-HMAC-SHA256 (RFC 8018), 600,000 iterations, a
 16-byte salt and a 32-byte derived key. No dependency or
@@ -798,3 +798,53 @@ pattern as `generate_uuid`: deterministic entropy and partial/error injection
 verify the stored record and unchanged-output failure contract. A real OS
 entropy smoke test verifies that the generated record authenticates correctly;
 no probabilistic distribution or collision assertions are used.
+
+## Bounded native password verification worker
+
+[`PasswordWorker`](../include/rut/runtime/password_worker.h) provides one private
+background thread and eight fixed-capacity slots per caller-owned instance.
+Exactly one producer shard uses `submit`, `poll` and `cancel`; a lifecycle owner
+starts the instance before transfer to the shard, reclaims it after the shard
+quiesces, and stops it off the request path. No mutex wait or heap allocation
+occurs in the shard API. Startup reports thread-creation errors through the
+existing `Expected<void, Error>` type. No worker is attached to gateway loops
+or created automatically by a connection or request.
+
+Submission copies a 1–1024-byte password and a fixed-length record into owned
+slot storage before release-publishing the job. A full or stopped worker and
+invalid spans return an invalid token. Completed but unpolled results retain
+their slot, so neither queue nor result storage grows. Tokens carry their
+worker owner, slot and a monotonically increasing generation, preserved across
+restart; stale or foreign tokens cannot observe or cancel reused slots. Token
+validity ends at worker destruction. Generation exhaustion rejects further
+submissions instead of wrapping to a reusable generation.
+
+The worker verifies only copied bytes, wipes inputs before publishing its
+boolean result, and never touches a connection, request arena, policy object
+or shard allocator. Only the owning shard consumes results. `poll` returns
+Queued/Running while pending, and consumes Matched/Rejected exactly once.
+Malformed records and incorrect passwords both produce Rejected.
+
+Cancellation makes the token invalid immediately. Queued work is skipped if it
+has not started; an already running fixed-cost KDF is allowed to finish on the
+background thread, its result is discarded and its inputs are wiped before
+capacity is released. There is no unsafe pthread cancellation or slot reuse
+while the worker owns inputs. Stop rejects future submissions, skips queued
+work, joins at most the currently executing fixed-cost KDF and wipes all slots.
+It is idempotent and must run off-shard with the producer quiescent. Violating
+exclusive lifecycle ownership such that join fails is fatal rather than
+releasing storage still potentially used by a worker. No wall-clock completion
+bound is promised when the OS deschedules the thread.
+
+The idle worker scans at one-millisecond intervals, following the existing
+background flusher polling model. Completion polling does not wake a gateway
+event loop. Handler suspension/resumption, timeout/connection-close wiring,
+worker ownership during configuration reload and error-to-HTTP mapping are
+future integration work; no Rut password login API is advertised yet. Password
+hash creation remains an offline synchronous operation, not a worker job.
+
+`test_hash` covers copied-input lifetime, queue saturation, cancellation of
+pending/running/completed work, result consumption, stale and foreign tokens,
+shutdown with pending work, restart and invalid submissions. Running-cancel
+coverage permits an already-completed result if the producer was descheduled,
+without relying on a fragile fixed sleep.

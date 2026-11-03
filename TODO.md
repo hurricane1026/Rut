@@ -786,7 +786,9 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   canonical bounded records, constant-time key comparison and independent vectors.
 - [x] Native password hashing overload with OS CSPRNG salt generation,
   deterministic entropy/failure tests and fail-closed output handling.
-- [ ] Bounded worker execution/cancellation before exposing slow password
-  verification to Rut/JIT/native-program handlers.
+- [x] Native bounded password verification worker with owned input copies,
+  generation tokens, backpressure, cancellation and shutdown cleanup.
+- [ ] Event-loop wakeups, handler suspension/resumption, deadlines/close and
+  reload ownership before exposing verification to Rut/JIT/native programs.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
   rate limits, rehash migration and session/JWT login composition.

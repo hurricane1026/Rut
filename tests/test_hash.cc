@@ -1,7 +1,10 @@
 #include "../src/runtime/password_internal.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/password.h"
+#include "rut/runtime/password_worker.h"
 #include "test.h"
+
+#include <time.h>
 
 using namespace rut;
 
@@ -523,6 +526,134 @@ TEST(password, random_salt_success_and_system_entropy) {
     CHECK(password_verify(lit_str("password"), {output, length}));
     CHECK(output[kPasswordRecordBytes] == '!');
     // Avoid probabilistic assertions about RNG distribution or uniqueness.
+}
+
+namespace {
+PasswordTaskStatus wait_password(PasswordWorker& worker, PasswordTask task, bool running = false) {
+    const timespec pause = {0, 1000000};
+    for (u32 i = 0; i < 30000; ++i) {
+        auto status = worker.poll(task);
+        if (running && status == PasswordTaskStatus::Running) return status;
+        if (status != PasswordTaskStatus::Queued && status != PasswordTaskStatus::Running)
+            return status;
+        nanosleep(&pause, nullptr);
+    }
+    return PasswordTaskStatus::Invalid;
+}
+}  // namespace
+
+TEST(password_worker, lifecycle_and_invalid_inputs) {
+    PasswordWorker worker;
+    CHECK(worker.submit(lit_str("password"), kPasswordRecord).owner == nullptr);
+    CHECK(worker.poll({}) == PasswordTaskStatus::Invalid);
+    CHECK(!worker.cancel({}));
+    worker.stop();
+    REQUIRE(worker.start().has_value());
+    CHECK(!worker.start().has_value());
+    CHECK(worker.submit({}, kPasswordRecord).owner == nullptr);
+    CHECK(worker.submit({nullptr, 1}, kPasswordRecord).owner == nullptr);
+    char oversized[kPasswordMaxBytes + 1]{};
+    CHECK(worker.submit({oversized, sizeof(oversized)}, kPasswordRecord).owner == nullptr);
+    CHECK(worker.submit(lit_str("p"), {}).owner == nullptr);
+    CHECK(worker.submit(lit_str("p"), {nullptr, kPasswordRecordBytes}).owner == nullptr);
+    CHECK(worker.submit(lit_str("p"), {kPasswordRecord.ptr, kPasswordRecordBytes - 1}).owner ==
+          nullptr);
+    CHECK(worker.poll({&worker, 1, PasswordWorker::kCapacity}) == PasswordTaskStatus::Invalid);
+    CHECK(!worker.cancel({&worker, 1, PasswordWorker::kCapacity}));
+    worker.stop();
+    worker.stop();
+}
+
+TEST(password_worker, copied_inputs_and_consumed_generation) {
+    PasswordWorker worker;
+    REQUIRE(worker.start().has_value());
+    char password[] = "password";
+    char record[kPasswordRecordBytes];
+    for (u32 i = 0; i < sizeof(record); ++i) record[i] = kPasswordRecord.ptr[i];
+    const auto first = worker.submit({password, 8}, {record, sizeof(record)});
+    REQUIRE(first.owner != nullptr);
+    for (char& c : password) c = 'x';
+    for (char& c : record) c = '!';
+    CHECK(wait_password(worker, first) == PasswordTaskStatus::Matched);
+    CHECK(worker.poll(first) == PasswordTaskStatus::Invalid);
+    const auto second = worker.submit(lit_str("wrong"), kPasswordRecord);
+    REQUIRE(second.owner != nullptr);
+    CHECK(second.generation != first.generation);
+    CHECK(!worker.cancel(first));
+    CHECK(wait_password(worker, second) == PasswordTaskStatus::Rejected);
+    CHECK(!worker.cancel(second));
+    const auto malformed = worker.submit(lit_str("p"), {record, sizeof(record)});
+    REQUIRE(malformed.owner != nullptr);
+    CHECK(wait_password(worker, malformed) == PasswordTaskStatus::Rejected);
+}
+
+TEST(password_worker, saturation_cancel_running_and_queued) {
+    PasswordWorker worker;
+    REQUIRE(worker.start().has_value());
+    PasswordTask tasks[PasswordWorker::kCapacity];
+    for (auto& task : tasks) {
+        task = worker.submit(lit_str("password"), kPasswordRecord);
+        REQUIRE(task.owner != nullptr);
+    }
+    // Done jobs retain their slots, making saturation independent of timing.
+    CHECK(worker.submit(lit_str("password"), kPasswordRecord).owner == nullptr);
+    const auto observed = wait_password(worker, tasks[0], true);
+    REQUIRE(observed == PasswordTaskStatus::Running || observed == PasswordTaskStatus::Matched);
+    // An oversubscribed host may finish the KDF before this producer runs.
+    if (observed == PasswordTaskStatus::Running) CHECK(worker.cancel(tasks[0]));
+    CHECK(!worker.cancel(tasks[0]));
+    CHECK(worker.poll(tasks[0]) == PasswordTaskStatus::Invalid);
+    for (u32 i = 1; i < PasswordWorker::kCapacity; ++i) {
+        CHECK(worker.cancel(tasks[i]));
+        CHECK(worker.poll(tasks[i]) == PasswordTaskStatus::Invalid);
+    }
+    // stop waits only for in-flight work and wipes queued cancelled jobs.
+    worker.stop();
+    REQUIRE(worker.start().has_value());
+    const auto restarted = worker.submit(lit_str("password"), kPasswordRecord);
+    REQUIRE(restarted.owner != nullptr);
+    for (auto task : tasks) {
+        CHECK(worker.poll(task) == PasswordTaskStatus::Invalid);
+        CHECK(!worker.cancel(task));
+    }
+    CHECK(wait_password(worker, restarted) == PasswordTaskStatus::Matched);
+}
+
+TEST(password_worker, cancel_completed_result) {
+    PasswordWorker worker;
+    REQUIRE(worker.start().has_value());
+    const auto first = worker.submit(lit_str("password"), kPasswordRecord);
+    REQUIRE(first.owner != nullptr);
+    char malformed[kPasswordRecordBytes]{};
+    const auto barrier = worker.submit(lit_str("p"), {malformed, sizeof(malformed)});
+    REQUIRE(barrier.owner != nullptr);
+    // Slots are scanned in order. Completion of slot 1 proves slot 0 is Done,
+    // without consuming its result or making a wall-clock assumption.
+    REQUIRE(wait_password(worker, barrier) == PasswordTaskStatus::Rejected);
+    CHECK(worker.cancel(first));
+    CHECK(worker.poll(first) == PasswordTaskStatus::Invalid);
+    CHECK(!worker.cancel(first));
+}
+
+TEST(password_worker, foreign_tokens_and_shutdown) {
+    PasswordWorker worker;
+    PasswordWorker other;
+    REQUIRE(worker.start().has_value());
+    REQUIRE(other.start().has_value());
+    const auto task = worker.submit(lit_str("password"), kPasswordRecord);
+    REQUIRE(task.owner != nullptr);
+    CHECK(other.poll(task) == PasswordTaskStatus::Invalid);
+    CHECK(!other.cancel(task));
+    // Pending work and unconsumed results may be abandoned at lifecycle stop.
+    worker.stop();
+    CHECK(worker.poll(task) == PasswordTaskStatus::Invalid);
+    CHECK(!worker.cancel(task));
+    CHECK(worker.submit(lit_str("password"), kPasswordRecord).owner == nullptr);
+    REQUIRE(worker.start().has_value());
+    const auto replacement = worker.submit(lit_str("password"), kPasswordRecord);
+    REQUIRE(replacement.owner != nullptr);
+    CHECK(!worker.cancel(task));
+    CHECK(wait_password(worker, replacement) == PasswordTaskStatus::Matched);
 }
 
 int main(int argc, char** argv) {

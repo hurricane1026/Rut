@@ -9323,3 +9323,19 @@ Worker scheduling, Rut/JIT integration, user persistence and
 account/password lifecycle remain future work; Basic auth retains its existing
 static credential contract. See [auth coverage](docs/auth-coverage.md#native-password-storage-primitive)
 for the full format, ownership, validation and failure contract.
+
+### Bounded native password worker
+
+`PasswordWorker` owns a pthread and eight fixed-capacity job/result slots. One
+shard producer copies credentials and exchanges state via acquire/release
+publication; worker-local copies are wiped before a result is published or a
+cancelled slot is released. No request views or connection pointers cross
+threads. Owner/slot/generation tokens reject stale and foreign operations,
+including after restart. Cancellation invalidates tokens immediately, skips
+pending jobs when possible and discards running KDF results. Completed results
+retain capacity until consumed or cancelled. Lifecycle start/stop run outside
+active shard use; stop joins the active KDF and wipes all slots. No heap or
+mutex waits are added to submission/poll/cancel. The worker uses one-millisecond
+idle polling, without event-loop notification. Rut/JIT integration still needs
+bounded completion wakeups, request suspension, deadline/close cancellation and
+reload-safe ownership. See the auth ledger for exact lifecycle and limits.
