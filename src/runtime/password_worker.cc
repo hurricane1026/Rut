@@ -6,9 +6,11 @@
 #include "rut/runtime/password.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <openssl/crypto.h>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
 
 namespace rut {
 PasswordWorker::~PasswordWorker() {
@@ -17,9 +19,29 @@ PasswordWorker::~PasswordWorker() {
 
 core::Expected<void, Error> PasswordWorker::start() {
     if (started) return core::make_unexpected(Error::make(EALREADY, Error::Source::Thread));
+    i32 fds[2] = {-1, -1};
+#ifdef __linux__
+    if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0)
+        return core::make_unexpected(Error::from_errno(Error::Source::Pipe));
+#else
+    if (pipe(fds) != 0) return core::make_unexpected(Error::from_errno(Error::Source::Pipe));
+    for (i32 fd : fds) {
+        if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+            const auto kError = Error::from_errno(Error::Source::Pipe);
+            close(fds[0]);
+            close(fds[1]);
+            return core::make_unexpected(kError);
+        }
+    }
+#endif
+    notification_read = fds[0];
+    notification_write = fds[1];
     __atomic_store_n(&stopping, 0u, __ATOMIC_RELEASE);
     const i32 kRc = pthread_create(&worker_thread, nullptr, entry, this);
-    if (kRc != 0) return core::make_unexpected(Error::make(kRc, Error::Source::Thread));
+    if (kRc != 0) {
+        close_notifications();
+        return core::make_unexpected(Error::make(kRc, Error::Source::Thread));
+    }
     started = true;
     return {};
 }
@@ -38,9 +60,41 @@ void PasswordWorker::stop() {
     // storage while a worker might still be using it.
     if (pthread_join(worker_thread, nullptr) != 0) __builtin_trap();
     started = false;
+    close_notifications();
     for (auto& slot : slots) {
         wipe(slot);
         __atomic_store_n(&slot.state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+    }
+}
+
+void PasswordWorker::close_notifications() {
+    if (notification_read >= 0) close(notification_read);
+    if (notification_write >= 0) close(notification_write);
+    notification_read = -1;
+    notification_write = -1;
+}
+
+void PasswordWorker::notify_completion() {
+    const u8 kByte = 1;
+    for (;;) {
+        const auto kWritten = write(notification_write, &kByte, 1);
+        if (kWritten == 1) return;
+        if (kWritten < 0 && errno == EINTR) continue;
+        // A full pipe already carries a readable wakeup. Other errors violate
+        // ownership: the producer must never close/change this borrowed fd.
+        if (kWritten < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        __builtin_trap();
+    }
+}
+
+bool PasswordWorker::drain_completions() {
+    if (!started) return false;
+    u8 bytes[256];
+    for (;;) {
+        const auto kCount = read(notification_read, bytes, sizeof(bytes));
+        if (kCount > 0) continue;
+        if (kCount < 0 && errno == EINTR) continue;
+        return kCount < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
     }
 }
 
@@ -127,6 +181,7 @@ void PasswordWorker::run() {
             if (state == CancelQueued) {
                 wipe(slot);
                 __atomic_store_n(&slot.state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+                notify_completion();
                 worked = true;
                 continue;
             }
@@ -152,6 +207,7 @@ void PasswordWorker::run() {
                 slot.matched = false;
                 __atomic_store_n(&slot.state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
             }
+            notify_completion();
             worked = true;
         }
         if (!worked) nanosleep(&kIdle, nullptr);

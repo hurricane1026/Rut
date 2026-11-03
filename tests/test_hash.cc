@@ -1,9 +1,13 @@
 #include "../src/runtime/password_internal.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/password.h"
+#include "rut/runtime/password_request.h"
 #include "rut/runtime/password_worker.h"
 #include "test.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <time.h>
 
 using namespace rut;
@@ -654,6 +658,127 @@ TEST(password_worker, foreign_tokens_and_shutdown) {
     REQUIRE(replacement.owner != nullptr);
     CHECK(!worker.cancel(task));
     CHECK(wait_password(worker, replacement) == PasswordTaskStatus::Matched);
+}
+
+namespace {
+bool password_ready(PasswordWorker& worker) {
+    pollfd event = {worker.completion_fd(), POLLIN, 0};
+    return ::poll(&event, 1, 10000) == 1 && (event.revents & POLLIN);
+}
+}  // namespace
+
+TEST(password_request, idle_fd_wakeup_and_once_only_result) {
+    PasswordWorker worker;
+    CHECK(worker.completion_fd() == -1);
+    CHECK(!worker.drain_completions());
+    REQUIRE(worker.start().has_value());
+    REQUIRE(worker.completion_fd() >= 0);
+    CHECK((fcntl(worker.completion_fd(), F_GETFL) & O_NONBLOCK) != 0);
+    CHECK((fcntl(worker.completion_fd(), F_GETFD) & FD_CLOEXEC) != 0);
+    REQUIRE(worker.drain_completions());
+    PasswordRequest request;
+    REQUIRE(request.begin(worker, lit_str("password"), kPasswordRecord, 100, 60000));
+    CHECK(request.deadline_ms() == 60100);
+    CHECK(!request.begin(worker, lit_str("wrong"), kPasswordRecord, 100, 100));
+    CHECK(request.take() == PasswordRequestStatus::Idle);
+    // No HTTP traffic, active polling of task state, or maintenance timer needed.
+    REQUIRE(password_ready(worker));
+    REQUIRE(worker.drain_completions());
+    CHECK(request.poll(101) == PasswordRequestStatus::Matched);
+    CHECK(request.poll(102) == PasswordRequestStatus::Matched);
+    CHECK(request.take() == PasswordRequestStatus::Matched);
+    CHECK(request.take() == PasswordRequestStatus::Idle);
+    CHECK(request.deadline_ms() == 0);
+    request.reset();
+    worker.stop();
+    CHECK(worker.completion_fd() == -1);
+}
+
+TEST(password_request, deadline_beats_completed_result_and_reuse) {
+    PasswordWorker worker;
+    REQUIRE(worker.start().has_value());
+    PasswordRequest request;
+    CHECK(!request.begin(worker, lit_str("password"), kPasswordRecord, 100, 0));
+    CHECK(!request.begin(worker, lit_str("password"), kPasswordRecord, 100, 60001));
+    CHECK(!request.begin(worker, lit_str("password"), kPasswordRecord, ~u64{0}, 10));
+    REQUIRE(request.begin(worker, lit_str("password"), kPasswordRecord, 100, 10));
+    REQUIRE(password_ready(worker));
+    REQUIRE(worker.drain_completions());
+    CHECK(request.poll(110) == PasswordRequestStatus::TimedOut);
+    CHECK(request.poll(111) == PasswordRequestStatus::TimedOut);
+    CHECK(request.take() == PasswordRequestStatus::TimedOut);
+    REQUIRE(request.begin(worker, lit_str("wrong"), kPasswordRecord, 200, 60000));
+    REQUIRE(password_ready(worker));
+    REQUIRE(worker.drain_completions());
+    CHECK(request.poll(201) == PasswordRequestStatus::Rejected);
+    CHECK(request.take() == PasswordRequestStatus::Rejected);
+    request.reset();
+}
+
+TEST(password_request, cancel_close_and_unavailable) {
+    PasswordWorker worker;
+    PasswordRequest request;
+    REQUIRE(request.begin(worker, lit_str("password"), kPasswordRecord, 0, 10));
+    CHECK(request.take() == PasswordRequestStatus::Unavailable);
+    REQUIRE(worker.start().has_value());
+    REQUIRE(request.begin(worker, {}, kPasswordRecord, 0, 10));
+    CHECK(request.take() == PasswordRequestStatus::Unavailable);
+    REQUIRE(request.begin(worker, lit_str("password"), kPasswordRecord, 0, 60000));
+    request.cancel();
+    CHECK(request.poll(1) == PasswordRequestStatus::Cancelled);
+    CHECK(request.take() == PasswordRequestStatus::Cancelled);
+    REQUIRE(request.begin(worker, lit_str("password"), kPasswordRecord, 0, 60000));
+    request.reset();  // Connection close/reload detaches before worker shutdown.
+    CHECK(request.poll(1) == PasswordRequestStatus::Idle);
+    worker.stop();
+    REQUIRE(worker.start().has_value());
+    REQUIRE(worker.drain_completions());
+    REQUIRE(request.begin(worker, lit_str("wrong"), kPasswordRecord, 10, 60000));
+    // A fresh request must never consume a cancelled predecessor's success.
+    REQUIRE(password_ready(worker));
+    REQUIRE(worker.drain_completions());
+    CHECK(request.poll(11) == PasswordRequestStatus::Rejected);
+    CHECK(request.take() == PasswordRequestStatus::Rejected);
+    request.reset();
+}
+
+TEST(password_request, queue_pressure_and_pending_timeout) {
+    PasswordWorker worker;
+    REQUIRE(worker.start().has_value());
+    PasswordTask tasks[PasswordWorker::kCapacity];
+    char malformed[kPasswordRecordBytes]{};
+    for (auto& task : tasks) {
+        task = worker.submit(lit_str("p"), {malformed, sizeof(malformed)});
+        REQUIRE(task.owner != nullptr);
+    }
+    PasswordRequest request;
+    REQUIRE(request.begin(worker, lit_str("password"), kPasswordRecord, 1, 10));
+    CHECK(request.take() == PasswordRequestStatus::Unavailable);
+    for (auto task : tasks) worker.cancel(task);
+    worker.stop();
+    REQUIRE(worker.start().has_value());
+    REQUIRE(request.begin(worker, lit_str("password"), kPasswordRecord, 1, 10));
+    CHECK(request.poll(11) == PasswordRequestStatus::TimedOut);
+    CHECK(request.take() == PasswordRequestStatus::TimedOut);
+    request.reset();
+}
+
+TEST(password_worker, completion_fd_restart_and_cancel_cleanup) {
+    PasswordWorker worker;
+    for (u32 attempt = 0; attempt < 3; ++attempt) {
+        REQUIRE(worker.start().has_value());
+        const auto task = worker.submit(lit_str("password"), kPasswordRecord);
+        REQUIRE(task.owner != nullptr);
+        REQUIRE(worker.cancel(task));
+        REQUIRE(password_ready(worker));
+        REQUIRE(worker.drain_completions());
+        CHECK(worker.poll(task) == PasswordTaskStatus::Invalid);
+        const i32 fd = worker.completion_fd();
+        worker.stop();
+        errno = 0;
+        CHECK(fcntl(fd, F_GETFD) == -1);
+        CHECK(errno == EBADF);
+    }
 }
 
 int main(int argc, char** argv) {

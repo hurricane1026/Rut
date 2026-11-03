@@ -9319,7 +9319,7 @@ Passwords are exact nonempty bytes up to 1024 bytes; output is a strict
 123-byte ASCII record. Derived keys and HMAC scratch are cleansed, with
 constant-time key comparison. This adds no language surface or dependency.
 These deliberately slow synchronous APIs belong off the shard event loop.
-Worker scheduling, Rut/JIT integration, user persistence and
+Gateway worker ownership, Rut/JIT integration, user persistence and
 account/password lifecycle remain future work; Basic auth retains its existing
 static credential contract. See [auth coverage](docs/auth-coverage.md#native-password-storage-primitive)
 for the full format, ownership, validation and failure contract.
@@ -9336,6 +9336,10 @@ pending jobs when possible and discards running KDF results. Completed results
 retain capacity until consumed or cancelled. Lifecycle start/stop run outside
 active shard use; stop joins the active KDF and wipes all slots. No heap or
 mutex waits are added to submission/poll/cancel. The worker uses one-millisecond
-idle polling, without event-loop notification. Rut/JIT integration still needs
-bounded completion wakeups, request suspension, deadline/close cancellation and
-reload-safe ownership. See the auth ledger for exact lifecycle and limits.
+idle polling and a nonblocking completion pipe. `PasswordRequest` supplies
+monotonic deadline checks (including completed-but-expired success), terminal
+result consumption and explicit close/reload cancellation. The producer drains
+notifications before polling adapters; worker stop joins before closing pipe
+ends. No connection/request pointers cross threads. Rut/JIT integration still
+needs gateway FD/timer registration, request suspension/resumption and
+reload-safe worker ownership. See the auth ledger for exact lifecycle and limits.

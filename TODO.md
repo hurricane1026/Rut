@@ -788,7 +788,9 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   deterministic entropy/failure tests and fail-closed output handling.
 - [x] Native bounded password verification worker with owned input copies,
   generation tokens, backpressure, cancellation and shutdown cleanup.
-- [ ] Event-loop wakeups, handler suspension/resumption, deadlines/close and
-  reload ownership before exposing verification to Rut/JIT/native programs.
+- [x] Native completion FD and request deadline/cancel adapter, with idle FD
+  wakeup, exact-deadline rejection, reset/reuse and descriptor lifecycle tests.
+- [ ] Gateway FD/timer registration, handler suspension/resumption, close hooks
+  and reload ownership before exposing verification to Rut/JIT/native programs.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
   rate limits, rehash migration and session/JWT login composition.

@@ -15,7 +15,7 @@ whether a competing open-source edition includes them.
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
-| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker | Event-loop wakeups and Rut/JIT/native-program integration, user registry and password lifecycle |
+| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with native deadline/completion-FD adapters | Event-loop wakeups and Rut/JIT/native-program integration, user registry and password lifecycle |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and RS256 policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | ES keys, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
@@ -837,8 +837,9 @@ releasing storage still potentially used by a worker. No wall-clock completion
 bound is promised when the OS deschedules the thread.
 
 The idle worker scans at one-millisecond intervals, following the existing
-background flusher polling model. Completion polling does not wake a gateway
-event loop. Handler suspension/resumption, timeout/connection-close wiring,
+background flusher polling model. A borrowed nonblocking, close-on-exec pipe FD
+now signals completion and cancellation cleanup. Handler suspension/resumption,
+registration in gateway backends, timeout/connection-close wiring,
 worker ownership during configuration reload and error-to-HTTP mapping are
 future integration work; no Rut password login API is advertised yet. Password
 hash creation remains an offline synchronous operation, not a worker job.
@@ -848,3 +849,39 @@ pending/running/completed work, result consumption, stale and foreign tokens,
 shutdown with pending work, restart and invalid submissions. Running-cancel
 coverage permits an already-completed result if the producer was descheduled,
 without relying on a fragile fixed sleep.
+
+## Native request completion and deadline adapter
+
+[`PasswordRequest`](../include/rut/runtime/password_request.h) provides a native
+single-shard request state machine around the worker. It owns only a worker
+token and a monotonic deadline; the worker never accesses the adapter. A begin
+must use a 1–60,000 ms budget and reject overflowing deadlines. Queue pressure,
+invalid input or a stopped worker becomes Unavailable. A deadline check runs
+before result consumption: at equality or later, even a completed matching
+result is cancelled and reported as TimedOut. Terminal results are consumed
+once through `take`; active requests cannot be overwritten by another begin.
+Explicit `reset` is the close/reload detach operation, cancelling pending work
+before forgetting the worker. Destruction also cancels pending work.
+
+The owner must keep the worker alive through pending adapter use, reset adapters
+before worker stop/replacement, and arm a separate deadline timer. The adapter
+accepts caller-supplied CLOCK_MONOTONIC milliseconds; it does not itself register
+callbacks, store connection pointers or extend any configuration lifetime.
+
+`PasswordWorker::completion_fd()` exposes a borrowed readable notification FD.
+The worker release-publishes completion or cancellation cleanup before a
+nonblocking one-byte write. A full pipe coalesces notifications instead of
+blocking the worker. The producer drains notifications before scanning pending
+requests; signal bytes are not task IDs or an exact count of results. The FD
+is owned by the worker and must be unregistered before stop; callers must not
+close it or change flags. Stop joins before closing both pipe ends, avoiding
+writes after reader destruction. Restart creates new pipe endpoints. Setup
+failure returns a Pipe error; thread-creation failure closes both endpoints.
+
+Tests block on the real notification FD while no gateway traffic or active task
+polling occurs, verify success and cancellation cleanup wakeups, exact-deadline
+rejection of already-completed success, pending timeout, saturation, once-only
+consumption, close/reset reuse and descriptor closure across restarts. This is
+native adapter coverage, not a claim of epoll/io_uring handler integration.
+Gateway FD/timer registration, handler resume/close wiring, configuration ownership
+and the Rut/JIT/native-program API remain outstanding.
