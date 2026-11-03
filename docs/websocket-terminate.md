@@ -306,11 +306,36 @@ if let root = clientDocument(msg) { msg.forward("client JSON") }
 else { msg.forward() }
 ```
 
-There must be one value-producing projection path; alternatives return `nil`.
 Selectors and presence tests share the 32-node condition budget, while the
-caller's guard/if-let consumes one of the four source clauses. Different
-value-producing branches, JSON mutation, dynamic pointers, HTTP reads/effects and
-other optional computations remain unsupported.
+caller's guard/if-let consumes one of the four source clauses. Helpers can also
+select different JSON projections; the selected path feeds later checks and
+rewrites without evaluating the sibling branch:
+
+```swift
+func chosenField(_ msg: WebSocketMessage, _ root: Json) -> Json {
+    if msg.fromClient { json.get(root, "/client") }
+    else { json.get(root, "/upstream") }
+}
+// Inside callback, after binding root:
+guard let selected = chosenField(msg, root) else { msg.drop() }
+guard let text = json.string(selected) else { msg.drop() }
+msg.forward(text)
+```
+
+Guard-let, terminal if-let and early if-let support these choices, including
+inside callback arms. An absent value in the selected branch takes the caller's
+failure path. A helper's explicit `if let`/`guard let` fallback is evaluated only
+when that binding is absent; a present null or false value does not select the
+fallback. Different existing projection kinds with the same language type, such
+as string and numberText, retain their own rewrite source.
+
+The compiler specializes the continuation for each possible projection. The
+original four source-clause limit is unchanged; all generated conditions and
+absence joins count toward 32 nodes, and specialized close/forward recipes share
+the existing policy tables. Excess specialization is a compile error. No runtime
+value slot, accessor tag, native format or handler ABI is added. JSON mutation,
+dynamic pointers, HTTP reads/effects and other optional computations remain
+unsupported.
 
 JSON helpers may use ordinary `guard let` and `if let` with nil failure paths,
 then return the successful binding or extract from it:
@@ -332,8 +357,8 @@ value does not repeat the presence check. Later extraction must match that
 proven expression, including its JSON path, and JSON inputs remain rooted in the
 immutable message. False, zero, empty strings and supported null nodes are still
 present values. These helpers work through import namespaces, using the same
-32-node and four-source-clause budgets. Different value-producing alternatives
-and general optional computations remain unsupported. A helper
+32-node and four-source-clause budgets. Value-producing fallback arms may choose
+another supported JSON projection. General optional computations remain unsupported. A helper
 may accept the borrowed message or its text, or an earlier validated JSON alias;
 it cannot supply an unrelated JSON document. Initializer-less shorthand bindings
 remain unsupported.

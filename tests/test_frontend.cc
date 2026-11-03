@@ -5587,6 +5587,178 @@ TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
     CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ name in ... }`")));
 }
 
+TEST(frontend, websocket_value_choices_specialize_guard_if_and_early_continuations) {
+    const char* source = R"rut(upstream ws at "127.0.0.1:9999"
+func pick(_ msg: WebSocketMessage, _ root: Json) -> Json {
+    if msg.fromClient { json.get(root, "/a") } else { json.get(root, "/b") }
+}
+func readChoice(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = pick(msg, root) else { nil }
+    json.string(field)
+}
+func fallback(_ root: Json) -> Json {
+    if let field = json.get(root, "/a") { field } else { json.get(root, "/b") }
+}
+func readFallback(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = fallback(root) else { nil }
+    json.string(field)
+}
+route GET "/guard" { return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.drop() }
+    guard text.hasPrefix("ok") else { msg.close(1008) }
+    msg.forward("<" + text + ">")
+} }
+route GET "/if" { return websocket(ws) { msg in
+    if let text = readChoice(msg) { msg.forward(text) }
+    else { msg.forward("absent") }
+} }
+route GET "/early" { return websocket(ws) { msg in
+    if msg.fromClient {
+        if let text = readFallback(msg) { msg.forward(text) }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/fallback" { return websocket(ws) { msg in
+    guard let text = readFallback(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/bare" { return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.close() }
+    msg.close(1008, "policy")
+} }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto copied = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*copied);
+    REQUIRE(hir);
+    copied.reset();
+    REQUIRE_EQ(hir->routes.len, 5u);
+    for (const auto& route : hir->routes) CHECK_EQ(route.locals.len, 0u);
+    CHECK(hir->routes[0].ws_handler.len_guards.len > 4u);
+    CHECK(hir->routes[0].ws_handler.forward_payload.source_path.eq(lit("/a")));
+    CHECK(hir->routes[0].ws_handler.forward_payloads[0].source_path.eq(lit("/b")));
+    CHECK_EQ(hir->routes[4].ws_handler.close_code, 1008u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, websocket_value_choices_keep_node_and_source_clause_limits) {
+    for (u32 terms : {14u, 15u}) {
+        std::string source =
+            "upstream ws\nfunc pick(_ msg: WebSocketMessage, _ root: Json) -> Json { if ";
+        for (u32 i = 0; i < terms; ++i) {
+            if (i) source += " && ";
+            source += "msg.fromClient";
+        }
+        source += R"rut( { json.get(root, "/a") } else { json.get(root, "/b") } }
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let field = pick(msg, root) else { msg.drop() }
+    guard let text = json.string(field) else { msg.drop() }
+    msg.forward(text)
+} })rut";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (terms == 14) {
+            REQUIRE(hir);
+            CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 32u);
+        } else {
+            REQUIRE_FALSE(hir);
+            CHECK(hir.error().code == FrontendError::TooManyItems);
+        }
+    }
+    for (u32 guards : {3u, 4u}) {
+        std::string source = R"rut(upstream ws
+func readChoice(_ msg: WebSocketMessage) -> Json {
+    if msg.fromClient { json.parse(msg.text) } else { json.parse(msg.text) }
+}
+route GET "/ws" { return websocket(ws) { msg in
+    guard let value = readChoice(msg) else { msg.drop() }
+)rut";
+        for (u32 i = 0; i < guards; ++i) source += "guard msg.isText else { msg.drop() }\n";
+        source += "msg.forward() } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (guards == 3)
+            REQUIRE(hir);
+        else {
+            REQUIRE_FALSE(hir);
+            CHECK(hir.error().code == FrontendError::TooManyItems);
+        }
+    }
+}
+
+TEST(frontend, websocket_value_choices_reject_scope_escape_and_policy_overflow) {
+    const char* bodies[] = {
+        "if let text = readChoice(msg) { msg.drop() } else { msg.forward(text) }",
+        "if let text = readChoice(msg) { msg.drop() } msg.forward(text)",
+        "guard let text = readChoice(msg) else { msg.forward(text) } msg.forward()"};
+    const char* definitions = R"rut(upstream ws at "127.0.0.1:9999"
+func pick(_ msg: WebSocketMessage, _ root: Json) -> Json {
+    if msg.fromClient { json.get(root, "/a") } else { json.get(root, "/b") }
+}
+func readChoice(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = pick(msg, root) else { nil }
+    json.string(field)
+}
+func fallback(_ root: Json) -> Json {
+    if let field = json.get(root, "/a") { field } else { json.get(root, "/b") }
+}
+func readFallback(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = fallback(root) else { nil }
+    json.string(field)
+}
+)rut";
+    for (const char* body : bodies) {
+        std::string source = definitions;
+        source += "route GET \"/ws\" { return websocket(ws) { msg in ";
+        source += body;
+        source += " } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+    const char* overflow = R"rut(upstream ws
+func pick(_ msg: WebSocketMessage, _ root: Json) -> Json {
+    if msg.fromClient { json.get(root, "/a") }
+    else { if msg.isText { json.get(root, "/b") } else { json.get(root, "/c") } }
+}
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    if let field = pick(msg, root) {
+        if msg.isText { msg.forward("x") } else { msg.forward("y") }
+    } else { msg.drop() }
+} })rut";
+    auto tokens = lex(lit(overflow));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::TooManyItems);
+}
+
 TEST(frontend, websocket_helper_bindings_retain_proven_paths_after_ast_copy) {
     const char* source = R"rut(upstream ws at "127.0.0.1:9999"
 func identity<T>(_ value: T) -> T => value
@@ -5711,7 +5883,7 @@ TEST(frontend, websocket_helper_bindings_reject_scope_escape_and_foreign_proofs)
         "guard let root = json.parse(msg.text) else { nil } "
         "guard let changed = json.remove(root, \"/a\") else { nil } changed",
         "guard let root = json.parse(msg.text) else { nil } "
-        "guard let selected = json.get(root, \"/a\") else { json.get(root, \"/b\") } selected"};
+        "guard let selected = json.get(root, \"/a\") else { json.remove(root, \"/b\") } selected"};
     for (const char* body : bodies) {
         std::string source = "upstream ws\nfunc readValue(_ msg: WebSocketMessage) { ";
         source += body;
@@ -5820,11 +5992,9 @@ route GET "/ws" { return websocket(ws) { msg in
 }
 
 TEST(frontend, websocket_optional_conditions_reject_value_selection_and_unproven_inputs) {
-    const char* bodies[] = {
-        "if msg.fromClient { json.get(root, \"/a\") } else { json.get(root, \"/b\") }",
-        "if req.path == \"/x\" { json.get(root, \"/a\") } else { nil }",
-        "if msg.fromClient { json.remove(root, \"/a\") } else { nil }",
-        "if msg.fromClient { nil } else { nil }"};
+    const char* bodies[] = {"if req.path == \"/x\" { json.get(root, \"/a\") } else { nil }",
+                            "if msg.fromClient { json.remove(root, \"/a\") } else { nil }",
+                            "if msg.fromClient { nil } else { nil }"};
     for (const char* body : bodies) {
         std::string source =
             "upstream ws\nfunc conditional(_ msg: WebSocketMessage, _ root: Json) -> Json { ";

@@ -477,6 +477,86 @@ return websocket(ws) { msg in
 """
 
 
+CHOICE_DECLARATIONS = r"""
+func pick(_ msg: WebSocketMessage, _ root: Json) -> Json {
+    if msg.fromClient { json.get(root, "/a") } else { json.get(root, "/b") }
+}
+func readChoice(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = pick(msg, root) else { nil }
+    json.string(field)
+}
+func fallback(_ root: Json) -> Json {
+    if let field = json.get(root, "/a") { field } else { json.get(root, "/b") }
+}
+func readFallback(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = fallback(root) else { nil }
+    json.string(field)
+}
+"""
+
+CHOICE_GUARD_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.drop() }
+    guard text.hasPrefix("ok") else { msg.close(1008) }
+    msg.forward("<" + text + ">")
+}
+"""
+
+CHOICE_EARLY_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        if let text = readFallback(msg) { msg.forward(text) }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\xff")
+    } else { msg.forward("server") }
+}
+"""
+
+
+def choice_guard_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"choice guard: {actual=!r}, {expected=!r}")
+    data = b'{"a":"ok\\u0000A","b":false}'
+    first = bytearray(masked_frame(1, data[:8]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, data[8:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<ok\0A>", True))
+    client.sendall(masked_frame(2, b'{"b":"okB"}') +
+                   masked_frame(2, b'{"a":"ok2","b":"ignored"}'))
+    expect(peer, (1, b"<ok2>", True))
+    for payload in (b'{"a":"okA"}', b'{"a":false,"b":"okB"}'):
+        peer.sendall(bytes((0x81, len(payload))) + payload)
+    expect(client, (1, b"<okB>", False))
+    client.sendall(masked_frame(1, b'{"a":"blocked","b":"okB"}'))
+    expect(peer, (8, b"\x03\xf0", True))
+    expect(client, (8, b"\x03\xf0", False))
+
+
+def choice_early_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"choice early: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(1, b'{"b":"B"}'))
+    expect(peer, (1, b"B", True))
+    client.sendall(masked_frame(1, b'{"a":null,"b":"B"}') +
+                   masked_frame(2, b'{"a":false,"b":"B"}'))
+    expect(peer, (2, b"\xff", True))
+    for payload, expected in ((b'{"a":"A","b":"B"}', b"A"),
+                              (b'{"a":"","b":"B"}', b"")):
+        client.sendall(masked_frame(2, payload))
+        expect(peer, (1, expected, True))
+    peer.sendall(b"\x82\x02\xff\x00")
+    expect(client, (1, b"server", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
 def helper_binding_exchange(client, peer):
     def expect(sock, expected):
         actual = recv_client_frame(sock)
@@ -1580,6 +1660,8 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (CHOICE_GUARD_HANDLER, choice_guard_exchange, CHOICE_DECLARATIONS),
+                (CHOICE_EARLY_HANDLER, choice_early_exchange, CHOICE_DECLARATIONS),
                 (HELPER_BINDING_HANDLER, helper_binding_exchange, HELPER_BINDING_DECLARATIONS),
                 (OPTIONAL_CONDITION_HANDLER, optional_condition_exchange,
                  OPTIONAL_CONDITION_DECLARATIONS),

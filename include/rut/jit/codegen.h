@@ -43,7 +43,7 @@ u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size);
 // Postorder message-condition forest, mirroring WsLenGuard without a HIR dependency.
 struct WsLenGuardSpec {
     static constexpr u32 kMaxConditions = 32;
-    static constexpr u32 kMaxGuards = 4;
+    static constexpr u32 kMaxGuards = 4;  // sequential roots; explicit graphs share 32 nodes
     u8 accessor;  // WsLenGuard::Accessor ordinal: 0=Len (message.len, i64 param 3),
                   //                                1=Opcode (internal message type, i8 param 1),
                   //                                2=FromClient (direction, i8 param 4),

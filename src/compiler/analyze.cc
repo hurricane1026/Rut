@@ -8696,8 +8696,8 @@ static FrontendResult<Str> ws_json_proof_path(const HirExpr& value,
 
 // One-sided optional helper branches lower to a lazy conjunction. Each reached
 // selector runs once; its rejected path returns absence without extracting JSON.
-// A successful binding still denotes one immutable projection, so differing
-// value-producing branches require a value-selection representation we do not have.
+// This compact fast path denotes one immutable projection. Different value
+// alternatives use continuation specialization below, without a runtime value slot.
 static FrontendResult<u32> lower_ws_json_optional(const HirExpr& value,
                                                   WsVerdict verdict,
                                                   HirRoute& route,
@@ -8814,12 +8814,11 @@ static FrontendResult<u32> lower_ws_json_optional(const HirExpr& value,
 }
 
 // JSON proof aliases share ordinary type checking with pure projection helpers.
-static FrontendResult<u32> analyze_ws_json_binding(const AstStatement& stmt,
-                                                   WsVerdict verdict,
-                                                   HirRoute& route,
-                                                   const HirModule& mod,
-                                                   WsJsonBindings& documents,
-                                                   WsCallbackScope& scope) {
+static FrontendResult<HirExpr> analyze_ws_json_initializer(const AstStatement& stmt,
+                                                           HirRoute& route,
+                                                           const HirModule& mod,
+                                                           WsJsonBindings& documents,
+                                                           WsCallbackScope& scope) {
     bool collision =
         stmt.name.eq(route.ws_handler.parameter_name) || stmt.name.eq(lit_str("json")) ||
         user_bound_ident_name(mod, scope.locals.data, scope.locals.len, nullptr, stmt.name);
@@ -8847,15 +8846,35 @@ static FrontendResult<u32> analyze_ws_json_binding(const AstStatement& stmt,
     auto value = kAnalyze();
     scope.locals.len = kSavedLocals;
     if (!value) return core::make_unexpected(value.error());
-    WsJsonBinding binding{};
-    binding.name = stmt.name;
     if (!value->may_nil || value->may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    return value.value();
+}
+
+static FrontendResult<u32> analyze_ws_json_binding_value(const AstStatement& stmt,
+                                                         const HirExpr& value,
+                                                         WsVerdict verdict,
+                                                         HirRoute& route,
+                                                         const HirModule& mod,
+                                                         WsJsonBindings& documents) {
+    WsJsonBinding binding{};
+    binding.name = stmt.name;
     WsJsonHelperProofs proofs{};
-    auto root = lower_ws_json_optional(value.value(), verdict, route, mod, binding, proofs);
+    auto root = lower_ws_json_optional(value, verdict, route, mod, binding, proofs);
     if (!root) return core::make_unexpected(root.error());
     if (!documents.push(binding)) return frontend_error(FrontendError::TooManyItems, stmt.span);
     return root.value();
+}
+
+static FrontendResult<u32> analyze_ws_json_binding(const AstStatement& stmt,
+                                                   WsVerdict verdict,
+                                                   HirRoute& route,
+                                                   const HirModule& mod,
+                                                   WsJsonBindings& documents,
+                                                   WsCallbackScope& scope) {
+    auto value = analyze_ws_json_initializer(stmt, route, mod, documents, scope);
+    if (!value) return core::make_unexpected(value.error());
+    return analyze_ws_json_binding_value(stmt, value.value(), verdict, route, mod, documents);
 }
 
 static FrontendResult<u32> analyze_ws_branch_guard(const AstStatement& stmt,
@@ -8887,24 +8906,318 @@ static FrontendResult<u32> analyze_ws_tree_branch(const AstStatement& body,
                                                   bool default_tail,
                                                   u32& conditional_count);
 
-static FrontendResult<u32> analyze_ws_tree_if(const AstStatement& stmt,
+// Alternative values specialize the callback continuation; no value slot crosses
+// the handler ABI. Nil edges are patched only after their shared continuation exists.
+static bool ws_optional_has_choices(const HirExpr& value, u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes) return true;
+    if (value.kind == HirExprKind::IfElse && value.may_nil && value.rhs && value.args.len == 1 &&
+        value.args[0] && value.rhs->kind != HirExprKind::Nil &&
+        value.args[0]->kind != HirExprKind::Nil)
+        return true;
+    if (value.lhs && ws_optional_has_choices(*value.lhs, depth + 1)) return true;
+    if (value.rhs && ws_optional_has_choices(*value.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && ws_optional_has_choices(*value.args[i], depth + 1)) return true;
+    return false;
+}
+
+struct WsOptionalEdge {
+    u32 root = 0;
+    bool pass = false;
+};
+using WsOptionalEdges = FixedVec<WsOptionalEdge, 2 * HirWsHandler::kMaxConditionNodes>;
+struct WsOptionalTarget {
+    u32 entry = kWsControlNext;
+    WsOptionalEdges* pending = nullptr;
+};
+using WsOptionalSuccess = FrontendResult<WsOptionalTarget> (*)(const WsJsonBinding&, void*);
+
+static FrontendResult<void> ws_optional_connect(WsOptionalEdge edge,
+                                                WsOptionalTarget target,
+                                                HirRoute& route,
+                                                Span span) {
+    if (target.entry == kWsControlNext) {
+        if (!target.pending || !target.pending->push(edge))
+            return frontend_error(FrontendError::TooManyItems, span);
+    } else {
+        auto& node = route.ws_handler.len_guards[edge.root];
+        if (edge.pass)
+            node.pass_target = target.entry;
+        else
+            node.fail_target = target.entry;
+    }
+    return {};
+}
+
+static FrontendResult<void> ws_optional_patch(const WsOptionalEdges& edges,
+                                              WsOptionalTarget target,
                                               HirRoute& route,
-                                              const HirModule& mod,
-                                              WsJsonBindings& documents,
-                                              WsCallbackScope& scope,
-                                              bool default_tail,
-                                              bool terminal,
-                                              u32& conditional_count) {
+                                              Span span) {
+    for (u32 i = 0; i < edges.len; ++i) {
+        auto linked = ws_optional_connect(edges[i], target, route, span);
+        if (!linked) return linked;
+    }
+    return {};
+}
+
+static FrontendResult<WsOptionalTarget> lower_ws_optional_choices(const HirExpr& value,
+                                                                  HirRoute& route,
+                                                                  const HirModule& mod,
+                                                                  WsJsonHelperProofs& proofs,
+                                                                  WsOptionalEdges& failures,
+                                                                  WsOptionalSuccess success,
+                                                                  void* context,
+                                                                  u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::TooManyItems, value.span);
+    if (value.may_error) return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    if (value.kind == HirExprKind::Nil) return WsOptionalTarget{kWsControlNext, &failures};
+    if (value.kind == HirExprKind::IfElse && value.lhs && value.rhs && value.args.len == 1 &&
+        value.args[0]) {
+        if (value.lhs->kind == HirExprKind::HasValue && value.lhs->lhs) {
+            // The selector itself may choose a value. Each success gets its own
+            // proof; selector absence alone enters the helper's else expression.
+            struct Continuation {
+                const HirExpr& source;
+                const HirExpr& body;
+                HirRoute& route;
+                const HirModule& mod;
+                WsJsonHelperProofs& proofs;
+                WsOptionalEdges& failures;
+                WsOptionalSuccess success;
+                void* context;
+                u32 depth;
+            } continuation{*value.lhs->lhs,
+                           *value.rhs,
+                           route,
+                           mod,
+                           proofs,
+                           failures,
+                           success,
+                           context,
+                           depth + 1};
+            const auto kContinue = [](const WsJsonBinding& binding,
+                                      void* opaque) -> FrontendResult<WsOptionalTarget> {
+                auto& next = *static_cast<Continuation*>(opaque);
+                const u32 kSavedProofs = next.proofs.len;
+                if (!next.proofs.push({&next.source, binding}))
+                    return frontend_error(FrontendError::TooManyItems, next.body.span);
+                auto result = lower_ws_optional_choices(next.body,
+                                                        next.route,
+                                                        next.mod,
+                                                        next.proofs,
+                                                        next.failures,
+                                                        next.success,
+                                                        next.context,
+                                                        next.depth);
+                next.proofs.len = kSavedProofs;
+                return result;
+            };
+            WsOptionalEdges missing{};
+            auto selected = lower_ws_optional_choices(
+                *value.lhs->lhs, route, mod, proofs, missing, kContinue, &continuation, depth + 1);
+            if (!selected) return core::make_unexpected(selected.error());
+            auto other = lower_ws_optional_choices(
+                *value.args[0], route, mod, proofs, failures, success, context, depth + 1);
+            if (!other) return core::make_unexpected(other.error());
+            auto linked = ws_optional_patch(missing, other.value(), route, value.span);
+            if (!linked) return core::make_unexpected(linked.error());
+            return selected->entry == kWsControlNext ? other.value() : selected.value();
+        }
+        auto condition = lower_ws_typed_condition(
+            *value.lhs, WsVerdict::Drop, route.ws_handler, false, false, depth + 1);
+        if (!condition) return core::make_unexpected(condition.error());
+        auto yes = lower_ws_optional_choices(
+            *value.rhs, route, mod, proofs, failures, success, context, depth + 1);
+        if (!yes) return core::make_unexpected(yes.error());
+        auto no = lower_ws_optional_choices(
+            *value.args[0], route, mod, proofs, failures, success, context, depth + 1);
+        if (!no) return core::make_unexpected(no.error());
+        auto linked =
+            ws_optional_connect({condition.value(), true}, yes.value(), route, value.span);
+        if (!linked) return core::make_unexpected(linked.error());
+        linked = ws_optional_connect({condition.value(), false}, no.value(), route, value.span);
+        if (!linked) return core::make_unexpected(linked.error());
+        return WsOptionalTarget{condition.value(), nullptr};
+    }
+    WsJsonBinding binding{};
+    auto present = lower_ws_json_optional(value, WsVerdict::Drop, route, mod, binding, proofs);
+    if (!present) return core::make_unexpected(present.error());
+    auto target = success(binding, context);
+    if (!target) return core::make_unexpected(target.error());
+    auto linked = ws_optional_connect({present.value(), true}, target.value(), route, value.span);
+    if (!linked) return core::make_unexpected(linked.error());
+    linked = ws_optional_connect(
+        {present.value(), false}, {kWsControlNext, &failures}, route, value.span);
+    if (!linked) return core::make_unexpected(linked.error());
+    return WsOptionalTarget{present.value(), nullptr};
+}
+
+struct WsChoiceBody {
+    Str name;
+    const AstStatement& body;
+    HirRoute& route;
+    const HirModule& mod;
+    WsJsonBindings& documents;
+    WsCallbackScope& scope;
+    bool default_tail;
+    u32 base_count;
+    u32 max_count;
+    u32 successes = 0;
+};
+
+static FrontendResult<WsOptionalTarget> analyze_ws_choice_body(const WsJsonBinding& binding,
+                                                               void* opaque) {
+    auto& next = *static_cast<WsChoiceBody*>(opaque);
+    const u32 kSavedBindings = next.documents.len;
+    WsJsonBinding named = binding;
+    named.name = next.name;
+    if (!next.documents.push(named))
+        return frontend_error(FrontendError::TooManyItems, next.body.span);
+    u32 count = next.base_count;
+    // The first specialization retains the lexical default recipe. Later ones
+    // use branch policies, so they cannot overwrite that default's JSON path.
+    const bool kDefault = next.default_tail && next.successes == 0;
+    ++next.successes;
+    auto entry = analyze_ws_tree_branch(
+        next.body, next.route, next.mod, next.documents, next.scope, kDefault, count);
+    next.documents.len = kSavedBindings;
+    if (!entry) return core::make_unexpected(entry.error());
+    if (count > next.max_count) next.max_count = count;
+    return WsOptionalTarget{entry.value(), nullptr};
+}
+
+struct WsTreeControl {
+    u32 entry = 0;
+    u32 continuation = 0;
+};
+
+static FrontendResult<WsTreeControl> analyze_ws_choice_if(const AstStatement& stmt,
+                                                          const HirExpr& value,
+                                                          HirRoute& route,
+                                                          const HirModule& mod,
+                                                          WsJsonBindings& documents,
+                                                          WsCallbackScope& scope,
+                                                          bool default_tail,
+                                                          bool terminal,
+                                                          u32& conditional_count) {
+    WsChoiceBody next{stmt.name,
+                      *stmt.then_stmt,
+                      route,
+                      mod,
+                      documents,
+                      scope,
+                      false,
+                      conditional_count,
+                      conditional_count};
+    WsOptionalEdges failures{};
+    WsJsonHelperProofs proofs{};
+    auto entry = lower_ws_optional_choices(
+        value, route, mod, proofs, failures, analyze_ws_choice_body, &next);
+    if (!entry) return core::make_unexpected(entry.error());
+    if (next.successes == 0 || entry->entry == kWsControlNext)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    conditional_count = next.max_count;
+    u32 continuation = entry->entry;
+    u32 no = 0;
+    if (terminal) {
+        auto other = analyze_ws_tree_branch(
+            *stmt.else_stmt, route, mod, documents, scope, default_tail, conditional_count);
+        if (!other) return core::make_unexpected(other.error());
+        no = other.value();
+    } else {
+        // Enclosing sequences must patch the absence join, never the selector's
+        // false edge (which may select a different successful value).
+        WsLenGuard join{};
+        join.accessor = WsLenGuard::Accessor::Constant;
+        join.pass_target = kWsControlDefault;
+        if (!route.ws_handler.len_guards.push(join))
+            return frontend_error(FrontendError::TooManyItems, stmt.span);
+        continuation = route.ws_handler.len_guards.len - 1;
+        no = continuation;
+        route.ws_handler.len_guards[continuation].fail_target =
+            ws_control_after(route.ws_handler.len_guards.len);
+    }
+    auto linked = ws_optional_patch(failures, {no, nullptr}, route, stmt.span);
+    if (!linked) return core::make_unexpected(linked.error());
+    return WsTreeControl{entry->entry, continuation};
+}
+
+static FrontendResult<u32> analyze_ws_choice_guard(const AstStatement& stmt,
+                                                   const HirExpr& value,
+                                                   WsVerdict verdict,
+                                                   const AstStatement& tail,
+                                                   HirRoute& route,
+                                                   const HirModule& mod,
+                                                   WsJsonBindings& documents,
+                                                   WsCallbackScope& scope,
+                                                   bool default_tail,
+                                                   u32& conditional_count) {
+    WsChoiceBody next{stmt.name,
+                      tail,
+                      route,
+                      mod,
+                      documents,
+                      scope,
+                      default_tail,
+                      conditional_count,
+                      conditional_count};
+    WsOptionalEdges failures{};
+    WsJsonHelperProofs proofs{};
+    auto entry = lower_ws_optional_choices(
+        value, route, mod, proofs, failures, analyze_ws_choice_body, &next);
+    if (!entry) return core::make_unexpected(entry.error());
+    if (next.successes == 0 || entry->entry == kWsControlNext)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    conditional_count = next.max_count;
+    auto linked = ws_optional_patch(
+        failures, {ws_control_return(static_cast<u8>(verdict)), nullptr}, route, stmt.span);
+    if (!linked) return core::make_unexpected(linked.error());
+    return entry->entry;
+}
+
+static AstStatement ws_remaining_body(const AstStatement& body, u32 first) {
+    AstStatement tail{};
+    tail.kind = AstStmtKind::Block;
+    tail.span = body.span;
+    for (u32 i = first; i < body.block_stmts.len; ++i)
+        (void)tail.block_stmts.push(body.block_stmts[i]);
+    return tail;
+}
+
+static FrontendResult<WsTreeControl> analyze_ws_tree_if(const AstStatement& stmt,
+                                                        HirRoute& route,
+                                                        const HirModule& mod,
+                                                        WsJsonBindings& documents,
+                                                        WsCallbackScope& scope,
+                                                        bool default_tail,
+                                                        bool terminal,
+                                                        u32& conditional_count) {
     if (stmt.kind != AstStmtKind::If || !stmt.then_stmt ||
         (terminal ? !stmt.else_stmt : stmt.else_stmt != nullptr))
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
     if (++conditional_count > HirWsHandler::kMaxLenGuards)
         return frontend_error(FrontendError::TooManyItems, stmt.span);
     const u32 kSavedBindings = documents.len;
-    auto root =
-        stmt.bind_value
-            ? analyze_ws_json_binding(stmt, WsVerdict::Drop, route, mod, documents, scope)
-            : analyze_message_condition(stmt.expr, WsVerdict::Drop, route, mod, documents, scope);
+    FrontendResult<u32> root = frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    if (stmt.bind_value) {
+        auto value = analyze_ws_json_initializer(stmt, route, mod, documents, scope);
+        if (!value) return core::make_unexpected(value.error());
+        if (ws_optional_has_choices(value.value()))
+            return analyze_ws_choice_if(stmt,
+                                        value.value(),
+                                        route,
+                                        mod,
+                                        documents,
+                                        scope,
+                                        default_tail,
+                                        terminal,
+                                        conditional_count);
+        root = analyze_ws_json_binding_value(
+            stmt, value.value(), WsVerdict::Drop, route, mod, documents);
+    } else {
+        root = analyze_message_condition(stmt.expr, WsVerdict::Drop, route, mod, documents, scope);
+    }
     if (!root) {
         documents.len = kSavedBindings;
         return core::make_unexpected(root.error());
@@ -8923,7 +9236,7 @@ static FrontendResult<u32> analyze_ws_tree_if(const AstStatement& stmt,
     auto& node = route.ws_handler.len_guards[root.value()];
     node.pass_target = yes.value();
     node.fail_target = no;
-    return root.value();
+    return WsTreeControl{root.value(), root.value()};
 }
 
 static FrontendResult<u32> analyze_ws_tree_branch(const AstStatement& body,
@@ -8959,31 +9272,64 @@ static FrontendResult<u32> analyze_ws_tree_branch(const AstStatement& body,
                     if (!binding) return core::make_unexpected(binding.error());
                     continue;
                 }
-                FrontendResult<u32> root =
-                    statement->kind == AstStmtKind::Guard
-                        ? analyze_ws_branch_guard(
-                              *statement, route, mod, documents, scope, conditional_count)
-                        : analyze_ws_tree_if(*statement,
-                                             route,
-                                             mod,
-                                             documents,
-                                             scope,
-                                             false,
-                                             false,
-                                             conditional_count);
-                if (!root) return core::make_unexpected(root.error());
-                kContinueAt(root.value());
-                if (entry == kWsControlNext) entry = root.value();
-                pending = root.value();
+                WsTreeControl control{};
+                if (statement->kind == AstStmtKind::Guard && statement->bind_value) {
+                    if (!statement->else_stmt || statement->else_stmt->kind != AstStmtKind::Expr)
+                        return frontend_error(FrontendError::UnsupportedSyntax, statement->span);
+                    if (++conditional_count > HirWsHandler::kMaxLenGuards)
+                        return frontend_error(FrontendError::TooManyItems, statement->span);
+                    auto verdict = analyze_message_guard_verdict(
+                        statement->else_stmt->expr, route, mod, documents, scope);
+                    if (!verdict) return core::make_unexpected(verdict.error());
+                    auto value =
+                        analyze_ws_json_initializer(*statement, route, mod, documents, scope);
+                    if (!value) return core::make_unexpected(value.error());
+                    if (ws_optional_has_choices(value.value())) {
+                        auto tail = ws_remaining_body(body, i + 1);
+                        auto selected = analyze_ws_choice_guard(*statement,
+                                                                value.value(),
+                                                                verdict.value(),
+                                                                tail,
+                                                                route,
+                                                                mod,
+                                                                documents,
+                                                                scope,
+                                                                default_tail,
+                                                                conditional_count);
+                        if (!selected) return core::make_unexpected(selected.error());
+                        kContinueAt(selected.value());
+                        return entry == kWsControlNext ? selected.value() : entry;
+                    }
+                    auto root = analyze_ws_json_binding_value(
+                        *statement, value.value(), verdict.value(), route, mod, documents);
+                    if (!root) return core::make_unexpected(root.error());
+                    control = {root.value(), root.value()};
+                } else if (statement->kind == AstStmtKind::Guard) {
+                    auto root = analyze_ws_branch_guard(
+                        *statement, route, mod, documents, scope, conditional_count);
+                    if (!root) return core::make_unexpected(root.error());
+                    control = {root.value(), root.value()};
+                } else {
+                    auto branch = analyze_ws_tree_if(
+                        *statement, route, mod, documents, scope, false, false, conditional_count);
+                    if (!branch) return core::make_unexpected(branch.error());
+                    control = branch.value();
+                }
+                kContinueAt(control.entry);
+                if (entry == kWsControlNext) entry = control.entry;
+                pending = control.continuation;
                 pending_fail = statement->kind == AstStmtKind::If;
             }
             last = body.block_stmts[body.block_stmts.len - 1];
         }
         if (!last) return frontend_error(FrontendError::UnsupportedSyntax, body.span);
         const auto kTail = [&]() -> FrontendResult<u32> {
-            if (last->kind == AstStmtKind::If)
-                return analyze_ws_tree_if(
+            if (last->kind == AstStmtKind::If) {
+                auto branch = analyze_ws_tree_if(
                     *last, route, mod, documents, scope, default_tail, true, conditional_count);
+                if (!branch) return core::make_unexpected(branch.error());
+                return branch->entry;
+            }
             if (last->kind != AstStmtKind::Expr)
                 return frontend_error(FrontendError::UnsupportedSyntax, last->span);
             if (default_tail) {
@@ -15255,8 +15601,25 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     gs->else_stmt->expr, *route, mod, documents, scope);
                 if (!gv) return core::make_unexpected(gv.error());
                 if (gs->bind_value) {
-                    auto binding =
-                        analyze_ws_json_binding(*gs, gv.value(), *route, mod, documents, scope);
+                    auto value = analyze_ws_json_initializer(*gs, *route, mod, documents, scope);
+                    if (!value) return core::make_unexpected(value.error());
+                    if (ws_optional_has_choices(value.value())) {
+                        auto tail = ws_remaining_body(*body, i + 1);
+                        auto selected = analyze_ws_choice_guard(*gs,
+                                                                value.value(),
+                                                                gv.value(),
+                                                                tail,
+                                                                *route,
+                                                                mod,
+                                                                documents,
+                                                                scope,
+                                                                true,
+                                                                conditional_count);
+                        if (!selected) return core::make_unexpected(selected.error());
+                        return {};
+                    }
+                    auto binding = analyze_ws_json_binding_value(
+                        *gs, value.value(), gv.value(), *route, mod, documents);
                     if (!binding) return core::make_unexpected(binding.error());
                 } else {
                     auto g = analyze_message_condition(

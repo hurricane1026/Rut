@@ -6341,6 +6341,160 @@ route GET "/root-iflet" { return websocket(backend) { msg in
     program.destroy();
 }
 
+TEST(serve_loader, websocket_value_choices_keep_selected_paths_defaults_and_joins) {
+    const char* source = R"rut(upstream ws at "127.0.0.1:9999"
+func pick(_ msg: WebSocketMessage, _ root: Json) -> Json {
+    if msg.fromClient { json.get(root, "/a") } else { json.get(root, "/b") }
+}
+func readChoice(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = pick(msg, root) else { nil }
+    json.string(field)
+}
+func fallback(_ root: Json) -> Json {
+    if let field = json.get(root, "/a") { field } else { json.get(root, "/b") }
+}
+func readFallback(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = fallback(root) else { nil }
+    json.string(field)
+}
+route GET "/guard" { return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.drop() }
+    guard text.hasPrefix("ok") else { msg.close(1008) }
+    msg.forward("<" + text + ">")
+} }
+route GET "/if" { return websocket(ws) { msg in
+    if let text = readChoice(msg) { msg.forward(text) }
+    else { msg.forward("absent") }
+} }
+route GET "/early" { return websocket(ws) { msg in
+    if msg.fromClient {
+        if let text = readFallback(msg) { msg.forward(text) }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/fallback" { return websocket(ws) { msg in
+    guard let text = readFallback(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/bare" { return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.close() }
+    msg.close(1008, "policy")
+} }
+func textOrNumber(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    if let text = json.string(root) { text } else { json.numberText(root) }
+}
+route GET "/scalar" { return websocket(ws) { msg in
+    guard let text = textOrNumber(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+)rut";
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_value_choices").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    REQUIRE_EQ(program.config.route_count, 6u);
+    const auto guard = program.config.routes[0].ws_frame_handler;
+    const auto branch = program.config.routes[1].ws_frame_handler;
+    const auto early = program.config.routes[2].ws_frame_handler;
+    const auto fallback = program.config.routes[3].ws_frame_handler;
+    const auto bare = program.config.routes[4].ws_frame_handler;
+    const auto scalar = program.config.routes[5].ws_frame_handler;
+    REQUIRE(guard);
+    REQUIRE(branch);
+    REQUIRE(early);
+    REQUIRE(fallback);
+    REQUIRE(bare);
+    REQUIRE(scalar);
+    struct Case {
+        const char* json;
+        WsFrameAction client;
+        WsFrameAction server;
+    };
+    const Case guards[] = {
+        {"{\"a\":\"okA\",\"b\":\"okB\"}",
+         WsFrameAction::ForwardText,
+         WsFrameAction::ForwardTextPolicy0},
+        {"{\"a\":\"\",\"b\":\"noB\"}", WsFrameAction::ClosePolicy0, WsFrameAction::ClosePolicy1},
+        {"{\"b\":\"okB\"}", WsFrameAction::Drop, WsFrameAction::ForwardTextPolicy0},
+        {"{\"a\":null,\"b\":\"okB\"}", WsFrameAction::Drop, WsFrameAction::ForwardTextPolicy0},
+        {"broken", WsFrameAction::Drop, WsFrameAction::Drop},
+        {"{\"a\":\"okA\",\"b\":false}", WsFrameAction::ForwardText, WsFrameAction::Drop}};
+    const Case branches[] = {
+        {"{\"a\":\"A\",\"b\":\"B\"}",
+         WsFrameAction::ForwardTextPolicy0,
+         WsFrameAction::ForwardTextPolicy1},
+        {"{\"a\":\"\",\"b\":\"\"}",
+         WsFrameAction::ForwardTextPolicy0,
+         WsFrameAction::ForwardTextPolicy1},
+        {"{\"b\":\"B\"}", WsFrameAction::ForwardText, WsFrameAction::ForwardTextPolicy1},
+        {"broken", WsFrameAction::ForwardText, WsFrameAction::ForwardText}};
+    const char* alternatives[] = {"{\"a\":\"A\",\"b\":\"B\"}",
+                                  "{\"b\":\"B\"}",
+                                  "{\"a\":null,\"b\":\"B\"}",
+                                  "{\"a\":false,\"b\":\"B\"}",
+                                  "{\"a\":\"\",\"b\":\"B\"}"};
+    const char* scalars[] = {"\"\"", "\"ok\"", "0", "1.2300e+999", "null"};
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (const auto& test : guards)
+                CHECK(guard(nullptr,
+                            op,
+                            reinterpret_cast<const u8*>(test.json),
+                            static_cast<u32>(strlen(test.json)),
+                            client) == (client ? test.client : test.server));
+            for (const auto& test : branches)
+                CHECK(branch(nullptr,
+                             op,
+                             reinterpret_cast<const u8*>(test.json),
+                             static_cast<u32>(strlen(test.json)),
+                             client) == (client ? test.client : test.server));
+            for (u32 i = 0; i < 5; ++i) {
+                const auto* bytes = reinterpret_cast<const u8*>(alternatives[i]);
+                const u32 size = static_cast<u32>(strlen(alternatives[i]));
+                const auto selected = i == 0 || i == 4 ? WsFrameAction::ForwardText
+                                      : i == 1         ? WsFrameAction::ForwardTextPolicy0
+                                                       : WsFrameAction::Drop;
+                CHECK(fallback(nullptr, op, bytes, size, client) == selected);
+                const auto resumed = !client                  ? WsFrameAction::ForwardText
+                                     : i == 0 || i == 4       ? WsFrameAction::ForwardTextPolicy0
+                                     : i == 1                 ? WsFrameAction::ForwardTextPolicy1
+                                     : op == WsOpcode::Binary ? WsFrameAction::ForwardTextPolicy2
+                                                              : WsFrameAction::Drop;
+                CHECK(early(nullptr, op, bytes, size, client) == resumed);
+                CHECK(scalar(nullptr,
+                             op,
+                             reinterpret_cast<const u8*>(scalars[i]),
+                             static_cast<u32>(strlen(scalars[i])),
+                             client) == (i < 2   ? WsFrameAction::ForwardText
+                                         : i < 4 ? WsFrameAction::ForwardTextPolicy0
+                                                 : WsFrameAction::Drop));
+            }
+            const char* valid = "{\"a\":\"okA\",\"b\":\"okB\"}";
+            CHECK(bare(nullptr,
+                       op,
+                       reinterpret_cast<const u8*>(valid),
+                       static_cast<u32>(strlen(valid)),
+                       client) == (client ? WsFrameAction::Close : WsFrameAction::ClosePolicy0));
+            CHECK(bare(nullptr, op, reinterpret_cast<const u8*>("broken"), 6, client) ==
+                  WsFrameAction::Close);
+        }
+    }
+    CHECK(program.config.routes[0].ws_forward_text.source_path.eq(lit_str("/a")));
+    CHECK(program.config.routes[0].ws_forward_texts[0].source_path.eq(lit_str("/b")));
+    CHECK_EQ(program.config.routes[4].ws_close_code, 1008u);
+    CHECK(program.config.routes[4].ws_close_reason.eq(lit_str("policy")));
+    CHECK(program.config.routes[5].ws_forward_text.source == WsTextSource::JsonString);
+    CHECK(program.config.routes[5].ws_forward_texts[0].source == WsTextSource::JsonNumberText);
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
 TEST(serve_loader, websocket_helper_bindings_keep_scopes_presence_and_distinct_paths) {
     const char* source = R"rut(upstream ws at "127.0.0.1:9999"
 func identity<T>(_ value: T) -> T => value

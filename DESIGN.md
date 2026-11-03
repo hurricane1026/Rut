@@ -2989,13 +2989,31 @@ operations. Returning a proven binding emits a constant-present operand instead
 of repeating its extraction. Proof scopes are restored before leaving the
 continuation, including failed lowering. Proofs stay in bounded compiler scratch;
 no value storage, runtime operation or serialization field is introduced. A
-caller binding publishes only the final successful projection. Nil failure arms
-and the one-value-path restriction remain in force.
+caller binding publishes only a successful projection.
 
-Different value-producing alternatives, JSON mutations, dynamic pointer
-expressions and other optional computations remain absent, as do initializer-less
-shorthand bindings. Helper calls add no
-runtime storage, native format or handler ABI.
+Helpers may select different immutable JSON projections or return a fallback
+projection from an optional-binding failure arm. Such values lower to a forward
+control graph: each selector runs once and each successful leaf specializes the
+callback continuation with its own alias kind/path and proof scope. An absent
+selected value enters the caller's failure continuation, rather than trying a
+sibling alternative; explicit helper fallbacks are taken only on their own
+HasValue absence edge. No choice slot or dynamic path is stored at runtime.
+
+Specialized callback copies count original source clauses once, using the maximum
+continuation count before analyzing a shared failure arm. All generated predicate
+operands, control roots and early-if absence joins share the 32-node limit. The
+four source clauses and existing close/forward policy-table limits remain. The
+first guard continuation retains the lexical default recipe; later specializations
+use branch policies, preserving both their own path and existing bare guard-close
+behavior. An early optional if returns a distinct absence-join handle so later
+statements cannot overwrite the selector edge that chooses another value.
+
+JIT validation retains four legacy sequential roots and permits explicit forward
+control roots within the same 32-node forest. Existing operand ownership, target,
+cycle and action checks remain. Compiler source clauses stay bounded separately.
+JSON mutations, dynamic pointer expressions, general optional computations and
+initializer-less shorthand bindings remain absent. No runtime storage, native
+format, accessor tag or handler ABI is added.
 
 A branch sequence tracks its entry and pending continuation edge. A guard's
 success edge or an early if's false edge is patched to the next source condition,

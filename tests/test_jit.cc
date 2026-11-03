@@ -20771,6 +20771,32 @@ TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
 }
 
+TEST(jit, websocket_explicit_control_graphs_use_the_condition_node_budget) {
+    WsLenGuardSpec nodes[WsLenGuardSpec::kMaxConditions]{};
+    for (u32 i = 0; i < WsLenGuardSpec::kMaxConditions; ++i) {
+        nodes[i].accessor = i == 0 ? 2 : 35;
+        nodes[i].cmp = 2;
+        nodes[i].bound = 1;
+        nodes[i].pass_target =
+            i + 1 < WsLenGuardSpec::kMaxConditions ? i + 1 : ws_control_return(0);
+        nodes[i].fail_target = ws_control_return(1);
+    }
+    auto generated = codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions, 69);
+    REQUIRE(generated.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(generated.mod, generated.ctx));
+    auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_69"));
+    REQUIRE(handler);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, false) == WsFrameAction::Drop);
+    CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
+    nodes[12].pass_target = 12;
+    CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions, 0).ok);
+    WsLenGuardSpec legacy[5]{};
+    CHECK_FALSE(codegen_ws_handler(0, legacy, 5, 0).ok);
+}
+
 TEST(jit, websocket_forward_control_targets_keep_nested_conditions_lazy) {
     WsLenGuardSpec guards[4]{};
     guards[0].accessor = 2;

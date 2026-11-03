@@ -923,9 +923,15 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // with nil failure paths. Successful bindings can feed later get/scalar calls or
 // be returned; presence proofs remain scoped to the success continuation and
 // distinguish JSON paths. Returning the unwrapped binding does not repeat its
-// presence check. Different value-producing alternatives, JSON mutations, dynamic
-// pointers, other optional computations, binding shorthand, loops and general
-// computation remain unsupported.
+// presence check. Helpers may select different JSON projections and use supported
+// projections as optional-binding fallback arms. Guard-let, terminal/early if-let
+// specialize the continuation per selected kind/path; selectors run once, sibling
+// alternatives stay lazy, and a missing selected value takes the caller failure.
+// Present null/false values do not take optional-binding fallbacks. Copies count
+// original source clauses once, but generated control/condition nodes and absence
+// joins share 32 nodes; all recipes share the existing bounded policy tables.
+// JSON mutations, dynamic pointers, general optional computations, binding
+// shorthand, loops and general computation remain unsupported.
 func messageDocument(_ msg: WebSocketMessage) -> Json => json.parse(msg.text)
 func jsonField(_ value: Json, _ pointer: str) -> Json => json.get(value, pointer)
 func jsonText(_ value: Json) -> str => json.string(value)

@@ -3151,7 +3151,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
     // A bounded forest, in postorder: every operand has exactly one parent. Validate
     // before recursive emission so malformed specs cannot create cycles or code expansion.
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
-    u32 roots = 0;
+    u32 sequential_roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
         if (guards[i].accessor > 36 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
@@ -3180,7 +3180,12 @@ bool emit_ws_handler(LLVMModuleRef mod,
                 if (child >= i || !guards[child].is_operand || ++parents[child] != 1) return false;
             }
         }
-        if (!guards[i].is_operand && ++roots > WsLenGuardSpec::kMaxGuards) return false;
+        // Source clauses remain bounded by the frontend. Explicit forward roots
+        // also represent specialized value alternatives within those clauses.
+        if (!guards[i].is_operand && guards[i].pass_target == kWsControlNext &&
+            guards[i].fail_target == kWsControlNext &&
+            ++sequential_roots > WsLenGuardSpec::kMaxGuards)
+            return false;
     }
     for (u32 i = 0; i < guard_count; i++) {
         if (guards[i].is_operand && parents[i] != 1) return false;
