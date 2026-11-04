@@ -3,6 +3,8 @@
 #include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
+#include "fixtures/ws_error_guard_match.h"
+#include "fixtures/ws_error_values.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_general_json.h"
 #include "fixtures/ws_general_regex.h"
@@ -46556,16 +46558,19 @@ TEST(frontend, websocket_uuid_uses_the_same_direct_initializer_contract_as_http)
 #endif
 
 #if RUT_ENABLE_WEBSOCKET
-TEST(frontend, websocket_eager_bindings_reject_unhandled_error_initializers) {
+TEST(frontend, websocket_error_values_preserve_ordinary_binding_and_recovery_types) {
     auto tokens = lex(lit(R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { msg in
     let failure: i32 = error(7)
+    guard let value = failure else { msg.forward("handled") }
     msg.forward()
 } })rut"));
     REQUIRE(tokens);
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
-    CHECK_FALSE(analyze_file_heap(ast.value()));
+    auto analyzed = analyze_file_heap(ast.value());
+    REQUIRE(analyzed);
+    check_general_ws_rir(analyzed.value(), _tc);
 }
 #endif
 
@@ -46922,3 +46927,80 @@ TEST(frontend, websocket_nominal_match_binders_survive_owning_ast_and_hir_copies
     check_general_ws_rir(*copy, _tc);
 }
 #endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_error_value_aliases_keep_owned_ir_and_require_unwrapping) {
+    for (const char* source :
+         {test::ws_error_values::kSource, test::ws_error_guard_match::kSource}) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto copied_ast = std::make_unique<AstFile>(ast.value());
+        ast.reset();
+        auto hir = analyze_file_heap(*copied_ast);
+        REQUIRE(hir);
+        copied_ast.reset();
+        auto copy = std::make_unique<HirModule>(hir.value());
+        hir.reset();
+        check_general_ws_rir(*copy, _tc);
+    }
+    for (const char* body : {
+             "msg.forward(result)",
+             "msg.forward(result + \"!\")",
+             "guard result.hasPrefix(\"x\") else { msg.drop() } msg.forward()",
+             "if result { msg.forward() } else { msg.drop() }",
+         }) {
+        std::string source = R"rut(upstream ws
+func value(_ n: i32) -> str { if n == 0 { error(7) } else { "ok" } }
+route GET "/" { return websocket(ws) { msg in let result = value(msg.len)
+)rut";
+        source += body;
+        source += " } }";
+        auto bad_tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(bad_tokens);
+        auto bad_ast = parse_file_heap(bad_tokens.value());
+        REQUIRE(bad_ast);
+        CHECK_FALSE(analyze_file_heap(bad_ast.value()));
+    }
+}
+#endif
+
+TEST(frontend, helper_error_domains_preserve_nominal_identity) {
+    const char* sources[] = {
+        R"rut(
+variant Failure { bad }
+variant Other { bad }
+func value(_ failed: bool) -> str {
+    if failed { error(Failure.bad) } else { error(Other.bad) }
+}
+route GET "/" { return 200 }
+)rut",
+        R"rut(
+variant Failure { bad }
+func value(_ failed: bool) -> str {
+    if failed { error(Failure.bad) } else { error(7) }
+}
+route GET "/" { return 200 }
+)rut",
+        R"rut(
+variant Failure { bad }
+func value(_ failed: bool) -> str {
+    if failed { error(Failure.bad) } else { "ok" }
+}
+func recover(_ failed: bool) -> str {
+    let result = value(failed)
+    guard match result else { .bad => "bad" }
+    "ok"
+}
+route GET "/" { return 200 }
+)rut",
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}

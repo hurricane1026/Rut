@@ -615,9 +615,10 @@ struct Parser {
                 st = binding.value();
             } else if (cur().type == TokenType::KwGuard) {
                 // `guard <cond> else { <verdict> }` — a conditional verdict.
-                const Token gt = cur();
+                const Token kGuardToken = cur();
                 pos++;
-                auto g = parse_ws_message_guard(gt);
+                auto g = cur().type == TokenType::KwMatch ? parse_func_guard_stmt(kGuardToken)
+                                                          : parse_ws_message_guard(kGuardToken);
                 if (!g) return core::make_unexpected(g.error());
                 st = g.value();
             } else if (cur().type == TokenType::KwIf) {

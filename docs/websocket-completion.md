@@ -60,3 +60,9 @@ commit behavior. Source/native tests on both backends cover zero-connect denial,
 keepalive reuse, stabilized values across request rewrites, coalesced messages
 from both peers and refusal to publish mutated handshake-critical headers. The
 ordinary HTTP wait/for restrictions on chain-after effects remain unchanged.
+
+Fallible helper results now retain error/nil carriers in lexical callback lets,
+aliases and helper-local recovery. `guard let`, `if let`, `.or(default)` and
+named-error `guard match` share ordinary analysis; the latter retains HTTP's
+final-wildcard rule. Reached producers run once even for unused results.
+Response/effect/yield helper semantics and the broad criteria remain open.

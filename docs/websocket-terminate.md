@@ -95,7 +95,7 @@ references reuse that value. Nullable values retain their presence channel.
 unwrap the token before use. Allocation failure follows its nil branch. The
 message arena is reset for each invocation after output has been copied.
 General JSON, digest/HMAC and argument-bearing verdicts also use shared IR, as
-described below. Error-capable local declarations remain pending. HTTP
+described below. Error-capable local declarations retain their error carrier. HTTP
 access is rejected even in statically unreachable message branches. The shared
 entry emits explicit branches and typed SSA merges: only the chosen arm runs,
 including nested nullable value choices. It does not reuse an eager `select`
@@ -105,7 +105,7 @@ Pure helper bodies and actual arguments retain reached lexical evaluation in
 message callbacks, including nested local/guard bindings and unused resource
 producers. Actual arguments run in declaration order once; repeated reads reuse
 the bound result. Infallible immutable projections can be substituted without
-work. Helpers with unintegrated error/effect semantics are rejected explicitly.
+work. Helpers with unintegrated response/effect/yield semantics are rejected explicitly.
 A borrowed whole-message alias cannot hide an initializer requiring runtime
 storage; pass its scalar or Bytes projections instead.
 
@@ -117,7 +117,7 @@ failure stops execution, never fabricates empty text. Only the selected branch
 allocates. Known invalid UTF-8 Text literals and a proven minimum output length
 above the configured limit remain compile errors; dynamic results are checked
 at publication. These String operations share their HTTP compiler path. General
-source interpolation and error/effect-capable helper bodies remain separate
+source interpolation and response/effect/yield helper bodies remain separate
 work.
 
 Boolean helpers may use ordinary `if`/`else` to select between two supported
@@ -239,9 +239,27 @@ expressions, message aliases and projections, ordinary optional values, JSON
 operations and digest/HMAC results. Bindings are immutable and visible
 only after their declaration, through the remainder of this callback. Names
 must be fresh across callback lets, JSON guard aliases and captured admission
-constants; `json` is unavailable as a local let name. HTTP reads/effects and
-error-capable lets remain unavailable. An unused initializer is still checked
-and reached nullable work still runs once.
+constants; `json` is unavailable as a local let name. HTTP reads/effects remain
+unavailable. An unused initializer is still checked, and reached nullable or
+fallible work still runs once.
+
+Fallible helper results may be stored and aliased before `guard let`, `if let`
+or `.or(default)` recovery. A stored error does not implicitly throw, and a
+successful false, zero or empty String remains present. Error and nil carriers
+remain distinct; neither may be passed as a plain success value. `guard match`
+uses the ordinary named Error domain and requires a final wildcard, as in HTTP:
+
+```swift
+variant MessageError { bad }
+func checked(_ value: str) -> str {
+    if value == "bad" { error(MessageError.bad) } else { value }
+}
+// Inside callback:
+// let result = checked(message.text)
+// guard match result else { .bad => message.drop() _ => message.close(1011) }
+// guard let text = result else { message.close(1011) }
+// message.forward(text)
+```
 
 Message aliases may receive verdicts. A borrowed text alias may feed the existing
 text rewrite or `json.parse` guard; JSON guard aliases retain their existing

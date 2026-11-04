@@ -891,7 +891,10 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // including unused arguments; only selected branches execute. String +, hasPrefix,
 // hasSuffix, contains accept unwrapped String operands; isEmpty is a property.
 // Concatenation owns bounded arena bytes and stops execution on allocation failure.
-// Error/effect-capable helper integration, error-capable lets, cache work and
+// Fallible helper values may be stored, aliased and recovered with guard let,
+// if let or .or(default). guard match handles named Error cases and requires
+// a final wildcard, as in HTTP. Unwrap before using a success value; nil and
+// Error stay distinct. Response/effect/yield helpers, cache work and
 // connection/close contexts still need integration. uuid() retains HTTP's
 // direct-let initializer restriction; failures are nil and must be unwrapped.
 //

@@ -390,6 +390,119 @@ def nominal_match_exchange(client, peer):
     expect(peer, (8, b"\x03\xe8", True))
 
 
+ERROR_VALUE_DECLARATIONS = r"""
+func resultValue(_ text: str) -> str {
+    let unused = sha256(text)
+    if text == "fail" { error(7) } else { if text == "nil" { nil } else { text } }
+}
+"""
+ERROR_VALUE_HANDLER = r"""
+return websocket(ws) { msg in
+    let result = resultValue(msg.text)
+    if msg.fromClient {
+        guard let plain = result else { msg.forward("absent") }
+        msg.forward(plain + "!")
+    } else { msg.forward(result.or("upstream fallback")) }
+}
+"""
+
+
+def error_value_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"error value: {actual=!r}, {expected=!r}")
+
+    client.sendall(b"".join(masked_frame(2, data) for data in (b"", b"fail", b"nil", b"ok")))
+    for expected in (b"!", b"absent", b"absent", b"ok!"):
+        expect(peer, (1, expected, True))
+    fragment = bytearray(masked_frame(2, b"f"))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"PING") + masked_frame(0, b"ail"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"absent", True))
+    peer.sendall(b"\x81\x04fail\x81\x03nil\x81\x00\x81\x05again")
+    for expected in (b"upstream fallback", b"upstream fallback", b"", b"again"):
+        expect(client, (1, expected, False))
+    client.sendall(masked_frame(2, b"\xff"))
+    expect(client, (8, b"\x03\xf3", False))
+    expect(peer, (8, b"\x03\xf3", True))
+
+
+ERROR_FIELDS_DECLARATIONS = r"""
+func inspectedFields(_ input: str) -> str {
+    if input == "bad" { error(7, "bad input") }
+    else { if input == "nil" { nil } else { input } }
+}
+"""
+ERROR_FIELDS_HANDLER = r"""
+return websocket(ws) { msg in
+    let result = inspectedFields(msg.text)
+    let code = result.code
+    let reason = result.msg
+    if code == 7 {
+        guard reason == "bad input" else { msg.close(1011) }
+        msg.forward(reason)
+    } else {
+        guard let plain = result else { msg.forward("absent") }
+        msg.forward(plain)
+    }
+}
+"""
+
+
+def error_fields_exchange(client, peer):
+    for opcode, value, expected in ((2, b"bad", b"bad input"),
+                                    (1, b"ok", b"ok"),
+                                    (2, b"nil", b"absent"),
+                                    (1, b"", b"")):
+        client.sendall(masked_frame(opcode, value))
+        if recv_client_frame(peer) != (1, expected, True):
+            raise AssertionError("client error fields lost their carrier")
+        peer.sendall(bytes((0x80 | opcode, len(value))) + value)
+        if recv_client_frame(client) != (1, expected, False):
+            raise AssertionError("upstream error fields lost their carrier")
+
+
+ERROR_MATCH_DECLARATIONS = r"""
+variant MessageError { bad, empty }
+func inspected(_ input: str) -> str {
+    let unused = sha256(input)
+    if input == "bad" { error(MessageError.bad) }
+    else { if input == "" { error(MessageError.empty) } else { input } }
+}
+"""
+ERROR_MATCH_IMPLICIT_DECLARATIONS = ERROR_MATCH_DECLARATIONS.replace(
+    "variant MessageError { bad, empty }", "").replace("MessageError.", ".")
+ERROR_MATCH_HANDLER = r"""
+return websocket(ws) { msg in
+    let result = inspected(msg.text)
+    guard match result else {
+        .bad => msg.forward("bad input")
+        .empty => msg.close(1008, "empty")
+        _ => msg.close(1011)
+    }
+    guard let plain = result else { msg.close(1011) }
+    msg.forward(plain + "!")
+}
+"""
+
+
+def error_match_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"error match: {actual=!r}, {expected=!r}")
+
+    client.sendall(b"".join(masked_frame(2, data) for data in (b"ok", b"bad", b"again")))
+    for expected in (b"ok!", b"bad input", b"again!"):
+        expect(peer, (1, expected, True))
+    peer.sendall(b"\x81\x03bad\x81\x00")
+    expect(client, (1, b"bad input", False))
+    expect(client, (8, b"\x03\xf0empty", False))
+    expect(peer, (8, b"\x03\xf0empty", True))
+
+
 EAGER_BINDING_DECLARATIONS = r"""
 func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
 """
@@ -2516,6 +2629,10 @@ def main():
                 (HASH_OUTPUT_HANDLER, hash_output_exchange, ""),
                 (STRING_HELPER_HANDLER, string_helper_exchange, STRING_HELPER_DECLARATIONS),
                 (NOMINAL_MATCH_HANDLER, nominal_match_exchange, NOMINAL_MATCH_DECLARATIONS),
+                (ERROR_VALUE_HANDLER, error_value_exchange, ERROR_VALUE_DECLARATIONS),
+                (ERROR_MATCH_HANDLER, error_match_exchange, ERROR_MATCH_DECLARATIONS),
+                (ERROR_MATCH_HANDLER, error_match_exchange, ERROR_MATCH_IMPLICIT_DECLARATIONS),
+                (ERROR_FIELDS_HANDLER, error_fields_exchange, ERROR_FIELDS_DECLARATIONS),
                 (DYNAMIC_OUTPUT_HANDLER, dynamic_output_exchange, DYNAMIC_OUTPUT_DECLARATIONS),
                 (DYNAMIC_BOUND_HANDLER, dynamic_bound_exchange, ""),
                 (DYNAMIC_UTF8_HANDLER, dynamic_utf8_exchange, ""),

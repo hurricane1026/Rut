@@ -2963,8 +2963,14 @@ General message callbacks retain lexical bindings through ordinary pure helper
 inlining. Reached helper local/guard producers and actual arguments run once,
 including unused resource-producing arguments; argument order is preserved and
 only the selected branch executes. Pure immutable message/scalar projections
-may be substituted. Error/effect-capable helper integration remains pending and
-unsupported bodies are diagnosed instead of silently dropping work.
+may be substituted. Fallible helper values and aliases retain the ordinary
+error carrier through lexical local storage, `guard let`, `if let` and
+`.or(default)` recovery. Successful false/zero/empty values stay present; nil
+and errors stay distinct. A stored error does not implicitly throw. Named
+error domains survive successful helper branches; incompatible domains are
+rejected. `guard match` uses the same final-wildcard requirement as HTTP.
+Response/effect/yield helper integration remains pending, and unsupported
+bodies are diagnosed instead of silently dropping work.
 
 Unwrapped String concatenation and the byte-exact `hasPrefix`, `hasSuffix`,
 `contains` and `isEmpty` operations share the HTTP compiler path. Concatenation

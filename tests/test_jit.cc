@@ -29673,3 +29673,74 @@ route GET "/api/users" use chain access {
 }
 
 #endif
+
+TEST(jit, http_error_values_can_be_stored_without_implicit_throwing) {
+    const char* source = R"rut(
+func value(_ failed: bool) -> str { if failed { error(7) } else { "ok" } }
+route GET "/" { let result = value(req.http11) return 200 }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    for (bool first : {false, true}) {
+        const Str request = first ? lit("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                                  : lit("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+        const auto result = HandlerResult::unpack(handler(
+            nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK_EQ(result.status_code, 200u);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, http_named_error_domains_survive_successful_helper_arms) {
+    const char* source = R"rut(
+variant MessageError { bad }
+func value(_ failed: bool) -> str { if failed { error(MessageError.bad) } else { "ok" } }
+route GET "/" {
+    let result = value(req.http11)
+    guard match result else { .bad => return 409 _ => return 500 }
+    return 200
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    for (bool first : {false, true}) {
+        const Str request = first ? lit("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                                  : lit("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+        const auto result = HandlerResult::unpack(handler(
+            nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK_EQ(result.status_code, first ? 409u : 200u);
+    }
+    engine.shutdown();
+    rir.destroy();
+}

@@ -6,6 +6,9 @@
 #include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
+#include "fixtures/ws_error_guard_match.h"
+#include "fixtures/ws_error_scalars.h"
+#include "fixtures/ws_error_values.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_general_json.h"
 #include "fixtures/ws_general_regex.h"
@@ -3324,5 +3327,41 @@ TEST(native_program, websocket_nominal_match_selector_is_not_elided_or_repeated)
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     test::ws_nominal_selector::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_error_values_bind_once_and_recover_after_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_error_values::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_error_values::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_error_guard_match_preserves_named_cases_and_single_evaluation) {
+    Source source;
+    REQUIRE(source.append(test::ws_error_guard_match::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_error_guard_match::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_error_scalar_bindings_keep_false_zero_and_absence_distinct) {
+    Source source;
+    REQUIRE(source.append(test::ws_error_scalars::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_error_scalars::check(_tc, owner.p->config);
 }
 #endif

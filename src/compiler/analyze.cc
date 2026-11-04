@@ -6500,13 +6500,15 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         u32 merged_error_variant = lhs.error_variant_index;
         u32 merged_struct_index = lhs.struct_index;
         if (lhs.type == HirTypeKind::Unknown) merged_struct_index = rhs.struct_index;
-        if (lhs.error_struct_index == 0xffffffffu) {
+        // A built-in Error has no custom struct index. That is still a real
+        // error domain: a successful arm must not overwrite its variant with
+        // the success value's absent metadata.
+        if (!lhs.may_error) {
             merged_error_struct = rhs.error_struct_index;
             merged_error_variant = rhs.error_variant_index;
-        } else if (rhs.error_struct_index != 0xffffffffu) {
-            if (lhs.error_struct_index != rhs.error_struct_index ||
-                lhs.error_variant_index != rhs.error_variant_index)
-                return false;
+        } else if (rhs.may_error && (lhs.error_struct_index != rhs.error_struct_index ||
+                                     lhs.error_variant_index != rhs.error_variant_index)) {
+            return false;
         }
 
         out->type = merged_type;
@@ -7305,11 +7307,6 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         FrontendError::UnsupportedSyntax,
                         inner.expr.span,
                         lit_str("a borrowed message alias cannot carry runtime initialization"));
-                if (uses_lexical_values(scratch) && init->may_error)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        inner.expr.span,
-                        lit_str("error-capable message lets require recovery integration"));
                 // Mirror the route-level let handler's ArrayLit-at-RHS gate
                 // (MIR has no ArrayLit lowering yet).
                 if (init->kind == HirExprKind::ArrayLit)
@@ -7549,7 +7546,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
 #endif
                 HirExpr* initializer_key = nullptr;
-                if (inner.bind_value) {
+                if (inner.bind_value || inner.match_arms.len != 0) {
                     auto cached = bind_message_initializer(
                         bound.value(), cur_locals, cur_local_count, inner.span);
                     if (!cached) return core::make_unexpected(cached.error());
@@ -7876,8 +7873,8 @@ static FrontendResult<void> build_lexical_function_body(const AstStatement& sour
 
 #if RUT_ENABLE_WEBSOCKET
 // Callback values use ordinary type checking and helper normalization. Only
-// infallible immutable values may be substituted; fallible work must retain its
-// existing reached-guard evaluation rather than becoming a lazy let initializer.
+// infallible immutable values may be substituted; reached nullable/fallible
+// initializers retain their lexical evaluation and explicit carrier.
 struct WsCallbackScope {
     std::unique_ptr<HirRoute> route = std::make_unique<HirRoute>();
     std::unique_ptr<HirFunction> normalized = std::make_unique<HirFunction>();
