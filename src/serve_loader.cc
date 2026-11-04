@@ -46,6 +46,7 @@ void LoadedProgram::destroy() {
         jit_inited = false;
     }
     rs256.destroy();
+    es256.destroy();
     rir.destroy();
     if (src_map) {
         munmap(src_map, src_map_len);
@@ -368,6 +369,9 @@ bool load_rut_program(const char* path,
     if (!out.rs256.load(out.config.rs256_configurations, out.config.rs256_configuration_count))
         return false;
     out.config.rs256 = &out.rs256;
+    if (!out.es256.load(out.config.es256_configurations, out.config.es256_configuration_count))
+        return false;
+    out.config.es256 = &out.es256;
     // After the transactional populate: a failed populate restores a byte
     // snapshot, which would leak files created inside it.
     attach_response_body_files(out.config);

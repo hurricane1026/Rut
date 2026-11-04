@@ -2,9 +2,9 @@
 
 #include "rut/common/shard_limits.h"
 #include "rut/runtime/arena.h"
-#include "rut/runtime/https_fetch.h"
 #include "rut/runtime/jwt_rs256.h"
 #include "rut/runtime/public_key.h"
+#include "rut/runtime/remote_jwks.h"
 
 namespace rut {
 // Immutable, configuration-owned trust policy. Only explicitly approved keys
@@ -27,13 +27,7 @@ public:
     // Apply only to signature/claims-verified documents. Immutable snapshot:
     // changes take effect with configuration adoption, retaining old RCU readers.
     bool permits(json::Document& document) const;
-    struct Remote {
-        HttpsEndpoint endpoint{};
-        u32 refresh_seconds = 0;
-        u32 max_age_seconds = 0;
-        u32 timeout_seconds = 0;
-        bool enabled() const { return refresh_seconds != 0; }
-    };
+    using Remote = RemoteJwks;
     const Remote& remote() const { return remote_; }
     // Accept only the intersection with configuration-approved IDs. Empty is a
     // valid authoritative removal of all trusted keys; malformed sets are not.

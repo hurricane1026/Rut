@@ -10,6 +10,7 @@ namespace rut {
 // Owns native code and configuration until every shard has joined.
 struct NativeProgram {
     Rs256Policies rs256;
+    Es256Policies es256;
     RouteConfig config;
     bool has_listener = false;
     ListenerSpec listener{};

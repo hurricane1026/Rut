@@ -7,6 +7,7 @@
 #include "rut/compiler/ast.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
+#include "rut/runtime/es256_policy.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/password.h"
@@ -1801,6 +1802,7 @@ static bool is_crypto_system_export(Str value) {
                            lit_str("jwtHs384"),
                            lit_str("jwtHs512"),
                            lit_str("jwtRs256"),
+                           lit_str("jwtEs256"),
                            lit_str("issueJwtHs256"),
                            lit_str("issueJwtHs256WithId"),
                            lit_str("issueJwtHs256WithIdAndScope"),
@@ -4120,6 +4122,53 @@ static FrontendResult<void> normalize_rs256_policy(HirExpr& expression,
     return {};
 }
 
+static FrontendResult<void> normalize_es256_policy(HirExpr& expression,
+                                                   HirRoute* route,
+                                                   const HirLocal* locals,
+                                                   u32 local_count) {
+    if (expression.kind != HirExprKind::JsonOp ||
+        expression.int_value != static_cast<i64>(json::Op::JwtVerifyEs256))
+        return {};
+    if (expression.args.len != 2 || !expression.args[1])
+        return frontend_error(FrontendError::UnsupportedSyntax, expression.span);
+    const HirExpr* value = expression.args[1];
+    // LocalRef holds a stable ref_index, which may differ from the array slot
+    // after guards, shadowing, or synthesized helper locals. Never prove trust
+    // using an unrelated local that happens to occupy that numeric slot.
+    for (u32 depth = 0; depth <= local_count && value->kind == HirExprKind::LocalRef; ++depth) {
+        const HirExpr* next = nullptr;
+        for (u32 i = 0; i < local_count; ++i) {
+            if (locals[i].ref_index == value->local_index) {
+                next = &locals[i].init;
+                break;
+            }
+        }
+        if (!next) break;
+        value = next;
+    }
+    if (value->kind != HirExprKind::StrLit || value->type != HirTypeKind::Str || value->may_nil ||
+        value->may_error) {
+        if (route && route->is_helper_scratch) return {};
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expression.span,
+                              lit_str("ES256 policy must be compile-time configuration"));
+    }
+    Es256Policy trust;
+    if (!trust.load(value->str_value))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expression.span,
+                              lit_str("invalid ES256 trust policy"));
+    HirExpr literal{};
+    literal.kind = HirExprKind::StrLit;
+    literal.type = HirTypeKind::Str;
+    literal.str_value = value->str_value;
+    literal.span = expression.span;
+    if (!route->exprs.push(literal))
+        return frontend_error(FrontendError::OutOfMemory, expression.span);
+    expression.args[1] = &route->exprs[route->exprs.len - 1];
+    return {};
+}
+
 static u32 next_local_ref_index(const HirRoute* route, const HirLocal* locals, u32 local_count);
 
 // Convert an already analyzed value to JSON. Keeping the analyzed HIR value
@@ -5926,6 +5975,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     out.span = expr.span;
     auto policy = normalize_rs256_policy(out, route, route->locals.data, route->locals.len);
     if (!policy) return core::make_unexpected(policy.error());
+    auto ec_policy = normalize_es256_policy(out, route, route->locals.data, route->locals.len);
+    if (!ec_policy) return core::make_unexpected(ec_policy.error());
     return out;
 }
 
@@ -10179,6 +10230,34 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                       route);
         if (!operation) return operation;
         auto normalized = normalize_rs256_policy(operation.value(), route, locals, local_count);
+        if (!normalized) return core::make_unexpected(normalized.error());
+        return operation;
+    }
+    if (expr.name.eq(lit_str("jwtVerifyEs256")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("jwtVerifyEs256"))) {
+        if (pipe_lhs || expr.args.len != 2)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("use jwtVerifyEs256(token, policy) directly"));
+        auto token = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!token) return token;
+        auto policy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (!policy) return policy;
+        if (token->type != HirTypeKind::Str || token->may_nil || token->may_error ||
+            policy->type != HirTypeKind::Str || policy->may_nil || policy->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("jwtVerifyEs256 requires unwrapped str values"));
+        auto operation = make_json_op(json::Op::JwtVerifyEs256,
+                                      HirTypeKind::Json,
+                                      true,
+                                      &token.value(),
+                                      &policy.value(),
+                                      nullptr,
+                                      expr.span,
+                                      route);
+        if (!operation) return operation;
+        auto normalized = normalize_es256_policy(operation.value(), route, locals, local_count);
         if (!normalized) return core::make_unexpected(normalized.error());
         return operation;
     }
@@ -15382,6 +15461,7 @@ func jwtHs256(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "
 func jwtHs384(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "HS384")
 func jwtHs512(_ token: str, _ secret: str) -> Json => jwtDecode(token, secret, "HS512")
 func jwtRs256(_ token: str, _ policy: str) -> Json => jwtVerifyRs256(token, policy)
+func jwtEs256(_ token: str, _ policy: str) -> Json => jwtVerifyEs256(token, policy)
 func issueJwtHs256(_ subject: str, _ issuer: str, _ audience: str, _ key: str, _ ttl: i32) =>
     jwtIssueHs256(subject, issuer, audience, key, ttl)
 func issueJwtHs256WithId(_ subject: str, _ issuer: str, _ audience: str,

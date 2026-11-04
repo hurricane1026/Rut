@@ -3907,9 +3907,10 @@ hmacSha256(key, data)         // str? (lowercase hex)
 hmacSha384(key, data)         // str? (lowercase hex)
 hmacSha512(key, data)         // str? (lowercase hex)
 
-// --- JWT (HMAC and configured RS256 verification implemented) ---
+// --- JWT (HMAC, configured RS256 and ES256 verification implemented) ---
 jwtDecode(token, secret)                    // Json? — verified HS256/384/512 claims
 jwtVerifyRs256(token, policy)               // Json? — approved RS256 key + issuer/audience/time
+jwtVerifyEs256(token, policy)               // Json? — approved P-256 key + issuer/audience/time
 // ⏳ other RSA/EC algorithms and arbitrary PEM overloads
 // ⏳ jwtEncode(claims, secret: key, alg: .HS256)
 // ⏳ jwtEncode(claims, privateKey: pem, alg: .RS256)
@@ -4319,7 +4320,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 
 | Feature Category | DSL Capability |
 |-----------------|----------------|
-| JWT auth | `jwtDecode(tok, secret)` built-in (HS256/384/512), `jwtVerifyRs256(tok, policy)` with trusted static JWKS, and `jwtHasGroup(claims, required)` for verified claims; other RS/ES and `jwtEncode` are roadmap |
+| JWT auth | `jwtDecode(tok, secret)` built-in (HS256/384/512), `jwtVerifyRs256(tok, policy)` / `jwtVerifyEs256(tok, policy)` with trusted JWKS, and `jwtHasGroup(claims, required)` for verified claims; other asymmetric algorithms and `jwtEncode` are roadmap |
 | HMAC auth | `hmacSha256()` built-in |
 | Basic auth | `base64` decode + string compare |
 | API key auth | header/query access + compare |
@@ -9265,8 +9266,8 @@ the executable contract and the auth ledger for remaining work.
 ### Configuration-owned remote JWKS refresh
 
 An optional eight-field `remoteJwks` object extends the existing static RS256
-policy without a new language keyword, dependency or handler ABI. See the
-language card for exact syntax and bounds. A fixed IPv4 endpoint, CA file,
+and ES256 policies without a new language keyword, dependency or handler ABI.
+See the language card for exact syntax and bounds. A fixed IPv4 endpoint, CA file,
 certificate hostname and origin-form path define a trusted TLS GET. No Token
 field selects endpoints/algorithms or triggers refresh. Initial JWKS keys only
 establish the approved kid inventory in remote mode; no token verifies before
@@ -9280,8 +9281,11 @@ no outstanding kernel buffer references, so cancellation closes its socket/TLS
 session directly for both epoll and io_uring. The public TLS interface uses opaque
 crypto handles, keeping OpenSSL headers out of configuration-only compiler units.
 
-`Rs256Policies` allocates remote workspaces before publication. Each shard loads
-its own TLS context at activation, then polls maintenance between handler batches.
+`Rs256Policies` and `Es256Policies` allocate remote workspaces before publication.
+Both use the same strict endpoint parser and bounded HTTPS transport; their
+approved key material and verifier banks remain algorithm-specific. Each shard
+loads its own TLS context at activation, then polls maintenance between handler
+batches.
 A fresh response imports only configured kids and warms a separate verifier bank
 before swapping the shard-local active bank. Verification is synchronous and
 retains no key references; published Json payloads remain request-owned. No active
@@ -9434,3 +9438,50 @@ record whose final cleanup or directory sync failed. Verification reads only a
 bounded canonical regular record, without following final symlinks. These are
 offline provisioning files, not a mutable account registry or session database.
 See the provisioning guide for exact input, exit, persistence and cleanup limits.
+
+
+### Configured ES256 resource-server verification
+
+`jwtVerifyEs256(token, policy) -> Json?` and `Crypto.jwtEs256(token, policy)`
+accept the same trusted compile-time four-field policy shape as RS256: `issuer`,
+`audience`, approved `kids`, and a local public `jwks`. Optional `revokedJtis`
+and `issuedAfter` have the same immutable snapshot semantics. Optional
+`remoteJwks` uses the bounded authenticated HTTPS refresh contract above,
+including its eight endpoint fields, approved-kid intersection and maximum age.
+Remote mode rejects tokens until the first successful authenticated fetch;
+selected keys must satisfy the ES256 public JWK profile below.
+
+Approved keys require `kty=EC`, `alg=ES256`, `crv=P-256`, and canonical unpadded
+base64url `x`/`y` coordinates of exactly 32 bytes each (including leading zeros).
+Optional `use`/`key_ops` must be `sig`/`["verify"]`. Private parameters, invalid
+points, wrong curves/algorithms, missing approved IDs, duplicate decoded keys
+or IDs, and malformed policies fail compilation/loading. At most 16 approved
+keys and 8192 policy bytes are accepted. No token header imports a key or URL.
+
+The protected header requires exactly ES256 and a configured `kid`. Compact
+JWS parsing retains the 1024-byte header / 8192-byte claims bounds and canonical
+base64url rules; `crit` and `b64` extensions reject. Signatures are the 64-byte
+JOSE `R || S` form, with both integers in 1..n-1. DER signatures reject. Both
+mathematically valid S representatives are accepted; signature bytes are not a
+replay/session identifier.
+
+Verification applies the existing resource-server claims rules before publishing
+Json: nonempty `sub`, exact issuer/audience, integer future `exp`, valid optional
+`nbf`/`iat`, and a positive Unix clock with zero skew. Use the existing lifetime
+and scope/group helpers for additional policy. `auth.jwtDocumentEs256` returns
+verified claims or a challenged 401; `auth.jwtIdentityEs256` additionally checks
+scope (403 on insufficient scope) before publishing method `jwtES256` and the
+trusted credential ID. Duplicate Authorization fields fail closed through
+`req.authorization.or("")`. See `examples/jwt-es256-auth.rut`.
+
+Initial key parsing occurs before configuration publication; remote replacements
+are parsed during shard maintenance, never during token verification. Each shard
+activates its own preallocated and warmed curve/bignum workspace before
+accepting or adopting that configuration. There is no lazy request-time initialization. Failed rows
+remain unavailable. Configurations and request-owned Json follow the existing
+RCU/arena lifetimes. Local key removal and revocation require configuration
+adoption; remote key removal takes effect at the next successful refresh.
+In-flight readers keep their generation and its cache expiration. Native artifact
+version 17 serializes owned policy bytes and reconstructs keys after compiler
+exit; mutable crypto workspaces and pointers are never serialized. This adds verification,
+not ES256 signing, OIDC, online revocation, persistent sessions or replay state.

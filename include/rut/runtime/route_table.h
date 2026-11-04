@@ -15,6 +15,7 @@
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/es256_policy.h"
 #include "rut/runtime/http_cache.h"
 #include "rut/runtime/rate_limit_key.h"
 #include "rut/runtime/route_art.h"
@@ -365,6 +366,7 @@ struct RouteConfig {
     mutable BackendSelectionState backend_selection[kMaxShards]{};
     // Sidecar is excluded from native metadata and retained with the program.
     Rs256Policies* rs256 = nullptr;
+    Es256Policies* es256 = nullptr;
 
     // Phase 2 dispatch — 2-way tagged union.
     //
@@ -724,15 +726,43 @@ struct RouteConfig {
         rs256_configuration_bytes_used += value.len;
         return true;
     }
+    Str es256_configurations[Es256Policies::kMaxPolicies]{};
+    u32 es256_configuration_count = 0;
+    char es256_configuration_bytes[Es256Policy::kMaxText * Es256Policies::kMaxPolicies]{};
+    u32 es256_configuration_bytes_used = 0;
+
+    bool add_es256_configuration(Str value) {
+        if (es256_configuration_count > Es256Policies::kMaxPolicies ||
+            es256_configuration_bytes_used > sizeof(es256_configuration_bytes))
+            return false;
+        for (u32 i = 0; i < es256_configuration_count; ++i)
+            if (es256_configurations[i].eq(value)) return true;
+        if (!value.ptr || value.len == 0 || value.len > Es256Policy::kMaxText ||
+            es256_configuration_count == Es256Policies::kMaxPolicies ||
+            value.len > sizeof(es256_configuration_bytes) - es256_configuration_bytes_used)
+            return false;
+        char* out = es256_configuration_bytes + es256_configuration_bytes_used;
+        __builtin_memcpy(out, value.ptr, value.len);
+        es256_configurations[es256_configuration_count++] = {out, value.len};
+        es256_configuration_bytes_used += value.len;
+        return true;
+    }
     bool activate_rs256(u32 shard) const {
         return rs256_configuration_count == 0 || (rs256 && rs256->activate(shard));
     }
-    void refresh_rs256(u32 shard) const {
-        if (rs256) rs256->maintain(shard);
+    bool activate_es256(u32 shard) const {
+        return es256_configuration_count == 0 || (es256 && es256->activate(shard));
     }
-    bool rs256_fetch_busy(u32 shard) const { return rs256 && rs256->fetch_busy(shard); }
-    void cancel_rs256(u32 shard) const {
+    void refresh_jwks(u32 shard) const {
+        if (rs256) rs256->maintain(shard);
+        if (es256) es256->maintain(shard);
+    }
+    bool jwks_fetch_busy(u32 shard) const {
+        return (rs256 && rs256->fetch_busy(shard)) || (es256 && es256->fetch_busy(shard));
+    }
+    void cancel_jwks(u32 shard) const {
         if (rs256) rs256->cancel(shard);
+        if (es256) es256->cancel(shard);
     }
 
     bool has_strict_local_response_policy_inventory() const {

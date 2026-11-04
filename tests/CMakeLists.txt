@@ -955,6 +955,12 @@ target_include_directories(test_jwt_rs256 PRIVATE ${PROJECT_SOURCE_DIR}/testing)
 add_test(NAME test_jwt_rs256 COMMAND test_jwt_rs256)
 set_tests_properties(test_jwt_rs256 PROPERTIES LABELS "unit")
 
+add_executable(test_jwt_es256 test_jwt_es256.cc)
+target_link_libraries(test_jwt_es256 rut_runtime)
+target_include_directories(test_jwt_es256 PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_jwt_es256 COMMAND test_jwt_es256)
+set_tests_properties(test_jwt_es256 PROPERTIES LABELS "unit;auth")
+
 add_executable(test_https_fetch test_https_fetch.cc)
 target_link_libraries(test_https_fetch rut_runtime)
 target_include_directories(test_https_fetch PRIVATE ${PROJECT_SOURCE_DIR}/testing)
@@ -971,6 +977,13 @@ if(RUT_ENABLE_JIT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${jwks_backend})
         set_tests_properties(test_remote_jwks_${jwks_backend} PROPERTIES
             LABELS "integration;auth" TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME test_remote_es256_jwks_${jwks_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_jwks.py
+                --server $<TARGET_FILE:rut> --helper $<TARGET_FILE:test_https_fetch>
+                --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${jwks_backend}
+                --algorithm ES256)
+        set_tests_properties(test_remote_es256_jwks_${jwks_backend} PROPERTIES
+            LABELS "integration;auth" TIMEOUT 90 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
 
@@ -986,6 +999,12 @@ target_link_libraries(test_public_key rut_runtime)
 target_include_directories(test_public_key PRIVATE ${PROJECT_SOURCE_DIR}/testing)
 add_test(NAME test_public_key COMMAND test_public_key)
 set_tests_properties(test_public_key PROPERTIES LABELS "unit")
+
+add_executable(test_ec_public_key test_ec_public_key.cc)
+target_link_libraries(test_ec_public_key rut_crypto)
+target_include_directories(test_ec_public_key PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_ec_public_key COMMAND test_ec_public_key)
+set_tests_properties(test_ec_public_key PROPERTIES LABELS "unit;auth")
 
 add_executable(test_signed_request test_signed_request.cc)
 target_link_libraries(test_signed_request rut_runtime)
@@ -1372,6 +1391,8 @@ target_include_directories(test_shard_control PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_compile_definitions(test_shard_control PRIVATE RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}")
+add_dependencies(test_shard_control test_tls_fixtures)
 add_test(NAME test_shard_control COMMAND test_shard_control)
 set_tests_properties(test_shard_control PROPERTIES LABELS "unit")
 
@@ -3881,6 +3902,16 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_password_login_${password_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 90 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(es256_backend epoll io_uring)
+                add_test(NAME test_es256_auth_${es256_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_es256_auth.py
+                        --server $<TARGET_FILE:rut>
+                        --helper $<TARGET_FILE:test_jwt_es256>
+                        --source ${PROJECT_SOURCE_DIR}/examples/jwt-es256-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${es256_backend})
+                set_tests_properties(test_es256_auth_${es256_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
+            endforeach()
         endif()
         add_test(NAME test_native_protocol
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test_native_protocol.py
@@ -4025,6 +4056,8 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_crypto_digest_c>
         COMMAND $<TARGET_FILE:test_crypto_rsa_core_c>
         COMMAND $<TARGET_FILE:test_https_fetch>
+        COMMAND $<TARGET_FILE:test_jwt_es256>
+        COMMAND $<TARGET_FILE:test_ec_public_key>
         COMMAND $<TARGET_FILE:test_jwt_rs256>
         COMMAND $<TARGET_FILE:test_rsa_verify>
         COMMAND $<TARGET_FILE:test_public_key>
@@ -4060,7 +4093,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_ws_shutdown_deadline test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
+        DEPENDS test_network test_ws_shutdown_deadline test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
         COMMENT "Running all tests..."
     )
 else()
@@ -4098,6 +4131,8 @@ else()
         COMMAND $<TARGET_FILE:test_crypto_digest_c>
         COMMAND $<TARGET_FILE:test_crypto_rsa_core_c>
         COMMAND $<TARGET_FILE:test_https_fetch>
+        COMMAND $<TARGET_FILE:test_jwt_es256>
+        COMMAND $<TARGET_FILE:test_ec_public_key>
         COMMAND $<TARGET_FILE:test_jwt_rs256>
         COMMAND $<TARGET_FILE:test_rsa_verify>
         COMMAND $<TARGET_FILE:test_public_key>
@@ -4129,7 +4164,7 @@ else()
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_ws_shutdown_deadline test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
+        DEPENDS test_network test_ws_shutdown_deadline test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
         COMMENT "Running non-JIT tests..."
     )
 endif()

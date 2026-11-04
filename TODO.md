@@ -804,3 +804,13 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   redirected bytes, cleansed scratch and private atomic no-replace record files.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
   account-level abuse policies, rehash migration and persistent sessions/refresh.
+
+### ES256 verification
+
+- [x] Fixed-profile P-256 public key/JWK import, approved kid selection and
+  preallocated shard-owned ES256 verification with independent vectors.
+- [x] Local ES256 JWT claims/revocation policy and Rut/JIT/native-artifact
+  integration; scope/group authorization remains separate from authentication.
+- [x] Bounded remote ES256 JWKS refresh with authenticated fixed endpoints,
+  approved-kid rotation, maximum-age expiry, idle maintenance and cancellation.
+- [ ] DNS/discovery, other remote JWKS profiles, other EC profiles and ES signing.

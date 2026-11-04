@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "es256_fixture.h"
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/signed_request.h"
 #include "framing_selection_preflight_fixture.h"
@@ -2166,4 +2167,106 @@ TEST(native_program, websocket_guard_text_policies_survive_source_removal) {
         CHECK_EQ(out[0], 0x81u);
         if (texts[i].len) CHECK(memcmp(out + 2, texts[i].ptr, texts[i].len) == 0);
     }
+}
+
+TEST(native_program, es256_policy_survives_compiler_exit_source_removal_and_shard_activation) {
+    test::Es256Fixture fixture;
+    REQUIRE(fixture.init());
+    char source_bytes[8192];
+    json::Writer source_text{source_bytes, sizeof(source_bytes) - 1};
+    source_text.text(lit_str(R"rut(import Crypto
+route GET "/" {
+    guard let claims = Crypto.jwtEs256(bearerToken(req.authorization.or("")).or(""), )rut"));
+    REQUIRE(json::quote(fixture.policy, source_text));
+    source_text.text(lit_str(R"rut() else { return 401 }
+    guard jwtHasScope(claims, "read") else { return 403 }
+    guard jwtHasGroup(claims, "read") else { return 403 }
+    return 200
+}
+)rut"));
+    char revoked_bytes[8192];
+    json::Writer revoked{revoked_bytes};
+    revoked.text({fixture.policy.ptr, fixture.policy.len - 1});
+    revoked.text(lit_str(R"(,"revokedJtis":["revoked"],"issuedAfter":50})"));
+    REQUIRE(revoked.ok);
+    source_text.text(lit_str(R"rut(route GET "/revocation" {
+    guard let claims = Crypto.jwtEs256(bearerToken(req.authorization.or("")).or(""), )rut"));
+    REQUIRE(json::quote({revoked_bytes, revoked.len}, source_text));
+    source_text.text(lit_str(R"rut() else { return 401 }
+    return 200
+}
+)rut"));
+    REQUIRE(source_text.ok);
+    source_bytes[source_text.len] = '\0';
+    Source source;
+    REQUIRE(source.append(source_bytes));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& config = owner.p->config;
+    REQUIRE_EQ(config.es256_configuration_count, 2u);
+    REQUIRE(config.es256);
+    auto* connection = owner.arena.alloc_t<ConnectionBase>();
+    REQUIRE(connection);
+    connection->request_config = &config;
+    connection->shard_id = 2;
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    connection->json_arena.backend.pool = &pool;
+    char token[4096];
+    const auto member_claims = lit_str(
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800,"scope":"read write","groups":["read","admin"]})");
+    Str signed_token = fixture.sign(test::Es256Fixture::header, member_claims, token);
+    REQUIRE(signed_token.len);
+    auto run = [&](u32 route = 0) {
+        char request[8192];
+        const int count =
+            snprintf(request,
+                     sizeof(request),
+                     "GET / HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer %.*s\r\n\r\n",
+                     signed_token.len,
+                     signed_token.ptr);
+        jit::HandlerCtx context{};
+        connection->json_arena.reset();
+        const auto result =
+            jit::HandlerResult::unpack(config.routes[route].fn(connection,
+                                                               &context,
+                                                               reinterpret_cast<const u8*>(request),
+                                                               static_cast<u32>(count),
+                                                               nullptr));
+        return result.status_code;
+    };
+    CHECK_EQ(run(), 401u);
+    REQUIRE(config.activate_es256(2));
+    CHECK_EQ(run(), 200u);
+    token[signed_token.len - 4] = token[signed_token.len - 4] == 'a' ? 'b' : 'a';
+    CHECK_EQ(run(), 401u);
+    signed_token = fixture.sign(test::Es256Fixture::header, member_claims, token);
+    CHECK_EQ(run(), 200u);
+    const auto nonmember_claims = lit_str(
+        R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800,"scope":"read write","groups":["admin"]})");
+    signed_token = fixture.sign(test::Es256Fixture::header, nonmember_claims, token);
+    CHECK_EQ(run(), 403u);
+    const Str extras[] = {
+        lit_str(R"(,"jti":"live","iat":51)"),
+        lit_str(R"(,"jti":"revoked","iat":51)"),
+        lit_str(R"(,"jti":"live","iat":50)"),
+        lit_str(R"(,"jti":"live")"),
+        lit_str(R"(,"iat":51)"),
+    };
+    for (u32 i = 0; i < sizeof(extras) / sizeof(extras[0]); ++i) {
+        char claims_bytes[1024];
+        json::Writer claims{claims_bytes, sizeof(claims_bytes)};
+        claims.text({member_claims.ptr, member_claims.len - 1});
+        claims.text(extras[i]);
+        claims.put('}');
+        REQUIRE(claims.ok);
+        signed_token = fixture.sign(test::Es256Fixture::header, {claims_bytes, claims.len}, token);
+        REQUIRE(signed_token.len);
+        CHECK_EQ(run(), 200u);  // The original policy has no revocation requirements.
+        CHECK_EQ(run(1), i == 0 ? 200u : 401u);
+    }
+    connection->json_arena.destroy();
+    pool.destroy();
 }

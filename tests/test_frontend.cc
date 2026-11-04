@@ -43991,6 +43991,36 @@ TEST(frontend, rs256_requires_static_valid_trust_policy_and_unwrapped_token) {
     CHECK(analyze_file_heap(ast.value()));
 }
 
+TEST(frontend, es256_requires_static_valid_trust_policy_and_unwrapped_token) {
+    const char* cases[] = {
+        R"(route GET "/" { let x = jwtVerifyEs256("t") return 200 })",
+        R"(route GET "/" { let x = jwtVerifyEs256(1, "{}") return 200 })",
+        R"(route GET "/" { let x = jwtVerifyEs256(req.authorization, "{}") return 200 })",
+        R"(route GET "/" { let x = jwtVerifyEs256("t", req.header("x").or("")) return 200 })",
+        R"(route GET "/" { let x = jwtVerifyEs256("t", "{}") return 200 })",
+        R"(func verify(_ token: str, _ policy: str) -> Json {
+            guard let claims = jwtVerifyEs256(token, policy) else { respond 401 }
+            claims
+        }
+        route GET "/" { let claims = verify("t", req.header("x").or("")) return 200 })",
+        R"(route GET "/" { let x = jwtVerifyEs256("t", "{\"jwks\":{},\"kids\":[],\"issuer\":\"i\",\"audience\":\"a\"}") return 200 })",
+    };
+    for (const char* source : cases) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    auto tokens =
+        lex(lit("func jwtVerifyEs256(_ n: i32) -> i32 => n\n"
+                "route GET \"/\" { let n = jwtVerifyEs256(200) return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}
+
 #if RUT_ENABLE_WEBSOCKET
 TEST(frontend, websocket_guard_text_replacements_validate_literals_and_limits) {
     for (const char* verdict : {"message.forward(\"\")",

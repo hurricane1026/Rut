@@ -48,6 +48,7 @@ enum class Op : u8 {
     JwtIssueHs256WithIdAndScope,
     Sha256HexValid,
     PasswordVerifyHeader,  // compiler-only asynchronous prefix, not generic JSON dispatch
+    JwtVerifyEs256,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

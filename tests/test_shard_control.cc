@@ -1,4 +1,5 @@
 // Per-shard independent control system tests.
+#include "es256_fixture.h"
 #include "rs256_fixture.h"
 #include "rut/runtime/mapped_array.h"
 #include "rut/runtime/route_table.h"
@@ -1779,5 +1780,88 @@ TEST(shard_control, rs256_reload_activates_epoll_shard_without_replacing_infligh
 #ifdef __linux__
 TEST(shard_control, rs256_reload_activates_iouring_shard_without_replacing_inflight_policy) {
     rs256_reload_activates_only_the_adopting_shard<IoUringEventLoop>(_tc);
+}
+#endif
+
+namespace {
+template <typename Loop>
+void es256_reload_cancels_retired_refresh(rut::test::TestCase* _tc) {
+    struct Listener {
+        i32 fd = -1;
+        ~Listener() {
+            if (fd >= 0) close(fd);
+        }
+    } listener;
+    const auto socket = create_listen_socket(0);
+    REQUIRE(socket.has_value());
+    listener.fd = socket.value();
+    test::Es256Fixture old_key, new_key;
+    REQUIRE(old_key.init());
+    REQUIRE(new_key.init());
+    char configuration[4096];
+    const int size = snprintf(configuration,
+                              sizeof(configuration),
+                              "%.*s,\"remoteJwks\":{\"address\":\"127.0.0.1\",\"port\":%u,"
+                              "\"serverName\":\"localhost\",\"ca\":\"%s\",\"path\":\"/keys\","
+                              "\"refreshSeconds\":1,\"maxAgeSeconds\":2,\"timeoutSeconds\":60}}",
+                              old_key.policy.len - 1,
+                              old_key.policy.ptr,
+                              get_port(listener.fd),
+                              RUT_TESTDATA_DIR "/localhost_cert.pem");
+    REQUIRE(size > 0 && static_cast<u32>(size) < sizeof(configuration));
+    const Str remote{configuration, static_cast<u32>(size)};
+    Es256Policies old_owner, new_owner;
+    REQUIRE(old_owner.load(&remote, 1));
+    REQUIRE(new_owner.load(&new_key.policy, 1));
+    REQUIRE(old_owner.activate(3));
+    REQUIRE(old_owner.activate(4));
+    // The TCP listener deliberately never responds to the TLS handshake.
+    old_owner.maintain(3);
+    old_owner.maintain(4);
+    REQUIRE(old_owner.fetch_busy(3));
+    REQUIRE(old_owner.fetch_busy(4));
+    MappedArray<RouteConfig> configs;
+    MappedArray<Loop> loops;
+    REQUIRE(configs.init(2).has_value());
+    REQUIRE(loops.init(1).has_value());
+    auto* before = &configs[0];
+    auto* after = &configs[1];
+    REQUIRE(before->add_es256_configuration(remote));
+    REQUIRE(after->add_es256_configuration(new_key.policy));
+    before->es256 = &old_owner;
+    after->es256 = &new_owner;
+    CHECK(before->jwks_fetch_busy(3));
+    const RouteConfig* active = before;
+    ShardControlBlock control;
+    auto* loop = loops.data();
+    loop->shard_id = 3;
+    loop->control = &control;
+    loop->config_ptr = &active;
+    control.pending_config.store(after, std::memory_order_release);
+    loop->poll_command();
+    CHECK(active == after);
+    CHECK(!before->jwks_fetch_busy(3));
+    CHECK(before->jwks_fetch_busy(4));
+    before->cancel_jwks(4);
+    CHECK(!before->jwks_fetch_busy(4));
+    json::Document document;
+    char token_bytes[4096], payload[8192];
+    const Str token =
+        new_key.sign(test::Es256Fixture::header, test::Es256Fixture::claims, token_bytes);
+    REQUIRE(token.len);
+    u32 length = 0;
+    CHECK(new_owner.verify(
+        3, new_key.policy, document, token, 2000000000, payload, sizeof(payload), length));
+    CHECK(!new_owner.verify(
+        4, new_key.policy, document, token, 2000000000, payload, sizeof(payload), length));
+}
+}  // namespace
+
+TEST(shard_control, es256_reload_cancels_only_retired_epoll_shard_refresh) {
+    es256_reload_cancels_retired_refresh<RealLoop>(_tc);
+}
+#ifdef __linux__
+TEST(shard_control, es256_reload_cancels_only_retired_iouring_shard_refresh) {
+    es256_reload_cancels_retired_refresh<IoUringEventLoop>(_tc);
 }
 #endif

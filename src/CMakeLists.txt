@@ -121,6 +121,8 @@ add_library(rut_crypto STATIC
     placement_new.cc
     runtime/public_key.cc
     runtime/crypto_rsa_c.cc
+    runtime/crypto_ec_math.c
+    runtime/ec_public_key.cc
 )
 target_include_directories(rut_crypto PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(rut_crypto PUBLIC rut_crypto_rsa_core)
@@ -137,9 +139,12 @@ add_library(rut_runtime STATIC
     runtime/http_tokens.cc
     runtime/http_cache.cc
     runtime/rs256_policy.cc
+    runtime/remote_jwks.cc
+    runtime/es256_policy.cc
     runtime/jwt_hs256.cc
     runtime/https_fetch.cc
     runtime/jwt_rs256.cc
+    runtime/jwt_es256.cc
     runtime/jwt_claims.cc
     runtime/arena.cc
     runtime/callbacks.cc
