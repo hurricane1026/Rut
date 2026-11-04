@@ -1,19 +1,27 @@
 #include "rut/runtime/ws_frame.h"
 
+#include "rut/common/types.h"
+#include "rut/runtime/http_parser.h"
+
 namespace rut {
 
-ParseStatus ws_parse_header(const u8* buf, u32 len, bool require_mask, WsFrameHeader* out) {
+ParseStatus ws_parse_header(
+    const u8* buf, u32 len, bool require_mask, WsFrameHeader* out, bool allow_compressed) {
     if (len < 2) return ParseStatus::Incomplete;
 
     const u8 b0 = buf[0];
     const u8 b1 = buf[1];
 
-    // RSV1-3 (0x70) must be zero — no extensions are negotiated (§5.2).
-    if ((b0 & 0x70) != 0) return ParseStatus::Error;
+    // RFC 7692 owns RSV1 only; no negotiated extension owns RSV2 or RSV3.
+    if ((b0 & 0x30) != 0) return ParseStatus::Error;
 
     const u8 opcode_bits = b0 & 0x0F;
     const WsOpcode opcode = static_cast<WsOpcode>(opcode_bits);
     if (!ws_opcode_valid(opcode)) return ParseStatus::Error;
+    const bool kCompressed = (b0 & 0x40) != 0;
+    if (kCompressed &&
+        (!allow_compressed || (opcode != WsOpcode::Text && opcode != WsOpcode::Binary)))
+        return ParseStatus::Error;
     const bool fin = (b0 & 0x80) != 0;
     const bool masked = (b1 & 0x80) != 0;
     const u8 len7 = b1 & 0x7F;
@@ -68,6 +76,7 @@ ParseStatus ws_parse_header(const u8* buf, u32 len, bool require_mask, WsFrameHe
     out->opcode = opcode;
     out->payload_len = payload_len;
     out->header_len = offset;
+    out->compressed = kCompressed;
     return ParseStatus::Complete;
 }
 
@@ -80,13 +89,19 @@ void ws_unmask_chunk(u8* payload, u64 len, const u8 mask_key[4], u64 offset) {
     for (u64 i = 0; i < len; i++) payload[i] ^= mask_key[(phase + (i & 3)) & 3];
 }
 
-u32 ws_write_header(
-    u8* out, WsOpcode op, bool fin, bool masked, const u8 mask_key[4], u64 payload_len) {
+u32 ws_write_header(u8* out,
+                    WsOpcode op,
+                    bool fin,
+                    bool masked,
+                    const u8 mask_key[4],
+                    u64 payload_len,
+                    bool compressed) {
     // Refuse to serialize anything ws_parse_header would reject, so the writer can never
     // put a protocol-invalid frame on the wire. Return 0 (never a valid header length —
     // the minimum is 2) to signal "rejected, nothing written". This mirrors the parser's
     // control-frame validation exactly (§5.5/§5.5.1) plus the 64-bit reserved bit (§5.2).
     if (!ws_opcode_valid(op)) return 0;
+    if (compressed && op != WsOpcode::Text && op != WsOpcode::Binary) return 0;
     if (ws_opcode_is_control(op)) {
         if (!fin) return 0;                                // control frames are never fragmented
         if (payload_len > kWsMaxControlPayload) return 0;  // and never use extended length
@@ -95,7 +110,7 @@ u32 ws_write_header(
     }
     if (payload_len >= (static_cast<u64>(1) << 63)) return 0;  // 64-bit length MSB is reserved zero
 
-    out[0] = static_cast<u8>((fin ? 0x80 : 0x00) | static_cast<u8>(op));
+    out[0] = static_cast<u8>((fin ? 0x80 : 0x00) | (compressed ? 0x40 : 0) | static_cast<u8>(op));
     const u8 mask_bit = masked ? 0x80 : 0x00;
     u32 offset;
     if (payload_len <= 125) {
@@ -130,7 +145,7 @@ WsMessageStatus ws_message_feed(WsMessageAssembler& m,
 
     if (h.opcode == WsOpcode::Continuation) {
         // A continuation is only meaningful once a message has been started.
-        if (!m.in_fragmented) return WsMessageStatus::Error;
+        if (!m.in_fragmented || h.compressed) return WsMessageStatus::Error;
     } else {
         // A new Text/Binary frame must not arrive in the middle of another message.
         if (m.in_fragmented) return WsMessageStatus::Error;
