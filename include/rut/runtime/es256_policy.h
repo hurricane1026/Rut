@@ -22,6 +22,7 @@ public:
     const Es256KeySet& keys() const { return key_set; }
     Str issuer() const { return {issuer_bytes, issuer_len}; }
     Str audience() const { return {audience_bytes, audience_len}; }
+    Str required_type() const { return {type_bytes, type_length}; }
     bool permits(json::Document& document) const;
     using Remote = RemoteJwks;
     const Remote& remote() const { return remote_configuration; }
@@ -40,6 +41,8 @@ private:
     u32 revoked_count = 0;
     bool require_jti = false;
     i64 issued_after = 0;
+    char type_bytes[kMaxEs256TypeBytes]{};
+    u32 type_length = 0;
     Remote remote_configuration{};
 };
 

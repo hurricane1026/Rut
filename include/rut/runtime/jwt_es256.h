@@ -8,6 +8,7 @@ struct Document;
 namespace rut {
 class EcP256Sha256Verifier;
 class Es256VerifierSet;
+inline constexpr u32 kMaxEs256TypeBytes = 128;
 
 // Fixed-key compact JWS profile: ES256 only, canonical unpadded base64url,
 // object header <=1024 bytes and claims <=8192 bytes. Rejects crit and b64
@@ -49,6 +50,10 @@ bool jwt_es256_validate(EcP256Sha256Verifier& verifier,
 // its lifetime ends at keys.reset()/destruction. On every failure it is empty,
 // payload_len is zero and document invalid. Other workspace/alias rules above
 // apply; output parameters must not alias each other or the input workspaces.
+// Optional trusted required_type pins exact decoded protected-header typ.
+// Empty disables the policy; enabled values are 1..128 visible ASCII bytes.
+// No media-type aliases, normalization or payload/HTTP-field fallback applies.
+// Like issuer/audience, required_type must not alias document or payload_out.
 bool jwt_es256_validate_set(Es256VerifierSet& keys,
                             json::Document& document,
                             Str token,
@@ -58,5 +63,6 @@ bool jwt_es256_validate_set(Es256VerifierSet& keys,
                             char* payload_out,
                             u32 capacity,
                             u32& payload_len,
-                            Str& verified_kid);
+                            Str& verified_kid,
+                            Str required_type = {});
 }  // namespace rut

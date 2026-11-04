@@ -3,6 +3,8 @@
 //  "jwks":{"keys":[{"kid":"current","kty":"EC","alg":"ES256","crv":"P-256",
 //                   "x":"...32-byte base64url coordinate...",
 //                   "y":"...32-byte base64url coordinate..."}]}}.
+// Optional "requiredType":"at+jwt" pins the exact signed protected-header typ.
+// Configure the issuer's actual type; no case folding or media-type aliases apply.
 // Optional revokedJtis/issuedAfter are immutable revocation snapshots.
 // Optional remoteJwks uses the same eight-field bounded HTTPS profile as RS256.
 // Initial keys approve IDs; remote mode denies until its first successful fetch.

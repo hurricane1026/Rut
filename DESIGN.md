@@ -9487,6 +9487,7 @@ exit; mutable crypto workspaces and pointers are never serialized. This adds ver
 not ES256 signing, OIDC, online revocation, persistent sessions or replay state.
 
 
+
 ### Configuration-owned RS256 explicit token type
 
 `Crypto.jwtRs256(token, policy)` accepts optional trusted `requiredType`. It is a
@@ -9508,3 +9509,26 @@ artifacts carry this policy through the existing configuration owner, including
 remote-key refresh. See [RFC 8725 section 3.11](https://www.rfc-editor.org/rfc/rfc8725.html#section-3.11)
 for explicit typing; this is a bounded application policy, not full OAuth access
 token profile conformance or nested-token support.
+
+### Configuration-owned ES256 explicit token type
+
+The trusted `Crypto.jwtEs256` policy accepts optional `requiredType`: 1–128
+decoded visible ASCII bytes owned by the existing immutable configuration.
+The compact-JWS verifier compares the decoded protected-header `typ` exactly,
+with case-sensitive bytes and no media-type aliases/normalization. Missing,
+non-string, duplicate or mismatching types reject before claims or identity
+publication. Neither payload fields, HTTP metadata nor `cty` can satisfy it.
+Signature/algorithm/approved-kid and existing claims/revocation policies still
+apply. Omission preserves the original untyped profile.
+
+The optional native `jwt_es256_validate_set` parameter has the same bounded
+input, alias, output-clearing and scratch-lifetime contract. Enabled type strings
+are validated before use; failure clears selected kid, payload length and document
+validity/source/count. Invalid configured values fail loading. `load_jwks` retains
+its existing untyped behavior, including after a failed policy-load attempt.
+
+Type bytes follow existing RCU generation lifetimes. Remote-JWKS cache replacement
+changes keys, never the configured token type. No new keyword, builtin, dependency,
+request-path allocation or mutable cross-shard state is introduced. This implements
+a bounded application type policy, not OAuth/OIDC profile conformance or nested
+JWT handling. See the language card for exact behavior and the ES256 example.

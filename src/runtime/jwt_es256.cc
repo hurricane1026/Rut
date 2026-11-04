@@ -55,10 +55,15 @@ bool decode_with_key(EcP256Sha256Verifier* verifier,
                      char* payload_out,
                      u32 capacity,
                      u32& payload_len,
-                     Str& selected_kid) {
+                     Str& selected_kid,
+                     Str required_type = {}) {
     payload_len = 0;
     selected_kid = {};
     Publication publication{document};
+    if (required_type.len > kMaxEs256TypeBytes || (required_type.len && !required_type.ptr))
+        return false;
+    for (u32 i = 0; i < required_type.len; ++i)
+        if (required_type.ptr[i] < 0x21 || required_type.ptr[i] > 0x7e) return false;
     if ((verifier == nullptr) == (keys == nullptr) || (verifier && !verifier->valid()) ||
         (keys && !keys->valid()) || !token.ptr || !payload_out || token.len > json::kMaxBytes * 3)
         return false;
@@ -82,6 +87,7 @@ bool decode_with_key(EcP256Sha256Verifier* verifier,
         return false;
     bool has_algorithm = false;
     bool has_kid = false;
+    bool has_type = false;
     char kid[Es256KeySet::kMaxKidBytes];
     u32 kid_length = 0;
     for (u32 node = document.nodes[0].child; node != json::kNone;
@@ -90,6 +96,13 @@ bool decode_with_key(EcP256Sha256Verifier* verifier,
         if (!document.string(document.nodes[node].key, key)) return false;
         const Str kName{document.scratch, key.len};
         if (kName.eq(lit_str("crit")) || kName.eq(lit_str("b64"))) return false;
+        if (required_type.len && kName.eq(lit_str("typ"))) {
+            json::Writer value{document.other, kMaxEs256TypeBytes};
+            if (!document.string(node, value) || !value.ok ||
+                !Str{document.other, value.len}.eq(required_type))
+                return false;
+            has_type = true;
+        }
         if (keys && kName.eq(lit_str("kid"))) {
             if (has_kid || document.nodes[node].kind != json::Kind::String) return false;
             json::Writer value{kid, sizeof(kid)};
@@ -104,7 +117,7 @@ bool decode_with_key(EcP256Sha256Verifier* verifier,
             return false;
         has_algorithm = true;
     }
-    if (!has_algorithm) return false;
+    if (!has_algorithm || (required_type.len && !has_type)) return false;
     Str candidate_id{};
     if (keys) {
         if (!has_kid) return false;
@@ -172,7 +185,8 @@ bool jwt_es256_validate_set(Es256VerifierSet& keys,
                             char* payload_out,
                             u32 capacity,
                             u32& payload_len,
-                            Str& verified_kid) {
+                            Str& verified_kid,
+                            Str required_type) {
     payload_len = 0;
     verified_kid = {};
     Publication publication{document};
@@ -180,8 +194,15 @@ bool jwt_es256_validate_set(Es256VerifierSet& keys,
         return false;
     u32 decoded_length = 0;
     Str selected_id;
-    if (!decode_with_key(
-            nullptr, &keys, document, token, payload_out, capacity, decoded_length, selected_id) ||
+    if (!decode_with_key(nullptr,
+                         &keys,
+                         document,
+                         token,
+                         payload_out,
+                         capacity,
+                         decoded_length,
+                         selected_id,
+                         required_type) ||
         !jwt_claims_valid(document, {payload_out, decoded_length}, issuer, audience, unix_seconds))
         return false;
     payload_len = decoded_length;

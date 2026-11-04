@@ -72,7 +72,8 @@ def exercise(args):
                 status, _, body = request(headers=good + [("X-Consumer-ID", "mallory")])
                 assert (status, body) == (200, b"alice"), (status, body)
             for name, expected in [("scope", 403), ("issuer", 401), ("expired", 401),
-                                    ("revoked", 401), ("algorithm", 401), ("unknown_kid", 401)]:
+                                    ("revoked", 401), ("algorithm", 401), ("unknown_kid", 401),
+                                    ("missing_type", 401), ("wrong_type", 401), ("duplicate_type", 401)]:
                 status, fields, body = request(headers=[("Authorization", "Bearer " + fixture[name])])
                 assert status == expected, (name, status, body)
                 assert "Bearer" in fields.get("WWW-Authenticate", ""), (name, dict(fields))

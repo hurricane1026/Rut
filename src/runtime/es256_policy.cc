@@ -13,6 +13,7 @@ bool Es256Policy::load_jwks(
     revoked_count = 0;
     require_jti = false;
     issued_after = 0;
+    type_length = 0;
     remote_configuration = {};
     return true;
 }
@@ -46,6 +47,7 @@ bool Es256Policy::load(Str configuration) {
     revoked_count = 0;
     require_jti = false;
     issued_after = 0;
+    type_length = 0;
     remote_configuration = {};
     for (u32 n = document.nodes[0].child; n != json::kNone; n = document.nodes[n].next) {
         json::Writer key{document.scratch};
@@ -65,6 +67,12 @@ bool Es256Policy::load(Str configuration) {
             if (!document.string(n, value) || !value.ok || value.len == 0) return false;
             (kIssuer ? issuer_len : audience_len) = value.len;
             required |= kIssuer ? 4 : 8;
+        } else if (kName.eq(lit_str("requiredType"))) {
+            json::Writer value{type_bytes, sizeof(type_bytes)};
+            if (!document.string(n, value) || !value.ok || !value.len) return false;
+            for (u32 i = 0; i < value.len; ++i)
+                if (type_bytes[i] < 0x21 || type_bytes[i] > 0x7e) return false;
+            type_length = value.len;
         } else if (kName.eq(lit_str("revokedJtis"))) {
             if (document.nodes[n].kind != json::Kind::Array) return false;
             require_jti = true;
@@ -278,7 +286,8 @@ bool Es256Policies::verify(u32 shard,
                                    payload,
                                    capacity,
                                    length,
-                                   kid) &&
+                                   kid,
+                                   policies[i].required_type()) &&
             policies[i].permits(document))
             return true;
         length = 0;

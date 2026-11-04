@@ -1099,6 +1099,7 @@ discovery, online revocation and durable sessions remain open; no full JWT/OIDC
 milestone completion is claimed.
 
 
+
 ## RS256 protected token type binding
 
 Optional trusted `requiredType` binds a route's RS256 policy to an exact signed
@@ -1116,3 +1117,24 @@ Bearer challenges and no identity publication; payload/HTTP `typ` and JOSE `cty`
 cannot substitute for the protected field. Native artifacts preserve type checks
 after compiler exit and source removal. All ordinary signature, claims, snapshot
 revocation and token time limits still apply, including remote-JWKS mode.
+
+## ES256 protected token type binding
+
+The ES256 policy supports optional trusted `requiredType`, an exact signed
+protected-header `typ` of 1–128 decoded visible ASCII bytes. No payload, HTTP
+field or JOSE `cty` fallback applies. Case and media-type aliases remain distinct;
+omission preserves the original untyped profile. This is application type
+binding, not full OAuth/OIDC profile support.
+
+Focused ES256 tests cover typed/untyped policies, shard isolation, escaped and
+duplicate field names, missing/non-string/mismatching types, forged signatures,
+strict configuration bounds and ownership, and zero observed crypto allocations
+during verification. HTTP/JIT tests verify Bearer challenges and absence of
+identity publication on rejection. Native artifact tests retain the rule after
+compiler exit/source removal. The two-shard TLS gateway tests exercise configured
+types, wrong/missing/duplicate types, signature and ordinary claims failures for
+epoll and io_uring; unavailable backends are reported as skips.
+
+The configured type stays with the policy during remote key replacement.
+Signature, approved keys, issuer/audience/time, snapshot revocation and scope/group
+checks continue to compose. Persistent replay state remains outstanding.
