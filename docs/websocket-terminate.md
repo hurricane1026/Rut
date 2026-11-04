@@ -1050,7 +1050,13 @@ The server-role downstream write half sends FIN as soon as its Close is sent
 and acknowledged, even while an upstream write or acknowledgement is pending.
 The other leg remains under the same fixed five-second shutdown deadline.
 EOF without a received Close is abnormal and does not fabricate acknowledgement.
-Lifecycle callbacks and graceful TLS shutdown remain unavailable.
+TLS sends a local `close_notify` before FIN and waits for its ciphertext to
+finish sending, including nonblocking retries. The authenticated WebSocket
+Close already defines application EOF, so this terminal TCP connection is not
+reused and does not wait for a second TLS alert. A peer close_notify or EOF
+reported to the WebSocket callback leaves the other leg's Close pending; TLS
+errors remain fatal. Failure and timeout retain normal
+I/O cancellation ownership. Lifecycle callbacks remain unavailable.
 
 Inspection currently uses bounded single-slice storage (16370 bytes),
 with separate per-direction output buffers. `maxMessageSize` cannot lift that

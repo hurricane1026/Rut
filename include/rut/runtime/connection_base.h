@@ -724,6 +724,9 @@ struct ConnectionBase {
     bool ws_close_upstream_received = false;
     bool ws_close_client_sent = false;
     bool ws_close_upstream_sent = false;
+    bool ws_tls_shutdown_pending = false;
+    bool ws_tls_shutdown_generated = false;
+    bool ws_tls_shutdown_need_read = false;
     bool ws_client_write_shutdown = false;
     bool ws_close_handshake_complete = false;
     // Dedicated inline control storage is never reused while its send is pending.
@@ -2114,6 +2117,9 @@ struct ConnectionBase {
         ws_close_upstream_received = false;
         ws_close_client_sent = false;
         ws_close_upstream_sent = false;
+        ws_tls_shutdown_pending = false;
+        ws_tls_shutdown_generated = false;
+        ws_tls_shutdown_need_read = false;
         ws_client_write_shutdown = false;
         ws_close_handshake_complete = false;
         idle_trim_examined = false;

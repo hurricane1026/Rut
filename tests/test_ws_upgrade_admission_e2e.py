@@ -1686,7 +1686,7 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
 
 def native_binary_source_removal_scenario(server, compiler, backend_kind,
                                          handler=BINARY_HANDLER, exchange=binary_exchange,
-                                         declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS):
+                                         declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS, tls=False):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-native-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -1695,7 +1695,8 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind,
         artifact = os.path.join(temp, "route.native")
         with open(source, "w", encoding="utf-8") as route_file:
             route_file.write(
-                f'listen 127.0.0.1:0\nupstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+                ('' if tls else 'listen 127.0.0.1:0\n')
+                + f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
                 + declarations + '\nroute GET "/ws" { ' + handler + '}\n')
         emitted = subprocess.run([compiler, source, "2"], capture_output=True, check=True, timeout=30)
         with open(artifact, "wb") as artifact_file:
@@ -1719,18 +1720,31 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind,
                 "finally:\n"
                 "    os.close(fd)\n")
         os.chmod(wrapper, 0o700)
-        process, port, diagnostic = launch(native_server, os.path.join(temp, "deleted.rut"), backend_kind)
+        extra_args = ()
+        context = None
+        if tls:
+            fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+            extra_args = ("0", "--tls-cert", os.path.join(fixtures, "localhost_cert.pem"),
+                          "--tls-key", os.path.join(fixtures, "localhost_key.pem"))
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.set_alpn_protocols(["http/1.1"])
+        def connect():
+            raw = socket.create_connection(("127.0.0.1", port), timeout=3)
+            return context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=False) if context else raw
+        process, port, diagnostic = launch(native_server, os.path.join(temp, "deleted.rut"), backend_kind, extra_args)
         if process is None:
             text = diagnostic.decode(errors="replace")
             if backend_kind == "io_uring" and "--backend io_uring requested, but io_uring is unavailable" in text:
                 return "skip", text
             raise AssertionError(f"{backend_kind} native binary artifact failed:\n{text}")
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+            with connect() as client:
                 client.sendall(REQUEST.replace(b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", b"") + masked_frame(1, b"TAIL"))
                 if not recv_http_response(client).startswith(b"HTTP/1.1 400"):
                     raise AssertionError("native source-removed artifact accepted malformed handshake")
-            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+            with connect() as client:
                 client.sendall(request)
                 with upstream.accept()[0] as peer:
                     peer.settimeout(3)
@@ -2357,7 +2371,7 @@ def tls_passthrough_scenario(server, backend_kind):
     return "pass", ""
 
 
-def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False, closing=False):
+def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False, closing=False, client_notify=False):
     cert = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_cert.pem")
     key = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_key.pem")
     backend = socket.socket()
@@ -2398,7 +2412,7 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
             context.set_alpn_protocols(["http/1.1"])
 
             raw = socket.create_connection(("127.0.0.1", port), timeout=3)
-            invalid_client = context.wrap_socket(raw, server_hostname="localhost")
+            invalid_client = context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=not closing)
             clients.append(invalid_client)
             invalid_client.sendall(
                 b"GET /ws HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
@@ -2431,7 +2445,8 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
             if connection_context:
                 connection_exchange(valid_client, peer, b"tls:")
             elif closing:
-                closing_handshake_exchange(valid_client, peer)
+                exchange = closing_client_notify_exchange if client_notify else closing_handshake_exchange
+                exchange(valid_client, peer)
             else:
                 valid_client.sendall(masked_frame(1, b"DROP"))
                 peer.settimeout(0.25)
@@ -2736,6 +2751,30 @@ def closing_handshake_exchange(client, peer):
         raise AssertionError("both acknowledgements did not retire the tunnel")
 
 
+def closing_client_notify_exchange(client, peer):
+    client.sendall(masked_frame(1, b"begin"))
+    expected = b"\x03\xf0policy"
+    if recv_client_frame(client) != (8, expected, False) or \
+            recv_client_frame(peer) != (8, expected, True):
+        raise AssertionError("handler Close changed before TLS shutdown")
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    # unwrap sends the client's close_notify and requires the authenticated
+    # server alert; a raw FIN without close_notify cannot satisfy this call.
+    raw = client.unwrap()
+    try:
+        if raw.recv(1) != b"":
+            raise AssertionError("TLS shutdown did not end the downstream TCP write half")
+        assert_socket_quiet(peer)
+        peer.sendall(b"\x89\x04live")
+        if recv_client_frame(peer) != (10, b"live", True):
+            raise AssertionError("client TLS shutdown prematurely retired the upstream")
+        peer.sendall(b"\x88\x00")
+        if peer.recv(1) != b"":
+            raise AssertionError("upstream acknowledgement did not finish TLS-backed tunnel")
+    finally:
+        raw.close()
+
+
 def closing_timeout_exchange(client, peer):
     started = time.monotonic()
     client.sendall(masked_frame(1, b"begin"))
@@ -3019,6 +3058,12 @@ def main():
             print(f"PASS {backend} TLS passthrough")
         status, details = tls_terminate_handshake_scenario(args.server, backend, closing=True)
         print(f"{status.upper()} {backend} TLS closing handshake: {details}")
+        status, details = tls_terminate_handshake_scenario(args.server, backend, closing=True, client_notify=True)
+        print(f"{status.upper()} {backend} TLS client close_notify: {details}")
+        for exchange in (closing_handshake_exchange, closing_client_notify_exchange):
+            status, details = native_binary_source_removal_scenario(
+                args.server, args.compiler, backend, CLOSING_HANDLER, exchange, tls=True)
+            print(f"{status.upper()} {backend} native TLS {exchange.__name__}: {details}")
         status, details = tls_terminate_handshake_scenario(args.server, backend, connection_context=True)
         print(f"{status.upper()} {backend} TLS connection context: {details}")
         status, details = tls_terminate_handshake_scenario(args.server, backend)

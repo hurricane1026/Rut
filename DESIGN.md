@@ -3424,8 +3424,15 @@ re-read), each with its own buffer for natural backpressure.
   retired without reusing that output, so neither leg can strand the other.
   EOF without Close is abnormal. The original shutdown deadline also bounds
   acknowledgement waiting; traffic cannot refresh it. All fd/slot/buffer release
-  still uses normal async retirement. Lifecycle callbacks and graceful TLS
-  shutdown remain to be implemented.
+  still uses normal async retirement. TLS emits local close_notify and drains
+  its owned ciphertext before FIN; epoll retries SSL_shutdown on its required
+  readiness, while io_uring retains the ordinary authenticated raw send owner.
+  Pending WebSocket output and the shutdown operation remain distinct. Peer
+  close_notify and EOF delivered to the WebSocket callback affect only the
+  downstream leg; fatal TLS errors still terminate the connection. A validated
+  WebSocket Close is application EOF and the TCP connection is terminal, so
+  local TLS shutdown does not wait for a second TLS alert. The same shutdown
+  deadline bounds blocked alert output. Lifecycle callbacks remain pending.
 
 - **Connection teardown — drain-then-close (nginx model).** WebSocket shutdown
   is an *application-level* event (the RFC 6455 Close-frame handshake), not a TCP

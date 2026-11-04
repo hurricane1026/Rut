@@ -18,6 +18,7 @@ struct EpollTlsHooks {
     // tables that predate ALPN; callers must null-check and default to Http11.
     AlpnProtocol (*alpn_negotiated)(SSL* ssl);
     bool (*capture_client_fingerprint)(SSL* ssl, char fingerprint[64], bool& valid);
+    i32 (*ssl_shutdown)(SSL* ssl) = nullptr;
 };
 
 }  // namespace rut

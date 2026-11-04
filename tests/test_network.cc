@@ -14565,6 +14565,233 @@ TEST(tls_iouring, closing_single_shot_defers_first_drain_and_keepalive_stays_cap
     loop.backend.pending = 0;
     loop.close_conn(conn);
 }
+TEST(tls_engine, websocket_shutdown_retries_without_faking_sent_alert) {
+    auto result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                            RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        result.value(), destroy_tls_server_context);
+    const int versions[] = {TLS1_2_VERSION, TLS1_3_VERSION};
+    for (int version : versions) {
+        struct OwnedEngine {
+            TlsEngine value;
+            ~OwnedEngine() { tls_engine_free(value); }
+        } server;
+        REQUIRE(tls_engine_init(server.value, context.get()).has_value());
+        TlsMemoryClientPeer client;
+        REQUIRE(client.init());
+        REQUIRE_EQ(SSL_set_min_proto_version(client.ssl, version), 1);
+        REQUIRE_EQ(SSL_set_max_proto_version(client.ssl, version), 1);
+        REQUIRE(tls_engine_handshake_with_memory_client(server.value, client.ssl));
+        u8 tiny[1], output[16384], input[16384], byte;
+        tls_engine_set_input(server.value, nullptr, 0);
+        tls_engine_set_output(server.value, tiny, sizeof(tiny));
+        CHECK(tls_engine_shutdown(server.value) == TlsOp::WantWrite);
+        const u32 partial_length = tls_engine_output_len(server.value);
+        REQUIRE_LE(partial_length, sizeof(tiny));
+        if (partial_length)
+            REQUIRE_EQ(BIO_write(SSL_get_rbio(client.ssl), tiny, partial_length),
+                       static_cast<int>(partial_length));
+        // SSL_SENT_SHUTDOWN can already be set after a failed write attempt.
+        // Only a successful retry plus an authenticated peer read proves delivery.
+        tls_engine_set_output(server.value, output, sizeof(output));
+        REQUIRE(tls_engine_shutdown(server.value) == TlsOp::Ok);
+        const u32 length = tls_engine_output_len(server.value);
+        REQUIRE_GT(length, 0u);
+        REQUIRE_EQ(BIO_write(SSL_get_rbio(client.ssl), output, length), static_cast<int>(length));
+        const int read_result = SSL_read(client.ssl, &byte, 1);
+        CHECK_EQ(read_result, 0);
+        CHECK_EQ(SSL_get_error(client.ssl, read_result), SSL_ERROR_ZERO_RETURN);
+        REQUIRE_GE(SSL_shutdown(client.ssl), 0);
+        const int peer_length = BIO_read(SSL_get_wbio(client.ssl), input, sizeof(input));
+        REQUIRE_GT(peer_length, 0);
+        tls_engine_set_input(server.value, input, static_cast<u32>(peer_length));
+        tls_engine_set_output(server.value, output, sizeof(output));
+        REQUIRE(tls_engine_shutdown(server.value) == TlsOp::Ok);
+        CHECK_EQ(tls_engine_output_len(server.value), 0u);  // no duplicate alert
+    }
+    TlsEngine absent;
+    CHECK(tls_engine_shutdown(absent) == TlsOp::Error);
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(tls_iouring, websocket_alert_is_owned_until_raw_completion_before_fin) {
+    auto result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                            RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        result.value(), destroy_tls_server_context);
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    auto& loop = *guard.loop;
+    auto& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    loop.free_top = 0;
+    int sockets[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
+    conn.fd = sockets[0];
+    std::unique_ptr<int, void (*)(int*)> peer(&sockets[1], [](int* fd) { close(*fd); });
+    loop.tls_server = context.get();
+    REQUIRE(loop.tls_setup(conn));
+    TlsMemoryClientPeer client;
+    REQUIRE(client.init());
+    REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+    conn.tls_handshake_complete = true;
+    conn.is_ws_tunnel = conn.is_ws_terminate = conn.ws_closing = true;
+    conn.ws_close_client_sent = conn.ws_close_client_received = true;
+    conn.ws_close_upstream_sent = conn.ws_close_upstream_received = true;
+    conn.ws_tls_shutdown_pending = conn.ws_upstream_send_pending = true;
+    REQUIRE(loop.submit_ws_tls_shutdown(conn));
+    REQUIRE(conn.tls_out_inflight);
+    REQUIRE(conn.ws_tls_shutdown_generated);
+    CHECK_FALSE(conn.ws_client_write_shutdown);
+    CHECK(conn.ws_tls_shutdown_pending);
+    u8 byte;
+    CHECK_EQ(recv(sockets[1], &byte, 1, MSG_DONTWAIT), -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+    const u32 generation = conn.tls_out_inflight_generation;
+    const u32 length = conn.tls_out_inflight_len;
+    REQUIRE_EQ(BIO_write(SSL_get_rbio(client.ssl), conn.tls_out_buf.data(), length),
+               static_cast<int>(length));
+    const int read_result = SSL_read(client.ssl, &byte, 1);
+    CHECK_EQ(read_result, 0);
+    CHECK_EQ(SSL_get_error(client.ssl, read_result), SSL_ERROR_ZERO_RETURN);
+    CHECK_EQ(conn.pending_ops, 1u);
+    loop.backend.send_state[0].remaining = 0;
+    loop.backend.send_state[0].offset = length;
+    guard.sq_head = guard.sq_tail;
+    loop.backend.pending = 0;
+    loop.dispatch(tls_send_event(0, static_cast<i32>(length), generation));
+    CHECK_EQ(conn.fd, -1);
+    CHECK_EQ(recv(sockets[1], &byte, 1, MSG_DONTWAIT), 0);
+    CHECK_EQ(conn.pending_ops, 0u);
+}
+
+TEST(tls_iouring, websocket_notify_and_tcp_eof_leave_other_leg_draining) {
+    const bool variants[] = {false, true};
+    for (bool notify : variants) {
+        auto result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                RUT_TESTDATA_DIR "/localhost_key.pem");
+        REQUIRE(result.has_value());
+        std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+            result.value(), destroy_tls_server_context);
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init());
+        auto& loop = *guard.loop;
+        auto& conn = loop.conns[0];
+        conn.reset();
+        conn.id = 0;
+        conn.fd = dup(STDERR_FILENO);
+        loop.free_top = 0;
+        REQUIRE_GE(conn.fd, 0);
+        loop.tls_server = context.get();
+        REQUIRE(loop.tls_setup(conn));
+        TlsMemoryClientPeer client;
+        REQUIRE(client.init());
+        REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+        u8 receive_storage[256], upstream_storage[256];
+        conn.recv_buf.bind(receive_storage, sizeof(receive_storage));
+        conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        conn.tls_handshake_complete = true;
+        conn.is_ws_tunnel = conn.is_ws_terminate = conn.ws_closing = true;
+        conn.ws_close_client_sent = conn.ws_close_client_received = conn.ws_client_write_shutdown =
+            true;
+        conn.ws_upstream_eof = conn.ws_client_send_pending = true;  // opposite Close still draining
+        conn.tls_pending_on_recv = &on_ws_client_recv<IoUringEventLoop>;
+        const i32 fd = conn.fd;
+        if (notify) {
+            REQUIRE_GE(SSL_shutdown(client.ssl), 0);
+            u8 ciphertext[1024];
+            const int length = BIO_read(SSL_get_wbio(client.ssl), ciphertext, sizeof(ciphertext));
+            REQUIRE_GT(length, 0);
+            REQUIRE_EQ(conn.tls_in_buf.write(ciphertext, length), static_cast<u32>(length));
+            tls_process<IoUringEventLoop>(&loop, conn);
+        } else {
+            tls_recv<IoUringEventLoop>(&loop, conn, make_ev(0, IoEventType::Recv, 0));
+        }
+        CHECK_EQ(conn.fd, fd);
+        CHECK(conn.ws_client_eof);
+        CHECK(conn.ws_client_send_pending);
+        CHECK_FALSE(conn.ws_close_handshake_complete);
+        loop.close_conn(conn);
+    }
+}
+
+TEST(tls_iouring, websocket_shutdown_cancel_keeps_alert_until_both_completions) {
+    const bool orders[] = {false, true};
+    for (bool cancel_first : orders) {
+        auto result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                RUT_TESTDATA_DIR "/localhost_key.pem");
+        REQUIRE(result.has_value());
+        std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+            result.value(), destroy_tls_server_context);
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init());
+        auto& loop = *guard.loop;
+        auto& conn = loop.conns[0];
+        conn.reset();
+        conn.id = 0;
+        conn.fd = dup(STDERR_FILENO);
+        loop.free_top = 0;
+        REQUIRE_GE(conn.fd, 0);
+        loop.tls_server = context.get();
+        REQUIRE(loop.tls_setup(conn));
+        TlsMemoryClientPeer client;
+        REQUIRE(client.init());
+        REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+        conn.ws_closing = conn.ws_tls_shutdown_pending = conn.ws_upstream_send_pending = true;
+        REQUIRE(loop.submit_ws_tls_shutdown(conn));
+        REQUIRE(conn.tls_out_inflight);
+        const u32 generation = conn.tls_out_inflight_generation;
+        const u8* const output = conn.tls_out_slice;
+        guard.sq_head = guard.sq_tail;
+        loop.backend.pending = 0;
+        loop.close_conn(conn);
+        REQUIRE_EQ(conn.pending_ops, 2u);
+        CHECK_EQ(conn.tls_out_slice, output);
+        const IoEvent target = tls_send_event(0, -ECANCELED, generation);
+        const IoEvent cancel = tls_send_event(0, 0, generation | kNonUpstreamSendCancelBit);
+        loop.dispatch(cancel_first ? cancel : target);
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK_EQ(conn.tls_out_slice, output);
+        loop.dispatch(cancel_first ? target : cancel);
+        CHECK_EQ(conn.pending_ops, 0u);
+        CHECK_EQ(conn.tls_out_slice, nullptr);
+    }
+}
+
+TEST(tls_iouring, websocket_shutdown_sq_full_has_no_raw_owner_or_fin) {
+    auto result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                            RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        result.value(), destroy_tls_server_context);
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    auto& loop = *guard.loop;
+    auto& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = dup(STDERR_FILENO);
+    loop.free_top = 0;
+    REQUIRE_GE(conn.fd, 0);
+    loop.tls_server = context.get();
+    REQUIRE(loop.tls_setup(conn));
+    TlsMemoryClientPeer client;
+    REQUIRE(client.init());
+    REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+    conn.ws_closing = conn.ws_tls_shutdown_pending = conn.ws_upstream_send_pending = true;
+    loop.backend.sq_ring_entries = 0;
+    CHECK_FALSE(loop.submit_ws_tls_shutdown(conn));
+    CHECK(conn.ws_tls_shutdown_generated);
+    CHECK_FALSE(conn.ws_client_write_shutdown);
+    CHECK(conn.tls_raw_send_owner_is_neutral());
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(guard.sq_tail, 0u);
+    loop.close_conn(conn);
+}
+#endif
 #endif  // __linux__
 
 TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {

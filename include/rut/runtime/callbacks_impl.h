@@ -11201,6 +11201,27 @@ bool ws_receive_closing(Loop* loop, Connection& conn) {
     return true;
 }
 
+// Local TLS alert ciphertext has drained before FIN. This operation owns no
+// application plaintext; keep it separate from ordinary TLS logical sends.
+template <typename Loop>
+bool ws_finish_tls_shutdown(Loop* loop, Connection& conn) {
+    conn.ws_tls_shutdown_pending = false;
+    conn.ws_tls_shutdown_need_read = false;
+    conn.ws_upstream_send_pending = false;
+    conn.on_send = nullptr;
+    if (!loop->end_ws_client_stream(conn)) return false;
+    conn.ws_client_write_shutdown = true;
+    return true;
+}
+
+template <typename Loop>
+void on_ws_tls_shutdown_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (!conn.ws_tls_shutdown_pending || ev.result <= 0 || !ws_finish_tls_shutdown(loop, conn) ||
+        !ws_drive_close(loop, conn))
+        close_conn_if_live(loop, conn);
+}
+
 // Submit each Close once its slot is idle, retain both send owners through
 // completion, and then receive peer acknowledgements independently. A completed
 // downstream handshake sends FIN immediately; upstream acknowledgement can still
@@ -11246,8 +11267,15 @@ bool ws_drive_close(Loop* loop, Connection& conn) {
     const bool kUpstreamDone = conn.ws_close_upstream_received || conn.ws_upstream_eof;
     if (conn.ws_close_client_sent && kClientDone && !conn.ws_upstream_send_pending &&
         !conn.ws_client_write_shutdown) {
-        if (!loop->end_ws_client_stream(conn)) return false;
-        conn.ws_client_write_shutdown = true;
+        if (conn.tls_active) {
+            conn.ws_tls_shutdown_pending = true;
+            conn.ws_upstream_send_pending = true;
+            conn.on_send = &on_ws_tls_shutdown_sent<Loop>;
+            if (!loop->submit_ws_tls_shutdown(conn)) return false;
+        } else {
+            if (!loop->end_ws_client_stream(conn)) return false;
+            conn.ws_client_write_shutdown = true;
+        }
     }
     if (conn.ws_close_client_sent && conn.ws_close_upstream_sent && kClientDone && kUpstreamDone &&
         !conn.ws_client_send_pending && !conn.ws_upstream_send_pending) {
@@ -11258,7 +11286,9 @@ bool ws_drive_close(Loop* loop, Connection& conn) {
     }
     // Closing controls reply to their sender, so this phase backpressures the
     // receive on its own send slot rather than the opposite forwarding slot.
-    if (kClientDone || conn.ws_upstream_send_pending) {
+    if (conn.ws_tls_shutdown_pending && conn.ws_tls_shutdown_need_read) {
+        if (!ws_resume_client_recv(loop, conn)) return false;
+    } else if (kClientDone || conn.ws_upstream_send_pending) {
         if (!conn.recv_paused_for_send && !ws_pause_client_recv(loop, conn)) return false;
     } else if (!ws_resume_client_recv(loop, conn)) {
         return false;

@@ -230,4 +230,12 @@ i32 tls_engine_write(TlsEngine& eng, const u8* src, u32 n, TlsOp& st) {
     return 0;
 }
 
+TlsOp tls_engine_shutdown(TlsEngine& eng) {
+    if (!eng.ssl || !eng.handshake_done) return TlsOp::Error;
+    ERR_clear_error();
+    const int kRc = SSL_shutdown(eng.ssl);
+    // Zero is successful local shutdown, not an SSL_get_error input.
+    return kRc >= 0 ? TlsOp::Ok : classify(eng.ssl, kRc);
+}
+
 }  // namespace rut

@@ -3964,6 +3964,38 @@ public:
         return false;
     }
 
+#if RUT_ENABLE_WEBSOCKET
+    bool advance_ws_tls_shutdown(Connection& c) {
+        if (!c.ws_tls_shutdown_pending || !c.ws_upstream_send_pending || !c.ws_closing ||
+            !c.tls_active || c.tls_engine.ssl == nullptr || c.tls_send_owner_generation != 0 ||
+            c.tls_send_src != nullptr || c.tls_pending_on_send != nullptr || c.tls_proxy_stream)
+            return false;
+        if (c.tls_out_inflight || c.tls_out_buf.len() != 0)
+            return tls_ensure_draining<Self>(this, c);
+        if (!c.ws_tls_shutdown_generated) {
+            tls_engine_set_input(c.tls_engine, c.tls_in_buf.data(), c.tls_in_buf.len());
+            tls_engine_set_output(
+                c.tls_engine, c.tls_out_buf.write_ptr(), c.tls_out_buf.write_avail());
+            const TlsOp kStatus = tls_engine_shutdown(c.tls_engine);
+            c.tls_in_buf.consume(tls_engine_input_consumed(c.tls_engine));
+            c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));
+            c.ws_tls_shutdown_generated = kStatus == TlsOp::Ok;
+            c.ws_tls_shutdown_need_read = kStatus == TlsOp::WantRead;
+            if (kStatus == TlsOp::Error || kStatus == TlsOp::Closed) return false;
+            if (c.tls_out_buf.len() != 0) return tls_ensure_draining<Self>(this, c);
+            if (kStatus == TlsOp::WantRead) {
+                c.recv_paused_for_send = false;
+                return submit_recv(c);
+            }
+            if (kStatus == TlsOp::WantWrite) return false;  // no output or retry driver
+        }
+        return ws_finish_tls_shutdown(this, c);
+    }
+
+    bool submit_ws_tls_shutdown_impl(Connection& c) { return advance_ws_tls_shutdown(c); }
+
+#endif
+
     // close() cannot end a stream that an armed io_uring recv still references:
     // the FIN would wait until the close-path cancel drains, after the client
     // has usually closed first. For a plaintext connection whose response is

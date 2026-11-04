@@ -976,6 +976,8 @@ public:
         return backend.add_send(c.fd, c.id, buf, len, c.plaintext_send_has_follow_up(len));
     }
 
+    bool submit_ws_tls_shutdown_impl(Connection& c) { return backend.add_tls_shutdown(c); }
+
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         if (!begin_upstream_episode(c)) return false;
         return backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode);

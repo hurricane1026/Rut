@@ -1268,6 +1268,7 @@ return websocket(chat) { message in
 // After closing starts, data no longer reaches the message callback. Close
 // acknowledgements and local Ping/Pong handling share the fixed shutdown deadline;
 // completing the downstream handshake sends FIN independently of the upstream.
+// TLS flushes its close_notify before FIN; the same deadline bounds alert output.
 return websocket(chat) { message in
     guard message.fromClient && message.text.contains("secret") else { message.forward() }
     message.close(1008, "policy violation")

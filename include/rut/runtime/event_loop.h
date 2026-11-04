@@ -95,6 +95,11 @@ public:
         if (c.fd < 0 || c.ws_upstream_send_pending || c.send_armed) return false;
         return ::shutdown(c.fd, SHUT_WR) == 0;
     }
+    bool submit_ws_tls_shutdown(Connection& c) {
+        if constexpr (requires { self().submit_ws_tls_shutdown_impl(c); })
+            return self().submit_ws_tls_shutdown_impl(c);
+        return false;
+    }
     Connection* alloc_conn() { return self().alloc_conn_impl(); }
     void free_conn(Connection& c) {
         if (password_gateway) password_gateway->cancel(c.id);

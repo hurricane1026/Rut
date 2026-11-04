@@ -122,8 +122,9 @@ struct EpollBackend {
         IoEventType type;
         bool tls;
         u32 tls_wait_events;
-        u32 upstream_episode;  // 0 for downstream; submission episode upstream
-        u32 msg_flags = 0;     // extra flags kept for the EPOLLOUT continuation
+        u32 upstream_episode;       // 0 for downstream; submission episode upstream
+        u32 msg_flags = 0;          // extra flags kept for the EPOLLOUT continuation
+        bool tls_shutdown = false;  // SSL_shutdown retry; owns no plaintext view
     };
     MappedArray<SendState> send_state;
     MappedArray<SendState> upstream_send_state;
@@ -228,6 +229,7 @@ struct EpollBackend {
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool more_follows = false);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode);
     bool add_send_tls(Connection& c, const u8* buf, u32 len);
+    bool add_tls_shutdown(Connection& c);
 
     // Register fd for connect completion (EPOLLOUT).
     bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 upstream_episode);

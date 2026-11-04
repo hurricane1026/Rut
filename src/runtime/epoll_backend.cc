@@ -48,7 +48,8 @@ EpollTlsHooks default_tls_hooks = {default_ssl_accept,
                                    default_ssl_write,
                                    default_ssl_get_error,
                                    default_alpn_negotiated,
-                                   tls_capture_verified_client_fingerprint};
+                                   tls_capture_verified_client_fingerprint,
+                                   SSL_shutdown};
 
 const EpollTlsHooks* get_tls_hooks() {
     if (const EpollTlsHooks* hooks =
@@ -105,7 +106,7 @@ static bool upstream_send_state_detached(const EpollBackend::SendState& state) {
     // for an empty state and later resurrected by EPOLLOUT.
     return state.src == nullptr && state.fd < 0 && state.offset == 0 && state.remaining == 0 &&
            state.type == IoEventType::UpstreamSend && !state.tls && state.tls_wait_events == 0 &&
-           state.upstream_episode == 0;
+           state.upstream_episode == 0 && !state.tls_shutdown;
 }
 
 static i32 set_fd_interest(EpollBackend::FdInterest* interest,
@@ -574,7 +575,9 @@ void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
         const auto& ss = send_state[conn_id];
         if (ss.remaining > 0 && ss.fd == fd) {
             type = ss.type;
-            if (ss.tls) {
+            if (ss.tls_shutdown) {
+                events = ss.tls_wait_events;  // do not wake a blocked alert write on peer FIN
+            } else if (ss.tls) {
                 events = (ss.tls_wait_events == EPOLLIN) ? (EPOLLIN | EPOLLRDHUP)
                                                          : (EPOLLOUT | EPOLLRDHUP);
             } else {
@@ -827,6 +830,40 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
         pending_completions, pending_count, c.id, IoEventType::Send, static_cast<i32>(len));
 }
 
+bool EpollBackend::add_tls_shutdown(Connection& c) {
+    if (c.id >= connection_capacity || c.fd < 0 || !c.tls_active || c.tls == nullptr ||
+        !c.ws_tls_shutdown_pending || !c.ws_upstream_send_pending || c.ws_tls_shutdown_generated ||
+        send_state[c.id].remaining != 0 || pending_count >= kPendingCap)
+        return false;
+    const auto* hooks = get_tls_hooks();
+    errno = 0;
+    const i32 kRc = hooks->ssl_shutdown ? hooks->ssl_shutdown(c.tls) : SSL_shutdown(c.tls);
+    if (kRc >= 0) {
+        c.ws_tls_shutdown_generated = true;
+        return queue_pending_completion(
+            pending_completions, pending_count, c.id, IoEventType::Send, 1);
+    }
+    const i32 kError = hooks->ssl_get_error(c.tls, kRc);
+    if (kError != SSL_ERROR_WANT_READ && kError != SSL_ERROR_WANT_WRITE)
+        return queue_pending_completion(
+            pending_completions, pending_count, c.id, IoEventType::Send, map_tls_error(c.tls, kRc));
+    auto& state = send_state[c.id];
+    state = {nullptr, c.fd, 0, 1, IoEventType::Send, true, tls_interest_for_error(kError), 0};
+    state.tls_shutdown = true;
+    const i32 kRegistered = set_fd_interest(fd_interest.data(),
+                                            connection_capacity,
+                                            epoll_fd,
+                                            c.fd,
+                                            c.id,
+                                            IoEventType::Send,
+                                            tls_interest_for_error(kError),
+                                            0);
+    if (kRegistered >= 0) return true;
+    state = {};
+    return queue_pending_completion(
+        pending_completions, pending_count, c.id, IoEventType::Send, kRegistered);
+}
+
 bool EpollBackend::add_connect(
     i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 upstream_episode) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
@@ -1037,18 +1074,16 @@ u32 EpollBackend::wait(
         bool has_read = (ep_events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0;
         bool has_write = (ep_events[i].events & EPOLLOUT) != 0;
         bool send_ready = false;
-        if (!(ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) &&
-            conn_id < connection_capacity) {
-            const auto& send_state_for_event =
+        if (conn_id < connection_capacity) {
+            const auto& state =
                 (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
-            if (send_state_for_event.remaining > 0 && send_state_for_event.src != nullptr &&
-                send_state_for_event.fd >= 0 &&
-                (!io_event_is_upstream(type) ||
-                 send_state_for_event.upstream_episode == upstream_episode)) {
-                send_ready =
-                    send_state_for_event.tls
-                        ? (send_state_for_event.tls_wait_events == EPOLLIN ? has_read : has_write)
-                        : has_write;
+            const bool kHangup = (ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0;
+            if ((!kHangup || state.tls_shutdown) && state.remaining > 0 &&
+                (state.src != nullptr || state.tls_shutdown) && state.fd >= 0 &&
+                (!io_event_is_upstream(type) || state.upstream_episode == upstream_episode)) {
+                send_ready = state.tls_shutdown && kHangup ? true
+                             : state.tls ? (state.tls_wait_events == EPOLLIN ? has_read : has_write)
+                                         : has_write;
             }
         }
 
@@ -1344,7 +1379,7 @@ u32 EpollBackend::wait(
                 continue;
             }
             if (ss.tls && (conns == nullptr || conn_id >= max_conns)) continue;
-            if (ss.remaining == 0 || !ss.src || ss.fd < 0) {
+            if (ss.remaining == 0 || (!ss.src && !ss.tls_shutdown) || ss.fd < 0) {
                 // No outstanding send associated with this connection.
                 // Drop EPOLLOUT so a stale level-triggered wakeup cannot spin.
                 rearm_recv_interest(fd_interest.data(),
@@ -1362,39 +1397,74 @@ u32 EpollBackend::wait(
             bool pending_retry = false;
             bool made_progress = false;
 
-            if (ss.tls) {
+            if (!ss.tls && ss.src == nullptr) {
+                result = -EINVAL;
+                ss.remaining = 0;
+            } else if (ss.tls) {
                 auto& conn = conns[conn_id];
                 SSL* ssl = conn.tls;
                 if (!ssl) {
                     result = -EINVAL;
                 } else {
-                    while (ss.remaining > 0) {
+                    if (ss.tls_shutdown && (ep_events[i].events & (EPOLLHUP | EPOLLERR))) {
+                        result = -EPIPE;
+                        ss.remaining = 0;
+                    } else if (ss.tls_shutdown) {
+                        const auto* hooks = get_tls_hooks();
                         errno = 0;
-                        i32 nw = get_tls_hooks()->ssl_write(
-                            ssl, ss.src + ss.offset, static_cast<i32>(ss.remaining));
-                        if (nw > 0) {
-                            ss.offset += static_cast<u32>(nw);
-                            ss.remaining -= static_cast<u32>(nw);
-                            continue;
+                        const i32 kRc =
+                            hooks->ssl_shutdown ? hooks->ssl_shutdown(ssl) : SSL_shutdown(ssl);
+                        if (kRc >= 0) {
+                            conn.ws_tls_shutdown_generated = true;
+                            result = 1;
+                            ss.remaining = 0;
+                        } else {
+                            const i32 kError = hooks->ssl_get_error(ssl, kRc);
+                            if (kError == SSL_ERROR_WANT_READ || kError == SSL_ERROR_WANT_WRITE) {
+                                ss.tls_wait_events = tls_interest_for_error(kError);
+                                set_fd_interest(fd_interest.data(),
+                                                connection_capacity,
+                                                epoll_fd,
+                                                ss.fd,
+                                                conn_id,
+                                                ss.type,
+                                                tls_interest_for_error(kError),
+                                                0);
+                                pending_retry = true;
+                            } else {
+                                result = map_tls_error(ssl, kRc);
+                                ss.remaining = 0;
+                            }
                         }
-                        i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, nw);
-                        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-                            ss.tls_wait_events = tls_interest_for_error(ssl_err);
-                            set_fd_interest(fd_interest.data(),
-                                            connection_capacity,
-                                            epoll_fd,
-                                            ss.fd,
-                                            conn_id,
-                                            ss.type,
-                                            tls_send_interest_for_error(ssl_err),
-                                            io_event_is_upstream(type) ? upstream_episode : 0);
-                            pending_retry = true;
+                    } else
+                        while (ss.remaining > 0) {
+                            errno = 0;
+                            const i32 kWritten = get_tls_hooks()->ssl_write(
+                                ssl, ss.src + ss.offset, static_cast<i32>(ss.remaining));
+                            if (kWritten > 0) {
+                                ss.offset += static_cast<u32>(kWritten);
+                                ss.remaining -= static_cast<u32>(kWritten);
+                                continue;
+                            }
+                            const i32 kSslError = get_tls_hooks()->ssl_get_error(ssl, kWritten);
+                            if (kSslError == SSL_ERROR_WANT_READ ||
+                                kSslError == SSL_ERROR_WANT_WRITE) {
+                                ss.tls_wait_events = tls_interest_for_error(kSslError);
+                                set_fd_interest(fd_interest.data(),
+                                                connection_capacity,
+                                                epoll_fd,
+                                                ss.fd,
+                                                conn_id,
+                                                ss.type,
+                                                tls_send_interest_for_error(kSslError),
+                                                io_event_is_upstream(type) ? upstream_episode : 0);
+                                pending_retry = true;
+                                break;
+                            }
+                            result = map_tls_error(ssl, kWritten);
+                            ss.remaining = 0;
                             break;
                         }
-                        result = map_tls_error(ssl, nw);
-                        ss.remaining = 0;
-                        break;
-                    }
                     if (!pending_retry && result == 0) result = static_cast<i32>(ss.offset);
                 }
             } else {
