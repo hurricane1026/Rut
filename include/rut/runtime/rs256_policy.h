@@ -24,6 +24,7 @@ public:
     const Rs256KeySet& keys() const { return keys_; }
     Str issuer() const { return {issuer_, issuer_len_}; }
     Str audience() const { return {audience_, audience_len_}; }
+    Str required_type() const { return {type_bytes, type_length}; }
     // Apply only to signature/claims-verified documents. Immutable snapshot:
     // changes take effect with configuration adoption, retaining old RCU readers.
     bool permits(json::Document& document) const;
@@ -46,6 +47,8 @@ private:
     u32 revoked_count_ = 0;
     bool require_jti_ = false;
     i64 issued_after_ = 0;
+    char type_bytes[kMaxJwtTypeBytes]{};
+    u32 type_length = 0;
     Remote remote_{};
 };
 

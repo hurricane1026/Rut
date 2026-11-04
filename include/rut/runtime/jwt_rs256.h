@@ -8,6 +8,7 @@ struct Document;
 namespace rut {
 class RsaSha256Verifier;
 class Rs256VerifierSet;
+inline constexpr u32 kMaxJwtTypeBytes = 128;
 
 // Fixed-key compact JWS profile: RS256 only, canonical unpadded base64url,
 // object header <=1024 bytes and claims <=8192 bytes. Rejects crit and b64
@@ -49,6 +50,10 @@ bool jwt_rs256_validate(RsaSha256Verifier& verifier,
 // its lifetime ends at keys.reset()/destruction. On every failure it is empty,
 // payload_len is zero and document invalid. Other workspace/alias rules above
 // apply; output parameters must not alias each other or the input workspaces.
+// Optional trusted required_type requires an exact decoded protected-header typ
+// (1..128 visible ASCII bytes). Empty disables this additional policy. No media
+// type normalization, aliases or inference from claims/HTTP fields is performed.
+// Like issuer/audience, required_type must not alias document or payload_out.
 bool jwt_rs256_validate_set(Rs256VerifierSet& keys,
                             json::Document& document,
                             Str token,
@@ -58,5 +63,6 @@ bool jwt_rs256_validate_set(Rs256VerifierSet& keys,
                             char* payload_out,
                             u32 capacity,
                             u32& payload_len,
-                            Str& verified_kid);
+                            Str& verified_kid,
+                            Str required_type = {});
 }  // namespace rut
