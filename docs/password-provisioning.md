@@ -27,7 +27,12 @@ or environment option. Redirected/piped input is 1–1024 **exact bytes**, read 
 EOF, with embedded NUL, whitespace and newlines preserved. A trailing newline in
 redirected input is part of the password; empty or oversized input fails without
 publishing a record. Terminal input additionally follows the terminal driver's
-normal line-editing rules. For arbitrary bytes, use redirected input from an
+configured erase and kill keys; its configured EOF key ends input. Echo remains
+disabled while a bounded noncanonical reader enforces the same 1–1024 byte
+limit without depending on the platform's canonical-line buffer. Over-limit
+lines are drained through Enter/EOF without storing the remaining bytes, so
+echo stays disabled until the line ends. Enter is still mapped according to the
+terminal's input settings. For arbitrary bytes, use redirected input from an
 existing secret-delivery channel.
 
 `hash` without `--output` writes exactly a canonical 123-byte record plus one LF

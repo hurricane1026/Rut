@@ -75,7 +75,9 @@ struct Terminal {
         if (tcgetattr(STDIN_FILENO, &saved) != 0) return false;
         active = true;
         auto hidden = saved;
-        hidden.c_lflag &= ~(ECHO | ECHONL);
+        hidden.c_lflag &= ~(ECHO | ECHONL | ICANON);
+        hidden.c_cc[VMIN] = 1;
+        hidden.c_cc[VTIME] = 0;
         return tcsetattr(STDIN_FILENO, TCSAFLUSH, &hidden) == 0;
     }
     bool restore() {
@@ -90,31 +92,68 @@ struct Terminal {
     ~Terminal() { (void)restore(); }
 };
 
+bool terminal_control_key(const Terminal& terminal, int index, unsigned char byte) {
+#ifdef _POSIX_VDISABLE
+    if (terminal.saved.c_cc[index] == _POSIX_VDISABLE) return false;
+#endif
+    return byte == terminal.saved.c_cc[index];
+}
+
 bool read_password(Secret& password) {
     Terminal terminal;
     const bool kInteractive = isatty(STDIN_FILENO) == 1;
     if (kInteractive && (!terminal.init() || !message("Password: "))) return false;
     bool ok = false;
-    while (!interrupted && password.length < sizeof(password.data)) {
-        const auto kN = read(
-            STDIN_FILENO, password.data + password.length, sizeof(password.data) - password.length);
-        if (kN < 0 && errno == EINTR) continue;
-        if (kN < 0) break;
-        if (kN == 0) {
-            ok = true;
-            break;
-        }
-        const u32 kCount = static_cast<u32>(kN);
-        if (kInteractive) {
-            u32 i = 0;
-            while (i < kCount && password.data[password.length + i] != '\n') ++i;
-            password.length += i;
-            if (i < kCount) {
+    if (kInteractive) {
+        char input[128];
+        bool too_long = false;
+        while (!interrupted && !ok) {
+            const auto kN = read(STDIN_FILENO, input, sizeof(input));
+            if (kN < 0 && errno == EINTR) continue;
+            if (kN < 0) break;
+            if (kN == 0) {
                 ok = true;
                 break;
             }
-        } else {
-            password.length += kCount;
+            for (u32 i = 0; i < static_cast<u32>(kN); ++i) {
+                const auto kByte = static_cast<unsigned char>(input[i]);
+                if (kByte == '\n' || terminal_control_key(terminal, VEOF, kByte)) {
+                    ok = true;
+                    break;
+                }
+                if (too_long) continue;
+                if (terminal_control_key(terminal, VERASE, kByte)) {
+                    if (password.length != 0) {
+                        password.data[--password.length] = '\0';
+                    }
+                    continue;
+                }
+                if (terminal_control_key(terminal, VKILL, kByte)) {
+                    rut_crypto_clear_v1(password.data, password.length);
+                    password.length = 0;
+                    continue;
+                }
+                if (password.length == kPasswordMaxBytes) {
+                    too_long = true;
+                    continue;
+                }
+                password.data[password.length++] = static_cast<char>(kByte);
+            }
+            rut_crypto_clear_v1(input, sizeof(input));
+        }
+        ok = ok && !too_long;
+    } else {
+        while (!interrupted && password.length < sizeof(password.data)) {
+            const auto kN = read(STDIN_FILENO,
+                                 password.data + password.length,
+                                 sizeof(password.data) - password.length);
+            if (kN < 0 && errno == EINTR) continue;
+            if (kN < 0) break;
+            if (kN == 0) {
+                ok = true;
+                break;
+            }
+            password.length += static_cast<u32>(kN);
         }
     }
     if (!terminal.restore()) ok = false;

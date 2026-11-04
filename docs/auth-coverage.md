@@ -1070,7 +1070,8 @@ offline provisioning interface, not a user registry or password-change endpoint.
 `test_password_cli` independently derives PBKDF2 records with Python's standard
 library and covers binary/whitespace/newline passwords, bounds, malformed records,
 symlink/FIFO rejection, file permissions, concurrent creation, occupied targets,
-closed output pipes, hidden terminal echo, oversized terminal input and SIGINT
-restoration. It is registered with CTest and the `check` target. Linux ELF tests
-verify the ordinary executable has no C++ runtime dependencies; sanitizer builds
-exercise the same CLI suite separately.
+closed output pipes, hidden terminal echo, terminal erase/kill/EOF handling,
+valid 1024-byte input, rejected oversized input with delayed-tail echo checks,
+and SIGINT restoration. It is registered with CTest and the `check` target.
+Linux ELF tests verify the ordinary executable has no C++ runtime dependencies;
+sanitizer builds exercise the same CLI suite separately.

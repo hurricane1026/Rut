@@ -9421,9 +9421,10 @@ already-issued tokens by itself.
 `rut-password` links the existing native password/crypto implementation without
 LLVM or a C++ standard/ABI runtime. It is available with JIT disabled and applies
 the existing static-runtime link option. Passwords enter only through stdin;
-interactive mode suppresses echo and restores terminal attributes after normal,
-error or caught cancellation exits. Redirected input preserves 1–1024 exact bytes.
-Fixed stack scratch is cleansed. Hashing remains off-shard.
+interactive mode suppresses echo, handles configured erase/kill/EOF keys, and
+restores terminal attributes after normal, error or caught cancellation exits.
+Redirected input preserves 1–1024 exact bytes. Fixed stack scratch is cleansed.
+Hashing remains off-shard.
 
 Optional record files are newly created in a protected caller-owned directory.
 A 0600 same-directory temporary record is synced, closed and atomically linked

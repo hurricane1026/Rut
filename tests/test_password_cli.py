@@ -28,14 +28,39 @@ def check_record(record, password):
     assert key == hashlib.pbkdf2_hmac("sha256", password, salt, 600000, 32)
 
 
-def terminal_case(tool, password, cancel=False):
+def write_all(fd, data):
+    os.set_blocking(fd, False)
+    deadline = time.monotonic() + 5
+    while data:
+        try:
+            written = os.write(fd, data)
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "terminal write timed out before the input reader drained it"
+            select.select([], [fd], [], min(0.05, remaining))
+            continue
+        assert written > 0, "terminal write made no progress"
+        data = data[written:]
+
+
+def terminal_cc(index):
+    master, slave = pty.openpty()
+    try:
+        value = termios.tcgetattr(slave)[6][index]
+        return bytes([value]) if isinstance(value, int) else value
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def terminal_case(tool, password, cancel=False, typed=None, terminator=b"\n"):
     master, slave = pty.openpty()
     original = termios.tcgetattr(slave)
     process = subprocess.Popen([tool, "hash"], stdin=slave, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 5
-        while termios.tcgetattr(slave)[3] & termios.ECHO:
+        while termios.tcgetattr(slave)[3] & (termios.ECHO | termios.ECHONL | termios.ICANON):
             assert process.poll() is None, "process exited before hiding terminal echo"
             assert time.monotonic() < deadline, "terminal echo was never disabled"
             time.sleep(0.005)
@@ -49,7 +74,7 @@ def terminal_case(tool, password, cancel=False):
         if cancel:
             process.send_signal(signal.SIGINT)
         else:
-            os.write(master, password + b"\n")
+            write_all(master, (password if typed is None else typed) + terminator)
         output, error = process.communicate(timeout=15)
         error = prompt + error
         assert termios.tcgetattr(slave) == original, "terminal settings were not restored"
@@ -62,6 +87,52 @@ def terminal_case(tool, password, cancel=False):
             assert process.returncode == 0, error
             assert password not in error
             check_record(output, password)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)
+        os.close(slave)
+
+
+def terminal_oversize_delayed_tail_case(tool):
+    master, slave = pty.openpty()
+    original = termios.tcgetattr(slave)
+    process = subprocess.Popen([tool, "hash"], stdin=slave, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 5
+        while termios.tcgetattr(slave)[3] & (termios.ECHO | termios.ECHONL | termios.ICANON):
+            assert process.poll() is None, "process exited before hiding terminal echo"
+            assert time.monotonic() < deadline, "terminal mode was not switched"
+            time.sleep(0.005)
+        prompt = b""
+        while b"Password: " not in prompt:
+            assert time.monotonic() < deadline, "password prompt was not written"
+            if select.select([process.stderr], [], [], 0.05)[0]:
+                chunk = os.read(process.stderr.fileno(), 4096)
+                assert chunk, "process exited before prompting"
+                prompt += chunk
+
+        write_all(master, b"a" * 1025)
+        time.sleep(0.05)
+        assert process.poll() is None, "oversized input returned before its line terminator"
+        hidden = termios.tcgetattr(slave)[3]
+        assert not hidden & (termios.ECHO | termios.ECHONL | termios.ICANON)
+
+        tail = b"private-terminal-tail"
+        write_all(master, tail + b"\n")
+        output, error = process.communicate(timeout=15)
+        error = prompt + error
+        assert termios.tcgetattr(slave) == original, "terminal settings were not restored"
+        assert process.returncode == 2 and not output, (process.returncode, output, error)
+        echoed = bytearray()
+        while select.select([master], [], [], 0.05)[0]:
+            try:
+                echoed.extend(os.read(master, 4096))
+            except BlockingIOError:
+                break
+        assert tail not in echoed, "oversized terminal tail was echoed"
     finally:
         if process.poll() is None:
             process.kill()
@@ -145,7 +216,15 @@ def main(tool):
 
     terminal_case(tool, b"hidden-password")
     terminal_case(tool, b"not-entered", cancel=True)
+    terminal_case(tool, b"a" * 1024)
+    erase = terminal_cc(termios.VERASE)
+    terminal_case(tool, b"wronpassword", typed=b"wrong" + erase + b"password")
+    kill = terminal_cc(termios.VKILL)
+    terminal_case(tool, b"final-password", typed=b"discard" + kill + b"final-password")
+    eof = terminal_cc(termios.VEOF)
+    terminal_case(tool, b"eof-password", terminator=eof)
     terminal_case(tool, b"a" * 1025)
+    terminal_oversize_delayed_tail_case(tool)
     print("password CLI: independent PBKDF2, binary bounds, private atomic files and terminal cleanup passed")
 
 
