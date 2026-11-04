@@ -349,6 +349,13 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         connection.destroy();
         return out;
     }
+    if (!scenario.target->program.config.activate_es256(scenario.shard_id)) {
+        out.harness.outcome = Outcome::Failed;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness, "scenario ES256 policy activation failed");
+        connection.destroy();
+        return out;
+    }
     ScenarioState local_state{};
     ScenarioState* state = scenario.state != nullptr ? scenario.state : &local_state;
     if (!state->ensure_cache_state()) {
