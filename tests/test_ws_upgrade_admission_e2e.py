@@ -48,6 +48,104 @@ def masked_frame(opcode, payload):
     return bytes((0x80 | opcode, 0x80 | len(payload))) + key + masked
 
 
+GENERAL_JSON_DECLARATIONS = r"""
+func jsonPath(_ client: bool) -> str { if client { "/name" } else { "/reply" } }
+struct JsonPayload { label: str count: i32 }
+"""
+GENERAL_JSON_HANDLER = r"""
+return websocket(ws) { msg in
+    let path = jsonPath(msg.fromClient)
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    guard let selected = json.get(root, path) else { msg.close(1008) }
+    guard let text = json.string(selected) else { msg.close(1003) }
+    guard let metadata = json.value({ side: msg.fromClient, length: msg.len }) else { msg.close(1011) }
+    guard let edited = json.member(root, "meta", metadata) else { msg.close(1008) }
+    guard let output = json.stringify(edited) else { msg.close(1011) }
+    if msg.isText { msg.forward(text) } else { msg.forward(output) }
+}
+"""
+
+
+def general_json_exchange(client, peer):
+    import json
+
+    first_payload = b'{"name":"a\\u0000b"}'
+    first = bytearray(masked_frame(2, first_payload[:7]))
+    first[0] &= 0x7f
+    client.sendall(first + masked_frame(9, b"p") + masked_frame(0, first_payload[7:]) +
+                   masked_frame(1, b'{"name":"second"}'))
+    if recv_client_frame(peer) != (9, b"p", True):
+        raise AssertionError("general JSON handler consumed a control frame")
+    opcode, payload, masked = recv_client_frame(peer)
+    if opcode != 1 or not masked or json.loads(payload) != {
+            "name": "a\0b", "meta": {"side": True, "length": len(first_payload)}}:
+        raise AssertionError(f"dynamic JSON edit output changed: {payload!r}")
+    if recv_client_frame(peer) != (1, b"second", True):
+        raise AssertionError("dynamic JSON path selected the wrong client field")
+    reply = b'{"reply":"back"}'
+    peer.sendall(bytes((0x81, len(reply))) + reply)
+    if recv_client_frame(client) != (1, b"back", False):
+        raise AssertionError("dynamic JSON path selected the wrong server field")
+    client.sendall(masked_frame(2, b"{"))
+    if recv_client_frame(client) != (8, b"\x03\xef", False) or \
+            recv_client_frame(peer) != (8, b"\x03\xef", True):
+        raise AssertionError("malformed JSON did not run its explicit 1007 close")
+
+
+TYPED_JSON_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    guard let value = json.decode(JsonPayload, root) else { msg.close(1003) }
+    guard value.count >= 0 else { msg.close(1008) }
+    guard let encoded = json.value(value) else { msg.close(1011) }
+    guard let output = json.stringify(encoded) else { msg.close(1011) }
+    msg.forward(output)
+}
+"""
+
+
+def typed_json_exchange(client, peer):
+    import json
+
+    payloads = (b'{"label":"a\\u0000b","count":3}', b'{"label":"second","count":0}')
+    client.sendall(b"".join(masked_frame(2, payload) for payload in payloads))
+    for expected in ({"label": "a\0b", "count": 3}, {"label": "second", "count": 0}):
+        opcode, payload, masked = recv_client_frame(peer)
+        if opcode != 1 or not masked or json.loads(payload) != expected:
+            raise AssertionError(f"typed JSON round trip changed: {payload!r}")
+    bad = b'{"label":true,"count":0}'
+    peer.sendall(bytes((0x82, len(bad))) + bad)
+    if recv_client_frame(client) != (8, b"\x03\xeb", False) or \
+            recv_client_frame(peer) != (8, b"\x03\xeb", True):
+        raise AssertionError("typed JSON failure did not run its explicit 1003 close")
+
+
+JSON_LIFETIME_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    guard let first = json.string(root) else { msg.close(1003) }
+    guard let other = json.parse("\"other\"") else { msg.close(1011) }
+    guard let second = json.string(other) else { msg.close(1011) }
+    guard first != second else { msg.drop() }
+    msg.forward(first)
+}
+"""
+
+
+def json_lifetime_exchange(client, peer):
+    messages = ((b'"a\\u0000b"', b"a\0b"), (b'"next"', b"next"))
+    client.sendall(b"".join(masked_frame(2, encoded) for encoded, _ in messages))
+    for _, expected in messages:
+        if recv_client_frame(peer) != (1, expected, True):
+            raise AssertionError("another JSON operation overwrote an earlier decoded value")
+    peer.sendall(b'\x82\x07"reply"')
+    if recv_client_frame(client) != (1, b"reply", False):
+        raise AssertionError("server JSON scratch survived with stale data")
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    if recv_client_frame(peer) != (8, b"\x03\xe8", True):
+        raise AssertionError("general JSON callback changed a close control")
+
+
 HASH_OUTPUT_HANDLER = r"""
 return websocket(ws) { msg in
     if msg.fromClient {
@@ -2182,6 +2280,9 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (GENERAL_JSON_HANDLER, general_json_exchange, GENERAL_JSON_DECLARATIONS),
+                (TYPED_JSON_HANDLER, typed_json_exchange, GENERAL_JSON_DECLARATIONS),
+                (JSON_LIFETIME_HANDLER, json_lifetime_exchange, ""),
                 (HASH_OUTPUT_HANDLER, hash_output_exchange, ""),
                 (DYNAMIC_OUTPUT_HANDLER, dynamic_output_exchange, DYNAMIC_OUTPUT_DECLARATIONS),
                 (DYNAMIC_BOUND_HANDLER, dynamic_bound_exchange, ""),

@@ -5697,8 +5697,10 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             function_index = req->function_index;
         }
         const auto& fn = mod.functions[function_index];
+        if (route != nullptr) route->uses_http_values |= fn.uses_http_values;
         if (route != nullptr && route->is_ws_callback &&
-            (fn.has_non_response_statement_effect || fn.respond_guards.len != 0))
+            (fn.uses_http_values || fn.has_non_response_statement_effect ||
+             fn.respond_guards.len != 0))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   lit_str("message predicates require pure helpers"));
@@ -7495,7 +7497,6 @@ static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
          expr.kind != HirExprKind::ConstMethod) ||
         expr.kind == HirExprKind::WaitResult || expr.kind == HirExprKind::WaitField ||
         expr.kind == HirExprKind::CacheGet || expr.kind == HirExprKind::CacheSet ||
-        expr.kind == HirExprKind::JsonOp || expr.kind == HirExprKind::JsonDecode ||
         expr.kind == HirExprKind::RegexMatch)
         return &expr;
     if (validate_receivers && expr.kind == HirExprKind::WsMessageField &&
@@ -11746,6 +11747,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         adopt_int_literal_type(&lhs.value(), &rhs.value());
         const bool lhs_maybe_missing = lhs->may_nil || lhs->may_error;
         const bool rhs_maybe_missing = rhs->may_nil || rhs->may_error;
+        // `!value` is synthesized as equality with false, but it is not the
+        // Optional equality operation. Unwrap optional/fallible Bool first.
+        // != and !(a == b) negate an already-plain comparison result.
+        if (expr.is_synthesized_negation && (lhs_maybe_missing || rhs_maybe_missing))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("logical negation requires an unwrapped bool"));
         if (lhs->type == HirTypeKind::WebSocketMessage ||
             rhs->type == HirTypeKind::WebSocketMessage)
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -12059,7 +12067,22 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
                                             const HirLocal* locals,
                                             u32 local_count,
                                             const MatchPayloadBinding* binding) {
-    return analyze_expr_impl(expr, route, mod, locals, local_count, binding, false);
+    auto result = analyze_expr_impl(expr, route, mod, locals, local_count, binding, false);
+    if (result && route != nullptr) {
+        const auto kKind = result->kind;
+        const bool kHttp = result->type == HirTypeKind::Response ||
+                           (kKind >= HirExprKind::ReqHeaderCount &&
+                            kKind <= HirExprKind::ReqMethod && kKind != HirExprKind::ConstMethod) ||
+                           kKind == HirExprKind::ReqSetHeader ||
+                           kKind == HirExprKind::ReqAddHeader ||
+                           kKind == HirExprKind::ReqRemoveHeader;
+        route->uses_http_values |= kHttp;
+        if (route->is_ws_callback && kHttp)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("HTTP values are unavailable in a message callback"));
+    }
+    return result;
 }
 
 static bool is_static_for_iter_expr(const HirExpr& expr,
@@ -13287,8 +13310,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
     if (fn_index == mod.functions.len) return fail_with_name(expr.span, "unknown function");
     const auto& fn = mod.functions[fn_index];
+    if (route != nullptr) route->uses_http_values |= fn.uses_http_values;
     if (route != nullptr && route->is_ws_callback &&
-        (fn.has_non_response_statement_effect || fn.respond_guards.len != 0))
+        (fn.uses_http_values || fn.has_non_response_statement_effect || fn.respond_guards.len != 0))
         return frontend_error(FrontendError::UnsupportedSyntax,
                               expr.span,
                               lit_str("message predicates require pure helpers"));
@@ -21312,6 +21336,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             normalize_function_expr(body.value(), &fn, all_locals, all_local_count, fn.params.len);
         if (!normalized) return core::make_unexpected(normalized.error());
         fn.body = normalized.value();
+        fn.uses_http_values = scratch->uses_http_values;
         return {};
     };
 
@@ -22894,6 +22919,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             normalize_function_expr(body.value(), &fn, all_locals, all_local_count, fn.params.len);
         if (!normalized) return core::make_unexpected(normalized.error());
         fn.body = normalized.value();
+        fn.uses_http_values = scratch.uses_http_values;
     }
 
     for (u32 i = 0; i < file.items.len; i++) {

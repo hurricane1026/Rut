@@ -626,6 +626,8 @@ struct HirFunction {
     // whether the source helper also contained another statement effect so a
     // call site cannot silently drop it during expansion.
     bool has_non_response_statement_effect = false;
+    // Phase capability retained before normalization can fold away a read.
+    bool uses_http_values = false;
     struct RespondHeader {
         Str key{};
         Str value{};
@@ -661,6 +663,7 @@ struct HirFunction {
           params(other.params),
           exprs(other.exprs),
           has_non_response_statement_effect(other.has_non_response_statement_effect),
+          uses_http_values(other.uses_http_values),
           respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
@@ -700,6 +703,7 @@ struct HirFunction {
         params = other.params;
         exprs = other.exprs;
         has_non_response_statement_effect = other.has_non_response_statement_effect;
+        uses_http_values = other.uses_http_values;
         respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);
@@ -723,6 +727,7 @@ struct HirFunction {
           params(other.params),
           exprs(other.exprs),
           has_non_response_statement_effect(other.has_non_response_statement_effect),
+          uses_http_values(other.uses_http_values),
           respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
@@ -762,6 +767,7 @@ struct HirFunction {
         params = other.params;
         exprs = other.exprs;
         has_non_response_statement_effect = other.has_non_response_statement_effect;
+        uses_http_values = other.uses_http_values;
         respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);
@@ -1327,6 +1333,8 @@ struct HirRoute {
     // Analyzer-only scratch scope for synchronous message expressions. HTTP
     // admission on a terminate route retains ordinary helper/effect semantics.
     bool is_ws_callback = false;
+    // Analyzer capability summary, including reads in otherwise unused values.
+    bool uses_http_values = false;
     HirWsHandler ws_handler{};
     // Timer route: the body is a `timer name, every: D {...}` background periodic
     // task, not an HTTP route. `path` holds the timer name; `timer_interval_ms`
@@ -1358,6 +1366,7 @@ struct HirRoute {
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           is_ws_callback(other.is_ws_callback),
+          uses_http_values(other.uses_http_values),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
@@ -1385,6 +1394,7 @@ struct HirRoute {
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         is_ws_callback = other.is_ws_callback;
+        uses_http_values = other.uses_http_values;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
@@ -1412,6 +1422,7 @@ struct HirRoute {
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           is_ws_callback(other.is_ws_callback),
+          uses_http_values(other.uses_http_values),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
@@ -1439,6 +1450,7 @@ struct HirRoute {
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         is_ws_callback = other.is_ws_callback;
+        uses_http_values = other.uses_http_values;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;

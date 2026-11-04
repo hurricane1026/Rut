@@ -4,6 +4,7 @@
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
+#include "fixtures/ws_general_json.h"
 #include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
@@ -36,13 +37,16 @@ using namespace rut;
 TEST(hir, function_moves_preserve_non_response_statement_effect) {
     HirFunction source;
     source.has_non_response_statement_effect = true;
+    source.uses_http_values = true;
 
     HirFunction moved(static_cast<HirFunction&&>(source));
     CHECK(moved.has_non_response_statement_effect);
+    CHECK(moved.uses_http_values);
 
     HirFunction assigned;
     assigned = static_cast<HirFunction&&>(moved);
     CHECK(assigned.has_non_response_statement_effect);
+    CHECK(assigned.uses_http_values);
 }
 
 static Str lit(const char* s) {
@@ -5793,7 +5797,36 @@ TEST(frontend, websocket_scalar_helpers_preserve_reached_paths_types_and_wide_bo
     rir.destroy();
 }
 
-TEST(frontend, websocket_scalar_helpers_require_proofs_scope_and_supported_operations) {
+// New general JSON forms must reach executable IR, rather than passing only
+// the type checker after the specialized recipe compiler declines the source.
+static void check_general_ws_rir(const HirModule& module, test::TestCase* _tc) {
+    REQUIRE(module.routes.len != 0);
+    for (u32 index = 0; index < module.routes.len; ++index) {
+        const auto& route = module.routes[index];
+        REQUIRE(route.ws_handler.general_body_expr < route.exprs.len);
+        auto callback = std::make_unique<HirRoute>();
+        callback->is_ws_callback = true;
+        HirLocal result{};
+        result.is_runtime_synthetic = true;
+        result.type = HirTypeKind::I32;
+        result.init = route.exprs[route.ws_handler.general_body_expr];
+        REQUIRE(callback->locals.push(result));
+        callback->control.kind = HirControlKind::Direct;
+        callback->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+        callback->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+        callback->control.direct_term.local_ref_index = 0;
+        auto built = build_mir_route(module, *callback);
+        REQUIRE(built);
+        std::unique_ptr<MirModule> mir(built.value());
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(*mir, rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, websocket_scalar_helpers_validate_json_types_and_scope) {
+    u32 json_case_0 = 0;
     const char* bodies[] = {
         R"rut(guard same(json.bool(root), false) else { msg.drop() } msg.forward())rut",
         R"rut(guard same(json.string(root), "ok") else { msg.drop() } msg.forward())rut",
@@ -5833,11 +5866,16 @@ route GET "/ws" { return websocket(ws) { msg in
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted =
+            json_case_0 == 5u || json_case_0 == 7u || json_case_0 == 8u || json_case_0 == 11u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
 }
 
-TEST(frontend, websocket_scalar_helpers_keep_the_condition_node_budget) {
+TEST(frontend, websocket_scalar_helpers_use_general_ir_beyond_recipe_node_budget) {
     for (u32 terms : {15u, 16u}) {
         std::string source = R"rut(upstream ws
 func same<T: Eq>(_ lhs: T, _ rhs: T) -> bool => lhs == rhs
@@ -5855,13 +5893,11 @@ route GET "/ws" { return websocket(ws) { msg in
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        if (terms == 15) {
-            REQUIRE(hir);
+        REQUIRE(hir);
+        if (terms == 15)
             CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 31u);
-        } else {
-            REQUIRE_FALSE(hir);
-            CHECK(hir.error().code == FrontendError::TooManyItems);
-        }
+        else
+            check_general_ws_rir(hir.value(), _tc);
     }
 }
 
@@ -6014,7 +6050,8 @@ TEST(frontend, websocket_optional_values_keep_owned_proofs_and_plain_concept_typ
     rir.destroy();
 }
 
-TEST(frontend, websocket_optional_values_reject_scope_effects_and_invalid_payloads) {
+TEST(frontend, websocket_optional_values_validate_scope_effects_and_payloads) {
+    u32 json_case_0 = 0;
     const char* bodies[] = {
         "if let text = maybeText(msg) { msg.drop() } else { msg.forward(text) }",
         "if let text = maybeText(msg) { msg.drop() } msg.forward(text)",
@@ -6049,7 +6086,11 @@ func dynamicPointer(_ msg: WebSocketMessage) -> str {
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_0 == 7u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
 }
 
@@ -6141,7 +6182,7 @@ route GET "/bare" { return websocket(ws) { msg in
     rir.destroy();
 }
 
-TEST(frontend, websocket_value_choices_keep_node_and_source_clause_limits) {
+TEST(frontend, websocket_value_choices_use_general_ir_beyond_recipe_limits) {
     for (u32 terms : {14u, 15u}) {
         std::string source =
             "upstream ws\nfunc pick(_ msg: WebSocketMessage, _ root: Json) -> Json { if ";
@@ -6161,13 +6202,11 @@ route GET "/ws" { return websocket(ws) { msg in
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        if (terms == 14) {
-            REQUIRE(hir);
+        REQUIRE(hir);
+        if (terms == 14)
             CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 32u);
-        } else {
-            REQUIRE_FALSE(hir);
-            CHECK(hir.error().code == FrontendError::TooManyItems);
-        }
+        else
+            check_general_ws_rir(hir.value(), _tc);
     }
     for (u32 guards : {3u, 4u}) {
         std::string source = R"rut(upstream ws
@@ -6184,16 +6223,12 @@ route GET "/ws" { return websocket(ws) { msg in
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        if (guards == 3)
-            REQUIRE(hir);
-        else {
-            REQUIRE_FALSE(hir);
-            CHECK(hir.error().code == FrontendError::TooManyItems);
-        }
+        REQUIRE(hir);
+        if (guards == 4) check_general_ws_rir(hir.value(), _tc);
     }
 }
 
-TEST(frontend, websocket_value_choices_reject_scope_escape_and_policy_overflow) {
+TEST(frontend, websocket_value_choices_reject_scope_escape_and_lower_richer_policies) {
     const char* bodies[] = {
         "if let text = readChoice(msg) { msg.drop() } else { msg.forward(text) }",
         "if let text = readChoice(msg) { msg.drop() } msg.forward(text)",
@@ -6243,8 +6278,8 @@ route GET "/ws" { return websocket(ws) { msg in
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK(hir.error().code == FrontendError::TooManyItems);
+    REQUIRE(hir);
+    check_general_ws_rir(hir.value(), _tc);
 }
 
 TEST(frontend, websocket_helper_bindings_retain_proven_paths_after_ast_copy) {
@@ -6333,7 +6368,7 @@ route GET "/different" { return websocket(ws) { msg in
     rir.destroy();
 }
 
-TEST(frontend, websocket_helper_bindings_share_the_existing_node_budget) {
+TEST(frontend, websocket_helper_bindings_use_general_ir_beyond_recipe_node_budget) {
     for (u32 terms : {14u, 15u}) {
         std::string source =
             "upstream ws\nfunc readValue(_ msg: WebSocketMessage) -> Json {\n"
@@ -6353,17 +6388,16 @@ route GET "/ws" { return websocket(ws) { msg in
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        if (terms == 14) {
-            REQUIRE(hir);
+        REQUIRE(hir);
+        if (terms == 14)
             CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 32u);
-        } else {
-            REQUIRE_FALSE(hir);
-            CHECK(hir.error().code == FrontendError::TooManyItems);
-        }
+        else
+            check_general_ws_rir(hir.value(), _tc);
     }
 }
 
-TEST(frontend, websocket_helper_bindings_reject_scope_escape_and_foreign_proofs) {
+TEST(frontend, websocket_helper_bindings_validate_scope_and_constructed_json) {
+    u32 json_case_0 = 0;
     const char* bodies[] = {
         "guard let root = json.parse(msg.text) else { root } root",
         "if let root = json.parse(msg.text) { nil } else { json.string(root) }",
@@ -6383,7 +6417,11 @@ route GET "/ws" { return websocket(ws) { msg in
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_0 == 2u || json_case_0 == 3u || json_case_0 == 4u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
 }
 
@@ -6451,7 +6489,7 @@ route GET "/scalar" { return websocket(ws) { msg in
     rir.destroy();
 }
 
-TEST(frontend, websocket_optional_conditions_share_existing_node_and_clause_limits) {
+TEST(frontend, websocket_optional_conditions_use_general_ir_beyond_recipe_limits) {
     for (u32 terms : {15u, 16u}) {
         std::string source = "upstream ws\nfunc conditional(_ msg: WebSocketMessage) -> Json { if ";
         for (u32 i = 0; i < terms; ++i) {
@@ -6469,17 +6507,16 @@ route GET "/ws" { return websocket(ws) { msg in
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        if (terms == 15) {
-            REQUIRE(hir);
+        REQUIRE(hir);
+        if (terms == 15)
             CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 32u);
-        } else {
-            REQUIRE_FALSE(hir);
-            CHECK(hir.error().code == FrontendError::TooManyItems);
-        }
+        else
+            check_general_ws_rir(hir.value(), _tc);
     }
 }
 
-TEST(frontend, websocket_optional_conditions_reject_value_selection_and_unproven_inputs) {
+TEST(frontend, websocket_optional_conditions_validate_selection_and_request_isolation) {
+    u32 json_case_0 = 0;
     const char* bodies[] = {"if req.path == \"/x\" { json.get(root, \"/a\") } else { nil }",
                             "if msg.fromClient { json.remove(root, \"/a\") } else { nil }",
                             "if msg.fromClient { nil } else { nil }"};
@@ -6496,7 +6533,11 @@ route GET "/ws" { return websocket(ws) { msg in
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_0 == 1u || json_case_0 == 2u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
 }
 
@@ -6752,7 +6793,7 @@ route GET "/ws" { return websocket(ws) { msg in
     CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 4u);
 }
 
-TEST(frontend, websocket_branch_bindings_share_clause_and_condition_node_limits) {
+TEST(frontend, websocket_branch_bindings_use_general_ir_beyond_recipe_limits) {
     for (u32 count : {3u, 4u}) {
         std::string source =
             "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in if msg.fromClient {\n";
@@ -6765,8 +6806,8 @@ TEST(frontend, websocket_branch_bindings_share_clause_and_condition_node_limits)
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        CHECK_EQ(hir.has_value(), count == 3);
-        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+        REQUIRE(hir);
+        if (count != 3) check_general_ws_rir(hir.value(), _tc);
     }
     for (u32 leaves : {15u, 16u}) {
         std::string source =
@@ -6782,8 +6823,8 @@ TEST(frontend, websocket_branch_bindings_share_clause_and_condition_node_limits)
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        CHECK_EQ(hir.has_value(), leaves == 15);
-        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+        REQUIRE(hir);
+        if (leaves != 15) check_general_ws_rir(hir.value(), _tc);
     }
 }
 
@@ -7208,6 +7249,7 @@ route GET "/ws" { return websocket(ws) { event in
 }
 
 TEST(frontend, websocket_callback_scope_rejects_effects_collisions_and_escapes) {
+    u32 json_case_0 = 0;
     const char* control = R"rut(upstream ws
 func changed(_ msg: WebSocketMessage) -> bool {
     guard msg.isText else { respond 403 }
@@ -7252,7 +7294,13 @@ route GET "/ws" { return websocket(ws) { msg in msg.forward() } }
         auto tokens = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
-        if (ast) CHECK_FALSE(analyze_file_heap(ast.value()));
+        if (ast) {
+            auto analyzed = analyze_file_heap(ast.value());
+            const bool kAccepted = json_case_0 == 10u;
+            CHECK_EQ(analyzed.has_value(), kAccepted);
+            if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+            ++json_case_0;
+        }
     }
     const char* source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { msg in let secret = true msg.forward() } }
@@ -7349,6 +7397,7 @@ route GET "/ws" { return websocket(ws) { message in
 }
 
 TEST(frontend, websocket_json_binding_scope_and_rejections) {
+    u32 json_case_0 = 0;
     for (const char* guards :
          {"guard json.get(document, \"/a\") != nil else { message.drop() }",
           "guard json.get(json.parse(message.text), \"/a\") != nil else { message.drop() }",
@@ -7373,7 +7422,11 @@ TEST(frontend, websocket_json_binding_scope_and_rejections) {
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_0 == 8u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
     for (const char* binding : {"document", "json"}) {
         std::string source = "upstream ws\nroute GET \"/ws\" { let ";
@@ -7486,6 +7539,7 @@ route GET "/ws" { return websocket(ws) { message in
 }
 
 TEST(frontend, websocket_nested_json_paths_keep_bounds_types_and_scope) {
+    u32 json_case_0 = 0;
     for (u32 total : {8192u, 8193u}) {
         std::string source =
             "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n"
@@ -7501,7 +7555,9 @@ TEST(frontend, websocket_nested_json_paths_keep_bounds_types_and_scope) {
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_EQ(analyze_file_heap(ast.value()).has_value(), total == 8192);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        if (total != 8192) check_general_ws_rir(hir.value(), _tc);
     }
     for (const char* guards :
          {"guard let parent = json.get(document, \"/a\") else { message.drop() }\n"
@@ -7525,7 +7581,11 @@ TEST(frontend, websocket_nested_json_paths_keep_bounds_types_and_scope) {
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_0 == 0u || json_case_0 == 4u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
 }
 
@@ -7588,6 +7648,7 @@ TEST(frontend, websocket_json_scalar_calls_compare_with_literals_and_nil) {
 }
 
 TEST(frontend, websocket_json_scalar_calls_keep_optional_types_and_scope) {
+    u32 json_case_0 = 0;
     for (const char* condition : {"json.bool(field)",
                                   "!json.bool(field)",
                                   "!!json.bool(field)",
@@ -7618,7 +7679,11 @@ TEST(frontend, websocket_json_scalar_calls_keep_optional_types_and_scope) {
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_0 == 12u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
     const char* source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { message in
@@ -7748,6 +7813,7 @@ route GET "/ws" { return websocket(ws) { message in
 #endif
 
 TEST(frontend, websocket_json_string_aliases_are_typed_and_bounded) {
+    u32 json_case_0 = 0;
     const char* source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { message in
  guard let document = json.parse(message.text) else { message.close(1007) }
@@ -7815,7 +7881,11 @@ route GET "/ws" { return websocket(ws) { message in
         REQUIRE(tokens);
         ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_0 == 0u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
 
     for (const char* invalid_guards :
@@ -7897,6 +7967,7 @@ route GET "/ws" {
 }
 
 TEST(frontend, websocket_json_number_text_aliases_preserve_typed_recipe) {
+    u32 json_case_0 = 0;
     const char* source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { message in
  guard let document = json.parse(message.text) else { message.close(1007) }
@@ -7974,7 +8045,11 @@ message.forward())rut",
         REQUIRE(invalid_tokens);
         auto invalid_ast = parse_file_heap(invalid_tokens.value());
         REQUIRE(invalid_ast);
-        CHECK_FALSE(analyze_file_heap(invalid_ast.value()));
+        auto analyzed = analyze_file_heap(invalid_ast.value());
+        const bool kAccepted = json_case_0 == 1u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
 }
 
@@ -8207,6 +8282,7 @@ route GET "/ws" { return websocket(ws) { message in
 }
 
 TEST(frontend, websocket_json_int_alias_uses_signed_i64_bounds) {
+    u32 json_case_0 = 0;
     const char* source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { message in
  guard let document = json.parse(message.text) else { message.drop() }
@@ -8275,11 +8351,16 @@ route GET "/ws" { return websocket(ws) { message in
         REQUIRE(tokens);
         ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_0 == 3u || json_case_0 == 4u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
 }
 
 TEST(frontend, websocket_json_kind_and_count_aliases_are_typed) {
+    u32 json_case_1 = 0;
     const char* kind_source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { message in
  guard let document = json.parse(message.text) else { message.drop() }
@@ -8423,7 +8504,11 @@ route GET "/ws" { return websocket(ws) { message in
         REQUIRE(tokens);
         ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_1 == 3u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_1;
     }
 }
 
@@ -9849,7 +9934,8 @@ route GET "/ws" {
     CHECK(hir->routes[0].exprs[handler.forward_payload.suffix_expr].str_value.eq(lit_str(">")));
 }
 
-TEST(frontend, websocket_json_string_rewrite_rejects_invalid_or_repeated_sources) {
+TEST(frontend, websocket_json_string_output_preserves_plain_string_typing) {
+    u32 json_case_0 = 0;
     const char* invalid[] = {
         "message.forward(document)",
         "message.forward(field)",
@@ -9876,7 +9962,11 @@ TEST(frontend, websocket_json_string_rewrite_rejects_invalid_or_repeated_sources
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool kAccepted = json_case_0 == 2u;
+        CHECK_EQ(analyzed.has_value(), kAccepted);
+        if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
+        ++json_case_0;
     }
     const char* own_else = R"rut(
 upstream ws
@@ -46511,5 +46601,111 @@ TEST(frontend, websocket_dynamic_outputs_preserve_owned_ir_and_reject_phase_leak
         REQUIRE(parsed);
         CHECK_FALSE(analyze_file_heap(parsed.value()));
     }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_general_json_keeps_owned_values_after_ast_and_hir_copy) {
+    auto tokens = lex(lit(test::ws_general_json::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto ast_copy = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*ast_copy);
+    REQUIRE(hir);
+    ast_copy.reset();
+    auto copy = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    check_general_ws_rir(*copy, _tc);
+}
+#endif
+
+TEST(frontend, logical_negation_requires_a_plain_bool_for_every_protocol) {
+    for (bool websocket : {false, true}) {
+#if !RUT_ENABLE_WEBSOCKET
+        if (websocket) continue;
+#endif
+        for (const char* operation : {"!value",
+                                      "!!value",
+                                      "!value == false",
+                                      "value == false",
+                                      "value != false",
+                                      "!(value == false)",
+                                      "!value.or(false)"}) {
+            std::string source =
+                "func optional(_ input: bool) -> bool { if input { false } else { nil } }\n";
+            if (websocket) source += "upstream ws\n";
+            source += "route GET \"/\" { ";
+            if (websocket) source += "return websocket(ws) { msg in ";
+            source += websocket ? "let value = optional(msg.fromClient) "
+                                : "let value = optional(req.path == \"/x\") ";
+            source += "guard ";
+            source += operation;
+            source += websocket ? " else { msg.drop() } msg.forward() } }"
+                                : " else { return 403 } return 200 }";
+            auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+            REQUIRE(tokens);
+            auto ast = parse_file_heap(tokens.value());
+            REQUIRE(ast);
+            auto hir = analyze_file_heap(ast.value());
+            const bool kValid = std::string_view(operation) != "!value" &&
+                                std::string_view(operation) != "!!value" &&
+                                std::string_view(operation) != "!value == false";
+            CHECK_EQ(hir.has_value(), kValid);
+            if (hir && websocket) check_general_ws_rir(hir.value(), _tc);
+        }
+    }
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_helpers_cannot_hide_http_phase_access_by_folding) {
+    const char* helpers = R"rut(upstream ws
+func ignore(_ unused: str) -> str => "safe"
+func hidden() -> str { let unused = req.body "safe" }
+func folded() -> bool => false && req.path == "/"
+func nested() -> str => hidden()
+func messageOnly(_ req: WebSocketMessage) -> i32 => req.len
+)rut";
+    for (const char* body : {"msg.forward(ignore(req.body))",
+                             "msg.forward(hidden())",
+                             "guard !folded() else { msg.drop() } msg.forward()",
+                             "msg.forward(nested())",
+                             "if false { msg.forward(req.body) } else { msg.drop() }"}) {
+        std::string source = helpers;
+        source += "route GET \"/\" { return websocket(ws) { msg in ";
+        source += body;
+        source += " } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    std::string source = helpers;
+    source += "route GET \"/\" { let value = nested() return response(200, body: value) }";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    for (u32 i : {1u, 2u, 3u}) CHECK(hir->functions[i].uses_http_values);
+    CHECK_FALSE(hir->functions[0].uses_http_values);
+    CHECK_FALSE(hir->functions[4].uses_http_values);
+    auto copy = std::make_unique<HirModule>(hir.value());
+    for (u32 i : {1u, 2u, 3u}) CHECK(copy->functions[i].uses_http_values);
+    source = helpers;
+    source += R"rut(route GET "/" { return websocket(ws) { req in
+        guard let document = json.parse(req.text) else { req.drop() }
+        let length = messageOnly(req)
+        guard length >= 0 else { req.drop() }
+        req.forward()
+    } })rut";
+    tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
 }
 #endif

@@ -856,115 +856,56 @@ return forward(users, load_balance: .roundRobin, streaming: true)         // ⏳
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
-// Current terminate handlers: up to 4 guard/if clauses over direction, text/binary type,
-// message.len (< > == <= >= != integer literal, either side), text.matches(re),
-// text ==/!= string literal (either side), text.isEmpty, and
-// text.hasPrefix("literal"), text.hasSuffix("literal"), text.contains("literal").
-// Text predicates
-// compare raw payload bytes; use message.isText for text-only filtering.
-// Literal predicates decode ordinary escapes, including embedded NUL.
-// Empty prefixes/suffixes/substrings match every message; arguments must be literals.
-// Conditions support !, &&, ||, parentheses and left-to-right short-circuiting.
-// ! binds tighter than comparisons; && binds tighter than ||.
-// At most 32 condition nodes (leaf predicates + binary operators); nesting is bounded.
-// Pure scalar callbacks can also use the ordinary MIR/RIR compiler entry:
-// integer arithmetic, bitwise helpers, String comparisons, immutable aliases,
-// guards and complete if/else expressions with bare message verdicts. The
-// four-clause/32-node forest is a specialized-path bound, not a bound on these
-// general pure predicates. The source parser and ordinary local limits apply.
-// Scalar/Bytes lets evaluate once at their reached declaration, including
-// unused nullable work. `let token = uuid()` keeps HTTP's direct initializer
-// restriction; unwrap with guard let before use. Allocation failure yields nil.
-// Error-capable local declarations, general JSON/regex/hash work and dynamic
-// argument-bearing verdicts still require further integration.
-// `message` has the built-in borrowed type WebSocketMessage. It is supplied only
-// by this callback, never constructed or stored as an HTTP/connection value.
-// Fields: fromClient/isText/isBinary: bool, len: i32 (payload bytes), text: str
-// (borrowed raw bytes, also available for Binary messages).
-// payload: Bytes — the complete payload for either message kind, borrowed only
-// during the synchronous callback. payload.count and payload.isEmpty use byte
-// semantics; compare with b"..." or pass to a Bytes helper. No UTF-8 decoding or
-// copy occurs when reading the view. Text messages expose their encoded bytes.
-// kind: WebSocketMessageKind (.text / .binary); direction: WebSocketDirection
-// (.clientToUpstream / .upstreamToClient). Spell cases with their full type name:
-// message.kind == WebSocketMessageKind.text. Both types support ==/!= and Eq
-// helpers, with no integer/string/Bool coercion or ordering. They also work as
-// ordinary helper parameters, return values and HTTP locals. They expose no
-// control-frame cases. Existing fromClient/isText/isBinary remain conveniences.
-// Pure helpers may accept the message or its scalar fields. Their inlined
-// predicates support these fields, bool literals/equality (either order),
-// Boolean composition, len/literal comparisons, text/literal equality and
-// text.matches(re). Ordinary type checking is shared with HTTP helpers.
-// A bool helper may return if selector { predicateA } else { predicateB },
-// including nested if expressions with two nonconstant arms. The selector and
-// exactly one arm execute once; negation applies to the selected Boolean result.
-// These helpers also initialize ordinary lets when every selector/arm is in the
-// infallible immutable subset, and can select paths inside nullable helpers.
-// Regex calls remain guard-time predicates, not ordinary let initializers.
-// Selectors, both arms and selection nodes share the same 32-node budget.
-// The callback parameter may use any identifier; `message` is not implicitly
-// bound when another name is chosen. Immutable callback lets support typed scalar
-// literals/projections, message aliases, byte counts, comparisons and Boolean
-// composition, including pure helper results in that subset. Lets require fresh
-// names (json is reserved), and do not escape the callback. Text aliases can feed
-// json.parse guards and text rewrites; message aliases can receive verdicts.
-// Eight statements per block, including lets/guards/final verdict. Captured
-// compile-time HTTP values keep their separate 16-local admission budget.
-// The four-clause/32-condition-node limits remain. Optional, JSON and regex
-// ordinary-let initializers remain unsupported. Bounded if/else verdict branches are supported:
-// an if without else may exit early; a terminal if/else-if chain needs a final
-// else. Each arm allows lets followed by a verdict or complete nested if/else
-// tree, with its own lexical scope; every nested path must end in a verdict.
-// A complete if/else chain must end its current block. Conditions use supported
-// bool/helper/JSON predicates. Later arms are lazy; all arms are type checked.
-// Each guard/if/else-if shares the same four-clause and 32-node budgets. The
-// eight-statement block limit applies to each arm too. Branch close() uses 1000
-// independently of the final else's close policy. Nested arms evaluate each
-// parent condition once and skip sibling arms; an early nested tree's false path
-// resumes after the whole subtree. Both arms count toward the existing limits.
-// Arms may contain guards and early if statements before their terminal verdict.
-// JSON if-let and else-if-let support the same parse/get/scalar initializer subset
-// as guard-let. If-let names exist only in the true arm; guard-let names exist
-// after success within their current block, never in the failure verdict. Present
-// false, zero and empty string values bind successfully. Early-if false paths and
-// guard success paths resume within the same arm, including its terminal verdict.
-// Optional initializers may call pure helpers that normalize to these same JSON
-// projections, including imported helpers and generic identity on unwrapped
-// arguments. JSON arguments require earlier proof aliases; pointers must normalize
-// to compile-time strings. The source must remain this message or its borrowed
-// text. Helpers can conditionally return one projection, with nil on the other
-// path; nesting and Boolean guard ... else { nil } are supported. Selectors use
-// supported message predicates, run once when reached and skip extraction on nil.
-// All selector/AND/presence nodes share the 32-node budget; one binding call still
-// consumes one of four clauses. Helpers also support JSON guard-let / if-let
-// with nil failure paths. Successful bindings can feed later get/scalar calls or
-// be returned; presence proofs remain scoped to the success continuation and
-// distinguish JSON paths. Returning the unwrapped binding does not repeat its
-// presence check. Helpers may select different JSON projections and use supported
-// projections as optional-binding fallback arms. Guard-let, terminal/early if-let
-// specialize the continuation per selected kind/path; selectors run once, sibling
-// alternatives stay lazy, and a missing selected value takes the caller failure.
-// Present null/false values do not take optional-binding fallbacks. Copies count
-// original source clauses once, but generated control/condition nodes and absence
-// joins share 32 nodes; all recipes share the existing bounded policy tables.
-// Nullable pure helpers may also return supported infallible immutable values:
-// scalar/Bytes literals, borrowed message/fields, byte counts and supported
-// comparisons/Boolean composition. Ordinary if-let/guard-let publishes these
-// values only on success. False, zero and empty str/Bytes are present.
-// Scoped helper bindings can feed later selectors, message text parsing and
-// literal JSON pointers. Within nullable helpers, .or(default) / any(value, default)
-// accepts the same infallible immutable defaults. Ordinary eager semantics are
-// preserved: regex scans, effects and other fallible defaults remain rejected.
-// After a reached scalar binding, ordinary predicate helpers can take its value:
-// Bool (including conditional helpers), String equality/generic Eq, decoded String
-// regex, and i32 count equality/Ord comparisons. String source identity is retained
-// for json.string/numberText/stringify/kind. Numeric comparison bounds may come
-// from compile-time helper results; I64 annotation/generic restrictions stay unchanged.
-// Helpers cannot bypass presence/kind proofs. String ordering, dynamic scalar pairs
-// (except Bool), numberText/stringify regex and ordinary JSON-let substitution
-// remain unsupported. Predicate helpers use the same four-clause/32-node limits.
-// JSON mutations, dynamic pointers, general optional computations, binding
-// shorthand, loops and general computation remain unsupported.
+// Terminate callbacks inspect complete Text/Binary messages. The runtime owns
+// fragments, controls, masks and wire framing; callbacks do not receive frames.
+// `message` is the borrowed WebSocketMessage parameter. Any identifier is valid;
+// choosing another name does not bind `message` implicitly.
+// Fields: fromClient/isText/isBinary: bool; len: i32; text: str (raw payload bytes,
+// also for Binary); payload: Bytes (the complete encoded/raw bytes).
+// payload.count / payload.isEmpty measure bytes; there is no implicit text conversion.
+// kind: WebSocketMessageKind.text / .binary; direction:
+// WebSocketDirection.clientToUpstream / .upstreamToClient. Fully qualified cases
+// support ==/!= and generic Eq with their own type, without ordering/coercion.
+// Pure helpers may accept/return these domains, message views and scalar fields.
+// They use the ordinary type checker and inliner shared with HTTP.
+//
+// Shared MIR/RIR callbacks support scalar arithmetic/bitwise/comparison, ordinary
+// optional equality/presence, guards, complete if/else values, Bytes, JSON and
+// digest/HMAC expressions. Reached callback lets and guard/if-let producers run
+// once; selected branches are lazy. False, zero, empty strings and JSON null are
+// present values. Optional/fallible Bool must be unwrapped before ! / && / ||.
+// Names are fresh within the callback (json is reserved); bindings never escape
+// their lexical continuation or become HTTP locals. Captured admission constants
+// retain a separate 16-local budget. Each source block has at most eight statements.
+// Error-capable lets, helper-internal single evaluation, general regex/cache work
+// and connection/close contexts still need integration. uuid() retains HTTP's
+// direct-let initializer restriction; failures are nil and must be unwrapped.
+//
+// JSON uses the same optional API as HTTP: parse/get/at/scalars/kind/count/keys,
+// member/set/remove/append, stringify, value construction and struct decode.
+// Runtime RFC 6901 pointers and separately constructed Json values are accepted.
+// Unwrap Json before consuming it; no string-to-Json cast or unchecked projection.
+// json(value) / json.encode(value) produce str?; json.value(value) produces Json?.
+// JSON work stays within 8192 bytes / 2048 nodes / depth 64 and the existing
+// per-message arena budget. Exhaustion and invalid inputs follow the nil branch.
+// Decoded strings and edited documents stay alive for the callback; outputs are
+// copied into owned send storage before another callback or asynchronous I/O.
+//
+// A specialized fast path also supports message.text.matches(re), byte-exact
+// literal text equality/isEmpty/hasPrefix/hasSuffix/contains, and JSON projection
+// predicates/rewrites. Text predicates operate on raw bytes; add isText to filter
+// the kind. Empty literal needles match, escapes decode, and Unicode is not normalized.
+// Regex matches the complete value; patterns are literals. Reached decode/scan
+// errors close before negation. Regex-containing callbacks still use the existing
+// four-clause / 32-node recipe limits; regex with general JSON needs further work.
+// Ordinary expressions outside that specialized subset use shared IR rather than
+// inheriting the recipe's clause/node/policy-table limits. Parser/local bounds apply.
+// Early-if false paths and guard success paths resume in their current arm; a
+// terminal if/else tree needs a verdict on every path. All arms are type checked.
+// Helpers cannot read or mutate HTTP state from the message phase, including
+// unused arguments and reads folded away during helper analysis. A message alias
+// may receive verdicts; HTTP/Response values and request-borrowed views cannot cross
+// the upgrade boundary. General string interpolation and Bytes concatenation are absent.
 func messageDocument(_ msg: WebSocketMessage) -> Json => json.parse(msg.text)
 func jsonField(_ value: Json, _ pointer: str) -> Json => json.get(value, pointer)
 func jsonText(_ value: Json) -> str => json.string(value)
@@ -1029,7 +970,7 @@ return websocket(chat, subprotocol: "graphql-transport-ws", maxMessageSize: 4kb)
 // The runtime bounds a graceful Close or clean-EOF drain to about five
 // seconds; a healthy quiet tunnel has no idle timeout.
 
-// Validate a complete message with the existing JSON parser. Only presence
+// Validate a complete message with the existing bounded JSON parser. Presence
 // comparisons and the document bindings shown below are supported here.
 // JSON null is a valid document, so json.parse("null") succeeds.
 // Parsing uses the ordinary JSON limits: 8 KiB input, 2048 nodes, depth 64.
@@ -1057,12 +998,12 @@ return websocket(chat) { message in
 // unwrapped before json.string; missing, null, number, bool, array and object fail.
 // String aliases support literal == / != plus isEmpty, hasPrefix, hasSuffix and
 // contains with string literals. The predicates compare decoded bytes exactly.
-// Bindings require fresh names and count toward the four-guard limit. Each reached
+// In the specialized recipe, bindings count toward four clauses. Each reached
 // check reparses within the JSON bounds; no document or borrowed string survives.
 // Empty contains needles match every valid string; a failed/non-string JSON value
 // still fails its binding. json.get accepts a previously guard-unwrapped Json
-// selection too; its literal pointer is relative to that value. Dynamic paths,
-// arbitrary extraction and mutation remain unsupported; no Unicode normalization occurs.
+// selection too; its pointer is relative to that value. Runtime paths and edits
+// use the shared JSON expression pipeline; no Unicode normalization occurs.
 
 // Match an unwrapped JSON string's decoded bytes with a regex literal. Matches
 // cover the whole value; use .* for substring rules. Escaped JSON characters,
@@ -1075,7 +1016,7 @@ return websocket(chat) { message in
     message.forward()
 }
 // !/&&/|| short-circuit. Patterns use existing compile-time regex validation.
-// Only guard-unwrapped json.string aliases support this operation; optional calls,
+// This specialized regex recipe accepts guard-unwrapped json.string aliases; optional calls,
 // Json values, numberText/stringify and other scalar aliases reject. A reached
 // decoding/scan error closes before applying negation. The existing workspace,
 // regex database ownership, native relocation and guard/node limits are retained.
@@ -1091,7 +1032,7 @@ return websocket(chat) { message in
     message.forward("hello " + name)
 }
 // The chain folds at compile time into a root-relative path, capped at 8192 bytes.
-// Four guards and 32 condition nodes remain the limit. Typed scalar aliases cannot
+// Four guards and 32 nodes bound this specialized recipe. Typed scalar aliases cannot
 // be containers, and a binding is unavailable in its own failure branch.
 
 // Compare optional JSON scalar extraction directly, avoiding a typed-binding guard.
@@ -1189,9 +1130,8 @@ return websocket(chat) { message in
 // json.kind(document) also checks the root and binds one of null/boolean/number/
 // string/array/object; JSON null is a successful "null" kind. Compare its alias
 // only to string literals with == / !=. json.count checks direct array elements
-// or object members; empty containers bind zero. Its Int literals must fit i32.
-// Selected-field chains need json.get too, so only one complete selected-field
-// kind/count check fits under the four source-guard limit.
+// or object members; empty containers bind zero. The count type is i32.
+// The specialized path has four source clauses; richer JSON expressions use shared IR.
 
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize

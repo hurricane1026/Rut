@@ -88,8 +88,9 @@ references reuse that value. Nullable values retain their presence channel.
 `let token = uuid()` uses the same direct-initializer contract as HTTP; bind and
 unwrap the token before use. Allocation failure follows its nil branch. The
 message arena is reset for each invocation after output has been copied.
-Error-capable local declarations, argument-bearing verdicts and general
-JSON/regex/hash work still use the specialized path or produce a compile error. HTTP
+General JSON, digest/HMAC and argument-bearing verdicts also use shared IR, as
+described below. Error-capable local declarations and general regex combinations
+remain pending. HTTP
 access is rejected even in statically unreachable message branches. The shared
 entry emits explicit branches and typed SSA merges: only the chosen arm runs,
 including nested nullable value choices. It does not reuse an eager `select`
@@ -116,8 +117,9 @@ ordinary lets still reject regex/fallible work in any arm, including unused lets
 Negation changes the selected result, and reached decode errors retain their
 existing close behavior. The selector, both arm trees and one selection node count
 toward 32 condition nodes; one helper call remains one source clause. The compiler
-adds no runtime value storage or native-format field. Arithmetic, effectful helpers
-and general callback computation remain unsupported.
+adds no runtime value storage or native-format field for that recipe. Other
+scalar arithmetic and general JSON expressions use shared IR; effectful helpers
+and general regex combinations remain pending.
 
 `message.kind` has type `WebSocketMessageKind`, whose cases are
 `WebSocketMessageKind.text` and `WebSocketMessageKind.binary`. `message.direction`
@@ -175,7 +177,8 @@ and generic `Eq` compare exact bytes in either operand order. Comparisons with
 `str`, implicit conversions, regex scans, ordering, concatenation and indexing
 are unsupported. Payload inspections currently lower literal equality, view
 reflexivity, count/literal comparisons and emptiness into the bounded condition
-forest. Dynamic payload replacement remains subsequent work.
+forest. General `msg.forward(bytes)` accepts an unwrapped Bytes expression and
+copies its result into owned send storage.
 
 ### Callback names and immutable bindings
 
@@ -201,15 +204,14 @@ return websocket(chat) { packet in
 ```
 
 Callback `let` bindings use the common expression analyzer, declared-type checker
-and pure helper normalization. They currently accept infallible scalar literals,
-message aliases and projections, byte counts, equality, ordering of supported
-integer projections, and Boolean composition. Bindings are immutable and visible
+and pure helper normalization. They accept scalar and Bytes
+expressions, message aliases and projections, ordinary optional values, JSON
+operations and digest/HMAC results. Bindings are immutable and visible
 only after their declaration, through the remainder of this callback. Names
 must be fresh across callback lets, JSON guard aliases and captured admission
-constants; `json` is unavailable as a local let name. Optional values, HTTP reads
-or effects, regex scans and JSON operations cannot be let initializers in this
-slice. In particular, fallible scans/decodes keep their existing guard evaluation
-and short-circuit behavior. An unused initializer is still checked.
+constants; `json` is unavailable as a local let name. HTTP reads/effects, general
+regex scans and error-capable lets remain unavailable. An unused initializer is
+still checked and reached nullable work still runs once.
 
 Message aliases may receive verdicts. A borrowed text alias may feed the existing
 text rewrite or `json.parse` guard; JSON guard aliases retain their existing
@@ -217,15 +219,16 @@ proof and scope rules. The general callback path also accepts runtime `i32` clos
 codes and `str` reasons, with wire-code and 123-byte UTF-8 validation. Fixed Binary replacements also
 accept immutable Bytes aliases and pure helper results normalized to literals;
 the complete borrowed message payload can also supply Binary output.
-None of these aliases allocate runtime storage, retain a message beyond the
-callback, or become HTTP route locals. Compile-time HTTP admission constants
+A message alias itself has no runtime carrier. General expressions can use the
+bounded per-message arena; their values never outlive the callback or become
+HTTP route locals. Compile-time HTTP admission constants
 remain capturable; request-borrowed values do not.
 
 The ordinary eight-statement block limit includes lets, guards and the final
 verdict. The existing 16-local HTTP admission budget remains independent of the
-callback parameter and its at-most-seven lets. JSON guard aliases remain bounded
-by the four-clause handler limit; all clauses share a 32-node condition forest. Arbitrary local computation, general nested blocks and lifecycle
-callbacks remain subsequent work.
+callback parameter and its at-most-seven lets per block. The specialized recipe
+uses four clauses and 32 condition nodes; richer non-regex callbacks use shared
+IR instead. Lifecycle callbacks remain subsequent work.
 
 ### Conditional verdicts
 
@@ -369,11 +372,11 @@ use compile-time helper results as bounds, including full-width inferred I64
 values. This adds no I64 parameter annotations or generic binding support.
 
 The scalar must already be unwrapped in the current scope. A helper cannot hide
-an optional extraction, manufacture a foreign JSON document, or use a binding
-from a sibling/failure arm. Existing limits remain: String ordering, dynamic
-scalar pairs (except Bool), numberText/stringify regex, JSON-valued ordinary lets,
-arithmetic over JSON scalars and effects are unsupported. No new runtime storage,
-JIT operation or native-format field is needed.
+an optional extraction without unwrapping or use a binding from a sibling/failure
+arm. Shared IR supports independent Json values, String ordering, dynamic scalar
+pairs, JSON lets and scalar arithmetic. NumberText/stringify regex and effects
+still require integration. The specialized projection path needs no additional
+runtime value storage.
 
 This helper subset normalizes to one parse/get/scalar projection over the same
 immutable message. Helpers may also return that projection conditionally, with
@@ -417,10 +420,9 @@ as string and numberText, retain their own rewrite source.
 The compiler specializes the continuation for each possible projection. The
 original four source-clause limit is unchanged; all generated conditions and
 absence joins count toward 32 nodes, and specialized close/forward recipes share
-the existing policy tables. Excess specialization is a compile error. No runtime
-value slot, accessor tag, native format or handler ABI is added. JSON mutation,
-dynamic pointers, HTTP reads/effects and other optional computations remain
-unsupported.
+the existing policy tables. Richer non-regex expressions use shared IR when
+those tables are insufficient. JSON edits, runtime paths and ordinary optional
+computations are described below; HTTP reads/effects remain unavailable.
 
 JSON helpers may use ordinary `guard let` and `if let` with nil failure paths,
 then return the successful binding or extract from it:
@@ -442,11 +444,10 @@ value does not repeat the presence check. Later extraction must match that
 proven expression, including its JSON path, and JSON inputs remain rooted in the
 immutable message. False, zero, empty strings and supported null nodes are still
 present values. These helpers work through import namespaces, using the same
-32-node and four-source-clause budgets. Value-producing fallback arms may choose
-another supported JSON projection. General optional computations remain unsupported. A helper
-may accept the borrowed message or its text, or an earlier validated JSON alias;
-it cannot supply an unrelated JSON document. Initializer-less shorthand bindings
-remain unsupported.
+32-node and four-source-clause budgets in the specialized projection path.
+Value-producing fallback arms may choose another projection. Independent Json
+values and general optional computations use shared IR. Initializer-less
+shorthand bindings remain unsupported.
 
 Optional bindings also accept ordinary nullable pure helpers whose successful
 results normalize to the supported infallible immutable values: scalar and Bytes
@@ -622,6 +623,37 @@ and narrowed reads; untaken branches perform no work. Exhaustion follows the
 chosen nil branch. Binary data, including NUL and non-UTF-8 bytes, is hashed
 exactly; this does not implicitly convert Bytes or add a new crypto algorithm.
 
+### General JSON expressions
+
+Message callbacks support the same optional JSON operations as HTTP: dynamic
+RFC 6901 pointers, independent constructed Json, scalar and collection queries,
+member/set/remove/append edits, stringify and concrete struct decode. `json(...)`
+and `json.encode(...)` produce optional text; `json.value(...)` constructs
+optional Json. Unwrap results before passing them to operations that require a
+plain value. Invalid JSON, missing/wrong-kind values and pool exhaustion take
+the declared nil branch. `!optionalBool` is a type error; unwrap it first.
+
+```swift
+return websocket(chat) { msg in
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    guard let metadata = json.value({ client: msg.fromClient, length: msg.len }) else { msg.close(1011) }
+    guard let edited = json.member(root, "meta", metadata) else { msg.close(1003) }
+    guard let output = json.stringify(edited) else { msg.close(1011) }
+    msg.forward(output)
+}
+```
+
+Decoded strings and edited documents live in the bounded message arena through
+the synchronous callback. An unrelated JSON operation cannot overwrite a prior
+value, and output is copied before the next message or asynchronous send.
+The JSON parser keeps its 8192-byte/2048-node/depth64 bounds and intermediate
+results share the existing 256KiB arena budget. Data-message bounds still apply.
+
+The four-clause/32-node restrictions in the specialized recipe descriptions
+below concern those tables, not the general JSON API. Richer non-regex JSON
+callbacks lower through shared MIR/RIR with ordinary source/local limits.
+General regex combinations and helper-internal single evaluation remain pending.
+
 Dynamic code/reason arguments use `msg.close(code, reason)` with an unwrapped
 `i32` and `str`. Known invalid values remain compile errors; invalid runtime
 code/reason or dynamic Text output closes with 1011. Oversized dynamic output
@@ -721,15 +753,15 @@ that synchronous callback. No decoded view escapes to asynchronous I/O. Patterns
 use the existing owned regex databases and scratch cache, including in native
 artifacts after source removal. A reached decode or scan error closes the tunnel
 before negation is applied; an error cannot become a successful negated match.
-The four-clause and 32-condition-node limits remain unchanged.
+The specialized regex recipe retains its four-clause and 32-node tables.
 
 Aliases are compile-time paths into the immutable message: each reached check
 reparses the bounded payload and retains no JSON node or borrowed string view.
 A `json.get` source may be the document or an earlier guard-unwrapped selected
 JSON value. Further `get` calls use literal RFC 6901 pointers relative to that
-value; each selection requires its own guard. General extraction, dynamic paths,
-and dynamic predicate arguments remain unsupported. These bindings and
-predicates use the existing four-clause and 32-condition-node limits.
+value. That recipe records literal paths and uses the four-clause/32-node
+tables; dynamic paths, editing and ordinary extraction use shared IR instead.
+Optional inputs still require unwrapping in both paths.
 
 For example, select a nested name in two steps and forward its decoded text:
 

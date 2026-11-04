@@ -2599,6 +2599,30 @@ receives the existing normal-closure echo without the configured reason.
 The echo uses its direction's idle output slice, retained until send completion;
 no extra slices or enlarged inline close-frame buffers are needed.
 
+General JSON message expressions use the ordinary optional API and shared
+MIR/RIR path: dynamic RFC 6901 pointers, independent Json values, scalar/collection
+queries, member/set/remove/append edits, JSON construction, stringify and concrete
+struct decoding. `json(value)`/`json.encode(value)` yield optional text;
+`json.value(value)` yields optional Json. Json remains nominally distinct from
+text, and optional arguments require explicit unwrapping. Parse/edit/decoding
+failure and arena exhaustion retain ordinary nil handling. Decoded/edited values
+use the connection's existing message arena and are retired only after output
+has been copied. Scalar queries and validated raw views keep their existing
+allocation behavior. Parser limits (8192 bytes, 2048 nodes, depth64), message
+bounds and the 256KiB intermediate-arena budget remain in force.
+
+The four-clause/32-node JSON predicate forest and fixed policy tables describe
+the specialized recipe lowering below. Their source shapes remain fast paths;
+callbacks outside those shapes use shared IR with ordinary parser/local bounds.
+Regex combinations outside the recipe, general error-capable lets and
+helper-internal evaluation still require integration. A synthesized logical
+negation is distinguished from optional equality in the common analyzer:
+`!optionalBool` rejects until unwrapped; `optionalBool == false` remains a plain
+Boolean equality result. HTTP capability evidence is recorded at recursive
+expression analysis before folding and propagated through helper metadata and
+HIR copies, so an unused argument or folded helper read cannot bypass the
+message phase boundary.
+
 General synchronous callbacks also accept `message.forward(value)` with an
 unwrapped `str` or `Bytes` expression, including conditional pure-helper results,
 callback-local values and a guard-unwrapped `uuid()`. `str` selects Text and
@@ -2616,7 +2640,7 @@ The existing digest and HMAC builtins are available on plain message strings,
 including raw Binary `message.text` bytes; optional hex results use the message
 arena and its existing crypto budget. Pool failure remains nil and follows the
 source's declared guard/else branch. No new crypto dependency or conversion is
-introduced. General JSON/regex/error integration and helper-internal lexical
+introduced. General regex/error integration and helper-internal lexical
 semantics remain separate completion work.
 
 `message.close(code, reason)` also accepts runtime plain `i32` and `str` values.
@@ -2893,8 +2917,8 @@ rebound into each owning expression pool during normalization/inlining and into
 scoped SSA values during RIR materialization, preventing numeric local-slot
 capture. Message aliases keep their zero-carrier representation. Nullable UUID
 locals use the ordinary runtime allocator/failure contract; ordinary helper
-body lets, general JSON/regex/hash work, dynamic verdict payloads and close-event
-context still require integration.
+body lets, general regex/error work and close-event context still require
+integration. Dynamic output, digest/HMAC and general JSON use shared IR.
 
 The message also projects two nominal, closed domains: `kind` is
 `WebSocketMessageKind` (`text`, `binary`), and `direction` is `WebSocketDirection`
@@ -3114,9 +3138,10 @@ statements cannot overwrite the selector edge that chooses another value.
 JIT validation retains four legacy sequential roots and permits explicit forward
 control roots within the same 32-node forest. Existing operand ownership, target,
 cycle and action checks remain. Compiler source clauses stay bounded separately.
-JSON mutations, dynamic pointer expressions, general optional computations and
-initializer-less shorthand bindings remain absent. No runtime storage, native
-format, accessor tag or handler ABI is added.
+These recipe tables do not represent JSON edits, runtime paths or general
+optional computations; those use shared IR. Initializer-less callback shorthand
+bindings remain unsupported. The recipe path adds no runtime storage, native
+format, accessor tag or handler ABI.
 
 Ordinary optional helper results now use the same bounded continuation lowering.
 Successful leaves may be the existing infallible immutable subset: scalar/Bytes
@@ -3218,9 +3243,9 @@ type checks still happen first. These path aliases are compile-time metadata:
 every reached check reparses the full bounded message and retains no document
 node or borrowed string. Nested `get` accepts an earlier guard-unwrapped Json
 selection. Direct optional `json.get` values, strings used as Json, documents
-used as strings without `json.string`, dynamic paths,
-dynamic predicate arguments, and general value extraction are rejected. This
-uses the existing four-clause and 32-condition-node limits.
+used as strings without `json.string` remain type errors. Dynamic paths and
+ordinary extraction use shared IR. The specialized predicates retain their
+four-clause and 32-condition-node tables.
 
 JSON booleans can be unwrapped with `json.bool(documentOrField)` after JSON
 parsing and, for a selected field, a `json.get` presence guard. Both JSON `true`
@@ -3251,11 +3276,12 @@ containers; it does not count descendants. Count aliases compare with signed
 32-bit integer literals using the six integer comparisons, and out-of-range
 literals are rejected. Arithmetic and alias-to-alias comparisons are unsupported.
 These checks use the same bounded JSON workspace and per-check reparse behavior.
-The four source-guard limit means a selected-field handler can use a
+Within the specialized recipe, the four source-guard limit allows a
 parse/get/kind/comparison chain or a parse/get/count/comparison chain, but cannot
 combine both complete selected-field chains. A root document can bind both kind
 and count and combine their predicates within four guards because it needs no
-`get` presence guard. The 32-condition-node and JSON parser limits are unchanged.
+`get` presence guard. Richer source uses shared IR; JSON parser limits still
+apply to every path.
 
 The native/JIT helper validates the complete unmasked, reassembled payload with
 the existing JSON parser and a bounded workspace per worker thread. It accepts

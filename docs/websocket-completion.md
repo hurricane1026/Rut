@@ -29,6 +29,12 @@ compile errors until their execution and lifetime rules have been implemented.
 Dynamic scalar Text/Bytes output and runtime close arguments now use shared IR.
 Results are copied into owned send storage; close reasons have separate drain
 storage, and backpressure is checked before the next callback. The current
-single-slice limit remains. General JSON/regex/error helper integration and
+single-slice limit remains. General regex/error and helper evaluation integration and
 string interpolation still need separate work; the broad criteria above remain
 open until those semantics and the remaining protocol resources are verified.
+
+General optional JSON expressions now use shared IR, including dynamic pointers,
+edits, independent Json values and concrete struct decoding. Callback bindings
+retain values across later JSON operations; the generic path uses normal source
+limits rather than specialized recipe-table limits. Helper-internal evaluation
+and general regex/error semantics remain open.

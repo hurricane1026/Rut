@@ -3,6 +3,7 @@
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
+#include "fixtures/ws_general_json.h"
 #include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
@@ -9876,6 +9877,18 @@ TEST(serve_loader, websocket_hash_bindings_evaluate_once_and_handle_pool_exhaust
     REQUIRE(load_rut_program(path.c_str(), program, err));
     REQUIRE_EQ(unlink(path.c_str()), 0);
     test::ws_hash_output::check(program.config, _tc);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_general_json_values_survive_source_removal_and_pool_exhaustion) {
+    auto path = write_file("/tmp/rut_ws_general_json", "app.rut", test::ws_general_json::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_general_json::check(program.config, _tc);
     program.destroy();
 }
 #endif

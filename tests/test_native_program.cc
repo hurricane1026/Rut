@@ -7,6 +7,7 @@
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
+#include "fixtures/ws_general_json.h"
 #include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
@@ -3420,5 +3421,17 @@ TEST(native_program, websocket_hash_bindings_evaluate_once_and_handle_pool_exhau
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     test::ws_hash_output::check(owner.p->config, _tc);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_general_json_values_survive_source_removal_and_pool_exhaustion) {
+    Source source;
+    REQUIRE(source.append(test::ws_general_json::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_general_json::check(owner.p->config, _tc);
 }
 #endif
