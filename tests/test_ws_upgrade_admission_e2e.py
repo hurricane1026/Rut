@@ -319,6 +319,94 @@ def bool_select_regex_exchange(client, peer):
     expect(client, (8, b"\x03\xe8", False))
 
 
+
+SCALAR_PREDICATE_DECLARATIONS = r"""
+func same<T: Eq>(_ lhs: T, _ rhs: T) -> bool => lhs == rhs
+func allowedName(_ value: str) -> bool => value.matches(re"^allow[0-9]+$") || same(value, "")
+func boolPolicy(_ value: bool, _ client: bool) -> bool {
+    if client { same(value, false) } else { value }
+}
+route POST "/scalar-shared" {
+    guard allowedName(req.body) else { return 403 }
+    return 200
+}
+"""
+SCALAR_STRING_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let field = json.get(root, "/a~1b/~0") else { msg.drop() }
+    guard let name = json.string(field) else { msg.drop() }
+    guard allowedName(name) else { msg.drop() }
+    msg.forward("<" + name + ">")
+}
+"""
+SCALAR_BOOL_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let field = json.get(root, "/flag") else { msg.drop() }
+    guard let value = json.bool(field) else { msg.drop() }
+    guard boolPolicy(value, msg.fromClient) else { msg.drop() }
+    msg.forward()
+}
+"""
+
+
+def scalar_string_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"scalar String helper: {actual=!r}, {expected=!r}")
+
+    for data, status in ((b"allow7", b"200"), (b"", b"200"), (b"denied", b"403")):
+        with socket.create_connection(client.getpeername(), timeout=3) as http:
+            http.sendall(b"POST /scalar-shared HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Length: " +
+                         str(len(data)).encode() + b"\r\n\r\n" + data)
+            response = recv_http_response(http)
+            if not response.startswith(b"HTTP/1.1 " + status):
+                raise AssertionError(f"shared scalar predicate: {data=!r}, {response=!r}")
+    payload = b'{"a/b":{"~":"allow\\u0037"}}'
+    first = bytearray(masked_frame(1, payload[:14]))
+    first[0] &= 0x7f
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, payload[14:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<allow7>", True))
+    client.sendall(masked_frame(1, b'{"a/b":{"~":"allow7\\u0000"}}') +
+                   masked_frame(1, b'{"a/b":{"~":null}}') +
+                   masked_frame(2, b'{"a/b":{"~":""}}'))
+    expect(peer, (1, b"<>", True))
+    payload = b'{"a/b":{"~":"allow9"}}'
+    peer.sendall(bytes((0x82, len(payload))) + payload)
+    expect(client, (1, b"<allow9>", False))
+    bad = b'{"a/b":{"~":false}}'
+    good = b'{"a/b":{"~":""}}'
+    peer.sendall(bytes((0x81, len(bad))) + bad + bytes((0x82, len(good))) + good)
+    expect(client, (1, b"<>", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def scalar_bool_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"scalar Bool helper: {actual=!r}, {expected=!r}")
+
+    yes = b'{"flag":false}'
+    client.sendall(masked_frame(1, b'{"flag":true}') + masked_frame(2, b'{"flag":null}') +
+                   masked_frame(1, b"broken") + masked_frame(2, yes))
+    expect(peer, (2, yes, True))
+    yes = b'{"flag":true}'
+    first = bytes((0x01, 7)) + yes[:7]
+    peer.sendall(first + b"\x8a\x01p" + bytes((0x80, len(yes) - 7)) + yes[7:])
+    expect(client, (10, b"p", False))
+    expect(client, (1, yes, False))
+    bad = b'{"flag":false}'
+    peer.sendall(bytes((0x81, len(bad))) + bad + bytes((0x82, len(yes))) + yes)
+    expect(client, (2, yes, False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
 NESTED_JSON_HANDLER = r"""
 return websocket(ws) { message in
     guard let document = json.parse(message.text) else { message.close(1007) }
@@ -1894,6 +1982,8 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (SCALAR_STRING_HANDLER, scalar_string_exchange, SCALAR_PREDICATE_DECLARATIONS),
+                (SCALAR_BOOL_HANDLER, scalar_bool_exchange, SCALAR_PREDICATE_DECLARATIONS),
                 (BOOL_SELECT_HANDLER, bool_select_exchange, BOOL_SELECT_DECLARATIONS),
                 (BOOL_SELECT_REGEX_HANDLER, bool_select_regex_exchange, BOOL_SELECT_DECLARATIONS),
                 (BORROWED_BINARY_HANDLER, borrowed_binary_exchange, BORROWED_BINARY_DECLARATIONS),

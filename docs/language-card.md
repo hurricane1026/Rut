@@ -945,6 +945,14 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // literal JSON pointers. Within nullable helpers, .or(default) / any(value, default)
 // accepts the same infallible immutable defaults. Ordinary eager semantics are
 // preserved: regex scans, effects and other fallible defaults remain rejected.
+// After a reached scalar binding, ordinary predicate helpers can take its value:
+// Bool (including conditional helpers), String equality/generic Eq, decoded String
+// regex, and i32 count equality/Ord comparisons. String source identity is retained
+// for json.string/numberText/stringify/kind. Numeric comparison bounds may come
+// from compile-time helper results; I64 annotation/generic restrictions stay unchanged.
+// Helpers cannot bypass presence/kind proofs. String ordering, dynamic scalar pairs
+// (except Bool), numberText/stringify regex and ordinary JSON-let substitution
+// remain unsupported. Predicate helpers use the same four-clause/32-node limits.
 // JSON mutations, dynamic pointers, general optional computations, binding
 // shorthand, loops and general computation remain unsupported.
 func messageDocument(_ msg: WebSocketMessage) -> Json => json.parse(msg.text)

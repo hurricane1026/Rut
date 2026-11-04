@@ -5,6 +5,7 @@
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_optional_values.h"
+#include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
 #include "rut/jit/native_helper_symbols.h"
@@ -1801,6 +1802,16 @@ route GET "/ws" { return websocket(backend) { message in
                   (!client || op == WsOpcode::Text ? WsFrameAction::Forward : WsFrameAction::Drop));
         }
     }
+}
+
+TEST(native_program, websocket_scalar_helpers_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_scalar_helpers::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_scalar_helpers::check(_tc, owner.p->config);
 }
 
 TEST(native_program, websocket_bool_select_survives_source_removal) {

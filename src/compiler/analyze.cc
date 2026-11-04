@@ -7434,6 +7434,11 @@ struct WsJsonBinding {
 
 using WsJsonBindings = FixedVec<WsJsonBinding, HirWsHandler::kMaxLenGuards>;
 
+static FrontendResult<HirExpr> analyze_ws_proven_value(const AstExpr& expr,
+                                                       const HirModule& mod,
+                                                       const WsJsonBindings& documents,
+                                                       WsCallbackScope& scope);
+
 static FrontendResult<void> ws_publish_value_binding(const WsJsonBinding& binding,
                                                      WsCallbackScope& scope) {
     if (binding.kind != WsJsonBinding::Kind::Value) return {};
@@ -8263,6 +8268,34 @@ static bool ws_payload_count(const HirExpr& expr) {
            ws_typed_field(*expr.lhs, lit_str("payload"));
 }
 
+// Reconstructed aliases contain a nonoptional parse and at most one get with
+// the complete proven path. User parse/get calls remain optional and cannot
+// manufacture this form through a predicate helper.
+static bool ws_typed_json_path(const HirExpr& expr, Str& path) {
+    const HirExpr* root = &expr;
+    path = {};
+    if (root->kind == HirExprKind::JsonOp && root->type == HirTypeKind::Json && !root->may_nil &&
+        !root->may_error && root->int_value == static_cast<i64>(json::Op::Get) &&
+        root->args.len == 2 && root->args[0] && root->args[1] &&
+        root->args[1]->kind == HirExprKind::StrLit) {
+        path = root->args[1]->str_value;
+        if (path.len > json::kMaxBytes || (!path.ptr && path.len)) return false;
+        root = root->args[0];
+    }
+    return root->kind == HirExprKind::JsonOp && root->type == HirTypeKind::Json && !root->may_nil &&
+           !root->may_error && root->int_value == static_cast<i64>(json::Op::Parse) &&
+           root->args.len == 1 && root->args[0] &&
+           ws_typed_field(*root->args[0], lit_str("text")) &&
+           root->args[0]->lhs->kind == HirExprKind::LocalRef &&
+           root->args[0]->lhs->local_index == 0;
+}
+
+static bool ws_typed_json_scalar(const HirExpr& expr, json::Op op, Str& path) {
+    return expr.kind == HirExprKind::JsonOp && !expr.may_nil && !expr.may_error &&
+           expr.int_value == static_cast<i64>(op) && expr.args.len == 1 && expr.args[0] &&
+           ws_typed_json_path(*expr.args[0], path);
+}
+
 static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
                                                     WsVerdict verdict,
                                                     HirWsHandler& handler,
@@ -8331,6 +8364,13 @@ static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
         node.rhs = rhs.value();
         return kAppend(node);
     }
+    Str proven_path{};
+    if (ws_typed_json_scalar(expr, json::Op::AsBool, proven_path)) {
+        node.accessor = WsLenGuard::Accessor::JsonBoolEqual;
+        node.pattern = proven_path;
+        node.bound = 1;
+        return kAppend(node);
+    }
     // Ordinary Boolean equality, including mirrored and nested comparisons.
     if (expr.kind == HirExprKind::Eq && expr.lhs && expr.rhs &&
         expr.lhs->type == HirTypeKind::Bool && expr.rhs->type == HirTypeKind::Bool) {
@@ -8395,11 +8435,55 @@ static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
                ws_typed_field(*expr.lhs, lit_str("text"))) {
         node.accessor = WsLenGuard::Accessor::TextMatch;
         node.pattern = expr.str_value;
+    } else if (expr.kind == HirExprKind::RegexMatch && expr.lhs &&
+               ws_typed_json_scalar(*expr.lhs, json::Op::AsString, proven_path)) {
+        node.accessor = WsLenGuard::Accessor::JsonStringRegex;
+        node.pattern = proven_path;
+        node.value = expr.str_value;
     } else if ((expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
                 expr.kind == HirExprKind::Gt) &&
                expr.lhs && expr.rhs) {
         const HirExpr* field = expr.lhs;
         const HirExpr* value = expr.rhs;
+        bool swapped = false;
+        if (field->kind != HirExprKind::JsonOp && value->kind == HirExprKind::JsonOp) {
+            field = expr.rhs;
+            value = expr.lhs;
+            swapped = true;
+        }
+        if (field->kind == HirExprKind::JsonOp) {
+            node.cmp = expr.kind == HirExprKind::Eq                ? WsLenGuard::Cmp::Eq
+                       : (expr.kind == HirExprKind::Lt) != swapped ? WsLenGuard::Cmp::Lt
+                                                                   : WsLenGuard::Cmp::Gt;
+            ConstValue bound{};
+            if ((ws_typed_json_scalar(*field, json::Op::AsInt, proven_path) ||
+                 ws_typed_json_scalar(*field, json::Op::Count, proven_path)) &&
+                const_eval_expr(*value, nullptr, 0, &bound, 0) && bound.type == field->type &&
+                (bound.type == HirTypeKind::I32 || bound.type == HirTypeKind::I64)) {
+                node.accessor = field->type == HirTypeKind::I32
+                                    ? WsLenGuard::Accessor::JsonCountCompare
+                                    : WsLenGuard::Accessor::JsonIntCompare;
+                node.int_bound = bound.int_value;
+            } else if (expr.kind == HirExprKind::Eq && value->kind == HirExprKind::StrLit) {
+                if (ws_typed_json_scalar(*field, json::Op::AsString, proven_path))
+                    node.accessor = WsLenGuard::Accessor::JsonStringEqual;
+                else if (ws_typed_json_scalar(*field, json::Op::AsNumber, proven_path))
+                    node.accessor = WsLenGuard::Accessor::JsonNumberTextEqual;
+                else if (ws_typed_json_scalar(*field, json::Op::Stringify, proven_path))
+                    node.accessor = WsLenGuard::Accessor::JsonStringifyEqual;
+                else if (ws_typed_json_scalar(*field, json::Op::KindName, proven_path))
+                    node.accessor = WsLenGuard::Accessor::JsonKindEqual;
+                else
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+                node.value = value->str_value;
+            } else {
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            }
+            node.pattern = proven_path;
+            return kAppend(node);
+        }
+        field = expr.lhs;
+        value = expr.rhs;
         const bool kSwapped =
             field->kind != HirExprKind::WsMessageField && !ws_payload_count(*field);
         if (kSwapped) {
@@ -8442,10 +8526,11 @@ static FrontendResult<u32> analyze_ws_typed_condition(const AstExpr& expr,
                                                       WsVerdict verdict,
                                                       HirWsHandler& handler,
                                                       const HirModule& mod,
+                                                      const WsJsonBindings& documents,
                                                       WsCallbackScope& scope,
                                                       bool is_operand,
                                                       bool negate) {
-    auto typed = analyze_ws_value(expr, scope, mod);
+    auto typed = analyze_ws_proven_value(expr, mod, documents, scope);
     if (!typed) return core::make_unexpected(typed.error());
     return lower_ws_typed_condition(typed.value(), verdict, handler, is_operand, negate);
 }
@@ -8497,8 +8582,8 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
             if (leaf.error().code != FrontendError::UnsupportedSyntax)
                 return core::make_unexpected(leaf.error());
             const u32 kSavedCount = handler.len_guards.len;
-            auto typed =
-                analyze_ws_typed_condition(cond, verdict, handler, mod, scope, is_operand, negate);
+            auto typed = analyze_ws_typed_condition(
+                cond, verdict, handler, mod, documents, scope, is_operand, negate);
             if (typed) return typed;
             handler.len_guards.len = kSavedCount;
             if (leaf.error().detail.len != 0) return core::make_unexpected(leaf.error());
@@ -8728,6 +8813,34 @@ static FrontendResult<HirExpr> ws_json_proof_value(const WsJsonBinding& binding,
                             scope.route.get());
     }
     return frontend_error(FrontendError::UnsupportedSyntax, span);
+}
+
+static FrontendResult<HirExpr> analyze_ws_proven_value(const AstExpr& expr,
+                                                       const HirModule& mod,
+                                                       const WsJsonBindings& documents,
+                                                       WsCallbackScope& scope) {
+    const u32 kSavedLocals = scope.locals.len;
+    const auto kAnalyze = [&]() -> FrontendResult<HirExpr> {
+        for (u32 i = 0; i < documents.len; ++i) {
+            const auto& binding = documents[i];
+            if (binding.kind == WsJsonBinding::Kind::Value) continue;
+            auto value = ws_json_proof_value(binding, expr.span, scope);
+            if (!value) return value;
+            HirLocal local{};
+            local.name = binding.name;
+            local.span = expr.span;
+            local.ref_index = scope.locals.len;
+            local.type = value->type;
+            local.shape_index = value->shape_index;
+            local.init = value.value();
+            if (!scope.locals.push(local))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
+        return analyze_ws_value(expr, scope, mod);
+    };
+    auto value = kAnalyze();
+    scope.locals.len = kSavedLocals;
+    return value;
 }
 
 // Helper inlining copies expression trees. Match only the concrete expression
@@ -9006,25 +9119,7 @@ static FrontendResult<HirExpr> analyze_ws_json_initializer(const AstStatement& s
         return frontend_error(FrontendError::UnsupportedSyntax,
                               stmt.span,
                               lit_str("message guard bindings require a fresh name"));
-    const u32 kSavedLocals = scope.locals.len;
-    const auto kAnalyze = [&]() -> FrontendResult<HirExpr> {
-        for (const auto& binding : documents) {
-            if (binding.kind == WsJsonBinding::Kind::Value) continue;
-            auto value = ws_json_proof_value(binding, stmt.span, scope);
-            if (!value) return value;
-            HirLocal local{};
-            local.name = binding.name;
-            local.span = stmt.span;
-            local.ref_index = scope.locals.len;
-            local.type = value->type;
-            local.init = value.value();
-            if (!scope.locals.push(local))
-                return frontend_error(FrontendError::TooManyItems, stmt.span);
-        }
-        return analyze_ws_value(stmt.expr, scope, mod);
-    };
-    auto value = kAnalyze();
-    scope.locals.len = kSavedLocals;
+    auto value = analyze_ws_proven_value(stmt.expr, mod, documents, scope);
     if (!value) return core::make_unexpected(value.error());
     if (!value->may_nil || value->may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);

@@ -316,6 +316,36 @@ if let name = text(selected) { msg.forward(name) }
 else { msg.drop() }
 ```
 
+After a successful scalar binding, its value may also feed ordinary predicate
+helpers. They use normal parameter types and generics, while preserving the
+message's established JSON path and scalar kind:
+
+```swift
+func same<T: Eq>(_ left: T, _ right: T) -> bool => left == right
+func allowed(_ text: str) -> bool => text.matches(re"^allow[0-9]+$") || same(text, "")
+return websocket(chat) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let text = json.string(root) else { msg.drop() }
+    guard allowed(text) else { msg.drop() }
+    msg.forward(text)
+}
+```
+
+The same String predicate may take `req.body` in HTTP. Bool helpers, including
+conditional Boolean helpers, retain false-versus-absence semantics. String equality
+helpers work on decoded strings, exact numberText, compact stringify output and
+kind names; regex helpers currently support decoded JSON String only. I32 count
+values support Eq/Ord helpers with constant bounds. Integer comparisons may also
+use compile-time helper results as bounds, including full-width inferred I64
+values. This adds no I64 parameter annotations or generic binding support.
+
+The scalar must already be unwrapped in the current scope. A helper cannot hide
+an optional extraction, manufacture a foreign JSON document, or use a binding
+from a sibling/failure arm. Existing limits remain: String ordering, dynamic
+scalar pairs (except Bool), numberText/stringify regex, JSON-valued ordinary lets,
+arithmetic over JSON scalars and effects are unsupported. No new runtime storage,
+JIT operation or native-format field is needed.
+
 This helper subset normalizes to one parse/get/scalar projection over the same
 immutable message. Helpers may also return that projection conditionally, with
 `nil` on the other path. Conditions use the supported ordinary message predicates;

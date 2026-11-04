@@ -2,6 +2,7 @@
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_optional_values.h"
+#include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
 #include "rut/compiler/analyze.h"
@@ -5590,6 +5591,107 @@ TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
     CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ name in ... }`")));
 }
 
+TEST(frontend, websocket_scalar_helpers_preserve_reached_paths_types_and_wide_bounds) {
+    auto tokens = lex(lit(test::ws_scalar_helpers::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto copied = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*copied);
+    REQUIRE(hir);
+    copied.reset();
+    REQUIRE_EQ(hir->routes.len, 10u);
+    for (const auto& route : hir->routes) CHECK_EQ(route.locals.len, 0u);
+    CHECK(hir->routes[9].ws_handler.len_guards[3].pattern.eq(lit("/a~1b/~0")));
+    bool upper = false, lower = false;
+    for (const auto& node : hir->routes[7].ws_handler.len_guards) {
+        if (node.accessor != WsLenGuard::Accessor::JsonIntCompare) continue;
+        upper |= node.int_bound == 9223372036854775807LL;
+        lower |= node.int_bound == -2147483649LL;
+    }
+    CHECK(upper);
+    CHECK(lower);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, websocket_scalar_helpers_require_proofs_scope_and_supported_operations) {
+    const char* bodies[] = {
+        R"rut(guard same(json.bool(root), false) else { msg.drop() } msg.forward())rut",
+        R"rut(guard same(json.string(root), "ok") else { msg.drop() } msg.forward())rut",
+        R"rut(guard countOK(json.count(root)) else { msg.drop() } msg.forward())rut",
+        R"rut(if let text = json.string(root) { msg.drop() }
+              else { guard same(text, "ok") else { msg.drop() } msg.forward() })rut",
+        R"rut(if let text = json.string(root) { msg.drop() }
+              guard same(text, "ok") else { msg.drop() } msg.forward())rut",
+        R"rut(guard let text = json.string(root) else { msg.drop() }
+              let verdict = same(text, "ok") msg.forward())rut",
+        R"rut(guard let text = json.string(root) else { msg.drop() }
+              guard same(text, false) else { msg.drop() } msg.forward())rut",
+        R"rut(guard let text = json.string(root) else { msg.drop() }
+              guard ordered(text, "z") else { msg.drop() } msg.forward())rut",
+        R"rut(guard let text = json.string(root) else { msg.drop() }
+              guard let rendered = json.stringify(root) else { msg.drop() }
+              guard same(text, rendered) else { msg.drop() } msg.forward())rut",
+        R"rut(guard let text = json.numberText(root) else { msg.drop() }
+              guard scan(text) else { msg.drop() } msg.forward())rut",
+        R"rut(guard let text = json.stringify(root) else { msg.drop() }
+              guard scan(text) else { msg.drop() } msg.forward())rut",
+        R"rut(guard let other = json.parse("\"ok\"") else { msg.drop() }
+              guard let text = json.string(other) else { msg.drop() } msg.forward())rut"};
+    const char* definitions = R"rut(upstream ws
+func same<T: Eq>(_ lhs: T, _ rhs: T) -> bool => lhs == rhs
+func ordered<T: Ord>(_ lhs: T, _ rhs: T) -> bool => lhs < rhs
+func scan(_ value: str) -> bool => value.matches(re"ok")
+func countOK(_ amount: i32) -> bool => amount < 2
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+)rut";
+    for (const char* body : bodies) {
+        std::string source = definitions;
+        source += body;
+        source += " } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+}
+
+TEST(frontend, websocket_scalar_helpers_keep_the_condition_node_budget) {
+    for (u32 terms : {15u, 16u}) {
+        std::string source = R"rut(upstream ws
+func same<T: Eq>(_ lhs: T, _ rhs: T) -> bool => lhs == rhs
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let text = json.string(root) else { msg.drop() }
+    guard )rut";
+        for (u32 i = 0; i < terms; ++i) {
+            if (i) source += " && ";
+            source += "same(text, \"ok\")";
+        }
+        source += " else { msg.drop() } msg.forward() } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (terms == 15) {
+            REQUIRE(hir);
+            CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 31u);
+        } else {
+            REQUIRE_FALSE(hir);
+            CHECK(hir.error().code == FrontendError::TooManyItems);
+        }
+    }
+}
+
 TEST(frontend, websocket_bool_select_uses_ordinary_helpers_lets_and_optional_selectors) {
     auto tokens = lex(lit(test::ws_bool_select::kSource));
     REQUIRE(tokens);
@@ -7834,7 +7936,7 @@ route GET "/ws" { return websocket(ws) { message in
     }
 }
 
-TEST(frontend, websocket_json_bool_aliases_support_literal_comparisons) {
+TEST(frontend, websocket_json_bool_aliases_support_typed_boolean_comparisons) {
     const char* source = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { message in
  guard let document = json.parse(message.text) else { message.drop() }
@@ -7886,6 +7988,25 @@ route GET "/ws" { return websocket(ws) { message in
     REQUIRE(ast);
     CHECK(analyze_file_heap(ast.value()));
 
+    const char* dynamic_bool = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let field = json.get(document, "/enabled") else { message.drop() }
+ guard let enabled = json.bool(field) else { message.drop() }
+ guard enabled == message.fromClient else { message.drop() }
+ message.forward()
+} })rut";
+    tokens = lex(lit(dynamic_bool));
+    REQUIRE(tokens);
+    ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    bool compared = false;
+    for (const auto& node : hir->routes[0].ws_handler.len_guards)
+        compared |= node.accessor == WsLenGuard::Accessor::BoolEqual;
+    CHECK(compared);
+
     for (const char* invalid_guards :
          {"guard enabled else { message.drop() }\n"
           "guard let document = json.parse(message.text) else { message.drop() }",
@@ -7896,7 +8017,7 @@ route GET "/ws" { return websocket(ws) { message in
           "guard let document = json.parse(message.text) else { message.drop() }\n"
           "guard let field = json.get(document, \"/enabled\") else { message.drop() }\n"
           "guard let enabled = json.bool(field) else { message.drop() }\n"
-          "guard enabled == message.fromClient else { message.drop() }",
+          "guard enabled == message.kind else { message.drop() }",
           "guard let document = json.parse(message.text) else { message.drop() }\n"
           "guard let field = json.get(document, \"/enabled\") else { message.drop() }\n"
           "guard let enabled = json.bool(field) else { message.drop() }\n"

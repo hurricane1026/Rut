@@ -2915,6 +2915,29 @@ share the existing 32-node forest budget, with no extra source clause, runtime
 state, helper symbol, handler ABI field or native-layout change. The existing
 constant-arm And/Or lowering remains compact.
 
+Reached JSON scalar aliases also feed ordinary typed predicate helpers. A
+compiler-only scope temporarily reconstructs their nonoptional parse/get/scalar
+expressions, normalizes the helper with the shared type checker, then restores
+locals before returning. The same scope builder handles optional initializers;
+no proof local escapes an arm or enters the HTTP route's runtime local storage.
+
+Typed predicate lowering accepts only the reconstructed nonoptional message-root
+parse, optionally one get carrying the complete validated path, and a supported
+scalar projection. User parse/get/scalar calls remain optional; helper wrapping
+cannot create a proof. Bool helpers use existing BoolEqual/BoolSelect composition.
+String equality preserves string/numberText/stringify/kind sources, and regex
+helpers over decoded JSON String use the existing JsonStringRegex operation.
+I32 count helpers use ordinary Eq/Ord constraints and existing count comparisons.
+Numeric bounds may normalize to compile-time integers, including inferred I64
+helper results, without truncation or new I64 annotations/generic support.
+
+These predicate calls retain the existing literal/constant comparison limits:
+no String ordering, general scalar-to-scalar comparison (except Bool), rendered
+number/stringify regex, dynamic pointers, arithmetic on JSON values or ordinary
+JSON-let substitution is added. Earlier presence and kind guards still dominate
+all uses, including wrong-kind, nil, false, zero and empty values. Existing source
+clauses, condition nodes, handler ABI and native layout are unchanged.
+
 The lexical scope includes compile-time admission constants and is discarded at
 the callback boundary. Locals require fresh names across lets, captures and JSON
 proof aliases; the `json` namespace cannot be a local let. The parameter may

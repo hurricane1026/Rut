@@ -1,6 +1,7 @@
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_optional_values.h"
+#include "fixtures/ws_scalar_helpers.h"
 // Tests for the .rut program loader (src/serve_loader.cc): the bridge that
 // compiles a source file end to end (lex -> parse -> analyze -> MIR -> RIR ->
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
@@ -6437,6 +6438,54 @@ route GET "/ws" { return websocket(ws) { msg in
                                          static_cast<u32>(strlen(payload)),
                                          client) ==
                   (client ? WsFrameAction::ForwardText : WsFrameAction::Drop));
+        }
+    }
+}
+
+TEST(serve_loader, websocket_scalar_helpers_survive_source_removal) {
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_scalar_helpers").string();
+    auto path = write_file(dir, "app.rut", test::ws_scalar_helpers::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    test::ws_scalar_helpers::check(_tc, program.config);
+}
+
+TEST(serve_loader, websocket_scalar_helpers_import_decoded_values_into_shared_http_predicates) {
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_scalar_import").string();
+    auto helper = write_file(dir, "scalar.rut", R"rut(
+func allowed(_ value: str) -> bool => value.matches(re"^ok$")
+)rut");
+    auto path = write_file(dir, "app.rut", R"rut(import "scalar"
+upstream ws at "127.0.0.1:9999"
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let field = json.get(root, "/a~1b/~0") else { msg.drop() }
+    guard let text = json.string(field) else { msg.drop() }
+    guard scalar.allowed(text) else { msg.drop() }
+    msg.forward()
+} }
+route POST "/http" { guard scalar.allowed(req.body) else { return 403 } return 200 }
+)rut");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    std::filesystem::remove(helper);
+    REQUIRE_EQ(program.config.route_count, 2u);
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const char* payloads[] = {
+        "{\"a/b\":{\"~\":\"o\\u006b\"}}", "{\"a/b\":{\"~\":\"no\"}}", "{}", "broken"};
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (u32 i = 0; i < 4; ++i)
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(payloads[i]),
+                              static_cast<u32>(strlen(payloads[i])),
+                              client) == (i == 0 ? WsFrameAction::Forward : WsFrameAction::Drop));
         }
     }
 }
