@@ -9354,7 +9354,20 @@ generation and copied input. Non-Timer terminal dispatch, timer scheduling
 failure, new request generation and the CRTP close path cancel abandoned work.
 POD TLS bindings are saved/restored across nested handler calls; no connection
 layout or packed handler ABI changes. Service ownership is independent of RCU
-configuration lifetime and remains with the loop's caller. This profile handles
-native HTTP/1 handlers only; compiler/loader exposure, HTTP/2 and automatic CLI
+configuration lifetime and remains with the loop's caller. Native HTTP/2 support uses a stream-specific binding and the existing single
+async slot as described below. Compiler/loader exposure and automatic CLI
 configuration are still pending. See the auth coverage ledger for the lifecycle
 contract and disconnect-observation limits.
+
+### Native HTTP/2 password stream ownership
+
+HTTP/2 dispatch and resume bind the live client stream ID for the native
+password helper. The service uses a protocol-tagged 64-bit key to keep stream
+IDs distinct from HTTP/1 request generations. A competing stream is refused
+before it can reset shared handler slots or displace the async owner's task.
+A stream-scoped guard retains work only for successful Timer suspension/re-arm;
+all other exits cancel that exact stream key. RST_STREAM cancels only its own
+task, and connection close/free cancels the connection's entire task set. The
+existing one-suspended-stream and RCU epoch contracts are preserved without
+new connection fields or handler ABI values. This remains a native embedding
+API; Rut/JIT/compiler exposure and automatic lifecycle configuration are pending.

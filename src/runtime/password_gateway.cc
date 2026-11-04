@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/http2_conn.h"
 #include "rut/runtime/password_request.h"
 #include "rut/runtime/password_worker.h"
 
@@ -10,18 +11,25 @@ namespace rut {
 namespace {
 thread_local PasswordGateway* current_gateway = nullptr;
 thread_local void* current_connection = nullptr;
+thread_local u32 current_stream = 0;
 }  // namespace
-PasswordHandlerScope::PasswordHandlerScope(PasswordGateway* gateway, void* connection)
-    : previous_gateway(current_gateway), previous_connection(current_connection) {
+PasswordHandlerScope::PasswordHandlerScope(PasswordGateway* gateway,
+                                           void* connection,
+                                           u32 stream_id)
+    : previous_gateway(current_gateway),
+      previous_connection(current_connection),
+      previous_stream(current_stream) {
     if (!gateway && !current_gateway) return;
     engaged = true;
     current_gateway = gateway;
     current_connection = connection;
+    current_stream = stream_id;
 }
 PasswordHandlerScope::~PasswordHandlerScope() {
     if (!engaged) return;
     current_gateway = previous_gateway;
     current_connection = previous_connection;
+    current_stream = previous_stream;
 }
 void PasswordGateway::stop() {
     for (auto& entry : entries) {
@@ -37,6 +45,14 @@ void PasswordGateway::cancel(u32 connection) {
         entry.active = false;
     }
 }
+void PasswordGateway::cancel_request(u32 connection, u64 generation) {
+    for (auto& entry : entries) {
+        if (!entry.active || entry.connection != connection || entry.generation != generation)
+            continue;
+        entry.request.reset();
+        entry.active = false;
+    }
+}
 u32 PasswordGateway::active_requests() const {
     u32 count = 0;
     for (const auto& entry : entries)
@@ -44,7 +60,7 @@ u32 PasswordGateway::active_requests() const {
     return count;
 }
 PasswordGatewayReply PasswordGateway::verify(
-    u32 connection, u32 generation, Str password, Str record, u64 now_ms, u32 timeout_ms) {
+    u32 connection, u64 generation, Str password, Str record, u64 now_ms, u32 timeout_ms) {
     if (generation == 0) return {};
     if (worker.completion_fd() >= 0 && !worker.drain_completions()) {
         cancel(connection);
@@ -87,10 +103,23 @@ PasswordGatewayReply verify_password_for_request(void* connection,
                                                  u32 timeout_ms) {
     if (!connection || !current_gateway || connection != current_connection) return {};
     auto& conn = *static_cast<ConnectionBase*>(connection);
-    if (conn.fd < 0 || conn.state != ConnState::ExecHandler ||
-        conn.protocol != ConnProtocol::Http11 || conn.handler_gen == 0)
+    if (conn.fd < 0) return {};
+    u64 generation = 0;
+    if (conn.protocol == ConnProtocol::Http11) {
+        if (current_stream != 0 || conn.state != ConnState::ExecHandler || conn.handler_gen == 0)
+            return {};
+        generation = conn.handler_gen;
+    } else if (conn.protocol == ConnProtocol::Http2) {
+        if (!conn.h2 || current_stream == 0 || (current_stream & 1u) == 0 ||
+            current_stream > 0x7fffffffu ||
+            (conn.h2->async_stream != 0 && conn.h2->async_stream != current_stream))
+            return {};
+        const auto* stream = conn.h2->find_stream(current_stream);
+        if (!stream || stream->state == Http2StreamState::Closed) return {};
+        generation = password_h2_generation(current_stream);
+    } else
         return {};
     return current_gateway->verify(
-        conn.id, conn.handler_gen, password, record, monotonic_us() / 1000, timeout_ms);
+        conn.id, generation, password, record, monotonic_us() / 1000, timeout_ms);
 }
 }  // namespace rut

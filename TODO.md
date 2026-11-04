@@ -792,7 +792,9 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   wakeup, exact-deadline rejection, reset/reuse and descriptor lifecycle tests.
 - [x] Optional native HTTP/1 gateway bridge using existing timer-yield resume,
   connection/request generation fencing and shared terminal/close cancellation.
-- [ ] Rut/JIT/native-artifact exposure, HTTP/2 and automatic application worker
+- [x] Native HTTP/2 stream binding, protocol-tagged task keys and stream-local
+  reset/terminal cancellation, retaining the existing single async slot.
+- [ ] Rut/JIT/native-artifact exposure and automatic application worker
   configuration/lifecycle; direct FD integration if needed beyond timer polling.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
   rate limits, rehash migration and session/JWT login composition.

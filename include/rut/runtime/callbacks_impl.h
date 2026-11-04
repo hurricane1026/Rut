@@ -277,12 +277,6 @@ inline void build_probe_request(Connection& conn, const UpstreamTarget& target, 
 }
 
 template <typename Loop>
-PasswordGateway* request_password_gateway(Loop* loop) {
-    if constexpr (requires { loop->password_gateway; }) return loop->password_gateway;
-    return nullptr;
-}
-
-template <typename Loop>
 void free_probe_conn(Loop* loop, Connection& conn) {
     // Minimal teardown — close the probe socket (EPOLL_CTL_DEL first) and return
     // the slot. Never touches metrics/epoch/access-log/keepalive (the probe is

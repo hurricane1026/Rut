@@ -15,7 +15,7 @@ whether a competing open-source edition includes them.
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
-| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with native deadline/completion-FD adapters | Rut/JIT/native-artifact and HTTP/2 integration, automatic application lifecycle, user registry and password lifecycle |
+| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters and native HTTP/1 + HTTP/2 timer bridges | Rut/JIT/native-artifact integration, automatic application lifecycle, user registry and password lifecycle |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and RS256 policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | ES keys, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
@@ -887,10 +887,10 @@ The optional native HTTP/1 bridge below reuses existing timers for resume/close
 wiring; direct gateway FD registration and the Rut/JIT/native-artifact API remain
 outstanding.
 
-## Optional native HTTP/1 gateway bridge
+## Optional native gateway bridge
 
 [`PasswordGateway`](../include/rut/runtime/password_gateway.h) connects the native
-worker/request adapters to trusted native `HandlerFn` routes. The lifecycle
+worker/request adapters to trusted native HTTP/1 and HTTP/2 `HandlerFn` routes. The lifecycle
 owner starts one service, binds `loop.password_gateway` after loop init and
 before run, and keeps it alive until the loop and all connections are stopped.
 It is independent of RCU configuration objects; task inputs are copied rather
@@ -903,7 +903,7 @@ Explicit nested scopes can mask the service and restore it on exit. Ordinary
 handlers with no bound service retain their original path without TLS binding
 work. No handler ABI or
 connection layout changes are made. A helper call for a foreign connection,
-without a binding, with generation zero, or on HTTP/2 returns Unavailable.
+without a binding, or with invalid request/stream identity returns Unavailable.
 There is no shared cross-shard password service or worker-global request state.
 
 `verify_password_for_request(connection, password, record, timeout_ms)` returns
@@ -933,15 +933,49 @@ behavior; it is not a shipped credential-extraction policy.
 
 This is not a Rut built-in, middleware function or an exported native-artifact
 helper. Those require compiler/loader integration and explicit async semantics.
-HTTP/2 password verification and automatic application lifecycle/configuration
-remain unimplemented.
+Automatic application lifecycle/configuration remains unimplemented. HTTP/2
+native verification follows the bounded extension below.
 
 Runtime validation for the bridge is registered in the existing `test_network`
 target: real quiet epoll and io_uring HTTP/1 success/rejection, timeout, abandoned
 work, disconnect and slot reuse; mock tests cover invocation binding, HTTP/2
 refusal, timer failure cancellation and generation/deadline fencing. The full
 network/hash regression passed. A complete no-JIT ASan/UBSan runtime build passed
-the six gateway tests; focused TSan testing instruments the new service, worker,
+the nine gateway tests; focused TSan testing instruments the new service, worker,
 hash/password code and gateway fixture while linking ordinary runtime/OpenSSL
 archives for the other components. macOS/kqueue and compiler/JIT exposure were
 not validated locally.
+
+## Native HTTP/2 password verification
+
+The optional native bridge also supports HTTP/2 `HandlerFn` invocations. Dispatch
+binds the actual stream ID, and resume reuses the same stream binding and original
+deadline. Service keys are widened to 64 bits: HTTP/1 generations occupy the low
+32-bit domain, while HTTP/2 uses a separate protocol tag plus the 31-bit stream
+ID. A live, odd client stream is mandatory. The worker still retains only copied
+credentials and an opaque token, not an Http2Stream/Connection pointer.
+
+The runtime's existing single suspended-stream contract remains in force.
+With the service enabled, a competing native handler is refused before resetting
+the connection-owned handler context. The helper independently rejects a stream
+binding that conflicts with the existing async owner. Another stream cannot
+replace a pending task's password, deadline, synthesized request or frame slots.
+
+An H2 task guard cancels only the current stream's task on terminal or failed
+invocation. Successful Timer suspension/re-arm retains the task; RST_STREAM
+cancels only the reset stream. Thus a reset/503 on another stream cannot cancel
+the current owner. Connection close/free still cancels every task for that
+connection. Stream reset is acted on when the existing transport observes it:
+control frames coalesced after the suspending HEADERS are processed immediately,
+while later network frames follow the runtime's existing parked-stream read
+behavior. The existing async slot pins the RCU config epoch and synthesized
+request across waits. No new stream/connection fields or packed handler ABI
+values are introduced.
+
+The gateway fixture exercises HTTP/1 and HTTP/2 over real epoll and io_uring:
+verified success, wrong password, timeout, terminal abandonment, disconnect and
+stream/slot reuse. HTTP/2 additionally sends HEADERS + RST_STREAM + another
+stream's wrong credentials in one batch and requires no response for the reset
+stream. Focused tests cover stream-binding restoration, busy-context integrity
+and unrelated-stream reset isolation. Rut/JIT/native-artifact helper exposure
+and automatic service configuration remain outstanding.

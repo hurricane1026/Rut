@@ -21,7 +21,9 @@ u64 password_handler(void* connection, jit::HandlerCtx*, const u8* data, u32 len
     Str password{};
     u32 count = 0;
     for (u32 i = 0; i < request.header_count; ++i) {
-        if (!request.headers[i].name.eq(lit_str("X-Password"))) continue;
+        if (!request.headers[i].name.eq(lit_str("X-Password")) &&
+            !request.headers[i].name.eq(lit_str("x-password")))
+            continue;
         password = request.headers[i].value;
         ++count;
     }
@@ -292,4 +294,198 @@ TEST(password_gateway, generation_change_and_deadline_are_not_replaceable) {
     CHECK(gateway.active_requests() == 1);
     gateway.cancel(2);
     CHECK(gateway.active_requests() == 0);
+}
+
+namespace {
+struct PasswordH2Client {
+    i32 fd = -1;
+    u8 input[16384]{};
+    u32 used = 0;
+    u16 statuses[32]{};
+    hpack::DynamicTable dynamic{};
+    PasswordH2Client() { dynamic.init(4096); }
+    ~PasswordH2Client() {
+        if (fd >= 0) close(fd);
+    }
+    static u32 request(u8* output, u32 capacity, u32 stream, Str path, Str password) {
+        const hpack::Header headers[] = {{lit_str(":method"), lit_str("GET")},
+                                         {lit_str(":scheme"), lit_str("http")},
+                                         {lit_str(":path"), path},
+                                         {lit_str(":authority"), lit_str("localhost")},
+                                         {lit_str("x-password"), password}};
+        return http2_write_headers(output, capacity, stream, headers, 5, true);
+    }
+    bool connect(u16 port) {
+        fd = connect_to(port);
+        if (fd < 0) return false;
+        u8 prologue[256];
+        memcpy(prologue, kClientPreface, kClientPrefaceLen);
+        Http2Settings settings{};
+        settings.set_defaults();
+        const u32 count =
+            kClientPrefaceLen + write_settings_frame(prologue + kClientPrefaceLen, settings);
+        return send_all(fd, reinterpret_cast<const char*>(prologue), count);
+    }
+    bool send_request(u32 stream, Str path, Str password) {
+        u8 out[1024];
+        const u32 count = request(out, sizeof(out), stream, path, password);
+        return count != 0 && send_all(fd, reinterpret_cast<const char*>(out), count);
+    }
+    bool receive_status(u32 stream, u16 status) {
+        const i64 deadline = test_mono_ms() + 10000;
+        for (;;) {
+            Http2FrameHeader header{};
+            if (parse_frame_header(input, used, &header) == ParseStatus::Complete &&
+                header.length <= used - kFrameHeaderSize) {
+                if (header.type == static_cast<u8>(Http2FrameType::Goaway)) return false;
+                if (header.type == static_cast<u8>(Http2FrameType::Headers)) {
+                    if (!(header.flags & http2_flag::kEndHeaders) || header.stream_id >= 32)
+                        return false;
+                    hpack::Header headers[32];
+                    u8 decoded[4096];
+                    u32 count = 0;
+                    if (!hpack::decode_header_block(dynamic,
+                                                    input + kFrameHeaderSize,
+                                                    header.length,
+                                                    decoded,
+                                                    sizeof(decoded),
+                                                    headers,
+                                                    32,
+                                                    &count))
+                        return false;
+                    for (u32 i = 0; i < count; ++i) {
+                        if (!headers[i].name.eq(lit_str(":status"))) continue;
+                        const auto value = headers[i].value;
+                        if (value.len != 3) return false;
+                        for (u32 j = 0; j < 3; ++j)
+                            if (value.ptr[j] < '0' || value.ptr[j] > '9') return false;
+                        statuses[header.stream_id] =
+                            static_cast<u16>((value.ptr[0] - '0') * 100 +
+                                             (value.ptr[1] - '0') * 10 + value.ptr[2] - '0');
+                    }
+                }
+                const u32 consumed = kFrameHeaderSize + header.length;
+                memmove(input, input + consumed, used - consumed);
+                used -= consumed;
+                if (statuses[stream] != 0) return statuses[stream] == status;
+                continue;
+            }
+            if (used == sizeof(input) || test_mono_ms() >= deadline) return false;
+            const i32 got = recv_timeout(fd,
+                                         reinterpret_cast<char*>(input + used),
+                                         sizeof(input) - used,
+                                         static_cast<i32>(deadline - test_mono_ms()));
+            if (got <= 0) return false;
+            used += static_cast<u32>(got);
+        }
+    }
+};
+
+template <typename Loop>
+void exercise_password_h2(rut::test::TestCase* _tc, PasswordServer<Loop>& server) {
+    PasswordH2Client client;
+    REQUIRE(client.connect(server.port));
+    REQUIRE(client.send_request(1, lit_str("/ok"), lit_str("password")));
+    CHECK(client.receive_status(1, 200));
+    REQUIRE(client.send_request(3, lit_str("/ok"), lit_str("wrong")));
+    CHECK(client.receive_status(3, 401));
+    REQUIRE(client.send_request(5, lit_str("/timeout"), lit_str("password")));
+    CHECK(client.receive_status(5, 504));
+    REQUIRE(client.send_request(7, lit_str("/abandon"), lit_str("password")));
+    CHECK(client.receive_status(7, 204));
+    // A coalesced RST must retire stream 9 before stream 11 can start. A late
+    // matching worker result must never authenticate stream 11's wrong input.
+    u8 batch[2048];
+    u32 count =
+        PasswordH2Client::request(batch, sizeof(batch), 9, lit_str("/ok"), lit_str("password"));
+    REQUIRE(count != 0);
+    count += write_rst_stream(batch + count, 9, Http2Error::Cancel);
+    const u32 second = PasswordH2Client::request(
+        batch + count, sizeof(batch) - count, 11, lit_str("/ok"), lit_str("wrong"));
+    REQUIRE(second != 0);
+    count += second;
+    REQUIRE(send_all(client.fd, reinterpret_cast<const char*>(batch), count));
+    CHECK(client.receive_status(11, 401));
+    CHECK(client.statuses[9] == 0);
+    REQUIRE(client.send_request(13, lit_str("/ok"), lit_str("password")));
+    close(client.fd);
+    client.fd = -1;
+    server.finish();
+    CHECK(server.gateway.active_requests() == 0);
+}
+}  // namespace
+
+TEST(password_gateway, real_default_backend_http2) {
+    PasswordServer<RealLoop> server;
+    REQUIRE(server.setup());
+    exercise_password_h2(_tc, server);
+}
+#ifdef __linux__
+TEST(password_gateway, real_iouring_http2) {
+    PasswordServer<IoUringEventLoop> server;
+    if (!server.setup()) {
+        if (io_uring_init_error_is_unsupported(server.error,
+                                               io_uring_init_failure_detail(*server.loop)))
+            SKIP("io_uring unavailable");
+        REQUIRE(false);
+    }
+    exercise_password_h2(_tc, server);
+}
+#endif
+
+TEST(password_gateway, h2_stream_binding_busy_context_and_reset_isolation) {
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    PasswordGateway gateway;
+    REQUIRE(gateway.start().has_value());
+    loop->password_gateway = &gateway;
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    conn->protocol = ConnProtocol::Http2;
+    auto h2 = std::make_unique<Http2Conn>();
+    h2->init();
+    h2->nstreams = 2;
+    h2->streams[0] = {1, Http2StreamState::HalfClosedRemote, 65535, 65535, true};
+    h2->streams[1] = {3, Http2StreamState::HalfClosedRemote, 65535, 65535, true};
+    conn->h2 = h2.get();
+    auto* ctx = conn->reset_jit_ctx();
+    ctx->store_slot<u64>(0, 123456);
+    CHECK(password_h2_generation(1) != 1u);
+    {
+        PasswordHandlerScope unbound(&gateway, conn);
+        CHECK(verify_password_for_request(conn, lit_str("password"), kRecord, 1000).status ==
+              PasswordRequestStatus::Unavailable);
+    }
+    {
+        PasswordHandlerScope scope(&gateway, conn, 1);
+        CHECK(verify_password_for_request(conn, lit_str("password"), kRecord, 1000).status ==
+              PasswordRequestStatus::Pending);
+        h2->async_stream = 1;
+        {
+            PasswordHandlerScope other(&gateway, conn, 3);
+            CHECK(verify_password_for_request(conn, lit_str("wrong"), kRecord, 1000).status ==
+                  PasswordRequestStatus::Unavailable);
+        }
+        CHECK(verify_password_for_request(conn, lit_str("changed"), kRecord, 1000).status ==
+              PasswordRequestStatus::Pending);
+    }
+    u8 response[8192]{};
+    H2Dispatch<SmallLoop> dispatch{loop.get(), conn, response, sizeof(response), 0, false};
+    RouteEntry route{};
+    route.fn = password_handler;
+    // Refuse the competing stream before it can reset the shared handler frame.
+    h2_invoke_emit(dispatch, 3, &route, nullptr, 0, nullptr, nullptr, 0, false, true);
+    CHECK(ctx->load_slot<u64>(0) == 123456);
+    CHECK(h2->async_stream == 1);
+    CHECK(gateway.active_requests() == 1);
+    h2_on_reset_dispatch_cb<SmallLoop>(&dispatch, *h2, 3, Http2Error::Cancel);
+    CHECK(h2->async_stream == 1);
+    CHECK(gateway.active_requests() == 1);
+    h2_on_reset_dispatch_cb<SmallLoop>(&dispatch, *h2, 1, Http2Error::Cancel);
+    CHECK(h2->async_stream == 0);
+    CHECK(gateway.active_requests() == 0);
+    conn->h2 = nullptr;
+    loop->close_conn(*conn);
+    loop->password_gateway = nullptr;
 }
