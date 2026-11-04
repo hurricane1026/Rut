@@ -585,7 +585,11 @@ bool load_native_program(const char* source,
     }
     for (u32 i = 0; i < h.route_count; i++) {
         const auto& route = c.routes[i];
-        if (!route.ws_terminate) continue;
+        if (!route.ws_terminate) {
+            if (route.ws_open_handler || route.ws_close_handler)
+                return fail("invalid native WebSocket lifecycle route");
+            continue;
+        }
         if (route.ws_subprotocol.len > SlicePool::kSliceSize ||
             (route.ws_subprotocol.len != 0 && !ws_valid_subprotocol(route.ws_subprotocol)))
             return fail("invalid native WebSocket subprotocol");

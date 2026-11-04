@@ -1671,7 +1671,7 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
                     peer.settimeout(3)
                     recv_until(peer, b"\r\n\r\n")
                     peer.sendall(response)
-                    if not recv_until(client, b"\r\n\r\n").startswith(b"HTTP/1.1 101"):
+                    if not recv_http_response(client).startswith(b"HTTP/1.1 101"):
                         raise AssertionError("binary replacement handshake failed")
                     exchange(client, peer)
         finally:
@@ -1751,7 +1751,7 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind,
                     if not recv_until(peer, b"\r\n\r\n").startswith(b"GET /ws "):
                         raise AssertionError("native artifact did not forward valid handshake")
                     peer.sendall(response)
-                    if not recv_until(client, b"\r\n\r\n").startswith(b"HTTP/1.1 101"):
+                    if not recv_http_response(client).startswith(b"HTTP/1.1 101"):
                         raise AssertionError("native artifact did not relay valid 101")
                     exchange(client, peer)
         finally:
@@ -2371,7 +2371,7 @@ def tls_passthrough_scenario(server, backend_kind):
     return "pass", ""
 
 
-def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False, closing=False, client_notify=False):
+def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False, closing=False, client_notify=False, lifecycle=False):
     cert = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_cert.pem")
     key = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_key.pem")
     backend = socket.socket()
@@ -2389,6 +2389,9 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
     if closing:
         source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
                   + '\nroute GET "/ws" { ' + CLOSING_HANDLER + '}\n')
+    if lifecycle:
+        source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+                  + LIFECYCLE_DECLARATIONS + '\nroute GET "/ws" { ' + LIFECYCLE_HANDLER + '}\n')
     with tempfile.TemporaryDirectory(prefix="rut-ws-tls-terminate-") as temp:
         path = os.path.join(temp, "route.rut")
         with open(path, "w", encoding="utf-8") as route_file:
@@ -2431,7 +2434,7 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
             clients.remove(invalid_client)
 
             raw = socket.create_connection(("127.0.0.1", port), timeout=3)
-            valid_client = context.wrap_socket(raw, server_hostname="localhost")
+            valid_client = context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=not (closing or lifecycle))
             clients.append(valid_client)
             valid_client.sendall(REQUEST)
             peer, _ = backend.accept()
@@ -2439,10 +2442,12 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
             if not recv_until(peer, b"\r\n\r\n").startswith(b"GET /ws "):
                 raise AssertionError("TLS valid handshake request was not forwarded")
             peer.sendall(WS_RESPONSE_HEADERS)
-            response = recv_until(valid_client, b"\r\n\r\n")
+            response = recv_http_response(valid_client)
             if not response.startswith(b"HTTP/1.1 101"):
                 raise AssertionError(f"TLS valid terminate handshake failed: {response!r}")
-            if connection_context:
+            if lifecycle:
+                lifecycle_exchange(valid_client, peer)
+            elif connection_context:
                 connection_exchange(valid_client, peer, b"tls:")
             elif closing:
                 exchange = closing_client_notify_exchange if client_notify else closing_handshake_exchange
@@ -2709,6 +2714,34 @@ def subprotocol_scenario(server, backend_kind):
 
 CLOSING_HANDLER = 'return websocket(ws) { msg in msg.close(1008, "policy") }'
 
+LIFECYCLE_DECLARATIONS = r'''let sessions = Cache<IP, i64>(capacity: 64)
+route GET "/lifecycle" {
+ let value = sessions.get(req.remoteAddr).or(0)
+ if value == 102 || value == 112 { return 204 } else { return 409 }
+}
+'''
+LIFECYCLE_HANDLER = r'''return websocket(ws) { message in
+ let value = sessions.get(message.connection.remoteAddr).or(0)
+ guard (!message.connection.isTls && value == 2) || (message.connection.isTls && value == 12)
+ else { message.close(1011, "open order") }
+ message.close(1008, "policy")
+} onOpen: { connection in
+ let key = connection.remoteAddr
+ sessions.set(key, sessions.get(key).or(0) + 1)
+ if connection.isTls { sessions.set(key, sessions.get(key).or(0) + 10) }
+ sessions.set(key, sessions.get(key).or(0) + 1)
+} onClose: { closed in
+ guard closed.wasClean && closed.code == 3001 && closed.reason == "ack" &&
+       closed.upstreamCode == 3002 && closed.upstreamReason.isEmpty else { return }
+ let key = closed.connection.remoteAddr
+ sessions.set(key, sessions.get(key).or(0) + 100)
+}'''
+OPEN_CLOSE_HANDLER = r'''return websocket(ws) { message in message.forward("unexpected") }
+onOpen: { connection in connection.close(1008, "policy") }
+onClose: { closed in let unused = closed.code }
+'''
+
+
 
 def assert_socket_quiet(sock):
     sock.settimeout(0.08)
@@ -2749,6 +2782,20 @@ def closing_handshake_exchange(client, peer):
     peer.sendall(b"\x88\x02\x0b\xba")
     if peer.recv(1) != b"":
         raise AssertionError("both acknowledgements did not retire the tunnel")
+
+
+def lifecycle_exchange(client, peer):
+    address = client.getpeername()
+    closing_handshake_exchange(client, peer)
+    # Both peers have acknowledged. A new HTTP request observes the callback's
+    # ordinary shard-local Cache effect after the WebSocket connection retired.
+    for _ in range(2):
+        with socket.create_connection(address, timeout=3) as raw:
+            observer = client.context.wrap_socket(raw, server_hostname="localhost") if isinstance(client, ssl.SSLSocket) else raw
+            with observer:
+                observer.sendall(b"GET /lifecycle HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+                if not recv_http_response(observer).startswith(b"HTTP/1.1 204"):
+                    raise AssertionError("lifecycle order, close context or exactly-once effect changed")
 
 
 def closing_client_notify_exchange(client, peer):
@@ -2861,6 +2908,8 @@ def main():
                 ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
                  peer_close_exchange(False, b"\x03\xf1\0" + b"r" * 119 + "€".encode()), ""),
                 (CLOSING_HANDLER, closing_handshake_exchange, ""),
+                (LIFECYCLE_HANDLER, lifecycle_exchange, LIFECYCLE_DECLARATIONS),
+                (OPEN_CLOSE_HANDLER, closing_handshake_exchange, ""),
                 (CLOSING_HANDLER, closing_timeout_exchange, ""),
                 (CLOSING_HANDLER, peer_closing_handshake_exchange(True), ""),
                 (CLOSING_HANDLER, peer_closing_handshake_exchange(False), ""),
@@ -3064,6 +3113,14 @@ def main():
             status, details = native_binary_source_removal_scenario(
                 args.server, args.compiler, backend, CLOSING_HANDLER, exchange, tls=True)
             print(f"{status.upper()} {backend} native TLS {exchange.__name__}: {details}")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, LIFECYCLE_HANDLER,
+                    lifecycle_exchange, LIFECYCLE_DECLARATIONS, tls=True)
+            else:
+                status, details = tls_terminate_handshake_scenario(args.server, backend, lifecycle=True)
+            print(f"{status.upper()} {backend} TLS lifecycle native={native}: {details}")
         status, details = tls_terminate_handshake_scenario(args.server, backend, connection_context=True)
         print(f"{status.upper()} {backend} TLS connection context: {details}")
         status, details = tls_terminate_handshake_scenario(args.server, backend)

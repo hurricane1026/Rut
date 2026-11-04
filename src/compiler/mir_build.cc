@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/hir.h"
 #include "rut/runtime/route_method.h"
@@ -785,8 +786,10 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     }
     if (expr.kind == HirExprKind::WsForward || expr.kind == HirExprKind::WsClose) {
         const bool kForward = expr.kind == HirExprKind::WsForward;
-        if (!fn->is_ws_callback || expr.type != HirTypeKind::I32 || expr.may_nil ||
-            expr.may_error || !expr.lhs || expr.lhs->may_nil || expr.lhs->may_error ||
+        if (!fn->is_ws_callback || fn->ws_callback_phase == WsCallbackPhase::Close ||
+            (kForward && fn->ws_callback_phase != WsCallbackPhase::Message) ||
+            expr.type != HirTypeKind::I32 || expr.may_nil || expr.may_error || !expr.lhs ||
+            expr.lhs->may_nil || expr.lhs->may_error ||
             (kForward
                  ? (expr.lhs->type != HirTypeKind::Str && expr.lhs->type != HirTypeKind::Bytes) ||
                        expr.rhs || expr.int_value != (expr.lhs->type == HirTypeKind::Bytes ? 2 : 1)
@@ -816,17 +819,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         // helper normalization, its projections must retain the callback input.
         const HirExpr* receiver = expr.lhs;
         const bool kConnection = receiver && receiver->type == HirTypeKind::WebSocketConnection;
-        if (kConnection) {
-            if (receiver->kind != HirExprKind::WsMessageField ||
-                !receiver->str_value.eq(lit_str("connection")) || receiver->may_nil ||
-                receiver->may_error)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-            receiver = receiver->lhs;
-        }
-        if (expr.may_nil || expr.may_error || receiver == nullptr ||
-            receiver->kind != HirExprKind::LocalRef || receiver->local_index != 0 ||
-            receiver->type != HirTypeKind::WebSocketMessage || receiver->may_nil ||
-            receiver->may_error)
+        if (!fn->is_ws_callback || expr.may_nil || expr.may_error ||
+            !ws_projection_receiver_valid(expr, fn->ws_callback_phase))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         v.kind = MirValueKind::WsMessageField;
         v.str_value = expr.str_value;
@@ -836,6 +830,17 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                 (expr.str_value.eq(lit_str("remotePort")) && expr.type == HirTypeKind::I32) ||
                 (expr.str_value.eq(lit_str("isTls")) && expr.type == HirTypeKind::Bool) ||
                 (expr.str_value.eq(lit_str("subprotocol")) && expr.type == HirTypeKind::Str))
+                return v;
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+        if (receiver && receiver->type == HirTypeKind::WebSocketClose) {
+            if (((expr.str_value.eq(lit_str("code")) ||
+                  expr.str_value.eq(lit_str("upstreamCode"))) &&
+                 expr.type == HirTypeKind::I32) ||
+                ((expr.str_value.eq(lit_str("reason")) ||
+                  expr.str_value.eq(lit_str("upstreamReason"))) &&
+                 expr.type == HirTypeKind::Str) ||
+                (expr.str_value.eq(lit_str("wasClean")) && expr.type == HirTypeKind::Bool))
                 return v;
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         }
@@ -1561,6 +1566,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         fn.throttle_down_bps = source_route.throttle_down_bps;
         fn.http_cache_ttl = source_route.http_cache_ttl;
         fn.is_ws_callback = source_route.is_ws_callback;
+        fn.ws_callback_phase = source_route.ws_callback_phase;
         fn.is_timer = source_route.is_timer;
         fn.timer_interval_ms = source_route.timer_interval_ms;
         fn.timer_shard = source_route.timer_shard;

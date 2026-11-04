@@ -79,6 +79,12 @@ public:
     void close_conn(Connection& c) {
         if (password_gateway) password_gateway->cancel(c.id);
         c.release_backend_active();
+        if (c.ws_session_started && !c.ws_session_close_notified) {
+            c.ws_session_close_notified = true;
+            // Synchronous, exactly once while config, TLS facts and owned Close
+            // metadata are still alive. Callback results cannot reopen teardown.
+            if (c.ws_close_handler) (void)c.ws_close_handler(&c, WsOpcode::Text, nullptr, 0, true);
+        }
         if (c.on_close) {
             auto cleanup = c.on_close;
             c.on_close = nullptr;

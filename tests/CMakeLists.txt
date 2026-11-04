@@ -1076,6 +1076,18 @@ target_include_directories(test_rir PRIVATE
 add_test(NAME test_rir COMMAND test_rir)
 set_tests_properties(test_rir PROPERTIES LABELS "unit")
 
+add_executable(test_ws_lifecycle test_ws_lifecycle.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_link_libraries(test_ws_lifecycle rut_compiler rut_runtime)
+target_include_directories(test_ws_lifecycle PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+if(RUT_ENABLE_JIT)
+    target_link_libraries(test_ws_lifecycle rut_loader)
+    target_compile_definitions(test_ws_lifecycle PRIVATE RUT_ENABLE_JIT=1)
+else()
+    target_compile_definitions(test_ws_lifecycle PRIVATE RUT_ENABLE_JIT=0)
+endif()
+add_test(NAME test_ws_lifecycle COMMAND test_ws_lifecycle)
+set_tests_properties(test_ws_lifecycle PROPERTIES LABELS "unit;compiler;network")
+
 add_executable(test_frontend test_frontend.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_link_libraries(test_frontend rut_compiler rut_runtime)
 target_include_directories(test_frontend PRIVATE
@@ -4033,6 +4045,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py
         COMMAND $<TARGET_FILE:test_network>
         COMMAND $<TARGET_FILE:test_ws_shutdown_deadline>
+        COMMAND $<TARGET_FILE:test_ws_lifecycle>
         COMMAND $<TARGET_FILE:test_integration>
         COMMAND $<TARGET_FILE:test_arena>
         COMMAND $<TARGET_FILE:test_expected>
@@ -4093,7 +4106,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_ws_shutdown_deadline test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
+        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
         COMMENT "Running all tests..."
     )
 else()
@@ -4108,6 +4121,7 @@ else()
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py
         COMMAND $<TARGET_FILE:test_network>
         COMMAND $<TARGET_FILE:test_ws_shutdown_deadline>
+        COMMAND $<TARGET_FILE:test_ws_lifecycle>
         COMMAND $<TARGET_FILE:test_integration>
         COMMAND $<TARGET_FILE:test_arena>
         COMMAND $<TARGET_FILE:test_expected>
@@ -4164,7 +4178,7 @@ else()
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_ws_shutdown_deadline test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
+        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
         COMMENT "Running non-JIT tests..."
     )
 endif()

@@ -147,6 +147,98 @@ u64 ws_yield_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
 }
 }  // namespace
 
+namespace {
+struct LifecycleObservation {
+    u32 opened = 0, messages = 0, closed = 0;
+    bool before_message = false, before_cleanup = false;
+    u16 code = 0;
+} lifecycle_observation;
+WsFrameAction observe_session_open(void* value, WsOpcode, const u8*, u64, bool) {
+    auto& conn = *static_cast<Connection*>(value);
+    ++lifecycle_observation.opened;
+    lifecycle_observation.before_message = conn.is_ws_terminate && conn.ws_c2u_msg &&
+                                           conn.ws_u2c_out && conn.is_ws_tunnel &&
+                                           lifecycle_observation.messages == 0;
+    return WsFrameAction::Drop;
+}
+WsFrameAction observe_session_message(void*, WsOpcode, const u8*, u64, bool) {
+    ++lifecycle_observation.messages;
+    return WsFrameAction::Drop;
+}
+WsFrameAction observe_session_close(void* value, WsOpcode, const u8*, u64, bool) {
+    auto& conn = *static_cast<Connection*>(value);
+    ++lifecycle_observation.closed;
+    lifecycle_observation.before_cleanup =
+        conn.fd == 42 && conn.ws_c2u_msg && conn.ws_session_close_notified;
+    lifecycle_observation.code = conn.ws_session_close_context().client.code;
+    return WsFrameAction::Drop;
+}
+}  // namespace
+
+struct WsLifecycleLoop : SmallLoop {
+    u8 c2u_msg[128]{}, u2c_msg[128]{}, c2u_out[256]{}, u2c_out[256]{};
+    bool alloc_ws_terminate_bufs(Connection& conn) {
+        conn.ws_c2u_msg = c2u_msg;
+        conn.ws_u2c_msg = u2c_msg;
+        conn.ws_c2u_out = c2u_out;
+        conn.ws_u2c_out = u2c_out;
+        return true;
+    }
+};
+
+TEST(websocket, lifecycle_open_precedes_coalesced_message_and_close_precedes_retirement) {
+    WsLifecycleLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn);
+    loop.alloc_upstream_buf(*conn);
+    conn->upstream_fd = 43;
+    conn->is_ws_terminate_route = true;
+    conn->ws_max_message_size = 128;
+    conn->ws_handshake_slice = loop.alloc_ws_handshake_slice();
+    REQUIRE(conn->ws_handshake_slice);
+    conn->ws_handshake_phase = WsHandshakePhase::Validated;
+    conn->req_wants_upgrade = true;
+    conn->req_upgrade_is_websocket = true;
+    conn->resp_upgrade_is_websocket = true;
+    conn->ws_open_handler = &observe_session_open;
+    conn->ws_close_handler = &observe_session_close;
+    conn->ws_handler = &observe_session_message;
+    lifecycle_observation = {};
+    const u8 kFrame[] = {0x81, 0x81, 1, 2, 3, 4, static_cast<u8>('x' ^ 1)};
+    REQUIRE_EQ(conn->recv_buf.write(kFrame, sizeof(kFrame)), sizeof(kFrame));
+    on_ws_101_sent<WsLifecycleLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
+    CHECK_EQ(lifecycle_observation.opened, 1u);
+    CHECK_EQ(lifecycle_observation.messages, 1u);
+    CHECK(lifecycle_observation.before_message);
+    CHECK_EQ(lifecycle_observation.closed, 0u);
+    loop.close_conn(*conn);
+    CHECK_EQ(lifecycle_observation.closed, 1u);
+    CHECK(lifecycle_observation.before_cleanup);
+    CHECK_EQ(lifecycle_observation.code, 1006u);
+    close_conn_if_live(&loop, *conn);  // a late callback cannot close the retired slot twice
+    CHECK_EQ(lifecycle_observation.closed, 1u);
+    CHECK_FALSE(conn->ws_session_started);
+    CHECK(conn->ws_open_handler == nullptr);
+    CHECK(conn->ws_close_handler == nullptr);
+}
+
+TEST(websocket, failed_upgrade_has_no_session_lifecycle_events) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn);
+    conn->ws_open_handler = &observe_session_open;
+    conn->ws_close_handler = &observe_session_close;
+    lifecycle_observation = {};
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, -EPIPE));
+    CHECK_EQ(lifecycle_observation.opened, 0u);
+    CHECK_EQ(lifecycle_observation.closed, 0u);
+    CHECK_EQ(conn->fd, -1);
+}
+
 TEST(websocket, deferred_peer_close_reply_survives_inspector_reset) {
     constexpr bool kDirections[] = {false, true};
     for (bool from_client : kDirections) {

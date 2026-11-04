@@ -45,6 +45,7 @@ constexpr Str kRateLimitArgsDetail =
     lit_str("rate-limit named arguments are `by`, `scope`, or `burst`");
 
 struct Parser {
+    bool ws_lifecycle_body = false;
     const LexedTokens* toks = nullptr;
     AstFile* file = nullptr;
     u32 pos = 0;
@@ -609,7 +610,8 @@ struct Parser {
         block.span = span_from(lbrace_tok);
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
             AstStatement st{};
-            if (cur().type == TokenType::KwLet || cur().type == TokenType::KwMatch) {
+            if (cur().type == TokenType::KwLet || cur().type == TokenType::KwMatch ||
+                (ws_lifecycle_body && cur().type == TokenType::KwReturn)) {
                 auto binding = parse_stmt();
                 if (!binding) return core::make_unexpected(binding.error());
                 st = binding.value();
@@ -641,11 +643,11 @@ struct Parser {
         }
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
-        if (block.block_stmts.len == 0)
+        if (block.block_stmts.len == 0 && !ws_lifecycle_body)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(*rbrace.value()), kEmptyBlockDetail);
         block.span.end = rbrace.value()->end;
-        if (block.block_stmts.len == 1) return *block.block_stmts[0];
+        if (block.block_stmts.len == 1 && !ws_lifecycle_body) return *block.block_stmts[0];
         return block;
     }
 
@@ -699,6 +701,29 @@ struct Parser {
     // ordinary boolean expression over message properties; the else body is a single
     // bare message verdict (message.drop()/forward()/close()). Reuses AstStmtKind::Guard with
     // expr=cond and else_stmt=the verdict Expr — the WsTerminate analyze path interprets it.
+    static bool ws_lifecycle_exits(const AstStatement& stmt, u32 depth = 0) {
+        if (depth > AstStatement::kMaxBlockStatements) return false;
+        if (stmt.kind == AstStmtKind::ReturnVoid) return true;
+        if (stmt.kind == AstStmtKind::Expr)
+            return stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.name.eq(lit_str("close"));
+        if (stmt.kind == AstStmtKind::Block)
+            return stmt.block_stmts.len &&
+                   ws_lifecycle_exits(*stmt.block_stmts[stmt.block_stmts.len - 1], depth + 1);
+        if (stmt.kind == AstStmtKind::If)
+            return stmt.then_stmt && stmt.else_stmt &&
+                   ws_lifecycle_exits(*stmt.then_stmt, depth + 1) &&
+                   ws_lifecycle_exits(*stmt.else_stmt, depth + 1);
+        if (stmt.kind == AstStmtKind::Match) {
+            if (!stmt.match_arms.len) return false;
+            for (u32 i = 0; i < stmt.match_arms.len; ++i)
+                if (!stmt.match_arms[i].stmt ||
+                    !ws_lifecycle_exits(*stmt.match_arms[i].stmt, depth + 1))
+                    return false;
+            return true;
+        }
+        return false;
+    }
+
     FrontendResult<AstStatement> parse_ws_message_guard(const Token& guard_tok) {
         AstStatement stmt{};
         stmt.kind = AstStmtKind::Guard;
@@ -717,6 +742,20 @@ struct Parser {
         if (!kw_else) return core::make_unexpected(kw_else.error());
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
+        if (ws_lifecycle_body) {
+            auto body = parse_ws_message_body(*lbrace.value());
+            if (!body) return core::make_unexpected(body.error());
+            if (!ws_lifecycle_exits(body.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      body->span,
+                                      lit_str("guard else must exit the lifecycle callback"));
+            auto ptr = alloc_stmt(body.value());
+            if (!ptr) return core::make_unexpected(ptr.error());
+            stmt.expr = cond.value();
+            stmt.else_stmt = ptr.value();
+            stmt.span = Span{guard_tok.start, body->span.end, guard_tok.line, guard_tok.col};
+            return stmt;
+        }
         auto verdict = parse_expr();
         if (!verdict) return core::make_unexpected(verdict.error());
         AstStatement vstmt{};
@@ -1928,6 +1967,14 @@ struct Parser {
             }
             return stmt;
         }
+        if (ws_lifecycle_body && cur().type == TokenType::KwReturn &&
+            (peek().type == TokenType::RBrace || peek().line > cur().line)) {
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::ReturnVoid;
+            stmt.span = span_from(cur());
+            ++pos;
+            return stmt;
+        }
         if (take(TokenType::KwReturn)) {
             // Three forms:
             //   return <IntLit>                           (legacy)
@@ -3065,6 +3112,35 @@ struct Parser {
                     stmt.kind = AstStmtKind::WsTerminate;
                     stmt.then_stmt = body_ptr.value();
                     stmt.span = Span{start.start, body.value().span.end, start.line, start.col};
+                    while (cur().type == TokenType::Ident && peek().type == TokenType::Colon) {
+                        const bool kOpen = cur().text.eq(lit_str("onOpen"));
+                        const bool kClose = cur().text.eq(lit_str("onClose"));
+                        if ((!kOpen && !kClose) || (kOpen ? stmt.ws_open_body : stmt.ws_close_body))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(cur()));
+                        pos += 2;
+                        auto brace = expect(TokenType::LBrace);
+                        if (!brace) return core::make_unexpected(brace.error());
+                        auto parameter = expect(TokenType::Ident);
+                        if (!parameter) return core::make_unexpected(parameter.error());
+                        auto in = expect(TokenType::KwIn);
+                        if (!in) return core::make_unexpected(in.error());
+                        const bool kSaved = ws_lifecycle_body;
+                        ws_lifecycle_body = true;
+                        auto hook = parse_ws_message_body(*brace.value());
+                        ws_lifecycle_body = kSaved;
+                        if (!hook) return core::make_unexpected(hook.error());
+                        auto hook_ptr = alloc_stmt(hook.value());
+                        if (!hook_ptr) return core::make_unexpected(hook_ptr.error());
+                        if (kOpen) {
+                            stmt.ws_open_body = hook_ptr.value();
+                            stmt.ws_open_parameter = parameter.value()->text;
+                        } else {
+                            stmt.ws_close_body = hook_ptr.value();
+                            stmt.ws_close_parameter = parameter.value()->text;
+                        }
+                        stmt.span.end = hook->span.end;
+                    }
                     return stmt;
                 }
                 // Passthrough form (no block): maxMessageSize only governs terminate-mode
@@ -4059,6 +4135,7 @@ struct Parser {
     }
 
     FrontendResult<AstStatement> parse_func_body_stmt() {
+        if (ws_lifecycle_body && cur().type == TokenType::KwReturn) return parse_stmt();
         if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   span_from(cur()),

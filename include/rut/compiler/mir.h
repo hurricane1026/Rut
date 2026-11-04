@@ -12,6 +12,7 @@
 #include "rut/common/types.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/common/wait_limits.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/node_pool.h"
@@ -382,6 +383,7 @@ struct MirFunction {
     // name). Carried to the RIR Function so config registers it into the timer
     // table instead of the route table.
     bool is_ws_callback = false;
+    WsCallbackPhase ws_callback_phase = WsCallbackPhase::Message;
     bool is_timer = false;
     u32 timer_interval_ms = 0;
     i32 timer_shard = -1;
@@ -405,6 +407,7 @@ struct MirFunction {
           throttle_down_bps(other.throttle_down_bps),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_callback(other.is_ws_callback),
+          ws_callback_phase(other.ws_callback_phase),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
           timer_shard(other.timer_shard) {
@@ -431,6 +434,7 @@ struct MirFunction {
         throttle_down_bps = other.throttle_down_bps;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_callback = other.is_ws_callback;
+        ws_callback_phase = other.ws_callback_phase;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;
@@ -455,6 +459,7 @@ struct MirFunction {
           throttle_down_bps(other.throttle_down_bps),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_callback(other.is_ws_callback),
+          ws_callback_phase(other.ws_callback_phase),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
           timer_shard(other.timer_shard) {
@@ -481,6 +486,7 @@ struct MirFunction {
         throttle_down_bps = other.throttle_down_bps;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_callback = other.is_ws_callback;
+        ws_callback_phase = other.ws_callback_phase;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;

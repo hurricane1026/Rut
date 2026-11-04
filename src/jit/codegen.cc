@@ -1049,7 +1049,34 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::WsMessageField: {
             const auto kField = static_cast<WsMessageFieldId>(inst.imm.i32_val);
             LLVMValueRef value = nullptr;
-            if (kField == WsMessageFieldId::ConnectionSubprotocol) {
+            if (kField == WsMessageFieldId::CloseReason ||
+                kField == WsMessageFieldId::CloseUpstreamReason) {
+                LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty, c.ptr_ty, c.ptr_ty};
+                LLVMTypeRef type =
+                    LLVMFunctionType(LLVMVoidTypeInContext(c.llvm_ctx), params, 4, 0);
+                LLVMValueRef helper =
+                    LLVMGetNamedFunction(c.llvm_mod, "rut_helper_ws_close_reason");
+                if (!helper)
+                    helper = LLVMAddFunction(c.llvm_mod, "rut_helper_ws_close_reason", type);
+                LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "close.reason.ptr");
+                LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "close.reason.len");
+                LLVMValueRef args[] = {
+                    c.param_conn, LLVMConstInt(c.i32_ty, static_cast<u32>(kField), 0), ptr, len};
+                LLVMBuildCall2(c.builder, type, helper, args, 4, "");
+                value = LLVMGetUndef(c.str_ty);
+                value = LLVMBuildInsertValue(
+                    c.builder,
+                    value,
+                    LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "close.reason.data"),
+                    0,
+                    "close.reason");
+                value = LLVMBuildInsertValue(
+                    c.builder,
+                    value,
+                    LLVMBuildLoad2(c.builder, c.i32_ty, len, "close.reason.size"),
+                    1,
+                    "close.reason");
+            } else if (kField == WsMessageFieldId::ConnectionSubprotocol) {
                 LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty};
                 LLVMTypeRef type =
                     LLVMFunctionType(LLVMVoidTypeInContext(c.llvm_ctx), params, 3, 0);
@@ -1077,7 +1104,10 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                     "connection.protocol");
             } else if (kField == WsMessageFieldId::ConnectionRemoteAddr ||
                        kField == WsMessageFieldId::ConnectionRemotePort ||
-                       kField == WsMessageFieldId::ConnectionIsTls) {
+                       kField == WsMessageFieldId::ConnectionIsTls ||
+                       kField == WsMessageFieldId::CloseCode ||
+                       kField == WsMessageFieldId::CloseUpstreamCode ||
+                       kField == WsMessageFieldId::CloseWasClean) {
                 LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty};
                 LLVMTypeRef type = LLVMFunctionType(c.i32_ty, params, 2, 0);
                 LLVMValueRef helper =
@@ -1087,7 +1117,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 LLVMValueRef args[] = {c.param_conn,
                                        LLVMConstInt(c.i32_ty, static_cast<u32>(kField), 0)};
                 value = LLVMBuildCall2(c.builder, type, helper, args, 2, "connection.scalar");
-                if (kField == WsMessageFieldId::ConnectionIsTls)
+                if (ws_message_field_is_bool(kField))
                     value = LLVMBuildICmp(c.builder,
                                           LLVMIntNE,
                                           value,
@@ -3436,15 +3466,31 @@ u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size) {
     return pos;
 }
 
+u32 format_ws_callback_symbol(u32 id, WsCallbackPhase phase, char* out, u32 out_size) {
+    char message[64];
+    const u32 kLength = format_ws_handler_symbol(id, message, sizeof(message));
+    const char* suffix = phase == WsCallbackPhase::Open    ? "_open"
+                         : phase == WsCallbackPhase::Close ? "_close"
+                                                           : "";
+    u32 extra = 0;
+    while (suffix[extra]) ++extra;
+    if (!out || out_size <= kLength + extra) return 0;
+    __builtin_memcpy(out, message, kLength);
+    __builtin_memcpy(out + kLength, suffix, extra + 1);
+    return kLength + extra;
+}
+
 bool emit_ws_body(LLVMModuleRef module,
                   LLVMContextRef context,
                   const rir::Module& body,
-                  u32 handler_id) {
+                  u32 handler_id,
+                  WsCallbackPhase phase) {
     if (module == nullptr || context == nullptr || LLVMGetModuleContext(module) != context ||
         body.func_count != 1 || body.functions == nullptr)
         return false;
     char wrapper_name[64];
-    const u32 kNameLen = format_ws_handler_symbol(handler_id, wrapper_name, sizeof(wrapper_name));
+    const u32 kNameLen =
+        format_ws_callback_symbol(handler_id, phase, wrapper_name, sizeof(wrapper_name));
     if (kNameLen == 0 || LLVMGetNamedFunction(module, wrapper_name) != nullptr) return false;
     char body_name[80];
     __builtin_memcpy(body_name, wrapper_name, kNameLen);

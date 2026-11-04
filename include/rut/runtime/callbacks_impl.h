@@ -3214,6 +3214,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                           (route->action == RouteAction::JitHandler && route->fn != nullptr));
     conn.is_ws_terminate_route = ws_term;
     conn.ws_handler = ws_term ? route->ws_frame_handler : nullptr;
+    conn.ws_open_handler = ws_term ? route->ws_open_handler : nullptr;
+    conn.ws_close_handler = ws_term ? route->ws_close_handler : nullptr;
     conn.ws_subprotocol = ws_term ? route->ws_subprotocol : Str{};
     conn.ws_max_message_size = ws_term ? route->ws_max_message_size : 0;
     conn.ws_close_code = ws_term ? route->ws_close_code : 1000;
@@ -11820,6 +11822,35 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
                    &on_ws_upstream_recv<Loop>,
                    &on_ws_client_to_upstream_sent<Loop>);
     conn.upstream_recv_paused_for_send = false;
+    if (conn.is_ws_terminate && !conn.ws_session_started) {
+        conn.ws_session_started = true;
+        const WsFrameAction kAction =
+            conn.ws_open_handler ? conn.ws_open_handler(&conn, WsOpcode::Text, nullptr, 0, true)
+                                 : WsFrameAction::Drop;
+        if (kAction == WsFrameAction::Close || kAction == WsFrameAction::CloseDynamic) {
+            const WsHandlerOutput& output = conn.ws_handler_output;
+            const u16 kCode =
+                kAction == WsFrameAction::CloseDynamic ? output.close_code : conn.ws_close_code;
+            const Str kReason =
+                kAction == WsFrameAction::CloseDynamic ? output.payload : conn.ws_close_reason;
+            if ((kAction == WsFrameAction::CloseDynamic &&
+                 (!output.ready || output.opcode != WsOpcode::Close)) ||
+                !conn.ws_close_payload.assign(kCode, kReason)) {
+                close_conn_if_live(loop, conn);
+                return;
+            }
+            conn.ws_closing = true;
+            conn.ws_close_client_need = true;
+            conn.ws_close_upstream_need = true;
+            ws_arm_shutdown_deadline(loop, conn);
+            if (!ws_drive_close(loop, conn)) close_conn_if_live(loop, conn);
+            return;
+        }
+        if (kAction != WsFrameAction::Drop && kAction != WsFrameAction::Forward) {
+            close_conn_if_live(loop, conn);
+            return;
+        }
+    }
     if (conn.ws_pre_tunnel_upstream_closed) {
         // Backend already half-closed during the 101 drain: enter drain mode
         // immediately rather than arming new client reads. Flush any buffered

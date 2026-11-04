@@ -1056,7 +1056,8 @@ Close already defines application EOF, so this terminal TCP connection is not
 reused and does not wait for a second TLS alert. A peer close_notify or EOF
 reported to the WebSocket callback leaves the other leg's Close pending; TLS
 errors remain fatal. Failure and timeout retain normal
-I/O cancellation ownership. Lifecycle callbacks remain unavailable.
+I/O cancellation ownership. Lifecycle callbacks use the synchronous `onOpen` / `onClose` trailing closures
+described in the language card.
 
 Inspection currently uses bounded single-slice storage (16370 bytes),
 with separate per-direction output buffers. `maxMessageSize` cannot lift that
@@ -1073,3 +1074,36 @@ and wire properties. Loader and native-artifact tests exercise those policies,
 including retained constants after source removal. Runtime tests cover partial
 reads, fragmented messages, interleaved control frames, output bounds and both
 message directions. Network integration covers epoll and io_uring.
+
+
+Lifecycle hooks are optional labeled trailing closures after the message body:
+
+```rut
+return websocket(chat) { message in
+    message.forward()
+} onOpen: { connection in
+    guard connection.remotePort > 0 else { connection.close(1008, "peer port") }
+} onClose: { closed in
+    let status = closed.code
+    let remote: IP = closed.connection.remoteAddr
+}
+```
+
+`onOpen` receives a borrowed `WebSocketConnection` after the 101 has drained and
+inspection buffers exist, before coalesced data is inspected. An open hook may
+initiate normal bounded closing with `connection.close()`, a status, or a status
+and reason, including runtime plain values. It cannot forward data. `onClose`
+receives `WebSocketClose` once at terminal teardown of an opened session,
+including failed I/O, protocol errors and timeouts; it cannot initiate closing.
+Failed admission or opening handshake produces neither event.
+
+Close `code` and `reason` are the first valid Close received from the downstream
+peer. `upstreamCode` and `upstreamReason` are the upstream equivalents; an empty
+Close is 1005 and no received Close is 1006. These may differ from the local
+initiating policy. `wasClean` requires both completed WebSocket handshakes.
+`connection` retains the usual remote IP/port, TLS and subprotocol facts. Views
+are valid only during the synchronous invocation. Ordinary local bindings,
+helpers, optional/error guards, String predicates, Cache effects and time retain
+their compiler semantics. Bare `return` ends a hook and a hook may fall through;
+`guard` failure must exit. Request captures, yielding and view escape remain
+compile errors. Native artifacts carry separate relocated hook symbols.

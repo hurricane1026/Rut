@@ -3437,7 +3437,19 @@ re-read), each with its own buffer for natural backpressure.
   Each reports its first received status/reason, 1005 for an empty Close and
   1006 when no valid Close was received; clean closure requires both handshakes.
   These connection-owned views remain valid during pre-teardown cleanup, even
-  after an inspector reset. Language lifecycle callbacks remain pending.
+  after an inspector reset. Optional `onOpen: { connection in ... }` and
+  `onClose: { closed in ... }` are synchronous compiled lifecycle entries using
+  Swift multiple trailing closures. Open runs after the accepted 101/resources
+  and before buffered messages; close runs once before config/TLS/slot teardown,
+  including failure/timeout, only for an opened session. The borrowed
+  `WebSocketClose` exposes downstream `code`/`reason`, explicit `upstreamCode` /
+  `upstreamReason`, `wasClean`, and `connection`. Normal helper/optional/guard,
+  Cache and time semantics apply. Bare return ends a hook; implicit fallthrough
+  is void. Shared lexical IR evaluates each branch once before continuation,
+  without duplicating the rest of the body into every branch. Open may call
+  `connection.close(...)` to enter normal bounded closing before messages;
+  close callbacks cannot reopen closing or yield. Native metadata version 16
+  relocates both hook symbols and retains their regex/config ownership.
 
 - **Connection teardown — drain-then-close (nginx model).** WebSocket shutdown
   is an *application-level* event (the RFC 6455 Close-frame handshake), not a TCP

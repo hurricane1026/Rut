@@ -8,7 +8,8 @@ namespace rut::native {
 // Private, same-build ABI. Artifacts contain executable code and are trusted
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
-constexpr u32 kVersion = 17;
+// Version 18 combines the auth metadata and WebSocket lifecycle ABI changes.
+constexpr u32 kVersion = 18;
 struct StreamHeader {
     u64 magic;
     u32 version;

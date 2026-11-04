@@ -2371,7 +2371,27 @@ extern "C" u32 rut_helper_ws_connection_scalar(void* conn, u32 field) {
     if (kField == WsMessageFieldId::ConnectionRemoteAddr) return connection.peer_addr;
     if (kField == WsMessageFieldId::ConnectionRemotePort) return connection.peer_port;
     if (kField == WsMessageFieldId::ConnectionIsTls) return connection.tls_active ? 1u : 0u;
+    const auto kClose = connection.ws_session_close_context();
+    if (kField == WsMessageFieldId::CloseCode) return kClose.client.code;
+    if (kField == WsMessageFieldId::CloseUpstreamCode) return kClose.upstream.code;
+    if (kField == WsMessageFieldId::CloseWasClean) return kClose.was_clean ? 1u : 0u;
     return 0;
+}
+
+extern "C" void rut_helper_ws_close_reason(void* conn,
+                                           u32 field,
+                                           const char** out_ptr,
+                                           u32* out_len) {
+    Str reason{};
+    if (conn) {
+        const auto kContext = static_cast<const ConnectionBase*>(conn)->ws_session_close_context();
+        if (field == static_cast<u32>(WsMessageFieldId::CloseReason))
+            reason = kContext.client.reason;
+        if (field == static_cast<u32>(WsMessageFieldId::CloseUpstreamReason))
+            reason = kContext.upstream.reason;
+    }
+    *out_ptr = reason.ptr;
+    *out_len = reason.len;
 }
 
 extern "C" void rut_helper_ws_connection_subprotocol(void* conn,

@@ -1274,6 +1274,34 @@ return websocket(chat) { message in
     message.close(1008, "policy violation")
 }
 
+// Optional lifecycle callbacks use Swift multiple trailing closures. No HTTP
+// request views escape admission. Hooks are synchronous; locals/guard/if and
+// ordinary pure helpers, Cache and time use the same compiler as message bodies.
+return websocket(chat) { message in
+    message.forward()
+} onOpen: { connection in
+    guard connection.remotePort > 0 else { connection.close(1008, "peer port") }
+} onClose: { closed in
+    let peer: IP = closed.connection.remoteAddr
+    let status: i32 = closed.code
+    let reason: str = closed.reason
+    let clean: bool = closed.wasClean
+}
+// onOpen receives borrowed WebSocketConnection after accepted 101 and buffers
+// are ready, before any coalesced first message. close()/close(code, reason)
+// starts the normal bounded handshake and skips application message callbacks.
+// onClose receives borrowed WebSocketClose exactly once before teardown of an
+// opened session (also on protocol/I/O failure or timeout). Failed admission or
+// upgrade has neither event. Hooks may return early with bare return; otherwise
+// they fall through. A guard else must exit. onClose cannot start another close.
+// closed.code/reason describe the FIRST received downstream Close (1005 for
+// empty, 1006 when absent). upstreamCode/upstreamReason describe the other leg.
+// wasClean requires both complete Close handshakes. Local closing policy is
+// independent; codes 1005/1006 are never wire status arguments.
+// Both borrowed contexts and reason views are invocation-scoped, never retained
+// in Cache, HTTP captures, or asynchronous work. No yield/wait or data forwarding
+// is available in lifecycle hooks. HTTP/2 Extended CONNECT remains outside scope.
+
 // Transparent proxy: no application message processing.
 return websocket(chat)
 // Message handlers above see complete Text/Binary payloads. No frame binding,

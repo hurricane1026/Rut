@@ -157,6 +157,8 @@ struct RouteEntry {
     // `ws_max_message_size`. Off (default) keeps the passthrough behavior.
     bool ws_terminate = false;
     WsMessageHandlerFn ws_frame_handler = nullptr;
+    WsMessageHandlerFn ws_open_handler = nullptr;
+    WsMessageHandlerFn ws_close_handler = nullptr;
     u32 ws_max_message_size = 0;
     Str ws_subprotocol{};  // empty = optional negotiation; otherwise required exact token
     // RFC 6455 status the handler's `message.close(code)` verdict puts on the wire (1000 default).

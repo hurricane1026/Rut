@@ -14,6 +14,7 @@
 #include "rut/common/upstream_tls.h"
 #include "rut/common/wait_limits.h"
 #include "rut/common/ws_control_flow.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/node_pool.h"
@@ -302,6 +303,7 @@ enum class HirTypeKind : u8 {
     // Raw octets. Runtime views use the existing pointer/length carrier;
     // source typing keeps these separate from text and JSON.
     Bytes,
+    WebSocketClose,
 };
 
 constexpr bool is_ws_enum_type(HirTypeKind type) {
@@ -309,7 +311,8 @@ constexpr bool is_ws_enum_type(HirTypeKind type) {
 }
 
 constexpr bool is_ws_borrowed_type(HirTypeKind type) {
-    return type == HirTypeKind::WebSocketMessage || type == HirTypeKind::WebSocketConnection;
+    return type == HirTypeKind::WebSocketMessage || type == HirTypeKind::WebSocketConnection ||
+           type == HirTypeKind::WebSocketClose;
 }
 
 inline constexpr u32 kMaxTupleSlots = 10;
@@ -1254,10 +1257,28 @@ struct HirWsTextRewrite {
     HirWsTextSource source = HirWsTextSource::Literal;
 };
 
+inline bool ws_projection_receiver_valid(const HirExpr& expr, WsCallbackPhase phase) {
+    const HirExpr* receiver = expr.lhs;
+    if (receiver && receiver->type == HirTypeKind::WebSocketConnection &&
+        receiver->kind == HirExprKind::WsMessageField) {
+        if (!receiver->str_value.eq(lit_str("connection")) || receiver->may_nil ||
+            receiver->may_error)
+            return false;
+        receiver = receiver->lhs;
+    }
+    const auto kRoot = phase == WsCallbackPhase::Open    ? HirTypeKind::WebSocketConnection
+                       : phase == WsCallbackPhase::Close ? HirTypeKind::WebSocketClose
+                                                         : HirTypeKind::WebSocketMessage;
+    return receiver && receiver->kind == HirExprKind::LocalRef && receiver->local_index == 0 &&
+           receiver->type == kRoot && !receiver->may_nil && !receiver->may_error;
+}
+
 struct HirWsHandler {
     // A normalized shared-IR entry lives in the owning route's expression pool.
     // The index preserves ordinary HirRoute copy/move rebasing and ownership.
     u32 general_body_expr = 0xffffffffu;
+    u32 open_body_expr = 0xffffffffu;
+    u32 close_body_expr = 0xffffffffu;
     Str parameter_name = lit_str("message");  // analyzer-only lexical binding
     WsVerdict default_verdict = WsVerdict::Forward;
     // Postorder condition forest with forward-only root control targets. Unset
@@ -1365,6 +1386,7 @@ struct HirRoute {
     // Analyzer-only scratch scope for synchronous message expressions. HTTP
     // admission on a terminate route retains ordinary helper/effect semantics.
     bool is_ws_callback = false;
+    WsCallbackPhase ws_callback_phase = WsCallbackPhase::Message;
     bool is_lexical_helper = false;
     // Analyzer capability summary, including reads in otherwise unused values.
     bool uses_http_values = false;
@@ -1399,6 +1421,7 @@ struct HirRoute {
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           is_ws_callback(other.is_ws_callback),
+          ws_callback_phase(other.ws_callback_phase),
           is_lexical_helper(other.is_lexical_helper),
           uses_http_values(other.uses_http_values),
           ws_handler(other.ws_handler),
@@ -1428,6 +1451,7 @@ struct HirRoute {
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         is_ws_callback = other.is_ws_callback;
+        ws_callback_phase = other.ws_callback_phase;
         is_lexical_helper = other.is_lexical_helper;
         uses_http_values = other.uses_http_values;
         ws_handler = other.ws_handler;
@@ -1457,6 +1481,7 @@ struct HirRoute {
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           is_ws_callback(other.is_ws_callback),
+          ws_callback_phase(other.ws_callback_phase),
           is_lexical_helper(other.is_lexical_helper),
           uses_http_values(other.uses_http_values),
           ws_handler(other.ws_handler),
@@ -1486,6 +1511,7 @@ struct HirRoute {
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         is_ws_callback = other.is_ws_callback;
+        ws_callback_phase = other.ws_callback_phase;
         is_lexical_helper = other.is_lexical_helper;
         uses_http_values = other.uses_http_values;
         ws_handler = other.ws_handler;

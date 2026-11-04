@@ -271,6 +271,7 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::Unknown:
         case HirTypeKind::WebSocketMessage:
         case HirTypeKind::WebSocketConnection:
+        case HirTypeKind::WebSocketClose:
         case HirTypeKind::WebSocketMessageKind:
         case HirTypeKind::WebSocketDirection:
             return true;
@@ -2006,6 +2007,7 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
 #if RUT_ENABLE_WEBSOCKET
     if (name.eq(lit_str("WebSocketMessage"))) return HirTypeKind::WebSocketMessage;
     if (name.eq(lit_str("WebSocketConnection"))) return HirTypeKind::WebSocketConnection;
+    if (name.eq(lit_str("WebSocketClose"))) return HirTypeKind::WebSocketClose;
     if (name.eq(lit_str("WebSocketMessageKind"))) return HirTypeKind::WebSocketMessageKind;
     if (name.eq(lit_str("WebSocketDirection"))) return HirTypeKind::WebSocketDirection;
 #endif
@@ -3522,7 +3524,8 @@ static FrontendResult<HirExpr> normalize_function_expr(
 #if RUT_ENABLE_WEBSOCKET
 static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
                                                   u32 depth = 0,
-                                                  bool validate_receivers = true);
+                                                  bool validate_receivers = true,
+                                                  WsCallbackPhase phase = WsCallbackPhase::Message);
 static bool ws_infallible_binding(const HirExpr& expr, u32 depth);
 #endif
 #if RUT_ENABLE_WEBSOCKET
@@ -5730,6 +5733,54 @@ static u8 route_method_key_from_token(u8 token_type) {
     }
 }
 
+static constexpr i64 kWsLifecycleContinue = 255;
+
+static FrontendResult<HirExpr> ws_lifecycle_sequence(HirRoute& owner,
+                                                     const HirExpr& head,
+                                                     const HirExpr& tail,
+                                                     Span span) {
+    const auto keep = [&](const HirExpr& value) -> HirExpr* {
+        if (!owner.exprs.push(value)) return nullptr;
+        return &owner.exprs[owner.exprs.len - 1];
+    };
+    HirExpr* initializer = keep(head);
+    if (!initializer) return frontend_error(FrontendError::OutOfMemory, span);
+    HirExpr reference = head;
+    reference.kind = HirExprKind::BoundValue;
+    reference.lhs = initializer;
+    reference.rhs = nullptr;
+    reference.args.len = 0;
+    reference.field_inits.len = 0;
+    HirExpr code{};
+    code.kind = HirExprKind::IntLit;
+    code.type = HirTypeKind::I32;
+    code.int_value = kWsLifecycleContinue;
+    HirExpr test{};
+    test.kind = HirExprKind::Eq;
+    test.type = HirTypeKind::Bool;
+    test.span = span;
+    test.lhs = keep(reference);
+    test.rhs = keep(code);
+    if (!test.lhs || !test.rhs) return frontend_error(FrontendError::OutOfMemory, span);
+    HirExpr choice{};
+    choice.kind = HirExprKind::IfElse;
+    choice.type = HirTypeKind::I32;
+    choice.span = span;
+    choice.lhs = keep(test);
+    choice.rhs = keep(tail);
+    HirExpr* retained = keep(reference);
+    if (!choice.lhs || !choice.rhs || !retained || !choice.args.push(retained))
+        return frontend_error(FrontendError::OutOfMemory, span);
+    HirExpr sequence{};
+    sequence.kind = HirExprKind::LetIn;
+    sequence.type = HirTypeKind::I32;
+    sequence.span = span;
+    sequence.lhs = initializer;
+    sequence.rhs = keep(choice);
+    if (!sequence.rhs) return frontend_error(FrontendError::OutOfMemory, span);
+    return sequence;
+}
+
 static bool uses_lexical_values(const HirRoute* route) {
     return route != nullptr && (route->is_ws_callback || route->is_lexical_helper);
 }
@@ -6691,7 +6742,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             // Binding references are still in lexical scope here. Validate
             // phase before folding; receiver lowering is checked after the
             // whole scoped value tree has been normalized into its owner.
-            if (const HirExpr* bad = ws_general_disallowed_value(result.value(), 0, false))
+            if (const HirExpr* bad = ws_general_disallowed_value(
+                    result.value(), 0, false, scratch->ws_callback_phase))
                 return frontend_error(FrontendError::UnsupportedSyntax, bad->span);
         }
 #endif
@@ -6744,17 +6796,46 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
     };
 
 #if RUT_ENABLE_WEBSOCKET
+    if (stmt.kind == AstStmtKind::ReturnVoid && scratch->is_ws_callback &&
+        scratch->ws_callback_phase != WsCallbackPhase::Message) {
+        HirExpr value{};
+        value.kind = HirExprKind::IntLit;
+        value.type = HirTypeKind::I32;
+        value.int_value = static_cast<u8>(WsVerdict::Drop);
+        value.span = stmt.span;
+        return value;
+    }
     if (stmt.kind == AstStmtKind::Expr && scratch->is_ws_callback) {
         const AstExpr& call = stmt.expr;
+        if (scratch->ws_callback_phase != WsCallbackPhase::Message &&
+            call.kind == AstExprKind::MethodCall && call.name.eq(lit_str("set")) && call.lhs &&
+            call.lhs->kind == AstExprKind::Ident &&
+            !user_bound_ident_name(mod, locals, local_count, binding, call.lhs->name)) {
+            for (u32 i = 0; i < mod.caches.len; ++i) {
+                if (!mod.caches[i].name.eq(call.lhs->name)) continue;
+                AstStatement effect{};
+                effect.kind = AstStmtKind::Block;
+                effect.span = stmt.span;
+                AstStatement atom = stmt;
+                if (!effect.block_stmts.push(&atom))
+                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                return analyze_function_body_stmt(
+                    effect, scratch, mod, locals, local_count, binding, false);
+            }
+        }
         if (call.kind != AstExprKind::MethodCall || call.lhs == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, call.span);
         auto receiver = analyze_function_expr(*call.lhs, locals, local_count, binding);
         if (!receiver) return core::make_unexpected(receiver.error());
         auto current = normalize_expr(receiver.value(), scratch->exprs, locals, local_count, 1);
         if (!current) return core::make_unexpected(current.error());
+        const bool kMessage = scratch->ws_callback_phase == WsCallbackPhase::Message &&
+                              current->type == HirTypeKind::WebSocketMessage;
+        const bool kOpen = scratch->ws_callback_phase == WsCallbackPhase::Open &&
+                           current->type == HirTypeKind::WebSocketConnection &&
+                           call.name.eq(lit_str("close"));
         if (current->kind != HirExprKind::LocalRef || current->local_index != 0 ||
-            current->type != HirTypeKind::WebSocketMessage || current->may_nil ||
-            current->may_error)
+            (!kMessage && !kOpen) || current->may_nil || current->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, call.span);
         HirExpr verdict{};
         verdict.kind = HirExprKind::IntLit;
@@ -7276,8 +7357,18 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                       const HirLocal* cur_locals,
                                       u32 cur_local_count,
                                       bool cur_allow_respond_guards) -> FrontendResult<HirExpr> {
-            if (si >= stmt.block_stmts.len)
+            if (si >= stmt.block_stmts.len) {
+                if (scratch->is_ws_callback &&
+                    scratch->ws_callback_phase != WsCallbackPhase::Message) {
+                    HirExpr done{};
+                    done.kind = HirExprKind::IntLit;
+                    done.type = HirTypeKind::I32;
+                    done.int_value = kWsLifecycleContinue;
+                    done.span = stmt.span;
+                    return done;
+                }
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            }
             auto analyze_block_expr =
                 [&](const AstExpr& expr,
                     const HirLocal* expr_locals,
@@ -7290,7 +7381,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             };
             const auto& inner = *stmt.block_stmts[si];
             const bool is_last = si + 1 == stmt.block_stmts.len;
-            if (inner.kind == AstStmtKind::Let && !is_last) {
+            const bool kLifecycle =
+                scratch->is_ws_callback && scratch->ws_callback_phase != WsCallbackPhase::Message;
+            if (inner.kind == AstStmtKind::Let && (!is_last || kLifecycle)) {
 #if RUT_ENABLE_WEBSOCKET
                 if (scratch->is_ws_callback &&
                     (inner.name.eq(lit_str("json")) ||
@@ -7380,9 +7473,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 evaluated.field_inits.len = 0;
                 return evaluated;
             }
-            if (scratch->is_ws_callback && inner.kind == AstStmtKind::Expr && !is_last &&
-                inner.expr.kind == AstExprKind::MethodCall && inner.expr.name.eq(lit_str("set")) &&
-                inner.expr.lhs && inner.expr.lhs->kind == AstExprKind::Ident &&
+            if (scratch->is_ws_callback && inner.kind == AstStmtKind::Expr &&
+                (!is_last || kLifecycle) && inner.expr.kind == AstExprKind::MethodCall &&
+                inner.expr.name.eq(lit_str("set")) && inner.expr.lhs &&
+                inner.expr.lhs->kind == AstExprKind::Ident &&
                 !user_bound_ident_name(
                     mod, cur_locals, cur_local_count, binding, inner.expr.lhs->name)) {
                 bool cache_receiver = false;
@@ -7568,7 +7662,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         self, si + 1, next_locals, cur_local_count, cur_allow_respond_guards);
                 }
             }
-            if (inner.kind == AstStmtKind::Guard && !is_last) {
+            if (inner.kind == AstStmtKind::Guard && (!is_last || kLifecycle)) {
                 auto bound = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
 #if RUT_ENABLE_WEBSOCKET
@@ -7741,6 +7835,28 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 return finish_message_initializer(initializer_key, out, inner.span);
             }
+            if (kLifecycle && (inner.kind == AstStmtKind::Match ||
+                               (inner.kind == AstStmtKind::If && inner.then_stmt))) {
+                AstStatement empty{};
+                empty.kind = AstStmtKind::Block;
+                empty.span = inner.span;
+                AstStatement choice = inner;
+                if (choice.kind == AstStmtKind::If && !choice.else_stmt) choice.else_stmt = &empty;
+                auto branch = analyze_function_body_stmt(
+                    choice, scratch, mod, cur_locals, cur_local_count, binding, false);
+                if (!branch) return core::make_unexpected(branch.error());
+                auto tail =
+                    self(self, si + 1, cur_locals, cur_local_count, cur_allow_respond_guards);
+                if (!tail) return core::make_unexpected(tail.error());
+                return ws_lifecycle_sequence(*scratch, branch.value(), tail.value(), inner.span);
+            }
+            if (kLifecycle && inner.kind == AstStmtKind::ReturnVoid)
+                return analyze_function_body_stmt(
+                    inner, scratch, mod, cur_locals, cur_local_count, binding, false);
+            if (kLifecycle && inner.kind == AstStmtKind::Expr &&
+                inner.expr.kind == AstExprKind::MethodCall && inner.expr.name.eq(lit_str("close")))
+                return analyze_function_body_stmt(
+                    inner, scratch, mod, cur_locals, cur_local_count, binding, false);
             if (scratch->is_ws_callback && !is_last && inner.kind == AstStmtKind::If &&
                 inner.else_stmt == nullptr && inner.then_stmt != nullptr) {
                 // An early terminal branch resumes at the following statements
@@ -7933,7 +8049,8 @@ static FrontendResult<HirExpr> analyze_ws_value(const AstExpr& expr,
 
 static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
                                                   u32 depth,
-                                                  bool validate_receivers) {
+                                                  bool validate_receivers,
+                                                  WsCallbackPhase phase) {
     if (depth > 128) return &expr;
     // The initializer is checked at LetIn, not again for every reference.
     // Following reference edges here would expand a shared lexical graph.
@@ -7942,37 +8059,26 @@ static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
          expr.kind != HirExprKind::ConstMethod) ||
         expr.kind == HirExprKind::WaitResult || expr.kind == HirExprKind::WaitField)
         return &expr;
-    if (validate_receivers && expr.kind == HirExprKind::WsMessageField) {
-        const HirExpr* receiver = expr.lhs;
-        if (receiver && receiver->type == HirTypeKind::WebSocketConnection) {
-            if (receiver->kind != HirExprKind::WsMessageField ||
-                !receiver->str_value.eq(lit_str("connection")) || receiver->may_nil ||
-                receiver->may_error)
-                return &expr;
-            receiver = receiver->lhs;
-        }
-        if (!receiver || receiver->kind != HirExprKind::LocalRef || receiver->local_index != 0 ||
-            receiver->type != HirTypeKind::WebSocketMessage || receiver->may_nil ||
-            receiver->may_error)
-            return &expr;
-    }
+    if (validate_receivers && expr.kind == HirExprKind::WsMessageField &&
+        !ws_projection_receiver_valid(expr, phase))
+        return &expr;
     if (expr.lhs != nullptr)
         if (const HirExpr* bad =
-                ws_general_disallowed_value(*expr.lhs, depth + 1, validate_receivers))
+                ws_general_disallowed_value(*expr.lhs, depth + 1, validate_receivers, phase))
             return bad;
     if (expr.rhs != nullptr)
         if (const HirExpr* bad =
-                ws_general_disallowed_value(*expr.rhs, depth + 1, validate_receivers))
+                ws_general_disallowed_value(*expr.rhs, depth + 1, validate_receivers, phase))
             return bad;
     for (u32 i = 0; i < expr.args.len; ++i)
         if (expr.args[i] != nullptr)
-            if (const HirExpr* bad =
-                    ws_general_disallowed_value(*expr.args[i], depth + 1, validate_receivers))
+            if (const HirExpr* bad = ws_general_disallowed_value(
+                    *expr.args[i], depth + 1, validate_receivers, phase))
                 return bad;
     for (u32 i = 0; i < expr.field_inits.len; ++i)
         if (expr.field_inits[i].value != nullptr)
             if (const HirExpr* bad = ws_general_disallowed_value(
-                    *expr.field_inits[i].value, depth + 1, validate_receivers))
+                    *expr.field_inits[i].value, depth + 1, validate_receivers, phase))
                 return bad;
     return nullptr;
 }
@@ -11078,6 +11184,26 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         auto base = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!base) return core::make_unexpected(base.error());
 #if RUT_ENABLE_WEBSOCKET
+        if (base->type == HirTypeKind::WebSocketClose) {
+            if (base->may_nil || base->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (expr.name.eq(lit_str("code")) || expr.name.eq(lit_str("upstreamCode")))
+                out.type = HirTypeKind::I32;
+            else if (expr.name.eq(lit_str("reason")) || expr.name.eq(lit_str("upstreamReason")))
+                out.type = HirTypeKind::Str;
+            else if (expr.name.eq(lit_str("wasClean")))
+                out.type = HirTypeKind::Bool;
+            else if (expr.name.eq(lit_str("connection")))
+                out.type = HirTypeKind::WebSocketConnection;
+            else
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            out.kind = HirExprKind::WsMessageField;
+            out.str_value = expr.name;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
         if (base->type == HirTypeKind::WebSocketConnection) {
             if (base->may_nil || base->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -16653,6 +16779,71 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             if (!scope.locals.push(captured))
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
         }
+        const auto analyze_hook = [&](const AstStatement* body,
+                                      Str name,
+                                      WsCallbackPhase phase,
+                                      u32& root) -> FrontendResult<void> {
+            if (!body) return {};
+            WsCallbackScope hook{};
+            hook.route->is_ws_callback = true;
+            hook.route->ws_callback_phase = phase;
+            hook.route->ws_handler.max_message_size = route->ws_handler.max_message_size;
+            HirLocal input{};
+            input.name = name;
+            input.type = phase == WsCallbackPhase::Open ? HirTypeKind::WebSocketConnection
+                                                        : HirTypeKind::WebSocketClose;
+            input.init.kind = HirExprKind::LocalRef;
+            input.init.type = input.type;
+            if (!hook.locals.push(input))
+                return frontend_error(FrontendError::TooManyItems, body->span);
+            for (u32 i = 1; i < scope.locals.len; ++i) {
+                if (scope.locals[i].name.eq(name)) continue;
+                HirLocal captured = scope.locals[i];
+                captured.ref_index = hook.locals.len;
+                if (!hook.locals.push(captured))
+                    return frontend_error(FrontendError::TooManyItems, body->span);
+            }
+            if (hook.locals.len > HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, body->span);
+            auto value = analyze_function_body_stmt(
+                *body, hook.route.get(), mod, hook.locals.data, hook.locals.len, nullptr, false);
+            if (!value) return core::make_unexpected(value.error());
+            HirExpr finished{};
+            finished.kind = HirExprKind::IntLit;
+            finished.type = HirTypeKind::I32;
+            finished.int_value = static_cast<u8>(WsVerdict::Drop);
+            auto sequenced =
+                ws_lifecycle_sequence(*hook.route, value.value(), finished, body->span);
+            if (!sequenced) return core::make_unexpected(sequenced.error());
+            value = sequenced;
+            HirLocal all_locals[HirRoute::kMaxLocals * 2]{};
+            u32 count = 0;
+            for (u32 i = 0; i < hook.locals.len; ++i) all_locals[count++] = hook.locals[i];
+            for (u32 i = 0; i < hook.route->locals.len; ++i)
+                all_locals[count++] = hook.route->locals[i];
+            auto normalized = normalize_expr(value.value(), route->exprs, all_locals, count, 1);
+            if (!normalized) return core::make_unexpected(normalized.error());
+            if (normalized->type != HirTypeKind::I32 || normalized->may_nil ||
+                normalized->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, body->span);
+            if (const HirExpr* bad =
+                    ws_general_disallowed_value(normalized.value(), 0, true, phase))
+                return frontend_error(FrontendError::UnsupportedSyntax, bad->span);
+            root = route->exprs.len;
+            if (!route->exprs.push(normalized.value()))
+                return frontend_error(FrontendError::OutOfMemory, body->span);
+            return {};
+        };
+        auto opened = analyze_hook(stmt.ws_open_body,
+                                   stmt.ws_open_parameter,
+                                   WsCallbackPhase::Open,
+                                   route->ws_handler.open_body_expr);
+        if (!opened) return opened;
+        auto closed = analyze_hook(stmt.ws_close_body,
+                                   stmt.ws_close_parameter,
+                                   WsCallbackPhase::Close,
+                                   route->ws_handler.close_body_expr);
+        if (!closed) return closed;
         const HirWsHandler kHandler = route->ws_handler;
         const u32 kExprCount = route->exprs.len;
         const u32 kCaptureCount = scope.locals.len;

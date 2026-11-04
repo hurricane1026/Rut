@@ -1,6 +1,7 @@
 #include "rut/serve_loader.h"
 
 #include "rut/common/types.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -306,9 +307,9 @@ bool load_rut_program(const char* path,
         for (u32 i = 0; i < ir.hir->routes.len; i++) {
             const HirWsHandler& h = ir.hir->routes[i].ws_handler;
             if (!ir.hir->routes[i].is_ws_terminate) continue;
-            if (h.general_body_expr != 0xffffffffu) {
+            const auto kEmitCallback = [&](u32 root, WsCallbackPhase phase) -> bool {
                 const HirRoute& source_route = ir.hir->routes[i];
-                if (h.general_body_expr >= source_route.exprs.len) {
+                if (root >= source_route.exprs.len) {
                     jit::dispose_module(cg.mod, cg.ctx);
                     return false;
                 }
@@ -320,13 +321,14 @@ bool load_rut_program(const char* path,
                 callback->path = source_route.path;
                 callback->method = source_route.method;
                 callback->is_ws_callback = true;
+                callback->ws_callback_phase = phase;
                 callback->span = h.span;
                 HirLocal result{};
                 result.type = HirTypeKind::I32;
                 result.ref_index = 0;
                 result.is_runtime_synthetic = true;
                 result.span = h.span;
-                result.init = source_route.exprs[h.general_body_expr];
+                result.init = source_route.exprs[root];
                 if (!callback->locals.push(result)) {
                     jit::dispose_module(cg.mod, cg.ctx);
                     return false;
@@ -354,12 +356,23 @@ bool load_rut_program(const char* path,
                     return false;
                 }
                 err.stage = LoadStage::Codegen;
-                const bool kEmitted = jit::emit_ws_body(cg.mod, cg.ctx, callback_rir.module, ws_n);
+                const bool kEmitted =
+                    jit::emit_ws_body(cg.mod, cg.ctx, callback_rir.module, ws_n, phase);
                 callback_rir.destroy();
                 if (!kEmitted) {
                     jit::dispose_module(cg.mod, cg.ctx);
                     return false;
                 }
+                return true;
+            };
+            if (h.open_body_expr != 0xffffffffu &&
+                !kEmitCallback(h.open_body_expr, WsCallbackPhase::Open))
+                return false;
+            if (h.close_body_expr != 0xffffffffu &&
+                !kEmitCallback(h.close_body_expr, WsCallbackPhase::Close))
+                return false;
+            if (h.general_body_expr != 0xffffffffu) {
+                if (!kEmitCallback(h.general_body_expr, WsCallbackPhase::Message)) return false;
                 ++ws_n;
                 continue;
             }
@@ -607,6 +620,19 @@ bool load_rut_program(const char* path,
                     forward_text_count,
                     subprotocol))
                 return false;
+            auto& attached = out.config.routes[http_route_ordinal];
+            if (route.ws_handler.open_body_expr != 0xffffffffu) {
+                jit::format_ws_callback_symbol(ws_n, WsCallbackPhase::Open, sym, sizeof(sym));
+                attached.ws_open_handler =
+                    reinterpret_cast<WsMessageHandlerFn>(out.engine.lookup(sym));
+                if (!attached.ws_open_handler) return false;
+            }
+            if (route.ws_handler.close_body_expr != 0xffffffffu) {
+                jit::format_ws_callback_symbol(ws_n, WsCallbackPhase::Close, sym, sizeof(sym));
+                attached.ws_close_handler =
+                    reinterpret_cast<WsMessageHandlerFn>(out.engine.lookup(sym));
+                if (!attached.ws_close_handler) return false;
+            }
             ws_n++;
             http_route_ordinal++;
         }

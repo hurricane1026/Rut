@@ -15,7 +15,7 @@ does not turn target syntax into supported syntax. The language card and
 - [ ] General message expressions, local evaluation and control flow through the
   normal compiler; preserve short-circuit, optional/error and helper semantics.
 - [ ] General bounded Text/Binary output with owned asynchronous send storage.
-- [ ] Connection and close context with explicit callback/session lifetimes.
+- [x] Connection and close context with explicit callback/session lifetimes.
 - [ ] RFC 7692 compression negotiation and bounded encode/decode resources.
 - [ ] Bounded messages beyond a single I/O slice, backpressure and cancellation.
 - [ ] Interoperability and malformed-input validation for both Linux backends,
@@ -86,10 +86,17 @@ separately from send completion, with local closing Ping/Pong handling and one
 fixed deadline. Downstream FIN is independent of upstream progress. TLS now
 flushes local close_notify before FIN using existing output ownership, with
 strict source/native wire tests and bounded failure/cancellation handling.
-Lifecycle callbacks remain open.
+Lifecycle callbacks now have synchronous open/close entries, described below.
 
 The runtime now retains each leg's first received Close status/reason separately
 from local closing policy, including empty (1005) and absent (1006) cases.
 Pre-teardown cleanup borrows this owned metadata; inspector reset and deferred
-sends cannot overwrite it. This is the runtime foundation for close context;
-language lifecycle callbacks remain pending.
+sends cannot overwrite it. Synchronous `onOpen` and `onClose` trailing closures now expose the connection
+and close contexts through ordinary helper/guard/if/match/Cache/time analysis.
+Open runs before buffered messages; close runs once before terminal resource
+retirement. Only open can initiate closing; hooks cannot forward data or yield.
+AST/HIR ownership transfers, phase errors, linear sequential control flow and
+runtime ordering are exercised in `test_ws_lifecycle` and
+`test_ws_shutdown_deadline`. Source/native × epoll/io_uring wire tests observe
+hook effects through ordinary HTTP Cache reads, including TLS. RFC 7692 and
+messages beyond one slice remain required.

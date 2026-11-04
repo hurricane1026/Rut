@@ -67,6 +67,8 @@ bool write_native_program(LoadedProgram& p, const char* output) {
     for (u32 i = 0; i < c.route_count; i++) {
         if (c.routes[i].fn) symbol_count++;
         if (c.routes[i].ws_frame_handler) symbol_count++;
+        if (c.routes[i].ws_open_handler) symbol_count++;
+        if (c.routes[i].ws_close_handler) symbol_count++;
     }
     const u32 kEbpfBytes = p.has_ebpf_plan ? sizeof(ebpf::Plan) : 0;
     u64 size = kEbpfBytes + sizeof(native::Header) + sizeof(RouteEntry) * c.route_count +
@@ -164,6 +166,14 @@ bool write_native_program(LoadedProgram& p, const char* output) {
                 if (c.routes[j].ws_frame_handler) id++;
             jit::format_ws_handler_symbol(id, name, sizeof(name));
             add_symbol(reinterpret_cast<const void*>(&route.ws_frame_handler), name);
+            if (route.ws_open_handler) {
+                jit::format_ws_callback_symbol(id, WsCallbackPhase::Open, name, sizeof(name));
+                add_symbol(reinterpret_cast<const void*>(&route.ws_open_handler), name);
+            }
+            if (route.ws_close_handler) {
+                jit::format_ws_callback_symbol(id, WsCallbackPhase::Close, name, sizeof(name));
+                add_symbol(reinterpret_cast<const void*>(&route.ws_close_handler), name);
+            }
         }
     }
     for (u32 i = 0; i < c.timer_count; i++) {

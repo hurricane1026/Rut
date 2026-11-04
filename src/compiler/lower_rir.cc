@@ -1810,6 +1810,16 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             field = WsMessageFieldId::ConnectionIsTls;
         else if (value.str_value.eq(lit_str("subprotocol")))
             field = WsMessageFieldId::ConnectionSubprotocol;
+        else if (value.str_value.eq(lit_str("code")))
+            field = WsMessageFieldId::CloseCode;
+        else if (value.str_value.eq(lit_str("reason")))
+            field = WsMessageFieldId::CloseReason;
+        else if (value.str_value.eq(lit_str("upstreamCode")))
+            field = WsMessageFieldId::CloseUpstreamCode;
+        else if (value.str_value.eq(lit_str("upstreamReason")))
+            field = WsMessageFieldId::CloseUpstreamReason;
+        else if (value.str_value.eq(lit_str("wasClean")))
+            field = WsMessageFieldId::CloseWasClean;
         else
             return frontend_error(FrontendError::UnsupportedSyntax, span);
         const bool kBool = ws_message_field_is_bool(field);

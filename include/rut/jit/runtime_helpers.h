@@ -319,6 +319,10 @@ rut::u32 rut_helper_ws_forward(void* conn, const char* payload, rut::u32 len, ru
 rut::u32 rut_helper_ws_close(void* conn, rut::i32 code, const char* reason, rut::u32 len);
 // Downstream connection metadata, borrowed only during the synchronous message callback.
 rut::u32 rut_helper_ws_connection_scalar(void* conn, rut::u32 field);
+void rut_helper_ws_close_reason(void* conn,
+                                rut::u32 field,
+                                const char** out_ptr,
+                                rut::u32* out_len);
 void rut_helper_ws_connection_subprotocol(void* conn, const char** out_ptr, rut::u32* out_len);
 
 // Validate a bounded complete JSON payload without publishing a document or allocating.

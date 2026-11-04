@@ -365,7 +365,14 @@ TEST(jit, websocket_message_inputs_reuse_general_expression_codegen) {
                     : field == WsMessageFieldId::ConnectionRemoteAddr  ? 1u
                     : field == WsMessageFieldId::ConnectionRemotePort  ? 43210u
                     : field == WsMessageFieldId::ConnectionSubprotocol ? 7u
-                                                                       : 1u;
+                    : field == WsMessageFieldId::CloseCode ||
+                            field == WsMessageFieldId::CloseUpstreamCode
+                        ? 1006u
+                    : field == WsMessageFieldId::CloseReason ||
+                            field == WsMessageFieldId::CloseUpstreamReason ||
+                            field == WsMessageFieldId::CloseWasClean
+                        ? 0u
+                        : 1u;
                 auto result = HandlerResult::unpack(handler(
                     connection.get(), nullptr, bytes, sizeof(bytes), nullptr, opcode, client));
                 CHECK_EQ(result.status_code, 200u + expected);
