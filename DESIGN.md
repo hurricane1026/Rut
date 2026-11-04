@@ -2616,18 +2616,19 @@ regex metacharacters or normalize Unicode. Dynamic arguments and interpolation
 remain unsupported.
 The HTTP route prelude before a terminating `websocket(...) { message in ... }`
 runs as the ordinary request JIT handler before its final direct forward to the
-same WebSocket upstream. It permits immutable compile-time `let` bindings and
-up to eight bounded top-level request guards with static local failure
-responses. Guard-let bindings are visible only to subsequent HTTP guards and
-cannot be captured by the separate message handler or its rewrite expressions.
-Only existing request reads, literals, earlier bindings, comparisons, boolean
-operators, and `.or(literal)` are admitted. Helpers, effects, body reads,
-mutation, waits, loops, conditionals, decorators and chains remain compile-time
-errors until there is an execution path that can preserve their semantics. The
-four message conditional clauses remain independent. Bare `websocket(upstream)` passthrough
-routes remain ordinary HTTP routes and retain their normal guards and
-decorators. Origin is enforced only when a route adds a corresponding request
-guard; terminate mode does not add implicit Origin validation.
+same WebSocket upstream. It uses ordinary request expressions, locals, helpers,
+JSON/regex, guards, effects, waits and route decorators with their
+existing ordering and limits. `chain before` steps participate in that admission
+path. A rejection returns locally without opening the WebSocket upstream.
+The callback declaration must be the route's final top-level statement; nested
+callback declarations and `chain after` response effects remain unsupported.
+HTTP values cannot be captured by the separate message callback; compile-time
+constants alone may cross the upgrade boundary. Message helper purity is checked
+only in the callback's analyzer scope, not in the enclosing HTTP route. The four
+message conditional clauses remain independent of HTTP guard capacity. Origin is
+enforced only when the route adds a request guard; terminate mode does not add
+implicit Origin validation. Strict opening-handshake validation still runs before
+the resulting WebSocket forward, including when admission mutates request headers.
 The DSL exposes complete Text/Binary messages. Wire opcodes, FIN, masking,
 continuation frames and Ping/Pong/Close frames are runtime-internal details.
 The legacy `frame` binding and `.opcode` access are rejected; message type

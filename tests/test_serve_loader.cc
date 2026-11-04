@@ -4404,24 +4404,26 @@ TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific
 }
 
 #if RUT_ENABLE_WEBSOCKET
-TEST(serve_loader, websocket_terminate_rejects_effectful_http_guard) {
+TEST(serve_loader, websocket_terminate_admission_accepts_normal_helper_guard) {
     const std::string dir = "/tmp/rut_serve_loader_ws_prelude";
     const std::string path =
         write_file(dir,
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
                    "func allowed() -> bool => true\n"
-                   "route GET \"/ws\" { guard allowed() else { return 403 }\n"
+                   "chain secure { before allowed() else 403 }\n"
+                   "@rateLimit(limit: 10, window: 1m)\n"
+                   "route GET \"/ws\" use chain secure { guard allowed() else { return 403 }\n"
                    "return websocket(backend) { message in message.forward() } }\n");
     LoadedProgram program;
     LoadError err;
-    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
-    CHECK(err.stage == LoadStage::Analyze);
-    CHECK(err.has_diag);
-    CHECK(err.diag.detail.eq(lit_str(
-        "WebSocket message routes allow only compile-time constant lets and bounded request "
-        "guards before websocket; effects are not executed")));
-    CHECK_EQ(program.config.route_count, 0u);
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 1u);
+    CHECK(program.config.routes[0].ws_terminate);
+    CHECK_EQ(program.config.routes[0].rate_limit.count, 1u);
+    CHECK(program.config.routes[0].action == RouteAction::JitHandler);
+    CHECK(program.config.routes[0].fn != nullptr);
+    CHECK(program.config.routes[0].ws_frame_handler != nullptr);
     program.destroy();
 }
 

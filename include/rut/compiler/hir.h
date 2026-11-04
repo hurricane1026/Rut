@@ -1313,6 +1313,9 @@ struct HirRoute {
     // Direct ForwardUpstream to the configured WebSocket backend; `ws_handler`
     // separately carries the post-101 message verdict handler.
     bool is_ws_terminate = false;
+    // Analyzer-only scratch scope for synchronous message expressions. HTTP
+    // admission on a terminate route retains ordinary helper/effect semantics.
+    bool is_ws_callback = false;
     HirWsHandler ws_handler{};
     // Timer route: the body is a `timer name, every: D {...}` background periodic
     // task, not an HTTP route. `path` holds the timer name; `timer_interval_ms`
@@ -1343,6 +1346,7 @@ struct HirRoute {
           throttle_down_bps(other.throttle_down_bps),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
+          is_ws_callback(other.is_ws_callback),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
@@ -1369,6 +1373,7 @@ struct HirRoute {
         throttle_down_bps = other.throttle_down_bps;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
+        is_ws_callback = other.is_ws_callback;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
@@ -1395,6 +1400,7 @@ struct HirRoute {
           throttle_down_bps(other.throttle_down_bps),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
+          is_ws_callback(other.is_ws_callback),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
@@ -1421,6 +1427,7 @@ struct HirRoute {
         throttle_down_bps = other.throttle_down_bps;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
+        is_ws_callback = other.is_ws_callback;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;

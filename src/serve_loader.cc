@@ -248,23 +248,16 @@ bool load_rut_program(const char* path,
     }
     ir.hir = hir.value();
 #if RUT_ENABLE_WEBSOCKET
-    constexpr Str kWsPreludeDetail = lit_str(
-        "WebSocket message routes allow only compile-time constant lets and bounded request guards "
-        "before websocket; effects are not executed");
-    // Keep a cheap publication boundary in the loader too: route effects and control flow that
-    // cannot be executed by the ordinary HTTP handler must not be silently omitted.
+    // Admission is already lowered through the ordinary HTTP handler. Keep
+    // the ownership invariant at publication, without excluding its effects,
+    // guard values, scheduling or registered route metadata.
     for (u32 i = 0; i < ir.hir->routes.len; i++) {
         const HirRoute& route = ir.hir->routes[i];
         if (!route.is_ws_terminate) continue;
-        if (route.waits.len != 0 || route.for_loops.len != 0 ||
-            route.control.kind != HirControlKind::Direct || route.decorators.len != 0 ||
-            route.rate_limit.count != 0 || route.throttle_down_bps != 0 ||
-            route.http_cache_ttl != 0) {
-            err.stage = LoadStage::Analyze;
-            set_load_diag(
-                err, Diagnostic{FrontendError::UnsupportedSyntax, route.span, kWsPreludeDetail});
+        if (route.is_ws_callback || route.control.kind != HirControlKind::Direct ||
+            route.control.direct_term.kind != HirTerminatorKind::ForwardUpstream ||
+            route.control.direct_term.upstream_index != route.ws_handler.upstream_index)
             return false;
-        }
     }
 #endif
     AccessLogSinkSpec loaded_access_log{};

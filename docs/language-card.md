@@ -970,14 +970,13 @@ func isTextKind(_ kind: WebSocketMessageKind) -> bool => kind == WebSocketMessag
 // Inside the callback: guard isTextKind(message.kind) else { message.drop() }
 func isMarker(_ bytes: Bytes) -> bool => bytes.count == 2 && bytes == b"\x00\xff"
 // Inside the callback: guard isMarker(message.payload) else { message.drop() }
-// A terminate route can run up to eight existing top-level HTTP guards before
-// websocket. These request reads and static failure responses run in the
-// ordinary JIT handler before it connects to the WebSocket upstream. A
-// guard-let binding is visible to later HTTP guards only; it cannot be captured
-// by the separate message handler. Only compile-time lets and bounded request
-// guards are supported here; helpers, effects, body reads, mutation, waits,
-// loops, conditionals, decorators, and chains remain rejected. Bare websocket
-// passthrough routes continue through the ordinary HTTP route pipeline.
+// A terminate route runs the ordinary HTTP admission pipeline before its final
+// top-level websocket declaration: request lets/guards/helpers, JSON, regex,
+// effects, waits, decorators and chain-before use ordinary route
+// semantics and limits. Rejection returns locally before connecting to the
+// WebSocket upstream. Runtime HTTP bindings cannot be captured by the separate
+// message callback; only compile-time constants cross the upgrade boundary.
+// Nested websocket callbacks and chain-after Response mutations remain rejected.
 guard let origin = req.uniqueHeader("Origin") else { return 403 }
 guard origin == "https://allowed.example" else { return 403 }
 return websocket(chat) { message in

@@ -22,20 +22,30 @@ route GET "/ws" {
 
 A bare `websocket(chat)` remains a transparent tunnel. The trailing block opts
 into message inspection and its bounded buffering costs. Before the terminating
-statement, the route can use the existing bounded HTTP guards for request
-admission. These guards run before the JIT handler forwards to the WebSocket
-upstream; a failed guard returns its static local response without connecting.
-`guard let` bindings are available to later HTTP guards only and cannot be
-captured by the message handler or its rewrite expressions.
+statement, the route runs the ordinary HTTP admission pipeline. A failed guard
+returns its local response before opening the WebSocket upstream. Request lets,
+pure or effectful HTTP helpers, JSON and regex expressions, request mutations,
+and waits use the same checks, ordering and capacity limits as ordinary HTTP
+routes. The normal route decorators and `chain before` steps also
+remain attached to the HTTP handler. For example:
 
-This slice allows immutable compile-time `let` bindings and at most eight
-top-level request guards before one final `websocket(...)` statement. Guard
-conditions use existing request reads (`method`, `path`, `pathOnly`, headers,
-query, cookies and route parameters), literals, prior bindings, comparisons,
-boolean operators, and `.or(literal)`. Failure branches must return a static
-status or response. Helpers, effects, request body reads, mutation, waits,
-loops, conditionals, decorators and chains remain unsupported. The message
-handler retains its independent four-clause limit.
+```swift
+func allowed(_ origin: str) -> bool => origin.matches(re"^https://allowed[.]example$")
+route GET "/checked" {
+    req.set("X-Admission", "checked")
+    let candidate = req.uniqueHeader("Origin")
+    guard let origin = candidate else { return 403 }
+    guard allowed(origin) else { return 403 }
+    return websocket(chat) { msg in msg.forward() }
+}
+```
+
+One final top-level `websocket(...)` statement owns the post-upgrade callback.
+Nested callback declarations and `chain after` response mutations remain
+unsupported. HTTP bindings cannot be captured by the message handler or its
+rewrite expressions; only compile-time constant values cross that boundary.
+This prevents request-buffer and request-arena views from escaping their lifetime.
+The message handler retains its independent four-clause limit.
 
 The message callback receives a borrowed `WebSocketMessage`. Its Boolean
 fields are `fromClient`, `isText` and `isBinary`; `len` is an `i32` byte count

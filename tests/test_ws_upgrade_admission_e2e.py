@@ -1347,7 +1347,8 @@ def scenario(server, backend_kind, terminate, response, expected):
     return "pass", ""
 
 
-def admission_scenario(server, backend_kind):
+def admission_scenario(server, backend_kind, prelude=""):
+    """Admission may suspend before reaching the upgrade."""
     ws_backend = socket.socket()
     ws_backend.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ws_backend.bind(("127.0.0.1", 0))
@@ -1362,9 +1363,17 @@ def admission_scenario(server, backend_kind):
         f'listen 127.0.0.1:0\n'
         f'upstream ws at "127.0.0.1:{ws_backend.getsockname()[1]}"\n'
         f'upstream normal at "127.0.0.1:{normal_backend.getsockname()[1]}"\n'
+        'func allowed(_ origin: str) -> bool => origin.matches(re"^https://allowed[.]example$")\n'
         'route GET "/ws" {\n'
-        '  guard let origin = req.uniqueHeader("Origin") else { return 403 }\n'
-        '  guard origin == "https://allowed.example" else { return 403 }\n'
+        '  req.set("X-Admission", "checked")\n'
+        '  let candidate = req.uniqueHeader("Origin")\n'
+        '  guard let origin = candidate else { return response(403, body: "missing") }\n'
+        '  let accepted = allowed(origin)\n'
+        '  guard accepted else { return response(403, body: "denied") }\n'
+        '  guard req.bodyBytes.isEmpty else { return 400 }\n'
+        '  guard let doc = json.parse(req.query("policy").or("true")) else { return 400 }\n'
+        '  guard json.bool(doc).or(false) else { return 403 }\n'
+        + prelude +
         '  return websocket(ws) { message in\n'
         '    guard message.text != "DROP" else { message.drop() }\n'
         '    message.forward("REWRITTEN")\n'
@@ -1403,6 +1412,8 @@ def admission_scenario(server, backend_kind):
                 denied = recv_http_response(client)
                 if not denied.startswith(b"HTTP/1.1 403"):
                     raise AssertionError(f"{label} did not get local 403: {denied!r}")
+                if label == "wrong Origin" and not denied.endswith(b"denied"):
+                    raise AssertionError(f"denial body was lost: {denied!r}")
                 try:
                     peer, _ = ws_backend.accept()
                     peers.append(peer)
@@ -1475,6 +1486,8 @@ def admission_scenario(server, backend_kind):
             forwarded = recv_until(peer, b"\r\n\r\n")
             if b"Origin: https://allowed.example" not in forwarded:
                 raise AssertionError("allowed Origin was not preserved to upstream")
+            if b"X-Admission: checked\r\n".lower() not in forwarded.lower():
+                raise AssertionError(f"HTTP admission request mutation was lost: {forwarded!r}")
             peer.sendall(WS_RESPONSE_HEADERS)
             headers = recv_until(client, b"\r\n\r\n")
             if not headers.startswith(b"HTTP/1.1 101"):
@@ -2121,11 +2134,13 @@ def main():
             print(f"SKIP {backend}: {details.strip()}")
         else:
             print(f"PASS {backend} strict request shape / 400 / 426 / zero-connect")
-        status, details = admission_scenario(args.server, backend)
-        if status == "skip":
-            print(f"SKIP {backend}: {details.strip()}")
-        else:
-            print(f"PASS {backend} HTTP admission / zero-connect / keepalive / message rewrite")
+        for prelude in ("", "wait(1)\n"):
+            status, details = admission_scenario(args.server, backend, prelude)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} HTTP admission / zero-connect / keepalive / "
+                      f"message rewrite prelude={prelude.strip()!r}")
         status, details = tls_passthrough_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")

@@ -284,7 +284,7 @@ TEST(native_program, websocket_terminate_http_guards_and_dual_handlers_survive_s
     CHECK_EQ(allowed.upstream_id, route.upstream_id);
 }
 
-TEST(native_program, websocket_terminate_rejects_unsupported_http_prelude_before_publish) {
+TEST(native_program, websocket_terminate_http_helper_guard_survives_source_removal) {
     Source source;
     REQUIRE(source.fd >= 0);
     REQUIRE(
@@ -295,9 +295,15 @@ TEST(native_program, websocket_terminate_rejects_unsupported_http_prelude_before
     Program owner;
     REQUIRE(owner.p);
     char error[512]{};
-    CHECK_FALSE(load_native_program(source.path, *owner.p, error, sizeof(error), 2));
-    CHECK_EQ(owner.p->config.route_count, 0u);
-    CHECK_EQ(owner.p->library, nullptr);
+    REQUIRE(load_native_program(source.path, *owner.p, error, sizeof(error), 2));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 1u);
+    const auto& route = owner.p->config.routes[0];
+    CHECK(route.ws_terminate);
+    REQUIRE(route.fn);
+    REQUIRE(route.ws_frame_handler);
+    const auto allowed = invoke(route, "GET /ws HTTP/1.1\r\nHost: test\r\n\r\n");
+    CHECK(allowed.action == jit::HandlerAction::Forward);
 }
 
 TEST(native_program, websocket_dual_handlers_keep_mixed_http_timer_ordinals) {
