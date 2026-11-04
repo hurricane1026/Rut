@@ -323,8 +323,17 @@ TEST(jit, websocket_message_inputs_reuse_general_expression_codegen) {
         auto input = V(b.emit_ws_message_field(field));
         if (ws_message_field_is_string(field)) input = V(b.emit_str_length(input));
         if (field == WsMessageFieldId::ConnectionRemoteAddr) {
-            auto expected = V(b.emit_const_i32(0x01020304));
-            input = V(b.emit_cmp(Opcode::CmpEq, input, expected));
+            CHECK(fn->values[input.id].type->kind == TypeKind::IP);
+            tc.mod.cache_instance_count = 1;
+            tc.mod.cache_instances[0] = {lit("input_fields"), 64};
+            const u32 caps[] = {64};
+            const u64 names[] = {cache_instance_identity("input_fields", 12)};
+            cache_registry_publish(caps, names, 1);
+            rut_helper_cache_set(0, connection->peer_addr, 42);
+            auto value = V(b.emit_cache_get(0, input));
+            auto missing = V(b.emit_opt_is_nil(value));
+            auto no = V(b.emit_const_bool(false));
+            input = V(b.emit_cmp(Opcode::CmpEq, missing, no));
         }
         if (ws_message_field_is_bool(field) || field == WsMessageFieldId::ConnectionRemoteAddr) {
             auto yes = V(b.emit_const_i32(1));
@@ -1839,8 +1848,9 @@ route GET "/users" {
     REQUIRE(handler != nullptr);
 
     cache_registry_set_seed(0xB4A4C4u);
+    rut_helper_cache_reset_local_state();
     const u32 caps[1] = {1024};
-    const u64 idents[1] = {cache_instance_identity("branch-buckets", 14)};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
     cache_registry_publish(caps, idents, 1);
 
     Connection conn;
@@ -29755,4 +29765,87 @@ route GET "/" {
     }
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit, bound_cache_helpers_keep_declaration_identity_across_reload) {
+    rut_helper_cache_reset_local_state();
+    const u64 alpha = cache_instance_identity("alpha", 5);
+    const u64 beta = cache_instance_identity("beta", 4);
+    const u32 caps[] = {64, 64};
+    const u64 initial[] = {alpha, beta};
+    cache_registry_publish(caps, initial, 2);
+    constexpr u32 kKey = 0x01020304u;
+    rut_helper_cache_set_bound(0, alpha, kKey, 11);
+    rut_helper_cache_set_bound(1, beta, kKey, 22);
+    u8 has = 0;
+    i64 value = 0;
+    rut_helper_cache_get_bound(0, alpha, kKey, &has, &value);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(value, 11);
+
+    const u64 reordered[] = {beta, alpha};
+    cache_registry_publish(caps, reordered, 2);
+    // Reordering may evict old slots: this cache is deliberately lossy.
+    rut_helper_cache_set(0, kKey, 22);
+    rut_helper_cache_set(1, kKey, 11);
+    rut_helper_cache_get_bound(0, alpha, kKey, &has, &value);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(value, 11);
+    rut_helper_cache_set_bound(0, alpha, kKey, 33);
+    rut_helper_cache_get(0, kKey, &has, &value);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(value, 22);
+    rut_helper_cache_get(1, kKey, &has, &value);
+    CHECK_EQ(value, 33);
+
+    cache_registry_publish(caps, reordered, 1);  // alpha removed, beta still at slot 0
+    rut_helper_cache_set(0, kKey, 44);
+    rut_helper_cache_get_bound(0, alpha, kKey, &has, &value);
+    CHECK_EQ(has, 0);
+    CHECK_EQ(value, 0);
+    rut_helper_cache_set_bound(0, alpha, kKey, 99);
+    rut_helper_cache_get(0, kKey, &has, &value);
+    CHECK_EQ(value, 44);
+
+    cache_registry_publish(caps, reordered, 2);  // alpha is a fresh incarnation
+    rut_helper_cache_get_bound(0, alpha, kKey, &has, &value);
+    CHECK_EQ(has, 0);
+    rut_helper_cache_set_bound(0, alpha, kKey, 55);
+    rut_helper_cache_get(1, kKey, &has, &value);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(value, 55);
+    rut_helper_cache_get_bound(0, 0, kKey, &has, &value);
+    CHECK_EQ(has, 0);
+    CHECK_EQ(value, 0);
+    rut_helper_cache_reset_local_state();
+}
+
+TEST(jit, cache_codegen_requires_a_valid_declaration_binding) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("cache_binding"), lit("/"), 'G'));
+    auto block = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, block);
+    auto key = V(b.emit_req_remote_addr());
+    V(b.emit_cache_get(0, key));
+    VOK(b.emit_ret_status(200));
+    CHECK_FALSE(codegen(tc.mod).ok);  // no descriptor for the referenced declaration
+    tc.mod.cache_instance_count = 1;
+    tc.mod.cache_instances[0] = {lit("cache"), 64};
+    auto valid = codegen(tc.mod);
+    REQUIRE(valid.ok);
+    dispose_module(valid.mod, valid.ctx);
+    Instruction& access = fn->entry()->insts[1];
+    for (i32 index : {-1, 1, 100}) {
+        access.imm.i32_val = index;
+        CHECK_FALSE(codegen(tc.mod).ok);
+    }
+    access.imm.i32_val = 0;
+    tc.mod.cache_instances[0].name = {};
+    CHECK_FALSE(codegen(tc.mod).ok);
+    tc.mod.cache_instances[0].name = lit("a_name_that_exceeds_thirty_one_bytes");
+    CHECK_FALSE(codegen(tc.mod).ok);
+    tc.destroy();
 }

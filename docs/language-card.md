@@ -899,8 +899,11 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // Fallible helper values may be stored, aliased and recovered with guard let,
 // if let or .or(default). guard match handles named Error cases and requires
 // a final wildcard, as in HTTP. Unwrap before using a success value; nil and
-// Error stay distinct. Response/effect/yield helpers, cache work and
-// open/close event contexts still need integration. uuid() retains HTTP's
+// Error stay distinct. Cache<IP, i64> reads and bare writes work on the
+// callback shard, using connection.remoteAddr as a key. Writes run only at
+// reached statements, including selected branches; set is not an expression.
+// time.nowMicros() is latched once per message invocation. HTTP effects/yield
+// helpers and open/close event contexts still need integration. uuid() retains HTTP's
 // direct-let initializer restriction; failures are nil and must be unwrapped.
 //
 // JSON uses the same optional API as HTTP: parse/get/at/scalars/kind/count/keys,
@@ -1444,6 +1447,16 @@ route GET "/api" {
   `wait`/`wait any` reject every cache op, including ops textually before the
   wait; branch writes in static-for routes remain unsupported. Per-shard state:
   effective limits ≈ limit × shard count.
+- Synchronous WebSocket callbacks share this Cache API, including pure read
+  predicates accepting `IP`. Counter values keep inferred `i64` types; explicit
+  user `i64` annotations remain unsupported. Bare writes execute at their reached source
+  position, after successful guards and only on selected branches. Cache remains
+  lossy per-shard state; it does not retain connection/session objects.
+- Compiled reads/writes carry their declaration name identity across hot reload.
+  A moved declaration is resolved in the current registry snapshot; a removed
+  declaration reads as a miss and ignores writes. Old handlers cannot address
+  another named cache merely because its slot was reused. Moving/resizing a
+  declaration may discard entries, as with other cache eviction.
 
 ## Constant-time equality
 
@@ -1544,7 +1557,7 @@ jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
 time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
-         uses in one request see the same value)
+         uses in one request or message callback see the same value)
          — now()/time(s)/Duration arithmetic still ⏳
 math:    max(a, b) min(a, b) (integer builtins; imported lib/math.rut also
          provides generic math.min/max/clamp)

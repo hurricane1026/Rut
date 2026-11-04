@@ -390,6 +390,45 @@ def nominal_match_exchange(client, peer):
     expect(peer, (8, b"\x03\xe8", True))
 
 
+CACHE_DECLARATIONS = r"""
+let counts = Cache<IP, i64>(capacity: 64)
+func canAcceptMessage(_ key: IP) -> bool => counts.get(key).or(0) < 2
+"""
+CACHE_HANDLER = r"""
+return websocket(ws) { msg in
+    let tick = time.nowMicros()
+    let unused = sha256(msg.text)
+    guard tick == time.nowMicros() else { msg.close(1011) }
+    guard msg.text != "skip" else { msg.drop() }
+    let key = msg.connection.remoteAddr
+    let before = counts.get(key).or(0)
+    if msg.fromClient {
+        guard canAcceptMessage(key) else { msg.drop() }
+        counts.set(key, before + 1)
+        msg.forward()
+    } else {
+        if before == 2 { msg.forward("two") } else { msg.forward("other") }
+    }
+}
+"""
+
+
+def cache_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"cache message: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(1, b"skip") + masked_frame(2, b"\x00\xff")
+                   + masked_frame(1, b"two") + masked_frame(1, b"blocked")
+                   + masked_frame(9, b"PING"))
+    expect(peer, (2, b"\x00\xff", True))
+    expect(peer, (1, b"two", True))
+    expect(peer, (9, b"PING", True))
+    peer.sendall(b"\x81\x03one\x82\x03two")
+    expect(client, (1, b"two", False))
+    expect(client, (1, b"two", False))
+
+
 CONNECTION_DECLARATIONS = r"""
 func clientPeer(_ connection: WebSocketConnection) -> IP => connection.remoteAddr
 func connectionLabel(_ connection: WebSocketConnection) -> str {
@@ -2664,6 +2703,7 @@ def main():
                 (NOMINAL_MATCH_HANDLER, nominal_match_exchange, NOMINAL_MATCH_DECLARATIONS),
                 (ERROR_VALUE_HANDLER, error_value_exchange, ERROR_VALUE_DECLARATIONS),
                 (CONNECTION_HANDLER, connection_exchange, CONNECTION_DECLARATIONS),
+                (CACHE_HANDLER, cache_exchange, CACHE_DECLARATIONS),
                 (ERROR_MATCH_HANDLER, error_match_exchange, ERROR_MATCH_DECLARATIONS),
                 (ERROR_MATCH_HANDLER, error_match_exchange, ERROR_MATCH_IMPLICIT_DECLARATIONS),
                 (ERROR_FIELDS_HANDLER, error_fields_exchange, ERROR_FIELDS_DECLARATIONS),

@@ -6,6 +6,7 @@
 #include "rut/compiler/rir.h"
 #include "rut/compiler/verifier.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/ws_frame.h"
@@ -85,6 +86,7 @@ struct Ctx {
 
     // Current RIR function (set per-function, for type lookups).
     const rir::Function* cur_fn;
+    const rir::Module* source_module;
 
     // Function parameters (set per-function)
     LLVMValueRef param_conn;
@@ -532,22 +534,22 @@ struct Ctx {
         return fn_req_remote_addr;
     }
 
-    // void rut_helper_cache_get(i32, i32, ptr, ptr)
+    // void rut_helper_cache_get_bound(i32, i64 identity, i32, ptr, ptr)
     LLVMValueRef get_cache_get() {
         if (!fn_cache_get) {
-            LLVMTypeRef params[] = {i32_ty, i32_ty, ptr_ty, ptr_ty};
-            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
-            fn_cache_get = LLVMAddFunction(llvm_mod, "rut_helper_cache_get", ft);
+            LLVMTypeRef params[] = {i32_ty, i64_ty, i32_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 5, 0);
+            fn_cache_get = LLVMAddFunction(llvm_mod, "rut_helper_cache_get_bound", ft);
         }
         return fn_cache_get;
     }
 
-    // void rut_helper_cache_set(i32, i32, i64)
+    // void rut_helper_cache_set_bound(i32, i64 identity, i32, i64)
     LLVMValueRef get_cache_set() {
         if (!fn_cache_set) {
-            LLVMTypeRef params[] = {i32_ty, i32_ty, i64_ty};
-            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
-            fn_cache_set = LLVMAddFunction(llvm_mod, "rut_helper_cache_set", ft);
+            LLVMTypeRef params[] = {i32_ty, i64_ty, i32_ty, i64_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
+            fn_cache_set = LLVMAddFunction(llvm_mod, "rut_helper_cache_set_bound", ft);
         }
         return fn_cache_set;
     }
@@ -2403,15 +2405,19 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::CacheGet: {
             LLVMValueRef instance =
                 LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            const u32 kIndex = static_cast<u32>(inst.imm.i32_val);
+            const Str kName = c.source_module->cache_instances[kIndex].name;
+            LLVMValueRef identity =
+                LLVMConstInt(c.i64_ty, cache_instance_identity(kName.ptr, kName.len), 0);
             LLVMValueRef key = c.get_value(inst.operands[0]);
             LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "cache.has");
             LLVMValueRef out_val = LLVMBuildAlloca(c.builder, c.i64_ty, "cache.val");
-            LLVMValueRef args[] = {instance, key, out_has, out_val};
+            LLVMValueRef args[] = {instance, identity, key, out_has, out_val};
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_cache_get()),
                            c.get_cache_get(),
                            args,
-                           4,
+                           5,
                            "");
             LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "cache.h");
             LLVMValueRef v = LLVMBuildLoad2(c.builder, c.i64_ty, out_val, "cache.v");
@@ -2426,14 +2432,18 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::CacheSet: {
             LLVMValueRef instance =
                 LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            const u32 kIndex = static_cast<u32>(inst.imm.i32_val);
+            const Str kName = c.source_module->cache_instances[kIndex].name;
+            LLVMValueRef identity =
+                LLVMConstInt(c.i64_ty, cache_instance_identity(kName.ptr, kName.len), 0);
             LLVMValueRef key = c.get_value(inst.operands[0]);
             LLVMValueRef val = c.get_value(inst.operands[1]);
-            LLVMValueRef args[] = {instance, key, val};
+            LLVMValueRef args[] = {instance, identity, key, val};
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_cache_set()),
                            c.get_cache_set(),
                            args,
-                           3,
+                           4,
                            "");
             // The instruction's value echoes the stored i64.
             c.set_value(inst.result, val);
@@ -3194,6 +3204,15 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 const rir::Instruction& inst = block.insts[ii];
                 has_phi |= inst.op == rir::Opcode::Phi;
                 if (!rir::valid_string_instruction(fn, inst)) return {nullptr, nullptr, false};
+                if (inst.op == rir::Opcode::CacheGet || inst.op == rir::Opcode::CacheSet) {
+                    const u32 kIndex = static_cast<u32>(inst.imm.i32_val);
+                    if (kIndex >= rir_mod.cache_instance_count ||
+                        kIndex >= rir::Module::kMaxCacheInstances)
+                        return {nullptr, nullptr, false};
+                    const Str kName = rir_mod.cache_instances[kIndex].name;
+                    if (!kName.ptr || kName.len == 0 || kName.len > 31)
+                        return {nullptr, nullptr, false};
+                }
                 // Neither HTTP inputs nor HTTP mutation/response effects belong
                 // to an application-message invocation, including hidden helper
                 // accesses. Context slots are compiler storage, not HTTP values.
@@ -3318,6 +3337,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
     static std::atomic<u32> next_regex_module_id{1};
     Ctx c{};
     c.ws_body_mode = ws_body_mode;
+    c.source_module = &rir_mod;
     c.llvm_ctx = shared_context != nullptr ? shared_context : LLVMContextCreate();
     c.llvm_mod = LLVMModuleCreateWithNameInContext(
         rir_mod.name.ptr ? rir_mod.name.ptr : "rue_module", c.llvm_ctx);

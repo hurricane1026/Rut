@@ -2919,7 +2919,7 @@ Supported helper predicates comprise Boolean literals/equality/composition,
 length comparisons against literals, text equality against literals, and
 whole-value regex matching. Both operand orders work for scalar equality.
 Non-Boolean conditions and mismatched operands are compile errors.
-HTTP reads, state/header mutations and HTTP response effects cannot execute
+HTTP reads, request/header mutations and HTTP response effects cannot execute
 in the message phase; helpers with discarded statement effects are rejected
 as well. Message verdicts remain callback statements. This introduces neither
 an HTTP storage representation for messages nor permission to retain a message
@@ -2951,6 +2951,22 @@ parsing or expired request views. Subprotocol storage remains pinned by the
 active route configuration and output publication copies it before async sends.
 The IP type is available to ordinary HTTP/helper signatures as well. Open/close
 event contexts and session state remain separate work.
+
+Synchronous message callbacks share `Cache<IP, i64>` reads and reached bare
+writes with the ordinary type checker and shared MIR/RIR. The connection IP
+keeps its IP domain through RIR, rather than degrading to a source integer.
+Read predicates accept `IP` keys; cache counters retain inferred `i64` types,
+without enabling user `i64` annotations. `.get` remains optional and `.set`
+remains a statement. Lexical sequencing keeps writes behind successful guards
+and inside selected branches. Compiled HTTP and message accesses carry the
+cache declaration name identity as well as its original index. The runtime
+resolves identity within the same seqlock snapshot used for table selection,
+so a retained old handler cannot address a different cache after slot reuse.
+Missing declarations degrade to the ordinary miss/no-op API; moved/resized
+slots may lose state, consistent with the lossy cache contract. This provides
+no strict session or cross-shard state. Shared codegen resets the monotonic
+clock latch for each callback that reads time; repeated reads within that
+invocation remain stable.
 
 The message also projects two nominal, closed domains: `kind` is
 `WebSocketMessageKind` (`text`, `binary`), and `direction` is `WebSocketDirection`

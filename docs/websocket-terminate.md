@@ -94,6 +94,32 @@ String outputs are copied into owned send storage before asynchronous I/O.
 The existing IP type now supports ordinary function signatures for HTTP and
 message helpers alike. This adds no IP parser or constructor.
 
+The existing `Cache<IP, i64>` API can use that connection address. Reads return
+`i64?` and require ordinary optional recovery; pure predicates may accept typed
+`IP` keys. Counter locals keep inferred types; user `i64` annotations remain
+unsupported. A bare `set` runs at its reached statement, including
+inside a selected branch after guards. It is not an expression, and callbacks
+must still end in a message verdict. Cache tables belong to the callback shard
+and remain lossy counters/timestamps, not session storage. Compiled accesses
+retain declaration identity across hot reload: a moved declaration resolves by
+name identity; a removed declaration misses/ignores writes instead of touching
+another cache occupying its old slot. Moving a declaration may evict its entries.
+
+`time.nowMicros()` uses the same per-invocation clock latch as HTTP: all reads in
+one callback see one value, and the next message samples again. It does not
+capture a timestamp from the opening HTTP request.
+
+```swift
+let counts = Cache<IP, i64>(capacity: 1024)
+func belowLimit(_ key: IP) -> bool => counts.get(key).or(0) < 100
+// Within the message callback:
+// let key = message.connection.remoteAddr
+// guard belowLimit(key) else { message.drop() }
+// let before = counts.get(key).or(0)
+// counts.set(key, before + 1)
+// message.forward()
+```
+
 ```swift
 func secure(_ connection: WebSocketConnection) -> bool => connection.isTls
 // Within the message callback:

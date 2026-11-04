@@ -122,6 +122,8 @@
     X(rut_helper_json)                                \
     X(rut_helper_cache_get)                           \
     X(rut_helper_cache_set)                           \
+    X(rut_helper_cache_get_bound)                     \
+    X(rut_helper_cache_set_bound)                     \
     X(rut_helper_time_now_micros)                     \
     X(rut_helper_time_unlatch)
 

@@ -1,5 +1,6 @@
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_cache_context.h"
 #include "fixtures/ws_connection_context.h"
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
@@ -9843,6 +9844,27 @@ TEST(serve_loader, websocket_connection_context_keeps_owned_metadata_and_helper_
     REQUIRE(load_rut_program(path.c_str(), program, error));
     REQUIRE_EQ(unlink(path.c_str()), 0);
     test::ws_connection_context::check(_tc, program.config);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_cache_effects_keep_identity_and_clock_across_messages) {
+    const auto path =
+        write_file("/tmp/rut_ws_cache_context", "app.rut", test::ws_cache_context::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    activate_rut_program(program);
+    const auto changed_path = write_file(
+        "/tmp/rut_ws_cache_context", "changed.rut", test::ws_cache_context::kReorderedSource);
+    LoadedProgram changed;
+    REQUIRE(load_rut_program(changed_path.c_str(), changed, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    REQUIRE_EQ(unlink(changed_path.c_str()), 0);
+    test::ws_cache_context::check(
+        _tc, program.config, changed.config, [&]() { activate_rut_program(changed); });
+    changed.destroy();
     program.destroy();
 }
 #endif

@@ -894,7 +894,7 @@ rut::CacheLocalState::ShardTables* shard_cache_tables() {
     return &state->shards[t_active_cache_shard];
 }
 
-rut::CacheTable* cache_table_for(rut::u32 instance) {
+rut::CacheTable* cache_table_for(rut::u32 instance, rut::u64 expected_identity = 0) {
     rut::CacheLocalState::ShardTables* t_state_ptr = shard_cache_tables();
     if (t_state_ptr == nullptr) {
         log_cache_state_error_once();
@@ -966,6 +966,19 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
         }
         t_generation = gen;
     }
+    // A long-lived handler may retain its old declaration index across reload.
+    // Resolve its compiled name identity inside THIS validated snapshot, before
+    // touching a table; a separate registry lookup could race another publish.
+    if (expected_identity != 0 &&
+        (instance >= live_count || snap_idents[instance] != expected_identity)) {
+        instance = live_count;
+        for (rut::u32 i = 0; i < live_count; ++i) {
+            if (snap_idents[i] == expected_identity) {
+                instance = i;
+                break;
+            }
+        }
+    }
     if (instance >= live_count) return nullptr;
     const rut::u32 cap = snap_caps[instance];
     if (cap == 0) return nullptr;
@@ -1009,6 +1022,19 @@ void rut_helper_cache_get(u32 instance, u32 key_ip, u8* out_has, i64* out_val) {
 void rut_helper_cache_set(u32 instance, u32 key_ip, i64 val) {
     rut::CacheTable* t = cache_table_for(instance);
     if (t != nullptr) t->set(key_ip, val);
+}
+
+void rut_helper_cache_get_bound(u32 instance, u64 identity, u32 key_ip, u8* out_has, i64* out_val) {
+    const rut::CacheTable* table = identity != 0 ? cache_table_for(instance, identity) : nullptr;
+    i64 value = 0;
+    const bool kFound = table && table->get(key_ip, &value);
+    *out_has = kFound ? 1u : 0u;
+    *out_val = kFound ? value : 0;
+}
+
+void rut_helper_cache_set_bound(u32 instance, u64 identity, u32 key_ip, i64 value) {
+    rut::CacheTable* table = identity != 0 ? cache_table_for(instance, identity) : nullptr;
+    if (table) table->set(key_ip, value);
 }
 
 u32 rut_helper_cache_select_local_shard(u32 shard_id) {

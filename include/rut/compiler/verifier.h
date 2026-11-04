@@ -905,8 +905,10 @@ inline VerifyResult verify_function(const Function* fn,
                 const auto kFieldId = static_cast<WsMessageFieldId>(kField);
                 const bool kBool = ws_message_field_is_bool(kFieldId);
                 const TypeKind kExpected = ws_message_field_is_string(kFieldId) ? TypeKind::Str
-                                           : kBool                              ? TypeKind::Bool
-                                                                                : TypeKind::I32;
+                                           : kFieldId == WsMessageFieldId::ConnectionRemoteAddr
+                                               ? TypeKind::IP
+                                           : kBool ? TypeKind::Bool
+                                                   : TypeKind::I32;
                 const Type* type = inst.result != kNoValue && inst.result.id < fn->value_count &&
                                            fn->values != nullptr
                                        ? fn->values[inst.result.id].type

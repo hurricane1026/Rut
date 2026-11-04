@@ -1,6 +1,7 @@
 #include "deferred_preflight_fixture.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_cache_context.h"
 #include "fixtures/ws_connection_context.h"
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
@@ -47066,3 +47067,42 @@ route GET "/" {
     CHECK(rir::verify_module(rir.module).ok);
     rir.destroy();
 }
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_cache_values_and_effects_preserve_owned_ir_and_statement_rules) {
+    auto tokens = lex(lit(test::ws_cache_context::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto owned_ast = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*owned_ast);
+    REQUIRE(hir);
+    owned_ast.reset();
+    auto owned_hir = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    check_general_ws_rir(*owned_hir, _tc);
+    for (const char* body : {
+             "let result = counts.set(msg.connection.remoteAddr, 1) msg.forward()",
+             "counts.set(msg.len, 1) msg.forward()",
+             "counts.set(msg.connection.remoteAddr, counts.get(msg.connection.remoteAddr)) "
+             "msg.forward()",
+             "counts.set(msg.connection.remoteAddr, counts.set(msg.connection.remoteAddr, 1)) "
+             "msg.forward()",
+             "msg.forward(counts.get(msg.connection.remoteAddr))",
+             "counts.get(msg.connection.remoteAddr) msg.forward()",
+             "counts.set(msg.connection.remoteAddr, 1)",
+         }) {
+        std::string source = R"rut(let counts = Cache<IP, i64>(capacity: 64)
+upstream ws
+route GET "/" { return websocket(ws) { msg in )rut";
+        source += body;
+        source += " } }";
+        auto bad_tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(bad_tokens);
+        auto bad_ast = parse_file_heap(bad_tokens.value());
+        REQUIRE(bad_ast);
+        CHECK_FALSE(analyze_file_heap(bad_ast.value()));
+    }
+}
+#endif

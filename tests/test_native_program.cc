@@ -4,6 +4,7 @@
 #include "fixtures/signed_request.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_cache_context.h"
 #include "fixtures/ws_connection_context.h"
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
@@ -3376,5 +3377,25 @@ TEST(native_program, websocket_connection_context_keeps_owned_metadata_and_helpe
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     test::ws_connection_context::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_cache_effects_keep_identity_and_clock_across_messages) {
+    Source source;
+    REQUIRE(source.append(test::ws_cache_context::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    activate_native_program(*owner.p);
+    Source changed_source;
+    REQUIRE(changed_source.append(test::ws_cache_context::kReorderedSource));
+    Program changed;
+    REQUIRE(changed.p);
+    REQUIRE(load(changed_source, *changed.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(unlink(changed_source.path), 0);
+    test::ws_cache_context::check(
+        _tc, owner.p->config, changed.p->config, [&]() { activate_native_program(*changed.p); });
 }
 #endif

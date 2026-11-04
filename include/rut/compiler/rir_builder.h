@@ -524,9 +524,10 @@ struct Builder {
         if (!ws_message_field_valid(static_cast<u32>(field)))
             return core::make_unexpected(RirError::InvalidState);
         const bool kBool = ws_message_field_is_bool(field);
-        const TypeKind kKind = ws_message_field_is_string(field) ? TypeKind::Str
-                               : kBool                           ? TypeKind::Bool
-                                                                 : TypeKind::I32;
+        const TypeKind kKind = ws_message_field_is_string(field)                 ? TypeKind::Str
+                               : field == WsMessageFieldId::ConnectionRemoteAddr ? TypeKind::IP
+                               : kBool                                           ? TypeKind::Bool
+                                                                                 : TypeKind::I32;
         auto* ty = TRY(make_type(kKind));
         auto result = TRY(emit(Opcode::WsMessageField, ty, loc));
         result.inst->imm.i32_val = static_cast<i32>(field);

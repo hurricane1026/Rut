@@ -7380,6 +7380,35 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 evaluated.field_inits.len = 0;
                 return evaluated;
             }
+            if (scratch->is_ws_callback && inner.kind == AstStmtKind::Expr && !is_last &&
+                inner.expr.kind == AstExprKind::MethodCall && inner.expr.name.eq(lit_str("set")) &&
+                inner.expr.lhs && inner.expr.lhs->kind == AstExprKind::Ident &&
+                !user_bound_ident_name(
+                    mod, cur_locals, cur_local_count, binding, inner.expr.lhs->name)) {
+                bool cache_receiver = false;
+                for (u32 ci = 0; ci < mod.caches.len; ++ci)
+                    cache_receiver |= mod.caches[ci].name.eq(inner.expr.lhs->name);
+                if (cache_receiver) {
+                    // Share the ordinary cache statement permission/type checker.
+                    // Keep the write at its reached lexical position, never in
+                    // an unconditional HTTP entry prelude or an elided helper.
+                    const bool kSavedPermission = scratch->cache_set_stmt_ok;
+                    scratch->cache_set_stmt_ok = true;
+                    auto effect =
+                        analyze_block_expr(inner.expr, cur_locals, cur_local_count, binding);
+                    scratch->cache_set_stmt_ok = kSavedPermission;
+                    if (!effect) return core::make_unexpected(effect.error());
+                    if (effect->kind != HirExprKind::CacheSet)
+                        return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+                    if (!scratch->exprs.push(effect.value()))
+                        return frontend_error(FrontendError::OutOfMemory, inner.span);
+                    HirExpr* initializer = &scratch->exprs[scratch->exprs.len - 1];
+                    auto tail =
+                        self(self, si + 1, cur_locals, cur_local_count, cur_allow_respond_guards);
+                    if (!tail) return core::make_unexpected(tail.error());
+                    return finish_message_initializer(initializer, tail.value(), inner.span);
+                }
+            }
             if (inner.kind == AstStmtKind::Expr && !is_last &&
                 inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
                 inner.expr.lhs->kind == AstExprKind::Ident) {
@@ -7911,8 +7940,7 @@ static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
     if (expr.kind == HirExprKind::BoundValue) return nullptr;
     if ((expr.kind >= HirExprKind::ReqHeaderCount && expr.kind <= HirExprKind::ReqMethod &&
          expr.kind != HirExprKind::ConstMethod) ||
-        expr.kind == HirExprKind::WaitResult || expr.kind == HirExprKind::WaitField ||
-        expr.kind == HirExprKind::CacheGet || expr.kind == HirExprKind::CacheSet)
+        expr.kind == HirExprKind::WaitResult || expr.kind == HirExprKind::WaitField)
         return &expr;
     if (validate_receivers && expr.kind == HirExprKind::WsMessageField) {
         const HirExpr* receiver = expr.lhs;

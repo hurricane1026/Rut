@@ -71,3 +71,10 @@ Message connection context now projects typed downstream IP/port, TLS and the
 negotiated subprotocol through ordinary borrowed helper/alias analysis. Values
 come from the live connection in either direction; no HTTP request views escape
 admission. The combined lifecycle criterion remains open for open/close events.
+
+Cache reads and reached bare writes now share ordinary typing/IR in callbacks,
+using a connection IP key. Compiled access binds declaration identity across
+registry reorder/removal, and writes retain lexical guard/branch ordering.
+Virtual-clock tests verify the existing per-invocation time latch refreshes for
+the next message in both source and native callbacks. Cache remains lossy and
+per-shard, not session storage.
