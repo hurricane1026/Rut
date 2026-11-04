@@ -2754,3 +2754,62 @@ TEST(RirBuilder, JwtIssueHs256WithIdAndScopeUsesSevenOperandsAndValidatesTypes) 
     VOK(b.emit_ret_status(204));
     ctx.destroy();
 }
+
+TEST(RirBuilder, PhiValidatesEdgesTypesAndIncomingDominance) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("branches"), lit("/"), 'G'));
+    const auto entry = V(b.create_block(fn, lit("entry")));
+    const auto merge = V(b.create_block(fn, lit("merge")));
+    const auto left = V(b.create_block(fn, lit("left")));
+    const auto right = V(b.create_block(fn, lit("right")));
+    b.set_insert_point(fn, entry);
+    auto condition = V(b.emit_const_bool(true));
+    auto shared = V(b.emit_const_i32(203));
+    VOK(b.emit_br(condition, left, right));
+    b.set_insert_point(fn, left);
+    auto first = V(b.emit_const_i32(201));
+    VOK(b.emit_jmp(merge));
+    b.set_insert_point(fn, right);
+    auto second = V(b.emit_const_i32(202));
+    VOK(b.emit_jmp(merge));
+    b.set_insert_point(fn, merge);
+    CHECK_FALSE(b.emit_phi(first, left, condition, right));
+    CHECK_FALSE(b.emit_phi(first, left, second, left));
+    CHECK_FALSE(b.emit_phi(first, merge, second, right));
+    CHECK_FALSE(b.emit_phi(first, left, kNoValue, right));
+    auto selected = V(b.emit_phi(first, left, second, right));
+    VOK(b.emit_ret_status(selected));
+    REQUIRE(verify_function(fn).ok);
+    auto& phi = fn->blocks[merge.id].insts[0];
+    char text[256];
+    PrintBuf buf{};
+    buf.init(text, sizeof(text), -1);
+    print_instruction(buf, phi, *fn);
+    CHECK(std::string(text, buf.len).find("phi") != std::string::npos);
+    phi.operands[0] = shared;
+    CHECK(verify_function(fn).ok);
+    phi.operands[0] = first;
+    phi.operand_count = 3;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    phi.operand_count = 2;
+    phi.imm.block_targets[1] = left;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    phi.imm.block_targets[1] = right;
+    phi.operands[1] = first;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    phi.operands[1] = second;
+    const Type* saved = fn->values[second.id].type;
+    fn->values[second.id].type = V(b.make_type(TypeKind::Bool));
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    fn->values[second.id].type = saved;
+    REQUIRE(verify_function(fn).ok);
+    // A third predecessor cannot be omitted from a two-input merge.
+    auto extra = V(b.create_block(fn, lit("extra")));
+    b.set_insert_point(fn, extra);
+    VOK(b.emit_jmp(merge));
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    tc.destroy();
+}

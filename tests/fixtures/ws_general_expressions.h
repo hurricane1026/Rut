@@ -4,6 +4,9 @@ namespace rut::test::ws_general_expressions {
 inline constexpr const char* kSource = R"rut(upstream backend at "127.0.0.1:9999"
 func allowed(_ size: i32, _ client: bool) -> bool =>
     !client || bitwise.and(size, 3) == 2
+func maybeCount(_ msg: WebSocketMessage) -> i32 {
+    if msg.fromClient { msg.len + 1 } else { nil }
+}
 route POST "/http" {
     let size = req.bodyBytes.count + 1
     guard allowed(size, true) else { return 403 }
@@ -22,6 +25,11 @@ route GET "/guards" { return websocket(backend) { msg in
     guard msg.len != 2 else { msg.drop() }
     guard msg.len != 3 else { msg.drop() }
     guard msg.len != 4 else { msg.drop() }
+    msg.forward()
+} }
+route GET "/optional" { return websocket(backend) { msg in
+    guard let size = maybeCount(msg) else { msg.forward() }
+    guard size == 2 else { msg.drop() }
     msg.forward()
 } })rut";
 }  // namespace rut::test::ws_general_expressions

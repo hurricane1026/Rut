@@ -9772,7 +9772,7 @@ TEST(serve_loader, websocket_general_expressions_share_http_helpers_and_own_code
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
     REQUIRE_EQ(unlink(path.c_str()), 0);
-    REQUIRE_EQ(program.config.route_count, 3u);
+    REQUIRE_EQ(program.config.route_count, 4u);
     const auto http = program.config.routes[0].fn;
     REQUIRE(http);
     for (const char* body : {"x", "xx", "xxxxx"}) {
@@ -9791,6 +9791,8 @@ TEST(serve_loader, websocket_general_expressions_share_http_helpers_and_own_code
     const auto guards = program.config.routes[2].ws_frame_handler;
     REQUIRE(handler);
     REQUIRE(guards);
+    const auto optional = program.config.routes[3].ws_frame_handler;
+    REQUIRE(optional);
     const u8 payload[13] = {0, 255};
     for (bool client : {false, true}) {
         for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
@@ -9801,11 +9803,38 @@ TEST(serve_loader, websocket_general_expressions_share_http_helpers_and_own_code
                         ? WsFrameAction::Drop
                         : WsFrameAction::Forward;
                 CHECK(handler(nullptr, opcode, payload, len, client) == expected);
+                CHECK(optional(nullptr, opcode, payload, len, client) ==
+                      (!client || len == 1 ? WsFrameAction::Forward : WsFrameAction::Drop));
                 CHECK(guards(nullptr, opcode, payload, len, client) ==
                       (len < 5 ? WsFrameAction::Drop : WsFrameAction::Forward));
             }
         }
     }
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_general_branches_grow_ir_maps_without_route_slots) {
+    std::string source = "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { ";
+    source += "return websocket(backend) { msg in guard msg.len + 0 == 1 && (";
+    for (u32 i = 0; i < 40; ++i) {
+        if (i != 0) source += " || ";
+        source += "msg.fromClient";
+    }
+    source += ") else { msg.drop() } msg.forward() } }";
+    auto path = write_file("/tmp/rut_ws_branch_growth", "app.rut", source.c_str());
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE(program.rir.module.func_count == 1u);
+    auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const u8 byte = 42;
+    CHECK(handler(nullptr, WsOpcode::Binary, &byte, 1, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, &byte, 1, false) == WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Binary, nullptr, 0, true) == WsFrameAction::Drop);
     program.destroy();
 }
 #endif

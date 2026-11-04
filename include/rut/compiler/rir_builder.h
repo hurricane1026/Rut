@@ -1156,6 +1156,30 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_phi(ValueId first,
+                             BlockId first_block,
+                             ValueId second,
+                             BlockId second_block,
+                             SourceLoc loc = {}) {
+        if (!valid_val(first) || !valid_val(second) || !cur_block ||
+            first_block.id >= cur_func->block_count || second_block.id >= cur_func->block_count ||
+            first_block == second_block || first_block == cur_block_id ||
+            second_block == cur_block_id)
+            return err(RirError::InvalidState);
+        const Type* type = cur_func->values[first.id].type;
+        if (!type || !types_equal(type, cur_func->values[second.id].type))
+            return err(RirError::InvalidState);
+        for (u32 i = 0; i < cur_block->inst_count; ++i)
+            if (cur_block->insts[i].op != Opcode::Phi) return err(RirError::InvalidState);
+        auto [inst, vid] = TRY(emit(Opcode::Phi, type, loc));
+        inst->operands[0] = first;
+        inst->operands[1] = second;
+        inst->operand_count = 2;
+        inst->imm.block_targets[0] = first_block;
+        inst->imm.block_targets[1] = second_block;
+        return vid;
+    }
+
     Result<ValueId> emit_opt_unwrap(ValueId opt, const Type* inner_type, SourceLoc loc = {}) {
         if (!valid_val(opt) || !inner_type) return err(RirError::InvalidState);
         // Verify operand is Optional and inner_type matches the payload.

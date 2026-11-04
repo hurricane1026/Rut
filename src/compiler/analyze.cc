@@ -7243,7 +7243,8 @@ static const HirExpr* ws_general_disallowed_value(const HirExpr& expr, u32 depth
         expr.kind == HirExprKind::Uuid || expr.kind == HirExprKind::WaitResult ||
         expr.kind == HirExprKind::WaitField || expr.kind == HirExprKind::CacheGet ||
         expr.kind == HirExprKind::CacheSet || expr.kind == HirExprKind::JsonOp ||
-        expr.kind == HirExprKind::JsonDecode || expr.kind == HirExprKind::RegexMatch)
+        expr.kind == HirExprKind::JsonDecode || expr.kind == HirExprKind::RegexMatch ||
+        expr.kind == HirExprKind::HashDigest)
         return &expr;
     if (expr.kind == HirExprKind::WsMessageField &&
         (expr.lhs == nullptr || expr.lhs->kind != HirExprKind::LocalRef ||

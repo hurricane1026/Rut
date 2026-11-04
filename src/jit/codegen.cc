@@ -2451,6 +2451,12 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             }
             break;
         }
+        case rir::Opcode::Phi: {
+            LLVMValueRef value = LLVMBuildPhi(
+                c.builder, c.map_type(c.cur_fn->values[inst.result.id].type), "merge.value");
+            c.set_value(inst.result, value);
+            break;
+        }
         case rir::Opcode::Select: {
             LLVMValueRef cond = c.get_value(inst.operands[0]);
             LLVMValueRef then_v = c.get_value(inst.operands[1]);
@@ -2852,6 +2858,8 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // maps from the existing compiler arena instead of hitting a Phase 1 cap.
     LLVMValueRef small_values[512]{};
     LLVMBasicBlockRef small_blocks[64]{};
+    // LLVM's opaque mutable block handles are required by LLVMAddIncoming.
+    LLVMBasicBlockRef small_exits[64]{};  // NOLINT(misc-const-correctness)
     struct MapStorage {
         MmapArena arena;
         ~MapStorage() { arena.destroy(); }
@@ -2861,7 +2869,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         fn.value_cap <= 512 ? small_values : maps.arena.alloc_array<LLVMValueRef>(fn.value_cap);
     c.block_map =
         fn.block_cap <= 64 ? small_blocks : maps.arena.alloc_array<LLVMBasicBlockRef>(fn.block_cap);
-    if (!c.value_map || !c.block_map) return false;
+    LLVMBasicBlockRef* exits =
+        fn.block_cap <= 64 ? small_exits : maps.arena.alloc_array<LLVMBasicBlockRef>(fn.block_cap);
+    if (!c.value_map || !c.block_map || !exits) return false;
 
     // Create all basic blocks upfront (forward references from Br/Jmp).
     for (u32 i = 0; i < fn.block_count; i++) {
@@ -2988,6 +2998,23 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         if (!blk.terminator()) {
             LLVMBuildUnreachable(c.builder);
         }
+        // Helpers may split LLVM blocks internally. A RIR edge leaves the
+        // helper's continuation, not necessarily its original entry block.
+        exits[blk.id.id] = LLVMGetInsertBlock(c.builder);
+    }
+    // Resolve incoming edges after every producer and helper continuation is
+    // available; RIR block IDs need not be in dependency order.
+    for (u32 bi = 0; bi < fn.block_count; ++bi) {
+        const auto& block = fn.blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ++ii) {
+            const auto& inst = block.insts[ii];
+            if (inst.op != rir::Opcode::Phi) continue;
+            LLVMValueRef values[] = {c.get_value(inst.operands[0]), c.get_value(inst.operands[1])};
+            LLVMBasicBlockRef incoming[] = {exits[inst.imm.block_targets[0].id],
+                                            exits[inst.imm.block_targets[1].id]};
+            if (!values[0] || !values[1] || !incoming[0] || !incoming[1]) return false;
+            LLVMAddIncoming(c.get_value(inst.result), values, incoming, 2);
+        }
     }
 
     return true;
@@ -3005,6 +3032,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
     if (rir_mod.func_count > 0 && rir_mod.functions == nullptr) return {nullptr, nullptr, false};
     for (u32 fi = 0; fi < rir_mod.func_count; ++fi) {
         const rir::Function& fn = rir_mod.functions[fi];
+        bool has_phi = false;
         if (ws_body_mode && (fn.yield_count != 0 || fn.is_timer || rir_function_uses_parse(fn)))
             return {nullptr, nullptr, false};
         if (fn.block_count > 0 && fn.blocks == nullptr) return {nullptr, nullptr, false};
@@ -3013,6 +3041,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
             if (block.inst_count > 0 && block.insts == nullptr) return {nullptr, nullptr, false};
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
+                has_phi |= inst.op == rir::Opcode::Phi;
                 // Neither HTTP inputs nor HTTP mutation/response effects belong
                 // to an application-message invocation, including hidden helper
                 // accesses. Context slots are compiler storage, not HTTP values.
@@ -3114,6 +3143,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 }
             }
         }
+        if (has_phi && !rir::verify_function(&fn).ok) return {nullptr, nullptr, false};
     }
     for (u32 i = 0; i < rir_mod.func_count; ++i)
         if (!rir::password_prefix_valid(rir_mod.functions[i])) return {nullptr, nullptr, false};

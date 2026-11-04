@@ -405,6 +405,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::OptUnwrap:
             buf.put_cstr("opt.unwrap");
             break;
+        case Opcode::Phi:
+            buf.put_cstr("phi");
+            break;
         case Opcode::Select:
             buf.put_cstr("select");
             break;
@@ -892,6 +895,17 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::BytesHex:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::Phi:
+            buf.put(' ');
+            for (u32 i = 0; i < 2; ++i) {
+                if (i != 0) buf.put_cstr(", ");
+                buf.put('[');
+                print_value_ref(buf, inst.operands[i]);
+                buf.put_cstr(", bb");
+                buf.put_u32(inst.imm.block_targets[i].id);
+                buf.put(']');
+            }
             break;
         case Opcode::Select:
             buf.put(' ');

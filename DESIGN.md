@@ -2841,7 +2841,10 @@ past its synchronous callback. A shared compiler entry now lowers pure scalar
 callback expressions through MIR/RIR and a private synchronous message ABI in
 the same LLVM module as HTTP handlers. It supports integer arithmetic/bitwise
 operations, String comparisons, local aliases, guards and full if/else values,
-without consuming HTTP route/timer slots. The existing specialized JSON/rewrite
+without consuming HTTP route/timer slots. Conditional message values use explicit
+RIR branches and verified Phi nodes; nullable/error carrier adaptation happens
+on the selected incoming edge. LLVM merges use each predecessor's final helper
+continuation, including helpers that split a block internally. The existing specialized JSON/rewrite
 path remains available; general eager locals, fallible expressions, dynamic
 verdict payloads and close-event context are subsequent work.
 

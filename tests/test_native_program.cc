@@ -3350,7 +3350,7 @@ TEST(native_program, websocket_general_expressions_survive_compiler_and_source_r
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
-    REQUIRE_EQ(owner.p->config.route_count, 3u);
+    REQUIRE_EQ(owner.p->config.route_count, 4u);
     const auto http = owner.p->config.routes[0];
     CHECK_EQ(
         invoke(http, "POST /http HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\n\r\nx").status_code,
@@ -3362,6 +3362,8 @@ TEST(native_program, websocket_general_expressions_survive_compiler_and_source_r
     const auto guards = owner.p->config.routes[2].ws_frame_handler;
     REQUIRE(handler);
     REQUIRE(guards);
+    const auto optional = owner.p->config.routes[3].ws_frame_handler;
+    REQUIRE(optional);
     const u8 payload[13] = {0, 255};
     for (bool client : {false, true}) {
         for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
@@ -3372,6 +3374,8 @@ TEST(native_program, websocket_general_expressions_survive_compiler_and_source_r
                         ? WsFrameAction::Drop
                         : WsFrameAction::Forward;
                 CHECK(handler(nullptr, opcode, payload, len, client) == expected);
+                CHECK(optional(nullptr, opcode, payload, len, client) ==
+                      (!client || len == 1 ? WsFrameAction::Forward : WsFrameAction::Drop));
                 CHECK(guards(nullptr, opcode, payload, len, client) ==
                       (len < 5 ? WsFrameAction::Drop : WsFrameAction::Forward));
             }

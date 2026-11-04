@@ -29002,3 +29002,71 @@ TEST(jit, password_identity_maps_terminal_results_and_rejects_untrusted_states) 
     engine.shutdown();
     rir.destroy();
 }
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_branch_phi_keeps_selected_effects_and_helper_continuations) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("branch_effect"), lit("/"), 'G'));
+    const auto entry = V(b.create_block(fn, lit("entry")));
+    const auto merge = V(b.create_block(fn, lit("merge")));
+    const auto left = V(b.create_block(fn, lit("left")));
+    const auto right = V(b.create_block(fn, lit("right")));
+    b.set_insert_point(fn, entry);
+    auto client = V(b.emit_ws_message_field(WsMessageFieldId::FromClient));
+    VOK(b.emit_br(client, left, right));
+    b.set_insert_point(fn, left);
+    auto ten = V(b.emit_const_i32(10));
+    VOK(b.emit_ctx_store_slot_i32(0, ten));
+    auto payload = V(b.emit_ws_message_field(WsMessageFieldId::Payload));
+    auto digest = V(b.emit_hash_digest(static_cast<u32>(HashAlgorithm::Sha256), &payload, 1));
+    VOK(b.emit_jmp(merge));
+    b.set_insert_point(fn, right);
+    auto twenty = V(b.emit_const_i32(20));
+    VOK(b.emit_ctx_store_slot_i32(0, twenty));
+    auto text = V(b.emit_const_str(lit("fallback")));
+    auto fallback = V(b.emit_opt_wrap(text));
+    VOK(b.emit_jmp(merge));
+    b.set_insert_point(fn, merge);
+    auto selected = V(b.emit_phi(digest, left, fallback, right));
+    auto absent = V(b.emit_opt_is_nil(selected));
+    auto ok = V(b.emit_const_i32(200));
+    auto bad = V(b.emit_const_i32(403));
+    auto status = V(b.emit_select(absent, bad, ok));
+    VOK(b.emit_ret_status(status));
+    auto cg = codegen_ws_body(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_branch_effect"));
+    REQUIRE(handler);
+    struct Frame {
+        HandlerCtx ctx{};
+        u64 slots[1]{};
+    } frame;
+    frame.ctx.slot_count = 1;
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto connection = std::make_unique<ConnectionBase>();
+    REQUIRE(connection->json_arena.init(&pool));
+    const u8 data[] = {0, 255};
+    for (void* conn : {static_cast<void*>(nullptr), static_cast<void*>(connection.get())}) {
+        for (u8 from_client : {0u, 1u}) {
+            frame.slots[0] = 0;
+            auto result = HandlerResult::unpack(
+                handler(conn, &frame.ctx, data, sizeof(data), nullptr, 2, from_client));
+            CHECK_EQ(result.status_code, conn == nullptr && from_client ? 403u : 200u);
+            CHECK_EQ(frame.slots[0], from_client ? 10u : 20u);
+        }
+    }
+    connection->json_arena.destroy();
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+    engine.shutdown();
+    tc.destroy();
+}
+#endif

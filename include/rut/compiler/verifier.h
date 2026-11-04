@@ -50,6 +50,7 @@ enum class VerifyIssueCode : u8 {
     InvalidPasswordPrefix,
     InvalidStrLength,
     InvalidWsMessageField,
+    InvalidPhi,
 };
 
 struct VerifyIssue {
@@ -702,6 +703,98 @@ inline VerifyHandlerCheckResult verify_handler_runtime_states(
     return result;
 }
 
+// Phi inputs must be available on their incoming edge. Reject a path from
+// entry to that edge which bypasses the defining block. This bounded walk
+// avoids trusting numeric block ordering (nested expression merges are not
+// necessarily appended in dependency order).
+inline bool verify_phi_dominates(const Function& fn, BlockId definition, BlockId edge) {
+    if (definition.id >= fn.block_count || edge.id >= fn.block_count) return false;
+    if (definition == edge || definition.id == 0) return true;
+    constexpr u32 kMaxBlocks = 4096;
+    if (fn.block_count > kMaxBlocks) return false;
+    bool visited[kMaxBlocks]{};
+    u32 pending[kMaxBlocks]{};
+    u32 count = 0;
+    pending[count++] = 0;
+    visited[0] = true;
+    while (count != 0) {
+        const u32 kId = pending[--count];
+        if (kId == edge.id) return false;
+        const Block& block = fn.blocks[kId];
+        if (block.insts == nullptr || block.inst_count == 0) return false;
+        const Instruction* term = block.terminator();
+        if (term == nullptr) return false;
+        const u32 kSuccessors = term->op == Opcode::Br ? 2u : term->op == Opcode::Jmp ? 1u : 0u;
+        for (u32 i = 0; i < kSuccessors; ++i) {
+            const u32 kNext = term->imm.block_targets[i].id;
+            if (kNext >= fn.block_count) return false;
+            if (kNext == definition.id || visited[kNext]) continue;
+            visited[kNext] = true;
+            pending[count++] = kNext;
+        }
+    }
+    return true;
+}
+
+inline bool verify_phi_types_equal(const Type* first, const Type* second, u32 depth = 0) {
+    if (first == nullptr || second == nullptr || depth > 64 || first->kind != second->kind ||
+        first->kind == TypeKind::Void || first->kind > TypeKind::Array)
+        return false;
+    if (first->kind == TypeKind::Optional || first->kind == TypeKind::Array)
+        return verify_phi_types_equal(first->inner, second->inner, depth + 1);
+    if (first->kind == TypeKind::Struct)
+        return first->struct_def != nullptr && first->struct_def == second->struct_def;
+    return first->inner == nullptr && second->inner == nullptr && first->struct_def == nullptr &&
+           second->struct_def == nullptr;
+}
+
+inline bool verify_phi(const Function& fn, u32 block_index, u32 inst_index) {
+    const Block& block = fn.blocks[block_index];
+    const Instruction& inst = block.insts[inst_index];
+    // Resume entries have additional runtime predecessors. They require a
+    // separate persisted-value analysis before using ordinary synchronous SSA.
+    if (fn.yield_count != 0 || inst.operand_count != 2 || fn.values == nullptr ||
+        inst.result == kNoValue || inst.result.id >= fn.value_count)
+        return false;
+    for (u32 i = 0; i < inst_index; ++i)
+        if (block.insts[i].op != Opcode::Phi) return false;
+    const Value& result = fn.values[inst.result.id];
+    if (result.def_block.id != block_index || result.def_inst != inst_index) return false;
+    const BlockId kFirst = inst.imm.block_targets[0];
+    const BlockId kSecond = inst.imm.block_targets[1];
+    if (kFirst == kSecond || kFirst.id >= fn.block_count || kSecond.id >= fn.block_count ||
+        kFirst.id == block_index || kSecond.id == block_index)
+        return false;
+    u32 predecessors = 0;
+    for (u32 bi = 0; bi < fn.block_count; ++bi) {
+        const Block& source = fn.blocks[bi];
+        if (source.inst_count == 0 || source.insts == nullptr) return false;
+        const Instruction* term = source.terminator();
+        if (term == nullptr) return false;
+        const u32 kTargets = term->op == Opcode::Br ? 2u : term->op == Opcode::Jmp ? 1u : 0u;
+        bool reaches = false;
+        for (u32 i = 0; i < kTargets; ++i) reaches |= term->imm.block_targets[i].id == block_index;
+        if (!reaches) continue;
+        if (bi != kFirst.id && bi != kSecond.id) return false;
+        ++predecessors;
+    }
+    if (predecessors != 2) return false;
+    for (u32 i = 0; i < 2; ++i) {
+        const ValueId kId = inst.operands[i];
+        if (kId == kNoValue || kId == inst.result || kId.id >= fn.value_count) return false;
+        const Value& value = fn.values[kId.id];
+        if (value.def_block.id >= fn.block_count ||
+            !verify_phi_types_equal(result.type, value.type))
+            return false;
+        const Block& definition = fn.blocks[value.def_block.id];
+        if (definition.insts == nullptr || value.def_inst >= definition.inst_count ||
+            definition.insts[value.def_inst].result != kId ||
+            !verify_phi_dominates(fn, value.def_block, inst.imm.block_targets[i]))
+            return false;
+    }
+    return true;
+}
+
 inline VerifyResult verify_function(const Function* fn,
                                     u32 function_index = 0,
                                     VerifyOptions options = {}) {
@@ -764,6 +857,8 @@ inline VerifyResult verify_function(const Function* fn,
         }
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const Instruction& inst = block.insts[ii];
+            if (inst.op == Opcode::Phi && !verify_phi(*fn, bi, ii))
+                return verify_fail(summary, VerifyIssueCode::InvalidPhi, function_index, bi, ii);
             if (inst.op == Opcode::WsMessageField) {
                 const u32 kField = static_cast<u32>(inst.imm.i32_val);
                 const bool kBool = kField == static_cast<u32>(WsMessageFieldId::FromClient) ||
@@ -1676,6 +1771,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidPasswordPrefix";
         case VerifyIssueCode::InvalidJwtClaimsLifetime:
             return "InvalidJwtClaimsLifetime";
+        case VerifyIssueCode::InvalidPhi:
+            return "InvalidPhi";
         case VerifyIssueCode::InvalidWsMessageField:
             return "InvalidWsMessageField";
         case VerifyIssueCode::InvalidStrLength:

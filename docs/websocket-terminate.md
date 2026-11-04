@@ -84,7 +84,10 @@ source parser and ordinary local limits; it does not reserve additional HTTP
 route or timer slots. Verdicts remain terminal `forward()`, `drop()` or `close()`
 statements. Argument-bearing verdicts, JSON/regex work and fallible/effectful let
 initializers still use the specialized path or produce a compile error. HTTP
-access is rejected even in statically unreachable message branches.
+access is rejected even in statically unreachable message branches. The shared
+entry emits explicit branches and typed SSA merges: only the chosen arm runs,
+including nested nullable value choices. It does not reuse an eager `select`
+for operations whose evaluation must be conditional.
 
 Boolean helpers may use ordinary `if`/`else` to select between two supported
 predicates, including nested conditionals. The selector evaluates once and only

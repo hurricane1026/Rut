@@ -311,6 +311,9 @@ enum class Opcode : u8 {
     JwtClaimsValidWithLifetime,
     // Length of the existing pointer/u32-length carrier, with no payload read.
     StrLength,
+    // Two-edge SSA merge. operands are values; block_targets are their
+    // predecessor blocks. Phi instructions precede ordinary merge-block work.
+    Phi,
 };
 
 // ── Instruction ─────────────────────────────────────────────────────

@@ -46304,8 +46304,8 @@ TEST(frontend, websocket_general_expressions_preserve_owned_ir_after_copy) {
     ast.reset();
     auto copied = std::make_unique<HirModule>(hir.value());
     hir.reset();
-    REQUIRE_EQ(copied->routes.len, 3u);
-    for (u32 route_index : {1u, 2u}) {
+    REQUIRE_EQ(copied->routes.len, 4u);
+    for (u32 route_index : {1u, 2u, 3u}) {
         const auto& route = copied->routes[route_index];
         REQUIRE_EQ(route.locals.len, 0u);
         REQUIRE(route.ws_handler.general_body_expr < route.exprs.len);
@@ -46323,10 +46323,20 @@ TEST(frontend, websocket_general_expressions_preserve_owned_ir_after_copy) {
         auto mir = build_mir_route(*copied, *callback);
         REQUIRE(mir);
         HeapFrontendResult<MirModule> owner{mir.value()};
+        REQUIRE(owner->functions[0].is_ws_callback);
+        auto function_copy = std::make_unique<MirFunction>(owner->functions[0]);
+        auto function_move =
+            std::make_unique<MirFunction>(static_cast<MirFunction&&>(*function_copy));
+        CHECK(function_move->is_ws_callback);
+        *function_copy = *function_move;
+        CHECK(function_copy->is_ws_callback);
+        owner->functions[0] = static_cast<MirFunction&&>(*function_copy);
+        CHECK(owner->functions[0].is_ws_callback);
         FrontendRirModule rir{};
         REQUIRE(lower_to_rir(owner.value(), rir));
         CHECK(rir::verify_module(rir.module).ok);
         CHECK(rir.module.functions[0].value_count > 1u);
+        CHECK(function_has_op(rir.module.functions[0], rir::Opcode::Phi));
         rir.destroy();
     }
 }

@@ -1042,6 +1042,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* else_ptr = &fn->values[fn->values.len - 1];
         v.kind = MirValueKind::IfElse;
+        v.is_branch_conditional = fn->is_ws_callback && !expr.is_eager_fallback;
         v.type = mir_type_kind(expr.type);
         v.lhs = cond_ptr;
         v.rhs = then_ptr;
@@ -1445,6 +1446,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         fn.rate_limit = source_route.rate_limit;
         fn.throttle_down_bps = source_route.throttle_down_bps;
         fn.http_cache_ttl = source_route.http_cache_ttl;
+        fn.is_ws_callback = source_route.is_ws_callback;
         fn.is_timer = source_route.is_timer;
         fn.timer_interval_ms = source_route.timer_interval_ms;
         fn.timer_shard = source_route.timer_shard;

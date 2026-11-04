@@ -230,6 +230,9 @@ struct MirValue {
     MirValue* rhs = nullptr;
     bool is_pipe_conditional = false;
     bool is_eager_fallback = false;
+    // Explicit expression branches execute only the selected value-producing
+    // arm. Eager fallback operators retain their separate evaluation contract.
+    bool is_branch_conditional = false;
     bool is_wait_result = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
@@ -372,6 +375,7 @@ struct MirFunction {
     // Timer function: a `timer name, every: D {...}` periodic task (path holds the
     // name). Carried to the RIR Function so config registers it into the timer
     // table instead of the route table.
+    bool is_ws_callback = false;
     bool is_timer = false;
     u32 timer_interval_ms = 0;
     i32 timer_shard = -1;
@@ -394,6 +398,7 @@ struct MirFunction {
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           http_cache_ttl(other.http_cache_ttl),
+          is_ws_callback(other.is_ws_callback),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
           timer_shard(other.timer_shard) {
@@ -419,6 +424,7 @@ struct MirFunction {
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         http_cache_ttl = other.http_cache_ttl;
+        is_ws_callback = other.is_ws_callback;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;
@@ -442,6 +448,7 @@ struct MirFunction {
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           http_cache_ttl(other.http_cache_ttl),
+          is_ws_callback(other.is_ws_callback),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
           timer_shard(other.timer_shard) {
@@ -467,6 +474,7 @@ struct MirFunction {
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         http_cache_ttl = other.http_cache_ttl;
+        is_ws_callback = other.is_ws_callback;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;
