@@ -13,6 +13,7 @@ bool Es256Policy::load_jwks(
     revoked_count = 0;
     require_jti = false;
     issued_after = 0;
+    remote_configuration = {};
     return true;
 }
 
@@ -45,6 +46,7 @@ bool Es256Policy::load(Str configuration) {
     revoked_count = 0;
     require_jti = false;
     issued_after = 0;
+    remote_configuration = {};
     for (u32 n = document.nodes[0].child; n != json::kNone; n = document.nodes[n].next) {
         json::Writer key{document.scratch};
         if (!document.string(document.nodes[n].key, key)) return false;
@@ -76,6 +78,8 @@ bool Es256Policy::load(Str configuration) {
                     if (kValue.eq({revoked_jtis[i], revoked_lengths[i]})) return false;
                 revoked_lengths[revoked_count++] = id.len;
             }
+        } else if (kName.eq(lit_str("remoteJwks"))) {
+            if (!remote_configuration.load(document, n)) return false;
         } else if (kName.eq(lit_str("issuedAfter"))) {
             if (document.nodes[n].kind != json::Kind::Number ||
                 !json::integer(document.raw(n), issued_after) || issued_after <= 0)
@@ -126,6 +130,48 @@ bool Es256Policy::permits(json::Document& document) const {
     return (!require_jti || has_jti) && (!issued_after || has_iat);
 }
 
+Es256Policy::Refresh Es256Policy::prepare_refresh(Str jwks, Es256KeySet& output) const {
+    if (!key_set.valid() || output.valid()) return Refresh::Invalid;
+    json::Document document;
+    if (!document.parse(jwks) || document.nodes[0].kind != json::Kind::Object)
+        return Refresh::Invalid;
+    u32 entries = json::kNone;
+    for (u32 n = document.nodes[0].child; n != json::kNone; n = document.nodes[n].next) {
+        json::Writer key{document.scratch};
+        if (!document.string(document.nodes[n].key, key)) return Refresh::Invalid;
+        if (Str{document.scratch, key.len}.eq(lit_str("keys"))) entries = n;
+    }
+    if (entries == json::kNone || document.nodes[entries].kind != json::Kind::Array)
+        return Refresh::Invalid;
+    char ids[Es256KeySet::kMaxKeys][Es256KeySet::kMaxKidBytes];
+    u32 lengths[Es256KeySet::kMaxKeys];
+    Str approved[Es256KeySet::kMaxKeys];
+    u32 count = 0, selected = 0;
+    for (u32 n = document.nodes[entries].child; n != json::kNone; n = document.nodes[n].next) {
+        if (count == Es256KeySet::kMaxKeys || document.nodes[n].kind != json::Kind::Object)
+            return Refresh::Invalid;
+        u32 kid = json::kNone;
+        for (u32 member = document.nodes[n].child; member != json::kNone;
+             member = document.nodes[member].next) {
+            json::Writer name{document.scratch};
+            if (!document.string(document.nodes[member].key, name)) return Refresh::Invalid;
+            if (Str{document.scratch, name.len}.eq(lit_str("kid"))) kid = member;
+        }
+        if (kid == json::kNone) return Refresh::Invalid;
+        json::Writer id{ids[count], sizeof(ids[count])};
+        if (!document.string(kid, id) || !id.ok || !id.len) return Refresh::Invalid;
+        const Str kValue{ids[count], id.len};
+        for (u32 i = 0; i < count; ++i)
+            if (kValue.eq({ids[i], lengths[i]})) return Refresh::Invalid;
+        lengths[count++] = id.len;
+        for (u32 i = 0; i < key_set.size(); ++i) {
+            if (kValue.eq(key_set.kid_at(i))) approved[selected++] = key_set.kid_at(i);
+        }
+    }
+    if (!selected) return Refresh::Empty;
+    return output.load(jwks, approved, selected) ? Refresh::Ready : Refresh::Invalid;
+}
+
 bool Es256Policies::load(const Str* configuration_values, u32 configuration_count) {
     if (policies || rows || configuration_count > kMaxPolicies ||
         (configuration_count && !configuration_values))
@@ -158,6 +204,17 @@ bool Es256Policies::load(const Str* configuration_values, u32 configuration_coun
         return false;
     }
     for (u32 i = 0; i < kMaxShards; ++i) ::new (&rows[i]) Row();
+    for (u32 shard = 0; shard < kMaxShards; ++shard) {
+        for (u32 i = 0; i < count; ++i) {
+            if (!policies[i].remote().enabled()) continue;
+            void* storage = arena.alloc(sizeof(RemoteRow));
+            if (!storage) {
+                destroy();
+                return false;
+            }
+            rows[shard].remote[i] = ::new (storage) RemoteRow();
+        }
+    }
     return true;
 }
 
@@ -173,6 +230,13 @@ bool Es256Policies::activate(u32 shard) {
             return false;
         }
     }
+    for (u32 i = 0; i < count; ++i) {
+        if (row.remote[i] && !row.remote[i]->fetch.init(policies[i].remote().endpoint)) {
+            for (u32 j = 0; j < count; ++j) row.verifiers[j].reset();
+            cancel(shard);
+            return false;
+        }
+    }
     row.ready = true;
     return true;
 }
@@ -184,7 +248,8 @@ bool Es256Policies::verify(u32 shard,
                            i64 now,
                            char* payload,
                            u32 capacity,
-                           u32& length) {
+                           u32& length,
+                           u64 monotonic_ms) {
     length = 0;
     document.valid = false;
     document.count = 0;
@@ -194,6 +259,15 @@ bool Es256Policies::verify(u32 shard,
         if (!configurations[i].eq(configuration)) continue;
         auto& row = rows[shard];
         Es256VerifierSet* verifiers = &row.verifiers[i];
+        if (auto* remote = row.remote[i]) {
+            if (monotonic_ms == ~u64{0}) monotonic_ms = jwt_monotonic_ms();
+            if (!monotonic_ms || !remote->last_success || remote->empty ||
+                monotonic_ms < remote->last_success ||
+                monotonic_ms - remote->last_success >=
+                    static_cast<u64>(policies[i].remote().max_age_seconds) * 1000)
+                return false;
+            if (remote->use_alternate) verifiers = &remote->alternate;
+        }
         Str kid{};
         if (jwt_es256_validate_set(*verifiers,
                                    document,
@@ -216,9 +290,73 @@ bool Es256Policies::verify(u32 shard,
     return false;
 }
 
+void Es256Policies::maintain(u32 shard, u64 monotonic_ms) {
+    if (!rows || shard >= kMaxShards || !rows[shard].ready) return;
+    auto& row = rows[shard];
+    for (u32 i = 0; i < count; ++i) {
+        auto* remote = row.remote[i];
+        if (!remote) continue;
+        if (monotonic_ms == ~u64{0}) monotonic_ms = jwt_monotonic_ms();
+        const auto& policy = policies[i].remote();
+        if (!monotonic_ms || (remote->last_success && monotonic_ms < remote->last_success)) {
+            remote->fetch.cancel();
+            remote->last_success = 0;
+            remote->next_attempt = 0;
+            continue;
+        }
+        if (remote->fetch.state() != HttpsFetch::State::Busy) {
+            if (monotonic_ms < remote->next_attempt) continue;
+            // Attempt start schedules the next retry too; setup failures cannot
+            // turn every batch into a connection storm.
+            remote->next_attempt = monotonic_ms + static_cast<u64>(policy.refresh_seconds) * 1000;
+            (void)remote->fetch.start(monotonic_ms, policy.timeout_seconds * 1000);
+        }
+        remote->fetch.advance(monotonic_ms);
+        if (remote->fetch.state() != HttpsFetch::State::Done) continue;
+        Es256KeySet keys;
+        const auto kPrepared = policies[i].prepare_refresh(remote->fetch.body(), keys);
+        if (kPrepared != Es256Policy::Refresh::Invalid) {
+            auto& candidate = remote->use_alternate ? row.verifiers[i] : remote->alternate;
+            candidate.reset();
+            if (kPrepared == Es256Policy::Refresh::Empty || candidate.init(keys)) {
+                // This maintenance callback runs between handler batches on the
+                // same shard. Verification retains no key/verifier views.
+                auto& previous = remote->use_alternate ? remote->alternate : row.verifiers[i];
+                previous.reset();
+                remote->use_alternate = !remote->use_alternate;
+                remote->empty = kPrepared == Es256Policy::Refresh::Empty;
+                remote->last_success = monotonic_ms;
+                remote->next_attempt =
+                    monotonic_ms + static_cast<u64>(policy.refresh_seconds) * 1000;
+            }
+        }
+        // Release the borrowed body only after key import/activation completes.
+        remote->fetch.cancel();
+    }
+}
+
+void Es256Policies::cancel(u32 shard) {
+    if (!rows || shard >= kMaxShards) return;
+    for (u32 i = 0; i < count; ++i)
+        if (rows[shard].remote[i]) rows[shard].remote[i]->fetch.cancel();
+}
+
+bool Es256Policies::fetch_busy(u32 shard) const {
+    if (!rows || shard >= kMaxShards || !rows[shard].ready) return false;
+    const auto& row = rows[shard];
+    for (u32 i = 0; i < count; ++i)
+        if (row.remote[i] && row.remote[i]->fetch.state() == HttpsFetch::State::Busy) return true;
+    return false;
+}
+
 void Es256Policies::destroy() {
-    if (rows)
-        for (u32 i = 0; i < kMaxShards; ++i) rows[i].~Row();
+    if (rows) {
+        for (u32 i = 0; i < kMaxShards; ++i) {
+            for (u32 j = 0; j < count; ++j)
+                if (rows[i].remote[j]) rows[i].remote[j]->~RemoteRow();
+            rows[i].~Row();
+        }
+    }
     for (u32 i = 0; i < count; ++i) policies[i].~Es256Policy();
     rows = nullptr;
     policies = nullptr;

@@ -2362,10 +2362,11 @@ policy rejects it. Signature, issuer, audience, time and revocation checks must 
 succeed before any claims are returned; revocation failure is the usual nil/401.
 
 
-### Remote RS256 JWKS refresh
+### Remote RS256 and ES256 JWKS refresh
 
-The same compile-time `Crypto.jwtRs256(token, policy)` policy can include an
-optional `remoteJwks` object with exactly these eight required members:
+The compile-time `Crypto.jwtRs256(token, policy)` and
+`Crypto.jwtEs256(token, policy)` policies can include an optional `remoteJwks`
+object with exactly these eight required members:
 
 ```json
 {"address":"192.0.2.10","port":443,"serverName":"issuer.example",
@@ -2388,7 +2389,7 @@ strictly greater than the refresh interval; `timeoutSeconds` is 1–60. Address,
 server name, CA path and request path are owned, bounded strings with no embedded
 NUL; paths start with `/` and cannot contain whitespace, controls, fragments or
 backslashes. The entire enclosing policy retains its 8192-byte bound. CA files
-are loaded at shard activation. Failure leaves that shard's RS256 policy row unavailable.
+are loaded at shard activation. Failure leaves that shard's policy row unavailable.
 
 Each shard owns its own bounded fetch and verification workspace. Between handler
 batches, a function-pointer state machine advances at most 16 nonblocking I/O
@@ -2409,10 +2410,11 @@ HTTP/2 or compressed response handling is advertised by this profile.
 
 A fetched set contains at most 16 objects with distinct nonempty bounded kids.
 Only the intersection with the configured approved kids can become trusted;
-unknown keys never expand trust. Selected keys retain the strict RS256 public
-JWK profile. Preapprove future kids through replacement configuration before
-rotating to them. An otherwise valid empty intersection is authoritative removal
-and immediately denies all tokens, rather than falling back to old keys.
+unknown keys never expand trust. Selected keys retain their algorithm-specific
+strict RS256 or ES256 public JWK profile. Preapprove future kids through
+replacement configuration before rotating to them. An otherwise valid empty
+intersection is authoritative removal and immediately denies all tokens, rather
+than falling back to old keys.
 
 A replacement verifier is completely prepared on the owning shard before its
 cache is switched. Signature/claims/revocation checks remain unchanged. Fetch,
@@ -2437,8 +2439,11 @@ cross-node synchronization, OIDC discovery, online Token revocation or signing.
 `jwtVerifyEs256(token, policy) -> Json?` and `Crypto.jwtEs256(token, policy)`
 accept the same trusted compile-time four-field policy shape as RS256: `issuer`,
 `audience`, approved `kids`, and a local public `jwks`. Optional `revokedJtis`
-and `issuedAfter` have the same immutable snapshot semantics. `remoteJwks` is
-rejected by this ES256 profile; remote refresh is a separate remaining capability.
+and `issuedAfter` have the same immutable snapshot semantics. Optional
+`remoteJwks` uses the bounded authenticated HTTPS refresh contract above,
+including its eight endpoint fields, approved-kid intersection and maximum age.
+Remote mode rejects tokens until the first successful authenticated fetch;
+selected keys must satisfy the ES256 public JWK profile below.
 
 Approved keys require `kty=EC`, `alg=ES256`, `crv=P-256`, and canonical unpadded
 base64url `x`/`y` coordinates of exactly 32 bytes each (including leading zeros).
@@ -2463,12 +2468,14 @@ scope (403 on insufficient scope) before publishing method `jwtES256` and the
 trusted credential ID. Duplicate Authorization fields fail closed through
 `req.authorization.or("")`. See [jwt-es256-auth.rut](../examples/jwt-es256-auth.rut).
 
-Key parsing occurs before configuration publication. Each shard activates its
-own preallocated and warmed curve/bignum workspace before accepting or adopting
-that configuration. There is no lazy request-time initialization. Failed rows
+Initial key parsing occurs before configuration publication; remote replacements
+are parsed during shard maintenance, never during token verification. Each shard
+activates its own preallocated and warmed curve/bignum workspace before
+accepting or adopting that configuration. There is no lazy request-time initialization. Failed rows
 remain unavailable. Configurations and request-owned Json follow the existing
-RCU/arena lifetimes; key removal or revocation requires configuration adoption,
-while in-flight readers keep the old snapshot. Native artifact version 17
-serializes owned policy bytes and reconstructs keys after compiler exit; mutable
-crypto workspaces and pointers are never serialized. This adds verification,
+RCU/arena lifetimes. Local key removal and revocation require configuration
+adoption; remote key removal takes effect at the next successful refresh.
+In-flight readers keep their generation and its cache expiration. Native artifact
+version 17 serializes owned policy bytes and reconstructs keys after compiler
+exit; mutable crypto workspaces and pointers are never serialized. This adds verification,
 not ES256 signing, OIDC, online revocation, persistent sessions or replay state.

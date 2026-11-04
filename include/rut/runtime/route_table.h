@@ -753,12 +753,16 @@ struct RouteConfig {
     bool activate_es256(u32 shard) const {
         return es256_configuration_count == 0 || (es256 && es256->activate(shard));
     }
-    void refresh_rs256(u32 shard) const {
+    void refresh_jwks(u32 shard) const {
         if (rs256) rs256->maintain(shard);
+        if (es256) es256->maintain(shard);
     }
-    bool rs256_fetch_busy(u32 shard) const { return rs256 && rs256->fetch_busy(shard); }
-    void cancel_rs256(u32 shard) const {
+    bool jwks_fetch_busy(u32 shard) const {
+        return (rs256 && rs256->fetch_busy(shard)) || (es256 && es256->fetch_busy(shard));
+    }
+    void cancel_jwks(u32 shard) const {
         if (rs256) rs256->cancel(shard);
+        if (es256) es256->cancel(shard);
     }
 
     bool has_strict_local_response_policy_inventory() const {

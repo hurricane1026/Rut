@@ -4,12 +4,13 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/ec_public_key.h"
 #include "rut/runtime/jwt_es256.h"
+#include "rut/runtime/remote_jwks.h"
 
 namespace rut {
 
 // Immutable configuration-owned ES256 trust profile. Only explicitly approved
 // IDs are loaded, with exact issuer/audience and optional revocation snapshots.
-// This profile accepts local JWKS only; remoteJwks is rejected, not ignored.
+// Remote refresh imports only the configured approved IDs, outside requests.
 class Es256Policy {
 public:
     static constexpr u32 kMaxText = 8192;
@@ -22,6 +23,10 @@ public:
     Str issuer() const { return {issuer_bytes, issuer_len}; }
     Str audience() const { return {audience_bytes, audience_len}; }
     bool permits(json::Document& document) const;
+    using Remote = RemoteJwks;
+    const Remote& remote() const { return remote_configuration; }
+    enum class Refresh : u8 { Invalid, Empty, Ready };
+    Refresh prepare_refresh(Str jwks, Es256KeySet& output) const;
 
 private:
     bool import_jwks(Str jwks, Str issuer, Str audience, const Str* approved_ids, u32 count);
@@ -35,6 +40,7 @@ private:
     u32 revoked_count = 0;
     bool require_jti = false;
     i64 issued_after = 0;
+    Remote remote_configuration{};
 };
 
 class Es256Policies {
@@ -53,12 +59,25 @@ public:
                 i64 now,
                 char* payload,
                 u32 capacity,
-                u32& length);
+                u32& length,
+                u64 monotonic_ms = ~u64{0});
+    void maintain(u32 shard, u64 monotonic_ms = ~u64{0});
+    bool fetch_busy(u32 shard) const;
+    void cancel(u32 shard);
     void destroy();
 
 private:
+    struct RemoteRow {
+        HttpsFetch fetch;
+        Es256VerifierSet alternate;
+        u64 last_success = 0;
+        u64 next_attempt = 0;
+        bool use_alternate = false;
+        bool empty = false;
+    };
     struct Row {
         Es256VerifierSet verifiers[kMaxPolicies];
+        RemoteRow* remote[kMaxPolicies]{};
         bool attempted = false;
         bool ready = false;
     };

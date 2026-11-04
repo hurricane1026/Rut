@@ -21,10 +21,13 @@ def main():
     parser.add_argument("--helper", required=True)
     parser.add_argument("--testdata", required=True)
     parser.add_argument("--backend", choices=("epoll", "io_uring"), required=True)
+    parser.add_argument("--algorithm", choices=("RS256", "ES256"), default="RS256")
     args = parser.parse_args()
-    fixture = json.loads(subprocess.check_output([args.helper, "--fixture"], timeout=10))
+    fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
+    fixture = json.loads(subprocess.check_output([args.helper, fixture_option], timeout=10))
     lock = threading.Lock()
-    state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200, "requests": 0}
+    release_response = threading.Event()
+    state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200, "requests": 0, "hold": False}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -35,13 +38,18 @@ def main():
                 return
             with lock:
                 state["requests"] += 1
-                status, body = state["status"], state["body"]
-            self.send_response(status)
-            self.send_header("Content-Type", "application/jwk-set+json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(body)
+                status, body, hold = state["status"], state["body"], state["hold"]
+            if hold:
+                release_response.wait(timeout=5)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/jwk-set+json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionError, ssl.SSLError):
+                pass
 
         def log_message(self, *unused):
             pass
@@ -61,7 +69,8 @@ def main():
                                 "ca": str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
                                 "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 1}
         literal = json.dumps(json.dumps(policy, separators=(",", ":")))
-        source = ('import Crypto\nroute GET "/" { guard let claims = Crypto.jwtRs256('
+        verifier = "jwtEs256" if args.algorithm == "ES256" else "jwtRs256"
+        source = ('import Crypto\nroute GET "/" { guard let claims = Crypto.' + verifier + '('
                   'bearerToken(req.authorization.or("")).or(""), ' + literal +
                   ') else { return 401 } return 200 }\n')
         with tempfile.TemporaryDirectory(prefix="rut-remote-jwks-") as directory:
@@ -93,6 +102,9 @@ def main():
                         raise SystemExit(77)
                     raise AssertionError(f"gateway exited during startup: {output}")
             assert port is not None, f"gateway did not listen: {startup!r}"
+
+            # The compiled native configuration owns the policy after source removal.
+            source_path.unlink()
 
             def request(token):
                 if process.poll() is not None:
@@ -155,11 +167,19 @@ def main():
             wait_status(fixture["b"], 200)
             publish(b"{bad")
             wait_status(fixture["b"], 401)
+            # Leave an authenticated fetch waiting on an origin response while
+            # retiring the gateway, exercising in-flight refresh cancellation.
+            with lock:
+                requests_before_shutdown = state["requests"]
+                state["hold"] = True
+            wait_for_origin_request(requests_before_shutdown)
             process.terminate()
             output = process.communicate(timeout=5)[0].decode(errors="replace")
             assert process.returncode == 0, output
-            print(f"PASS: {args.backend} remote JWKS rotation, empty set, outage, malformed refresh and shutdown")
+            release_response.set()
+            print(f"PASS: {args.algorithm} {args.backend} remote JWKS rotation, empty set, outage, malformed refresh and shutdown")
     finally:
+        release_response.set()
         if process is not None and process.poll() is None:
             process.kill()
             process.communicate(timeout=5)

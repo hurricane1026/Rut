@@ -4,7 +4,8 @@
 //                   "x":"...32-byte base64url coordinate...",
 //                   "y":"...32-byte base64url coordinate..."}]}}.
 // Optional revokedJtis/issuedAfter are immutable revocation snapshots.
-// This ES256 profile accepts local JWKS only; remoteJwks is rejected.
+// Optional remoteJwks uses the same eight-field bounded HTTPS profile as RS256.
+// Initial keys approve IDs; remote mode denies until its first successful fetch.
 import "middleware/auth.rut"
 
 route GET "/orders" {

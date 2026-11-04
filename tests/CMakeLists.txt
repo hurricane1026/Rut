@@ -977,6 +977,13 @@ if(RUT_ENABLE_JIT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${jwks_backend})
         set_tests_properties(test_remote_jwks_${jwks_backend} PROPERTIES
             LABELS "integration;auth" TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME test_remote_es256_jwks_${jwks_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_jwks.py
+                --server $<TARGET_FILE:rut> --helper $<TARGET_FILE:test_https_fetch>
+                --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${jwks_backend}
+                --algorithm ES256)
+        set_tests_properties(test_remote_es256_jwks_${jwks_backend} PROPERTIES
+            LABELS "integration;auth" TIMEOUT 90 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
 
@@ -1384,6 +1391,8 @@ target_include_directories(test_shard_control PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_compile_definitions(test_shard_control PRIVATE RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}")
+add_dependencies(test_shard_control test_tls_fixtures)
 add_test(NAME test_shard_control COMMAND test_shard_control)
 set_tests_properties(test_shard_control PROPERTIES LABELS "unit")
 

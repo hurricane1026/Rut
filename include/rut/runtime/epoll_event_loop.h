@@ -412,7 +412,7 @@ public:
 
         while (is_running()) {
             const bool fetch_busy =
-                config_ptr && *config_ptr && (*config_ptr)->rs256_fetch_busy(shard_id);
+                config_ptr && *config_ptr && (*config_ptr)->jwks_fetch_busy(shard_id);
             u32 n = backend.wait(
                 events, kMaxEventsPerWait, conns, connection_capacity, fetch_busy ? 10u : ~u32{0});
             dispatch_batch(events, n);
@@ -447,7 +447,7 @@ public:
                 }
             }
         }
-        if (config_ptr && *config_ptr) (*config_ptr)->cancel_rs256(shard_id);
+        if (config_ptr && *config_ptr) (*config_ptr)->cancel_jwks(shard_id);
     }
 
     void stop() { running_.store(false, std::memory_order_release); }
@@ -455,7 +455,7 @@ public:
     bool is_draining() const { return draining_.load(std::memory_order_acquire); }
 
     void poll_command() {
-        if (config_ptr && *config_ptr) (*config_ptr)->refresh_rs256(shard_id);
+        if (config_ptr && *config_ptr) (*config_ptr)->refresh_jwks(shard_id);
         if (!control) return;
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
         // A prepared worker is published before its requiring config. Acquire
@@ -464,7 +464,7 @@ public:
                 control->pending_password_gateway.exchange(nullptr, std::memory_order_acq_rel))
             this->password_gateway = passwords;
         if (cfg && config_ptr) {
-            if (*config_ptr && *config_ptr != cfg) (*config_ptr)->cancel_rs256(shard_id);
+            if (*config_ptr && *config_ptr != cfg) (*config_ptr)->cancel_jwks(shard_id);
             (void)cfg->activate_rs256(shard_id);
             (void)cfg->activate_es256(shard_id);
             *config_ptr = cfg;

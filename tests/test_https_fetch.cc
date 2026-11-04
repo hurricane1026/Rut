@@ -1,4 +1,6 @@
+#include "es256_fixture.h"
 #include "rs256_fixture.h"
+#include "rut/runtime/es256_policy.h"
 #include "rut/runtime/https_fetch.h"
 #include "rut/runtime/rs256_policy.h"
 #include "test.h"
@@ -72,8 +74,9 @@ struct TlsOrigin {
                 u32 length = 0;
                 self.request[0] = 0;
                 while (length < sizeof(self.request) - 1) {
-                    const int n =
-                        SSL_read(ssl, self.request + length, sizeof(self.request) - 1 - length);
+                    const int n = SSL_read(ssl,
+                                           self.request + length,
+                                           static_cast<int>(sizeof(self.request) - 1 - length));
                     if (n <= 0) break;
                     length += static_cast<u32>(n);
                     self.request[length] = 0;
@@ -84,7 +87,7 @@ struct TlsOrigin {
                 for (u32 offset = 0; offset < response.len;) {
                     const u32 remaining = response.len - offset;
                     const u32 size = remaining < self.fragment ? remaining : self.fragment;
-                    const int n = SSL_write(ssl, response.ptr + offset, size);
+                    const int n = SSL_write(ssl, response.ptr + offset, static_cast<int>(size));
                     if (n <= 0) break;
                     offset += static_cast<u32>(n);
                 }
@@ -239,26 +242,32 @@ TEST(https_fetch, cancellation_timeout_clock_failure_and_endpoint_validation) {
     CHECK(!no_ca.init(bad));
 }
 
+template <typename Fixture>
+static int print_remote_fixture() {
+    Fixture first, second;
+    if (!first.init() || !second.init()) return 2;
+    char a_bytes[4096], b_bytes[4096];
+    const Str a = first.sign(Fixture::header, Fixture::claims, a_bytes);
+    const Str b = second.sign(Fixture::header, Fixture::claims, b_bytes);
+    if (!a.len || !b.len) return 2;
+    printf("{\"first\":%.*s,\"second\":%.*s,\"a\":\"%.*s\",\"b\":\"%.*s\"}\n",
+           first.policy.len,
+           first.policy.ptr,
+           second.policy.len,
+           second.policy.ptr,
+           a.len,
+           a.ptr,
+           b.len,
+           b.ptr);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
-    if (argc == 2 && strcmp(argv[1], "--fixture") == 0) {
-        test::Rs256Fixture first, second;
-        if (!first.init() || !second.init()) return 2;
-        char a_bytes[4096], b_bytes[4096];
-        const Str a = first.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, a_bytes);
-        const Str b = second.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, b_bytes);
-        if (!a.len || !b.len) return 2;
-        printf("{\"first\":%.*s,\"second\":%.*s,\"a\":\"%.*s\",\"b\":\"%.*s\"}\n",
-               first.policy.len,
-               first.policy.ptr,
-               second.policy.len,
-               second.policy.ptr,
-               a.len,
-               a.ptr,
-               b.len,
-               b.ptr);
-        return 0;
-    }
+    if (argc == 2 && strcmp(argv[1], "--fixture") == 0)
+        return print_remote_fixture<test::Rs256Fixture>();
+    if (argc == 2 && strcmp(argv[1], "--fixture-es256") == 0)
+        return print_remote_fixture<test::Es256Fixture>();
     return rut::test::run_all(argc, argv);
 }
 
@@ -275,7 +284,8 @@ static Str json_response(Str body, char* output, u32 capacity) {
     return {output, static_cast<u32>(size) + body.len};
 }
 
-static Str fixture_jwks(test::Rs256Fixture& fixture, json::Document& document) {
+template <typename Fixture>
+static Str fixture_jwks(Fixture& fixture, json::Document& document) {
     if (!document.parse(fixture.policy)) return {};
     for (u32 n = document.nodes[0].child; n != json::kNone; n = document.nodes[n].next) {
         json::Writer name{document.scratch};
@@ -285,8 +295,9 @@ static Str fixture_jwks(test::Rs256Fixture& fixture, json::Document& document) {
     return {};
 }
 
-TEST(https_fetch, remote_jwks_rotation_failure_expiry_empty_set_and_shard_isolation) {
-    test::Rs256Fixture first, second;
+template <typename Fixture, typename Policies>
+static void remote_rotation(test::TestCase* _tc) {
+    Fixture first, second;
     REQUIRE(first.init());
     REQUIRE(second.init());
     json::Document document;
@@ -317,18 +328,25 @@ TEST(https_fetch, remote_jwks_rotation_failure_expiry_empty_set_and_shard_isolat
         RUT_TESTDATA_DIR "/localhost_cert.pem");
     REQUIRE(size > 0 && static_cast<u32>(size) < sizeof(configuration));
     const Str policy{configuration, static_cast<u32>(size)};
-    Rs256Policies policies;
+    Policies policies;
     REQUIRE(policies.load(&policy, 1));
     REQUIRE(policies.activate(0));
     REQUIRE(policies.activate(1));
     char a_bytes[4096], b_bytes[4096], payload[8192];
-    const Str a = first.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, a_bytes);
-    const Str b = second.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, b_bytes);
+    const Str a = first.sign(Fixture::header, Fixture::claims, a_bytes);
+    const Str b = second.sign(Fixture::header, Fixture::claims, b_bytes);
     REQUIRE(a.len && b.len);
     u32 length = 7;
     const auto verify = [&](u32 shard, Str token, u64 now) {
-        return policies.verify(
+        const bool valid = policies.verify(
             shard, policy, document, token, 100, payload, sizeof(payload), length, now);
+        if (!valid) {
+            CHECK_EQ(length, 0u);
+            CHECK(!document.valid);
+            CHECK_EQ(document.count, 0u);
+            CHECK(document.source.ptr == nullptr);
+        }
+        return valid;
     };
     CHECK(!verify(0, a, 100));  // Bootstrap is not an offline remote cache.
     CHECK_EQ(length, 0u);
@@ -358,7 +376,7 @@ TEST(https_fetch, remote_jwks_rotation_failure_expiry_empty_set_and_shard_isolat
     CHECK(verify(0, a, 3100));
     REQUIRE(refresh(0, 4100, 5));  // Authoritative empty set removes keys immediately.
     CHECK(!verify(0, a, 4100));
-    REQUIRE(refresh(0, 5100, 6));  // Same approved kid now owns a different RSA key.
+    REQUIRE(refresh(0, 5100, 6));  // Same approved kid now owns a different signing key.
     CHECK(!verify(0, a, 5100));
     CHECK(verify(0, b, 5100));
     CHECK(!verify(1, b, 5100));
@@ -374,10 +392,19 @@ TEST(https_fetch, remote_jwks_rotation_failure_expiry_empty_set_and_shard_isolat
     CHECK(verify(1, b, 5100));
 }
 
-TEST(https_fetch, remote_key_import_checks_complete_set_and_never_expands_approved_ids) {
-    test::Rs256Fixture fixture;
+TEST(https_fetch, remote_jwks_rotation_failure_expiry_empty_set_and_shard_isolation) {
+    remote_rotation<test::Rs256Fixture, Rs256Policies>(_tc);
+}
+
+TEST(https_fetch, es256_remote_jwks_rotation_failure_expiry_empty_set_and_shard_isolation) {
+    remote_rotation<test::Es256Fixture, Es256Policies>(_tc);
+}
+
+template <typename Fixture, typename Policy, typename Keys>
+static void remote_key_import(test::TestCase* _tc) {
+    Fixture fixture;
     REQUIRE(fixture.init());
-    Rs256Policy policy;
+    Policy policy;
     REQUIRE(policy.load(fixture.policy));
     const Str bad[] = {
         lit_str("null"),
@@ -389,24 +416,76 @@ TEST(https_fetch, remote_key_import_checks_complete_set_and_never_expands_approv
         lit_str(R"({"keys":[{"kid":"current","kid":"other"}]})"),
     };
     for (Str value : bad) {
-        Rs256KeySet keys;
-        CHECK_EQ(policy.prepare_refresh(value, keys), Rs256Policy::Refresh::Invalid);
+        Keys keys;
+        CHECK_EQ(policy.prepare_refresh(value, keys), Policy::Refresh::Invalid);
         CHECK(!keys.valid());
     }
-    Rs256KeySet keys;
-    CHECK_EQ(policy.prepare_refresh(lit_str(R"({"keys":[]})"), keys), Rs256Policy::Refresh::Empty);
+    Keys keys;
+    CHECK_EQ(policy.prepare_refresh(lit_str(R"({"keys":[]})"), keys), Policy::Refresh::Empty);
     CHECK_EQ(policy.prepare_refresh(lit_str(R"({"keys":[{"kid":"unapproved","kty":"EC"}]})"), keys),
-             Rs256Policy::Refresh::Empty);
+             Policy::Refresh::Empty);
     json::Document document;
     REQUIRE_EQ(policy.prepare_refresh(fixture_jwks(fixture, document), keys),
-               Rs256Policy::Refresh::Ready);
+               Policy::Refresh::Ready);
     CHECK_EQ(keys.size(), 1u);
     CHECK(keys.kid_at(0).eq(lit_str("current")));
     CHECK(keys.kid_at(1).ptr == nullptr);
 }
 
-TEST(https_fetch, remote_endpoint_configuration_rejects_unbounded_or_ambiguous_inputs) {
-    test::Rs256Fixture fixture;
+TEST(https_fetch, remote_key_import_checks_complete_set_and_never_expands_approved_ids) {
+    remote_key_import<test::Rs256Fixture, Rs256Policy, Rs256KeySet>(_tc);
+}
+
+TEST(https_fetch, es256_remote_key_import_checks_complete_set_and_never_expands_approved_ids) {
+    remote_key_import<test::Es256Fixture, Es256Policy, Es256KeySet>(_tc);
+}
+
+TEST(https_fetch, es256_refresh_rejects_invalid_selected_key_material) {
+    test::Es256Fixture fixture;
+    REQUIRE(fixture.init());
+    Es256Policy policy;
+    REQUIRE(policy.load(fixture.policy));
+    json::Document document;
+    const Str jwks = fixture_jwks(fixture, document);
+    REQUIRE(jwks.len);
+    const char* fields[] = {R"("alg":"ES384")",
+                            R"("crv":"P-384")",
+                            R"("d":"AA")",
+                            R"("x":"AA")",
+                            R"("key_ops":["sign"])"};
+    // Duplicate members are rejected too, even if the original valid member
+    // would otherwise make the selected key appear usable.
+    for (const char* field : fields) {
+        char bytes[4096];
+        const int size =
+            snprintf(bytes, sizeof(bytes), "%.*s,%s}]}", jwks.len - 3, jwks.ptr, field);
+        REQUIRE(size > 0 && static_cast<u32>(size) < sizeof(bytes));
+        Es256KeySet keys;
+        CHECK_EQ(policy.prepare_refresh({bytes, static_cast<u32>(size)}, keys),
+                 Es256Policy::Refresh::Invalid);
+        CHECK(!keys.valid());
+    }
+}
+
+TEST(https_fetch, es256_separate_import_clears_failed_policy_extensions) {
+    test::Es256Fixture fixture;
+    REQUIRE(fixture.init());
+    Es256Policy policy;
+    CHECK(!policy.load(lit_str(
+        R"({"issuer":"issuer","audience":"gateway","revokedJtis":[],"issuedAfter":50,"remoteJwks":{"address":"127.0.0.1","port":443,"serverName":"localhost","ca":"ca.pem","path":"/keys","refreshSeconds":1,"maxAgeSeconds":2,"timeoutSeconds":1},"kids":["current"],"jwks":{"keys":[]}})")));
+    CHECK(policy.remote().enabled());
+    json::Document document;
+    const Str approved[] = {lit_str("current")};
+    REQUIRE(policy.load_jwks(
+        fixture_jwks(fixture, document), lit_str("issuer"), lit_str("gateway"), approved, 1));
+    CHECK(!policy.remote().enabled());
+    REQUIRE(document.parse(test::Es256Fixture::claims));
+    CHECK(policy.permits(document));
+}
+
+template <typename Fixture, typename Policy>
+static void remote_configuration(test::TestCase* _tc) {
+    Fixture fixture;
     REQUIRE(fixture.init());
     const char* options[] = {
         R"({})",
@@ -429,13 +508,22 @@ TEST(https_fetch, remote_endpoint_configuration_rejects_unbounded_or_ambiguous_i
                                     fixture.policy.ptr,
                                     options[i]);
         REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(bytes));
-        Rs256Policy policy;
+        Policy policy;
         CHECK_EQ(policy.load({bytes, static_cast<u32>(length)}), i == 1);
     }
 }
 
-TEST(https_fetch, failed_tls_activation_cannot_serve_bootstrap_or_initialize_on_verification) {
-    test::Rs256Fixture fixture;
+TEST(https_fetch, remote_endpoint_configuration_rejects_unbounded_or_ambiguous_inputs) {
+    remote_configuration<test::Rs256Fixture, Rs256Policy>(_tc);
+}
+
+TEST(https_fetch, es256_remote_endpoint_configuration_rejects_unbounded_or_ambiguous_inputs) {
+    remote_configuration<test::Es256Fixture, Es256Policy>(_tc);
+}
+
+template <typename Fixture, typename Policies>
+static void failed_remote_activation(test::TestCase* _tc) {
+    Fixture fixture;
     REQUIRE(fixture.init());
     char bytes[8192];
     const int size = snprintf(
@@ -448,13 +536,12 @@ TEST(https_fetch, failed_tls_activation_cannot_serve_bootstrap_or_initialize_on_
         fixture.policy.ptr);
     REQUIRE(size > 0 && static_cast<u32>(size) < sizeof(bytes));
     const Str policy{bytes, static_cast<u32>(size)};
-    Rs256Policies policies;
+    Policies policies;
     REQUIRE(policies.load(&policy, 1));
     CHECK(!policies.activate(0));
     CHECK(!policies.activate(0));
     char token_bytes[4096], payload[8192];
-    const Str token =
-        fixture.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token_bytes);
+    const Str token = fixture.sign(Fixture::header, Fixture::claims, token_bytes);
     json::Document document;
     u32 length = 99;
     CHECK(!policies.verify(0, policy, document, token, 100, payload, sizeof(payload), length, 100));
@@ -463,6 +550,15 @@ TEST(https_fetch, failed_tls_activation_cannot_serve_bootstrap_or_initialize_on_
     policies.maintain(0, 100);
     policies.cancel(0);
     CHECK(!policies.verify(0, policy, document, token, 100, payload, sizeof(payload), length, 100));
+}
+
+TEST(https_fetch, failed_tls_activation_cannot_serve_bootstrap_or_initialize_on_verification) {
+    failed_remote_activation<test::Rs256Fixture, Rs256Policies>(_tc);
+}
+
+TEST(https_fetch,
+     es256_failed_tls_activation_cannot_serve_bootstrap_or_initialize_on_verification) {
+    failed_remote_activation<test::Es256Fixture, Es256Policies>(_tc);
 }
 
 TEST(https_fetch, only_authenticated_tls_eof_completes_a_close_delimited_body) {
