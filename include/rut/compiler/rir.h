@@ -314,6 +314,8 @@ enum class Opcode : u8 {
     // Two-edge SSA merge. operands are values; block_targets are their
     // predecessor blocks. Phi instructions precede ordinary merge-block work.
     Phi,
+    WsForward,  // Str carrier operand; Text/Binary opcode immediate; I32 action
+    WsClose,    // I32 code and Str reason operands; I32 action
 };
 
 // ── Instruction ─────────────────────────────────────────────────────

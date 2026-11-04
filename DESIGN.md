@@ -2599,6 +2599,35 @@ receives the existing normal-closure echo without the configured reason.
 The echo uses its direction's idle output slice, retained until send completion;
 no extra slices or enlarged inline close-frame buffers are needed.
 
+General synchronous callbacks also accept `message.forward(value)` with an
+unwrapped `str` or `Bytes` expression, including conditional pure-helper results,
+callback-local values and a guard-unwrapped `uuid()`. `str` selects Text and
+validates UTF-8 even for Binary input; Bytes selects Binary. Bare forward keeps
+the incoming kind. The specialized `message.text` affix recipe applies the same
+UTF-8 rule to valid Binary payloads. No implicit conversion or interpolation is
+introduced. Values borrowed from HTTP admission remain prohibited.
+
+`message.close(code, reason)` also accepts runtime plain `i32` and `str` values.
+Known invalid codes and reasons remain compile errors. Runtime invalid codes
+are checked before narrowing; an invalid code/reason or invalid dynamic Text
+produces a 1011 close, and over-limit dynamic output produces 1009. Reasons
+retain their 123-byte UTF-8 bound, independently of the data-message limit.
+Argumentless closes and fixed route-owned policies retain the behavior above.
+
+Shared HIR/MIR output nodes become verified RIR `ws.forward` / `ws.close`
+operations and use explicit native-allowlisted publication helpers. Only the
+selected branch publishes. A synchronous callback borrows its result until
+inspection copies it into the existing owned output slice; later message-arena
+retirement cannot invalidate an asynchronous send. A closing inspector copies
+its echo reason separately before the other direction can reuse callback
+scratch. Before consuming a subsequent final data frame, a dynamic-output route
+reserves its configured maximum message size and the maximum close payload;
+insufficient space flushes prior output before the next callback. Expanding
+routes retain the existing io_uring receive-pause strategy. There is no extra
+per-message allocation or runtime LLVM dependency. The one-slice message/output
+limit remains; this does not complete compression, multi-slice buffers or
+connection/session lifecycle contexts.
+
 Current terminate handlers support `guard` conditions over `message.fromClient`,
 `message.isText`, `message.isBinary`, `message.len` comparisons, and
 `message.text.matches(re"…")`, `message.text == "literal"` (or `!=`, with the
@@ -2685,7 +2714,7 @@ affix alone or an identity `message.text`. Route-local `let` strings whose value
 are known at compile time, including aliases of such strings, may supply fixed
 replacements or affix leaves. Their decoded bytes are copied into the same
 route-owned recipe as literals; request-derived, optional, and non-string values
-are rejected. Calls remain unsupported. Constant strings obey the same UTF-8,
+are rejected. Calls do not participate in this specialized `+` grammar. Constant strings obey the same UTF-8,
 combined fixed-byte limit, and expression-node limits as literal leaves. The
 expression contains at most 32 nodes (literals or constant references, `+`, and
 at most one dynamic source): either `message.text` or one previously guard-unwrapped
@@ -2696,7 +2725,8 @@ visible only after its guard succeeds, including in later guard else branches;
 the binding being declared is unavailable in its own else branch. Constant
 fragments are folded into immutable prefix/suffix views. Other fields, functions,
 two aliases, combining an alias with `message.text`, interpolation, and injection
-remain unsupported. A `message.text` recipe requires Text input; a JSON string
+remain unsupported by the affix grammar. A `message.text` recipe validates UTF-8
+for either input kind; a JSON string
 recipe can select a valid JSON string from Text or Binary input and emits Text.
 Empty values, embedded NUL, and Unicode are preserved without normalization.
 The final payload, including both affixes, must fit both bounds; overflow fails
@@ -2890,7 +2920,7 @@ require a plain string carrier and i32 result. This is separate from the RIR
 `Bytes` kind used internally for fixed-size cryptographic outputs. No new
 runtime helper or allocation is needed. Message predicates lower payload count,
 emptiness and literal byte equality to existing length/raw-comparison nodes.
-Dynamic payload replacement and byte indexing/concatenation remain subsequent work.
+Dynamic scalar payload replacement is supported as described below; byte indexing/concatenation remains unsupported.
 
 The callback parameter uses an ordinary source identifier, recorded on the AST
 and analyzer-only handler metadata. Its spelling is not part of the runtime or
@@ -3091,15 +3121,17 @@ may lower to presence alternatives only when the fallback normalizes to that
 infallible immutable subset. Omitting its evaluation on a present path cannot
 change effects or errors. Regex scans, HTTP/state effects and other fallible
 fallback work are rejected, preserving ordinary evaluation/error semantics.
-General optional locals and computations remain absent. Compile-time Bytes aliases
+The general callback path separately supports ordinary nullable scalar locals
+and computations with explicit unwrapping. Compile-time Bytes aliases
 and helper results also feed the existing LiteralBinary recipe.
 
 `message.forward(message.payload)` accepts the complete borrowed Bytes value,
 including immutable aliases, inlined pure helper returns and reached optional
 bindings. It always emits Binary, even for Text input; bare `forward()` preserves
 the original kind. Normalization must resolve to the current callback message's
-payload field. Request bodies, unrelated values, slices and byte concatenation are
-not introduced. Empty Bytes emits an empty Binary frame; invalid UTF-8 in a Binary
+payload field in this specialized recipe. General scalar output may select
+another Bytes expression; request bodies, slices and byte concatenation remain
+unsupported. Empty Bytes emits an empty Binary frame; invalid UTF-8 in a Binary
 input remains byte-exact, while malformed Text is rejected before the handler.
 
 An appended MessageBytes rewrite-source tag reuses the existing recipe fields,

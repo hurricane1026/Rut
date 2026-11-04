@@ -683,9 +683,12 @@ struct ConnectionBase {
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
     const WsTextRewrite* ws_forward_texts = nullptr;
     u32 ws_forward_text_count = 0;
+    WsHandlerOutput ws_handler_output{};
     WsTextRewrite ws_forward_text{};  // route-owned replacement view, pinned with the route config
     bool ws_has_nonempty_rewrite() const {
-        if (ws_forward_text.prefix.len != 0 || ws_forward_text.suffix.len != 0) return true;
+        if (ws_forward_text.source == WsTextSource::Dynamic || ws_forward_text.prefix.len != 0 ||
+            ws_forward_text.suffix.len != 0)
+            return true;
         if (ws_forward_text_count > kWsMaxForwardTexts ||
             (ws_forward_text_count != 0 && !ws_forward_texts))
             return true;
@@ -2087,6 +2090,9 @@ struct ConnectionBase {
         ws_echo_close_reason = {};
         ws_close_code = 1000;
         ws_forward_text = {};
+        ws_handler_output = {};
+        ws_c2u.dynamic_output = nullptr;
+        ws_u2c.dynamic_output = nullptr;
         ws_forward_texts = nullptr;
         ws_forward_text_count = 0;
         ws_echo_close_code = 1000;

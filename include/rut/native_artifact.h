@@ -67,6 +67,9 @@ bool visit_views(RouteConfig& c, F f) {
     auto str = [&](Str& s) { return f(s.ptr, s.len); };
     for (u32 i = 0; i < c.route_count; i++) {
         auto rewrite = [&](WsTextRewrite& r) {
+            if (r.source == WsTextSource::Dynamic)
+                return !r.prefix.ptr && !r.prefix.len && !r.suffix.ptr && !r.suffix.len &&
+                       !r.source_path.ptr && !r.source_path.len;
             if (r.source > WsTextSource::MessageBytes ||
                 (r.source == WsTextSource::MessageBytes && (r.prefix.len || r.suffix.len)) ||
                 !str(r.prefix) || !str(r.suffix))

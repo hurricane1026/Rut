@@ -4,6 +4,7 @@
 #include "fixtures/signed_request.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_optional_values.h"
@@ -1722,7 +1723,7 @@ TEST(native_program, websocket_guard_close_policies_survive_source_removal) {
                            &used,
                            &produced) == WsInspectStatus::Close);
         CHECK_EQ(st.echo_close_code, codes[i]);
-        CHECK(st.echo_close_reason.eq(reasons[i]));
+        CHECK(st.echo_close_reason().eq(reasons[i]));
         CHECK_EQ(produced, 4u + reasons[i].len);
         if (!reasons[i].empty()) CHECK(memcmp(out + 4, reasons[i].ptr, reasons[i].len) == 0);
     }
@@ -3394,5 +3395,17 @@ TEST(native_program, websocket_eager_bindings_survive_source_removal_and_pool_ex
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     test::ws_eager_bindings::check(owner.p->config, _tc);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_dynamic_outputs_survive_source_removal_and_pool_exhaustion) {
+    Source source;
+    REQUIRE(source.append(test::ws_dynamic_output::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_dynamic_output::check(owner.p->config, _tc);
 }
 #endif

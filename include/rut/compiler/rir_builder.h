@@ -534,6 +534,28 @@ struct Builder {
         return result.vid;
     }
 
+    Result<ValueId> emit_ws_forward(ValueId payload, u8 opcode, SourceLoc loc = {}) {
+        if (!val_has_type(payload, TypeKind::Str) || (opcode != 1 && opcode != 2))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::WsForward, ty, loc));
+        inst->operands[0] = payload;
+        inst->operand_count = 1;
+        inst->imm.i32_val = opcode;
+        return vid;
+    }
+
+    Result<ValueId> emit_ws_close(ValueId code, ValueId reason, SourceLoc loc = {}) {
+        if (!val_has_type(code, TypeKind::I32) || !val_has_type(reason, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::WsClose, ty, loc));
+        inst->operands[0] = code;
+        inst->operands[1] = reason;
+        inst->operand_count = 2;
+        return vid;
+    }
+
     Result<ValueId> emit_req_body(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
         return TRY(emit(Opcode::ReqBody, ty, loc)).vid;

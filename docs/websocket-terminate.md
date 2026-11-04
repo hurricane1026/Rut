@@ -213,8 +213,8 @@ and short-circuit behavior. An unused initializer is still checked.
 
 Message aliases may receive verdicts. A borrowed text alias may feed the existing
 text rewrite or `json.parse` guard; JSON guard aliases retain their existing
-proof and scope rules. Close codes may use constant integer aliases, while close
-reasons retain their existing literal-only form. Fixed Binary replacements also
+proof and scope rules. The general callback path also accepts runtime `i32` close
+codes and `str` reasons, with wire-code and 123-byte UTF-8 validation. Fixed Binary replacements also
 accept immutable Bytes aliases and pure helper results normalized to literals;
 the complete borrowed message payload can also supply Binary output.
 None of these aliases allocate runtime storage, retain a message beyond the
@@ -589,7 +589,7 @@ matching compiler and serving binaries.
   with Binary. One exact-byte literal is allowed, including an empty payload or
   invalid UTF-8. It must fit both the existing 4096-byte decoded byte-literal cap
   and `maxMessageSize`. The `b` must touch the opening quote; NUL is `\x00`.
-  Escapes are `\n`, `\r`, `\t`, `\\`, `\"` and `\xHH`. Concatenation, variables,
+  Escapes are `\n`, `\r`, `\t`, `\\`, `\"` and `\xHH`. Byte concatenation,
   Unicode escapes and interpolation are unsupported. Guard branches can mix
   Binary replacements, Text replacements and bare forwarding. Invalid Text input
   still fails before the handler. Route-owned bytes survive source removal and
@@ -597,6 +597,35 @@ matching compiler and serving binaries.
 - `message.drop()` discards the complete message.
 - `message.close(code, "reason")` requests connection shutdown. The runtime emits
   and drains Close frames to both peers. It does not expose raw frame creation.
+
+Ordinary scalar output expressions are also accepted: a plain `str` emits Text,
+and a plain `Bytes` emits Binary. Pure helpers can select runtime values, and
+optional results such as `uuid()` must be unwrapped first. Text output validates
+UTF-8 even when the input is Binary; a raw `message.text` affix recipe follows
+the same rule. General string interpolation and Bytes concatenation are still
+unsupported. Request-derived views cannot enter a message callback.
+
+```swift
+return websocket(chat) { msg in
+    let token = uuid()
+    guard let value = token else { msg.close() }
+    msg.forward(value)
+}
+```
+
+Dynamic code/reason arguments use `msg.close(code, reason)` with an unwrapped
+`i32` and `str`. Known invalid values remain compile errors; invalid runtime
+code/reason or dynamic Text output closes with 1011. Oversized dynamic output
+closes with 1009. A close reason remains bounded to 123 UTF-8 bytes, independent
+of the configured data-message limit. Empty strings and embedded NUL work.
+
+The callback publishes a borrowed result synchronously. Inspection copies it
+into owned send storage before the next callback or asynchronous I/O; close
+reasons are copied into separate drain storage. Before another message callback,
+backpressure reserves the route's maximum possible output and maximum Close
+payload, flushing an earlier batch first if necessary. These paths use the same
+one-slice limit and existing allocator pools. JSON/regex recipes retain their
+current specialized limits until their general expression integration is complete.
 
 The binding is `{ message in ... }`. The former `{ frame in ... }` syntax and
 `.opcode` comparisons are rejected. Use `isText` / `isBinary` for message types.

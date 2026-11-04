@@ -1018,6 +1018,29 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, strval);
             break;
         }
+        case rir::Opcode::WsForward:
+        case rir::Opcode::WsClose: {
+            const bool kForward = inst.op == rir::Opcode::WsForward;
+            LLVMValueRef payload = c.get_value(inst.operands[kForward ? 0 : 1]);
+            LLVMValueRef ptr = LLVMBuildExtractValue(c.builder, payload, 0, "ws.output.ptr");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, payload, 1, "ws.output.len");
+            LLVMTypeRef params_forward[] = {c.ptr_ty, c.ptr_ty, c.i32_ty, c.i8_ty};
+            LLVMTypeRef params_close[] = {c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
+            LLVMTypeRef ft =
+                LLVMFunctionType(c.i32_ty, kForward ? params_forward : params_close, 4, 0);
+            const char* name = kForward ? "rut_helper_ws_forward" : "rut_helper_ws_close";
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, name);
+            if (!fn) fn = LLVMAddFunction(c.llvm_mod, name, ft);
+            LLVMValueRef args_forward[] = {
+                c.param_conn, ptr, len, LLVMConstInt(c.i8_ty, inst.imm.i32_val, 0)};
+            LLVMValueRef args_close[] = {
+                c.param_conn, kForward ? nullptr : c.get_value(inst.operands[0]), ptr, len};
+            c.set_value(
+                inst.result,
+                LLVMBuildCall2(
+                    c.builder, ft, fn, kForward ? args_forward : args_close, 4, "ws.output"));
+            break;
+        }
         case rir::Opcode::WsMessageField: {
             const auto kField = static_cast<WsMessageFieldId>(inst.imm.i32_val);
             LLVMValueRef value = nullptr;
@@ -3055,6 +3078,22 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                      inst.op == rir::Opcode::RetForwardBundle ||
                      inst.op == rir::Opcode::RetRedirect || inst.op == rir::Opcode::RespBody))
                     return {nullptr, nullptr, false};
+                if (inst.op == rir::Opcode::WsForward || inst.op == rir::Opcode::WsClose) {
+                    const bool kForward = inst.op == rir::Opcode::WsForward;
+                    const auto kExactType = [&](rir::ValueId id, rir::TypeKind kind) {
+                        if (id == rir::kNoValue || id.id >= fn.value_count || !fn.values)
+                            return false;
+                        const auto* type = fn.values[id.id].type;
+                        return type && type->kind == kind && !type->inner && !type->struct_def;
+                    };
+                    if (!ws_body_mode || inst.operand_count != (kForward ? 1u : 2u) ||
+                        inst.extra_operands || !kExactType(inst.result, rir::TypeKind::I32) ||
+                        !kExactType(inst.operands[0],
+                                    kForward ? rir::TypeKind::Str : rir::TypeKind::I32) ||
+                        (kForward ? inst.imm.i32_val != 1 && inst.imm.i32_val != 2
+                                  : !kExactType(inst.operands[1], rir::TypeKind::Str)))
+                        return {nullptr, nullptr, false};
+                }
                 if (inst.op == rir::Opcode::WsMessageField) {
                     if (!ws_body_mode || inst.operand_count != 0 ||
                         !ws_message_field_valid(static_cast<u32>(inst.imm.i32_val)))
@@ -3374,7 +3413,7 @@ bool emit_ws_body(LLVMModuleRef module,
         LLVMBuildICmp(builder,
                       LLVMIntULE,
                       verdict,
-                      LLVMConstInt(i64_ty, static_cast<u8>(WsFrameAction::ForwardTextPolicy3), 0),
+                      LLVMConstInt(i64_ty, static_cast<u8>(WsFrameAction::CloseDynamic), 0),
                       "verdict.ok");
     LLVMValueRef output_ok = LLVMBuildAnd(
         builder, action_ok, LLVMBuildAnd(builder, extra_ok, verdict_ok, "value.ok"), "output.ok");

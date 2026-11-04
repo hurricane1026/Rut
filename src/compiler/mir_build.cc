@@ -760,6 +760,34 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.type = MirTypeKind::Str;
         return v;
     }
+    if (expr.kind == HirExprKind::WsForward || expr.kind == HirExprKind::WsClose) {
+        const bool kForward = expr.kind == HirExprKind::WsForward;
+        if (!fn->is_ws_callback || expr.type != HirTypeKind::I32 || expr.may_nil ||
+            expr.may_error || !expr.lhs || expr.lhs->may_nil || expr.lhs->may_error ||
+            (kForward
+                 ? (expr.lhs->type != HirTypeKind::Str && expr.lhs->type != HirTypeKind::Bytes) ||
+                       expr.rhs || expr.int_value != (expr.lhs->type == HirTypeKind::Bytes ? 2 : 1)
+                 : expr.lhs->type != HirTypeKind::I32 || !expr.rhs ||
+                       expr.rhs->type != HirTypeKind::Str || expr.rhs->may_nil ||
+                       expr.rhs->may_error))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v.lhs = &fn->values[fn->values.len - 1];
+        if (!kForward) {
+            auto rhs = mir_value(*expr.rhs, module, fn, ctx);
+            if (!rhs) return core::make_unexpected(rhs.error());
+            if (!fn->values.push(rhs.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            v.rhs = &fn->values[fn->values.len - 1];
+        }
+        v.kind = kForward ? MirValueKind::WsForward : MirValueKind::WsClose;
+        v.type = MirTypeKind::I32;
+        v.int_value = expr.int_value;
+        return v;
+    }
     if (expr.kind == HirExprKind::WsMessageField) {
         // A borrowed message has no stored runtime carrier. After ordinary
         // helper normalization, its projections must retain the callback input.

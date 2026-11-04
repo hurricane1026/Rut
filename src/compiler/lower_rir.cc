@@ -1705,6 +1705,45 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
+    if (value.kind == MirValueKind::WsForward || value.kind == MirValueKind::WsClose) {
+        const bool kForward = value.kind == MirValueKind::WsForward;
+        if (value.type != MirTypeKind::I32 || value.may_nil || value.may_error || !value.lhs ||
+            value.lhs->may_nil || value.lhs->may_error ||
+            (kForward ? value.lhs->type != MirTypeKind::Str || value.rhs ||
+                            (value.int_value != 1 && value.int_value != 2)
+                      : value.lhs->type != MirTypeKind::I32 || !value.rhs ||
+                            value.rhs->type != MirTypeKind::Str || value.rhs->may_nil ||
+                            value.rhs->may_error))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto materialize = [&](const MirValue& child) {
+            return materialize_value(child,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        };
+        auto lhs = materialize(*value.lhs);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        if (kForward) {
+            auto result = b.emit_ws_forward(
+                lhs.value(), static_cast<u8>(value.int_value), {span.line, span.col});
+            if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+            return result.value();
+        }
+        auto rhs = materialize(*value.rhs);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        auto result = b.emit_ws_close(lhs.value(), rhs.value(), {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
+    }
     if (value.kind == MirValueKind::WsMessageField) {
         WsMessageFieldId field{};
         if (value.str_value.eq(lit_str("text")) || value.str_value.eq(lit_str("payload")))

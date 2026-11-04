@@ -117,6 +117,8 @@ enum class MirValueKind : u8 {
     WsMessageField,
     LetIn,
     BoundValue,
+    WsForward,  // lhs payload, int_value Text/Binary wire opcode; produces an action
+    WsClose,    // lhs code, rhs reason; produces an action
 };
 
 enum class MirTypeKind : u8 {

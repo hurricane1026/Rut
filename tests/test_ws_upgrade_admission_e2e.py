@@ -48,6 +48,84 @@ def masked_frame(opcode, payload):
     return bytes((0x80 | opcode, 0x80 | len(payload))) + key + masked
 
 
+DYNAMIC_OUTPUT_DECLARATIONS = r"""
+func outputBytes(_ m: WebSocketMessage) -> Bytes {
+    if m.len == 3 { m.payload } else { b"\x00\xff" }
+}
+func outputText(_ m: WebSocketMessage) -> str {
+    if m.isBinary { m.text } else { "answer" }
+}
+"""
+DYNAMIC_OUTPUT_HANDLER = r"""
+return websocket(ws, maxMessageSize: 128b) { msg in
+    let token = uuid()
+    guard let value = token else { msg.close() }
+    if msg.fromClient { msg.forward(outputBytes(msg)) }
+    else {
+        if msg.len == 3 { msg.close(1000 + msg.len, msg.text) }
+        else { msg.forward(outputText(msg)) }
+    }
+}
+"""
+
+
+def dynamic_output_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"dynamic output: {actual=!r}, {expected=!r}")
+
+    # Message outputs share callback scratch but must own separate send bytes.
+    client.sendall(masked_frame(1, b"one") + masked_frame(2, b"four") + masked_frame(1, b"two"))
+    for payload in (b"one", b"\0\xff", b"two"):
+        expect(peer, (2, payload, True))
+    fragment = bytearray(masked_frame(2, b"\xff"))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"PING") + masked_frame(0, b"\0x"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xff\0x", True))
+    peer.sendall(b"\x81\x04text" + b"\x82\x04a\0bc")
+    expect(client, (1, b"answer", False))
+    expect(client, (1, b"a\0bc", False))
+    peer.sendall(b"\x82\x03bye")
+    expect(client, (8, b"\x03\xebbye", False))
+    expect(peer, (8, b"\x03\xebbye", True))
+
+
+DYNAMIC_BOUND_HANDLER = r"""
+return websocket(ws, maxMessageSize: 8b) { msg in
+    let token = uuid()
+    guard let value = token else { msg.close() }
+    msg.forward(value)
+}
+"""
+
+
+def dynamic_bound_exchange(client, peer):
+    client.sendall(masked_frame(1, b"x"))
+    if recv_client_frame(client) != (8, b"\x03\xf1", False):
+        raise AssertionError("oversized dynamic output did not close with 1009")
+    if recv_client_frame(peer) != (8, b"\x03\xf1", True):
+        raise AssertionError("oversized dynamic output did not close upstream")
+
+
+DYNAMIC_UTF8_HANDLER = r"""
+return websocket(ws) { msg in
+    let token = uuid()
+    guard let value = token else { msg.close() }
+    msg.forward(msg.text)
+}
+"""
+
+
+def dynamic_utf8_exchange(client, peer):
+    client.sendall(masked_frame(2, b"\xff"))
+    if recv_client_frame(client) != (8, b"\x03\xf3", False):
+        raise AssertionError("invalid dynamic Text output did not close with 1011")
+    if recv_client_frame(peer) != (8, b"\x03\xf3", True):
+        raise AssertionError("invalid dynamic Text output did not close upstream")
+
+
 EAGER_BINDING_DECLARATIONS = r"""
 func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
 """
@@ -2067,6 +2145,9 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (DYNAMIC_OUTPUT_HANDLER, dynamic_output_exchange, DYNAMIC_OUTPUT_DECLARATIONS),
+                (DYNAMIC_BOUND_HANDLER, dynamic_bound_exchange, ""),
+                (DYNAMIC_UTF8_HANDLER, dynamic_utf8_exchange, ""),
                 (EAGER_BINDING_HANDLER, eager_binding_exchange, EAGER_BINDING_DECLARATIONS),
                 (GENERAL_HANDLER, general_expression_exchange, GENERAL_DECLARATIONS),
                 (SCALAR_STRING_HANDLER, scalar_string_exchange, SCALAR_PREDICATE_DECLARATIONS),

@@ -1,5 +1,6 @@
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_optional_values.h"
@@ -7696,7 +7697,7 @@ TEST(serve_loader, websocket_compound_opcode_guards_reach_wire_after_reassembly)
                     (rejected ? WsInspectStatus::Close : WsInspectStatus::Ok));
             if (rejected) {
                 CHECK_EQ(st.echo_close_code, 1008u);
-                CHECK(st.echo_close_reason.eq({"text only", 9}));
+                CHECK(st.echo_close_reason().eq({"text only", 9}));
             } else {
                 REQUIRE_EQ(produced, 4u);
                 CHECK_EQ(out[0], text ? 0x81u : 0x82u);
@@ -7994,7 +7995,7 @@ TEST(serve_loader, websocket_guard_close_policies_reach_wire) {
                                &produced) == WsInspectStatus::Close);
             const u32 policy = from_client ? i : 4;
             CHECK_EQ(st.echo_close_code, codes[policy]);
-            CHECK(st.echo_close_reason.eq(reasons[policy]));
+            CHECK(st.echo_close_reason().eq(reasons[policy]));
             CHECK_EQ(produced, 4u + reasons[policy].len);
             CHECK_EQ((static_cast<u16>(out[2]) << 8) | out[3], codes[policy]);
             if (!reasons[policy].empty())
@@ -8081,7 +8082,7 @@ TEST(serve_loader, websocket_guard_close_coexists_with_default_text_rewrite) {
             CHECK(status == WsInspectStatus::Close);
             CHECK_EQ(out[0], 0x88u);
             CHECK_EQ(st.echo_close_code, 1008u);
-            CHECK(st.echo_close_reason.eq({"blocked", 7}));
+            CHECK(st.echo_close_reason().eq({"blocked", 7}));
         } else {
             CHECK(status == WsInspectStatus::Ok);
             CHECK_EQ(out[0], 0x81u);
@@ -9849,6 +9850,19 @@ TEST(serve_loader, websocket_eager_bindings_survive_source_removal_and_pool_exha
     REQUIRE(load_rut_program(path.c_str(), program, err));
     REQUIRE_EQ(unlink(path.c_str()), 0);
     test::ws_eager_bindings::check(program.config, _tc);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_dynamic_outputs_survive_source_removal_and_pool_exhaustion) {
+    auto path =
+        write_file("/tmp/rut_ws_dynamic_output", "app.rut", test::ws_dynamic_output::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_dynamic_output::check(program.config, _tc);
     program.destroy();
 }
 #endif

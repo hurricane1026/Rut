@@ -2813,3 +2813,49 @@ TEST(RirBuilder, PhiValidatesEdgesTypesAndIncomingDominance) {
     CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
     tc.destroy();
 }
+
+TEST(RirVerifier, WebSocketOutputChecksCarrierOpcodeArityAndResultType) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("output"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto payload = V(b.emit_const_str(lit("payload")));
+    auto code = V(b.emit_const_i32(1000));
+    CHECK_FALSE(b.emit_ws_forward(code, 1));
+    CHECK_FALSE(b.emit_ws_forward(payload, 9));
+    CHECK_FALSE(b.emit_ws_close(payload, payload));
+    CHECK_FALSE(b.emit_ws_close(code, code));
+    auto forward = V(b.emit_ws_forward(payload, 2));
+    auto close = V(b.emit_ws_close(code, payload));
+    VOK(b.emit_ret_status(200));
+    REQUIRE(verify_function(fn).ok);
+    Instruction& output = fn->entry()->insts[2];
+    const Instruction saved = output;
+    for (u32 mode = 0; mode < 5; ++mode) {
+        output = saved;
+        if (mode == 0) output.imm.i32_val = 3;
+        if (mode == 1) output.operand_count = 0;
+        if (mode == 2) output.operands[0] = code;
+        if (mode == 3) output.result = payload;
+        if (mode == 4) output.extra_operands = &code;
+        CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsOutput);
+    }
+    output = saved;
+    Instruction& closing = fn->entry()->insts[3];
+    closing.operands[1] = code;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsOutput);
+    closing.operands[1] = payload;
+    REQUIRE(verify_function(fn).ok);
+    CHECK(fn->values[forward.id].type->kind == TypeKind::I32);
+    CHECK(fn->values[close.id].type->kind == TypeKind::I32);
+    char output_text[2048];
+    PrintBuf print;
+    print.init(output_text, sizeof(output_text), -1);
+    print_function(print, *fn);
+    CHECK(std::string(output_text, print.len).find("ws.forward 2, %0") != std::string::npos);
+    CHECK(std::string(output_text, print.len).find("ws.close %1, %0") != std::string::npos);
+    ctx.destroy();
+}

@@ -1195,7 +1195,7 @@ return websocket(chat) { message in
 
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
-// and the single-slice cap. General expressions/interpolation remain unsupported.
+// and the single-slice cap. Runtime scalar expressions are supported below; interpolation is not.
 return websocket(chat, maxMessageSize: 4kb) { message in
     guard message.fromClient && message.isText else { message.forward() }
     message.forward("message replaced")
@@ -1209,7 +1209,7 @@ return websocket(chat, maxMessageSize: 4kb) { message in
     guard message.len != 0 else { message.forward(b"") }
     message.forward(b"\x00\xff")
 }
-// A replacement must normalize to one adjacent b"..." literal, at most 4096 decoded
+// A byte literal uses one adjacent b"..." token, at most 4096 decoded
 // bytes, and fit maxMessageSize. Supported escapes: \n, \r, \t, \\, \" and \xHH (NUL is \x00).
 // Byte concatenation, Unicode escapes and interpolation remain unsupported.
 // Guard branches choose independent Text/Binary replacements; bare forward()
@@ -1224,8 +1224,8 @@ return websocket(chat) { message in
 // Equivalent: message.forward(message.payload). Text input becomes Binary without
 // changing its encoded bytes; Binary input is preserved byte-for-byte. Empty Bytes
 // emits an empty Binary. Bare forward() still preserves the original message kind.
-// Only the current message's complete payload is supported dynamically; slicing,
-// concatenation and unrelated/request-borrowed Bytes output remain unsupported.
+// Callback-local Bytes values and pure helper results may select a different payload.
+// Request-borrowed output, slicing and byte concatenation remain unsupported.
 // Reassembly/output must fit maxMessageSize and the existing single-slice cap.
 
 // Terminate mode defaults to 16370 bytes (16 KiB slice minus the maximum 14-byte
@@ -1235,9 +1235,9 @@ return websocket(chat) { message in
 // Add fixed UTF-8 affixes around one complete Text message, using String +.
 // Parentheses, concatenated literals, and compile-time-known route let strings
 // (including aliases) are accepted, with at most 32 expression nodes.
-// Request-derived strings, optional values, and calls are rejected.
+// This specialized + form requires non-optional operands and fixed literal affixes.
 // At most one message.text reference may appear; repeated references/interpolation reject.
-// Binary messages selected for this operation fail the tunnel; guard the opcode first.
+// Binary input may become Text when its complete payload is valid UTF-8.
 // The complete rewritten output must fit maxMessageSize and the single-slice cap.
 let label = "audit:"
 return websocket(chat, maxMessageSize: 4kb) { message in
@@ -1245,6 +1245,27 @@ return websocket(chat, maxMessageSize: 4kb) { message in
     guard !message.text.hasPrefix("audit:") else { message.forward("[" + message.text + "]") }
     message.forward(label + message.text)
 }
+
+// Runtime output uses the ordinary scalar expression pipeline. A str emits Text
+// after UTF-8 validation; Bytes emits Binary. Bare forward() keeps the input kind.
+// Unwrap optional values first. UUID failure follows the chosen guard branch.
+return websocket(chat) { message in
+    let token = uuid()
+    guard let value = token else { message.close() }
+    message.forward(value)
+}
+// Dynamic close arguments are an unwrapped i32 and str, with the same valid wire
+// codes and 123-byte UTF-8 reason limit. Invalid fixed arguments are compile errors;
+// invalid runtime code/reason closes with 1011. Dynamic output over maxMessageSize
+// closes with 1009; invalid dynamic Text closes with 1011. No truncation occurs.
+return websocket(chat) { message in
+    guard message.len <= 123 else { message.close(1009) }
+    message.close(1008, message.text)
+}
+// Callback views are copied before another invocation and before async sending.
+// Close reasons have separate owned drain storage. Backpressure can split a batch
+// before invoking its next callback. Output still fits one existing I/O slice.
+// This does not add string interpolation, Bytes concatenation or request captures.
 
 // Each guard may choose its own replacement; the first failing guard wins.
 return websocket(chat) { message in

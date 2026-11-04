@@ -10996,6 +10996,7 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_c2u.masked = true;       // client->upstream is client-role on both ends → masked
         conn.ws_c2u.from_client = true;  // this leg is the client→upstream direction
         conn.ws_c2u.max_message_size = kCap;
+        conn.ws_c2u.dynamic_output = &conn.ws_handler_output;
         conn.ws_c2u.forward_text = conn.ws_forward_text;
         conn.ws_c2u.forward_texts = conn.ws_forward_texts;
         conn.ws_c2u.forward_text_count = conn.ws_forward_text_count;
@@ -11008,6 +11009,7 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_u2c.masked = false;       // upstream->client is server-role on both ends → unmasked
         conn.ws_u2c.from_client = false;  // this leg is the upstream→client direction
         conn.ws_u2c.max_message_size = kCap;
+        conn.ws_u2c.dynamic_output = &conn.ws_handler_output;
         conn.ws_u2c.forward_text = conn.ws_forward_text;
         conn.ws_u2c.forward_texts = conn.ws_forward_texts;
         conn.ws_u2c.forward_text_count = conn.ws_forward_text_count;
@@ -11239,7 +11241,7 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                 conn.ws_close_upstream_inflight = true;
                 conn.ws_close_client_need = true;
                 conn.ws_echo_close_code = conn.ws_c2u.echo_close_code;
-                conn.ws_echo_close_reason = conn.ws_c2u.echo_close_reason;
+                conn.ws_echo_close_reason = conn.ws_c2u.echo_close_reason();
             }
             if (!loop->submit_send_upstream(conn, conn.ws_c2u_out, produced)) return false;
             conn.ws_client_send_pending = true;
@@ -11318,7 +11320,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
                 conn.ws_close_client_inflight = true;
                 conn.ws_close_upstream_need = true;
                 conn.ws_echo_close_code = conn.ws_u2c.echo_close_code;
-                conn.ws_echo_close_reason = conn.ws_u2c.echo_close_reason;
+                conn.ws_echo_close_reason = conn.ws_u2c.echo_close_reason();
             }
             if (!client_send(loop, conn, conn.ws_u2c_out, produced)) return false;
             conn.ws_upstream_send_pending = true;

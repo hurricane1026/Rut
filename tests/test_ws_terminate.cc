@@ -2316,7 +2316,7 @@ TEST(ws_terminate, handler_close_reason_and_echo_serialize_both_roles) {
         CHECK_EQ(payload[0], 3u);
         CHECK_EQ(payload[1], 240u);
         CHECK(memcmp(payload + 2, reason, sizeof(reason)) == 0);
-        CHECK(st.echo_close_reason.eq(st.close_reason));
+        CHECK(st.echo_close_reason().eq(st.close_reason));
         u64 rng = 0;
         produced = ws_emit_close_frame(
             out, sizeof(out), !masked, rng, st.echo_close_code, st.close_reason);
@@ -2363,7 +2363,7 @@ TEST(ws_terminate, branch_close_policies_select_code_reason_and_echo) {
                 CHECK(memcmp(payload + 2, policies[index].reason.ptr, policies[index].reason.len) ==
                       0);
             CHECK_EQ(st.echo_close_code, policies[index].code);
-            CHECK(st.echo_close_reason.eq(policies[index].reason));
+            CHECK(st.echo_close_reason().eq(policies[index].reason));
         }
     }
 }
@@ -2548,8 +2548,7 @@ TEST(ws_terminate, peer_close_echo_stays_1000) {
     WsInspector st = make_state(false);
     st.close_code = 1008;
     st.close_reason = {"policy", 6};
-    st.echo_close_reason =
-        st.close_reason;  // would only apply to a HANDLER close, not this peer close
+    REQUIRE(st.set_echo_close_reason(st.close_reason));  // handler-only policy, not peer close
     Recorder r;
     u8 in[64];
     const u8 body[] = {0x03, 0xF1};  // 1009 Too Big, from the peer
@@ -2561,7 +2560,7 @@ TEST(ws_terminate, peer_close_echo_stays_1000) {
         st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
     CHECK(s == WsInspectStatus::Close);
     CHECK_EQ(r.calls, 0);  // control frames never reach the handler
-    CHECK(st.echo_close_reason.empty());
+    CHECK(st.echo_close_reason().empty());
     CHECK_EQ(st.echo_close_code, 1000u);  // echo unchanged by the route's close_code
     // The peer's 1009 was forwarded verbatim.
     WsFrameHeader h;
@@ -2885,7 +2884,7 @@ TEST(ws_terminate, affix_rewrite_reassembles_preserves_control_and_masks_both_ro
     }
 }
 
-TEST(ws_terminate, affix_rewrite_rejects_binary_size_utf8_and_truncated_output) {
+TEST(ws_terminate, affix_rewrite_rejects_invalid_binary_text_size_utf8_and_truncated_output) {
     const char bad[] = {static_cast<char>(0xff)};
     for (u32 invalid = 0; invalid < 6; invalid++) {
         auto st = make_state(false);
@@ -2904,7 +2903,7 @@ TEST(ws_terminate, affix_rewrite_rejects_binary_size_utf8_and_truncated_output) 
         if (invalid == 5) {
             st.forward_text = {{oversized, sizeof(oversized)}, {}, {}, WsTextSource::MessageText};
         }
-        const u8 input[] = {'x'};
+        const u8 input[] = {invalid == 0 ? static_cast<u8>(0xff) : static_cast<u8>('x')};
         u8 in[32], out[128], msg[32];
         const u32 n = build(in, op, true, false, input, 1);
         u32 used = 0, produced = 0;
@@ -2985,5 +2984,211 @@ TEST(ws_terminate, affix_rewrite_accepts_single_slice_limit_both_roles) {
         CHECK(memcmp(payload, prefix, sizeof(prefix)) == 0);
         CHECK_EQ(payload[sizeof(prefix)], static_cast<u8>('x'));
         CHECK_EQ(payload[sizeof(prefix) + 1], static_cast<u8>('!'));
+    }
+}
+
+TEST(ws_terminate, dynamic_output_is_copied_and_backpressure_precedes_callback) {
+    struct Output {
+        WsHandlerOutput publication{};
+        char bytes[100]{};
+        u32 calls = 0;
+    };
+    auto callback = [](void* ctx, WsOpcode, const u8*, u64, bool) {
+        auto& output = *static_cast<Output*>(ctx);
+        ++output.calls;
+        memset(output.bytes, static_cast<int>('a' + output.calls), sizeof(output.bytes));
+        output.publication = {{output.bytes, sizeof(output.bytes)}, 1000, WsOpcode::Binary, true};
+        return WsFrameAction::ForwardDynamic;
+    };
+    for (bool masked : {false, true}) {
+        Output output{};
+        WsInspector st = make_state(masked);
+        st.max_message_size = 128;
+        st.forward_text.source = WsTextSource::Dynamic;
+        st.dynamic_output = &output.publication;
+        u8 in[64], out[512], msg[128], decoded[128];
+        u32 size = build(in, WsOpcode::Text, true, masked, reinterpret_cast<const u8*>("x"), 1);
+        size += build(in + size, WsOpcode::Text, true, masked, reinterpret_cast<const u8*>("y"), 1);
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           size,
+                           out,
+                           200,
+                           msg,
+                           sizeof(msg),
+                           callback,
+                           &output,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(output.calls, 1u);
+        CHECK_LT(consumed, size);
+        CHECK_FALSE(output.publication.ready);
+        WsFrameHeader header{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &header, decoded), produced);
+        CHECK(header.opcode == WsOpcode::Binary);
+        CHECK_EQ(header.payload_len, 100u);
+        CHECK_EQ(decoded[0], 'b');
+        const u32 first = consumed;
+        REQUIRE(ws_inspect(st,
+                           in + first,
+                           size - first,
+                           out,
+                           200,
+                           msg,
+                           sizeof(msg),
+                           callback,
+                           &output,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(output.calls, 2u);
+        CHECK_EQ(consumed, size - first);
+        REQUIRE_EQ(parse_one(out, produced, masked, &header, decoded), produced);
+        CHECK_EQ(decoded[0], 'c');
+        // Both outputs fit together. The second callback overwrites its scratch,
+        // but it cannot alter the already-serialized first message.
+        REQUIRE(ws_inspect(st,
+                           in,
+                           size,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           callback,
+                           &output,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(output.calls, 4u);
+        const u32 first_frame = parse_one(out, produced, masked, &header, decoded);
+        REQUIRE(first_frame);
+        CHECK_EQ(decoded[0], 'd');
+        REQUIRE_EQ(parse_one(out + first_frame, produced - first_frame, masked, &header, decoded),
+                   produced - first_frame);
+        CHECK_EQ(decoded[0], 'e');
+    }
+}
+
+TEST(ws_terminate, dynamic_close_owns_echo_reason_after_callback_storage_retires) {
+    struct Output {
+        WsHandlerOutput publication{};
+        char reason[5] = {'a', 0, 'b', 'c', 'd'};
+    };
+    for (bool masked : {false, true}) {
+        Output output{};
+        WsInspector st = make_state(masked);
+        st.forward_text.source = WsTextSource::Dynamic;
+        st.dynamic_output = &output.publication;
+        auto callback = [](void* ctx, WsOpcode, const u8*, u64, bool) {
+            auto& output = *static_cast<Output*>(ctx);
+            output.publication = {
+                {output.reason, sizeof(output.reason)}, 1008, WsOpcode::Close, true};
+            return WsFrameAction::CloseDynamic;
+        };
+        u8 in[32], out[160], msg[32], decoded[128];
+        const u32 size =
+            build(in, WsOpcode::Text, true, masked, reinterpret_cast<const u8*>("x"), 1);
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           size,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           callback,
+                           &output,
+                           &consumed,
+                           &produced) == WsInspectStatus::Close);
+        memset(output.reason, 'x', sizeof(output.reason));
+        output.publication = {};
+        CHECK_EQ(st.echo_close_code, 1008u);
+        CHECK(st.echo_close_reason().eq({"a\0bcd", 5}));
+        auto copied = st;
+        st.reset();
+        CHECK(copied.echo_close_reason().eq({"a\0bcd", 5}));
+        CHECK(st.echo_close_reason().empty());
+        WsFrameHeader header{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &header, decoded), produced);
+        CHECK(header.opcode == WsOpcode::Close);
+        CHECK_EQ(header.payload_len, 7u);
+        CHECK_EQ(decoded[0], 3u);
+        CHECK_EQ(decoded[1], 240u);
+        CHECK(memcmp(decoded + 2, "a\0bcd", 5) == 0);
+    }
+}
+
+TEST(ws_terminate, dynamic_output_rejects_missing_stale_or_invalid_publications) {
+    for (u32 mode = 0; mode < 7; ++mode) {
+        struct Output {
+            WsHandlerOutput value{};
+            u32 mode;
+        } output{{}, mode};
+        WsInspector st = make_state(false);
+        st.max_message_size = 32;
+        st.forward_text.source = WsTextSource::Dynamic;
+        st.dynamic_output = &output.value;
+        output.value = {{"stale", 5}, 1000, WsOpcode::Text, true};
+        auto callback = [](void* ctx, WsOpcode, const u8*, u64, bool) {
+            auto& output = *static_cast<Output*>(ctx);
+            if (output.mode == 0) return WsFrameAction::ForwardDynamic;
+            output.value = {{"x", 1}, 1000, WsOpcode::Text, true};
+            if (output.mode == 1) output.value.payload = {"\xff", 1};
+            if (output.mode == 2) output.value.payload = {nullptr, 1};
+            if (output.mode == 3) output.value.payload.len = 33;
+            if (output.mode == 4) output.value.opcode = WsOpcode::Ping;
+            if (output.mode == 5) output.value.close_code = 1005;
+            if (output.mode == 6) output.value.payload.len = 124;
+            return output.mode >= 5 ? WsFrameAction::CloseDynamic : WsFrameAction::ForwardDynamic;
+        };
+        u8 in[32], out[160], msg[32];
+        const u32 size =
+            build(in, WsOpcode::Binary, true, false, reinterpret_cast<const u8*>("x"), 1);
+        u32 consumed = 0, produced = 0;
+        CHECK(ws_inspect(st,
+                         in,
+                         size,
+                         out,
+                         sizeof(out),
+                         msg,
+                         sizeof(msg),
+                         callback,
+                         &output,
+                         &consumed,
+                         &produced) == WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
+    }
+    WsTextRewrite marker{};
+    marker.source = WsTextSource::Dynamic;
+    CHECK(ws_valid_text_rewrite(marker, 32));
+    marker.prefix = lit_str("");
+    CHECK_FALSE(ws_valid_text_rewrite(marker, 32));
+}
+
+TEST(ws_terminate, text_affixes_validate_and_retag_utf8_binary_input) {
+    for (bool masked : {false, true}) {
+        WsInspector st = make_state(masked);
+        st.forward_text = {{"<", 1}, {">", 1}, {}, WsTextSource::MessageText};
+        Recorder recorder;
+        recorder.verdict = WsFrameAction::ForwardText;
+        const u8 payload[] = {'a', 0, 0xe2, 0x82, 0xac};
+        u8 input[32], output[64], message[32], decoded[32];
+        const u32 size = build(input, WsOpcode::Binary, true, masked, payload, sizeof(payload));
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           size,
+                           output,
+                           sizeof(output),
+                           message,
+                           sizeof(message),
+                           record,
+                           &recorder,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        WsFrameHeader header{};
+        REQUIRE_EQ(parse_one(output, produced, masked, &header, decoded), produced);
+        CHECK(header.opcode == WsOpcode::Text);
+        CHECK_EQ(header.payload_len, 7u);
+        CHECK(memcmp(decoded, "<a\0\xe2\x82\xac>", 7) == 0);
     }
 }

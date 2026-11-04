@@ -50,6 +50,7 @@ enum class VerifyIssueCode : u8 {
     InvalidPasswordPrefix,
     InvalidStrLength,
     InvalidWsMessageField,
+    InvalidWsOutput,
     InvalidPhi,
 };
 
@@ -859,6 +860,21 @@ inline VerifyResult verify_function(const Function* fn,
             const Instruction& inst = block.insts[ii];
             if (inst.op == Opcode::Phi && !verify_phi(*fn, bi, ii))
                 return verify_fail(summary, VerifyIssueCode::InvalidPhi, function_index, bi, ii);
+            if (inst.op == Opcode::WsForward || inst.op == Opcode::WsClose) {
+                const auto kExactType = [&](ValueId id, TypeKind kind) {
+                    if (id == kNoValue || id.id >= fn->value_count || !fn->values) return false;
+                    const Type* type = fn->values[id.id].type;
+                    return type && type->kind == kind && !type->inner && !type->struct_def;
+                };
+                const bool kForward = inst.op == Opcode::WsForward;
+                if (inst.operand_count != (kForward ? 1u : 2u) || inst.extra_operands ||
+                    !kExactType(inst.result, TypeKind::I32) ||
+                    !kExactType(inst.operands[0], kForward ? TypeKind::Str : TypeKind::I32) ||
+                    (kForward ? inst.imm.i32_val != 1 && inst.imm.i32_val != 2
+                              : !kExactType(inst.operands[1], TypeKind::Str)))
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidWsOutput, function_index, bi, ii);
+            }
             if (inst.op == Opcode::WsMessageField) {
                 const u32 kField = static_cast<u32>(inst.imm.i32_val);
                 const bool kBool = kField == static_cast<u32>(WsMessageFieldId::FromClient) ||
@@ -1773,6 +1789,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidJwtClaimsLifetime";
         case VerifyIssueCode::InvalidPhi:
             return "InvalidPhi";
+        case VerifyIssueCode::InvalidWsOutput:
+            return "InvalidWsOutput";
         case VerifyIssueCode::InvalidWsMessageField:
             return "InvalidWsMessageField";
         case VerifyIssueCode::InvalidStrLength:

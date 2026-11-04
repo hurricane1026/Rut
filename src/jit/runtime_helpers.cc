@@ -22,6 +22,7 @@
 #include "rut/runtime/signed_request.h"
 #include "rut/runtime/uuid.h"
 #include "rut/runtime/webhook.h"
+#include "rut/runtime/ws_frame.h"
 #include "rut/runtime/ws_terminate.h"
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -2288,9 +2289,42 @@ extern "C" void rut_helper_ws_begin_message(void* conn) {
     auto& connection = *static_cast<ConnectionBase*>(conn);
     // Admission is complete before a message callback can run. Keep the shard
     // pool binding while returning all previous evaluation slices to that pool.
+    connection.ws_handler_output = {};
     connection.json_arena.destroy();
     connection.jit_response_body = {};
     connection.jit_response_body_valid = false;
+}
+
+extern "C" u32 rut_helper_ws_forward(void* conn, const char* payload, u32 len, u8 opcode) {
+    if (!conn) return static_cast<u32>(WsFrameAction::Close);
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    const u32 kCap = connection.ws_max_message_size ? connection.ws_max_message_size
+                                                    : kWsTerminateMessageCapacity;
+    if (len > kCap || len > kWsTerminateMessageCapacity) {
+        connection.ws_handler_output = {{}, 1009, WsOpcode::Close, true};
+        return static_cast<u32>(WsFrameAction::CloseDynamic);
+    }
+    if ((opcode != 1 && opcode != 2) || (!payload && len) ||
+        (opcode == 1 && !ws_valid_text_payload({payload, len}))) {
+        connection.ws_handler_output = {{}, 1011, WsOpcode::Close, true};
+        return static_cast<u32>(WsFrameAction::CloseDynamic);
+    }
+    connection.ws_handler_output = {{payload, len}, 1000, static_cast<WsOpcode>(opcode), true};
+    return static_cast<u32>(WsFrameAction::ForwardDynamic);
+}
+
+extern "C" u32 rut_helper_ws_close(void* conn, i32 code, const char* reason, u32 len) {
+    if (!conn) return static_cast<u32>(WsFrameAction::Close);
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    // Check before narrowing: a large integer must never wrap to a valid wire code.
+    if (code < 0 || !ws_valid_close_code(static_cast<u32>(code)) ||
+        !ws_valid_close_reason({reason, len})) {
+        code = 1011;
+        reason = nullptr;
+        len = 0;
+    }
+    connection.ws_handler_output = {{reason, len}, static_cast<u16>(code), WsOpcode::Close, true};
+    return static_cast<u32>(WsFrameAction::CloseDynamic);
 }
 
 extern "C" u8 rut_helper_ws_json_string_regex_at_path(

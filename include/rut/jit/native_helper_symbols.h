@@ -88,6 +88,8 @@
     X(rut_helper_hmac_sha256_matches)                 \
     X(rut_helper_basic_matches)                       \
     X(rut_helper_str_constant_time_equal)             \
+    X(rut_helper_ws_forward)                          \
+    X(rut_helper_ws_close)                            \
     X(rut_helper_ws_begin_message)                    \
     X(rut_helper_ws_json_has_path)                    \
     X(rut_helper_ws_json_valid)                       \

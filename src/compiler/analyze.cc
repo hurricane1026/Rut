@@ -6395,7 +6395,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
 #if RUT_ENABLE_WEBSOCKET
     if (stmt.kind == AstStmtKind::Expr && scratch->is_ws_callback) {
         const AstExpr& call = stmt.expr;
-        if (call.kind != AstExprKind::MethodCall || call.lhs == nullptr || call.args.len != 0)
+        if (call.kind != AstExprKind::MethodCall || call.lhs == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, call.span);
         auto receiver = analyze_function_expr(*call.lhs, locals, local_count, binding);
         if (!receiver) return core::make_unexpected(receiver.error());
@@ -6409,6 +6409,55 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         verdict.kind = HirExprKind::IntLit;
         verdict.type = HirTypeKind::I32;
         verdict.span = call.span;
+        if (call.args.len != 0) {
+            const bool kForward = call.name.eq(lit_str("forward"));
+            const bool kClose = call.name.eq(lit_str("close"));
+            if ((!kForward && !kClose) || call.args.len > (kForward ? 1u : 2u))
+                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+            HirExpr operands[2]{};
+            for (u32 i = 0; i < call.args.len; ++i) {
+                if (!call.args[i])
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+                auto value = analyze_function_expr(*call.args[i], locals, local_count, binding);
+                if (!value) return core::make_unexpected(value.error());
+                if (value->may_nil || value->may_error ||
+                    (kForward ? value->type != HirTypeKind::Str && value->type != HirTypeKind::Bytes
+                              : value->type != (i == 0 ? HirTypeKind::I32 : HirTypeKind::Str)))
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[i]->span);
+                ConstValue known{};
+                if (const_eval_expr(value.value(), locals, local_count, &known, 0)) {
+                    if ((!kForward && i == 0 &&
+                         (known.int_value < 0 || known.int_value > 65535 ||
+                          !ws_valid_close_code(static_cast<u32>(known.int_value)))) ||
+                        ((!kForward && i == 1) && !ws_valid_close_reason(known.str_value)) ||
+                        (kForward &&
+                         (known.str_value.len > kWsTerminateMessageCapacity ||
+                          (scratch->ws_handler.max_message_size &&
+                           known.str_value.len > scratch->ws_handler.max_message_size) ||
+                          (value->type == HirTypeKind::Str &&
+                           !ws_valid_text_payload(known.str_value)))))
+                        return frontend_error(FrontendError::UnsupportedSyntax, call.args[i]->span);
+                }
+                operands[i] = value.value();
+            }
+            if (kClose && call.args.len == 1) {
+                operands[1].kind = HirExprKind::StrLit;
+                operands[1].type = HirTypeKind::Str;
+                operands[1].str_value = lit_str("");
+            }
+            if (!scratch->exprs.push(operands[0]))
+                return frontend_error(FrontendError::OutOfMemory, call.span);
+            verdict.lhs = &scratch->exprs[scratch->exprs.len - 1];
+            if (kClose) {
+                if (!scratch->exprs.push(operands[1]))
+                    return frontend_error(FrontendError::OutOfMemory, call.span);
+                verdict.rhs = &scratch->exprs[scratch->exprs.len - 1];
+            }
+            verdict.kind = kForward ? HirExprKind::WsForward : HirExprKind::WsClose;
+            verdict.int_value = operands[0].type == HirTypeKind::Bytes ? 2 : 1;
+            scratch->ws_handler.has_forward_payload = true;
+            return verdict;
+        }
         if (call.name.eq(lit_str("forward")))
             verdict.int_value = static_cast<u8>(WsVerdict::Forward);
         else if (call.name.eq(lit_str("drop")))
@@ -16122,6 +16171,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         auto generic = std::unique_ptr<WsCallbackScope>(new (std::nothrow) WsCallbackScope{});
         if (!generic) return frontend_error(FrontendError::OutOfMemory, stmt.span);
         generic->route->is_ws_callback = true;
+        generic->route->ws_handler.max_message_size = kHandler.max_message_size;
         for (u32 i = 0; i < kCaptureCount; ++i)
             if (!generic->locals.push(scope.locals[i]))
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
@@ -16153,6 +16203,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             if (!route->exprs.push(normalized.value()))
                 return frontend_error(FrontendError::OutOfMemory, stmt.span);
             route->ws_handler.general_body_expr = kRoot;
+            if (generic->route->ws_handler.has_forward_payload) {
+                route->ws_handler.has_forward_payload = true;
+                route->ws_handler.forward_payload = {};
+                route->ws_handler.forward_payload.source = HirWsTextSource::Dynamic;
+            }
             return {};
         }();
         if (result) return result;

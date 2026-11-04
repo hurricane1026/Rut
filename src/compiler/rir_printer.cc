@@ -171,6 +171,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqPathOnly:
             buf.put_cstr("req.pathOnly");
             break;
+        case Opcode::WsForward:
+            buf.put_cstr("ws.forward");
+            break;
+        case Opcode::WsClose:
+            buf.put_cstr("ws.close");
+            break;
         case Opcode::WsMessageField:
             buf.put_cstr("ws.message.field");
             break;
@@ -739,6 +745,18 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ReqCookie:
             buf.put(' ');
             print_quoted_str(buf, inst.imm.str_val);
+            break;
+        case Opcode::WsForward:
+            buf.put(' ');
+            buf.put_i32(inst.imm.i32_val);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::WsClose:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
             break;
         case Opcode::WsMessageField:
             buf.put(' ');

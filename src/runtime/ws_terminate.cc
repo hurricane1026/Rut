@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/ws_frame.h"
 
 #include <openssl/rand.h>
 #include <string.h>
@@ -539,6 +540,9 @@ bool ws_valid_text_payload(Str text) {
 }
 
 bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
+    if (rewrite.source == WsTextSource::Dynamic)
+        return !rewrite.prefix.ptr && !rewrite.prefix.len && !rewrite.suffix.ptr &&
+               !rewrite.suffix.len && !rewrite.source_path.ptr && !rewrite.source_path.len;
     const u64 literal_size = static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len;
     const bool kSourceValid =
         rewrite.source <= WsTextSource::MessageBytes &&
@@ -632,7 +636,12 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // frame and the assembler state untouched for the next call.
         if (*produced != 0) {
             const u64 original_size = st.message_len + h.payload_len;
-            auto rewritten_size = [original_size](const WsTextRewrite& rewrite) {
+            auto rewritten_size = [original_size, &st](const WsTextRewrite& rewrite) -> u64 {
+                if (rewrite.source == WsTextSource::Dynamic) {
+                    const u64 kCap =
+                        st.max_message_size ? st.max_message_size : kWsTerminateMessageCapacity;
+                    return kCap > kWsMaxControlPayload ? kCap : kWsMaxControlPayload;
+                }
                 const u64 kSourceSize = rewrite.source == WsTextSource::JsonStringify
                                             ? json::kMaxBytes
                                         : rewrite.source != WsTextSource::Literal &&
@@ -691,7 +700,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 // Peer-initiated close: the peer's own code was relayed verbatim above; keep
                 // the echo to the other side at 1000 (unchanged behavior — see header).
                 st.echo_close_code = 1000;
-                st.echo_close_reason = {};
+                st.echo_close_reason_len = 0;
                 return WsInspectStatus::Close;
             }
             continue;
@@ -731,7 +740,16 @@ WsInspectStatus ws_inspect(WsInspector& st,
         }
 
         // Message complete — invoke the handler and act on its verdict.
+        if (st.dynamic_output) *st.dynamic_output = {};
         const WsFrameAction action = handler(ctx, msg_op, msg_buf, total, st.from_client);
+        WsHandlerOutput published{};
+        if (action == WsFrameAction::ForwardDynamic || action == WsFrameAction::CloseDynamic) {
+            if (st.forward_text.source != WsTextSource::Dynamic || !st.dynamic_output ||
+                !st.dynamic_output->ready)
+                return WsInspectStatus::Error;
+            published = *st.dynamic_output;
+        }
+        if (st.dynamic_output) *st.dynamic_output = {};
         const u8 action_value = static_cast<u8>(action);
         const u8 first_policy = static_cast<u8>(WsFrameAction::ClosePolicy0);
         const bool policy_close =
@@ -749,6 +767,22 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     out, out_cap, produced, msg_op, msg_buf, total, st.masked, st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
+        } else if (action == WsFrameAction::ForwardDynamic) {
+            if ((published.opcode != WsOpcode::Text && published.opcode != WsOpcode::Binary) ||
+                (!published.payload.ptr && published.payload.len) ||
+                published.payload.len > kWsTerminateMessageCapacity ||
+                (st.max_message_size && published.payload.len > st.max_message_size) ||
+                (published.opcode == WsOpcode::Text && !ws_valid_text_payload(published.payload)))
+                return WsInspectStatus::Error;
+            if (!emit_frame(out,
+                            out_cap,
+                            produced,
+                            published.opcode,
+                            reinterpret_cast<const u8*>(published.payload.ptr),
+                            published.payload.len,
+                            st.masked,
+                            st.mask_rng))
+                return WsInspectStatus::Error;
         } else if (action == WsFrameAction::ForwardText || policy_forward) {
             // Input has already been reassembled and validated. Output owns a
             // separate slice, so replacement may grow without overwriting input.
@@ -760,13 +794,16 @@ WsInspectStatus ws_inspect(WsInspector& st,
                                          ? total
                                          : 0;
             const u64 kOutputSize = kPayloadSize + rewrite.prefix.len + rewrite.suffix.len;
-            if (!ws_valid_text_rewrite(rewrite, st.max_message_size) ||
-                (rewrite.source == WsTextSource::MessageText && msg_op != WsOpcode::Text) ||
+            if (rewrite.source == WsTextSource::Dynamic ||
+                !ws_valid_text_rewrite(rewrite, st.max_message_size) ||
+                (rewrite.source == WsTextSource::MessageText && !utf8_valid(msg_buf, total)) ||
                 kOutputSize > kWsTerminateMessageCapacity ||
                 (st.max_message_size != 0 && kOutputSize > st.max_message_size))
                 return WsInspectStatus::Error;
             bool emitted = false;
             switch (rewrite.source) {
+                case WsTextSource::Dynamic:
+                    return WsInspectStatus::Error;
                 case WsTextSource::JsonNumberText:
                     emitted = emit_json_number_text_frame(out,
                                                           out_cap,
@@ -826,30 +863,33 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     break;
             }
             if (!emitted) return WsInspectStatus::Error;
-        } else if (action == WsFrameAction::Close || policy_close) {
-            const WsClosePolicy selected = policy_close
-                                               ? st.close_policies[action_value - first_policy]
-                                               : WsClosePolicy{st.close_code, st.close_reason};
-            if (!ws_valid_close_code(selected.code) || !ws_valid_close_reason(selected.reason))
+        } else if (action == WsFrameAction::Close || policy_close ||
+                   action == WsFrameAction::CloseDynamic) {
+            const WsClosePolicy kSelected =
+                action == WsFrameAction::CloseDynamic
+                    ? WsClosePolicy{published.close_code, published.payload}
+                : policy_close ? st.close_policies[action_value - first_policy]
+                               : WsClosePolicy{st.close_code, st.close_reason};
+            if (!ws_valid_close_code(kSelected.code) || !ws_valid_close_reason(kSelected.reason))
                 return WsInspectStatus::Error;
             u8 cc[kWsMaxControlPayload];
-            cc[0] = static_cast<u8>(selected.code >> 8);
-            cc[1] = static_cast<u8>(selected.code);
-            for (u32 i = 0; i < selected.reason.len; i++)
-                cc[i + 2] = static_cast<u8>(selected.reason.ptr[i]);
+            cc[0] = static_cast<u8>(kSelected.code >> 8);
+            cc[1] = static_cast<u8>(kSelected.code);
+            for (u32 i = 0; i < kSelected.reason.len; i++)
+                cc[i + 2] = static_cast<u8>(kSelected.reason.ptr[i]);
             const u32 hdr = 2u + (st.masked ? 4u : 0u);
-            u32 body = 2u + selected.reason.len;
+            u32 body = 2u + kSelected.reason.len;
             // Preserve the legacy empty-status fallback only for code-only closes.
             // A configured reason must fit whole; never truncate UTF-8 or silently discard it.
             if (static_cast<u64>(*produced) + hdr + body > out_cap) {
-                if (selected.reason.len != 0) return WsInspectStatus::Error;
+                if (kSelected.reason.len != 0) return WsInspectStatus::Error;
                 body = 0;
             }
             if (!emit_frame(
                     out, out_cap, produced, WsOpcode::Close, cc, body, st.masked, st.mask_rng))
                 return WsInspectStatus::Error;
-            st.echo_close_reason = selected.reason;
-            st.echo_close_code = selected.code;
+            if (!st.set_echo_close_reason(kSelected.reason)) return WsInspectStatus::Error;
+            st.echo_close_code = kSelected.code;
             st.message_len = 0;
             return WsInspectStatus::Close;
         } else if (action != WsFrameAction::Drop) {

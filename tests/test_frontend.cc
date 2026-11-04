@@ -1,6 +1,7 @@
 #include "deferred_preflight_fixture.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_optional_values.h"
@@ -6051,7 +6052,7 @@ func dynamicPointer(_ msg: WebSocketMessage) -> str {
     }
 }
 
-TEST(frontend, websocket_optional_values_keep_ordinary_clause_limit) {
+TEST(frontend, websocket_optional_outputs_use_shared_ir_beyond_legacy_clause_limit) {
     for (u32 count : {3u, 4u}) {
         std::string source = R"rut(upstream ws
 func maybeText(_ msg: WebSocketMessage) -> str { if msg.fromClient { msg.text } else { nil } }
@@ -6065,11 +6066,10 @@ route GET "/ws" { return websocket(ws) { msg in
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        if (count == 3)
-            REQUIRE(hir);
-        else {
-            REQUIRE_FALSE(hir);
-            CHECK(hir.error().code == FrontendError::TooManyItems);
+        REQUIRE(hir);
+        if (count == 4) {
+            CHECK(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu);
+            CHECK(hir->routes[0].ws_handler.forward_payload.source == HirWsTextSource::Dynamic);
         }
     }
 }
@@ -8734,7 +8734,7 @@ TEST(frontend, analyze_websocket_close_reason_literal_and_byte_limit) {
         auto hir = analyze_file_heap(ast.value());
         CHECK_EQ(static_cast<bool>(hir), count == 41);
     }
-    for (const char* arg : {"1", "message.text", "\"\\(message.len)\"", "\"a\", \"b\""}) {
+    for (const char* arg : {"1", "\"\\(message.len)\"", "\"a\", \"b\""}) {
         std::string source =
             "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
             "message.close(1008, ";
@@ -8799,8 +8799,6 @@ TEST(frontend, analyze_websocket_guard_close_policies) {
 TEST(frontend, analyze_websocket_guard_close_rejects_invalid_arguments) {
     for (const char* verdict : {"message.close(1006)",
                                 "message.close(1008, 1)",
-                                "message.close(message.len)",
-                                "message.close(1008, message.text)",
                                 "message.close(1008, \"\\(message.len)\")",
                                 "message.forward(message.text + message.text)"}) {
         std::string source =
@@ -46446,5 +46444,65 @@ route GET "/ws" { return websocket(ws) { msg in
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_dynamic_outputs_preserve_owned_ir_and_reject_phase_leaks) {
+    auto tokens = lex(lit(test::ws_dynamic_output::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    ast.reset();
+    auto copied = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    REQUIRE_EQ(copied->routes.len, 5u);
+    for (const auto& route : copied->routes) {
+        REQUIRE(route.ws_handler.general_body_expr < route.exprs.len);
+        CHECK(route.ws_handler.forward_payload.source == HirWsTextSource::Dynamic);
+        auto callback = std::make_unique<HirRoute>();
+        callback->is_ws_callback = true;
+        HirLocal result{};
+        result.is_runtime_synthetic = true;
+        result.type = HirTypeKind::I32;
+        result.init = route.exprs[route.ws_handler.general_body_expr];
+        REQUIRE(callback->locals.push(result));
+        callback->control.kind = HirControlKind::Direct;
+        callback->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+        callback->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+        callback->control.direct_term.local_ref_index = 0;
+        auto mir = build_mir_route(*copied, *callback);
+        REQUIRE(mir);
+        HeapFrontendResult<MirModule> owner{mir.value()};
+        auto function = std::make_unique<MirFunction>(owner->functions[0]);
+        owner->functions[0] = static_cast<MirFunction&&>(*function);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(owner.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        const auto& body = rir.module.functions[0];
+        CHECK(function_has_op(body, rir::Opcode::WsForward) ||
+              function_has_op(body, rir::Opcode::WsClose));
+        rir.destroy();
+    }
+    for (const char* body : {"let token = uuid() msg.forward(token)",
+                             "msg.forward(req.path)",
+                             "msg.close(1000, req.path)",
+                             "msg.close(66536, msg.text)",
+                             "msg.close(-64536, msg.text)",
+                             "if true { msg.forward() } else { msg.close(1000, req.path) }",
+                             "msg.close(msg.len, msg.payload)",
+                             "msg.forward(msg.len)",
+                             "msg.drop(msg.payload)"}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";
+        source += body;
+        source += " } }";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto parsed = parse_file_heap(lexed.value());
+        REQUIRE(parsed);
+        CHECK_FALSE(analyze_file_heap(parsed.value()));
+    }
 }
 #endif

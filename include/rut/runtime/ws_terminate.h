@@ -87,6 +87,8 @@ enum class WsFrameAction : u8 {
     ForwardTextPolicy1,
     ForwardTextPolicy2,
     ForwardTextPolicy3,
+    ForwardDynamic,  // synchronous callback publication, copied before the next invocation
+    CloseDynamic,
 };
 
 inline constexpr u32 kWsMaxClosePolicies = 4;
@@ -103,7 +105,8 @@ enum class WsTextSource : u8 {
     JsonNumberText,
     JsonStringify,
     LiteralBinary,
-    MessageBytes
+    MessageBytes,
+    Dynamic  // shared-IR callback may publish a runtime payload or close reason
 };
 
 // Immutable text output recipe. Literal replacement omits the input; affix recipes
@@ -134,6 +137,16 @@ enum class WsInspectStatus : u8 {
     Error,  // protocol violation or a bound exceeded (message/output cap) — fail the tunnel
 };
 
+// Borrowed only during a synchronous callback. Inspection copies data into owned
+// send storage before returning or invoking another callback. Close reasons are
+// copied separately into the closing inspector, so the other leg cannot retire them.
+struct WsHandlerOutput {
+    Str payload{};
+    u16 close_code = 1000;
+    WsOpcode opcode = WsOpcode::Text;
+    bool ready = false;
+};
+
 // Per-direction inspection state. One instance per tunnel direction; persists across
 // recv chunks because frames and messages span reads.
 //
@@ -151,6 +164,7 @@ struct WsInspector {
     bool from_client = false;
     // Immutable route-owned default and branch texts. The pinned route
     // configuration must remain alive until this connection retires.
+    WsHandlerOutput* dynamic_output = nullptr;
     WsTextRewrite forward_text{};
     const WsTextRewrite* forward_texts = nullptr;
     u32 forward_text_count = 0;
@@ -165,7 +179,15 @@ struct WsInspector {
     Str close_reason{};  // immutable route-owned UTF-8, at most 123 bytes
     const WsClosePolicy* close_policies = nullptr;
     u32 close_policy_count = 0;
-    Str echo_close_reason{};  // selected handler reason, empty for a peer-initiated close
+    char echo_close_storage[kWsMaxCloseReasonBytes]{};
+    u32 echo_close_reason_len = 0;
+    Str echo_close_reason() const { return {echo_close_storage, echo_close_reason_len}; }
+    bool set_echo_close_reason(Str reason) {
+        if (reason.len > kWsMaxCloseReasonBytes || (!reason.ptr && reason.len)) return false;
+        for (u32 i = 0; i < reason.len; ++i) echo_close_storage[i] = reason.ptr[i];
+        echo_close_reason_len = reason.len;
+        return true;
+    }
     u16 close_code = 1000;
     u16 echo_close_code = 1000;
     // Reject fragmented messages when a caller cannot provide a separate output buffer.
@@ -178,7 +200,7 @@ struct WsInspector {
     u64 partial_payload_len = 0;
 
     void reset() {
-        echo_close_reason = {};
+        echo_close_reason_len = 0;
         assembler.reset();
         message_len = 0;
         partial_data_frame = false;

@@ -258,6 +258,8 @@ enum class HirExprKind : u8 {
     // different local with a coincidentally equal slot index.
     LetIn,
     BoundValue,
+    WsForward,  // lhs payload, int_value Text/Binary wire opcode; produces an action
+    WsClose,    // lhs code, rhs reason; produces an action
 };
 
 enum class HirTypeKind : u8 {
@@ -1203,7 +1205,8 @@ enum class HirWsTextSource : u8 {
     JsonNumberText,
     JsonStringify,
     LiteralBinary,
-    MessageBytes
+    MessageBytes,
+    Dynamic  // shared-IR callback may publish a runtime payload or close reason
 };
 
 struct HirWsTextRewrite {

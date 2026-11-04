@@ -478,6 +478,11 @@ bool load_rut_program(const char* path,
             };
             auto retain_rewrite = [&](const HirWsTextRewrite& source, WsTextRewrite& result) {
                 switch (source.source) {
+                    case HirWsTextSource::Dynamic:
+                        result.source = WsTextSource::Dynamic;
+                        return source.prefix_expr == 0xffffffffu &&
+                               source.suffix_expr == 0xffffffffu && !source.source_path.ptr &&
+                               !source.source_path.len && ws_valid_text_rewrite(result, max_msg);
                     case HirWsTextSource::Literal:
                         result.source = WsTextSource::Literal;
                         if (source.source_path.ptr || source.source_path.len != 0) return false;
