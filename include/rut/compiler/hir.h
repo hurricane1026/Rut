@@ -1195,7 +1195,8 @@ enum class HirWsTextSource : u8 {
     JsonString,
     JsonNumberText,
     JsonStringify,
-    LiteralBinary
+    LiteralBinary,
+    MessageBytes
 };
 
 struct HirWsTextRewrite {

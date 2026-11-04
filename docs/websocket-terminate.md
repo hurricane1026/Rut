@@ -163,7 +163,7 @@ text rewrite or `json.parse` guard; JSON guard aliases retain their existing
 proof and scope rules. Close codes may use constant integer aliases, while close
 reasons retain their existing literal-only form. Fixed Binary replacements also
 accept immutable Bytes aliases and pure helper results normalized to literals;
-borrowed dynamic Bytes output remains unsupported.
+the complete borrowed message payload can also supply Binary output.
 None of these aliases allocate runtime storage, retain a message beyond the
 callback, or become HTTP route locals. Compile-time HTTP admission constants
 remain capturable; request-borrowed values do not.
@@ -401,8 +401,8 @@ other fallible defaults remain rejected. A valid JSON value of the wrong scalar
 kind selects the default; malformed JSON in the example returns absence before
 reaching it. False, zero and empty defaults remain present. Literal Bytes aliases
 and pure helper results emit fixed Binary messages, including empty or non-UTF-8
-bytes. Borrowed Bytes may be inspected but cannot yet supply dynamic replacement
-output. General optional callback locals, arbitrary calculations and constant-string
+bytes. Complete borrowed message Bytes may also supply Binary output as described
+below. General optional callback locals, arbitrary calculations and constant-string
 regex predicates remain unsupported. Existing source, graph and recipe limits apply.
 
 Presence is separate from truthiness: a valid `false`, `0`, empty string or empty
@@ -633,6 +633,33 @@ with at most 8192 combined decoded pointer bytes. Runtime callbacks still repars
 the complete bounded message and retain no selected node or borrowed view between
 calls. The existing four source guards and 32 condition nodes remain the limit;
 no native format or handler ABI change is required.
+
+### Forwarding borrowed Bytes
+
+`message.forward(message.payload)` emits the complete payload as Binary. It uses
+ordinary `Bytes` typing and also accepts immutable aliases, pure helper results and
+successful optional bindings that normalize to this message's payload:
+
+```swift
+func payload(_ msg: WebSocketMessage) -> Bytes => msg.payload
+return websocket(chat) { msg in
+    let bytes: Bytes = payload(msg)
+    msg.forward(bytes)
+}
+```
+
+Both Text and Binary input work. Text's UTF-8 encoding is copied unchanged into
+Binary output; arbitrary Binary octets and empty payloads are preserved. Bare
+`forward()` retains the original message kind. Malformed Text still fails before
+the callback, and control frames bypass it.
+
+The inspector reassembles the complete message and copies its bytes into the owned
+output slice before asynchronous sending. It retains no borrowed pointer. Input
+and output remain bounded by `maxMessageSize` and the existing single-slice cap;
+output backpressure drains earlier frames before dispatching another message.
+Byte slicing, concatenation and unrelated/request-borrowed Bytes outputs remain
+unsupported. The appended recipe tag uses the existing action ABI and native
+layout; old readers reject artifacts using the new tag.
 
 ### Direct optional scalar comparisons
 

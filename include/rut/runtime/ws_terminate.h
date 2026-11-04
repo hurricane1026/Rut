@@ -102,14 +102,16 @@ enum class WsTextSource : u8 {
     JsonString,
     JsonNumberText,
     JsonStringify,
-    LiteralBinary
+    LiteralBinary,
+    MessageBytes
 };
 
 // Immutable text output recipe. Literal replacement omits the input; affix recipes
 // surround one bounded dynamic source, if present, with route-owned UTF-8 views.
 // JSON paths and fixed strings are pinned with the route config until the send retires.
-// LiteralBinary reuses this recipe and the ForwardText action ABI, but emits Binary
-// and permits arbitrary bytes. Other sources still emit validated UTF-8 Text.
+// LiteralBinary and MessageBytes reuse the ForwardText action ABI, emitting Binary
+// with arbitrary bytes. MessageBytes copies the complete borrowed payload, with no
+// affixes. Other sources emit validated UTF-8 Text.
 struct WsTextRewrite {
     Str prefix{};
     Str suffix{};

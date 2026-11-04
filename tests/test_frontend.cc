@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_optional_values.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
@@ -5588,6 +5589,53 @@ TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
     CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ name in ... }`")));
 }
 
+TEST(frontend, websocket_borrowed_binary_uses_message_values_and_owned_recipes) {
+    auto tokens = lex(lit(test::ws_borrowed_binary::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto copied = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*copied);
+    REQUIRE(hir);
+    copied.reset();
+    REQUIRE_EQ(hir->routes.len, 5u);
+    for (u32 i = 0; i < 4; ++i) {
+        const auto& route = hir->routes[i];
+        CHECK_EQ(route.locals.len, 0u);
+        CHECK(route.ws_handler.forward_payload.source == HirWsTextSource::MessageBytes);
+        CHECK_EQ(route.exprs[route.ws_handler.forward_payload.prefix_expr].str_value.len, 0u);
+        CHECK_EQ(route.exprs[route.ws_handler.forward_payload.suffix_expr].str_value.len, 0u);
+    }
+    CHECK(hir->routes[4].ws_handler.forward_payloads[0].source == HirWsTextSource::MessageBytes);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, websocket_borrowed_binary_rejects_concatenation_and_wrong_phases) {
+    const char* bodies[] = {R"rut(msg.forward(msg.payload + b"x"))rut",
+                            R"rut(msg.forward(b"x" + msg.payload))rut",
+                            R"rut(msg.forward(msg.payload, b"x"))rut",
+                            "msg.forward(req.bodyBytes)",
+                            "msg.forward(msg.payload.count)",
+                            R"rut(msg.forward(msg.payload == b""))rut"};
+    for (const char* body : bodies) {
+        std::string source = R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { msg in )rut";
+        source += body;
+        source += " } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+}
+
 TEST(frontend, websocket_optional_values_keep_owned_proofs_and_plain_concept_types) {
     auto tokens = lex(lit(test::ws_optional_values::kSource));
     REQUIRE(tokens);
@@ -5610,13 +5658,13 @@ TEST(frontend, websocket_optional_values_keep_owned_proofs_and_plain_concept_typ
     rir.destroy();
 }
 
-TEST(frontend, websocket_optional_values_reject_scope_effects_and_dynamic_payloads) {
+TEST(frontend, websocket_optional_values_reject_scope_effects_and_invalid_payloads) {
     const char* bodies[] = {
         "if let text = maybeText(msg) { msg.drop() } else { msg.forward(text) }",
         "if let text = maybeText(msg) { msg.drop() } msg.forward(text)",
         "guard let text = maybeText(msg) else { msg.forward(text) } msg.forward()",
         "if let text = maybeText(msg) { let alias = text msg.drop() } else { msg.forward(alias) }",
-        "guard let bytes = maybeBytes(msg) else { msg.drop() } msg.forward(bytes)",
+        "guard let bytes = maybeBytes(msg) else { msg.drop() } msg.forward(bytes + b\"\")",
         "if let value = identity(false) { msg.forward() } else { msg.drop() }",
         "guard let root = json.parse(msg.text) else { msg.drop() } "
         "guard let text = fallback(msg, root) else { msg.drop() } msg.forward()",

@@ -2663,7 +2663,8 @@ literal decoder and its 4096-byte decoded limit; it must also fit `maxMessageSiz
 The adjacent `b"..."` form accepts raw bytes and the escapes `\n`, `\r`,
 `\t`, `\\`, `\"`, and `\xHH`; NUL is `\x00`. Empty and non-UTF-8 payloads are valid.
 Immutable Bytes aliases and pure helpers normalized to these literals are also
-accepted. Concatenation, dynamic Bytes, Unicode escapes and interpolation are rejected.
+accepted. Concatenation, Unicode escapes and interpolation are rejected. Complete
+borrowed message payloads also support Binary output as described below.
 Text or Binary input becomes Binary output; ordinary string replacements still
 produce Text. Bare `forward()` keeps the original message, and control frames
 bypass the handler. Malformed Text input remains a protocol error before dispatch.
@@ -2891,7 +2892,8 @@ fallible work or runtime storage. Predicates consume normalized HIR in the
 existing bounded lowerer; aliases never enter the HTTP route's local storage.
 Message aliases can receive verdicts, and text aliases can feed the existing
 text recipe and JSON parse guards. Fixed Binary output accepts Bytes aliases and
-pure helper results that normalize to exact-byte literals; borrowed dynamic Bytes output remains absent. Close reasons
+pure helper results that normalize to exact-byte literals, as well as the complete
+borrowed message payload. Close reasons
 keep their literal-only contract; close codes accept constant integer aliases.
 
 The lexical scope includes compile-time admission constants and is discarded at
@@ -3033,8 +3035,25 @@ infallible immutable subset. Omitting its evaluation on a present path cannot
 change effects or errors. Regex scans, HTTP/state effects and other fallible
 fallback work are rejected, preserving ordinary evaluation/error semantics.
 General optional locals and computations remain absent. Compile-time Bytes aliases
-and helper results also feed the existing LiteralBinary recipe; borrowing a
-message payload does not make dynamic Binary output supported.
+and helper results also feed the existing LiteralBinary recipe.
+
+`message.forward(message.payload)` accepts the complete borrowed Bytes value,
+including immutable aliases, inlined pure helper returns and reached optional
+bindings. It always emits Binary, even for Text input; bare `forward()` preserves
+the original kind. Normalization must resolve to the current callback message's
+payload field. Request bodies, unrelated values, slices and byte concatenation are
+not introduced. Empty Bytes emits an empty Binary frame; invalid UTF-8 in a Binary
+input remains byte-exact, while malformed Text is rejected before the handler.
+
+An appended MessageBytes rewrite-source tag reuses the existing recipe fields,
+ForwardText action and native layout. It carries no source pointer or affixes;
+metadata validation rejects nonempty prefix/suffix and JSON paths. Older readers
+reject the unknown tag; native artifacts retain the same-build identity contract.
+Output sizing includes the full reassembled payload in both bounds checks and
+pre-dispatch drain estimates. The inspector copies into the separate owned output
+slice before asynchronous I/O; no input pointer, per-message allocation or new
+connection state is added. Fragmentation, partial reads, control relay and both
+I/O backends retain their existing ownership and cancellation paths.
 
 A branch sequence tracks its entry and pending continuation edge. A guard's
 success edge or an early if's false edge is patched to the next source condition,

@@ -1,3 +1,4 @@
+#include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_optional_values.h"
 // Tests for the .rut program loader (src/serve_loader.cc): the bridge that
 // compiles a source file end to end (lex -> parse -> analyze -> MIR -> RIR ->
@@ -6439,6 +6440,16 @@ route GET "/ws" { return websocket(ws) { msg in
     }
 }
 
+TEST(serve_loader, websocket_borrowed_binary_survives_source_removal) {
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_borrowed_binary").string();
+    auto path = write_file(dir, "app.rut", test::ws_borrowed_binary::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    test::ws_borrowed_binary::check(_tc, program.config);
+}
+
 TEST(serve_loader, websocket_optional_values_survive_source_removal) {
     const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_optional_values").string();
     auto path = write_file(dir, "app.rut", test::ws_optional_values::kSource);
@@ -9634,6 +9645,9 @@ TEST(serve_loader, websocket_guard_text_policies_reach_wire) {
         {{}, {}, {"x", json::kMaxBytes + 1}, WsTextSource::JsonStringify},
         {{}, {}, {"x", 1}, WsTextSource::Literal},
         {{}, {}, {"x", 1}, WsTextSource::MessageText},
+        {{"x", 1}, {}, {}, WsTextSource::MessageBytes},
+        {{}, {"x", 1}, {}, WsTextSource::MessageBytes},
+        {{}, {}, {"x", 1}, WsTextSource::MessageBytes},
     };
     for (const WsTextRewrite& rewrite : invalid_recipes) {
         CHECK_FALSE(cfg.add_ws_terminate("/bad",

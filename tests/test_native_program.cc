@@ -2,6 +2,7 @@
 #include "es256_fixture.h"
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/signed_request.h"
+#include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_optional_values.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
@@ -1799,6 +1800,16 @@ route GET "/ws" { return websocket(backend) { message in
                   (!client || op == WsOpcode::Text ? WsFrameAction::Forward : WsFrameAction::Drop));
         }
     }
+}
+
+TEST(native_program, websocket_borrowed_binary_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_borrowed_binary::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_borrowed_binary::check(_tc, owner.p->config);
 }
 
 TEST(native_program, websocket_optional_values_survive_source_removal) {

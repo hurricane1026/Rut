@@ -433,6 +433,10 @@ bool load_rut_program(const char* path,
                         result.source = WsTextSource::LiteralBinary;
                         if (source.source_path.ptr || source.source_path.len != 0) return false;
                         break;
+                    case HirWsTextSource::MessageBytes:
+                        result.source = WsTextSource::MessageBytes;
+                        if (source.source_path.ptr || source.source_path.len != 0) return false;
+                        break;
                     case HirWsTextSource::MessageText:
                         result.source = WsTextSource::MessageText;
                         if (source.source_path.ptr || source.source_path.len != 0) return false;

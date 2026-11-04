@@ -160,6 +160,84 @@ def optional_bytes_exchange(client, peer):
     expect(peer, (8, b"\x03\xe8", True))
 
 
+
+BORROWED_BINARY_DECLARATIONS = r"""
+func identity<T>(_ value: T) -> T => value
+func payload(_ msg: WebSocketMessage) -> Bytes => msg.payload
+func selectedBytes(_ msg: WebSocketMessage) -> Bytes {
+    if msg.text == "DROP" { nil } else { payload(msg) }
+}
+"""
+BORROWED_BINARY_HANDLER = r"""
+return websocket(ws) { msg in
+    guard msg.text != "CLOSE" else { msg.close(1000) }
+    guard msg.text != "PASS" else { msg.forward() }
+    guard let bytes = selectedBytes(msg) else { msg.drop() }
+    msg.forward(identity(bytes))
+}
+"""
+
+
+def borrowed_binary_exchange(client, peer):
+    def expect(sock, expected):
+        first, second = recv_exact(sock, 2)
+        size = second & 0x7f
+        if size == 126:
+            size = int.from_bytes(recv_exact(sock, 2), "big")
+        elif size == 127:
+            size = int.from_bytes(recv_exact(sock, 8), "big")
+        mask = recv_exact(sock, 4) if second & 0x80 else None
+        data = recv_exact(sock, size)
+        if mask:
+            data = bytes(v ^ mask[i & 3] for i, v in enumerate(data))
+        actual = (first & 0x0f, data, mask is not None)
+        if not first & 0x80 or actual != expected:
+            raise AssertionError(f"borrowed Binary: {actual=!r}, {expected=!r}")
+
+    def frame(opcode, data, masked, fin=True):
+        size = len(data)
+        length = bytes((size,)) if size < 126 else b"\x7e" + size.to_bytes(2, "big")
+        mask = b"\x12\x34\x56\x78" if masked else b""
+        if masked:
+            length = bytes((length[0] | 0x80,)) + length[1:]
+            data = bytes(v ^ mask[i & 3] for i, v in enumerate(data))
+        return bytes(((0x80 if fin else 0) | opcode,)) + length + mask + data
+
+    payload = b"A\0\xc3\xa9"
+    client.sendall(frame(1, payload[:2], True, False) + masked_frame(9, b"PING") +
+                   frame(0, payload[2:], True))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, payload, True))
+    client.sendall(masked_frame(1, b"") + masked_frame(2, b"\xff\0") +
+                   masked_frame(1, b"DROP") + masked_frame(1, b"PASS"))
+    expect(peer, (2, b"", True))
+    expect(peer, (2, b"\xff\0", True))
+    expect(peer, (1, b"PASS", True))
+    peer.sendall(frame(2, b"\xff", False, False) + frame(10, b"p", False) +
+                 frame(0, b"\0", False))
+    expect(client, (10, b"p", False))
+    expect(client, (2, b"\xff\0", False))
+    peer.sendall(frame(1, b"\xc3\xa9", False) + frame(1, b"DROP", False) +
+                 frame(2, b"PASS", False))
+    expect(client, (2, b"\xc3\xa9", False))
+    expect(client, (2, b"PASS", False))
+    # Max-size message crosses a receive slice and competes with a control frame
+    # for output space. No borrowed input may survive the asynchronous send.
+    large = b"\0\xff" * 8185
+    client.sendall(frame(2, large[:5000], True, False) + masked_frame(9, b"p") +
+                   frame(0, large[5000:], True))
+    expect(peer, (9, b"p", True))
+    expect(peer, (2, large, True))
+    wire = frame(2, large, False)
+    peer.sendall(wire[:5])
+    peer.sendall(wire[5:8192])
+    peer.sendall(wire[8192:])
+    expect(client, (2, large, False))
+    client.sendall(masked_frame(1, b"CLOSE"))
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
 NESTED_JSON_HANDLER = r"""
 return websocket(ws) { message in
     guard let document = json.parse(message.text) else { message.close(1007) }
@@ -1735,6 +1813,7 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (BORROWED_BINARY_HANDLER, borrowed_binary_exchange, BORROWED_BINARY_DECLARATIONS),
                 (OPTIONAL_DEFAULT_HANDLER, optional_default_exchange, OPTIONAL_VALUE_DECLARATIONS),
                 (OPTIONAL_BYTES_HANDLER, optional_bytes_exchange, OPTIONAL_VALUE_DECLARATIONS),
                 (CHOICE_GUARD_HANDLER, choice_guard_exchange, CHOICE_DECLARATIONS),

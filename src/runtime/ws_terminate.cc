@@ -541,7 +541,9 @@ bool ws_valid_text_payload(Str text) {
 bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
     const u64 literal_size = static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len;
     const bool kSourceValid =
-        rewrite.source <= WsTextSource::LiteralBinary &&
+        rewrite.source <= WsTextSource::MessageBytes &&
+        (rewrite.source != WsTextSource::MessageBytes ||
+         (rewrite.prefix.len == 0 && rewrite.suffix.len == 0)) &&
         ((rewrite.source == WsTextSource::JsonString ||
           rewrite.source == WsTextSource::JsonNumberText ||
           rewrite.source == WsTextSource::JsonStringify)
@@ -753,12 +755,15 @@ WsInspectStatus ws_inspect(WsInspector& st,
             const WsTextRewrite& rewrite = policy_forward
                                                ? st.forward_texts[action_value - first_text_policy]
                                                : st.forward_text;
-            const u64 payload_size = rewrite.source == WsTextSource::MessageText ? total : 0;
-            const u64 output_size = payload_size + rewrite.prefix.len + rewrite.suffix.len;
+            const u64 kPayloadSize = rewrite.source == WsTextSource::MessageText ||
+                                             rewrite.source == WsTextSource::MessageBytes
+                                         ? total
+                                         : 0;
+            const u64 kOutputSize = kPayloadSize + rewrite.prefix.len + rewrite.suffix.len;
             if (!ws_valid_text_rewrite(rewrite, st.max_message_size) ||
                 (rewrite.source == WsTextSource::MessageText && msg_op != WsOpcode::Text) ||
-                output_size > kWsTerminateMessageCapacity ||
-                (st.max_message_size != 0 && output_size > st.max_message_size))
+                kOutputSize > kWsTerminateMessageCapacity ||
+                (st.max_message_size != 0 && kOutputSize > st.max_message_size))
                 return WsInspectStatus::Error;
             bool emitted = false;
             switch (rewrite.source) {
@@ -804,18 +809,20 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 case WsTextSource::Literal:
                 case WsTextSource::MessageText:
                 case WsTextSource::LiteralBinary:
-                    emitted =
-                        emit_frame(out,
-                                   out_cap,
-                                   produced,
-                                   rewrite.source == WsTextSource::LiteralBinary ? WsOpcode::Binary
-                                                                                 : WsOpcode::Text,
-                                   msg_buf,
-                                   payload_size,
-                                   st.masked,
-                                   st.mask_rng,
-                                   rewrite.prefix,
-                                   rewrite.suffix);
+                case WsTextSource::MessageBytes:
+                    emitted = emit_frame(out,
+                                         out_cap,
+                                         produced,
+                                         rewrite.source == WsTextSource::LiteralBinary ||
+                                                 rewrite.source == WsTextSource::MessageBytes
+                                             ? WsOpcode::Binary
+                                             : WsOpcode::Text,
+                                         msg_buf,
+                                         kPayloadSize,
+                                         st.masked,
+                                         st.mask_rng,
+                                         rewrite.prefix,
+                                         rewrite.suffix);
                     break;
             }
             if (!emitted) return WsInspectStatus::Error;

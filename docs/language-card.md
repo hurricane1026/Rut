@@ -1187,10 +1187,22 @@ return websocket(chat, maxMessageSize: 4kb) { message in
 }
 // A replacement must normalize to one adjacent b"..." literal, at most 4096 decoded
 // bytes, and fit maxMessageSize. Supported escapes: \n, \r, \t, \\, \" and \xHH (NUL is \x00).
-// Byte concatenation, dynamic Bytes output, Unicode escapes and interpolation
-// remain unsupported.
+// Byte concatenation, Unicode escapes and interpolation remain unsupported.
 // Guard branches choose independent Text/Binary replacements; bare forward()
 // preserves the original type and payload. Invalid Text input is still rejected.
+
+// The complete borrowed payload may also be sent as Binary, including aliases,
+// pure helper results and successful optional bindings of that Bytes value.
+return websocket(chat) { message in
+    let bytes: Bytes = message.payload
+    message.forward(bytes)
+}
+// Equivalent: message.forward(message.payload). Text input becomes Binary without
+// changing its encoded bytes; Binary input is preserved byte-for-byte. Empty Bytes
+// emits an empty Binary. Bare forward() still preserves the original message kind.
+// Only the current message's complete payload is supported dynamically; slicing,
+// concatenation and unrelated/request-borrowed Bytes output remain unsupported.
+// Reassembly/output must fit maxMessageSize and the existing single-slice cap.
 
 // Terminate mode defaults to 16370 bytes (16 KiB slice minus the maximum 14-byte
 // WebSocket header). Explicit `maxMessageSize` values must be 1b through 16370b;

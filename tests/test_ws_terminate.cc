@@ -9,6 +9,7 @@
 #include "test.h"
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 using namespace rut;
 
@@ -1306,6 +1307,232 @@ TEST(ws_terminate, fixed_text_rewrite_fails_closed_on_invalid_output) {
                   st, in, n, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
               WsInspectStatus::Error);
         CHECK_EQ(produced, 0u);
+    }
+}
+
+TEST(ws_terminate, borrowed_binary_copies_payload_for_default_and_branch_recipes) {
+    const Str payloads[] = {{}, {"A\0B", 3}, {"\xc3\xa9", 2}, {"\0\xff", 2}};
+    for (bool masked : kMaskDirections) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (Str bytes : payloads) {
+                for (WsFrameAction action :
+                     {WsFrameAction::ForwardText, WsFrameAction::ForwardTextPolicy0}) {
+                    auto st = make_state(masked);
+                    st.forward_text = {{}, {}, {}, WsTextSource::MessageBytes};
+                    const WsTextRewrite branch = st.forward_text;
+                    st.forward_texts = &branch;
+                    st.forward_text_count = 1;
+                    Recorder r;
+                    r.verdict = action;
+                    u8 in[32], out[32], msg[32], decoded[32];
+                    const u32 n = build(
+                        in, op, true, masked, reinterpret_cast<const u8*>(bytes.ptr), bytes.len);
+                    u32 used = 0, produced = 0;
+                    const auto status = ws_inspect(st,
+                                                   in,
+                                                   n,
+                                                   out,
+                                                   sizeof(out),
+                                                   msg,
+                                                   sizeof(msg),
+                                                   record,
+                                                   &r,
+                                                   &used,
+                                                   &produced);
+                    if (op == WsOpcode::Text && !ws_valid_text_payload(bytes)) {
+                        CHECK(status == WsInspectStatus::Error);
+                        CHECK_EQ(r.calls, 0);
+                        CHECK_EQ(produced, 0u);
+                        continue;
+                    }
+                    REQUIRE(status == WsInspectStatus::Ok);
+                    CHECK_EQ(used, n);
+                    CHECK_EQ(r.calls, 1);
+                    CHECK_EQ(r.last_len, bytes.len);
+                    CHECK_EQ(r.last_from_client, masked);
+                    memset(in, 0xee, sizeof(in));
+                    memset(msg, 0xee, sizeof(msg));
+                    WsFrameHeader h{};
+                    REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+                    CHECK(h.opcode == WsOpcode::Binary);
+                    CHECK(h.fin);
+                    CHECK_EQ(h.payload_len, bytes.len);
+                    if (bytes.len) CHECK(memcmp(decoded, bytes.ptr, bytes.len) == 0);
+                }
+            }
+        }
+    }
+}
+
+TEST(ws_terminate, borrowed_binary_reassembles_partial_frames_and_relays_controls) {
+    for (bool masked : kMaskDirections) {
+        auto st = make_state(masked);
+        st.forward_text = {{}, {}, {}, WsTextSource::MessageBytes};
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        u8 in[64], out[64], msg[64], decoded[64];
+        const u8 first[] = {'A'}, ping[] = {'P'}, last[] = {0, 0xc3, 0xa9};
+        const u32 fragment = build(in, WsOpcode::Text, false, masked, first, sizeof(first));
+        const u32 control = build(in + fragment, WsOpcode::Ping, true, masked, ping, sizeof(ping));
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           fragment + control,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, fragment + control);
+        CHECK_EQ(r.calls, 0);
+        WsFrameHeader h{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(h.opcode == WsOpcode::Ping);
+        CHECK_EQ(decoded[0], 'P');
+        const u32 n = build(in, WsOpcode::Continuation, true, masked, last, sizeof(last));
+        const u32 split = n - 2;
+        REQUIRE(
+            ws_inspect(
+                st, in, split, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+            WsInspectStatus::Ok);
+        CHECK_EQ(used, split);
+        CHECK_EQ(produced, 0u);
+        CHECK_EQ(r.calls, 0);
+        CHECK(st.partial_data_frame);
+        REQUIRE(ws_inspect(st,
+                           in + split,
+                           n - split,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, n - split);
+        CHECK_EQ(r.calls, 1);
+        CHECK_FALSE(st.partial_data_frame);
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(h.opcode == WsOpcode::Binary);
+        CHECK_EQ(h.payload_len, 4u);
+        CHECK(memcmp(decoded, "A\0\xc3\xa9", 4) == 0);
+    }
+}
+
+TEST(ws_terminate, borrowed_binary_waits_for_output_drain_without_repeating_handler) {
+    for (bool masked : kMaskDirections) {
+        auto st = make_state(masked);
+        st.forward_text = {{}, {}, {}, WsTextSource::MessageBytes};
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        const u8 bytes[] = {0xff, 0, 1, 2, 3, 4, 5, 6};
+        u8 in[64], out[16], msg[32], decoded[32];
+        const u32 one = build(in, WsOpcode::Binary, true, masked, bytes, sizeof(bytes));
+        const u32 two = build(in + one, WsOpcode::Binary, true, masked, bytes, sizeof(bytes));
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           one + two,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, one);
+        CHECK_EQ(r.calls, 1);
+        WsFrameHeader h{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(h.opcode == WsOpcode::Binary);
+        CHECK(memcmp(decoded, bytes, sizeof(bytes)) == 0);
+        REQUIRE(ws_inspect(st,
+                           in + one,
+                           two,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, two);
+        CHECK_EQ(r.calls, 2);
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(memcmp(decoded, bytes, sizeof(bytes)) == 0);
+    }
+}
+
+TEST(ws_terminate, borrowed_binary_checks_metadata_capacity_and_output_bounds) {
+    const WsTextRewrite invalid[] = {{{"x", 1}, {}, {}, WsTextSource::MessageBytes},
+                                     {{}, {"x", 1}, {}, WsTextSource::MessageBytes},
+                                     {{}, {}, {"/x", 2}, WsTextSource::MessageBytes},
+                                     {{nullptr, 1}, {}, {}, WsTextSource::MessageBytes},
+                                     {{}, {}, {}, static_cast<WsTextSource>(255)}};
+    for (const auto& recipe : invalid) {
+        CHECK_FALSE(ws_valid_text_rewrite(recipe, kWsTerminateMessageCapacity));
+        auto st = make_state(false);
+        st.forward_text = recipe;
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        u8 in[] = {0x82, 0}, out[16], msg[16];
+        u32 used = 0, produced = 0;
+        CHECK(ws_inspect(st,
+                         in,
+                         sizeof(in),
+                         out,
+                         sizeof(out),
+                         msg,
+                         sizeof(msg),
+                         record,
+                         &r,
+                         &used,
+                         &produced) == WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
+    }
+    for (bool masked : kMaskDirections) {
+        u8 bytes[kWsTerminateMessageCapacity], in[SlicePool::kSliceSize];
+        u8 out[SlicePool::kSliceSize], msg[sizeof(bytes)], decoded[sizeof(bytes)];
+        memset(bytes, 0xff, sizeof(bytes));
+        const u32 n = build(in, WsOpcode::Binary, true, masked, bytes, sizeof(bytes));
+        for (u32 scenario = 0; scenario < 4; ++scenario) {
+            auto st = make_state(masked);
+            st.max_message_size = scenario == 1 ? sizeof(bytes) - 1 : sizeof(bytes);
+            st.forward_text = {{}, {}, {}, WsTextSource::MessageBytes};
+            Recorder r;
+            r.verdict = WsFrameAction::ForwardText;
+            u32 used = 0, produced = 0;
+            const auto status = ws_inspect(st,
+                                           in,
+                                           n,
+                                           out,
+                                           scenario == 2 ? n - 1 : sizeof(out),
+                                           msg,
+                                           scenario == 3 ? sizeof(msg) - 1 : sizeof(msg),
+                                           record,
+                                           &r,
+                                           &used,
+                                           &produced);
+            if (scenario) {
+                CHECK(status == WsInspectStatus::Error);
+                CHECK_EQ(produced, 0u);
+                CHECK_EQ(r.calls, scenario == 2 ? 1 : 0);
+            } else {
+                REQUIRE(status == WsInspectStatus::Ok);
+                CHECK_EQ(used, n);
+                WsFrameHeader h{};
+                REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+                CHECK(h.opcode == WsOpcode::Binary);
+                CHECK_EQ(h.payload_len, sizeof(bytes));
+                CHECK(memcmp(decoded, bytes, sizeof(bytes)) == 0);
+            }
+        }
     }
 }
 

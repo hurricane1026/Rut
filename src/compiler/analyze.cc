@@ -7623,13 +7623,24 @@ static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(
                             : nullptr;
     if (!binary && (!alias || alias->kind == WsJsonBinding::Kind::Value)) {
         auto value = analyze_ws_value(*call.args[0], scope, mod);
-        if (value && value->kind == HirExprKind::BytesLit && !value->may_nil && !value->may_error) {
-            binary = true;
-            bytes = value->str_value;
+        if (value && !value->may_nil && !value->may_error) {
+            if (value->kind == HirExprKind::BytesLit) {
+                binary = true;
+                bytes = value->str_value;
+            } else if (value->kind == HirExprKind::WsMessageField &&
+                       value->type == HirTypeKind::Bytes &&
+                       value->str_value.eq(lit_str("payload")) && value->lhs &&
+                       value->lhs->kind == HirExprKind::LocalRef &&
+                       value->lhs->type == HirTypeKind::WebSocketMessage &&
+                       value->lhs->local_index == 0) {
+                binary = true;
+                result.source = HirWsTextSource::MessageBytes;
+            }
         }
     }
     if (binary) {
-        result.source = HirWsTextSource::LiteralBinary;
+        if (result.source != HirWsTextSource::MessageBytes)
+            result.source = HirWsTextSource::LiteralBinary;
         const Str kBytes = bytes;
         if (kBytes.len != 0) prefix.assign(kBytes.ptr, kBytes.len);
     } else {
