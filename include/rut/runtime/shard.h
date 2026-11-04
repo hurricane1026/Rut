@@ -392,6 +392,13 @@ struct Shard {
             (!seed->rate_limit_ids_valid() || !seed->forward_policy_tables_valid() ||
              !seed->password_gateway_metadata_valid()))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+        if (seed && seed->requires_password_gateway()) {
+            if constexpr (!requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                              event_loop.password_gateway = gateway;
+                          }) {
+                return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+            }
+        }
         active_config = seed;
 
         pthread_attr_t attr;
@@ -435,7 +442,10 @@ struct Shard {
                 pthread_attr_destroy(&attr);
                 return ready;
             }
-            loop->password_gateway = &automatic_password_gateway;
+            if constexpr (requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                              event_loop.password_gateway = gateway;
+                          })
+                loop->password_gateway = &automatic_password_gateway;
         }
         i32 rc = pthread_create(&thread, &attr, thread_entry, this);
         pthread_attr_destroy(&attr);
@@ -443,7 +453,10 @@ struct Shard {
             if (kStartedPasswordNow) {
                 automatic_password_gateway.stop();
                 password_gateway_started = false;
-                loop->password_gateway = nullptr;
+                if constexpr (requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                                  event_loop.password_gateway = gateway;
+                              })
+                    loop->password_gateway = nullptr;
             }
             return core::make_unexpected(Error::make(rc, Error::Source::Thread));
         }
@@ -494,6 +507,13 @@ struct Shard {
             (!cfg->rate_limit_ids_valid() || !cfg->forward_policy_tables_valid() ||
              !cfg->password_gateway_metadata_valid()))
             return false;
+        if (cfg && cfg->requires_password_gateway()) {
+            if constexpr (!requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                              event_loop.password_gateway = gateway;
+                          }) {
+                return false;
+            }
+        }
         if (!thread_spawned) {
             // No thread — direct apply. The running path's poll_command() drains
             // the idle pool on every config adopt; this not-running path must do
@@ -535,7 +555,11 @@ struct Shard {
             auto* cfg = control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
             if (auto* passwords =
                     control.pending_password_gateway.exchange(nullptr, std::memory_order_acq_rel))
-                if (loop) loop->password_gateway = passwords;
+                if constexpr (requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                                  event_loop.password_gateway = gateway;
+                              }) {
+                    if (loop) loop->password_gateway = passwords;
+                }
             if (cfg) {
                 // Mirror poll_command(): adopting a config on the not-running join
                 // path must also drop idle sockets parked under the old config, or
@@ -562,7 +586,11 @@ struct Shard {
         automatic_password_gateway.stop();
         password_gateway_started = false;
         control.pending_password_gateway.store(nullptr, std::memory_order_relaxed);
-        if (loop) loop->password_gateway = nullptr;
+        if constexpr (requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                          event_loop.password_gateway = gateway;
+                      }) {
+            if (loop) loop->password_gateway = nullptr;
+        }
         if (loop) loop->live_access_log = nullptr;
         if (live_log_host_ring && live_log_lease.load(std::memory_order_acquire) == nullptr) {
             live_log_host_ring->~SourceLiveAccessLogHostRing();

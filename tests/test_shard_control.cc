@@ -710,6 +710,39 @@ TEST(shard_control, spawn_rejects_invalid_seed_without_installing_it) {
     close(lfd);
 }
 
+TEST(shard_control, password_config_rejected_for_loop_without_gateway_capability) {
+    struct ProbeLoop {
+        void run() {}
+        void set_capture(CaptureRing*) {}
+    } probe;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/password", kRouteMethodGet, 200));
+    cfg.routes[0].action = RouteAction::JitHandler;
+    cfg.routes[0].needs_password_gateway = 1;
+
+    Shard<ProbeLoop> shard;
+    shard.loop = &probe;
+    CHECK_FALSE(shard.reload_config(&cfg, 1));
+    CHECK(shard.active_config == nullptr);
+    CHECK_FALSE(shard.password_gateway_started);
+    CHECK(shard.control.pending_config.load(std::memory_order_acquire) == nullptr);
+    CHECK(shard.control.pending_password_gateway.load(std::memory_order_acquire) == nullptr);
+
+    shard.route_config = &cfg;
+    CHECK_FALSE(shard.spawn().has_value());
+    CHECK(shard.active_config == nullptr);
+    CHECK_FALSE(shard.password_gateway_started);
+    shard.route_config = nullptr;
+    REQUIRE(shard.spawn().has_value());
+    CHECK_FALSE(shard.reload_config(&cfg, 1));
+    CHECK(shard.active_config == nullptr);
+    CHECK_FALSE(shard.password_gateway_started);
+    CHECK(shard.control.pending_config.load(std::memory_order_acquire) == nullptr);
+    CHECK(shard.control.pending_password_gateway.load(std::memory_order_acquire) == nullptr);
+    shard.join();
+    shard.loop = nullptr;
+}
+
 TEST(shard_control, shard_reload_config) {
     // Spawn a real shard, send ReloadConfig, verify active_config changes.
     auto lfd_result = create_listen_socket(0);

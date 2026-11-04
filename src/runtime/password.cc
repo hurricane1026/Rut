@@ -8,6 +8,8 @@
 #include <stddef.h>
 #ifdef __linux__
 #include <sys/random.h>
+#elif defined(__APPLE__)
+#include <sys/random.h>
 #else
 #include <unistd.h>
 #endif
