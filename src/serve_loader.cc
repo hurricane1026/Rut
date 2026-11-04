@@ -478,7 +478,7 @@ bool load_rut_program(const char* path,
                 if (index >= route.exprs.len) return false;
                 const auto& expr = route.exprs[index];
                 if (expr.kind != HirExprKind::StrLit || expr.str_value.len > max_msg ||
-                    expr.str_value.len > kWsTerminateMessageCapacity ||
+                    expr.str_value.len > kWsMaxMessageCapacity ||
                     (binary ? (!expr.str_value.ptr && expr.str_value.len != 0)
                             : !ws_valid_text_payload(expr.str_value)))
                     return false;

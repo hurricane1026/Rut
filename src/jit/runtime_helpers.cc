@@ -2407,7 +2407,7 @@ extern "C" u32 rut_helper_ws_forward(void* conn, const char* payload, u32 len, u
     auto& connection = *static_cast<ConnectionBase*>(conn);
     const u32 kCap = connection.ws_max_message_size ? connection.ws_max_message_size
                                                     : kWsTerminateMessageCapacity;
-    if (len > kCap || len > kWsTerminateMessageCapacity) {
+    if (len > kCap || len > kWsMaxMessageCapacity) {
         connection.ws_handler_output = {{}, 1009, WsOpcode::Close, true};
         return static_cast<u32>(WsFrameAction::CloseDynamic);
     }

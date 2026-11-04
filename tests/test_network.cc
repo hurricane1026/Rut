@@ -38052,7 +38052,7 @@ TEST(legacy_loop, ws_arm_terminate_rejects_invalid_limits_before_allocating) {
     auto* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     const u32 available = loop->pool.available();
-    for (u32 size : {0u, kWsTerminateMessageCapacity + 1u, 0xffffffffu}) {
+    for (u32 size : {0u, kWsMaxMessageCapacity + 1u, 0xffffffffu}) {
         conn->ws_max_message_size = size;
         CHECK_FALSE(ws_arm_terminate(loop, *conn));
         CHECK_EQ(loop->pool.available(), available);

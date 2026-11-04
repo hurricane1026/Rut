@@ -721,8 +721,10 @@ public:
         timer.init();
         // Reserve six ordinary slices and one complete bounded response chain
         // per admitted connection. Storage remains lazy and shared by the shard.
-        auto pooled =
-            pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
+        auto pooled = pool.init(SlicePool::capacity_for_connections(connection_capacity),
+                                pool_prealloc,
+                                SlicePool::kMaxCachedSlices,
+                                SlicePool::bulk_capacity_for_connections(connection_capacity));
         if (!pooled) {
             destroy_slot_storage();
             return core::make_unexpected(pooled.error());
@@ -979,25 +981,7 @@ public:
     // WebSocket reassembly and output slices for both directions. All-or-nothing;
     // freed in free_conn_impl. Without this the legacy EventLoop's ws_arm_terminate would
     // hit the requires-guard's false branch and close a terminate tunnel at the 101.
-    bool alloc_ws_terminate_bufs(ConnectionBase& c) {
-        if (c.ws_c2u_msg) return true;  // already allocated
-        u8* a = pool.alloc();
-        u8* b = pool.alloc();
-        u8* x = pool.alloc();
-        u8* y = pool.alloc();
-        if (!a || !b || !x || !y) {
-            if (a) pool.free(a);
-            if (b) pool.free(b);
-            if (x) pool.free(x);
-            if (y) pool.free(y);
-            return false;
-        }
-        c.ws_c2u_msg = a;
-        c.ws_u2c_msg = b;
-        c.ws_c2u_out = x;
-        c.ws_u2c_out = y;
-        return true;
-    }
+    bool alloc_ws_terminate_bufs(ConnectionBase& c) { return c.alloc_ws_buffers(pool); }
 
     u8* alloc_ws_handshake_slice() { return pool.alloc(); }
     void free_ws_handshake_slice(u8* slice) {

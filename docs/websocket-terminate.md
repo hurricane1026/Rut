@@ -249,7 +249,7 @@ can also hold byte literals or select between them at runtime. HTTP's
 `req.body`'s complete-body buffering, limits and request-scoped lifetime.
 Imported helpers retain their literal bytes after the imported AST disappears. Literals reuse
 the existing binary escape rules and 4096-byte decoded limit; the message view
-still spans the full single-slice payload, up to 16370 bytes. Equality/inequality
+still spans the full bounded payload, up to the configured message limit. Equality/inequality
 and generic `Eq` compare exact bytes in either operand order. Comparisons with
 `str`, implicit conversions, Bytes regex scans, ordering, concatenation and indexing
 are unsupported. Payload inspections currently lower literal equality, view
@@ -659,7 +659,7 @@ any 101 bytes reach the client. Non-101 responses retain ordinary HTTP behavior.
 Omitting the option retains optional negotiation from the client's validated offers.
 
 The policy uses route-owned storage pinned across asynchronous handshake I/O.
-Native artifacts retain and relocate the same bytes; native format 15 requires
+Native artifacts retain and relocate the same bytes; native format 16 requires
 matching compiler and serving binaries.
 
 ## Application messages
@@ -669,9 +669,10 @@ matching compiler and serving binaries.
 - `message.len` is the complete payload length in bytes, excluding frame headers
   and masking keys. The limit applies across all fragments of one message.
 - `maxMessageSize` defaults to 16370 bytes (16 KiB slice capacity minus the
-  maximum 14-byte WebSocket header). Explicit values from `1b` through `16370b`
-  are accepted. Larger values such as `16kb` or `64kb` are rejected; larger-message
-  buffering is not implemented.
+  maximum 14-byte WebSocket header). Explicit values from `1b` through `262130b`
+  are accepted, including `16kb` and `64kb`. Limits above 16370 bytes reserve four
+  256 KiB bulk buffers per connection from the existing shard-local pool.
+  Allocation is all-or-nothing; exhaustion never lowers the configured limit.
 - `message.text` supports the bounded predicates and rewrite recipes documented
   in [the language card](language-card.md). Current predicates compare payload
   bytes; add `message.isText` to restrict them to Text messages.
@@ -679,7 +680,7 @@ matching compiler and serving binaries.
   wire framing; original frame boundaries are not preserved.
 - `message.forward(text)` replaces one complete message. Ordinary unwrapped
   Strings, including helper/JSON results and repeated dynamic operands, may use
-  String `+`. Replacement output must fit the message and single-slice limits.
+  String `+`. Replacement output must fit the message and storage limits.
   It produces Text even when the input was Binary.
 - `message.forward(b"\x00\xff")` replaces one complete Text or Binary message
   with Binary. One exact-byte literal is allowed, including an empty payload or
@@ -775,7 +776,7 @@ into owned send storage before the next callback or asynchronous I/O; close
 reasons are copied into separate drain storage. Before another message callback,
 backpressure reserves the route's maximum possible output and maximum Close
 payload, flushing an earlier batch first if necessary. These paths use the same
-one-slice limit and existing allocator pools. JSON/regex recipes retain their
+configured message limit and existing allocator pools. JSON/regex recipes retain their
 current specialized limits until their general expression integration is complete.
 
 The binding is `{ message in ... }`. The former `{ frame in ... }` syntax and
@@ -918,7 +919,7 @@ the callback, and control frames bypass it.
 
 The inspector reassembles the complete message and copies its bytes into the owned
 output slice before asynchronous sending. It retains no borrowed pointer. Input
-and output remain bounded by `maxMessageSize` and the existing single-slice cap;
+and output remain bounded by `maxMessageSize` and the bounded storage cap;
 output backpressure drains earlier frames before dispatching another message.
 Byte slicing, concatenation and unrelated/request-borrowed Bytes outputs remain
 unsupported. The appended recipe tag uses the existing action ABI and native
@@ -1059,9 +1060,12 @@ errors remain fatal. Failure and timeout retain normal
 I/O cancellation ownership. Lifecycle callbacks use the synchronous `onOpen` / `onClose` trailing closures
 described in the language card.
 
-Inspection currently uses bounded single-slice storage (16370 bytes),
-with separate per-direction output buffers. `maxMessageSize` cannot lift that
-storage cap. Supporting larger messages requires a separate buffering design.
+Inspection streams ordinary I/O slices into bounded complete-message storage,
+with separate per-direction owned output buffers. The default is 16370 bytes;
+explicit limits reach 262130 bytes using bulk slices. Backpressure stops the next
+callback until earlier output drains. CPU message storage can be reclaimed on
+close, while asynchronous sends retain their output until target and cancel
+completions retire.
 
 The native/JIT message handler ABI may continue using internal `WsOpcode` and
 `WsFrameAction` values. They are implementation details, not DSL types. The

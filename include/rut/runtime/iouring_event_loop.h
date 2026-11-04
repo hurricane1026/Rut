@@ -3039,25 +3039,7 @@ public:
     }
 
     // WebSocket reassembly and output slices for both directions. All-or-nothing.
-    bool alloc_ws_terminate_bufs(ConnectionBase& c) {
-        if (c.ws_c2u_msg) return true;  // already allocated
-        u8* a = pool.alloc();
-        u8* b = pool.alloc();
-        u8* x = pool.alloc();
-        u8* y = pool.alloc();
-        if (!a || !b || !x || !y) {
-            if (a) pool.free(a);
-            if (b) pool.free(b);
-            if (x) pool.free(x);
-            if (y) pool.free(y);
-            return false;
-        }
-        c.ws_c2u_msg = a;
-        c.ws_u2c_msg = b;
-        c.ws_c2u_out = x;
-        c.ws_u2c_out = y;
-        return true;
-    }
+    bool alloc_ws_terminate_bufs(ConnectionBase& c) { return c.alloc_ws_buffers(pool); }
 
     u8* alloc_ws_handshake_slice() { return pool.alloc(); }
     void free_ws_handshake_slice(u8* slice) {
@@ -3549,7 +3531,12 @@ public:
             if (c.recv_pause_cancel_pending) c.recv_pause_rearm_pending = true;
             return true;
         }
-        if (backend.add_recv(c.fd, c.id)) {
+        const bool kBoundedWs = c.is_ws_tunnel && c.is_ws_terminate &&
+                                c.ws_max_message_size > kWsTerminateMessageCapacity;
+        const u32 kAvailable = c.tls_active ? c.tls_in_buf.write_avail() : c.recv_buf.write_avail();
+        const bool kSubmitted = kBoundedWs ? backend.add_recv_once(c.fd, c.id, kAvailable)
+                                           : backend.add_recv(c.fd, c.id);
+        if (kSubmitted) {
             c.pending_ops++;
             c.recv_armed = true;
             c.recv_pause_rearm_pending = false;
@@ -4579,7 +4566,9 @@ public:
         // A fixed rewrite can expand several tiny inputs into multiple full
         // output batches. Bound each upstream read by available receive space:
         // multishot CQEs otherwise append before callbacks can drain that space.
-        if (c.is_ws_tunnel && c.is_ws_terminate && c.ws_has_nonempty_rewrite() && !c.ws_closing &&
+        if (c.is_ws_tunnel && c.is_ws_terminate &&
+            (c.ws_max_message_size > kWsTerminateMessageCapacity ||
+             (c.ws_has_nonempty_rewrite() && !c.ws_closing)) &&
             c.fd >= 0 && c.upstream_fd >= 0 && c.on_upstream_recv == &on_ws_upstream_recv<Self> &&
             valid_upstream_episode(c.upstream_episode) && !c.upstream_episode_quarantined &&
             !c.upstream_abandoned)

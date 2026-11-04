@@ -666,26 +666,8 @@ public:
 
     // Acquire reassembly and output slices for both WebSocket directions.
     // All-or-nothing: frees a partial acquisition on pool exhaustion. Freed in
-    // free_conn_impl (pure CPU scratch — never kernel-referenced).
-    bool alloc_ws_terminate_bufs(ConnectionBase& c) {
-        if (c.ws_c2u_msg) return true;  // already allocated
-        u8* a = pool.alloc();
-        u8* b = pool.alloc();
-        u8* x = pool.alloc();
-        u8* y = pool.alloc();
-        if (!a || !b || !x || !y) {
-            if (a) pool.free(a);
-            if (b) pool.free(b);
-            if (x) pool.free(x);
-            if (y) pool.free(y);
-            return false;
-        }
-        c.ws_c2u_msg = a;
-        c.ws_u2c_msg = b;
-        c.ws_c2u_out = x;
-        c.ws_u2c_out = y;
-        return true;
-    }
+    // free_conn_impl after the backend has cancelled its send state.
+    bool alloc_ws_terminate_bufs(ConnectionBase& c) { return c.alloc_ws_buffers(pool); }
 
     u8* alloc_ws_handshake_slice() { return pool.alloc(); }
     void free_ws_handshake_slice(u8* slice) {

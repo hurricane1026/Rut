@@ -6863,9 +6863,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                           !ws_valid_close_code(static_cast<u32>(known.int_value)))) ||
                         ((!kForward && i == 1) && !ws_valid_close_reason(known.str_value)) ||
                         (kForward &&
-                         (known.str_value.len > kWsTerminateMessageCapacity ||
-                          (scratch->ws_handler.max_message_size &&
-                           known.str_value.len > scratch->ws_handler.max_message_size) ||
+                         (known.str_value.len > kWsMaxMessageCapacity ||
+                          known.str_value.len > (scratch->ws_handler.max_message_size
+                                                     ? scratch->ws_handler.max_message_size
+                                                     : kWsTerminateMessageCapacity) ||
                           (value->type == HirTypeKind::Str &&
                            !ws_valid_text_payload(known.str_value)))))
                         return frontend_error(FrontendError::UnsupportedSyntax, call.args[i]->span);
@@ -6876,9 +6877,12 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         ws_output_literal_bounds(value.value(), locals, local_count, visits);
                     if (!kBounds.complete)
                         return frontend_error(FrontendError::TooManyItems, call.args[i]->span);
-                    const u32 kMaximum = kForward ? scratch->ws_handler.max_message_size : 123u;
+                    const u32 kMaximum = kForward ? (scratch->ws_handler.max_message_size
+                                                         ? scratch->ws_handler.max_message_size
+                                                         : kWsTerminateMessageCapacity)
+                                                  : 123u;
                     if ((value->type == HirTypeKind::Str && !kBounds.valid_utf8) ||
-                        kBounds.minimum > (kForward ? kWsTerminateMessageCapacity : 123u) ||
+                        kBounds.minimum > (kForward ? kWsMaxMessageCapacity : 123u) ||
                         (kMaximum && kBounds.minimum > kMaximum))
                         return frontend_error(FrontendError::UnsupportedSyntax, call.args[i]->span);
                 }
@@ -8377,8 +8381,8 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
         after_source = true;
         return {};
     }
-    if (text.len > kWsTerminateMessageCapacity ||
-        prefix.size() + suffix.size() + text.len > kWsTerminateMessageCapacity)
+    if (text.len > kWsMaxMessageCapacity ||
+        prefix.size() + suffix.size() + text.len > kWsMaxMessageCapacity)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     auto& part = after_source ? suffix : prefix;
     if (text.len != 0) part.append(text.ptr, text.len);
@@ -8439,8 +8443,9 @@ static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(
                                                 nodes);
         if (!parts) return core::make_unexpected(parts.error());
     }
-    if ((route.ws_handler.max_message_size != 0 &&
-         prefix.size() + suffix.size() > route.ws_handler.max_message_size) ||
+    if ((prefix.size() + suffix.size() > (route.ws_handler.max_message_size
+                                              ? route.ws_handler.max_message_size
+                                              : kWsTerminateMessageCapacity)) ||
         (!binary && (!utf8_valid(reinterpret_cast<const u8*>(prefix.data()), prefix.size()) ||
                      !utf8_valid(reinterpret_cast<const u8*>(suffix.data()), suffix.size()))))
         return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);

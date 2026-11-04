@@ -2582,7 +2582,7 @@ message bytes. A backend 101 must select that exact token before any response by
 are sent. Without the option, the backend may select a validated offer or omit
 selection. Bare passthrough does not accept the option. The policy is route-owned
 and pinned across I/O, including after native relocation; compiler and serving
-binaries must agree on native format 15. See [terminate mode](docs/websocket-terminate.md).
+binaries must agree on native format 16. See [terminate mode](docs/websocket-terminate.md).
 
 The `message.close(code, "reason")` verdict, final or in a guard else-branch, sends a fixed reason to both
 peers during the handler-initiated close handshake. The code follows the existing
@@ -2673,9 +2673,8 @@ scratch. Before consuming a subsequent final data frame, a dynamic-output route
 reserves its configured maximum message size and the maximum close payload;
 insufficient space flushes prior output before the next callback. Expanding
 routes retain the existing io_uring receive-pause strategy. There is no extra
-per-message allocation or runtime LLVM dependency. The one-slice message/output
-limit remains; this does not complete compression, multi-slice buffers or
-connection/session lifecycle contexts.
+per-message allocation or runtime LLVM dependency. Message/output storage follows the configured bounded capacity described below.
+Open/close lifecycle contexts are supported; RFC 7692 compression remains pending.
 
 Current terminate handlers support `guard` conditions over `message.fromClient`,
 `message.isText`, `message.isBinary`, `message.len` comparisons, and
@@ -2761,10 +2760,14 @@ The loader copies decoded bytes into retained route storage; output framing copi
 those bytes into the owned send slice before asynchronous I/O.
 
 A terminate route defaults to a 16370-byte `maxMessageSize`: one 16 KiB slice minus
-the maximum 14-byte WebSocket header. Explicit limits must be from 1 through 16370
-bytes; larger values such as `16kb` are rejected until larger-message buffering is
-implemented. A fixed replacement uses ordinary string escape decoding and must fit both
-`maxMessageSize` and the single-slice terminate cap. Bounded text concatenation is
+the maximum 14-byte WebSocket header. Explicit limits may range from 1 through 262130
+bytes (256 KiB minus the same header allowance), including `16kb` and `64kb`.
+Limits above the default acquire four bulk slices atomically from the existing
+shard-local SlicePool: one complete-message and one owned output buffer per
+direction. Failure returns all acquired slices and closes without silently
+lowering the limit. Ordinary I/O slices stream into message storage; outbound
+frames retain owned storage through send and cancellation retirement. A fixed replacement uses ordinary string escape decoding and must fit both
+`maxMessageSize` and the bounded terminate storage cap. Bounded text concatenation is
 also supported: `message.forward("prefix" + message.text + "suffix")`, including either
 affix alone or an identity `message.text`. Route-local `let` strings whose values
 are known at compile time, including aliases of such strings, may supply fixed

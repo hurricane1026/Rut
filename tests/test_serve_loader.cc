@@ -8064,7 +8064,7 @@ TEST(serve_loader, add_ws_terminate_rejects_invalid_message_limits_without_route
     WsMessageHandlerFn handler = [](void*, WsOpcode, const u8*, u64, bool) {
         return WsFrameAction::Forward;
     };
-    const u32 invalid[] = {0, kWsTerminateMessageCapacity + 1u, 0xffffffffu};
+    const u32 invalid[] = {0, kWsMaxMessageCapacity + 1u, 0xffffffffu};
     for (u32 size : invalid) {
         CHECK_FALSE(cfg.add_ws_terminate("/ws", 0, uid, handler, size));
         CHECK_EQ(cfg.route_count, 0u);

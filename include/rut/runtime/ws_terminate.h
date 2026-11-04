@@ -20,10 +20,13 @@ namespace rut {
 
 inline constexpr u32 kWsMaxCloseReasonBytes = kWsMaxControlPayload - 2;
 
+// Default remains the ordinary-slice payload budget. Explicit larger limits
+// use existing bulk storage; reserve the worst-case masked frame header.
 inline constexpr u32 kWsTerminateMessageCapacity = SlicePool::kSliceSize - kWsMaxHeaderSize;
+inline constexpr u32 kWsMaxMessageCapacity = SlicePool::kBulkSliceSize - kWsMaxHeaderSize;
 
 constexpr bool ws_valid_message_capacity(u32 size) {
-    return size != 0 && size <= kWsTerminateMessageCapacity;
+    return size != 0 && size <= kWsMaxMessageCapacity;
 }
 
 enum class WsJsonStringMatch : u8 { Equal, Prefix, Suffix, Contains };

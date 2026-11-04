@@ -684,7 +684,7 @@ struct ConnectionBase {
     bool ws_session_started = false;
     bool ws_session_close_notified = false;
     WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
-    u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
+    u32 ws_max_message_size;        // configured bounded payload size
     const WsTextRewrite* ws_forward_texts = nullptr;
     u32 ws_forward_text_count = 0;
     WsHandlerOutput ws_handler_output{};
@@ -718,8 +718,37 @@ struct ConnectionBase {
     u8* ws_u2c_msg = nullptr;  // upstream->client reassembly slice
     u8* ws_c2u_out = nullptr;  // client->upstream output, retained until send completion
     u8* ws_u2c_out = nullptr;  // upstream->client output, retained until send completion
-    u32 ws_c2u_consumed;       // recv_buf bytes consumed by the in-flight c->u send
-    u32 ws_u2c_consumed;       // upstream_recv_buf bytes consumed by the in-flight u->c send
+    u32 ws_buffer_capacity() const {
+        return ws_max_message_size > kWsTerminateMessageCapacity ? SlicePool::kBulkSliceSize
+                                                                 : SlicePool::kSliceSize;
+    }
+    bool alloc_ws_buffers(SlicePool& pool) {
+        if (ws_max_message_size > kWsMaxMessageCapacity) return false;
+        const u32 kCapacity = ws_buffer_capacity();
+        if (ws_c2u_msg || ws_u2c_msg || ws_c2u_out || ws_u2c_out)
+            return ws_c2u_msg && ws_u2c_msg && ws_c2u_out && ws_u2c_out &&
+                   pool.capacity_of(ws_c2u_msg) == kCapacity &&
+                   pool.capacity_of(ws_u2c_msg) == kCapacity &&
+                   pool.capacity_of(ws_c2u_out) == kCapacity &&
+                   pool.capacity_of(ws_u2c_out) == kCapacity;
+        // These allocations become mutable reassembly and asynchronous send storage.
+        // NOLINTNEXTLINE(misc-const-correctness)
+        u8* buffers[4]{};
+        for (u32 i = 0; i < 4; ++i) {
+            buffers[i] = kCapacity == SlicePool::kSliceSize ? pool.alloc() : pool.alloc_bulk();
+            if (!buffers[i]) {
+                for (u32 j = 0; j < i; ++j) pool.free(buffers[j]);
+                return false;
+            }
+        }
+        ws_c2u_msg = buffers[0];
+        ws_u2c_msg = buffers[1];
+        ws_c2u_out = buffers[2];
+        ws_u2c_out = buffers[3];
+        return true;
+    }
+    u32 ws_c2u_consumed;  // recv_buf bytes consumed by the in-flight c->u send
+    u32 ws_u2c_consumed;  // upstream_recv_buf bytes consumed by the in-flight u->c send
     // Each leg tracks Close send completion independently of peer acknowledgement.
     // After local initiation only closing controls are processed; application
     // callbacks stop. The original shutdown deadline also bounds acknowledgement.

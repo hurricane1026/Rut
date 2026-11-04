@@ -1299,7 +1299,7 @@ struct HirWsHandler {
     u16 close_code = 1000;
     u32 close_reason_expr = 0xffffffffu;  // decoded literal in HirRoute.exprs, or absent
     // `maxMessageSize:` kwarg in bytes (0 = omitted → the loader uses the engine default). The
-    // explicit values are validated against the single-slice payload capacity.
+    // explicit values are validated against the bounded bulk payload capacity.
     u32 max_message_size = 0;
     Str subprotocol{};  // decoded, validated required offer; empty means no policy
     u32 upstream_index = 0;

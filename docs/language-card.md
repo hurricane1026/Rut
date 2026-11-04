@@ -1164,7 +1164,7 @@ return websocket(chat) { message in
 
 // Fixed text replacement in the final verdict or a guard branch. Empty literals
 // emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
-// and the single-slice cap. Runtime scalar expressions are supported below; interpolation is not.
+// and the bounded storage cap. Runtime scalar expressions are supported below; interpolation is not.
 return websocket(chat, maxMessageSize: 4kb) { message in
     guard message.fromClient && message.isText else { message.forward() }
     message.forward("message replaced")
@@ -1195,11 +1195,12 @@ return websocket(chat) { message in
 // emits an empty Binary. Bare forward() still preserves the original message kind.
 // Callback-local Bytes values and pure helper results may select a different payload.
 // Request-borrowed output, slicing and byte concatenation remain unsupported.
-// Reassembly/output must fit maxMessageSize and the existing single-slice cap.
+// Reassembly/output must fit maxMessageSize and the bounded storage cap.
 
 // Terminate mode defaults to 16370 bytes (16 KiB slice minus the maximum 14-byte
-// WebSocket header). Explicit `maxMessageSize` values must be 1b through 16370b;
-// values such as 16kb or 64kb are rejected because larger-message buffering is not implemented.
+// WebSocket header). Explicit `maxMessageSize` accepts 1b through 262130b, including
+// 16kb and 64kb. Limits above 16370 bytes reserve four 256 KiB bulk buffers per
+// connection; allocation failure closes the session without lowering its limit.
 
 // Add fixed UTF-8 affixes around one complete Text message, using String +.
 // Parentheses, concatenated literals, and compile-time-known route let strings
@@ -1207,7 +1208,7 @@ return websocket(chat) { message in
 // This specialized + form requires non-optional operands and fixed literal affixes.
 // At most one message.text reference may appear; repeated references/interpolation reject.
 // Binary input may become Text when its complete payload is valid UTF-8.
-// The complete rewritten output must fit maxMessageSize and the single-slice cap.
+// The complete rewritten output must fit maxMessageSize and the bounded storage cap.
 let label = "audit:"
 return websocket(chat, maxMessageSize: 4kb) { message in
     guard message.isText else { message.forward() }

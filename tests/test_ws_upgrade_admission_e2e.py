@@ -42,10 +42,17 @@ UNSOLICITED_PROTOCOL_RESPONSE = (
 )
 
 
+def wire_frame(opcode, payload, masked=False, fin=True):
+    key = b"\x12\x34\x56\x78" if masked else b""
+    size = len(payload)
+    length = bytes((size,)) if size < 126 else (b"\x7e" + size.to_bytes(2, "big") if size <= 65535 else b"\x7f" + size.to_bytes(8, "big"))
+    header = bytes(((0x80 if fin else 0) | opcode, length[0] | (0x80 if masked else 0))) + length[1:]
+    body = bytes(value ^ key[index & 3] for index, value in enumerate(payload)) if masked else payload
+    return header + key + body
+
+
 def masked_frame(opcode, payload):
-    key = b"\x12\x34\x56\x78"
-    masked = bytes(value ^ key[index & 3] for index, value in enumerate(payload))
-    return bytes((0x80 | opcode, 0x80 | len(payload))) + key + masked
+    return wire_frame(opcode, payload, masked=True)
 
 
 GENERAL_JSON_DECLARATIONS = r"""
@@ -1776,9 +1783,17 @@ def recv_exact(sock, length):
 
 def recv_client_frame(sock):
     first, second = recv_exact(sock, 2)
-    if second & 0x7F >= 126:
-        raise AssertionError("short test frame unexpectedly used an extended length")
     length = second & 0x7F
+    if length == 126:
+        length = int.from_bytes(recv_exact(sock, 2), "big")
+        if length < 126:
+            raise AssertionError("noncanonical 16-bit frame length")
+    elif length == 127:
+        length = int.from_bytes(recv_exact(sock, 8), "big")
+        if length <= 65535:
+            raise AssertionError("noncanonical 64-bit frame length")
+    if length > 1024 * 1024:
+        raise AssertionError("test peer advertised an unbounded frame")
     mask_key = recv_exact(sock, 4) if second & 0x80 else b""
     payload = bytearray(recv_exact(sock, length))
     if mask_key:
@@ -2371,7 +2386,7 @@ def tls_passthrough_scenario(server, backend_kind):
     return "pass", ""
 
 
-def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False, closing=False, client_notify=False, lifecycle=False):
+def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False, closing=False, client_notify=False, lifecycle=False, bulk=False, dynamic=False):
     cert = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_cert.pem")
     key = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_key.pem")
     backend = socket.socket()
@@ -2392,6 +2407,11 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
     if lifecycle:
         source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
                   + LIFECYCLE_DECLARATIONS + '\nroute GET "/ws" { ' + LIFECYCLE_HANDLER + '}\n')
+    if bulk:
+        source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+                  + (BULK_DYNAMIC_DECLARATIONS if dynamic else '')
+                  + '\nroute GET "/ws" { '
+                  + (BULK_DYNAMIC_HANDLER if dynamic else BULK_HANDLER) + '}\n')
     with tempfile.TemporaryDirectory(prefix="rut-ws-tls-terminate-") as temp:
         path = os.path.join(temp, "route.rut")
         with open(path, "w", encoding="utf-8") as route_file:
@@ -2434,7 +2454,7 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
             clients.remove(invalid_client)
 
             raw = socket.create_connection(("127.0.0.1", port), timeout=3)
-            valid_client = context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=not (closing or lifecycle))
+            valid_client = context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=not (closing or lifecycle or bulk))
             clients.append(valid_client)
             valid_client.sendall(REQUEST)
             peer, _ = backend.accept()
@@ -2445,7 +2465,9 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
             response = recv_http_response(valid_client)
             if not response.startswith(b"HTTP/1.1 101"):
                 raise AssertionError(f"TLS valid terminate handshake failed: {response!r}")
-            if lifecycle:
+            if bulk:
+                bulk_exchange(dynamic)(valid_client, peer)
+            elif lifecycle:
                 lifecycle_exchange(valid_client, peer)
             elif connection_context:
                 connection_exchange(valid_client, peer, b"tls:")
@@ -2712,6 +2734,61 @@ def subprotocol_scenario(server, backend_kind):
     return "pass", ""
 
 
+BULK_HANDLER = "return websocket(ws, maxMessageSize: 262130b) { msg in msg.forward() }"
+BULK_DYNAMIC_DECLARATIONS = r'''func chosen(_ bytes: Bytes, _ text: str) -> Bytes {
+ let unused = sha256(text)
+ bytes
+}
+'''
+BULK_DYNAMIC_HANDLER = "return websocket(ws, maxMessageSize: 262130b) { msg in msg.forward(chosen(msg.payload, msg.text)) }"
+
+
+def bulk_exchange(dynamic=False, stress=False):
+    def exchange(client, peer):
+        def expect(sock, opcode, body, masked):
+            actual = recv_client_frame(sock)
+            if actual != (opcode, body, masked):
+                raise AssertionError(f"bulk frame changed: opcode={actual[0]} bytes={len(actual[1])} expected={len(body)}")
+        text = b"a" * 16383 + "€".encode() + b"b" * (262130 - 16386)
+        binary = bytes(range(256)) * 256
+        # The 81907-byte payload also leaves a one-byte TLS plaintext tail
+        # after five full records when the frame header is split below.
+        for opcode, payload in ((2, binary), (2, b"x" * 81907), (1, text)):
+            frame = masked_frame(opcode, payload)
+            client.sendall(frame[:5])
+            time.sleep(0.01)
+            client.sendall(frame[5:])
+            expect(peer, 2 if dynamic else opcode, payload, True)
+            peer.sendall(wire_frame(opcode, payload))
+            expect(client, 2 if dynamic else opcode, payload, False)
+        client.sendall(wire_frame(1, text[:16384], masked=True, fin=False)
+                       + masked_frame(9, b"inside")
+                       + wire_frame(0, text[16384:65537], masked=True, fin=False)
+                       + wire_frame(0, text[65537:], masked=True))
+        expect(peer, 9, b"inside", True)
+        peer.sendall(wire_frame(10, b"inside"))
+        expect(peer, 2 if dynamic else 1, text, True)
+        expect(client, 10, b"inside", False)
+        if stress:
+            # Leave the destination unread while enough data is queued to make
+            # nonblocking send/receive progress independent of application reads.
+            for sender, receiver, masked in ((client, peer, True), (peer, client, False)):
+                receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)
+                frames = [bytes((index,)) + b"z" * (262130 - 1) for index in range(12)]
+                sender.sendall(b"".join(wire_frame(2, body, masked=masked) for body in frames))
+                time.sleep(0.05)
+                for body in frames:
+                    expect(receiver, 2, body, masked)
+        client.sendall(masked_frame(8, b"\x03\xe8"))
+        expect(peer, 8, b"\x03\xe8", True)
+        expect(client, 8, b"\x03\xe8", False)
+        peer.sendall(wire_frame(8, b"\x03\xe8"))
+        if client.recv(1) != b"":
+            raise AssertionError("bulk session did not finish closing")
+    exchange.__name__ = f"bulk_dynamic={dynamic}_stress={stress}"
+    return exchange
+
+
 CLOSING_HANDLER = 'return websocket(ws) { msg in msg.close(1008, "policy") }'
 
 LIFECYCLE_DECLARATIONS = r'''let sessions = Cache<IP, i64>(capacity: 64)
@@ -2968,6 +3045,27 @@ def main():
                     if status != "pass":
                         raise AssertionError(f"callback scope: {details}")
                     print(f"PASS {backend} {exchange.__name__} native={native}")
+        for dynamic in (False, True):
+            handler = BULK_DYNAMIC_HANDLER if dynamic else BULK_HANDLER
+            declarations = BULK_DYNAMIC_DECLARATIONS if dynamic else ''
+            for native in (False, True):
+                for tls in (False, True):
+                    if native:
+                        status, details = native_binary_source_removal_scenario(
+                            args.server, args.compiler, backend, handler,
+                            bulk_exchange(dynamic), declarations, tls=tls)
+                    elif tls:
+                        status, details = tls_terminate_handshake_scenario(
+                            args.server, backend, bulk=True, dynamic=dynamic)
+                    else:
+                        status, details = binary_replacement_scenario(
+                            args.server, backend, handler, bulk_exchange(dynamic), declarations)
+                    print(f"{status.upper()} {backend} bulk native={native} TLS={tls} dynamic={dynamic}: {details}")
+        for tls in (False, True):
+            status, details = native_binary_source_removal_scenario(
+                args.server, args.compiler, backend, BULK_HANDLER,
+                bulk_exchange(stress=True), tls=tls)
+            print(f"{status.upper()} {backend} bulk backpressure TLS={tls}: {details}")
         for native in (False, True):
             handler = CONNECTION_HANDLER.replace("websocket(ws)", 'websocket(ws, subprotocol: "chat")')
             request = REQUEST[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n"

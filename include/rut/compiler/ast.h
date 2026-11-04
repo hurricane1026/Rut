@@ -254,8 +254,8 @@ struct AstStatement {
     Str name{};
     bool bind_value = false;
     // WsTerminate only: the `maxMessageSize:` kwarg in bytes (`websocket(x, maxMessageSize: 8kb)`),
-    // 0 when omitted (the loader then uses the engine default); explicit values fit one slice.
-    // Carried to HirWsHandler.
+    // 0 when omitted (the loader then uses the engine default); explicit values fit bounded pool
+    // storage. Carried to HirWsHandler.
     AstStatement* ws_open_body = nullptr;
     AstStatement* ws_close_body = nullptr;
     Str ws_open_parameter{};

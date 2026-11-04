@@ -655,45 +655,62 @@ TEST(websocket, half_close_deadline_is_one_shot_and_normal_drain_reclaims_slot) 
 }
 
 TEST(websocket, async_deadline_retains_output_until_target_and_cancel_retire) {
-    MmapLoopOwner<EventLoop<AsyncMockBackend>> owner;
-    REQUIRE(owner.loop != nullptr);
-    auto* loop = owner.loop;
-    REQUIRE(loop->init(0, -1, 0, 64).has_value());
-    owner.mark_initialized();
-    auto* conn = loop->alloc_conn();
-    REQUIRE(conn != nullptr);
-    REQUIRE(loop->alloc_ws_terminate_bufs(*conn));
-    const u8* const kOutput = conn->ws_c2u_out;
-    REQUIRE(kOutput != nullptr);
-    REQUIRE(loop->submit_send(*conn, kOutput, 16));
-    CHECK_EQ(conn->pending_ops, 1u);
-    conn->is_ws_tunnel = true;
-    conn->ws_shutdown_deadline_armed = true;
-    loop->timer.add(conn, kWsShutdownDrainTimeoutSeconds);
-    const u32 kConnId = conn->id;
+    constexpr u32 kLimits[] = {kWsTerminateMessageCapacity, kWsMaxMessageCapacity};
+    constexpr bool kOrders[] = {false, true};
+    for (u32 limit : kLimits) {
+        for (bool cancel_first : kOrders) {
+            MmapLoopOwner<EventLoop<AsyncMockBackend>> owner;
+            REQUIRE(owner.loop != nullptr);
+            auto* loop = owner.loop;
+            REQUIRE(loop->init(0, -1, 0, 64).has_value());
+            owner.mark_initialized();
+            auto* conn = loop->alloc_conn();
+            REQUIRE(conn != nullptr);
+            const u32 kBulkBefore = loop->pool.bulk_available();
+            conn->ws_max_message_size = limit;
+            REQUIRE(loop->alloc_ws_terminate_bufs(*conn));
+            u8* const kOutput = conn->ws_c2u_out;
+            REQUIRE(kOutput != nullptr);
+            const u32 kLength = limit + kWsMaxHeaderSize;
+            kOutput[0] = 0x5a;
+            kOutput[kLength - 1] = 0xa5;
+            CHECK_EQ(loop->pool.is_bulk(kOutput), limit > kWsTerminateMessageCapacity);
+            REQUIRE(loop->submit_send(*conn, kOutput, kLength));
+            CHECK_EQ(conn->pending_ops, 1u);
+            conn->is_ws_tunnel = true;
+            conn->ws_shutdown_deadline_armed = true;
+            loop->timer.add(conn, kWsShutdownDrainTimeoutSeconds);
+            const u32 kConnId = conn->id;
 
-    loop->dispatch(
-        make_ev(0, IoEventType::Timeout, static_cast<i32>(kWsShutdownDrainTimeoutSeconds + 1)));
-    CHECK_EQ(conn->fd, -1);
-    CHECK_EQ(conn->pending_ops, 2u);  // send target + close cancel
-    CHECK_EQ(conn->ws_c2u_out, kOutput);
-    CHECK_EQ(loop->active_count(), 1u);
-    CHECK_EQ(loop->backend.count_ops(MockOp::Cancel), 1u);
-
-    // The target and its cancellation can retire in either order. The output
-    // slice and slot stay owned until the final completion.
-    loop->dispatch(make_ev(kConnId, IoEventType::Send, 16));
-    CHECK_EQ(conn->pending_ops, 1u);
-    CHECK_EQ(conn->ws_c2u_out, kOutput);
-    CHECK_EQ(loop->active_count(), 1u);
-    loop->dispatch(make_ev(kConnId, IoEventType::Send, -ECANCELED));
-    CHECK_EQ(loop->active_count(), 0u);
-    CHECK_EQ(conn->ws_c2u_out, nullptr);
-    auto* reused = loop->alloc_conn();
-    REQUIRE(reused != nullptr);
-    CHECK_EQ(reused->id, kConnId);
-    CHECK_FALSE(reused->ws_shutdown_deadline_armed);
-    loop->free_conn(*reused);
+            loop->dispatch(make_ev(
+                0, IoEventType::Timeout, static_cast<i32>(kWsShutdownDrainTimeoutSeconds + 1)));
+            CHECK_EQ(conn->fd, -1);
+            CHECK_EQ(conn->pending_ops, 2u);
+            CHECK_EQ(conn->ws_c2u_out, kOutput);
+            CHECK_EQ(loop->active_count(), 1u);
+            CHECK_EQ(loop->backend.count_ops(MockOp::Cancel), 1u);
+            // The parser's CPU storage is free, while both outputs remain owned.
+            if (limit > kWsTerminateMessageCapacity)
+                CHECK_EQ(loop->pool.bulk_available(), kBulkBefore - 2u);
+            loop->dispatch(make_ev(
+                kConnId, IoEventType::Send, cancel_first ? -ECANCELED : static_cast<i32>(kLength)));
+            CHECK_EQ(conn->pending_ops, 1u);
+            CHECK_EQ(conn->ws_c2u_out, kOutput);
+            CHECK_EQ(loop->active_count(), 1u);
+            CHECK_EQ(kOutput[0], 0x5au);
+            CHECK_EQ(kOutput[kLength - 1], 0xa5u);
+            loop->dispatch(make_ev(
+                kConnId, IoEventType::Send, cancel_first ? static_cast<i32>(kLength) : -ECANCELED));
+            CHECK_EQ(loop->active_count(), 0u);
+            CHECK_EQ(conn->ws_c2u_out, nullptr);
+            CHECK_EQ(loop->pool.bulk_available(), kBulkBefore);
+            auto* reused = loop->alloc_conn();
+            REQUIRE(reused != nullptr);
+            CHECK_EQ(reused->id, kConnId);
+            CHECK_FALSE(reused->ws_shutdown_deadline_armed);
+            loop->free_conn(*reused);
+        }
+    }
 }
 
 TEST(legacy_loop, ws_shutdown_deadline_preempts_proxy_timeout) {
@@ -915,6 +932,37 @@ TEST(websocket, epoll_send_progress_does_not_extend_shutdown_deadline) {
     loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
     CHECK_EQ(conn->state, ConnState::Idle);
     CHECK_FALSE(conn->ws_shutdown_deadline_armed);
+}
+
+TEST(websocket, iouring_bulk_reads_keep_downstream_ring_and_bound_each_submission) {
+    MmapLoopOwner<IoUringEventLoop> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
+    if (!init_iouring_loop_with_retry(*loop, "WebSocket bounded receive", 64))
+        SKIP("io_uring unavailable");
+    owner.mark_initialized();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    SocketPairOwner pair;
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair.fds), 0);
+    conn->fd = pair.fds[0];
+    pair.fds[0] = -1;  // The connection owns this endpoint through shutdown.
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->ws_max_message_size = kWsMaxMessageCapacity;
+    const u32 kTail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    REQUIRE(loop->submit_recv_impl(*conn));
+    const auto& sqe = loop->backend.sq_entries[kTail & *loop->backend.sq_ring_mask];
+    CHECK_EQ(sqe.opcode, IORING_OP_RECV);
+    CHECK_EQ(sqe.len, kProvidedBufSize);
+    CHECK_EQ(sqe.buf_group, kBufGroupId);
+    CHECK_EQ(sqe.flags, IOSQE_BUFFER_SELECT);
+    CHECK_EQ(sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+    CHECK(conn->recv_armed);
+    CHECK_EQ(conn->pending_ops, 1u);
+    CHECK_FALSE(loop->backend.add_recv_once(conn->fd, conn->id, 0));
+    CHECK_FALSE(loop->backend.add_recv_once(-1, conn->id, 1));
+    CHECK_FALSE(loop->backend.add_recv_once(conn->fd, loop->connection_capacity, 1));
 }
 
 TEST(websocket, iouring_dispatch_expires_shutdown_deadline_before_http_yield) {

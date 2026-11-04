@@ -17,7 +17,7 @@ does not turn target syntax into supported syntax. The language card and
 - [ ] General bounded Text/Binary output with owned asynchronous send storage.
 - [x] Connection and close context with explicit callback/session lifetimes.
 - [ ] RFC 7692 compression negotiation and bounded encode/decode resources.
-- [ ] Bounded messages beyond a single I/O slice, backpressure and cancellation.
+- [x] Bounded messages beyond a single I/O slice, backpressure and cancellation.
 - [ ] Interoperability and malformed-input validation for both Linux backends,
   source/JIT and native programs, feature-disabled builds and sanitizer checks.
 - [ ] Review the complete diff, create a GitHub PR and leave it unmerged.
@@ -28,8 +28,7 @@ compile errors until their execution and lifetime rules have been implemented.
 
 Dynamic scalar Text/Bytes output and runtime close arguments now use shared IR.
 Results are copied into owned send storage; close reasons have separate drain
-storage, and backpressure is checked before the next callback. The current
-single-slice limit remains. General error and helper evaluation integration and
+storage, and backpressure is checked before the next callback. The configured message limit now reaches 262130 bytes using the existing bulk pool. General error and helper evaluation integration and
 string interpolation still need separate work; the broad criteria above remain
 open until those semantics and the remaining protocol resources are verified.
 
@@ -98,5 +97,13 @@ retirement. Only open can initiate closing; hooks cannot forward data or yield.
 AST/HIR ownership transfers, phase errors, linear sequential control flow and
 runtime ordering are exercised in `test_ws_lifecycle` and
 `test_ws_shutdown_deadline`. Source/native × epoll/io_uring wire tests observe
-hook effects through ordinary HTTP Cache reads, including TLS. RFC 7692 and
-messages beyond one slice remain required.
+hook effects through ordinary HTTP Cache reads, including TLS. RFC 7692 remains required.
+
+Explicit `maxMessageSize` values now accept 1 through 262130 bytes; the default
+remains 16370. Large routes atomically acquire four bulk message/output buffers,
+with no smaller-limit fallback. Both Linux backends stream ordinary I/O slices
+into complete-message storage. io_uring uses bounded reads while preserving
+its downstream ring and cancellation validation. Tests cover allocation rollback,
+whole-message callbacks, 64-bit wire lengths, UTF-8 across fragments, interleaved
+controls, deferred-send retirement and source/native × TLS × both backends.
+The end-to-end matrix now contains 310 passing cases; RFC 7692 is still open.

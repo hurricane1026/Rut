@@ -8693,10 +8693,11 @@ TEST(frontend, analyze_accepts_websocket_max_message_size_kwarg) {
     CHECK_EQ(hir->routes[0].ws_handler.max_message_size, 4096u);
 }
 
-TEST(frontend, websocket_max_message_size_accepts_single_slice_boundaries) {
-    const char* values[] = {"1b", "16370b"};
-    const u32 expected_sizes[] = {1, kWsTerminateMessageCapacity};
-    for (u32 i = 0; i < 2; i++) {
+TEST(frontend, websocket_max_message_size_accepts_slice_and_bulk_boundaries) {
+    const char* values[] = {"1b", "16370b", "16kb", "64kb", "262130b"};
+    const u32 expected_sizes[] = {
+        1, kWsTerminateMessageCapacity, 16384, 65536, kWsMaxMessageCapacity};
+    for (u32 i = 0; i < 5; i++) {
         std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws, ";
         source += "maxMessageSize: ";
         source += values[i];
@@ -8711,9 +8712,9 @@ TEST(frontend, websocket_max_message_size_accepts_single_slice_boundaries) {
     }
 }
 
-TEST(frontend, websocket_max_message_size_rejects_values_over_single_slice) {
-    constexpr Str kExpectedDetail = lit_str("single-slice maximum is 16370 bytes");
-    for (const char* value : {"16371b", "16kb", "64kb"}) {
+TEST(frontend, websocket_max_message_size_rejects_values_over_bulk_capacity) {
+    constexpr Str kExpectedDetail = lit_str("maximum WebSocket message size is 262130 bytes");
+    for (const char* value : {"262131b", "256kb", "1mb"}) {
         std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws, ";
         source += "maxMessageSize: ";
         source += value;

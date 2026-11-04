@@ -451,7 +451,7 @@ bool emit_json_string_frame(u8* out,
         if (document.string(kId, decoded) && decoded.ok &&
             ws_valid_text_payload({document.scratch, decoded.len})) {
             const u64 kOutputSize = static_cast<u64>(prefix.len) + decoded.len + suffix.len;
-            if (kOutputSize <= kWsTerminateMessageCapacity &&
+            if (kOutputSize <= kWsMaxMessageCapacity &&
                 (max_size == 0 || kOutputSize <= max_size)) {
                 emitted = emit_frame(out,
                                      out_cap,
@@ -495,8 +495,7 @@ bool emit_json_number_text_frame(u8* out,
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::Number) {
         const Str kLexeme = document.raw(kId);
         const u64 kOutputSize = static_cast<u64>(prefix.len) + kLexeme.len + suffix.len;
-        if (kOutputSize <= kWsTerminateMessageCapacity &&
-            (max_size == 0 || kOutputSize <= max_size)) {
+        if (kOutputSize <= kWsMaxMessageCapacity && (max_size == 0 || kOutputSize <= max_size)) {
             emitted = emit_frame(out,
                                  out_cap,
                                  produced,
@@ -529,7 +528,7 @@ bool emit_json_stringify_frame(u8* out,
     u32 serialized_len = 0;
     if (!ws_json_stringify_to_workspace(document, payload, len, path, serialized_len)) return false;
     const u64 kOutputSize = static_cast<u64>(prefix.len) + serialized_len + suffix.len;
-    if (kOutputSize > kWsTerminateMessageCapacity || (max_size != 0 && kOutputSize > max_size))
+    if (kOutputSize > kWsMaxMessageCapacity || (max_size != 0 && kOutputSize > max_size))
         return false;
     return emit_frame(out,
                       out_cap,
@@ -569,7 +568,7 @@ bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
             ? (rewrite.prefix.ptr || rewrite.prefix.len == 0) &&
                   (rewrite.suffix.ptr || rewrite.suffix.len == 0)
             : ws_valid_text_payload(rewrite.prefix) && ws_valid_text_payload(rewrite.suffix);
-    return kSourceValid && literal_size <= kWsTerminateMessageCapacity &&
+    return kSourceValid && literal_size <= kWsMaxMessageCapacity &&
            (max_size == 0 || literal_size <= max_size) && kPayloadValid;
 }
 
@@ -659,7 +658,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             auto rewritten_size = [original_size, &st](const WsTextRewrite& rewrite) -> u64 {
                 if (rewrite.source == WsTextSource::Dynamic) {
                     const u64 kCap =
-                        st.max_message_size ? st.max_message_size : kWsTerminateMessageCapacity;
+                        st.max_message_size ? st.max_message_size : kWsMaxMessageCapacity;
                     return kCap > kWsMaxControlPayload ? kCap : kWsMaxControlPayload;
                 }
                 const u64 kSourceSize = rewrite.source == WsTextSource::JsonStringify
@@ -794,7 +793,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
         } else if (action == WsFrameAction::ForwardDynamic) {
             if ((published.opcode != WsOpcode::Text && published.opcode != WsOpcode::Binary) ||
                 (!published.payload.ptr && published.payload.len) ||
-                published.payload.len > kWsTerminateMessageCapacity ||
+                published.payload.len > kWsMaxMessageCapacity ||
                 (st.max_message_size && published.payload.len > st.max_message_size) ||
                 (published.opcode == WsOpcode::Text && !ws_valid_text_payload(published.payload)))
                 return WsInspectStatus::Error;
@@ -821,7 +820,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             if (rewrite.source == WsTextSource::Dynamic ||
                 !ws_valid_text_rewrite(rewrite, st.max_message_size) ||
                 (rewrite.source == WsTextSource::MessageText && !utf8_valid(msg_buf, total)) ||
-                kOutputSize > kWsTerminateMessageCapacity ||
+                kOutputSize > kWsMaxMessageCapacity ||
                 (st.max_message_size != 0 && kOutputSize > st.max_message_size))
                 return WsInspectStatus::Error;
             bool emitted = false;
@@ -986,8 +985,8 @@ WsClosingRead ws_read_closing(
             continue;  // unsolicited Pong has no reply
         }
         if ((header.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented ||
-            header.payload_len > kWsTerminateMessageCapacity ||
-            st.assembler.accumulated_len > kWsTerminateMessageCapacity - header.payload_len ||
+            header.payload_len > kWsMaxMessageCapacity ||
+            st.assembler.accumulated_len > kWsMaxMessageCapacity - header.payload_len ||
             (st.max_message_size &&
              (header.payload_len > st.max_message_size ||
               st.assembler.accumulated_len > st.max_message_size - header.payload_len)))

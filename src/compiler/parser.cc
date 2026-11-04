@@ -20,7 +20,7 @@ constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `patter
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
 constexpr Str kWsTrailingBlockDetail =
     lit_str("websocket trailing blocks require `{ name in ... }`");
-constexpr Str kWsMaxMessageSizeDetail = lit_str("single-slice maximum is 16370 bytes");
+constexpr Str kWsMaxMessageSizeDetail = lit_str("maximum WebSocket message size is 262130 bytes");
 constexpr Str kObjectCallArgDetail = lit_str("object literals are only allowed as call arguments");
 // The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
 // member names work); the parser rejects them in operator/operand positions.
@@ -3072,7 +3072,7 @@ struct Parser {
                     const u64 bytes = amount * mult;
                     if (bytes == 0 || bytes > 0xffffffffull)
                         return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
-                    if (bytes > kWsTerminateMessageCapacity) {
+                    if (bytes > kWsMaxMessageCapacity) {
                         const Span kValueSpan{num.value()->start,
                                               unit.value()->end,
                                               num.value()->line,
