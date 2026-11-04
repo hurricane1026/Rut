@@ -2944,8 +2944,13 @@ carrier; source-level integer operations or wire opcodes are not exposed.
 Message-phase lowering compares each domain's first-case predicate using the
 existing single-evaluation Boolean equality node. Complete messages have only
 Text/Binary kinds; Ping/Pong/Close/Continuation remain runtime protocol events.
-The old Boolean properties remain supported. Contextual case inference and
-closed-case exhaustive matching are not part of this projection support.
+The old Boolean properties remain supported. Ordinary `match` accepts both
+fully qualified cases and contextual `.case` patterns for these closed domains,
+in helpers, HTTP routes and message callbacks. An unguarded complete pair or
+wildcard is required where ordinary match requires exhaustiveness. Duplicate
+cases, cross-domain cases, payload patterns and integer/Boolean substitutions
+are rejected. The matched value retains nominal typing; a reached resource
+producer in a lexical helper/callback selector runs once.
 
 General message callbacks retain lexical bindings through ordinary pure helper
 inlining. Reached helper local/guard producers and actual arguments run once,

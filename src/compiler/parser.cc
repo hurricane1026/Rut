@@ -609,7 +609,7 @@ struct Parser {
         block.span = span_from(lbrace_tok);
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
             AstStatement st{};
-            if (cur().type == TokenType::KwLet) {
+            if (cur().type == TokenType::KwLet || cur().type == TokenType::KwMatch) {
                 auto binding = parse_stmt();
                 if (!binding) return core::make_unexpected(binding.error());
                 st = binding.value();

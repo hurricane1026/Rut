@@ -50,3 +50,7 @@ evaluation in general callbacks, including unused resource producers and ordered
 arguments. Common String concatenation/predicates use shared IR and bounded
 owned arena storage. Error/effect/yield integration, interpolation and the broader
 protocol/resource criteria above remain open.
+
+Closed message-kind/direction domains now use ordinary match analysis, including
+contextual case patterns and coverage checks shared with helpers/HTTP routes.
+Lexical helper/callback match selectors retain reached single evaluation.

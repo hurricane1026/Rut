@@ -340,6 +340,56 @@ def string_helper_exchange(client, peer):
     expect(peer, (8, b"\x03\xf1", True))
 
 
+NOMINAL_MATCH_DECLARATIONS = r"""
+func kindName(_ kind: WebSocketMessageKind) -> str {
+    match kind {
+        .text => "T"
+        .binary => "B"
+    }
+}
+func directionName(_ direction: WebSocketDirection) -> str {
+    match direction {
+        .clientToUpstream => "client"
+        .upstreamToClient => "server"
+    }
+}
+func classified(_ text: str) -> WebSocketMessageKind {
+    let unused = sha256(text)
+    if text == "t" { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+"""
+NOMINAL_MATCH_HANDLER = r"""
+return websocket(ws) { msg in
+    match classified(msg.text) {
+        .text => msg.forward(directionName(msg.direction) + kindName(msg.kind) + "T")
+        .binary => msg.forward(directionName(msg.direction) + kindName(msg.kind) + "B")
+    }
+}
+"""
+
+
+def nominal_match_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"nominal match: {actual=!r}, {expected=!r}")
+
+    client.sendall(masked_frame(1, b"t") + masked_frame(2, b"\xff"))
+    expect(peer, (1, b"clientTT", True))
+    expect(peer, (1, b"clientBB", True))
+    fragment = bytearray(masked_frame(2, b""))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"PING") + masked_frame(0, b"t"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"clientBT", True))
+    peer.sendall(b"\x81\x01t\x82\x01t\x81\x00")
+    expect(client, (1, b"serverTT", False))
+    expect(client, (1, b"serverBT", False))
+    expect(client, (1, b"serverTB", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
 EAGER_BINDING_DECLARATIONS = r"""
 func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
 """
@@ -2365,6 +2415,7 @@ def main():
                 (JSON_LIFETIME_HANDLER, json_lifetime_exchange, ""),
                 (HASH_OUTPUT_HANDLER, hash_output_exchange, ""),
                 (STRING_HELPER_HANDLER, string_helper_exchange, STRING_HELPER_DECLARATIONS),
+                (NOMINAL_MATCH_HANDLER, nominal_match_exchange, NOMINAL_MATCH_DECLARATIONS),
                 (DYNAMIC_OUTPUT_HANDLER, dynamic_output_exchange, DYNAMIC_OUTPUT_DECLARATIONS),
                 (DYNAMIC_BOUND_HANDLER, dynamic_bound_exchange, ""),
                 (DYNAMIC_UTF8_HANDLER, dynamic_utf8_exchange, ""),

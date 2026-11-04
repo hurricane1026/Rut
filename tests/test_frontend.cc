@@ -8,6 +8,7 @@
 #include "fixtures/ws_general_regex.h"
 #include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_helper_lexical.h"
+#include "fixtures/ws_nominal_match.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
@@ -46849,5 +46850,65 @@ route GET "/" { return websocket(ws) { msg in msg.close(1008, join(")rut";
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_closed_domains_share_exhaustive_match_analysis) {
+    const char* bodies[] = {
+        "match msg.kind { .text => msg.forward()\n .binary => msg.drop() }",
+        "match msg.direction { .clientToUpstream => msg.forward()\n .upstreamToClient => "
+        "msg.drop() "
+        "}",
+        "match msg.kind { WebSocketMessageKind.text => msg.forward() _ => msg.drop() }",
+        "guard permitted(msg.kind) else { msg.drop() } msg.forward()",
+        "guard directionCode(msg.direction) == 1 else { msg.drop() } msg.forward()",
+        "match msg.kind { .text => msg.forward() }",
+        "match msg.kind { .text => msg.forward()\n .text => msg.drop()\n .binary => msg.drop() }",
+        "match msg.kind { .text => msg.forward()\n .upstreamToClient => msg.drop() }",
+        "match msg.kind { WebSocketDirection.clientToUpstream => msg.forward() _ => msg.drop() }",
+        "match msg.kind { 0 => msg.forward() 1 => msg.drop() }",
+        "match msg.kind { .text(1) => msg.forward() _ => msg.drop() }",
+        "match msg.direction { .clientToUpstream => msg.forward() }",
+    };
+    for (u32 i = 0; i < sizeof(bodies) / sizeof(bodies[0]); ++i) {
+        std::string source = R"rut(upstream ws
+func permitted(_ kind: WebSocketMessageKind) -> bool {
+    match kind { WebSocketMessageKind.text => true
+ WebSocketMessageKind.binary => false }
+}
+func directionCode(_ direction: WebSocketDirection) -> i32 {
+    match direction { .clientToUpstream => 1
+ .upstreamToClient => 2 }
+}
+route GET "/" { return websocket(ws) { msg in )rut";
+        source += bodies[i];
+        source += " } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto analyzed = analyze_file_heap(ast.value());
+        CHECK_EQ(analyzed.has_value(), i < 5);
+        if (analyzed && analyzed->routes[0].ws_handler.general_body_expr != 0xffffffffu)
+            check_general_ws_rir(analyzed.value(), _tc);
+    }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_nominal_match_binders_survive_owning_ast_and_hir_copies) {
+    auto tokens = lex(lit(test::ws_nominal_match::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto ast_copy = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*ast_copy);
+    REQUIRE(hir);
+    ast_copy.reset();
+    auto copy = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    check_general_ws_rir(*copy, _tc);
 }
 #endif

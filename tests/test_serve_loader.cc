@@ -8,6 +8,8 @@
 #include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_helper_lexical.h"
 #include "fixtures/ws_helper_observables.h"
+#include "fixtures/ws_nominal_match.h"
+#include "fixtures/ws_nominal_selector.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 // Tests for the .rut program loader (src/serve_loader.cc): the bridge that
@@ -9762,6 +9764,31 @@ TEST(serve_loader, websocket_helpers_and_arguments_evaluate_reached_producers_on
     REQUIRE(load_rut_program(path.c_str(), program, err));
     REQUIRE_EQ(unlink(path.c_str()), 0);
     test::ws_helper_lexical::check(program.config, _tc);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_nominal_matches_keep_owned_outputs_and_single_subject_evaluation) {
+    auto path = write_file("/tmp/rut_ws_nominal_match", "app.rut", test::ws_nominal_match::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_nominal_match::check(_tc, program.config);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_nominal_match_selector_is_not_elided_or_repeated) {
+    auto path =
+        write_file("/tmp/rut_ws_nominal_selector", "app.rut", test::ws_nominal_selector::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_nominal_selector::check(_tc, program.config);
     program.destroy();
 }
 #endif

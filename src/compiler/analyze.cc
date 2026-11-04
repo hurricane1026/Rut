@@ -5578,12 +5578,47 @@ static bool is_standard_error_field(Str field_name) {
            field_name.eq({"func", 4}) || field_name.eq({"line", 4});
 }
 
+// Bool and the two closed WebSocket domains have exactly two scalar cases.
+// Keep nominal types through analysis; MIR uses their existing scalar carrier.
+static bool is_match_pattern(const HirExpr& pattern) {
+    return pattern.kind == HirExprKind::BoolLit || pattern.kind == HirExprKind::IntLit ||
+           pattern.kind == HirExprKind::StrLit || pattern.kind == HirExprKind::VariantCase ||
+           (pattern.kind == HirExprKind::ConstWsCase && is_ws_enum_type(pattern.type) &&
+            pattern.int_value >= 0 && pattern.int_value <= 1);
+}
+static bool is_binary_match_case(const HirExpr& pattern) {
+    return pattern.kind == HirExprKind::BoolLit || pattern.kind == HirExprKind::ConstWsCase;
+}
+static bool binary_match_case_value(const HirExpr& pattern) {
+    return pattern.kind == HirExprKind::BoolLit ? pattern.bool_value : pattern.int_value != 0;
+}
+
 static FrontendResult<HirExpr> analyze_match_pattern(const AstExpr& pattern_expr,
                                                      const HirExpr& subject,
                                                      HirRoute* route,
                                                      const HirModule& mod,
                                                      const HirLocal* locals,
                                                      u32 local_count) {
+#if RUT_ENABLE_WEBSOCKET
+    if (pattern_expr.kind == AstExprKind::VariantCase && is_ws_enum_type(subject.type)) {
+        const bool kKind = subject.type == HirTypeKind::WebSocketMessageKind;
+        const Str kDomain = kKind ? lit_str("WebSocketMessageKind") : lit_str("WebSocketDirection");
+        if (pattern_expr.lhs || (pattern_expr.name.len && !pattern_expr.name.eq(kDomain)))
+            return frontend_error(FrontendError::UnsupportedSyntax, pattern_expr.span);
+        const bool kFirst =
+            pattern_expr.str_value.eq(kKind ? lit_str("text") : lit_str("clientToUpstream"));
+        const bool kSecond =
+            pattern_expr.str_value.eq(kKind ? lit_str("binary") : lit_str("upstreamToClient"));
+        if (!kFirst && !kSecond)
+            return frontend_error(FrontendError::UnsupportedSyntax, pattern_expr.span);
+        HirExpr result{};
+        result.kind = HirExprKind::ConstWsCase;
+        result.type = subject.type;
+        result.span = pattern_expr.span;
+        result.int_value = kFirst ? 0 : 1;
+        return result;
+    }
+#endif
     if (pattern_expr.kind == AstExprKind::VariantCase) {
         const bool subject_is_error_kind = subject.type != HirTypeKind::Variant &&
                                            subject.may_error &&
@@ -6966,11 +7001,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             if (!pattern) return core::make_unexpected(pattern.error());
 
             bool matched = false;
-            if (pattern->kind == HirExprKind::BoolLit && subject_value.type == HirTypeKind::Bool) {
-                matched = pattern->bool_value == subject_value.bool_value;
-            } else if (pattern->kind == HirExprKind::IntLit &&
-                       subject_value.type == HirTypeKind::I32) {
+            if ((pattern->kind == HirExprKind::ConstWsCase && pattern->type == subject_value.type &&
+                 is_ws_enum_type(subject_value.type)) ||
+                (pattern->kind == HirExprKind::IntLit && subject_value.type == HirTypeKind::I32)) {
                 matched = pattern->int_value == subject_value.int_value;
+            } else if (pattern->kind == HirExprKind::BoolLit &&
+                       subject_value.type == HirTypeKind::Bool) {
+                matched = binary_match_case_value(pattern.value()) == subject_value.bool_value;
             } else if (pattern->kind == HirExprKind::StrLit &&
                        subject_value.type == HirTypeKind::Str) {
                 matched = pattern->str_value.eq(subject_value.str_value);
@@ -7017,6 +7054,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             return frontend_error(
                 FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
 
+        LexicalCallArguments match_subject{scratch, {}};
+        auto bound_subject = match_subject.bind(subject.value());
+        if (!bound_subject) return core::make_unexpected(bound_subject.error());
         if (!scratch->exprs.push(subject.value()))
             return frontend_error(FrontendError::OutOfMemory, stmt.span);
         const HirExpr* subject_ptr = &scratch->exprs[scratch->exprs.len - 1];
@@ -7130,8 +7170,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             auto pattern =
                 analyze_function_match_pattern(*arm.pattern, subject.value(), locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
-            if (pattern->kind != HirExprKind::BoolLit && pattern->kind != HirExprKind::IntLit &&
-                pattern->kind != HirExprKind::StrLit && pattern->kind != HirExprKind::VariantCase)
+            if (!is_match_pattern(pattern.value()))
                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
             if (pattern->type != subject->type)
                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
@@ -7147,13 +7186,14 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     seen_variant_cases[case_index] = true;
                     seen_variant_case_count++;
                 }
-            } else if (pattern->type == HirTypeKind::Bool) {
-                bool& seen_bool_case = pattern->bool_value ? seen_bool_true : seen_bool_false;
-                if (seen_bool_case && !arm.has_guard)
+            } else if (pattern->type == HirTypeKind::Bool || is_ws_enum_type(pattern->type)) {
+                const bool kSeenBoolCase =
+                    binary_match_case_value(pattern.value()) ? seen_bool_true : seen_bool_false;
+                if (kSeenBoolCase && !arm.has_guard)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                if (pattern->bool_value && !seen_bool_case)
+                if (binary_match_case_value(pattern.value()) && !kSeenBoolCase)
                     seen_bool_true = true;
-                else if (!pattern->bool_value && !seen_bool_case)
+                else if (!binary_match_case_value(pattern.value()) && !kSeenBoolCase)
                     seen_bool_false = true;
             }
 
@@ -7210,15 +7250,16 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         if (!seen_wildcard) {
             if (seen_guarded_arm)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-            if (subject->type == HirTypeKind::Bool && seen_bool_true && seen_bool_false)
-                return result;
+            if ((subject->type == HirTypeKind::Bool || is_ws_enum_type(subject->type)) &&
+                seen_bool_true && seen_bool_false)
+                return match_subject.finish(result);
             if (subject->type != HirTypeKind::Variant)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             const auto& variant = mod.variants[subject->variant_index];
             if (seen_variant_case_count != variant.cases.len)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
         }
-        return result;
+        return match_subject.finish(result);
     }
 
     if (stmt.kind == AstStmtKind::Block) {
@@ -15233,11 +15274,13 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 *inner_arm.pattern, subject.value(), route, mod, locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
             bool matched = false;
-            if (pattern->kind == HirExprKind::BoolLit && subject_value.type == HirTypeKind::Bool) {
-                matched = pattern->bool_value == subject_value.bool_value;
-            } else if (pattern->kind == HirExprKind::IntLit &&
-                       subject_value.type == HirTypeKind::I32) {
+            if ((pattern->kind == HirExprKind::ConstWsCase && pattern->type == subject_value.type &&
+                 is_ws_enum_type(subject_value.type)) ||
+                (pattern->kind == HirExprKind::IntLit && subject_value.type == HirTypeKind::I32)) {
                 matched = pattern->int_value == subject_value.int_value;
+            } else if (pattern->kind == HirExprKind::BoolLit &&
+                       subject_value.type == HirTypeKind::Bool) {
+                matched = binary_match_case_value(pattern.value()) == subject_value.bool_value;
             } else if (pattern->kind == HirExprKind::StrLit &&
                        subject_value.type == HirTypeKind::Str) {
                 matched = pattern->str_value.eq(subject_value.str_value);
@@ -15712,11 +15755,13 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             if (!pattern) return core::make_unexpected(pattern.error());
 
             bool matched = false;
-            if (pattern->kind == HirExprKind::BoolLit && subject_value.type == HirTypeKind::Bool) {
-                matched = pattern->bool_value == subject_value.bool_value;
-            } else if (pattern->kind == HirExprKind::IntLit &&
-                       subject_value.type == HirTypeKind::I32) {
+            if ((pattern->kind == HirExprKind::ConstWsCase && pattern->type == subject_value.type &&
+                 is_ws_enum_type(subject_value.type)) ||
+                (pattern->kind == HirExprKind::IntLit && subject_value.type == HirTypeKind::I32)) {
                 matched = pattern->int_value == subject_value.int_value;
+            } else if (pattern->kind == HirExprKind::BoolLit &&
+                       subject_value.type == HirTypeKind::Bool) {
+                matched = binary_match_case_value(pattern.value()) == subject_value.bool_value;
             } else if (pattern->kind == HirExprKind::StrLit &&
                        subject_value.type == HirTypeKind::Str) {
                 matched = pattern->str_value.eq(subject_value.str_value);
@@ -16113,21 +16158,18 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 auto outer_pattern = analyze_match_pattern(
                     *arm.pattern, subject.value(), route, mod, locals, local_count);
                 if (!outer_pattern) return core::make_unexpected(outer_pattern.error());
-                if (outer_pattern->kind != HirExprKind::BoolLit &&
-                    outer_pattern->kind != HirExprKind::IntLit &&
-                    outer_pattern->kind != HirExprKind::StrLit &&
-                    outer_pattern->kind != HirExprKind::VariantCase)
+                if (!is_match_pattern(outer_pattern.value()))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (outer_pattern->type != subject->type &&
                     !(subject_is_error_kind && outer_pattern->kind == HirExprKind::VariantCase))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                if (outer_pattern->kind == HirExprKind::BoolLit) {
-                    bool& seen_unguarded_bool_case = outer_pattern->bool_value
+                if (is_binary_match_case(outer_pattern.value())) {
+                    bool& seen_unguarded_bool_case = binary_match_case_value(outer_pattern.value())
                                                          ? seen_unguarded_bool_true
                                                          : seen_unguarded_bool_false;
                     if (seen_unguarded_bool_case)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    if (outer_pattern->bool_value)
+                    if (binary_match_case_value(outer_pattern.value()))
                         seen_bool_true = true;
                     else
                         seen_bool_false = true;
@@ -16189,21 +16231,19 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                                    nested_locals,
                                                                    nested_local_count);
                         if (!inner_pattern) return core::make_unexpected(inner_pattern.error());
-                        if (inner_pattern->kind != HirExprKind::BoolLit &&
-                            inner_pattern->kind != HirExprKind::IntLit &&
-                            inner_pattern->kind != HirExprKind::StrLit &&
-                            inner_pattern->kind != HirExprKind::VariantCase)
+                        if (!is_match_pattern(inner_pattern.value()))
                             return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
                         if (inner_pattern->type != inner_subject->type)
                             return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
-                        if (inner_pattern->kind == HirExprKind::BoolLit) {
-                            bool& seen_bool_case = inner_pattern->bool_value
-                                                       ? inner_seen_bool_true
-                                                       : inner_seen_bool_false;
-                            if (seen_bool_case)
+                        if (is_binary_match_case(inner_pattern.value())) {
+                            const bool kSeenBoolCase =
+                                binary_match_case_value(inner_pattern.value())
+                                    ? inner_seen_bool_true
+                                    : inner_seen_bool_false;
+                            if (kSeenBoolCase)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_arm.span);
-                            if (inner_pattern->bool_value)
+                            if (binary_match_case_value(inner_pattern.value()))
                                 inner_seen_bool_true = true;
                             else
                                 inner_seen_bool_false = true;
@@ -16280,8 +16320,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 }
                 if (!inner_seen_wildcard) {
                     bool inner_is_exhaustive = false;
-                    if (inner_subject->type == HirTypeKind::Bool && inner_seen_bool_true &&
-                        inner_seen_bool_false) {
+                    if ((inner_subject->type == HirTypeKind::Bool ||
+                         is_ws_enum_type(inner_subject->type)) &&
+                        inner_seen_bool_true && inner_seen_bool_false) {
                         inner_is_exhaustive = true;
                     } else if (inner_subject->type == HirTypeKind::Variant) {
                         const auto& variant = mod.variants[inner_subject->variant_index];
@@ -16331,8 +16372,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     if (!analyzed_pattern) return core::make_unexpected(analyzed_pattern.error());
                     pattern = analyzed_pattern.value();
                 }
-                if (pattern.kind != HirExprKind::BoolLit && pattern.kind != HirExprKind::IntLit &&
-                    pattern.kind != HirExprKind::StrLit && pattern.kind != HirExprKind::VariantCase)
+                if (!is_match_pattern(pattern))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (pattern.type != subject->type &&
                     !(subject_is_error_kind && pattern.kind == HirExprKind::VariantCase))
@@ -16342,15 +16382,17 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                       pattern.variant_index != subject->error_variant_index) ||
                      (!subject_is_error_kind && pattern.variant_index != subject->variant_index)))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                if (pattern.kind == HirExprKind::BoolLit) {
-                    bool& seen_bool_case = pattern.bool_value ? seen_bool_true : seen_bool_false;
-                    bool& seen_unguarded_bool_case =
-                        pattern.bool_value ? seen_unguarded_bool_true : seen_unguarded_bool_false;
+                if (is_binary_match_case(pattern)) {
+                    const bool kSeenBoolCase =
+                        binary_match_case_value(pattern) ? seen_bool_true : seen_bool_false;
+                    bool& seen_unguarded_bool_case = binary_match_case_value(pattern)
+                                                         ? seen_unguarded_bool_true
+                                                         : seen_unguarded_bool_false;
                     if (seen_unguarded_bool_case)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    if (pattern.bool_value && !seen_bool_case)
+                    if (binary_match_case_value(pattern) && !kSeenBoolCase)
                         seen_bool_true = true;
-                    else if (!pattern.bool_value && !seen_bool_case)
+                    else if (!binary_match_case_value(pattern) && !kSeenBoolCase)
                         seen_bool_false = true;
                     if (!arm.has_guard) seen_unguarded_bool_case = true;
                 }
@@ -16469,7 +16511,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         if (!seen_wildcard) {
             if (seen_guarded_arm)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-            if (subject->type == HirTypeKind::Bool && seen_bool_true && seen_bool_false) return {};
+            if ((subject->type == HirTypeKind::Bool || is_ws_enum_type(subject->type)) &&
+                seen_bool_true && seen_bool_false)
+                return {};
             if (subject->type != HirTypeKind::Variant && !subject_is_error_kind)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             if (subject_is_error_kind && subject->error_variant_index == 0xffffffffu)
@@ -18671,16 +18715,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                route->locals.data,
                                                                route->locals.len);
                     if (!outer_pattern) return core::make_unexpected(outer_pattern.error());
-                    if (outer_pattern->kind != HirExprKind::BoolLit &&
-                        outer_pattern->kind != HirExprKind::IntLit &&
-                        outer_pattern->kind != HirExprKind::StrLit &&
-                        outer_pattern->kind != HirExprKind::VariantCase)
+                    if (!is_match_pattern(outer_pattern.value()))
                         return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
                     if (outer_pattern->type != subject->type)
                         return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
-                    if (outer_pattern->kind == HirExprKind::BoolLit) {
-                        bool& seen = outer_pattern->bool_value ? seen_bool_true : seen_bool_false;
-                        bool& seen_unguarded = outer_pattern->bool_value
+                    if (is_binary_match_case(outer_pattern.value())) {
+                        bool& seen = binary_match_case_value(outer_pattern.value())
+                                         ? seen_bool_true
+                                         : seen_bool_false;
+                        bool& seen_unguarded = binary_match_case_value(outer_pattern.value())
                                                    ? seen_unguarded_bool_true
                                                    : seen_unguarded_bool_false;
                         if (seen_unguarded)
@@ -18759,17 +18802,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                        route->locals.data,
                                                                        route->locals.len);
                             if (!inner_pattern) return core::make_unexpected(inner_pattern.error());
-                            if (inner_pattern->kind != HirExprKind::BoolLit &&
-                                inner_pattern->kind != HirExprKind::IntLit &&
-                                inner_pattern->kind != HirExprKind::StrLit &&
-                                inner_pattern->kind != HirExprKind::VariantCase)
+                            if (!is_match_pattern(inner_pattern.value()))
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_arm.span);
                             if (inner_pattern->type != inner_subject->type)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_arm.span);
-                            if (inner_pattern->kind == HirExprKind::BoolLit) {
-                                bool& seen_inner = inner_pattern->bool_value
+                            if (is_binary_match_case(inner_pattern.value())) {
+                                bool& seen_inner = binary_match_case_value(inner_pattern.value())
                                                        ? inner_seen_bool_true
                                                        : inner_seen_bool_false;
                                 if (seen_inner)
@@ -18894,17 +18934,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                          route->locals.data,
                                                          route->locals.len);
                     if (!pattern) return core::make_unexpected(pattern.error());
-                    if (pattern->kind != HirExprKind::BoolLit &&
-                        pattern->kind != HirExprKind::IntLit &&
-                        pattern->kind != HirExprKind::StrLit &&
-                        pattern->kind != HirExprKind::VariantCase)
+                    if (!is_match_pattern(pattern.value()))
                         return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
                     if (pattern->type != subject->type)
                         return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
-                    if (pattern->kind == HirExprKind::BoolLit) {
-                        bool& seen = pattern->bool_value ? seen_bool_true : seen_bool_false;
-                        bool& seen_unguarded = pattern->bool_value ? seen_unguarded_bool_true
-                                                                   : seen_unguarded_bool_false;
+                    if (is_binary_match_case(pattern.value())) {
+                        bool& seen = binary_match_case_value(pattern.value()) ? seen_bool_true
+                                                                              : seen_bool_false;
+                        bool& seen_unguarded = binary_match_case_value(pattern.value())
+                                                   ? seen_unguarded_bool_true
+                                                   : seen_unguarded_bool_false;
                         if (seen_unguarded)
                             return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
                         if (!seen) seen = true;
@@ -19283,17 +19322,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                        arm_locals,
                                                                        arm_local_count);
                             if (!inner_pattern) return core::make_unexpected(inner_pattern.error());
-                            if (inner_pattern->kind != HirExprKind::BoolLit &&
-                                inner_pattern->kind != HirExprKind::IntLit &&
-                                inner_pattern->kind != HirExprKind::StrLit &&
-                                inner_pattern->kind != HirExprKind::VariantCase)
+                            if (!is_match_pattern(inner_pattern.value()))
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_ast_arm.span);
                             if (inner_pattern->type != inner_subject->type)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_ast_arm.span);
-                            if (inner_pattern->kind == HirExprKind::BoolLit) {
-                                bool& seen_inner = inner_pattern->bool_value
+                            if (is_binary_match_case(inner_pattern.value())) {
+                                bool& seen_inner = binary_match_case_value(inner_pattern.value())
                                                        ? inner_seen_bool_true
                                                        : inner_seen_bool_false;
                                 if (seen_inner)

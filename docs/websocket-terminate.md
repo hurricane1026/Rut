@@ -163,8 +163,14 @@ func fromClient(_ direction: WebSocketDirection) -> bool =>
 
 The domains carry case identity; they do not borrow payload memory. A generic
 identity helper can also return the borrowed `WebSocketMessage` within the same
-synchronous callback. Closed-case exhaustive matching and contextual `.case`
-inference are not introduced by these typed equality projections.
+synchronous callback. Ordinary `match` supports their two closed cases in
+helpers, HTTP routes and message callbacks. Match patterns may use a fully
+qualified case or contextual `.text` / `.binary` and `.clientToUpstream` /
+`.upstreamToClient`. A complete unguarded pair or wildcard covers the domain;
+wrong-domain cases, payload patterns, integer/Boolean coercions and duplicate
+unconditional cases are errors. Match selectors in lexical helper/callback
+expressions retain one reached evaluation, including allocation-producing work.
+Contextual case inference here applies to match patterns.
 
 ### Borrowed payload bytes
 

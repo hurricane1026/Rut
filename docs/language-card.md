@@ -872,6 +872,10 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // kind: WebSocketMessageKind.text / .binary; direction:
 // WebSocketDirection.clientToUpstream / .upstreamToClient. Fully qualified cases
 // support ==/!= and generic Eq with their own type, without ordering/coercion.
+// Ordinary match accepts fully qualified or contextual .case patterns. Both
+// unguarded cases or a wildcard cover the closed domain; duplicate/wrong-domain
+// cases and payload patterns are errors. Helpers, HTTP routes and message
+// callbacks share this matching, with reached callback/helper selectors run once.
 // Pure helpers may accept/return these domains, message views and scalar fields.
 // They use the ordinary type checker and inliner shared with HTTP.
 //

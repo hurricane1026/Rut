@@ -29539,3 +29539,58 @@ TEST(jit, frontend_string_helpers_preserve_lazy_branches_and_actual_argument_eva
         rir.destroy();
     }
 }
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_nominal_domains_match_in_ordinary_http_helpers_and_routes) {
+    const char* source = R"rut(
+func chooseKind(_ first: bool) -> WebSocketMessageKind {
+    if first { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+func directionStatus(_ value: WebSocketDirection) -> i32 {
+    match value { .clientToUpstream => 210
+ .upstreamToClient => 211 }
+}
+func directionFor(_ kind: WebSocketMessageKind) -> WebSocketDirection {
+    match kind {
+        .text => WebSocketDirection.clientToUpstream
+        .binary => WebSocketDirection.upstreamToClient
+    }
+}
+route GET "/" {
+    let kind = chooseKind(req.httpVersion == "HTTP/1.1")
+    let status = directionStatus(directionFor(kind))
+    guard (status == 210) == req.http11 else { return 500 }
+    match kind {
+        .text => return 210
+        .binary => return 211
+    }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    for (bool first : {false, true}) {
+        const Str request = first ? lit("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                                  : lit("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+        const auto result = HandlerResult::unpack(handler(
+            nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK_EQ(result.status_code, first ? 210u : 211u);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+#endif

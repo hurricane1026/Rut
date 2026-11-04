@@ -12,6 +12,8 @@
 #include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_helper_lexical.h"
 #include "fixtures/ws_helper_observables.h"
+#include "fixtures/ws_nominal_match.h"
+#include "fixtures/ws_nominal_selector.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
@@ -3298,5 +3300,29 @@ TEST(native_program, websocket_helpers_and_arguments_evaluate_reached_producers_
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     test::ws_helper_lexical::check(owner.p->config, _tc);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_nominal_matches_keep_owned_outputs_and_single_subject_evaluation) {
+    Source source;
+    REQUIRE(source.append(test::ws_nominal_match::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_nominal_match::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_nominal_match_selector_is_not_elided_or_repeated) {
+    Source source;
+    REQUIRE(source.append(test::ws_nominal_selector::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_nominal_selector::check(_tc, owner.p->config);
 }
 #endif
