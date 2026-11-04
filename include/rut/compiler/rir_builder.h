@@ -912,6 +912,22 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_str_predicate(ValueId text,
+                                       ValueId needle,
+                                       u32 predicate,
+                                       SourceLoc loc = {}) {
+        if (predicate > 3 || !val_has_type(text, TypeKind::Str) ||
+            !val_has_type(needle, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::StrPredicate, ty, loc));
+        inst->operands[0] = text;
+        inst->operands[1] = needle;
+        inst->operand_count = 2;
+        inst->imm.i32_val = static_cast<i32>(predicate);
+        return vid;
+    }
+
     Result<ValueId> emit_str_trim_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
             return err(RirError::InvalidState);
@@ -934,6 +950,9 @@ struct Builder {
     }
 
     Result<ValueId> emit_str_interpolate(const ValueId* parts, u32 count, SourceLoc loc = {}) {
+        if (!parts || count == 0 || count > 64) return err(RirError::InvalidState);
+        for (u32 i = 0; i < count; ++i)
+            if (!val_has_type(parts[i], TypeKind::Str)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Str));
         auto r = TRY(emit(Opcode::StrInterpolate, ty, loc));
         auto ops = set_operands(r.inst, parts, count);

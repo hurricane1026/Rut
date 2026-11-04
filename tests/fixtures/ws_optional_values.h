@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "test.h"
+#include "ws_callback_probe.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
 #endif
@@ -97,67 +98,81 @@ template <typename Config>
 void check(TestCase* _tc, const Config& config) {
     REQUIRE_EQ(config.route_count, 8u);
     for (u32 i = 0; i < config.route_count; ++i) REQUIRE(config.routes[i].ws_frame_handler);
+    WsCallbackProbe probe;
+    REQUIRE(probe.init());
     for (bool client : {false, true}) {
         for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
-            const auto run = [&](u32 route, const char* payload) {
-                return config.routes[route].ws_frame_handler(nullptr,
-                                                             op,
-                                                             reinterpret_cast<const u8*>(payload),
-                                                             static_cast<u32>(strlen(payload)),
-                                                             client);
+            const auto expect = [&](u32 route,
+                                    Str input,
+                                    WsFrameAction action,
+                                    Str output = {},
+                                    WsOpcode output_op = WsOpcode::Text) {
+                probe.expect(_tc,
+                             config.routes[route].ws_frame_handler,
+                             op,
+                             input,
+                             client,
+                             action,
+                             output,
+                             output_op);
             };
-            CHECK(run(0, "\"ok\"") == WsFrameAction::ForwardText);
-            CHECK(run(0, "\"\"") == WsFrameAction::ForwardTextPolicy0);
-            CHECK(run(0, "null") == WsFrameAction::ForwardTextPolicy2);
-            CHECK(run(0, "false") == WsFrameAction::ForwardTextPolicy2);
-            CHECK(run(0, "0") == WsFrameAction::ForwardTextPolicy2);
-            CHECK(run(0, "broken") == WsFrameAction::Drop);
-            CHECK(run(1, "okA") ==
-                  (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
-            CHECK(run(1, "no") == (client ? WsFrameAction::Drop : WsFrameAction::ForwardText));
-            CHECK(run(2, "") ==
-                  (op == WsOpcode::Text ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::Drop));
-            CHECK(run(2, "x") ==
-                  (op == WsOpcode::Text ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::Drop));
-            CHECK(run(3, "") == (op == WsOpcode::Text ? WsFrameAction::ForwardTextPolicy0
-                                                      : WsFrameAction::ForwardText));
-            CHECK(run(4, "x") == (client                 ? WsFrameAction::ForwardText
-                                  : op == WsOpcode::Text ? WsFrameAction::ForwardTextPolicy0
-                                                         : WsFrameAction::Drop));
-            CHECK(run(5, "raw") ==
-                  (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
-            CHECK(run(5, "other") ==
-                  (client ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::ForwardText));
-            CHECK(run(6, "x") ==
-                  (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
-            CHECK(run(7, "") ==
-                  (client && op == WsOpcode::Text ? WsFrameAction::Forward : WsFrameAction::Drop));
-            CHECK(run(7, "x") == WsFrameAction::Drop);
+            expect(0, lit_str("\"ok\""), WsFrameAction::ForwardText, lit_str("[ok]"));
+            expect(0, lit_str("\"\""), WsFrameAction::ForwardTextPolicy0, lit_str("empty"));
+            for (Str input : {lit_str("null"), lit_str("false"), lit_str("0")})
+                expect(0, input, WsFrameAction::ForwardTextPolicy2, lit_str("[fallback]"));
+            expect(0, lit_str("broken"), WsFrameAction::Drop);
+            expect(1,
+                   lit_str("okA"),
+                   client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText,
+                   client ? lit_str("<okA>") : lit_str("server"));
+            expect(1,
+                   lit_str("no"),
+                   client ? WsFrameAction::Drop : WsFrameAction::ForwardText,
+                   lit_str("server"));
+            expect(2,
+                   lit_str(""),
+                   op == WsOpcode::Text ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::Drop,
+                   lit_str("zero"));
+            expect(2,
+                   lit_str("x"),
+                   op == WsOpcode::Text ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::Drop,
+                   lit_str("nonempty"));
+            expect(3,
+                   lit_str(""),
+                   op == WsOpcode::Text ? WsFrameAction::ForwardTextPolicy0
+                                        : WsFrameAction::ForwardText,
+                   op == WsOpcode::Text ? lit_str("false") : lit_str("absent"));
+            expect(4,
+                   lit_str("x"),
+                   client                 ? WsFrameAction::ForwardText
+                   : op == WsOpcode::Text ? WsFrameAction::ForwardTextPolicy0
+                                          : WsFrameAction::Drop,
+                   client ? Str{"\0\xff", 2} : lit_str(""),
+                   WsOpcode::Binary);
+            expect(5,
+                   lit_str("raw"),
+                   client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText,
+                   client ? lit_str("<literal>") : lit_str("absent"));
+            expect(5,
+                   lit_str("other"),
+                   client ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::ForwardText,
+                   client ? lit_str("<other>") : lit_str("absent"));
+            expect(6,
+                   lit_str("x"),
+                   client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText,
+                   client ? lit_str("[]") : lit_str("absent"));
+            expect(7,
+                   lit_str(""),
+                   client && op == WsOpcode::Text ? WsFrameAction::Forward : WsFrameAction::Drop);
+            expect(7, lit_str("x"), WsFrameAction::Drop);
         }
     }
-    const auto& fallback = config.routes[0];
-    CHECK(fallback.ws_forward_text.source == WsTextSource::JsonString);
-    CHECK(fallback.ws_forward_text.prefix.eq(lit_str("[")));
-    CHECK(fallback.ws_forward_text.suffix.eq(lit_str("]")));
-    REQUIRE_EQ(fallback.ws_forward_text_count, 3u);
-    CHECK(fallback.ws_forward_texts[0].prefix.eq(lit_str("empty")));
-    CHECK(fallback.ws_forward_texts[2].source == WsTextSource::Literal);
-    CHECK(fallback.ws_forward_texts[2].prefix.eq(lit_str("[fallback]")));
-    CHECK(config.routes[1].ws_forward_texts[0].source == WsTextSource::MessageText);
-    CHECK(config.routes[2].ws_forward_texts[0].prefix.eq(lit_str("nonempty")));
-    CHECK(config.routes[2].ws_forward_texts[1].prefix.eq(lit_str("zero")));
-    CHECK(config.routes[3].ws_forward_texts[0].prefix.eq(lit_str("false")));
+    // This pure Binary projection still uses route-owned exact-byte storage.
     const auto& binary = config.routes[4];
     CHECK(binary.ws_forward_text.source == WsTextSource::LiteralBinary);
-    REQUIRE_EQ(binary.ws_forward_text.prefix.len, 2u);
-    CHECK_EQ(static_cast<u8>(binary.ws_forward_text.prefix.ptr[0]), 0u);
-    CHECK_EQ(static_cast<u8>(binary.ws_forward_text.prefix.ptr[1]), 255u);
+    CHECK(binary.ws_forward_text.prefix.eq({"\0\xff", 2}));
     REQUIRE_EQ(binary.ws_forward_text_count, 1u);
-    CHECK(binary.ws_forward_texts[0].source == WsTextSource::LiteralBinary);
-    CHECK_EQ(binary.ws_forward_texts[0].prefix.len, 0u);
-    CHECK(config.routes[5].ws_forward_texts[0].prefix.eq(lit_str("<literal>")));
-    CHECK(config.routes[5].ws_forward_texts[1].source == WsTextSource::MessageText);
-    CHECK(config.routes[6].ws_forward_texts[0].prefix.eq(lit_str("[]")));
+    CHECK(binary.ws_forward_texts[0].prefix.len == 0);
 }
 #endif
 

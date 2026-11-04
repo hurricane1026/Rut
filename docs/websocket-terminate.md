@@ -95,6 +95,25 @@ entry emits explicit branches and typed SSA merges: only the chosen arm runs,
 including nested nullable value choices. It does not reuse an eager `select`
 for operations whose evaluation must be conditional.
 
+Pure helper bodies and actual arguments retain reached lexical evaluation in
+message callbacks, including nested local/guard bindings and unused resource
+producers. Actual arguments run in declaration order once; repeated reads reuse
+the bound result. Infallible immutable projections can be substituted without
+work. Helpers with unintegrated error/effect semantics are rejected explicitly.
+A borrowed whole-message alias cannot hide an initializer requiring runtime
+storage; pass its scalar or Bytes projections instead.
+
+Ordinary String `+`, `.hasPrefix(str)`, `.hasSuffix(str)`, `.contains(str)` and
+`.isEmpty` also work in general message expressions. Both concatenation operands
+must be unwrapped String values. Predicates compare bytes, including embedded
+NUL. Concatenation owns its result in the existing bounded arena; allocation
+failure stops execution, never fabricates empty text. Only the selected branch
+allocates. Known invalid UTF-8 Text literals and a proven minimum output length
+above the configured limit remain compile errors; dynamic results are checked
+at publication. These String operations share their HTTP compiler path. General
+source interpolation and error/effect-capable helper bodies remain separate
+work.
+
 Boolean helpers may use ordinary `if`/`else` to select between two supported
 predicates, including nested conditionals. The selector evaluates once and only
 the selected arm runs:
@@ -581,11 +600,10 @@ matching compiler and serving binaries.
   bytes; add `message.isText` to restrict them to Text messages.
 - `message.forward()` forwards one complete message. The runtime chooses its
   wire framing; original frame boundaries are not preserved.
-- `message.forward(text)` replaces one complete message. Fixed literals and
-  compile-time-known route-local strings may surround one `message.text` reference
-  using String `+`. Replacement output must fit the message and single-slice limits.
-  The same affix form may use one previously unwrapped `json.string` alias as its
-  dynamic source; this produces a Text message even when the input was Binary.
+- `message.forward(text)` replaces one complete message. Ordinary unwrapped
+  Strings, including helper/JSON results and repeated dynamic operands, may use
+  String `+`. Replacement output must fit the message and single-slice limits.
+  It produces Text even when the input was Binary.
 - `message.forward(b"\x00\xff")` replaces one complete Text or Binary message
   with Binary. One exact-byte literal is allowed, including an empty payload or
   invalid UTF-8. It must fit both the existing 4096-byte decoded byte-literal cap

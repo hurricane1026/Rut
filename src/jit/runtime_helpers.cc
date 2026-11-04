@@ -2049,6 +2049,44 @@ static u8 regex_match_result(const char* s, u32 s_len, void* db) {
     return ctx.matched ? 1 : 0;
 }
 
+u8 rut_helper_str_has_suffix(const char* text, u32 size, const char* needle, u32 needle_size) {
+    if ((!text && size) || (!needle && needle_size) || needle_size > size) return 0;
+    if (!needle_size) return 1;
+    return __builtin_memcmp(text + size - needle_size, needle, needle_size) == 0 ? 1u : 0u;
+}
+
+u8 rut_helper_str_concat(
+    void* conn, void* arena, const Str* parts, u32 count, const char** out_ptr, u32* out_size) {
+    *out_ptr = nullptr;
+    *out_size = 0;
+    if (!parts || count == 0 || count > 64) return 0;
+    u32 size = 0;
+    static constexpr u32 kBudget = 262144;
+    for (u32 i = 0; i < count; ++i) {
+        if ((!parts[i].ptr && parts[i].len) || parts[i].len > kBudget - size) return 0;
+        size += parts[i].len;
+    }
+    if (size == 0) {
+        *out_ptr = "";
+        return 1;
+    }
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    if (!storage || !storage->backend.pool || storage->space_used() > kBudget - size ||
+        (!storage->current && !storage->init(storage->backend.pool)))
+        return 0;
+    auto* result = static_cast<char*>(storage->alloc(size));
+    if (!result) return 0;
+    u32 offset = 0;
+    for (u32 i = 0; i < count; ++i) {
+        if (parts[i].len) __builtin_memcpy(result + offset, parts[i].ptr, parts[i].len);
+        offset += parts[i].len;
+    }
+    *out_ptr = result;
+    *out_size = size;
+    return 1;
+}
+
 u8 rut_helper_str_regex_result(const char* s, u32 s_len, void* db) {
     return regex_match_result(s, s_len, db);
 }

@@ -1699,6 +1699,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, b);
             break;
         }
+        case rir::Opcode::StrPredicate:
         case rir::Opcode::StrHasPrefix: {
             LLVMValueRef s = c.get_value(inst.operands[0]);
             LLVMValueRef pfx = c.get_value(inst.operands[1]);
@@ -1707,16 +1708,81 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef p_ptr = LLVMBuildExtractValue(c.builder, pfx, 0, "p.ptr");
             LLVMValueRef p_len = LLVMBuildExtractValue(c.builder, pfx, 1, "p.len");
             LLVMValueRef args[] = {s_ptr, s_len, p_ptr, p_len};
-            LLVMValueRef r = LLVMBuildCall2(c.builder,
-                                            LLVMGlobalGetValueType(c.get_str_has_prefix()),
-                                            c.get_str_has_prefix(),
-                                            args,
-                                            4,
-                                            "hp");
+            if (inst.op == rir::Opcode::StrPredicate && inst.imm.i32_val == 3) {
+                c.set_value(
+                    inst.result,
+                    LLVMBuildICmp(
+                        c.builder, LLVMIntEQ, s_len, LLVMConstInt(c.i32_ty, 0, 0), "str.empty"));
+                break;
+            }
+            LLVMValueRef helper = c.get_str_has_prefix();
+            if (inst.op == rir::Opcode::StrPredicate && inst.imm.i32_val != 0) {
+                const char* name =
+                    inst.imm.i32_val == 1 ? "rut_helper_str_has_suffix" : "rut_helper_str_contains";
+                helper = LLVMGetNamedFunction(c.llvm_mod, name);
+                if (!helper) {
+                    LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
+                    helper =
+                        LLVMAddFunction(c.llvm_mod, name, LLVMFunctionType(c.i8_ty, params, 4, 0));
+                }
+            }
+            LLVMValueRef r =
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 4, "hp");
             // Convert u8 result to i1 for branch usage
             LLVMValueRef b =
                 LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "hp.bool");
             c.set_value(inst.result, b);
+            break;
+        }
+        case rir::Opcode::StrInterpolate: {
+            LLVMTypeRef array_ty = LLVMArrayType2(c.str_ty, inst.operand_count);
+            LLVMValueRef parts = LLVMBuildAlloca(c.builder, array_ty, "concat.parts");
+            for (u32 i = 0; i < inst.operand_count; ++i) {
+                LLVMValueRef indices[] = {LLVMConstInt(c.i32_ty, 0, 0),
+                                          LLVMConstInt(c.i32_ty, i, 0)};
+                LLVMValueRef slot =
+                    LLVMBuildGEP2(c.builder, array_ty, parts, indices, 2, "concat.part");
+                LLVMBuildStore(c.builder, c.get_value(inst.operand(i)), slot);
+            }
+            LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.ptr_ty};
+            LLVMTypeRef type = LLVMFunctionType(c.i8_ty, params, 6, 0);
+            LLVMValueRef helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_str_concat");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_str_concat", type);
+            LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "concat.ptr");
+            LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "concat.len");
+            LLVMValueRef args[] = {c.param_conn,
+                                   c.param_arena,
+                                   parts,
+                                   LLVMConstInt(c.i32_ty, inst.operand_count, 0),
+                                   ptr,
+                                   len};
+            LLVMValueRef result = LLVMBuildCall2(c.builder, type, helper, args, 6, "concat.ok");
+            LLVMValueRef function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+            auto* success = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "concat.success");
+            auto* failure = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "concat.failure");
+            LLVMValueRef valid = LLVMBuildICmp(
+                c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "concat.valid");
+            LLVMBuildCondBr(c.builder, valid, success, failure);
+            LLVMPositionBuilderAtEnd(c.builder, failure);
+            c.emit_parse_unprime();
+            const u64 kFailed =
+                static_cast<u64>(HandlerAction::ReturnStatus) |
+                (static_cast<u64>(c.ws_body_mode ? static_cast<u32>(WsFrameAction::Close) : 500u)
+                 << 8);
+            LLVMBuildRet(c.builder, LLVMConstInt(c.i64_ty, kFailed, 0));
+            LLVMPositionBuilderAtEnd(c.builder, success);
+            LLVMValueRef text = LLVMGetUndef(c.str_ty);
+            text = LLVMBuildInsertValue(c.builder,
+                                        text,
+                                        LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "concat.data"),
+                                        0,
+                                        "concat.text.ptr");
+            text = LLVMBuildInsertValue(c.builder,
+                                        text,
+                                        LLVMBuildLoad2(c.builder, c.i32_ty, len, "concat.size"),
+                                        1,
+                                        "concat.text.len");
+            c.set_value(inst.result, text);
             break;
         }
         case rir::Opcode::StrRegexMatch: {
@@ -3083,6 +3149,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
                 has_phi |= inst.op == rir::Opcode::Phi;
+                if (!rir::valid_string_instruction(fn, inst)) return {nullptr, nullptr, false};
                 // Neither HTTP inputs nor HTTP mutation/response effects belong
                 // to an application-message invocation, including hidden helper
                 // accesses. Context slots are compiler storage, not HTTP values.

@@ -131,6 +131,8 @@ enum class HirExprKind : u8 {
     IntLit,
     StrLit,
     RegexMatch,
+    StringConcat,
+    StringPredicate,
     Tuple,
     // Array literal: elements stored in `args`. analyze rejects heterogeneous
     // arrays and bare empty `[]`; typed empty route locals are currently
@@ -560,6 +562,23 @@ struct HirExpr {
     FixedVec<HirExpr*, kMaxArgs> args;
 };
 
+// A bounded String construction can allocate/fail; preserve its selected branch
+// and call-site evaluation even when pure scalar trees can still be substituted.
+inline bool hir_has_string_construction(const HirExpr& value, u32 depth = 0) {
+    if (depth > 128) return true;
+    if (value.kind == HirExprKind::StringConcat) return true;
+    if (value.kind == HirExprKind::BoundValue) return false;
+    if (value.lhs && hir_has_string_construction(*value.lhs, depth + 1)) return true;
+    if (value.rhs && hir_has_string_construction(*value.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && hir_has_string_construction(*value.args[i], depth + 1)) return true;
+    for (u32 i = 0; i < value.field_inits.len; ++i)
+        if (value.field_inits[i].value &&
+            hir_has_string_construction(*value.field_inits[i].value, depth + 1))
+            return true;
+    return false;
+}
+
 struct HirFunction {
     static constexpr u32 kMaxTypeParams = 4;
     struct TypeParamDecl {
@@ -643,6 +662,10 @@ struct HirFunction {
     static constexpr u32 kMaxRespondGuards = 4;
     FixedVec<RespondGuard, kMaxRespondGuards> respond_guards;
     HirExpr body{};
+    // The same typed source normalized with reached lexical values for the
+    // synchronous message phase and common String construction; owned by exprs,
+    // including imported helpers.
+    u32 lexical_body_index = 0xffffffffu;
 
     HirFunction() = default;
     HirFunction(const HirFunction& other)
@@ -665,7 +688,8 @@ struct HirFunction {
           has_non_response_statement_effect(other.has_non_response_statement_effect),
           uses_http_values(other.uses_http_values),
           respond_guards(other.respond_guards),
-          body(other.body) {
+          body(other.body),
+          lexical_body_index(other.lexical_body_index) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
@@ -706,6 +730,7 @@ struct HirFunction {
         uses_http_values = other.uses_http_values;
         respond_guards = other.respond_guards;
         body = other.body;
+        lexical_body_index = other.lexical_body_index;
         rebase_from(other);
         return *this;
     }
@@ -729,7 +754,8 @@ struct HirFunction {
           has_non_response_statement_effect(other.has_non_response_statement_effect),
           uses_http_values(other.uses_http_values),
           respond_guards(other.respond_guards),
-          body(other.body) {
+          body(other.body),
+          lexical_body_index(other.lexical_body_index) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
@@ -770,6 +796,7 @@ struct HirFunction {
         uses_http_values = other.uses_http_values;
         respond_guards = other.respond_guards;
         body = other.body;
+        lexical_body_index = other.lexical_body_index;
         rebase_from(other);
         return *this;
     }
@@ -1333,6 +1360,7 @@ struct HirRoute {
     // Analyzer-only scratch scope for synchronous message expressions. HTTP
     // admission on a terminate route retains ordinary helper/effect semantics.
     bool is_ws_callback = false;
+    bool is_lexical_helper = false;
     // Analyzer capability summary, including reads in otherwise unused values.
     bool uses_http_values = false;
     HirWsHandler ws_handler{};
@@ -1366,6 +1394,7 @@ struct HirRoute {
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           is_ws_callback(other.is_ws_callback),
+          is_lexical_helper(other.is_lexical_helper),
           uses_http_values(other.uses_http_values),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
@@ -1394,6 +1423,7 @@ struct HirRoute {
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         is_ws_callback = other.is_ws_callback;
+        is_lexical_helper = other.is_lexical_helper;
         uses_http_values = other.uses_http_values;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
@@ -1422,6 +1452,7 @@ struct HirRoute {
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           is_ws_callback(other.is_ws_callback),
+          is_lexical_helper(other.is_lexical_helper),
           uses_http_values(other.uses_http_values),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
@@ -1450,6 +1481,7 @@ struct HirRoute {
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         is_ws_callback = other.is_ws_callback;
+        is_lexical_helper = other.is_lexical_helper;
         uses_http_values = other.uses_http_values;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;

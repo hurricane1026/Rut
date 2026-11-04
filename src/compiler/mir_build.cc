@@ -539,6 +539,29 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.str_value = expr.str_value;
         return v;
     }
+    if (expr.kind == HirExprKind::StringConcat || expr.kind == HirExprKind::StringPredicate) {
+        const bool kPredicate = expr.kind == HirExprKind::StringPredicate;
+        if (!expr.lhs || !expr.rhs || expr.lhs->type != HirTypeKind::Str ||
+            expr.rhs->type != HirTypeKind::Str || expr.lhs->may_nil || expr.lhs->may_error ||
+            expr.rhs->may_nil || expr.rhs->may_error || expr.may_nil || expr.may_error ||
+            expr.type != (kPredicate ? HirTypeKind::Bool : HirTypeKind::Str) ||
+            (kPredicate && (expr.int_value < 0 || expr.int_value > 3)))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = mir_value(*expr.rhs, module, fn, ctx);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v.lhs = &fn->values[fn->values.len - 1];
+        if (!fn->values.push(rhs.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v.rhs = &fn->values[fn->values.len - 1];
+        v.kind = kPredicate ? MirValueKind::StringPredicate : MirValueKind::StringConcat;
+        v.type = kPredicate ? MirTypeKind::Bool : MirTypeKind::Str;
+        v.int_value = expr.int_value;
+        return v;
+    }
     if (expr.kind == HirExprKind::RegexMatch) {
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
@@ -1115,7 +1138,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* else_ptr = &fn->values[fn->values.len - 1];
         v.kind = MirValueKind::IfElse;
-        v.is_branch_conditional = fn->is_ws_callback && !expr.is_eager_fallback;
+        v.is_branch_conditional =
+            !expr.is_eager_fallback && (fn->is_ws_callback || hir_has_string_construction(expr));
         v.type = mir_type_kind(expr.type);
         v.lhs = cond_ptr;
         v.rhs = then_ptr;

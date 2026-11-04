@@ -29327,3 +29327,215 @@ TEST(jit, websocket_recipe_regex_errors_close_before_negation) {
     }
 }
 #endif
+
+TEST(helpers, string_concat_retains_bytes_and_never_turns_failure_into_empty_text) {
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto conn = std::make_unique<ConnectionBase>();
+    REQUIRE(conn->json_arena.init(&pool));
+    char first[] = {'a', 0, 'b'};
+    Str parts[] = {{first, sizeof(first)}, lit("!")};
+    const char* output = nullptr;
+    u32 size = 0;
+    REQUIRE(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size));
+    CHECK((Str{output, size}.eq({"a\0b!", 4})));
+    first[0] = 'z';
+    const Str retained{output, size};
+    parts[0] = lit("second");
+    REQUIRE(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size));
+    CHECK((Str{output, size}.eq(lit("second!"))));
+    CHECK(retained.eq({"a\0b!", 4}));
+    CHECK_EQ(rut_helper_str_has_suffix(retained.ptr, retained.len, "b!", 2), 1u);
+    CHECK_EQ(rut_helper_str_has_suffix(retained.ptr, retained.len, "a!", 2), 0u);
+    CHECK_EQ(rut_helper_str_has_suffix(nullptr, 0, nullptr, 0), 1u);
+    CHECK_EQ(rut_helper_str_has_suffix(nullptr, 1, nullptr, 0), 0u);
+    parts[0] = {nullptr, 1};
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size), 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(size, 0u);
+    parts[0] = {reinterpret_cast<const char*>(1), 262145};
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size), 0u);
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 65, &output, &size), 0u);
+    conn->json_arena.destroy();
+    u8* held[8]{};
+    for (auto& slice : held) {
+        slice = pool.alloc();
+        REQUIRE(slice);
+    }
+    parts[0] = lit("x");
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size), 0u);
+    CHECK_EQ(pool.in_use(), 8u);
+    CHECK(output == nullptr);
+    CHECK_EQ(size, 0u);
+    parts[0] = lit("");
+    parts[1] = lit("");
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size), 1u);
+    CHECK(output != nullptr);
+    CHECK_EQ(size, 0u);
+    for (auto* slice : held) pool.free(slice);
+    conn->json_arena.destroy();
+    pool.destroy();
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_string_concat_is_lazy_and_owns_output_before_the_next_message) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("string_message"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto chosen = V(b.create_block(fn, lit("chosen")));
+    auto skipped = V(b.create_block(fn, lit("skipped")));
+    auto merged = V(b.create_block(fn, lit("merged")));
+    b.set_insert_point(fn, entry);
+    auto client = V(b.emit_ws_message_field(WsMessageFieldId::FromClient));
+    VOK(b.emit_br(client, chosen, skipped));
+    b.set_insert_point(fn, chosen);
+    auto text = V(b.emit_ws_message_field(WsMessageFieldId::Payload));
+    auto suffix = V(b.emit_const_str(lit("!")));
+    ValueId parts[] = {text, suffix};
+    auto joined = V(b.emit_str_interpolate(parts, 2));
+    auto matched = V(b.emit_str_predicate(joined, suffix, 1));
+    auto yes = V(b.create_block(fn, lit("yes")));
+    auto no = V(b.create_block(fn, lit("no")));
+    VOK(b.emit_br(matched, yes, no));
+    b.set_insert_point(fn, no);
+    VOK(b.emit_ret_status(1));
+    b.set_insert_point(fn, yes);
+    VOK(b.emit_jmp(merged));
+    b.set_insert_point(fn, skipped);
+    auto literal = V(b.emit_const_str(lit("skip")));
+    VOK(b.emit_jmp(merged));
+    b.set_insert_point(fn, merged);
+    auto selected = V(b.emit_phi(joined, yes, literal, skipped));
+    auto action = V(b.emit_ws_forward(selected, 1));
+    VOK(b.emit_ret_status(action));
+    auto cg = codegen_ws_body(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_string_message"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto conn = std::make_unique<ConnectionBase>();
+    REQUIRE(conn->json_arena.init(&pool));
+    const u8 input[] = {'a', 0};
+    for (u8 client : {1u, 0u}) {
+        rut_helper_ws_begin_message(conn.get());
+        auto result = HandlerResult::unpack(
+            handler(conn.get(), nullptr, input, sizeof(input), nullptr, 2, client));
+        CHECK_EQ(result.status_code, static_cast<u16>(WsFrameAction::ForwardDynamic));
+        REQUIRE(conn->ws_handler_output.ready);
+        CHECK(conn->ws_handler_output.payload.eq(client ? Str{"a\0!", 3} : lit("skip")));
+        CHECK_EQ(conn->json_arena.space_used(), client ? 8u : 0u);
+    }
+    conn->json_arena.destroy();
+    u8* held[8]{};
+    for (auto& slice : held) {
+        slice = pool.alloc();
+        REQUIRE(slice);
+    }
+    for (u8 client : {0u, 1u}) {
+        rut_helper_ws_begin_message(conn.get());
+        auto result = HandlerResult::unpack(
+            handler(conn.get(), nullptr, input, sizeof(input), nullptr, 2, client));
+        CHECK_EQ(result.status_code,
+                 static_cast<u16>(client ? WsFrameAction::Close : WsFrameAction::ForwardDynamic));
+        CHECK_EQ(conn->ws_handler_output.ready, client == 0u);
+        CHECK_EQ(pool.in_use(), 8u);
+    }
+    for (auto* slice : held) pool.free(slice);
+    conn->json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    tc.destroy();
+}
+#endif
+
+TEST(jit, frontend_string_helpers_preserve_lazy_branches_and_actual_argument_evaluation) {
+    struct Scenario {
+        const char* helpers;
+        const char* expression;
+        u32 bytes;
+        bool chosen_only;
+    };
+    const Scenario scenarios[] = {
+        {R"rut(func choose(_ yes: bool, _ text: str) -> str {
+            if yes { text + "!" } else { "skip" }
+        })rut",
+         "choose(req.httpVersion == \"HTTP/1.1\", req.path)",
+         8,
+         true},
+        {"func ignore(_ text: str) -> str => \"skip\"", "ignore(req.path + \"!\")", 8, false},
+        {"func same(_ text: str) -> bool => text == text", "same(req.path + \"!\")", 8, false},
+        {R"rut(func repeatText(_ text: str) -> str {
+            let joined = text + "!"
+            joined + joined
+        })rut",
+         "repeatText(req.path)",
+         24,
+         false},
+        {R"rut(func readPath() -> str {
+            let joined = req.path + "!"
+            joined + joined
+        })rut",
+         "readPath()",
+         24,
+         false},
+        {"func second(_ first: str, _ last: str) -> str => last",
+         "second(req.path + \"a\", req.path + \"b\")",
+         16,
+         false},
+    };
+    for (const auto& scenario : scenarios) {
+        std::string source = scenario.helpers;
+        source += "\nroute GET \"/\" { let value = ";
+        source += scenario.expression;
+        source += " return 200 }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        SlicePool pool;
+        REQUIRE(pool.init(8));
+        auto conn = std::make_unique<ConnectionBase>();
+        REQUIRE(conn->json_arena.init(&pool));
+        for (bool chosen : {false, true}) {
+            const Str request = chosen ? lit("GET /one HTTP/1.1\r\nHost: x\r\n\r\n")
+                                       : lit("GET /one HTTP/1.0\r\nHost: x\r\n\r\n");
+            const bool evaluates = chosen || !scenario.chosen_only;
+            auto result = HandlerResult::unpack(handler(
+                nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+            CHECK_EQ(result.status_code, evaluates ? 500u : 200u);
+            conn->json_arena.reset();
+            result = HandlerResult::unpack(handler(conn.get(),
+                                                   nullptr,
+                                                   reinterpret_cast<const u8*>(request.ptr),
+                                                   request.len,
+                                                   nullptr));
+            CHECK_EQ(result.status_code, 200u);
+            CHECK_EQ(conn->json_arena.space_used(), evaluates ? scenario.bytes : 0u);
+        }
+        conn->json_arena.destroy();
+        pool.destroy();
+        engine.shutdown();
+        rir.destroy();
+    }
+}

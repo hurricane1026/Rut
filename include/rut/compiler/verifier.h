@@ -49,6 +49,7 @@ enum class VerifyIssueCode : u8 {
     InvalidJwtClaimsLifetime,
     InvalidPasswordPrefix,
     InvalidStrLength,
+    InvalidStringOperation,
     InvalidWsMessageField,
     InvalidWsOutput,
     InvalidPhi,
@@ -71,6 +72,30 @@ struct VerifySummary {
     u32 yield_count = 0;
     u32 branch_edge_count = 0;
 };
+
+// Shared boundary validation for the bounded String operations. Codegen also
+// checks direct RIR clients before indexing operands or allocating LLVM arrays.
+inline bool valid_string_instruction(const Function& fn, const Instruction& inst) {
+    if (inst.op != Opcode::StrPredicate && inst.op != Opcode::StrInterpolate) return true;
+    if (inst.operand_count <= kMaxInlineOperands && inst.extra_operands) return false;
+    const auto kExact = [&](ValueId id, TypeKind kind) {
+        if (id == kNoValue || id.id >= fn.value_count || !fn.values) return false;
+        const Type* type = fn.values[id.id].type;
+        return type && type->kind == kind && !type->inner && !type->struct_def;
+    };
+    if (inst.op == Opcode::StrPredicate) {
+        return inst.operand_count == 2 && inst.imm.i32_val >= 0 && inst.imm.i32_val <= 3 &&
+               kExact(inst.result, TypeKind::Bool) && kExact(inst.operand(0), TypeKind::Str) &&
+               kExact(inst.operand(1), TypeKind::Str);
+    }
+    if (inst.operand_count == 0 || inst.operand_count > 64 ||
+        (inst.operand_count > kMaxInlineOperands && !inst.extra_operands) ||
+        !kExact(inst.result, TypeKind::Str))
+        return false;
+    for (u32 i = 0; i < inst.operand_count; ++i)
+        if (!kExact(inst.operand(i), TypeKind::Str)) return false;
+    return true;
+}
 
 struct VerifyOptions {
     // Rut route automata should not carry dead blocks: dead IR makes later
@@ -894,6 +919,9 @@ inline VerifyResult verify_function(const Function* fn,
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidWsMessageField, function_index, bi, ii);
             }
+            if (!valid_string_instruction(*fn, inst))
+                return verify_fail(
+                    summary, VerifyIssueCode::InvalidStringOperation, function_index, bi, ii);
             if (inst.op == Opcode::StrLength) {
                 const auto kExactType = [&](ValueId id, TypeKind kind) {
                     if (id == kNoValue || id.id >= fn->value_count || fn->values == nullptr)
@@ -1793,6 +1821,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidWsOutput";
         case VerifyIssueCode::InvalidWsMessageField:
             return "InvalidWsMessageField";
+        case VerifyIssueCode::InvalidStringOperation:
+            return "InvalidStringOperation";
         case VerifyIssueCode::InvalidStrLength:
             return "InvalidStrLength";
     }

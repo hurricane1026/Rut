@@ -44,3 +44,9 @@ message IR. Its message entry retains a tri-state scan result and closes before
 Boolean negation on scan/resource failure; HTTP keeps its existing Boolean API.
 The raw-message recipe path also preserves failures. Regex locals, dynamic JSON
 string sources and callbacks beyond recipe tables use this same behavior.
+
+Pure helper local/guard producers and reached actual arguments now retain lexical
+evaluation in general callbacks, including unused resource producers and ordered
+arguments. Common String concatenation/predicates use shared IR and bounded
+owned arena storage. Error/effect/yield integration, interpolation and the broader
+protocol/resource criteria above remain open.

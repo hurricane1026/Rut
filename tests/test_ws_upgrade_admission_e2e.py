@@ -295,6 +295,51 @@ def dynamic_utf8_exchange(client, peer):
         raise AssertionError("invalid dynamic Text output did not close upstream")
 
 
+STRING_HELPER_DECLARATIONS = r"""
+func decorated(_ text: str) -> str {
+    let value = text + "!"
+    value + value
+}
+func decodedText(_ text: str) -> str {
+    guard let root = json.parse(text) else { nil }
+    json.string(root)
+}
+"""
+STRING_HELPER_HANDLER = r"""
+return websocket(ws, maxMessageSize: 32b) { msg in
+    if !msg.fromClient { msg.forward("skip") }
+    guard let text = decodedText(msg.text) else { msg.close(1007) }
+    guard text.hasPrefix("a") && text.hasSuffix("z") && text.contains("\0") else { msg.drop() }
+    msg.forward(decorated(text))
+}
+"""
+
+
+def string_helper_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"String helper: {actual=!r}, {expected=!r}")
+
+    client.sendall(masked_frame(2, b'"a\\u0000z"') +
+                   masked_frame(1, b'"drop"') + masked_frame(2, b'"ab\\u0000z"'))
+    expect(peer, (1, b"a\0z!a\0z!", True))
+    expect(peer, (1, b"ab\0z!ab\0z!", True))
+    fragment = bytearray(masked_frame(2, b'"a'))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"PING") + masked_frame(0, b'\\u0000z"'))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"a\0z!a\0z!", True))
+    # Early direction return must skip JSON parsing of invalid Binary data.
+    peer.sendall(b"\x82\x01\xff\x81\x00")
+    expect(client, (1, b"skip", False))
+    expect(client, (1, b"skip", False))
+    # Input fits; the repeated dynamic result exceeds the configured output bound.
+    client.sendall(masked_frame(2, b'"a' + b'x' * 15 + b'\\u0000z"'))
+    expect(client, (8, b"\x03\xf1", False))
+    expect(peer, (8, b"\x03\xf1", True))
+
+
 EAGER_BINDING_DECLARATIONS = r"""
 func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
 """
@@ -2319,6 +2364,7 @@ def main():
                 (TYPED_JSON_HANDLER, typed_json_exchange, GENERAL_JSON_DECLARATIONS),
                 (JSON_LIFETIME_HANDLER, json_lifetime_exchange, ""),
                 (HASH_OUTPUT_HANDLER, hash_output_exchange, ""),
+                (STRING_HELPER_HANDLER, string_helper_exchange, STRING_HELPER_DECLARATIONS),
                 (DYNAMIC_OUTPUT_HANDLER, dynamic_output_exchange, DYNAMIC_OUTPUT_DECLARATIONS),
                 (DYNAMIC_BOUND_HANDLER, dynamic_bound_exchange, ""),
                 (DYNAMIC_UTF8_HANDLER, dynamic_utf8_exchange, ""),

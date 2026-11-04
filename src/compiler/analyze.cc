@@ -3522,6 +3522,60 @@ static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
                                                   bool validate_receivers = true);
 static bool ws_infallible_binding(const HirExpr& expr, u32 depth);
 #endif
+#if RUT_ENABLE_WEBSOCKET
+struct WsOutputLiteralBounds {
+    u32 minimum = 0;
+    bool valid_utf8 = true;
+    bool complete = true;
+};
+
+// Follow only the produced String/Bytes value, not inputs to JSON/hash work.
+// Dynamic data retains runtime checks; literal Text components and a proven
+// minimum length retain the compile-time guarantees of the recipe path.
+static WsOutputLiteralBounds ws_output_literal_bounds(
+    const HirExpr& value, const HirLocal* locals, u32 count, u32& visits, u32 depth = 0) {
+    if (++visits > 4096 || depth > 128) return {0, true, false};
+    if (value.kind == HirExprKind::StrLit)
+        return {value.str_value.len, ws_valid_text_payload(value.str_value)};
+    if (value.kind == HirExprKind::BytesLit) return {value.str_value.len, true};
+    if (value.kind == HirExprKind::LocalRef) {
+        for (u32 i = 0; i < count; ++i)
+            if (locals[i].ref_index == value.local_index)
+                return ws_output_literal_bounds(locals[i].init, locals, count, visits, depth + 1);
+        return {};
+    }
+    if ((value.kind == HirExprKind::BoundValue || value.kind == HirExprKind::ValueOf) && value.lhs)
+        return ws_output_literal_bounds(*value.lhs, locals, count, visits, depth + 1);
+    if (value.kind == HirExprKind::LetIn && value.rhs)
+        return ws_output_literal_bounds(*value.rhs, locals, count, visits, depth + 1);
+    if (value.kind == HirExprKind::StringConcat && value.lhs && value.rhs) {
+        const auto kLhs = ws_output_literal_bounds(*value.lhs, locals, count, visits, depth + 1);
+        const auto kRhs = ws_output_literal_bounds(*value.rhs, locals, count, visits, depth + 1);
+        const u64 kSize = static_cast<u64>(kLhs.minimum) + kRhs.minimum;
+        return {kSize > 0xffffffffu ? 0xffffffffu : static_cast<u32>(kSize),
+                kLhs.valid_utf8 && kRhs.valid_utf8,
+                kLhs.complete && kRhs.complete};
+    }
+    if (value.kind == HirExprKind::IfElse && value.lhs && value.rhs && value.args.len == 1 &&
+        value.args[0]) {
+        ConstValue condition{};
+        if (const_eval_expr(*value.lhs, locals, count, &condition, 0) &&
+            condition.type == HirTypeKind::Bool)
+            return ws_output_literal_bounds(condition.bool_value ? *value.rhs : *value.args[0],
+                                            locals,
+                                            count,
+                                            visits,
+                                            depth + 1);
+        const auto kYes = ws_output_literal_bounds(*value.rhs, locals, count, visits, depth + 1);
+        const auto kNo = ws_output_literal_bounds(*value.args[0], locals, count, visits, depth + 1);
+        return {kYes.minimum < kNo.minimum ? kYes.minimum : kNo.minimum,
+                kYes.valid_utf8 && kNo.valid_utf8,
+                kYes.complete && kNo.complete};
+    }
+    return {};
+}
+#endif
+
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
                                                           HirRoute* scratch,
                                                           const HirModule& mod,
@@ -3895,6 +3949,37 @@ static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
     if (!lhs) return core::make_unexpected(lhs.error());
     auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
     if (!rhs) return core::make_unexpected(rhs.error());
+    if (expr.kind == AstExprKind::Add && lhs->type == HirTypeKind::Str &&
+        rhs->type == HirTypeKind::Str && !lhs->may_nil && !lhs->may_error && !rhs->may_nil &&
+        !rhs->may_error) {
+        if (lhs->kind == HirExprKind::StrLit && rhs->kind == HirExprKind::StrLit) {
+            if (rhs->str_value.len > 262144 || lhs->str_value.len > 262144 - rhs->str_value.len)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("String concatenation exceeds its byte budget"));
+            std::string text(lhs->str_value.ptr ? lhs->str_value.ptr : "", lhs->str_value.len);
+            if (rhs->str_value.len) text.append(rhs->str_value.ptr, rhs->str_value.len);
+            auto owned = intern_analysis_string(mod, std::move(text));
+            if (!owned) return core::make_unexpected(owned.error());
+            HirExpr literal{};
+            literal.kind = HirExprKind::StrLit;
+            literal.type = HirTypeKind::Str;
+            literal.span = expr.span;
+            literal.str_value = owned.value();
+            return literal;
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::StringConcat;
+        out.type = HirTypeKind::Str;
+        out.span = expr.span;
+        if (!route->exprs.push(lhs.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(rhs.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
     adopt_int_literal_type(&lhs.value(), &rhs.value());
     const bool int_typed = (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&
                            (rhs->type == HirTypeKind::I32 || rhs->type == HirTypeKind::I64);
@@ -4954,6 +5039,28 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (recv.may_nil || recv.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
+    if (recv.type == HirTypeKind::Str && expr.args.len == 1 &&
+        (expr.name.eq(lit_str("hasPrefix")) || expr.name.eq(lit_str("hasSuffix")) ||
+         expr.name.eq(lit_str("contains")))) {
+        auto needle = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!needle) return core::make_unexpected(needle.error());
+        if (needle->type != HirTypeKind::Str || needle->may_nil || needle->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        HirExpr out{};
+        out.kind = HirExprKind::StringPredicate;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        out.int_value = expr.name.eq(lit_str("hasPrefix"))   ? 0
+                        : expr.name.eq(lit_str("hasSuffix")) ? 1
+                                                             : 2;
+        if (!route->exprs.push(recv)) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(needle.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
     if (expr.name.eq({"matches", 7}) && recv.type == HirTypeKind::Str && expr.args.len == 1 &&
         expr.args[0]->kind == AstExprKind::RegexLit) {
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
@@ -5585,6 +5692,155 @@ static u8 route_method_key_from_token(u8 token_type) {
     }
 }
 
+static bool uses_lexical_values(const HirRoute* route) {
+    return route != nullptr && (route->is_ws_callback || route->is_lexical_helper);
+}
+
+static FrontendResult<HirExpr> function_call_body(const HirFunction& fn,
+                                                  const HirRoute* route,
+                                                  Span span) {
+    const bool kLexical = uses_lexical_values(route);
+    const bool kStringBody = hir_has_string_construction(fn.body);
+    if (!kLexical && (!kStringBody || fn.lexical_body_index >= fn.exprs.len)) return fn.body;
+    if (fn.lexical_body_index >= fn.exprs.len)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              span,
+                              lit_str("helper requires lexical error/effect integration"));
+    return fn.exprs[fn.lexical_body_index];
+}
+
+// Only proven immutable computations may be substituted at multiple/zero uses.
+// Unknown operations conservatively retain their evaluation at the call site.
+static bool call_argument_needs_evaluation(const HirExpr& value, u32 depth = 0) {
+    if (depth > 128) return true;
+    if (value.kind == HirExprKind::BoundValue) return false;
+    switch (value.kind) {
+        case HirExprKind::BoolLit:
+        case HirExprKind::IntLit:
+        case HirExprKind::StrLit:
+        case HirExprKind::BytesLit:
+        case HirExprKind::ConstMethod:
+        case HirExprKind::ConstWsCase:
+        case HirExprKind::Nil:
+        case HirExprKind::Error:
+        case HirExprKind::LocalRef:
+        case HirExprKind::WsMessageField:
+        case HirExprKind::BytesCount:
+        case HirExprKind::Eq:
+        case HirExprKind::Lt:
+        case HirExprKind::Gt:
+        case HirExprKind::BitAnd:
+        case HirExprKind::BitOr:
+        case HirExprKind::BitXor:
+        case HirExprKind::BitShl:
+        case HirExprKind::BitShr:
+        case HirExprKind::Add:
+        case HirExprKind::Sub:
+        case HirExprKind::Mul:
+        case HirExprKind::Div:
+        case HirExprKind::Mod:
+        case HirExprKind::WidenI64:
+        case HirExprKind::MaxInt:
+        case HirExprKind::MinInt:
+        case HirExprKind::Or:
+        case HirExprKind::NoError:
+        case HirExprKind::HasValue:
+        case HirExprKind::ValueOf:
+        case HirExprKind::MissingOf:
+        case HirExprKind::Tuple:
+        case HirExprKind::TupleSlot:
+        case HirExprKind::StructInit:
+        case HirExprKind::Field:
+        case HirExprKind::VariantCase:
+        case HirExprKind::VariantTag:
+        case HirExprKind::IfElse:
+            break;
+        default:
+            return true;
+    }
+    if (value.lhs && call_argument_needs_evaluation(*value.lhs, depth + 1)) return true;
+    if (value.rhs && call_argument_needs_evaluation(*value.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && call_argument_needs_evaluation(*value.args[i], depth + 1)) return true;
+    for (u32 i = 0; i < value.field_inits.len; ++i)
+        if (value.field_inits[i].value &&
+            call_argument_needs_evaluation(*value.field_inits[i].value, depth + 1))
+            return true;
+    return false;
+}
+
+struct LexicalCallArguments {
+    HirRoute* route;
+    FixedVec<HirExpr*, AstExpr::kMaxArgs + 1> initializers;
+
+    FrontendResult<void> bind(HirExpr& value) {
+        if (route == nullptr ||
+            (!uses_lexical_values(route) && !hir_has_string_construction(value)))
+            return {};
+        const bool kEvaluated = call_argument_needs_evaluation(value);
+        if (value.type == HirTypeKind::WebSocketMessage && kEvaluated)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                value.span,
+                lit_str("a borrowed message alias cannot carry runtime initialization"));
+        if (value.type == HirTypeKind::WebSocketMessage || !kEvaluated) return {};
+        if (!route->exprs.push(value))
+            return frontend_error(FrontendError::OutOfMemory, value.span);
+        HirExpr* key = &route->exprs[route->exprs.len - 1];
+        if (!initializers.push(key)) return frontend_error(FrontendError::TooManyItems, value.span);
+        value.kind = HirExprKind::BoundValue;
+        value.lhs = key;
+        value.rhs = nullptr;
+        value.args.len = 0;
+        value.field_inits.len = 0;
+        return {};
+    }
+
+    FrontendResult<HirExpr> finish(HirExpr body) {
+        for (u32 i = initializers.len; i > 0; --i) {
+            if (!route->exprs.push(body))
+                return frontend_error(FrontendError::OutOfMemory, body.span);
+            body.kind = HirExprKind::LetIn;
+            body.lhs = initializers[i - 1];
+            body.rhs = &route->exprs[route->exprs.len - 1];
+            body.args.len = 0;
+            body.field_inits.len = 0;
+        }
+        return body;
+    }
+};
+
+static FrontendResult<HirExpr> inline_function_call(const HirFunction& fn,
+                                                    HirRoute* route,
+                                                    const HirModule& mod,
+                                                    const HirExpr* args,
+                                                    u32 arg_count,
+                                                    const GenericBinding* generic_bindings,
+                                                    u32 generic_binding_count,
+                                                    Span span,
+                                                    const ExprValueBinding* bindings = nullptr) {
+    if (arg_count > AstExpr::kMaxArgs) return frontend_error(FrontendError::TooManyItems, span);
+    HirExpr values[AstExpr::kMaxArgs]{};
+    LexicalCallArguments evaluated{route, {}};
+    for (u32 i = 0; i < arg_count; ++i) {
+        values[i] = args[i];
+        auto bound = evaluated.bind(values[i]);
+        if (!bound) return core::make_unexpected(bound.error());
+    }
+    auto body = function_call_body(fn, route, span);
+    if (!body) return core::make_unexpected(body.error());
+    auto result = instantiate_function_expr(body.value(),
+                                            route,
+                                            mod,
+                                            values,
+                                            arg_count,
+                                            generic_bindings,
+                                            generic_binding_count,
+                                            bindings);
+    if (!result) return core::make_unexpected(result.error());
+    return evaluated.finish(result.value());
+}
+
 static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          HirRoute* route,
                                                          const HirModule& mod,
@@ -5754,14 +6010,15 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         }
         if (fn.respond_guards.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, fn.name);
-        auto inlined = instantiate_function_expr(fn.body,
-                                                 route,
-                                                 mod,
-                                                 call_args,
-                                                 call_arg_count,
-                                                 impl_bindings,
-                                                 impl_binding_count,
-                                                 bindings);
+        auto inlined = inline_function_call(fn,
+                                            route,
+                                            mod,
+                                            call_args,
+                                            call_arg_count,
+                                            impl_bindings,
+                                            impl_binding_count,
+                                            expr.span,
+                                            bindings);
         if (!inlined) return core::make_unexpected(inlined.error());
         if (fn.return_type != HirTypeKind::Unknown &&
             (inlined->kind == HirExprKind::Nil || inlined->kind == HirExprKind::Error)) {
@@ -5958,6 +6215,25 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     out.span = expr.span;
+    if (out.kind == HirExprKind::StringConcat && out.lhs && out.rhs) {
+        ConstValue lhs{};
+        ConstValue rhs{};
+        if (const_eval_expr(*out.lhs, nullptr, 0, &lhs, 0) && lhs.type == HirTypeKind::Str &&
+            const_eval_expr(*out.rhs, nullptr, 0, &rhs, 0) && rhs.type == HirTypeKind::Str) {
+            if (rhs.str_value.len > 262144 || lhs.str_value.len > 262144 - rhs.str_value.len)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("String concatenation exceeds its byte budget"));
+            std::string text(lhs.str_value.ptr ? lhs.str_value.ptr : "", lhs.str_value.len);
+            if (rhs.str_value.len) text.append(rhs.str_value.ptr, rhs.str_value.len);
+            auto owned = intern_analysis_string(mod, std::move(text));
+            if (!owned) return core::make_unexpected(owned.error());
+            out.kind = HirExprKind::StrLit;
+            out.str_value = owned.value();
+            out.lhs = nullptr;
+            out.rhs = nullptr;
+        }
+    }
     auto policy = normalize_rs256_policy(out, route, route->locals.data, route->locals.len);
     if (!policy) return core::make_unexpected(policy.error());
     auto ec_policy = normalize_es256_policy(out, route, route->locals.data, route->locals.len);
@@ -6388,7 +6664,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                         Span span) -> FrontendResult<HirExpr*> {
         // Presence tests and narrowed reads must share a reached producer. Keep
         // known nil/error handling on its existing dead-branch typing path.
-        if (!scratch->is_ws_callback ||
+        if (!uses_lexical_values(scratch) ||
+            (scratch->is_lexical_helper && !call_argument_needs_evaluation(value)) ||
             known_value_state(value, scope, count, 0) != KnownValueState::Unknown)
             return static_cast<HirExpr*>(nullptr);
         if (!scratch->exprs.push(value)) return frontend_error(FrontendError::OutOfMemory, span);
@@ -6470,6 +6747,18 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                            known.str_value.len > scratch->ws_handler.max_message_size) ||
                           (value->type == HirTypeKind::Str &&
                            !ws_valid_text_payload(known.str_value)))))
+                        return frontend_error(FrontendError::UnsupportedSyntax, call.args[i]->span);
+                }
+                if (kForward || i == 1) {
+                    u32 visits = 0;
+                    const auto kBounds =
+                        ws_output_literal_bounds(value.value(), locals, local_count, visits);
+                    if (!kBounds.complete)
+                        return frontend_error(FrontendError::TooManyItems, call.args[i]->span);
+                    const u32 kMaximum = kForward ? scratch->ws_handler.max_message_size : 123u;
+                    if ((value->type == HirTypeKind::Str && !kBounds.valid_utf8) ||
+                        kBounds.minimum > (kForward ? kWsTerminateMessageCapacity : 123u) ||
+                        (kMaximum && kBounds.minimum > kMaximum))
                         return frontend_error(FrontendError::UnsupportedSyntax, call.args[i]->span);
                 }
                 operands[i] = value.value();
@@ -6969,7 +7258,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 auto init = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 scratch->uuid_init_ok = kSavedUuidInitOk;
                 if (!init) return core::make_unexpected(init.error());
-                if (scratch->is_ws_callback && init->may_error)
+                if (uses_lexical_values(scratch) && init->type == HirTypeKind::WebSocketMessage &&
+                    call_argument_needs_evaluation(init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.expr.span,
+                        lit_str("a borrowed message alias cannot carry runtime initialization"));
+                if (uses_lexical_values(scratch) && init->may_error)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax,
                         inner.expr.span,
@@ -7013,10 +7308,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 local.shape_index = init->shape_index;
                 local.init = init.value();
                 HirExpr* initializer_key = nullptr;
-#if RUT_ENABLE_WEBSOCKET
                 // A message alias has no runtime carrier. Scalar/Bytes values
                 // use a real lexical binding, including unused nullable work.
-                if (scratch->is_ws_callback && init->type != HirTypeKind::WebSocketMessage) {
+                if (uses_lexical_values(scratch) && init->type != HirTypeKind::WebSocketMessage &&
+                    (scratch->is_ws_callback || call_argument_needs_evaluation(init.value()))) {
                     if (!scratch->exprs.push(init.value()))
                         return frontend_error(FrontendError::OutOfMemory, inner.span);
                     initializer_key = &scratch->exprs[scratch->exprs.len - 1];
@@ -7026,7 +7321,6 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     local.init.args.len = 0;
                     local.init.field_inits.len = 0;
                 }
-#endif
                 auto inserted = insert_scoped_local(
                     next_locals, next_count, HirRoute::kMaxLocals, local, inner.span);
                 if (!inserted) return core::make_unexpected(inserted.error());
@@ -7377,6 +7671,22 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 return finish_message_initializer(initializer_key, out, inner.span);
             }
+            if (scratch->is_ws_callback && !is_last && inner.kind == AstStmtKind::If &&
+                inner.else_stmt == nullptr && inner.then_stmt != nullptr) {
+                // An early terminal branch resumes at the following statements
+                // only when its condition/binding is absent. Analyze the tail in
+                // the outer scope, and reuse the ordinary lazy IfElse lowering.
+                AstStatement tail{};
+                tail.kind = AstStmtKind::Block;
+                tail.span = stmt.span;
+                for (u32 next = si + 1; next < stmt.block_stmts.len; ++next)
+                    if (!tail.block_stmts.push(stmt.block_stmts[next]))
+                        return frontend_error(FrontendError::TooManyItems, inner.span);
+                AstStatement choice = inner;
+                choice.else_stmt = &tail;
+                return analyze_function_body_stmt(
+                    choice, scratch, mod, cur_locals, cur_local_count, binding, false);
+            }
             if (!is_last && inner.kind != AstStmtKind::Let && inner.kind != AstStmtKind::Guard)
                 return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
             return analyze_function_body_stmt(inner,
@@ -7456,6 +7766,71 @@ static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
     }
 
     return false;
+}
+
+// Function declarations retain their existing HTTP control/effect representation.
+// Message calls reuse the same analyzer with real lexical initializers, then
+// normalize the result into the function's owning pool (never retain AST views).
+static FrontendResult<void> build_lexical_function_body(const AstStatement& source,
+                                                        HirFunction& fn,
+                                                        const HirModule& mod,
+                                                        const HirLocal* params,
+                                                        u32 error_variant_index) {
+    fn.lexical_body_index = 0xffffffffu;
+    if (fn.has_non_response_statement_effect || fn.respond_guards.len != 0) return {};
+    auto scratch = std::make_unique<HirRoute>();
+    scratch->is_helper_scratch = true;
+    scratch->is_lexical_helper = true;
+    scratch->error_variant_index = error_variant_index;
+    auto body = analyze_function_body_stmt(
+        source, scratch.get(), mod, params, fn.params.len, nullptr, false);
+    if (!body) {
+        // A valid HTTP helper can still use recovery/effects unavailable in a
+        // synchronous message callback. Reject that call, not the declaration.
+        if (body.error().code == FrontendError::UnsupportedSyntax) return {};
+        return core::make_unexpected(body.error());
+    }
+    // Contextual nil/error results need the declaration's complete type shape
+    // through a lexical continuation, rather than only on its outer LetIn.
+    const auto kAdoptMissing = [&](auto&& self, HirExpr& value) -> void {
+        if (value.type == HirTypeKind::Unknown && (value.may_nil || value.may_error)) {
+            value.type = fn.body.type;
+            value.generic_index = fn.body.generic_index;
+            value.associated_name = fn.body.associated_name;
+            value.generic_has_error_constraint = fn.body.generic_has_error_constraint;
+            value.generic_has_eq_constraint = fn.body.generic_has_eq_constraint;
+            value.generic_has_ord_constraint = fn.body.generic_has_ord_constraint;
+            value.generic_protocol_index = fn.body.generic_protocol_index;
+            value.generic_protocol_count = fn.body.generic_protocol_count;
+            for (u32 i = 0; i < value.generic_protocol_count; ++i)
+                value.generic_protocol_indices[i] = fn.body.generic_protocol_indices[i];
+            value.variant_index = fn.body.variant_index;
+            value.struct_index = fn.body.struct_index;
+            value.shape_index = fn.body.shape_index;
+            value.tuple_len = fn.body.tuple_len;
+            for (u32 i = 0; i < value.tuple_len; ++i) {
+                value.tuple_types[i] = fn.body.tuple_types[i];
+                value.tuple_variant_indices[i] = fn.body.tuple_variant_indices[i];
+                value.tuple_struct_indices[i] = fn.body.tuple_struct_indices[i];
+            }
+            if (value.kind == HirExprKind::LetIn && value.rhs) self(self, *value.rhs);
+            if (value.kind == HirExprKind::IfElse) {
+                if (value.rhs) self(self, *value.rhs);
+                if (value.args.len && value.args[0]) self(self, *value.args[0]);
+            }
+        }
+    };
+    kAdoptMissing(kAdoptMissing, body.value());
+    HirLocal locals[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
+    u32 count = 0;
+    for (u32 i = 0; i < fn.params.len; ++i) locals[count++] = params[i];
+    for (u32 i = 0; i < scratch->locals.len; ++i) locals[count++] = scratch->locals[i];
+    auto normalized = normalize_function_expr(body.value(), &fn, locals, count, fn.params.len);
+    if (!normalized) return core::make_unexpected(normalized.error());
+    if (!fn.exprs.push(normalized.value()))
+        return frontend_error(FrontendError::OutOfMemory, source.span);
+    fn.lexical_body_index = fn.exprs.len - 1;
+    return {};
 }
 
 #if RUT_ENABLE_WEBSOCKET
@@ -10651,6 +11026,25 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return out;
         }
 #endif
+        if (base->type == HirTypeKind::Str && expr.name.eq(lit_str("isEmpty"))) {
+            if (base->may_nil || base->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            out.kind = HirExprKind::StringPredicate;
+            out.type = HirTypeKind::Bool;
+            out.int_value = 3;
+            out.span = expr.span;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            HirExpr empty{};
+            empty.kind = HirExprKind::StrLit;
+            empty.type = HirTypeKind::Str;
+            empty.str_value = lit_str("");
+            if (!route->exprs.push(empty))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.rhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
         if (base->type == HirTypeKind::Bytes) {
             if (base->may_nil || base->may_error ||
                 (!expr.name.eq(lit_str("count")) && !expr.name.eq(lit_str("isEmpty"))))
@@ -13555,6 +13949,15 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
         return {};
     };
+    LexicalCallArguments pipe_input{route, {}};
+    HirExpr pipe_value{};
+    if (pipe_lhs != nullptr &&
+        (uses_lexical_values(route) || hir_has_string_construction(*pipe_lhs))) {
+        pipe_value = *pipe_lhs;
+        auto bound = pipe_input.bind(pipe_value);
+        if (!bound) return core::make_unexpected(bound.error());
+        pipe_lhs = &pipe_value;
+    }
     if (pipe_lhs != nullptr) {
         const auto lhs_state = known_value_state(*pipe_lhs, locals, local_count, 0);
         if (lhs_state == KnownValueState::Nil) {
@@ -13582,7 +13985,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             }
             folded.span = expr.span;
             folded.may_nil = true;
-            return folded;
+            return pipe_input.finish(folded);
         }
         if (lhs_state == KnownValueState::Error) {
             const HirExpr* err_expr = known_error_expr(*pipe_lhs, locals, local_count, 0);
@@ -13611,7 +14014,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             folded.span = expr.span;
             folded.may_nil = false;
             folded.may_error = true;
-            return folded;
+            return pipe_input.finish(folded);
         }
         if (lhs_state == KnownValueState::Unknown && (pipe_lhs->may_nil || pipe_lhs->may_error)) {
             u32 placeholder_count = 0;
@@ -13693,13 +14096,14 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     expr.span,
                     "respond-capable helper calls are not supported in conditional pipe",
                     nullptr);
-            auto then_expr = instantiate_function_expr(fn.body,
-                                                       route,
-                                                       mod,
-                                                       analyzed_args,
-                                                       effective_arg_count,
-                                                       generic_bindings,
-                                                       fn.type_params.len);
+            auto then_expr = inline_function_call(fn,
+                                                  route,
+                                                  mod,
+                                                  analyzed_args,
+                                                  effective_arg_count,
+                                                  generic_bindings,
+                                                  fn.type_params.len,
+                                                  expr.span);
             if (!then_expr) return core::make_unexpected(then_expr.error());
             auto pipe_then_typed = apply_return_type(then_expr.value(), "pipe conditional");
             if (!pipe_then_typed) return core::make_unexpected(pipe_then_typed.error());
@@ -13784,7 +14188,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.rhs = then_ptr;
             if (!out.args.push(else_ptr))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
-            return out;
+            return pipe_input.finish(out);
         }
     }
     HirExpr analyzed_args[AstExpr::kMaxArgs]{};
@@ -13835,13 +14239,14 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                               fn.type_params.len,
                                                               respond_guard_span);
     if (!respond_guards) return core::make_unexpected(respond_guards.error());
-    auto inlined = instantiate_function_expr(fn.body,
-                                             route,
-                                             mod,
-                                             analyzed_args,
-                                             effective_arg_count,
-                                             generic_bindings,
-                                             fn.type_params.len);
+    auto inlined = inline_function_call(fn,
+                                        route,
+                                        mod,
+                                        analyzed_args,
+                                        effective_arg_count,
+                                        generic_bindings,
+                                        fn.type_params.len,
+                                        expr.span);
     if (!inlined) {
         return core::make_unexpected(inlined.error());
     }
@@ -13853,7 +14258,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     // `if ok { 2147483648 } else { error(500) }` infers exactly that.
     if (inlined->type == HirTypeKind::I64 && inlined->may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
-    return inlined.value();
+    return pipe_input.finish(inlined.value());
 }
 
 static bool push_named_error_case(FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases>& cases,
@@ -21336,7 +21741,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (!normalized) return core::make_unexpected(normalized.error());
         fn.body = normalized.value();
         fn.uses_http_values = scratch->uses_http_values;
-        return {};
+        return build_lexical_function_body(
+            *ast_func.body, fn, mod, param_locals, scratch->error_variant_index);
     };
 
     auto resolve_impl_target_for_header =
@@ -22919,6 +23325,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (!normalized) return core::make_unexpected(normalized.error());
         fn.body = normalized.value();
         fn.uses_http_values = scratch.uses_http_values;
+        auto lexical = build_lexical_function_body(
+            *item.func.body, fn, mod, param_locals, scratch.error_variant_index);
+        if (!lexical) return core::make_unexpected(lexical.error());
     }
 
     for (u32 i = 0; i < file.items.len; i++) {

@@ -2859,3 +2859,61 @@ TEST(RirVerifier, WebSocketOutputChecksCarrierOpcodeArityAndResultType) {
     CHECK(std::string(output_text, print.len).find("ws.close %1, %0") != std::string::npos);
     ctx.destroy();
 }
+
+TEST(RirVerifier, StringOperationsRejectForgedCarriersArityAndPredicateIds) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("strings"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto text = V(b.emit_const_str(lit("text")));
+    auto number = V(b.emit_const_i32(1));
+    CHECK_FALSE(b.emit_str_predicate(text, number, 0));
+    CHECK_FALSE(b.emit_str_predicate(number, text, 0));
+    CHECK_FALSE(b.emit_str_predicate(text, text, 4));
+    ValueId parts[65];
+    for (auto& part : parts) part = text;
+    CHECK_FALSE(b.emit_str_interpolate(parts, 0));
+    CHECK_FALSE(b.emit_str_interpolate(parts, 65));
+    CHECK_FALSE(b.emit_str_interpolate(nullptr, 2));
+    parts[0] = number;
+    CHECK_FALSE(b.emit_str_interpolate(parts, 2));
+    parts[0] = text;
+    V(b.emit_str_predicate(text, text, 3));
+    V(b.emit_str_interpolate(parts, 2));
+    V(b.emit_str_interpolate(parts, 64));
+    VOK(b.emit_ret_status(200));
+    REQUIRE(verify_function(fn).ok);
+    for (u32 index : {2u, 3u, 4u}) {
+        auto& instruction = fn->entry()->insts[index];
+        const Instruction saved = instruction;
+        for (u32 mode = 0; mode < 6; ++mode) {
+            instruction = saved;
+            if (mode == 0) instruction.operand_count = 0;
+            if (mode == 1) instruction.operand_count = 65;
+            if (mode == 2) instruction.operands[0] = number;
+            if (mode == 3) instruction.result = number;
+            if (mode == 4) {
+                if (index == 2)
+                    instruction.imm.i32_val = 4;
+                else if (index == 3)
+                    instruction.operands[1] = kNoValue;
+                else
+                    instruction.extra_operands = nullptr;
+            }
+            if (mode == 5) {
+                if (index == 4)
+                    instruction.extra_operands[0] = number;
+                else
+                    instruction.extra_operands = &number;
+            }
+            CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidStringOperation);
+            if (mode == 5 && index == 4) instruction.extra_operands[0] = text;
+        }
+        instruction = saved;
+        REQUIRE(verify_function(fn).ok);
+    }
+    tc.destroy();
+}

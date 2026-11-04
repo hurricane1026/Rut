@@ -1317,59 +1317,65 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
     if (value.kind == MirValueKind::LetIn) {
         if (value.lhs == nullptr || value.rhs == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, span);
-        const MirValue& initializer = *value.lhs;
-        MirLocal local{};
-        local.span = span;
-        local.type = initializer.type;
-        local.shape_index = initializer.shape_index;
-        local.may_nil = initializer.may_nil;
-        local.may_error = initializer.may_error;
-        local.variant_index = initializer.variant_index;
-        local.struct_index = initializer.struct_index;
-        local.error_struct_index = initializer.error_struct_index;
-        local.error_variant_index = initializer.error_variant_index;
-        local.tuple_len = initializer.tuple_len;
-        if (local.tuple_len > kMaxMirTupleSlots)
-            return frontend_error(FrontendError::UnsupportedSyntax, span);
-        for (u32 i = 0; i < local.tuple_len; ++i) {
-            local.tuple_types[i] = initializer.tuple_types[i];
-            local.tuple_variant_indices[i] = initializer.tuple_variant_indices[i];
-            local.tuple_struct_indices[i] = initializer.tuple_struct_indices[i];
-        }
-        local.init = initializer;
-        const auto* error_type = error_scalar_infos[static_cast<u32>(MirTypeKind::I32)].error_type;
-        if (error_type == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
-        auto evaluated = materialize_local_init(local,
-                                                mir,
-                                                variant_infos,
-                                                tuple_infos,
-                                                tuple_info_count,
-                                                error_scalar_infos,
-                                                error_variant_infos,
-                                                error_struct_infos,
-                                                error_type->struct_def,
-                                                user_struct_defs,
-                                                b,
-                                                locals,
-                                                local_count,
-                                                b.cur_func->name,
-                                                b.mod->name);
+        const auto kInitialize = [&](const MirValue& initializer) -> FrontendResult<rir::ValueId> {
+            MirLocal local{};
+            local.span = span;
+            local.type = initializer.type;
+            local.shape_index = initializer.shape_index;
+            local.may_nil = initializer.may_nil;
+            local.may_error = initializer.may_error;
+            local.variant_index = initializer.variant_index;
+            local.struct_index = initializer.struct_index;
+            local.error_struct_index = initializer.error_struct_index;
+            local.error_variant_index = initializer.error_variant_index;
+            local.tuple_len = initializer.tuple_len;
+            if (local.tuple_len > kMaxMirTupleSlots)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            for (u32 i = 0; i < local.tuple_len; ++i) {
+                local.tuple_types[i] = initializer.tuple_types[i];
+                local.tuple_variant_indices[i] = initializer.tuple_variant_indices[i];
+                local.tuple_struct_indices[i] = initializer.tuple_struct_indices[i];
+            }
+            local.init = initializer;
+            const auto* error_type =
+                error_scalar_infos[static_cast<u32>(MirTypeKind::I32)].error_type;
+            if (error_type == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            return materialize_local_init(local,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          error_type->struct_def,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          b.cur_func->name,
+                                          b.mod->name);
+        };
+        auto evaluated = kInitialize(*value.lhs);
         if (!evaluated) return core::make_unexpected(evaluated.error());
         const rir::Builder::ValueBinding kBinding{value.lhs, evaluated.value(), b.value_bindings};
         b.value_bindings = &kBinding;
-        auto result = materialize_value(*value.rhs,
-                                        mir,
-                                        variant_infos,
-                                        tuple_infos,
-                                        tuple_info_count,
-                                        error_scalar_infos,
-                                        error_variant_infos,
-                                        error_struct_infos,
-                                        user_struct_defs,
-                                        b,
-                                        locals,
-                                        local_count,
-                                        span);
+        auto result = value.rhs->kind == MirValueKind::Nil || value.rhs->kind == MirValueKind::Error
+                          ? kInitialize(*value.rhs)
+                          : materialize_value(*value.rhs,
+                                              mir,
+                                              variant_infos,
+                                              tuple_infos,
+                                              tuple_info_count,
+                                              error_scalar_infos,
+                                              error_variant_infos,
+                                              error_struct_infos,
+                                              user_struct_defs,
+                                              b,
+                                              locals,
+                                              local_count,
+                                              span);
         b.value_bindings = kBinding.parent;
         return result;
     }
@@ -1389,6 +1395,42 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         auto v = b.emit_const_str(value.str_value, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
+    }
+    if (value.kind == MirValueKind::StringConcat || value.kind == MirValueKind::StringPredicate) {
+        const bool kPredicate = value.kind == MirValueKind::StringPredicate;
+        if (!value.lhs || !value.rhs || value.lhs->type != MirTypeKind::Str ||
+            value.rhs->type != MirTypeKind::Str || value.lhs->may_nil || value.lhs->may_error ||
+            value.rhs->may_nil || value.rhs->may_error || value.may_nil || value.may_error ||
+            value.type != (kPredicate ? MirTypeKind::Bool : MirTypeKind::Str) ||
+            (kPredicate && (value.int_value < 0 || value.int_value > 3)))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        const auto kOperand = [&](const MirValue& input) {
+            return materialize_value(input,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        };
+        auto lhs = kOperand(*value.lhs);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = kOperand(*value.rhs);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        rir::ValueId parts[] = {lhs.value(), rhs.value()};
+        auto result =
+            kPredicate
+                ? b.emit_str_predicate(
+                      parts[0], parts[1], static_cast<u32>(value.int_value), {span.line, span.col})
+                : b.emit_str_interpolate(parts, 2, {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
     }
     if (value.kind == MirValueKind::RegexMatch) {
         auto lhs = materialize_value(*value.lhs,
@@ -5572,7 +5614,8 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
 
         for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
             b.set_insert_point(fn.value(),
-                               mir.functions[i].is_ws_callback && bi == 0 && !has_error_prelude
+                               bi == 0 && !has_error_prelude && mir.functions[i].waits.len == 0 &&
+                                       !mir.functions[i].has_explicit_resume_blocks
                                    ? kLocalContinuation
                                    : block_ids[bi]);
             if (mir.functions[i].has_explicit_resume_blocks) {

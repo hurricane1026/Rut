@@ -2947,6 +2947,20 @@ Text/Binary kinds; Ping/Pong/Close/Continuation remain runtime protocol events.
 The old Boolean properties remain supported. Contextual case inference and
 closed-case exhaustive matching are not part of this projection support.
 
+General message callbacks retain lexical bindings through ordinary pure helper
+inlining. Reached helper local/guard producers and actual arguments run once,
+including unused resource-producing arguments; argument order is preserved and
+only the selected branch executes. Pure immutable message/scalar projections
+may be substituted. Error/effect-capable helper integration remains pending and
+unsupported bodies are diagnosed instead of silently dropping work.
+
+Unwrapped String concatenation and the byte-exact `hasPrefix`, `hasSuffix`,
+`contains` and `isEmpty` operations share the HTTP compiler path. Concatenation
+owns bytes in the existing bounded arena and stops on allocation failure. Text
+publication still checks UTF-8 and message/frame limits; known invalid literal
+components and a proven minimum output exceeding a limit are compile errors.
+General source interpolation and Bytes concatenation remain unsupported.
+
 `message.payload` projects an immutable `Bytes` view of the complete payload,
 regardless of message kind. It borrows the runtime message buffer for the
 synchronous callback; helpers cannot retain it past that callback. The public

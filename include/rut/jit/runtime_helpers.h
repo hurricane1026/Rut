@@ -423,6 +423,20 @@ rut::u8 rut_helper_str_regex_result(const char* s, rut::u32 s_len, void* db);
 // Returns 1 when the Vectorscan backend is available.
 rut::u8 rut_helper_regex_backend_available();
 
+// Byte-exact suffix predicate; empty needle matches any valid String.
+rut::u8 rut_helper_str_has_suffix(const char* text,
+                                  rut::u32 size,
+                                  const char* needle,
+                                  rut::u32 needle_size);
+// Bounded String concatenation into the existing invocation arena. Returns 0
+// on invalid carriers or allocation failure, never a fabricated empty result.
+rut::u8 rut_helper_str_concat(void* conn,
+                              void* arena,
+                              const rut::Str* parts,
+                              rut::u32 count,
+                              const char** out_ptr,
+                              rut::u32* out_size);
+
 // Trim prefix from string. If s starts with pfx, out = remainder.
 // Otherwise out = s unchanged.
 void rut_helper_str_trim_prefix(const char* s,

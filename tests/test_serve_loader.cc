@@ -6,6 +6,8 @@
 #include "fixtures/ws_general_json.h"
 #include "fixtures/ws_general_regex.h"
 #include "fixtures/ws_hash_output.h"
+#include "fixtures/ws_helper_lexical.h"
+#include "fixtures/ws_helper_observables.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 // Tests for the .rut program loader (src/serve_loader.cc): the bridge that
@@ -6369,6 +6371,8 @@ TEST(serve_loader, websocket_optional_values_import_any_or_and_literal_pointer_p
         {"json.string(root).or(\"\")", "value == \"\"", "\"\"", "\"x\"", "null"},
         {"json.numberText(root).or(\"0\")", "value == \"0\"", "0", "1", "null"},
         {"any(json.string(root), input)", "value == \"null\"", "\"null\"", "false", "null"}};
+    test::WsCallbackProbe probe;
+    REQUIRE(probe.init());
     const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_optional_defaults").string();
     for (const auto& test : cases) {
         std::string helper = "func read(_ input: str) {\n";
@@ -6402,7 +6406,7 @@ route POST "/http" {
         for (bool client : {false, true}) {
             for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
                 const auto run = [&](const char* payload) {
-                    return handler(nullptr,
+                    return handler(probe.conn.get(),
                                    op,
                                    reinterpret_cast<const u8*>(payload),
                                    static_cast<u32>(strlen(payload)),
@@ -6436,16 +6440,17 @@ route GET "/ws" { return websocket(ws) { msg in
     std::filesystem::remove(path);
     const auto& route = program.config.routes[0];
     REQUIRE(route.ws_frame_handler);
-    CHECK(route.ws_forward_text.source_path.eq(lit_str("/a~1b")));
+    CHECK(route.ws_forward_text.source == WsTextSource::Dynamic);
     for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
         for (bool client : {false, true}) {
             const char* payload = "{\"a/b\":\"ok\"}";
-            CHECK(route.ws_frame_handler(nullptr,
-                                         op,
-                                         reinterpret_cast<const u8*>(payload),
-                                         static_cast<u32>(strlen(payload)),
-                                         client) ==
-                  (client ? WsFrameAction::ForwardText : WsFrameAction::Drop));
+            probe.expect(_tc,
+                         route.ws_frame_handler,
+                         op,
+                         Str{payload, static_cast<u32>(strlen(payload))},
+                         client,
+                         client ? WsFrameAction::ForwardText : WsFrameAction::Drop,
+                         lit_str("ok"));
         }
     }
 }
@@ -6585,99 +6590,7 @@ route GET "/scalar" { return websocket(ws) { msg in
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
     std::filesystem::remove(path);
-    REQUIRE_EQ(program.config.route_count, 6u);
-    const auto guard = program.config.routes[0].ws_frame_handler;
-    const auto branch = program.config.routes[1].ws_frame_handler;
-    const auto early = program.config.routes[2].ws_frame_handler;
-    const auto fallback = program.config.routes[3].ws_frame_handler;
-    const auto bare = program.config.routes[4].ws_frame_handler;
-    const auto scalar = program.config.routes[5].ws_frame_handler;
-    REQUIRE(guard);
-    REQUIRE(branch);
-    REQUIRE(early);
-    REQUIRE(fallback);
-    REQUIRE(bare);
-    REQUIRE(scalar);
-    struct Case {
-        const char* json;
-        WsFrameAction client;
-        WsFrameAction server;
-    };
-    const Case guards[] = {
-        {"{\"a\":\"okA\",\"b\":\"okB\"}",
-         WsFrameAction::ForwardText,
-         WsFrameAction::ForwardTextPolicy0},
-        {"{\"a\":\"\",\"b\":\"noB\"}", WsFrameAction::ClosePolicy0, WsFrameAction::ClosePolicy1},
-        {"{\"b\":\"okB\"}", WsFrameAction::Drop, WsFrameAction::ForwardTextPolicy0},
-        {"{\"a\":null,\"b\":\"okB\"}", WsFrameAction::Drop, WsFrameAction::ForwardTextPolicy0},
-        {"broken", WsFrameAction::Drop, WsFrameAction::Drop},
-        {"{\"a\":\"okA\",\"b\":false}", WsFrameAction::ForwardText, WsFrameAction::Drop}};
-    const Case branches[] = {
-        {"{\"a\":\"A\",\"b\":\"B\"}",
-         WsFrameAction::ForwardTextPolicy0,
-         WsFrameAction::ForwardTextPolicy1},
-        {"{\"a\":\"\",\"b\":\"\"}",
-         WsFrameAction::ForwardTextPolicy0,
-         WsFrameAction::ForwardTextPolicy1},
-        {"{\"b\":\"B\"}", WsFrameAction::ForwardText, WsFrameAction::ForwardTextPolicy1},
-        {"broken", WsFrameAction::ForwardText, WsFrameAction::ForwardText}};
-    const char* alternatives[] = {"{\"a\":\"A\",\"b\":\"B\"}",
-                                  "{\"b\":\"B\"}",
-                                  "{\"a\":null,\"b\":\"B\"}",
-                                  "{\"a\":false,\"b\":\"B\"}",
-                                  "{\"a\":\"\",\"b\":\"B\"}"};
-    const char* scalars[] = {"\"\"", "\"ok\"", "0", "1.2300e+999", "null"};
-    for (bool client : {false, true}) {
-        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
-            for (const auto& test : guards)
-                CHECK(guard(nullptr,
-                            op,
-                            reinterpret_cast<const u8*>(test.json),
-                            static_cast<u32>(strlen(test.json)),
-                            client) == (client ? test.client : test.server));
-            for (const auto& test : branches)
-                CHECK(branch(nullptr,
-                             op,
-                             reinterpret_cast<const u8*>(test.json),
-                             static_cast<u32>(strlen(test.json)),
-                             client) == (client ? test.client : test.server));
-            for (u32 i = 0; i < 5; ++i) {
-                const auto* bytes = reinterpret_cast<const u8*>(alternatives[i]);
-                const u32 size = static_cast<u32>(strlen(alternatives[i]));
-                const auto selected = i == 0 || i == 4 ? WsFrameAction::ForwardText
-                                      : i == 1         ? WsFrameAction::ForwardTextPolicy0
-                                                       : WsFrameAction::Drop;
-                CHECK(fallback(nullptr, op, bytes, size, client) == selected);
-                const auto resumed = !client                  ? WsFrameAction::ForwardText
-                                     : i == 0 || i == 4       ? WsFrameAction::ForwardTextPolicy0
-                                     : i == 1                 ? WsFrameAction::ForwardTextPolicy1
-                                     : op == WsOpcode::Binary ? WsFrameAction::ForwardTextPolicy2
-                                                              : WsFrameAction::Drop;
-                CHECK(early(nullptr, op, bytes, size, client) == resumed);
-                CHECK(scalar(nullptr,
-                             op,
-                             reinterpret_cast<const u8*>(scalars[i]),
-                             static_cast<u32>(strlen(scalars[i])),
-                             client) == (i < 2   ? WsFrameAction::ForwardText
-                                         : i < 4 ? WsFrameAction::ForwardTextPolicy0
-                                                 : WsFrameAction::Drop));
-            }
-            const char* valid = "{\"a\":\"okA\",\"b\":\"okB\"}";
-            CHECK(bare(nullptr,
-                       op,
-                       reinterpret_cast<const u8*>(valid),
-                       static_cast<u32>(strlen(valid)),
-                       client) == (client ? WsFrameAction::Close : WsFrameAction::ClosePolicy0));
-            CHECK(bare(nullptr, op, reinterpret_cast<const u8*>("broken"), 6, client) ==
-                  WsFrameAction::Close);
-        }
-    }
-    CHECK(program.config.routes[0].ws_forward_text.source_path.eq(lit_str("/a")));
-    CHECK(program.config.routes[0].ws_forward_texts[0].source_path.eq(lit_str("/b")));
-    CHECK_EQ(program.config.routes[4].ws_close_code, 1008u);
-    CHECK(program.config.routes[4].ws_close_reason.eq(lit_str("policy")));
-    CHECK(program.config.routes[5].ws_forward_text.source == WsTextSource::JsonString);
-    CHECK(program.config.routes[5].ws_forward_texts[0].source == WsTextSource::JsonNumberText);
+    test::ws_helper_observables::choices(_tc, program.config);
     program.destroy();
     std::filesystem::remove_all(dir);
 }
@@ -6743,73 +6656,7 @@ route GET "/different" { return websocket(ws) { msg in
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
     std::filesystem::remove(path);
-    REQUIRE_EQ(program.config.route_count, 5u);
-    const auto name = program.config.routes[0].ws_frame_handler;
-    const auto flag = program.config.routes[1].ws_frame_handler;
-    const auto root = program.config.routes[2].ws_frame_handler;
-    const auto nested = program.config.routes[3].ws_frame_handler;
-    const auto different = program.config.routes[4].ws_frame_handler;
-    REQUIRE(name);
-    REQUIRE(flag);
-    REQUIRE(root);
-    REQUIRE(nested);
-    REQUIRE(different);
-    for (bool client : {false, true}) {
-        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
-            const char* names[] = {
-                "{\"name\":\"a\\u0000b\"}", "{\"name\":\"\"}", "{}", "{\"name\":false}", "broken"};
-            for (u32 j = 0; j < 5; ++j)
-                CHECK(name(nullptr,
-                           op,
-                           reinterpret_cast<const u8*>(names[j]),
-                           static_cast<u32>(strlen(names[j])),
-                           client) ==
-                      (j < 2 ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
-            const char* flags[] = {
-                "{\"flag\":false}", "{\"flag\":true}", "{\"flag\":null}", "{}", "broken"};
-            for (u32 j = 0; j < 5; ++j)
-                CHECK(flag(nullptr,
-                           op,
-                           reinterpret_cast<const u8*>(flags[j]),
-                           static_cast<u32>(strlen(flags[j])),
-                           client) == (j == 0   ? WsFrameAction::ForwardTextPolicy0
-                                       : j == 1 ? WsFrameAction::ForwardTextPolicy1
-                                                : WsFrameAction::ForwardText));
-            const char* roots[] = {"\"\"", "\"ok\"", "null", "false", "broken"};
-            for (u32 j = 0; j < 5; ++j)
-                CHECK(root(nullptr,
-                           op,
-                           reinterpret_cast<const u8*>(roots[j]),
-                           static_cast<u32>(strlen(roots[j])),
-                           client) == (j < 2    ? WsFrameAction::ForwardText
-                                       : j == 4 ? WsFrameAction::ClosePolicy0
-                                                : WsFrameAction::Drop));
-            const char* paths[] = {"{\"a/b\":{\"~\":\"ok\"}}",
-                                   "{\"a/b\":{\"~\":\"\"}}",
-                                   "{}",
-                                   "{\"a/b\":{\"~\":false}}"};
-            for (u32 j = 0; j < 4; ++j)
-                CHECK(nested(nullptr,
-                             op,
-                             reinterpret_cast<const u8*>(paths[j]),
-                             static_cast<u32>(strlen(paths[j])),
-                             client) == (j < 2 ? WsFrameAction::ForwardText : WsFrameAction::Drop));
-            const char* different_paths[] = {"{\"a\":null,\"b\":\"second\"}",
-                                             "{\"a\":\"first\",\"b\":\"\"}",
-                                             "{\"b\":\"second\"}",
-                                             "{\"a\":null,\"b\":false}"};
-            for (u32 j = 0; j < 4; ++j)
-                CHECK(different(nullptr,
-                                op,
-                                reinterpret_cast<const u8*>(different_paths[j]),
-                                static_cast<u32>(strlen(different_paths[j])),
-                                client) ==
-                      (j < 2 ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
-        }
-    }
-    CHECK(program.config.routes[0].ws_forward_texts[0].source_path.eq(lit_str("/name")));
-    CHECK(program.config.routes[3].ws_forward_text.source_path.eq(lit_str("/a~1b/~0")));
-    CHECK(program.config.routes[4].ws_forward_texts[0].source_path.eq(lit_str("/b")));
+    test::ws_helper_observables::bindings(_tc, program.config);
     program.destroy();
     std::filesystem::remove_all(dir);
 }
@@ -7051,6 +6898,8 @@ TEST(serve_loader, websocket_helper_bindings_imported_extractors_preserve_option
                           {"get", "{}", false},
                           {"parse", "null", true},
                           {"parse", "broken", false}};
+    test::WsCallbackProbe probe;
+    REQUIRE(probe.init());
     const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_helper_extractors").string();
     for (const auto& test : cases) {
         const bool parse = strcmp(test.operation, "parse") == 0;
@@ -7080,12 +6929,14 @@ TEST(serve_loader, websocket_helper_bindings_imported_extractors_preserve_option
         const auto handler = program.config.routes[0].ws_frame_handler;
         REQUIRE(handler);
         for (bool client : {false, true})
-            CHECK(handler(nullptr,
-                          WsOpcode::Text,
-                          reinterpret_cast<const u8*>(test.value),
-                          static_cast<u32>(strlen(test.value)),
-                          client) ==
-                  (test.present ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+            probe.expect(
+                _tc,
+                handler,
+                WsOpcode::Text,
+                Str{test.value, static_cast<u32>(strlen(test.value))},
+                client,
+                test.present ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText,
+                test.present ? lit_str("present") : lit_str("missing"));
         program.destroy();
     }
     std::filesystem::remove_all(dir);
@@ -9900,6 +9751,17 @@ TEST(serve_loader, websocket_general_regex_uses_shared_values_after_source_remov
     REQUIRE(load_rut_program(path.c_str(), program, err));
     REQUIRE_EQ(unlink(path.c_str()), 0);
     test::ws_general_regex::check(program.config, _tc);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_helpers_and_arguments_evaluate_reached_producers_once) {
+    auto path =
+        write_file("/tmp/rut_ws_helper_lexical", "app.rut", test::ws_helper_lexical::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_helper_lexical::check(program.config, _tc);
     program.destroy();
 }
 #endif

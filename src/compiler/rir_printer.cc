@@ -282,6 +282,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::StrConstantTimeEqual:
             buf.put_cstr("str.constant_time_equal");
             break;
+        case Opcode::StrPredicate:
+            buf.put_cstr("str.predicate");
+            break;
         case Opcode::StrHasPrefix:
             buf.put_cstr("str.has_prefix");
             break;
@@ -826,6 +829,14 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_i64(static_cast<i64>(inst.imm.i32_val));
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::StrPredicate:
+            buf.put(' ');
+            buf.put_i32(inst.imm.i32_val);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
             break;
         case Opcode::HttpOriginListAllows:
         case Opcode::HttpTokenListAllows:

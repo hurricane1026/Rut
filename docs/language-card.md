@@ -92,6 +92,12 @@ bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 Statements end at newline (no semicolons). Blocks need no commas between items.
 Comments: `// line only`.
 
+Unwrapped `str` values also support `+` concatenation, `.hasPrefix(str)`,
+`.hasSuffix(str)`, `.contains(str)` and `.isEmpty`. These operations compare
+bytes; concatenation owns bounded arena storage and stops on allocation failure.
+They do not implicitly convert Bytes or optional values. Source interpolation
+remains restricted to the separately documented forms.
+
 ## Bindings and control flow
 
 ```swift
@@ -877,7 +883,11 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // Names are fresh within the callback (json is reserved); bindings never escape
 // their lexical continuation or become HTTP locals. Captured admission constants
 // retain a separate 16-local budget. Each source block has at most eight statements.
-// Error-capable lets, helper-internal single evaluation, cache work and
+// Pure helper locals/guards and reached actual arguments evaluate producers once,
+// including unused arguments; only selected branches execute. String +, hasPrefix,
+// hasSuffix, contains accept unwrapped String operands; isEmpty is a property.
+// Concatenation owns bounded arena bytes and stops execution on allocation failure.
+// Error/effect-capable helper integration, error-capable lets, cache work and
 // connection/close contexts still need integration. uuid() retains HTTP's
 // direct-let initializer restriction; failures are nil and must be unwrapped.
 //
@@ -1501,7 +1511,8 @@ not provided. Runnable example: [math.rut](../examples/math.rut).
 ```
 string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
          s.replace/split/slice s.matches(re"") s.match(re"")
-         ⏳ s.hasPrefix/hasSuffix/trimPrefix/trimSuffix
+         s.hasPrefix(str) s.hasSuffix(str)
+         ⏳ s.trimPrefix/trimSuffix
 hash:    md5/sha1/sha224/sha256/sha384/sha512(data) -> str? (lowercase hex)
          hmacMd5/hmacSha1/hmacSha224/hmacSha256/hmacSha384/hmacSha512(key, data) -> str?
          ⏳ fnv32 fnv64

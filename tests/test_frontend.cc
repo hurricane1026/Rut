@@ -7,6 +7,7 @@
 #include "fixtures/ws_general_json.h"
 #include "fixtures/ws_general_regex.h"
 #include "fixtures/ws_hash_output.h"
+#include "fixtures/ws_helper_lexical.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
@@ -236,8 +237,10 @@ func score(_ msg: WebSocketMessage) -> i32 => msg.payload.count * 2 + msg.len
     // accepting a forged view or manufacturing a stored message carrier.
     HirExpr* field = nullptr;
     for (u32 i = 0; i < hir->functions[0].exprs.len; ++i)
-        if (hir->functions[0].exprs[i].kind == HirExprKind::WsMessageField)
+        if (hir->functions[0].exprs[i].kind == HirExprKind::WsMessageField) {
             field = &hir->functions[0].exprs[i];
+            break;
+        }
     REQUIRE(field != nullptr);
     const HirTypeKind kType = field->type;
     field->type = HirTypeKind::I64;
@@ -5800,9 +5803,12 @@ TEST(frontend, websocket_scalar_helpers_preserve_reached_paths_types_and_wide_bo
 
 // New general JSON forms must reach executable IR, rather than passing only
 // the type checker after the specialized recipe compiler declines the source.
-static void check_general_ws_rir(const HirModule& module, test::TestCase* _tc) {
+static void check_general_ws_rir(const HirModule& module,
+                                 test::TestCase* _tc,
+                                 u32 only_route = 0xffffffffu) {
     REQUIRE(module.routes.len != 0);
     for (u32 index = 0; index < module.routes.len; ++index) {
+        if (only_route != 0xffffffffu && index != only_route) continue;
         const auto& route = module.routes[index];
         REQUIRE(route.ws_handler.general_body_expr < route.exprs.len);
         auto callback = std::make_unique<HirRoute>();
@@ -6175,10 +6181,7 @@ route GET "/bare" { return websocket(ws) { msg in
     copied.reset();
     REQUIRE_EQ(hir->routes.len, 5u);
     for (const auto& route : hir->routes) CHECK_EQ(route.locals.len, 0u);
-    CHECK(hir->routes[0].ws_handler.len_guards.len > 4u);
-    CHECK(hir->routes[0].ws_handler.forward_payload.source_path.eq(lit("/a")));
-    CHECK(hir->routes[0].ws_handler.forward_payloads[0].source_path.eq(lit("/b")));
-    CHECK_EQ(hir->routes[4].ws_handler.close_code, 1008u);
+    check_general_ws_rir(hir.value(), _tc);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
@@ -6353,18 +6356,7 @@ route GET "/different" { return websocket(ws) { msg in
     copied.reset();
     REQUIRE_EQ(hir->routes.len, 5u);
     for (const auto& route : hir->routes) CHECK_EQ(route.locals.len, 0u);
-    const auto& nodes = hir->routes[0].ws_handler.len_guards;
-    REQUIRE_EQ(nodes.len, 7u);
-    CHECK(nodes[0].accessor == WsLenGuard::Accessor::JsonValid);
-    CHECK(nodes[1].accessor == WsLenGuard::Accessor::JsonHasPath);
-    CHECK(nodes[2].accessor == WsLenGuard::Accessor::JsonStringValid);
-    CHECK(nodes[3].accessor == WsLenGuard::Accessor::Constant);
-    CHECK_EQ(nodes[3].bound, 1u);
-    for (u32 i = 0; i + 1 < nodes.len; ++i) CHECK(nodes[i].is_operand);
-    CHECK(!nodes[nodes.len - 1].is_operand);
-    CHECK(hir->routes[0].ws_handler.forward_payloads[0].source_path.eq(lit("/name")));
-    CHECK(hir->routes[3].ws_handler.forward_payload.source_path.eq(lit("/a~1b/~0")));
-    CHECK(hir->routes[4].ws_handler.forward_payloads[0].source_path.eq(lit("/b")));
+    check_general_ws_rir(hir.value(), _tc);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
@@ -6394,10 +6386,7 @@ route GET "/ws" { return websocket(ws) { msg in
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE(hir);
-        if (terms == 14)
-            CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 32u);
-        else
-            check_general_ws_rir(hir.value(), _tc);
+        check_general_ws_rir(hir.value(), _tc);
     }
 }
 
@@ -7168,8 +7157,8 @@ route GET "/ws" { return websocket(ws) { msg in
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK(hir.error().code == FrontendError::TooManyItems);
+    REQUIRE(hir);
+    check_general_ws_rir(hir.value(), _tc);
 }
 
 TEST(frontend, websocket_callback_parameter_has_an_ordinary_name) {
@@ -8056,7 +8045,7 @@ message.forward())rut",
         auto invalid_ast = parse_file_heap(invalid_tokens.value());
         REQUIRE(invalid_ast);
         auto analyzed = analyze_file_heap(invalid_ast.value());
-        const bool kAccepted = json_case_0 == 1u;
+        const bool kAccepted = (json_case_0 == 1u || json_case_0 == 2u);
         CHECK_EQ(analyzed.has_value(), kAccepted);
         if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
         ++json_case_0;
@@ -8189,7 +8178,12 @@ route GET "/ws" { return websocket(ws) { message in
         REQUIRE(tokens);
         ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool accepted = strcmp(condition, "kind.hasPrefix(message.text)") == 0 ||
+                              strcmp(condition, "kind.hasPrefix(\"a\" + \"b\")") == 0;
+        CHECK_EQ(analyzed.has_value(), accepted);
+        if (analyzed && strcmp(condition, "kind.hasPrefix(message.text)") == 0)
+            check_general_ws_rir(analyzed.value(), _tc);
     }
 }
 
@@ -8515,7 +8509,7 @@ route GET "/ws" { return websocket(ws) { message in
         ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto analyzed = analyze_file_heap(ast.value());
-        const bool kAccepted = json_case_1 == 3u;
+        const bool kAccepted = (json_case_1 == 2u || json_case_1 == 3u);
         CHECK_EQ(analyzed.has_value(), kAccepted);
         if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
         ++json_case_1;
@@ -8907,7 +8901,10 @@ TEST(frontend, analyze_websocket_guard_close_rejects_invalid_arguments) {
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
         REQUIRE(ast);
-        CHECK(!analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool accepted = strcmp(verdict, "message.forward(message.text + message.text)") == 0;
+        CHECK_EQ(analyzed.has_value(), accepted);
+        if (analyzed && accepted) check_general_ws_rir(analyzed.value(), _tc);
     }
     for (u32 length : {123u, 124u}) {
         std::string source =
@@ -9507,6 +9504,9 @@ TEST(frontend, analyze_websocket_text_prefix_suffix_conditions) {
                 CHECK(nodes[0].negate);
                 REQUIRE_EQ(nodes[0].pattern.len, 3u);
                 CHECK_EQ(nodes[0].pattern.ptr[1], '\0');
+            } else if (strcmp(argument, "message.text") == 0) {
+                REQUIRE(hir);
+                check_general_ws_rir(hir.value(), _tc);
             } else {
                 CHECK(!hir);
             }
@@ -9973,7 +9973,7 @@ TEST(frontend, websocket_json_string_output_preserves_plain_string_typing) {
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto analyzed = analyze_file_heap(ast.value());
-        const bool kAccepted = json_case_0 == 2u;
+        const bool kAccepted = (json_case_0 >= 2u && json_case_0 <= 5u);
         CHECK_EQ(analyzed.has_value(), kAccepted);
         if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
         ++json_case_0;
@@ -10052,7 +10052,10 @@ TEST(frontend, websocket_text_affix_rewrite_rejects_unbounded_or_unsupported_exp
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto analyzed = analyze_file_heap(ast.value());
+        const bool accepted = strcmp(expression, "message.text + message.text") == 0;
+        CHECK_EQ(analyzed.has_value(), accepted);
+        if (analyzed && accepted) check_general_ws_rir(analyzed.value(), _tc);
     }
     for (u32 length : {4u, 5u}) {
         std::string source =
@@ -10075,7 +10078,9 @@ TEST(frontend, websocket_text_affix_rewrite_rejects_unbounded_or_unsupported_exp
     REQUIRE(tokens);
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
-    CHECK_FALSE(analyze_file_heap(ast.value()));
+    auto analyzed = analyze_file_heap(ast.value());
+    REQUIRE(analyzed);
+    check_general_ws_rir(analyzed.value(), _tc);
 }
 
 TEST(frontend, websocket_text_affix_node_budget_and_utf8_validation) {
@@ -10090,7 +10095,9 @@ TEST(frontend, websocket_text_affix_node_budget_and_utf8_validation) {
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_EQ(static_cast<bool>(analyze_file_heap(ast.value())), levels == 4);
+        auto analyzed = analyze_file_heap(ast.value());
+        REQUIRE(analyzed);
+        if (levels == 5) check_general_ws_rir(analyzed.value(), _tc);
     }
     std::string source =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
@@ -46245,14 +46252,17 @@ TEST(frontend, websocket_guard_text_replacements_validate_literals_and_limits) {
         auto ast = parse_file_heap(lexed.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        const bool valid = strstr(verdict, "message.text") == nullptr &&
-                           strstr(verdict, "(1)") == nullptr && strstr(verdict, ",") == nullptr &&
+        const bool valid = strstr(verdict, "(1)") == nullptr && strstr(verdict, ",") == nullptr &&
                            strstr(verdict, "\\(") == nullptr;
         CHECK_EQ(static_cast<bool>(hir), valid);
         if (hir) {
             const auto& handler = hir->routes[0].ws_handler;
-            REQUIRE_EQ(handler.forward_payloads.len, 1u);
-            CHECK_EQ(static_cast<u8>(handler.len_guards[0].verdict), 8u);
+            if (handler.general_body_expr != 0xffffffffu) {
+                check_general_ws_rir(hir.value(), _tc);
+            } else {
+                REQUIRE_EQ(handler.forward_payloads.len, 1u);
+                CHECK_EQ(static_cast<u8>(handler.len_guards[0].verdict), 8u);
+            }
         }
     }
     for (u32 length : {16370u, 16371u}) {
@@ -46736,5 +46746,108 @@ TEST(frontend, websocket_general_regex_keeps_owned_ir_and_unwrapped_string_types
     auto owned = std::make_unique<HirModule>(hir.value());
     hir.reset();
     check_general_ws_rir(*owned, _tc);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_helper_lexical_values_keep_owned_binders_and_types) {
+    auto tokens = lex(lit(test::ws_helper_lexical::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto ast_copy = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*ast_copy);
+    REQUIRE(hir);
+    ast_copy.reset();
+    auto owned = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    for (u32 i = 0; i < owned->functions.len; ++i)
+        CHECK(owned->functions[i].lexical_body_index < owned->functions[i].exprs.len);
+    auto function = std::make_unique<HirFunction>(owned->functions[0]);
+    auto moved = std::make_unique<HirFunction>(std::move(*function));
+    function.reset();
+    CHECK(moved->lexical_body_index < moved->exprs.len);
+    bool bound = false;
+    for (u32 i = 0; i < moved->exprs.len; ++i) {
+        const auto& value = moved->exprs[i];
+        if (value.kind != HirExprKind::BoundValue) continue;
+        bound = true;
+        CHECK(moved->exprs.index_of(value.lhs) < moved->exprs.len);
+    }
+    CHECK(bound);
+    check_general_ws_rir(*owned, _tc);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_noncarrier_aliases_cannot_elide_helper_initialization) {
+    for (const char* body :
+         {"msg.forward(ignore(opaque(msg)))", "let unused = opaque(msg) msg.forward()"}) {
+        std::string source = R"rut(upstream ws
+func opaque(_ msg: WebSocketMessage) -> WebSocketMessage {
+    let unused = json.parse(msg.text)
+    msg
+}
+func ignore(_ msg: WebSocketMessage) -> str => "ok"
+route GET "/" { return websocket(ws) { msg in )rut";
+        source += body;
+        source += " } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_helper_concatenation_retains_literal_output_validation) {
+    struct Scenario {
+        const char* output;
+        bool accepted;
+    };
+    const Scenario scenarios[] = {
+        {"msg.forward(join(msg.text, \"!\"))", true},
+        {"msg.forward(join(\"\\u{20ac}\", \"\"))", true},
+        {"msg.forward(join(msg.text, \"12345\"))", false},
+        {"msg.forward(join(\"123\", \"45\"))", false},
+        {"msg.close(1008, join(msg.text, \"!\"))", true},
+        {"msg.close(1006, join(msg.text, \"!\"))", false},
+        {"msg.forward(join(msg.text, \"BAD_UTF8\"))", false},
+        {"msg.forward(join(\"BAD_UTF8\", \"\"))", false},
+        // Hashing raw String bytes does not validate its input as output Text.
+        {"guard let digest = sha256(join(msg.text, \"BAD_UTF8\")) else { msg.drop() } "
+         "msg.forward(digest)",
+         true},
+    };
+    for (const auto& scenario : scenarios) {
+        std::string source = R"rut(upstream ws
+func join(_ first: str, _ last: str) -> str => first + last
+route GET "/" { return websocket(ws, maxMessageSize: 4b) { msg in )rut";
+        source += scenario.output;
+        source += " } }";
+        const auto marker = source.find("BAD_UTF8");
+        if (marker != std::string::npos) source.replace(marker, 8, 1, static_cast<char>(0xff));
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto analyzed = analyze_file_heap(ast.value());
+        CHECK_EQ(analyzed.has_value(), scenario.accepted);
+        if (analyzed && analyzed->routes[0].ws_handler.general_body_expr != 0xffffffffu)
+            check_general_ws_rir(analyzed.value(), _tc);
+    }
+    std::string source = R"rut(upstream ws
+func join(_ first: str, _ last: str) -> str => first + last
+route GET "/" { return websocket(ws) { msg in msg.close(1008, join(")rut";
+    source.append(123, 'x');
+    source += "\", \"!\")) } }";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
 }
 #endif
