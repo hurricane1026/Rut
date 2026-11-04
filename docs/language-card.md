@@ -1265,6 +1265,9 @@ return websocket(chat) { message in
 // Handler closes send the configured code/reason to both peers. Peer closes
 // forward and reply with the received status/reason, preserving an empty Close
 // body when no status was sent. Internal 1005 is never sent as a wire status.
+// After closing starts, data no longer reaches the message callback. Close
+// acknowledgements and local Ping/Pong handling share the fixed shutdown deadline;
+// completing the downstream handshake sends FIN independently of the upstream.
 return websocket(chat) { message in
     guard message.fromClient && message.text.contains("secret") else { message.forward() }
     message.close(1008, "policy violation")

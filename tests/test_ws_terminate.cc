@@ -2646,6 +2646,155 @@ TEST(ws_terminate, close_payload_rejects_invalid_status_reason_and_forged_metada
     CHECK_EQ(out[1], 0u);  // local 1005 is represented by no status bytes on wire
 }
 
+TEST(ws_terminate, closing_reader_handles_fragmented_data_controls_and_split_close) {
+    for (bool masked : kMaskDirections) {
+        u8 wire[256];
+        const u8 first[] = {'a', 'b', 'c'}, last[] = {'d', 'e', 'f'};
+        const u8 ping[] = {'p', 0, 'q'};
+        const u8 close[] = {3, 241, 'w', 'h', 'y'};
+        u32 length = build(wire, WsOpcode::Binary, false, masked, first, sizeof(first));
+        length += build(wire + length, WsOpcode::Ping, true, masked, ping, sizeof(ping));
+        length += build(wire + length, WsOpcode::Continuation, true, masked, last, sizeof(last));
+        length += build(wire + length, WsOpcode::Pong, true, masked, ping, sizeof(ping));
+        length += build(wire + length, WsOpcode::Close, true, masked, close, sizeof(close));
+        for (u32 chunk_size = 1; chunk_size <= length; ++chunk_size) {
+            auto st = make_state(masked);
+            st.max_message_size = 128;
+            u8 buffered[256], control[kWsMaxControlPayload], pong[256], decoded[128];
+            u32 source = 0, used = 0, pings = 0;
+            bool closed = false;
+            while (source < length && !closed) {
+                const u32 take = length - source < chunk_size ? length - source : chunk_size;
+                memcpy(buffered + used, wire + source, take);
+                used += take;
+                source += take;
+                for (;;) {
+                    u32 consumed = 0, ping_len = 0;
+                    const WsClosingRead status =
+                        ws_read_closing(st, buffered, used, control, &ping_len, &consumed);
+                    REQUIRE(status != WsClosingRead::Error);
+                    REQUIRE(consumed <= used);
+                    memmove(buffered, buffered + consumed, used - consumed);
+                    used -= consumed;
+                    if (status == WsClosingRead::Ping) {
+                        ++pings;
+                        CHECK_EQ(ping_len, sizeof(ping));
+                        CHECK(memcmp(control, ping, sizeof(ping)) == 0);
+                        u64 rng = 0;
+                        const u32 n =
+                            ws_emit_pong_frame(pong, sizeof(pong), !masked, rng, control, ping_len);
+                        WsFrameHeader header;
+                        REQUIRE_EQ(parse_one(pong, n, !masked, &header, decoded), n);
+                        CHECK(header.opcode == WsOpcode::Pong);
+                        CHECK(memcmp(decoded, ping, sizeof(ping)) == 0);
+                        continue;
+                    }
+                    closed = status == WsClosingRead::Close;
+                    break;
+                }
+            }
+            CHECK(closed);
+            CHECK_EQ(pings, 1u);
+            CHECK(st.received_close);
+            CHECK_EQ(st.echo_close_code, 1009u);
+            memset(buffered, 'x', sizeof(buffered));
+            CHECK(st.echo_close_reason().eq(lit_str("why")));
+            u32 consumed = 1, ping_len = 1;
+            CHECK(ws_read_closing(st, buffered, sizeof(buffered), control, &ping_len, &consumed) ==
+                  WsClosingRead::Close);
+            CHECK_EQ(consumed, 0u);  // caller discards everything following the first Close
+            CHECK_EQ(ping_len, 0u);
+        }
+    }
+}
+
+TEST(ws_terminate, closing_reader_continues_a_partially_inspected_data_frame) {
+    for (bool masked : kMaskDirections) {
+        auto st = make_state(masked);
+        Recorder recorder;
+        u8 wire[128], output[256], message[64], ping[kWsMaxControlPayload];
+        const u8 data[] = {'a', 'b', 'c', 'd', 'e', 'f'};
+        u32 n = build(wire, WsOpcode::Text, false, masked, data, sizeof(data));
+        const u32 first_len = n - 3;
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           wire,
+                           first_len,
+                           output,
+                           sizeof(output),
+                           message,
+                           sizeof(message),
+                           record,
+                           &recorder,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        REQUIRE_EQ(consumed, first_len);
+        REQUIRE(st.partial_data_frame);
+        n += build(wire + n, WsOpcode::Continuation, true, masked, data, sizeof(data));
+        n += build(wire + n, WsOpcode::Close, true, masked, nullptr, 0);
+        u32 ping_len = 0;
+        REQUIRE(ws_read_closing(st, wire + first_len, n - first_len, ping, &ping_len, &consumed) ==
+                WsClosingRead::Close);
+        CHECK_EQ(consumed, n - first_len);
+        CHECK_EQ(recorder.calls, 0);
+        CHECK_EQ(st.echo_close_code, 1005u);
+        CHECK(st.received_close);
+        CHECK_FALSE(st.partial_data_frame);
+    }
+}
+
+TEST(ws_terminate, closing_reader_fails_invalid_controls_and_announced_data_bounds) {
+    for (bool masked : kMaskDirections) {
+        const u8 bad_bodies[][3] = {{3, 238, 0}, {3, 232, 255}};
+        for (const auto& body : bad_bodies) {
+            auto st = make_state(masked);
+            u8 wire[128], ping[kWsMaxControlPayload];
+            const u32 length = build(wire, WsOpcode::Close, true, masked, body, sizeof(body));
+            u32 consumed = 0, ping_len = 0;
+            CHECK(ws_read_closing(st, wire, length, ping, &ping_len, &consumed) ==
+                  WsClosingRead::Error);
+            CHECK_FALSE(st.received_close);
+        }
+        for (bool fragmented : kMaskDirections) {
+            auto st = make_state(masked);
+            st.max_message_size = 128;
+            st.assembler.in_fragmented = fragmented;
+            st.assembler.accumulated_len = fragmented ? 127 : 0;
+            u8 header[kWsMaxHeaderSize], ping[kWsMaxControlPayload];
+            const u32 n = ws_write_header(header,
+                                          fragmented ? WsOpcode::Continuation : WsOpcode::Binary,
+                                          true,
+                                          masked,
+                                          kKeyIn,
+                                          fragmented ? 2 : 129);
+            u32 consumed = 0, ping_len = 0;
+            CHECK(ws_read_closing(st, header, n, ping, &ping_len, &consumed) ==
+                  WsClosingRead::Error);
+            CHECK_EQ(consumed, 0u);  // reject using the header before reading its payload
+        }
+    }
+}
+
+TEST(ws_terminate, closing_reader_rejects_forged_partial_control_state_and_pong_bounds) {
+    auto st = make_state(false);
+    st.partial_data_frame = true;
+    st.partial_header = {};
+    st.partial_header.opcode = WsOpcode::Ping;
+    st.partial_header.payload_len = 1;
+    u8 input[1]{}, control[kWsMaxControlPayload], output[256];
+    u32 consumed = 0, ping_len = 0;
+    CHECK(ws_read_closing(st, input, sizeof(input), control, &ping_len, &consumed) ==
+          WsClosingRead::Error);
+    CHECK_EQ(consumed, 0u);
+    u64 rng = 0;
+    CHECK_EQ(ws_emit_pong_frame(output, sizeof(output), false, rng, nullptr, 1), 0u);
+    CHECK_EQ(ws_emit_pong_frame(output, sizeof(output), true, rng, control, 126), 0u);
+    CHECK_EQ(ws_emit_pong_frame(output, 1, false, rng, nullptr, 0), 0u);
+    CHECK_EQ(ws_emit_pong_frame(output, sizeof(output), false, rng, nullptr, 0), 2u);
+    CHECK_EQ(output[0], 0x8au);
+    CHECK_EQ(output[1], 0u);
+}
+
 // === Partial frames across chunks ===
 
 TEST(ws_terminate, partial_data_payload_consumed_incrementally) {

@@ -86,6 +86,15 @@ public:
         }
         self().close_conn_impl(c);
     }
+    // Complete the server-role TCP write half once its WebSocket Close is
+    // acknowledged and all client-bound output is drained. Keep fd/slot custody
+    // until the ordinary retirement path cancels outstanding kernel operations.
+    bool end_ws_client_stream(Connection& c) {
+        if constexpr (requires { self().end_ws_client_stream_impl(c); })
+            return self().end_ws_client_stream_impl(c);
+        if (c.fd < 0 || c.ws_upstream_send_pending || c.send_armed) return false;
+        return ::shutdown(c.fd, SHUT_WR) == 0;
+    }
     Connection* alloc_conn() { return self().alloc_conn_impl(); }
     void free_conn(Connection& c) {
         if (password_gateway) password_gateway->cancel(c.id);

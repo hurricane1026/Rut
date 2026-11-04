@@ -62,6 +62,13 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     ShardMetrics* const* all_shard_metrics = nullptr;
     u32 shard_metrics_count = 0;
 
+    u32 ws_client_write_shutdowns = 0;
+    bool end_ws_client_stream_impl(Connection& c) {
+        if (c.ws_upstream_send_pending) return false;
+        ++ws_client_write_shutdowns;
+        return true;
+    }
+
     // Inline buffer storage for tests (no SlicePool dependency).
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];

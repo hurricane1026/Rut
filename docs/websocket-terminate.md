@@ -1043,9 +1043,14 @@ A valid peer Close is forwarded and replied to with the same status and UTF-8
 reason. An empty Close body stays empty; the internal no-status value 1005 is
 never encoded on the wire. Reply metadata owns its reason bytes independently
 of receive buffers and inspector reset, including a reply deferred behind an
-existing send. This preserves a peer's reason but does not yet add peer
-acknowledgement waiting: the current close pump still tears down after its
-outgoing Close sends drain. Lifecycle callbacks remain unavailable.
+existing send. The close pump tracks send completion and peer acknowledgement
+independently on each leg. It ignores further application data while handling
+Close and replying locally to Ping; these frames never invoke message handlers.
+The server-role downstream write half sends FIN as soon as its Close is sent
+and acknowledged, even while an upstream write or acknowledgement is pending.
+The other leg remains under the same fixed five-second shutdown deadline.
+EOF without a received Close is abnormal and does not fabricate acknowledgement.
+Lifecycle callbacks and graceful TLS shutdown remain unavailable.
 
 Inspection currently uses bounded single-slice storage (16370 bytes),
 with separate per-direction output buffers. `maxMessageSize` cannot lift that

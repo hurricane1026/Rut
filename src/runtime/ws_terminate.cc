@@ -415,6 +415,16 @@ bool emit_frame(u8* out,
     return true;
 }
 
+bool decode_close_payload(const u8* payload, u32 len, u16& code, Str& reason) {
+    if (len > kWsMaxControlPayload || len == 1 || (!payload && len)) return false;
+    code = 1005;
+    reason = {};
+    if (len == 0) return true;
+    code = static_cast<u16>((static_cast<u16>(payload[0]) << 8) | payload[1]);
+    reason = {reinterpret_cast<const char*>(payload + 2), len - 2};
+    return ws_valid_close_code(code) && ws_valid_close_reason(reason);
+}
+
 bool emit_json_string_frame(u8* out,
                             u32 out_cap,
                             u32* produced,
@@ -690,14 +700,11 @@ WsInspectStatus ws_inspect(WsInspector& st,
             // §7.4/§5.5.1: a Close body, if present, is a 2-byte status code (which must be
             // a valid wire code) followed by a UTF-8 reason. Fail the tunnel otherwise.
             u16 received_code = 1005;
-            if (h.opcode == WsOpcode::Close) {
-                if (h.payload_len == 1) return WsInspectStatus::Error;
-                if (h.payload_len >= 2) {
-                    received_code = static_cast<u16>((static_cast<u16>(cbuf[0]) << 8) | cbuf[1]);
-                    if (!ws_valid_close_code(received_code)) return WsInspectStatus::Error;
-                    if (!utf8_valid(cbuf + 2, h.payload_len - 2)) return WsInspectStatus::Error;
-                }
-            }
+            Str received_reason{};
+            if (h.opcode == WsOpcode::Close &&
+                !decode_close_payload(
+                    cbuf, static_cast<u32>(h.payload_len), received_code, received_reason))
+                return WsInspectStatus::Error;
 
             if (!emit_frame(out,
                             out_cap,
@@ -714,9 +721,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 // Reply to the sender with the same status/reason, including an
                 // empty body. Retain owned bytes before receive storage is recycled.
                 st.echo_close_code = received_code;
-                const Str kReason{reinterpret_cast<const char*>(cbuf + 2),
-                                  h.payload_len == 0 ? 0 : static_cast<u32>(h.payload_len - 2)};
-                if (!st.set_echo_close_reason(kReason)) return WsInspectStatus::Error;
+                if (!st.set_echo_close_reason(received_reason)) return WsInspectStatus::Error;
                 st.received_close = true;
                 return WsInspectStatus::Close;
             }
@@ -929,6 +934,91 @@ u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 co
     u32 produced = 0;
     if (!emit_frame(
             out, out_cap, &produced, WsOpcode::Close, body, 2u + reason.len, masked, mask_rng))
+        return 0;
+    return produced;
+}
+
+WsClosingRead ws_read_closing(
+    WsInspector& st, const u8* in, u32 in_len, u8* ping_payload, u32* ping_len, u32* consumed) {
+    *consumed = 0;
+    *ping_len = 0;
+    if (st.received_close) return WsClosingRead::Close;
+    while (*consumed < in_len) {
+        const u8* p = in + *consumed;
+        const u32 kAvailable = in_len - *consumed;
+        WsFrameHeader header;
+        if (st.partial_data_frame) {
+            header = st.partial_header;
+        } else {
+            const ParseStatus kStatus = ws_parse_header(p, kAvailable, st.masked, &header);
+            if (kStatus == ParseStatus::Incomplete) return WsClosingRead::NeedMore;
+            if (kStatus == ParseStatus::Error) return WsClosingRead::Error;
+        }
+        if (ws_opcode_is_control(header.opcode)) {
+            if (st.partial_data_frame || header.payload_len > kWsMaxControlPayload)
+                return WsClosingRead::Error;
+            const u32 kPayloadLen = static_cast<u32>(header.payload_len);
+            const u32 kTotal = header.header_len + kPayloadLen;
+            if (kAvailable < kTotal) return WsClosingRead::NeedMore;
+            u8 body[kWsMaxControlPayload];
+            memcpy(body, p + header.header_len, kPayloadLen);
+            if (header.masked) ws_unmask(body, header.payload_len, header.mask_key);
+            if (header.opcode == WsOpcode::Close) {
+                u16 code = 1005;
+                Str reason{};
+                if (!decode_close_payload(
+                        body, static_cast<u32>(header.payload_len), code, reason) ||
+                    !st.set_echo_close_reason(reason))
+                    return WsClosingRead::Error;
+                st.echo_close_code = code;
+                st.received_close = true;
+                *consumed += kTotal;
+                return WsClosingRead::Close;
+            }
+            *consumed += kTotal;
+            if (header.opcode == WsOpcode::Ping) {
+                memcpy(ping_payload, body, kPayloadLen);
+                *ping_len = static_cast<u32>(header.payload_len);
+                return WsClosingRead::Ping;
+            }
+            continue;  // unsolicited Pong has no reply
+        }
+        if ((header.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented ||
+            header.payload_len > kWsTerminateMessageCapacity ||
+            st.assembler.accumulated_len > kWsTerminateMessageCapacity - header.payload_len ||
+            (st.max_message_size &&
+             (header.payload_len > st.max_message_size ||
+              st.assembler.accumulated_len > st.max_message_size - header.payload_len)))
+            return WsClosingRead::Error;
+        const u32 kHeaderLen = st.partial_data_frame ? 0 : header.header_len;
+        const u64 kRemaining = header.payload_len - st.partial_payload_len;
+        const u32 kAvailablePayload = kAvailable - kHeaderLen;
+        const u32 kTake =
+            kRemaining < kAvailablePayload ? static_cast<u32>(kRemaining) : kAvailablePayload;
+        st.partial_payload_len += kTake;
+        *consumed += kHeaderLen + kTake;
+        if (st.partial_payload_len != header.payload_len) {
+            st.partial_header = header;
+            st.partial_data_frame = true;
+            return WsClosingRead::NeedMore;
+        }
+        st.partial_data_frame = false;
+        st.partial_payload_len = 0;
+        WsOpcode opcode;
+        u64 total = 0;
+        if (ws_message_feed(st.assembler, header, st.max_message_size, &opcode, &total) ==
+            WsMessageStatus::Error)
+            return WsClosingRead::Error;
+        st.message_len = 0;  // ignored application bytes never enter reassembly storage
+    }
+    return WsClosingRead::NeedMore;
+}
+
+u32 ws_emit_pong_frame(
+    u8* out, u32 out_cap, bool masked, u64& mask_rng, const u8* payload, u32 len) {
+    if (len > kWsMaxControlPayload || (!payload && len)) return 0;
+    u32 produced = 0;
+    if (!emit_frame(out, out_cap, &produced, WsOpcode::Pong, payload, len, masked, mask_rng))
         return 0;
     return produced;
 }

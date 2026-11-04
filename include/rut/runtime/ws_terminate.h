@@ -256,6 +256,17 @@ WsInspectStatus ws_inspect(WsInspector& st,
 u32 ws_emit_close_frame(
     u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code = 1000, Str reason = {});
 
+// Closing receive mode: ignore data without invoking application code or
+// publishing output, but retain framing/fragment bounds across reads. Controls
+// remain whole; Ping exposes its unmasked body for a same-peer Pong reply.
+// Close stores owned echo metadata and received_close in the inspector. Bytes
+// following the first Close are left unconsumed for the caller to discard.
+enum class WsClosingRead : u8 { NeedMore, Ping, Close, Error };
+WsClosingRead ws_read_closing(
+    WsInspector& st, const u8* in, u32 in_len, u8* ping_payload, u32* ping_len, u32* consumed);
+u32 ws_emit_pong_frame(
+    u8* out, u32 out_cap, bool masked, u64& mask_rng, const u8* payload, u32 len);
+
 // Emit owned metadata, preserving an absent status as an empty Close body.
 // Unlike ws_emit_close_frame, this accepts the local-only 1005 representation
 // only with an empty reason; it never writes that number onto the wire.

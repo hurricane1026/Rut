@@ -81,5 +81,7 @@ per-shard, not session storage.
 
 Peer Close replies now preserve the exact received status/reason, including an
 empty body when no status was sent. Reply bytes are connection-owned across
-inspector reset and deferred sends. Outgoing Close drain remains distinct from
-peer acknowledgement; the lifecycle/closing-handshake criterion stays open.
+inspector reset and deferred sends. Each leg now waits for its peer's valid Close
+separately from send completion, with local closing Ping/Pong handling and one
+fixed deadline. Downstream FIN is independent of upstream progress. Lifecycle
+callbacks and graceful TLS shutdown remain open.

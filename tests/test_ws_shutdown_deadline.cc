@@ -54,6 +54,83 @@ WsFrameAction ws_close_handler(void*, WsOpcode, const u8*, u64, bool) {
 
 void ws_noop_recv(void*, Connection&, IoEvent) {}
 
+struct WsCloseObservation {
+    u32 calls = 0;
+    bool clean = false;
+    bool client_received = false;
+    bool upstream_received = false;
+    u16 original_code = 0;
+};
+WsCloseObservation ws_close_observation;
+void ws_observe_close(void*, Connection& c) {
+    ++ws_close_observation.calls;
+    ws_close_observation.clean = c.ws_close_handshake_complete;
+    ws_close_observation.client_received = c.ws_close_client_received;
+    ws_close_observation.upstream_received = c.ws_close_upstream_received;
+    ws_close_observation.original_code = c.ws_close_payload.code;
+}
+
+struct WsClosingFixture {
+    SmallLoop loop;
+    Connection* conn = nullptr;
+    u8 c2u_message[128]{}, c2u_output[256]{};
+    u8 u2c_message[128]{}, u2c_output[256]{};
+
+    void setup() {
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        conn = loop.find_fd(42);
+        if (!conn) return;
+        loop.alloc_upstream_buf(*conn);
+        conn->upstream_fd = 43;
+        conn->is_ws_tunnel = true;
+        conn->is_ws_terminate = true;
+        conn->ws_handler = &ws_close_handler;
+        conn->ws_max_message_size = 128;
+        conn->ws_c2u_msg = c2u_message;
+        conn->ws_c2u_out = c2u_output;
+        conn->ws_u2c_msg = u2c_message;
+        conn->ws_u2c_out = u2c_output;
+        conn->ws_c2u.masked = true;
+        conn->ws_c2u.from_client = true;
+        conn->ws_u2c.masked = false;
+        conn->on_close = &ws_observe_close;
+        ws_close_observation = {};
+    }
+    bool start() {
+        const u8 frame[] = {0x81, 0x81, 1, 2, 3, 4, static_cast<u8>('x' ^ 1)};
+        if (!conn || conn->recv_buf.write(frame, sizeof(frame)) != sizeof(frame)) return false;
+        on_ws_client_recv<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::Recv, sizeof(frame)));
+        return conn->ws_closing;
+    }
+    void sent(bool client) {
+        if (client)
+            on_ws_upstream_to_client_sent<SmallLoop>(
+                &loop, *conn, make_ev(conn->id, IoEventType::Send, 1));
+        else
+            on_ws_client_to_upstream_sent<SmallLoop>(
+                &loop, *conn, make_ev(conn->id, IoEventType::UpstreamSend, 1));
+    }
+    bool receive(bool client, const u8* frame, u32 len) {
+        auto& buffer = client ? conn->recv_buf : conn->upstream_recv_buf;
+        if (buffer.write(frame, len) != len) return false;
+        if (client)
+            on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Recv, len));
+        else
+            on_ws_upstream_recv<SmallLoop>(
+                &loop, *conn, make_ev(conn->id, IoEventType::UpstreamRecv, len));
+        return true;
+    }
+    bool acknowledge(bool client) {
+        u8 frame[32];
+        u64 rng = 0;
+        const u32 len = ws_emit_close_frame(
+            frame, sizeof(frame), client, rng, client ? 3001 : 3002, lit_str("ack"));
+        return len && receive(client, frame, len);
+    }
+};
+
 u32 ws_yield_handler_calls = 0;
 u64 ws_yield_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     ws_yield_handler_calls++;
@@ -114,7 +191,7 @@ TEST(websocket, deferred_peer_close_reply_survives_inspector_reset) {
         REQUIRE(conn->ws_close_upstream_inflight);
         CHECK_EQ(conn->ws_close_payload.code, 1009u);
         CHECK(conn->ws_close_payload.reason().eq(reason));
-        const u8* reply = from_client ? u2c_output : c2u_output;
+        const u8* reply = from_client ? conn->ws_close_frame_client : conn->ws_close_frame_upstream;
         WsFrameHeader header;
         REQUIRE(ws_parse_header(reply, 128, !from_client, &header) == ParseStatus::Complete);
         CHECK(header.opcode == WsOpcode::Close);
@@ -126,6 +203,145 @@ TEST(websocket, deferred_peer_close_reply_survives_inspector_reset) {
         CHECK_EQ(body[1], 241u);
         CHECK(memcmp(body + 2, reason.ptr, reason.len) == 0);
     }
+}
+
+TEST(websocket, close_waits_for_both_acknowledgements_and_preserves_first_cause) {
+    constexpr bool kOrders[] = {false, true};
+    for (bool first_client : kOrders) {
+        WsClosingFixture f;
+        f.setup();
+        REQUIRE(f.start());
+        f.sent(first_client);
+        f.sent(!first_client);
+        REQUIRE_EQ(f.conn->fd, 42);
+        CHECK_EQ(ws_close_observation.calls, 0u);
+        REQUIRE(f.acknowledge(first_client));
+        REQUIRE_EQ(f.conn->fd, 42);
+        CHECK_EQ(ws_close_observation.calls, 0u);
+        REQUIRE(f.acknowledge(!first_client));
+        CHECK_EQ(f.conn->fd, -1);
+        CHECK_EQ(f.loop.ws_client_write_shutdowns, 1u);
+        CHECK_EQ(ws_close_observation.calls, 1u);
+        CHECK(ws_close_observation.clean);
+        CHECK(ws_close_observation.client_received);
+        CHECK(ws_close_observation.upstream_received);
+        CHECK_EQ(ws_close_observation.original_code, 1000u);
+    }
+}
+
+TEST(websocket, downstream_ack_sends_fin_while_upstream_close_send_is_blocked) {
+    WsClosingFixture f;
+    f.setup();
+    REQUIRE(f.start());
+    u8 retained[8];
+    memcpy(retained, f.c2u_output, sizeof(retained));
+    f.sent(true);
+    REQUIRE(f.conn->ws_client_send_pending);
+    REQUIRE(f.acknowledge(true));
+    CHECK_EQ(f.loop.ws_client_write_shutdowns, 1u);
+    CHECK(f.conn->ws_client_write_shutdown);
+    CHECK_EQ(f.conn->fd, 42);
+    CHECK_EQ(ws_close_observation.calls, 0u);
+    CHECK(memcmp(retained, f.c2u_output, sizeof(retained)) == 0);
+    f.sent(false);
+    REQUIRE(f.acknowledge(false));
+    CHECK_EQ(f.conn->fd, -1);
+    CHECK(ws_close_observation.clean);
+}
+
+TEST(websocket, closing_ping_replies_to_sender_before_coalesced_ack) {
+    WsClosingFixture f;
+    f.setup();
+    REQUIRE(f.start());
+    f.sent(true);
+    f.sent(false);
+    // A late message is ignored, then Ping gets a local Pong. The Close behind
+    // it remains buffered until the Pong send retires, without duplicate Close.
+    const u8 wire[] = {0x81,
+                       0x81,
+                       1,
+                       2,
+                       3,
+                       4,
+                       static_cast<u8>('z' ^ 1),
+                       0x89,
+                       0x81,
+                       1,
+                       2,
+                       3,
+                       4,
+                       static_cast<u8>('p' ^ 1),
+                       0x88,
+                       0x82,
+                       1,
+                       2,
+                       3,
+                       4,
+                       static_cast<u8>(3 ^ 1),
+                       static_cast<u8>(232 ^ 2)};
+    REQUIRE(f.receive(true, wire, sizeof(wire)));
+    CHECK(f.conn->ws_upstream_send_pending);
+    CHECK_FALSE(f.conn->ws_close_client_received);
+    CHECK_FALSE(f.conn->ws_close_client_inflight);
+    CHECK_EQ(f.conn->ws_close_frame_client[0], 0x8au);
+    CHECK_EQ(f.conn->ws_close_frame_client[1], 1u);
+    CHECK_EQ(f.conn->ws_close_frame_client[2], static_cast<u8>('p'));
+    REQUIRE(f.acknowledge(false));
+    CHECK_EQ(f.conn->fd, 42);
+    f.sent(true);  // Pong completion processes the already-buffered client acknowledgement.
+    CHECK_EQ(f.conn->fd, -1);
+    CHECK(ws_close_observation.clean);
+    CHECK_EQ(ws_close_observation.calls, 1u);
+}
+
+TEST(websocket, closing_eof_without_ack_is_abnormal_and_other_leg_can_finish) {
+    WsClosingFixture f;
+    f.setup();
+    REQUIRE(f.start());
+    f.sent(true);
+    f.sent(false);
+    on_ws_client_recv<SmallLoop>(&f.loop, *f.conn, make_ev(f.conn->id, IoEventType::Recv, 0));
+    CHECK_EQ(f.conn->fd, 42);
+    CHECK_FALSE(f.conn->ws_close_client_received);
+    REQUIRE(f.acknowledge(false));
+    CHECK_EQ(f.conn->fd, -1);
+    CHECK_FALSE(ws_close_observation.clean);
+    CHECK_FALSE(ws_close_observation.client_received);
+    CHECK(ws_close_observation.upstream_received);
+}
+
+TEST(websocket, malformed_close_ack_fails_without_waiting_for_more_input) {
+    WsClosingFixture f;
+    f.setup();
+    REQUIRE(f.start());
+    f.sent(true);
+    f.sent(false);
+    const u8 invalid[] = {0x88, 0x82, 1, 2, 3, 4, static_cast<u8>(3 ^ 1), static_cast<u8>(238 ^ 2)};
+    REQUIRE(f.receive(true, invalid, sizeof(invalid)));
+    CHECK_EQ(f.conn->fd, -1);
+    CHECK_EQ(ws_close_observation.calls, 1u);
+    CHECK_FALSE(ws_close_observation.clean);
+}
+
+TEST(websocket, acknowledgement_wait_deadline_is_not_refreshed_by_closing_controls) {
+    WsClosingFixture f;
+    f.setup();
+    REQUIRE(f.start());
+    f.sent(true);
+    f.sent(false);
+    const u32 kStarted = f.conn->ws_shutdown_started_tick;
+    const u8 ping[] = {0x89, 0x81, 1, 2, 3, 4, static_cast<u8>('p' ^ 1)};
+    for (u32 tick = 0; tick < kWsShutdownDrainTimeoutSeconds; ++tick) {
+        REQUIRE(f.receive(true, ping, sizeof(ping)));
+        f.sent(true);
+        CHECK_EQ(f.conn->ws_shutdown_started_tick, kStarted);
+        f.loop.dispatch(make_ev(0, IoEventType::Timeout, 1));
+        CHECK_EQ(f.conn->fd, 42);
+    }
+    f.loop.dispatch(make_ev(0, IoEventType::Timeout, 1));
+    CHECK_EQ(f.conn->fd, -1);
+    CHECK_EQ(ws_close_observation.calls, 1u);
+    CHECK_FALSE(ws_close_observation.clean);
 }
 
 TEST(websocket, handler_close_drain_deadline_expires_before_http_yield) {

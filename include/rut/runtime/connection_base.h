@@ -712,22 +712,23 @@ struct ConnectionBase {
     u8* ws_u2c_out = nullptr;  // upstream->client output, retained until send completion
     u32 ws_c2u_consumed;       // recv_buf bytes consumed by the in-flight c->u send
     u32 ws_u2c_consumed;       // upstream_recv_buf bytes consumed by the in-flight u->c send
-    // Bidirectional Close handshake (RFC 6455 §5.5.1). When a Close is determined (a peer
-    // sent Close, or the handler returned Close), terminate sends a Close frame to BOTH
-    // peers and tears the connection down only once both Close sends have drained — so a
-    // policy/peer close is graceful (the initiating client sees a Close, not EOF/1006). Per
-    // send slot: `_need` = a Close still to submit on this slot, `_inflight` = a Close is
-    // draining on it. close_conn fires when ws_closing and neither need nor inflight is set
-    // on either slot. The forward Close (emitted by ws_inspect) starts its slot _inflight;
-    // the echo Close (built into ws_close_frame_*) is submitted on the opposite slot.
+    // Each leg tracks Close send completion independently of peer acknowledgement.
+    // After local initiation only closing controls are processed; application
+    // callbacks stop. The original shutdown deadline also bounds acknowledgement.
     bool ws_closing;
-    bool ws_close_client_need;        // Close still to send on the client slot (u->c)
-    bool ws_close_client_inflight;    // a Close is draining on the client slot
-    bool ws_close_upstream_need;      // Close still to send on the upstream slot (c->u)
-    bool ws_close_upstream_inflight;  // a Close is draining on the upstream slot
-    u8 ws_close_frame_client[12];     // echo Close frame to the client (unmasked, persists during
-                                      // send)
-    u8 ws_close_frame_upstream[12];   // echo Close frame to the upstream (masked)
+    bool ws_close_client_need;
+    bool ws_close_client_inflight;
+    bool ws_close_upstream_need;
+    bool ws_close_upstream_inflight;
+    bool ws_close_client_received = false;
+    bool ws_close_upstream_received = false;
+    bool ws_close_client_sent = false;
+    bool ws_close_upstream_sent = false;
+    bool ws_client_write_shutdown = false;
+    bool ws_close_handshake_complete = false;
+    // Dedicated inline control storage is never reused while its send is pending.
+    u8 ws_close_frame_client[kWsMaxHeaderSize + kWsMaxControlPayload];
+    u8 ws_close_frame_upstream[kWsMaxHeaderSize + kWsMaxControlPayload];
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -2109,6 +2110,12 @@ struct ConnectionBase {
         ws_close_client_inflight = false;
         ws_close_upstream_need = false;
         ws_close_upstream_inflight = false;
+        ws_close_client_received = false;
+        ws_close_upstream_received = false;
+        ws_close_client_sent = false;
+        ws_close_upstream_sent = false;
+        ws_client_write_shutdown = false;
+        ws_close_handshake_complete = false;
         idle_trim_examined = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;

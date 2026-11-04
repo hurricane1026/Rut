@@ -2357,7 +2357,7 @@ def tls_passthrough_scenario(server, backend_kind):
     return "pass", ""
 
 
-def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False):
+def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False, closing=False):
     cert = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_cert.pem")
     key = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_key.pem")
     backend = socket.socket()
@@ -2372,6 +2372,9 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
     if connection_context:
         source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
                   + CONNECTION_DECLARATIONS + '\nroute GET "/ws" { ' + CONNECTION_HANDLER + '}\n')
+    if closing:
+        source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+                  + '\nroute GET "/ws" { ' + CLOSING_HANDLER + '}\n')
     with tempfile.TemporaryDirectory(prefix="rut-ws-tls-terminate-") as temp:
         path = os.path.join(temp, "route.rut")
         with open(path, "w", encoding="utf-8") as route_file:
@@ -2427,6 +2430,8 @@ def tls_terminate_handshake_scenario(server, backend_kind, connection_context=Fa
                 raise AssertionError(f"TLS valid terminate handshake failed: {response!r}")
             if connection_context:
                 connection_exchange(valid_client, peer, b"tls:")
+            elif closing:
+                closing_handshake_exchange(valid_client, peer)
             else:
                 valid_client.sendall(masked_frame(1, b"DROP"))
                 peer.settimeout(0.25)
@@ -2687,6 +2692,101 @@ def subprotocol_scenario(server, backend_kind):
     return "pass", ""
 
 
+CLOSING_HANDLER = 'return websocket(ws) { msg in msg.close(1008, "policy") }'
+
+
+def assert_socket_quiet(sock):
+    sock.settimeout(0.08)
+    try:
+        data = sock.recv(1)
+    except TimeoutError:
+        return
+    finally:
+        sock.settimeout(3)
+    raise AssertionError(f"expected an open quiet socket, received {data!r}")
+
+
+def closing_handshake_exchange(client, peer):
+    client.sendall(masked_frame(1, b"begin"))
+    expected = b"\x03\xf0policy"
+    if recv_client_frame(client) != (8, expected, False) or \
+            recv_client_frame(peer) != (8, expected, True):
+        raise AssertionError("handler close policy changed")
+    assert_socket_quiet(client)
+    assert_socket_quiet(peer)
+    # App messages stop, while closing controls are answered on the sender's
+    # own leg. A Ping must not be forwarded to the other peer during closing.
+    client.sendall(masked_frame(2, b"late") + masked_frame(9, b"client-ping"))
+    if recv_client_frame(client) != (10, b"client-ping", False):
+        raise AssertionError("closing client Ping did not get its local Pong")
+    assert_socket_quiet(peer)
+    acknowledgement = masked_frame(8, b"\x0b\xb9ack")  # 3001 differs from local cause
+    client.sendall(acknowledgement[:1])
+    assert_socket_quiet(client)
+    client.sendall(acknowledgement[1:])
+    if client.recv(1) != b"":
+        raise AssertionError("downstream handshake did not end its TCP stream")
+    # The gateway must retain the upstream fd and continue closing controls
+    # even though the downstream server-role write half has already sent FIN.
+    peer.sendall(b"\x81\x04late\x89\x0dupstream-ping")
+    if recv_client_frame(peer) != (10, b"upstream-ping", True):
+        raise AssertionError("upstream closing receive was lost after downstream FIN")
+    peer.sendall(b"\x88\x02\x0b\xba")
+    if peer.recv(1) != b"":
+        raise AssertionError("both acknowledgements did not retire the tunnel")
+
+
+def closing_timeout_exchange(client, peer):
+    started = time.monotonic()
+    client.sendall(masked_frame(1, b"begin"))
+    expected = b"\x03\xf0policy"
+    if recv_client_frame(client) != (8, expected, False) or \
+            recv_client_frame(peer) != (8, expected, True):
+        raise AssertionError("handler Close was not sent before acknowledgement wait")
+    while time.monotonic() - started < 8:
+        time.sleep(0.2)
+        try:
+            client.sendall(masked_frame(9, b"still-here"))
+            if recv_client_frame(client) != (10, b"still-here", False):
+                raise AssertionError("closing timeout changed its Pong body")
+        except (ConnectionResetError, BrokenPipeError):
+            break
+        except AssertionError as error:
+            if "unexpected EOF while reading WebSocket frame" not in str(error):
+                raise
+            break
+    else:
+        raise AssertionError("closing traffic refreshed the fixed acknowledgement deadline")
+    elapsed = time.monotonic() - started
+    if not 4 <= elapsed <= 8:
+        raise AssertionError(f"unexpected acknowledgement timeout duration: {elapsed}")
+
+
+def peer_closing_handshake_exchange(from_client):
+    def exchange(client, peer):
+        body = b"\x03\xf1peer reason"
+        sender, other = (client, peer) if from_client else (peer, client)
+        sender.sendall(masked_frame(8, body) if from_client else b"\x88" + bytes((len(body),)) + body)
+        if recv_client_frame(sender) != (8, body, not from_client) or \
+                recv_client_frame(other) != (8, body, from_client):
+            raise AssertionError("peer initiation did not preserve its Close body")
+        if from_client:
+            if client.recv(1) != b"":
+                raise AssertionError("initiating client did not receive FIN after its reply")
+            assert_socket_quiet(peer)
+            peer.sendall(b"\x88\x00")  # acknowledgement may have no status
+            if peer.recv(1) != b"":
+                raise AssertionError("upstream acknowledgement did not retire the tunnel")
+        else:
+            peer.shutdown(socket.SHUT_WR)  # server can close TCP after its handshake
+            assert_socket_quiet(client)
+            client.sendall(masked_frame(8, b""))
+            if client.recv(1) != b"":
+                raise AssertionError("client acknowledgement was lost after upstream EOF")
+    exchange.__name__ = f"peer_closing_handshake_client={from_client}"
+    return exchange
+
+
 def peer_close_exchange(from_client, payload):
     def exchange(client, peer):
         sender, other = (client, peer) if from_client else (peer, client)
@@ -2721,6 +2821,10 @@ def main():
                  peer_close_exchange(True, b"\x03\xf1\0" + b"r" * 119 + "€".encode()), ""),
                 ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
                  peer_close_exchange(False, b"\x03\xf1\0" + b"r" * 119 + "€".encode()), ""),
+                (CLOSING_HANDLER, closing_handshake_exchange, ""),
+                (CLOSING_HANDLER, closing_timeout_exchange, ""),
+                (CLOSING_HANDLER, peer_closing_handshake_exchange(True), ""),
+                (CLOSING_HANDLER, peer_closing_handshake_exchange(False), ""),
                 (GENERAL_JSON_HANDLER, general_json_exchange, GENERAL_JSON_DECLARATIONS),
                 (GENERAL_REGEX_HANDLER, general_regex_exchange, GENERAL_JSON_DECLARATIONS),
                 (TYPED_JSON_HANDLER, typed_json_exchange, GENERAL_JSON_DECLARATIONS),
@@ -2913,6 +3017,8 @@ def main():
             print(f"SKIP {backend}: {details.strip()}")
         else:
             print(f"PASS {backend} TLS passthrough")
+        status, details = tls_terminate_handshake_scenario(args.server, backend, closing=True)
+        print(f"{status.upper()} {backend} TLS closing handshake: {details}")
         status, details = tls_terminate_handshake_scenario(args.server, backend, connection_context=True)
         print(f"{status.upper()} {backend} TLS connection context: {details}")
         status, details = tls_terminate_handshake_scenario(args.server, backend)

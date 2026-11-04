@@ -3415,9 +3415,17 @@ re-read), each with its own buffer for natural backpressure.
   and UTF-8 reason on both the forwarded frame and the reply to its sender.
   An absent status is represented internally by 1005 and emitted as an empty
   body, never as status bytes. The connection owns reply reason storage across
-  inspector reset and deferred sends. This is separate from completion of the
-  closing handshake: the current pump drains outgoing Close frames and does
-  not yet wait for both peer acknowledgements or expose lifecycle callbacks.
+  inspector reset and deferred sends. Each leg tracks Close send completion
+  separately from the first valid peer Close; both are required for a clean
+  handshake. Once closing starts, application data is discarded, Ping receives
+  a same-peer Pong and Close acknowledgements retain framing/status validation.
+  A downstream handshake sends TCP FIN independently of a blocked upstream send
+  or acknowledgement. Receive prefixes already copied into owned output can be
+  retired without reusing that output, so neither leg can strand the other.
+  EOF without Close is abnormal. The original shutdown deadline also bounds
+  acknowledgement waiting; traffic cannot refresh it. All fd/slot/buffer release
+  still uses normal async retirement. Lifecycle callbacks and graceful TLS
+  shutdown remain to be implemented.
 
 - **Connection teardown — drain-then-close (nginx model).** WebSocket shutdown
   is an *application-level* event (the RFC 6455 Close-frame handshake), not a TCP
