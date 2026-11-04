@@ -2699,7 +2699,7 @@ JSON/regex, guards, effects, waits and route decorators with their
 existing ordering and limits. `chain before` steps participate in that admission
 path. A rejection returns locally without opening the WebSocket upstream.
 The callback declaration must be the route's final top-level statement; nested
-callback declarations and `chain after` response effects remain unsupported.
+callback declarations remain unsupported.
 HTTP values cannot be captured by the separate message callback; compile-time
 constants alone may cross the upgrade boundary. Message helper purity is checked
 only in the callback's analyzer scope, not in the enclosing HTTP route. The four
@@ -2711,6 +2711,13 @@ The DSL exposes complete Text/Binary messages. Wire opcodes, FIN, masking,
 continuation frames and Ping/Pong/Close frames are runtime-internal details.
 The legacy `frame` binding and `.opcode` access are rejected; message type
 selection uses `message.isText` / `message.isBinary`.
+
+Response-header `chain after` steps share the ordinary HTTP effect/commit path,
+including local admission rejection and the accepted upstream 101. The runtime
+stabilizes request-derived values across rewrites. Existing HTTP wait/for
+restrictions still apply. Mutations cannot rewrite protected 101 Connection,
+Upgrade or Sec-WebSocket handshake fields after negotiation; they fail before
+publishing the handshake. HTTP response effects never become message captures.
 
 ```swift
 upstream chat at "127.0.0.1:9000"

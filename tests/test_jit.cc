@@ -29594,3 +29594,82 @@ route GET "/" {
     rir.destroy();
 }
 #endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_chain_after_response_headers_commit_on_admission_and_rejection) {
+    const auto src = R"rut(
+func response_headers(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Path", req.path)
+    resp.add("X-Stage", "after")
+    resp.remove("Server")
+    0
+}
+func require_http11(_ req: i32) -> i32 {
+    guard req.http11 else { respond 505 }
+    0
+}
+chain access { before require_http11(req) after response_headers(req, resp) }
+upstream ws at "127.0.0.1:9999"
+route GET "/api/users" use chain access {
+    return websocket(ws) { msg in msg.forward() }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    static const char kHttp10Request[] = "GET /api/users HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    const auto rejected = HandlerResult::unpack(handler(&conn,
+                                                        nullptr,
+                                                        reinterpret_cast<const u8*>(kHttp10Request),
+                                                        sizeof(kHttp10Request) - 1,
+                                                        nullptr));
+    CHECK(rejected.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(rejected.status_code, 505);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 3u);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("after")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    conn.reset();
+    const auto result = HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                                      sizeof(kGetApiRequest) - 1,
+                                                      nullptr));
+    CHECK(result.action == HandlerAction::Forward);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 3u);
+    CHECK(conn.resp_header_mutations[0].mode == ConnectionBase::RespHeaderMutationMode::Set);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].mode == ConnectionBase::RespHeaderMutationMode::Add);
+    CHECK(conn.resp_header_mutations[1].name.eq(lit("X-Stage")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("after")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK(conn.resp_header_mutations[2].name.eq(lit("Server")));
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+#endif

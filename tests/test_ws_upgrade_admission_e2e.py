@@ -1761,6 +1761,106 @@ def scenario(server, backend_kind, terminate, response, expected):
     return "pass", ""
 
 
+def chain_after_scenario(server, compiler, backend_kind, native, protected_header=None):
+    with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-after-") as temp:
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(2)
+        source = os.path.join(temp, "route.rut")
+        effects = ('resp.set("X-After-Value", req.header("X-Value").or("missing"))\n'
+                   'resp.add("X-Stage", "after")\n')
+        if protected_header:
+            effects += f'resp.set("{protected_header}", "broken")\n'
+        with open(source, "w", encoding="utf-8") as route_file:
+            route_file.write(
+                f'listen 127.0.0.1:0\nupstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+                'func decorate(_ req: i32, _ resp: Response) -> i32 {\n' + effects + '0\n}\n'
+                'chain headers { after decorate(req, resp) }\n'
+                'route GET "/ws" use chain headers {\n'
+                'req.set("X-Admission", "changed")\n'
+                'guard req.header("X-Deny").or("") != "yes" else { return 403 }\n'
+                'return websocket(ws) { msg in msg.forward(msg.text + "!") }\n}\n')
+        selected_server = server
+        selected_source = source
+        if native:
+            artifact = os.path.join(temp, "route.native")
+            emitted = subprocess.run([compiler, source, "2"], capture_output=True,
+                                     check=True, timeout=30)
+            with open(artifact, "wb") as target:
+                target.write(emitted.stdout)
+            os.unlink(source)
+            selected_server = os.path.join(temp, "rut")
+            shutil.copy2(server, selected_server)
+            wrapper = os.path.join(temp, "rut-compile")
+            with open(wrapper, "w", encoding="utf-8") as target:
+                target.write('#!/usr/bin/env python3\nimport sys\n'
+                             f'with open({artifact!r}, "rb") as source:\n'
+                             '    sys.stdout.buffer.write(source.read())\n')
+            os.chmod(wrapper, 0o700)
+            selected_source = os.path.join(temp, "deleted.rut")
+        process, port, diagnostic = launch(selected_server, selected_source, backend_kind)
+        if process is None:
+            text = diagnostic.decode(errors="replace")
+            if backend_kind == "io_uring" and "--backend io_uring requested, but io_uring is unavailable" in text:
+                return "skip", text
+            raise AssertionError(f"chain after server failed:\n{text}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                denied_request = REQUEST.replace(
+                    b"Connection: Upgrade\r\n", b"Connection: keep-alive\r\n").replace(
+                    b"\r\n\r\n", b"\r\nX-Deny: yes\r\nX-Value: denied-value\r\n\r\n")
+                client.sendall(denied_request)
+                denied = recv_http_response(client)
+                if not denied.startswith(b"HTTP/1.1 403") or \
+                        b"x-after-value: denied-value\r\n" not in denied.lower() or \
+                        denied.lower().count(b"x-stage: after\r\n") != 1:
+                    raise AssertionError(f"chain after denial effects lost: {denied!r}")
+                upstream.settimeout(0.2)
+                try:
+                    unexpected, _ = upstream.accept()
+                except TimeoutError:
+                    pass
+                else:
+                    unexpected.close()
+                    raise AssertionError("chain after denial opened an upstream")
+                upstream.settimeout(3)
+                # Reuse the denied keepalive connection; response values must be fresh.
+                accepted = REQUEST.replace(b"\r\n\r\n", b"\r\nX-Value: allowed-value\r\n\r\n")
+                client.sendall(accepted + masked_frame(1, b"first"))
+                with upstream.accept()[0] as peer:
+                    peer.settimeout(3)
+                    forwarded = recv_until(peer, b"\r\n\r\n")
+                    if b"x-admission: changed\r\n" not in forwarded.lower():
+                        raise AssertionError(f"request rewrite was lost: {forwarded!r}")
+                    peer.sendall(WS_RESPONSE_HEADERS + b"\x81\x06server")
+                    if protected_header:
+                        rejected = recv_until(client, b"\r\n\r\n")
+                        if rejected:
+                            raise AssertionError(f"modified handshake was published: {rejected!r}")
+                        if peer.recv(4096):
+                            raise AssertionError("protected handshake mutation leaked application data")
+                    else:
+                        response = recv_http_response(client)
+                        if not response.startswith(b"HTTP/1.1 101") or \
+                                b"x-after-value: allowed-value\r\n" not in response.lower() or \
+                                response.lower().count(b"x-stage: after\r\n") != 1:
+                            raise AssertionError(f"chain after 101 effects lost/stale: {response!r}")
+                        if recv_client_frame(peer) != (1, b"first!", True):
+                            raise AssertionError("client early message was lost after response rewrite")
+                        if recv_client_frame(client) != (1, b"server!", False):
+                            raise AssertionError("upstream early message was lost after response rewrite")
+                        client.sendall(masked_frame(8, b"\x03\xe8"))
+                        if recv_client_frame(peer) != (8, b"\x03\xe8", True):
+                            raise AssertionError("chain after changed Close forwarding")
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return "pass", ""
+
+
 def admission_scenario(server, backend_kind, prelude=""):
     """Admission may suspend before reaching the upgrade."""
     ws_backend = socket.socket()
@@ -2567,6 +2667,15 @@ def main():
             else:
                 print(f"PASS {backend} HTTP admission / zero-connect / keepalive / "
                       f"message rewrite prelude={prelude.strip()!r}")
+        for native in (False, True):
+            for protected_header in (None, "Sec-WebSocket-Accept", "Sec-WebSocket-Protocol",
+                                     "Sec-WebSocket-Extensions"):
+                status, details = chain_after_scenario(args.server, args.compiler, backend,
+                                                      native, protected_header)
+                if status == "skip":
+                    print(f"SKIP {backend}: {details.strip()}")
+                else:
+                    print(f"PASS {backend} HTTP chain after native={native} protected={protected_header}")
         status, details = tls_passthrough_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")

@@ -939,11 +939,13 @@ func isMarker(_ bytes: Bytes) -> bool => bytes.count == 2 && bytes == b"\x00\xff
 // Inside the callback: guard isMarker(message.payload) else { message.drop() }
 // A terminate route runs the ordinary HTTP admission pipeline before its final
 // top-level websocket declaration: request lets/guards/helpers, JSON, regex,
-// effects, waits, decorators and chain-before use ordinary route
-// semantics and limits. Rejection returns locally before connecting to the
-// WebSocket upstream. Runtime HTTP bindings cannot be captured by the separate
-// message callback; only compile-time constants cross the upgrade boundary.
-// Nested websocket callbacks and chain-after Response mutations remain rejected.
+// effects, waits, decorators and chain-before use ordinary route semantics and
+// limits. Rejection returns locally before connecting to the WebSocket upstream.
+// Runtime HTTP bindings cannot be captured by the separate message callback;
+// only compile-time constants cross the upgrade boundary. Nested websocket
+// callbacks remain rejected. chain-after Response headers apply to rejection
+// and accepted upstream 101; ordinary HTTP wait/for limits remain. Negotiated
+// handshake fields cannot be rewritten after validation.
 guard let origin = req.uniqueHeader("Origin") else { return 403 }
 guard origin == "https://allowed.example" else { return 403 }
 return websocket(chat) { message in

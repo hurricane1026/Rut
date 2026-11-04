@@ -10,7 +10,7 @@ does not turn target syntax into supported syntax. The language card and
 - [x] Complete Text/Binary message concepts, typed kind/direction and borrowed Bytes.
 - [x] Ordinary pure helper typing, optional bindings, JSON projection and predicates.
 - [x] Fragmentation, masking, UTF-8 validation, controls and bounded close draining.
-- [ ] Ordinary HTTP admission without a separate expression whitelist, with zero
+- [x] Ordinary HTTP admission without a separate expression whitelist, with zero
   WebSocket upstream connections on rejection and no request-view capture.
 - [ ] General message expressions, local evaluation and control flow through the
   normal compiler; preserve short-circuit, optional/error and helper semantics.
@@ -54,3 +54,9 @@ protocol/resource criteria above remain open.
 Closed message-kind/direction domains now use ordinary match analysis, including
 contextual case patterns and coverage checks shared with helpers/HTTP routes.
 Lexical helper/callback match selectors retain reached single evaluation.
+
+HTTP chain-after response effects now share admission rejection and accepted-101
+commit behavior. Source/native tests on both backends cover zero-connect denial,
+keepalive reuse, stabilized values across request rewrites, coalesced messages
+from both peers and refusal to publish mutated handshake-critical headers. The
+ordinary HTTP wait/for restrictions on chain-after effects remain unchanged.

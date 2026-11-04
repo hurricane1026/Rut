@@ -24359,11 +24359,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
         if (has_chain_after_response_effects) {
-            if (route.is_ws_terminate)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax,
-                    route_decl.span,
-                    lit_str("chain after Response effects are not supported on WebSocket routes"));
             auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
             // Explicit status returns in guard failure bodies are response
             // terminators too. Chain-after values are request-derived and are

@@ -41,8 +41,14 @@ route GET "/checked" {
 ```
 
 One final top-level `websocket(...)` statement owns the post-upgrade callback.
-Nested callback declarations and `chain after` response mutations remain
-unsupported. HTTP bindings cannot be captured by the message handler or its
+`chain after` Response-header effects also use the ordinary HTTP path: they
+apply to local admission rejections and the upstream HTTP response, including a
+successful 101. Request-derived values are stabilized across request rewriting;
+message callbacks cannot capture them. The normal HTTP restriction against
+combining these effects with wait/for remains. Rewriting Connection, Upgrade or
+negotiated Sec-WebSocket-Accept/Protocol/Extensions on a 101 closes before any
+invalid handshake is published. Nested callback declarations remain unsupported.
+HTTP bindings cannot be captured by the message handler or its
 rewrite expressions; only compile-time constant values cross that boundary.
 This prevents request-buffer and request-arena views from escaping their lifetime.
 The specialized JSON/rewrite path retains its four-clause limit. Pure scalar

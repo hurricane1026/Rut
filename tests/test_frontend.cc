@@ -13218,15 +13218,16 @@ route GET "/ws" {
     CHECK_FALSE(analyze_file_heap(ast.value()));
 }
 
-TEST(frontend, chain_after_rejects_websocket_terminate_routes) {
+TEST(frontend, chain_after_commits_http_response_effects_on_websocket_terminate_routes) {
     const char* src = R"rut(
 upstream ws at "127.0.0.1:9000"
-func mutate(_ resp: Response) -> i32 {
-    resp.set("X-Test", "yes")
+func mutate(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Test", req.path)
     0
 }
-chain access { after mutate(resp) }
+chain access { after mutate(req, resp) }
 route GET "/ws" use chain access {
+    guard req.http11 else { return 505 }
     return websocket(ws) { message in message.forward() }
 }
 )rut";
@@ -13235,9 +13236,18 @@ route GET "/ws" use chain access {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.eq(
-        lit("chain after Response effects are not supported on WebSocket routes")));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK(hir->routes[0].is_ws_terminate);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK(hir->routes[0].guards[0].fail_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
 }
 #endif
 
