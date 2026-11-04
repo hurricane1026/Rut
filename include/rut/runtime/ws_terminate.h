@@ -17,6 +17,7 @@
 // This is the pure decision engine — it touches no sockets. The tunnel pump calls
 // ws_inspect at the forward boundary and sends the produced bytes.
 namespace rut {
+struct WsDeflateCodec;
 
 inline constexpr u32 kWsMaxCloseReasonBytes = kWsMaxControlPayload - 2;
 
@@ -192,6 +193,11 @@ struct WsInspector {
     // client leg, but masking is a wire-format property and direction is a routing one —
     // conflating them would break the day they diverge. The caller sets it at arm time.
     bool from_client = false;
+    // Independently negotiated receive and destination legs. The session owns
+    // these codecs; reset never discards their negotiated dictionary history.
+    WsDeflateCodec* decoder = nullptr;
+    WsDeflateCodec* encoder = nullptr;
+    bool compressed_message = false;
     // Immutable route-owned default and branch texts. The pinned route
     // configuration must remain alive until this connection retires.
     WsHandlerOutput* dynamic_output = nullptr;
@@ -233,6 +239,7 @@ struct WsInspector {
         received_close = false;
         assembler.reset();
         message_len = 0;
+        compressed_message = false;
         partial_data_frame = false;
         partial_payload_len = 0;
     }

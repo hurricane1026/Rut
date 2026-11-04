@@ -112,6 +112,10 @@ The internal RFC 7692 raw-DEFLATE codec now uses a pinned static C zlib with
 `Z_SOLO` and a custom allocator confined to one existing bulk slice per leg.
 The existing compress-only zstd cannot supply DEFLATE. The codec tests cover
 RFC vectors, received context history, BFINAL streams, negotiated window sizes,
-decoded/wire work budgets and incompressible output fallback. This foundation
-is not yet connected to extension negotiation or frame processing; compression
-remains unchecked above and is not advertised to peers.
+decoded/wire work budgets and incompressible output fallback. The frame engine now decodes before application dispatch and independently
+compresses destination output. Recompression uses the completed message buffer
+only after copying the result into disjoint owned send storage; bounded attempts
+retain the original frame for incompressible fallback. Controls remain uncompressed,
+and closing discards application bytes without running the codec. Extension
+negotiation and session codec ownership are not yet wired, so compression remains
+unchecked above and is not advertised to peers.
