@@ -800,5 +800,7 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [x] Fixed-account password-to-JWT login composition in Rut, with terminal
   result-to-Identity mapping, process-shared peer-IP admission, fresh jti,
   bounded lifetime/scope, no-store token response and protected-route validation.
+- [x] Offline rut-password hash/verify CLI with hidden terminal input, exact
+  redirected bytes, cleansed scratch and private atomic no-replace record files.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
   account-level abuse policies, rehash migration and persistent sessions/refresh.

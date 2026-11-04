@@ -15,7 +15,7 @@ whether a competing open-source edition includes them.
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
-| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
+| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived scoped HS256 token and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and RS256 policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | ES keys, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
@@ -1050,3 +1050,27 @@ issued JWTs keep their original expiry unless separately revoked or their
 signing key is removed. This profile adds no refresh token, cookie, logout,
 registration or password-change endpoint, account database, persistent session
 or durable token-revocation state.
+
+## Offline password provisioning
+
+[`rut-password`](password-provisioning.md) exposes the existing native hash/verify
+profile as a standalone administrative command, also in no-JIT builds. It reads
+passwords only from stdin, hides/restores terminal echo for interactive input,
+preserves exact redirected bytes, and cleanses bounded input storage. Verification
+accepts only bounded canonical regular record files, refusing final symlinks and
+special files. Exit codes distinguish mismatch from input/OS/crypto failure.
+
+Optional file output uses a protected owned parent directory, 0600 temporary
+records, file sync, atomic no-replace hard-link publication and directory sync.
+Concurrent creators cannot overwrite a winner or an existing symlink/file. Errors
+after publication explicitly report that the destination may already exist.
+No plaintext is written to files, placed in arguments or logged. This is an
+offline provisioning interface, not a user registry or password-change endpoint.
+
+`test_password_cli` independently derives PBKDF2 records with Python's standard
+library and covers binary/whitespace/newline passwords, bounds, malformed records,
+symlink/FIFO rejection, file permissions, concurrent creation, occupied targets,
+closed output pipes, hidden terminal echo, oversized terminal input and SIGINT
+restoration. It is registered with CTest and the `check` target. Linux ELF tests
+verify the ordinary executable has no C++ runtime dependencies; sanitizer builds
+exercise the same CLI suite separately.

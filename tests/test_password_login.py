@@ -66,7 +66,7 @@ def gateway(args, *, subject="alice", key=KEY.decode(), timeout=5000):
         middleware.mkdir()
         module = middleware / "auth.rut"
         module.write_bytes((source.parent / "middleware/auth.rut").read_bytes())
-        env = dict(os.environ, PASSWORD_HASH=RECORD, PASSWORD_SUBJECT=subject, JWT_ISSUE_KEY=key)
+        env = dict(os.environ, PASSWORD_HASH=args.record, PASSWORD_SUBJECT=subject, JWT_ISSUE_KEY=key)
         context = ssl.create_default_context(cafile=str(Path(args.testdata) / "localhost_cert.pem"))
         process = subprocess.Popen(
             [args.server, "0", str(path), "--backend", args.backend, "--shards", "2",
@@ -184,4 +184,13 @@ if __name__ == "__main__":
     parser.add_argument("--source", required=True)
     parser.add_argument("--testdata", required=True)
     parser.add_argument("--backend", choices=("epoll", "io_uring"), required=True)
-    exercise(parser.parse_args())
+    parser.add_argument("--password-tool")
+    args = parser.parse_args()
+    args.record = RECORD
+    if args.password_tool:
+        result = subprocess.run([args.password_tool, "hash"], input=b"password",
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        assert result.returncode == 0 and not result.stderr, result.stderr
+        assert re.fullmatch(rb"\$rut-pbkdf2-sha256\$600000\$[0-9a-f]{32}\$[0-9a-f]{64}\n", result.stdout)
+        args.record = result.stdout[:-1].decode("ascii")
+    exercise(args)

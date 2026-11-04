@@ -9415,3 +9415,21 @@ The account is a compile-time configuration snapshot. Durable user storage,
 registration/reset/change, account lockout, refresh/logout and session/revocation
 persistence remain separate work. Password replacement does not invalidate
 already-issued tokens by itself.
+
+### Offline password provisioning command
+
+`rut-password` links the existing native password/crypto implementation without
+LLVM or a C++ standard/ABI runtime. It is available with JIT disabled and applies
+the existing static-runtime link option. Passwords enter only through stdin;
+interactive mode suppresses echo and restores terminal attributes after normal,
+error or caught cancellation exits. Redirected input preserves 1–1024 exact bytes.
+Fixed stack scratch is cleansed. Hashing remains off-shard.
+
+Optional record files are newly created in a protected caller-owned directory.
+A 0600 same-directory temporary record is synced, closed and atomically linked
+into an absent destination, then unlinked and the directory synced. The target
+is never replaced; publication/sync errors remain explicit, including a completed
+record whose final cleanup or directory sync failed. Verification reads only a
+bounded canonical regular record, without following final symlinks. These are
+offline provisioning files, not a mutable account registry or session database.
+See the provisioning guide for exact input, exit, persistence and cleanup limits.

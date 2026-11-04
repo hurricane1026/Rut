@@ -503,6 +503,27 @@ find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME test_password_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_password_cli.py
+        $<TARGET_FILE:rut-password>)
+set_tests_properties(test_password_cli PROPERTIES LABELS "unit;auth;cli" TIMEOUT 90)
+add_custom_target(check_password_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_password_cli.py
+        $<TARGET_FILE:rut-password>
+    DEPENDS rut-password VERBATIM)
+if(NOT RUT_SANITIZE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME test_password_cli_cxx_deps
+        COMMAND ${CMAKE_COMMAND} -DREADELF=${CMAKE_READELF} -DRUT_BINARY=$<TARGET_FILE:rut-password>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_cxx_deps.cmake)
+    set_tests_properties(test_password_cli_cxx_deps PROPERTIES LABELS "unit;auth")
+    if(RUT_STATIC_RUNTIME)
+        add_test(NAME test_password_cli_static_deps
+            COMMAND ${CMAKE_COMMAND} -DREADELF=${CMAKE_READELF} -DRUT_BINARY=$<TARGET_FILE:rut-password>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_static.cmake)
+        set_tests_properties(test_password_cli_static_deps PROPERTIES LABELS "unit;auth")
+    endif()
+endif()
+
 add_test(NAME test_proxy_benchmark_tools
          COMMAND ${Python3_EXECUTABLE} -m unittest discover
                  -s ${PROJECT_SOURCE_DIR}/scripts/proxy_benchmark -p "test_*.py")
@@ -3854,6 +3875,7 @@ if(RUT_ENABLE_JIT)
                 add_test(NAME test_password_login_${password_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_password_login.py
                         --server $<TARGET_FILE:rut>
+                        --password-tool $<TARGET_FILE:rut-password>
                         --source ${PROJECT_SOURCE_DIR}/examples/password-jwt-login.rut
                         --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${password_backend})
                 set_tests_properties(test_password_login_${password_backend} PROPERTIES
@@ -4207,4 +4229,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
         set_tests_properties(test_cli_cors_cache_${backend} PROPERTIES
             LABELS "cli;cors;http-cache;network" RUN_SERIAL TRUE TIMEOUT 45 SKIP_RETURN_CODE 77)
     endforeach()
+endif()
+
+if(TARGET check)
+    add_dependencies(check check_password_cli)
 endif()

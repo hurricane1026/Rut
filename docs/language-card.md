@@ -1718,7 +1718,9 @@ artifact metadata carries this requirement. See
 [the password example](../examples/password-header-auth.rut) and
 [auth coverage](auth-coverage.md#rut-password-verification-and-worker-lifecycle).
 
-Hash creation remains an offline native API. This prefix uses one fixed record;
+Hash creation remains offline, through the native API or the
+[`rut-password` provisioning tool](password-provisioning.md). The tool is not a
+Rut builtin and cannot run on the shard. This prefix uses one fixed record;
 user lookup/persistence, registration, reset/change, automatic rehash and session
 or JWT login orchestration are not implemented by it. Basic auth keeps its
 existing static credential semantics.
