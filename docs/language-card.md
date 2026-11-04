@@ -872,7 +872,10 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // guards and complete if/else expressions with bare message verdicts. The
 // four-clause/32-node forest is a specialized-path bound, not a bound on these
 // general pure predicates. The source parser and ordinary local limits apply.
-// General JSON/regex work, effectful/fallible let initializers and dynamic
+// Scalar/Bytes lets evaluate once at their reached declaration, including
+// unused nullable work. `let token = uuid()` keeps HTTP's direct initializer
+// restriction; unwrap with guard let before use. Allocation failure yields nil.
+// Error-capable local declarations, general JSON/regex/hash work and dynamic
 // argument-bearing verdicts still require further integration.
 // `message` has the built-in borrowed type WebSocketMessage. It is supplied only
 // by this callback, never constructed or stored as an HTTP/connection value.

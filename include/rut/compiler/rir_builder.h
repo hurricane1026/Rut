@@ -61,6 +61,15 @@ struct Builder {
 
     Module* mod;
 
+    // Frontend lexical values are keyed by their owning initializer identity.
+    // A scoped stack entry lives only during synchronous IR materialization.
+    struct ValueBinding {
+        const void* key = nullptr;
+        ValueId value = kNoValue;
+        const ValueBinding* parent = nullptr;
+    };
+    const ValueBinding* value_bindings = nullptr;
+
     // Current insert point — stored as index to survive grow_blocks().
     Function* cur_func;
     BlockId cur_block_id;
@@ -72,6 +81,7 @@ struct Builder {
 
     void init(Module* m) {
         mod = m;
+        value_bindings = nullptr;
         cur_func = nullptr;
         cur_block_id = kNoBlock;
         cur_block = nullptr;

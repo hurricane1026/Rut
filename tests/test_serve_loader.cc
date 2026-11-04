@@ -1,5 +1,6 @@
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
@@ -9835,6 +9836,19 @@ TEST(serve_loader, websocket_general_branches_grow_ir_maps_without_route_slots) 
     CHECK(handler(nullptr, WsOpcode::Binary, &byte, 1, true) == WsFrameAction::Forward);
     CHECK(handler(nullptr, WsOpcode::Binary, &byte, 1, false) == WsFrameAction::Drop);
     CHECK(handler(nullptr, WsOpcode::Binary, nullptr, 0, true) == WsFrameAction::Drop);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_eager_bindings_survive_source_removal_and_pool_exhaustion) {
+    auto path =
+        write_file("/tmp/rut_ws_eager_bindings", "app.rut", test::ws_eager_bindings::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_eager_bindings::check(program.config, _tc);
     program.destroy();
 }
 #endif

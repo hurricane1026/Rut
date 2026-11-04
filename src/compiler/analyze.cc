@@ -3496,17 +3496,30 @@ static FrontendResult<HirExpr> analyze_array_iter_expr(const AstExpr& expr,
                                                        const HirModule& mod,
                                                        const HirLocal* locals,
                                                        u32 local_count);
-static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
-                                                         HirRoute* route,
-                                                         const HirModule& mod,
-                                                         const HirExpr* args,
-                                                         u32 arg_count,
-                                                         const GenericBinding* generic_bindings,
-                                                         u32 generic_binding_count);
+// Rebind lexical initializer identities while copying a function body into
+// another owning expression pool. Numeric local slots are not unique across
+// nested helper invocations.
+struct ExprValueBinding {
+    const HirExpr* source = nullptr;
+    HirExpr* target = nullptr;
+    const ExprValueBinding* parent = nullptr;
+};
+
+static FrontendResult<HirExpr> instantiate_function_expr(
+    const HirExpr& expr,
+    HirRoute* route,
+    const HirModule& mod,
+    const HirExpr* args,
+    u32 arg_count,
+    const GenericBinding* generic_bindings,
+    u32 generic_binding_count,
+    const ExprValueBinding* bindings = nullptr);
 static FrontendResult<HirExpr> normalize_function_expr(
     const HirExpr& expr, HirFunction* fn, const HirLocal* locals, u32 local_count, u32 param_count);
 #if RUT_ENABLE_WEBSOCKET
-static const HirExpr* ws_general_disallowed_value(const HirExpr& expr, u32 depth);
+static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
+                                                  u32 depth = 0,
+                                                  bool validate_receivers = true);
 static bool ws_infallible_binding(const HirExpr& expr, u32 depth);
 #endif
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
@@ -5578,7 +5591,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          const HirExpr* args,
                                                          u32 arg_count,
                                                          const GenericBinding* generic_bindings,
-                                                         u32 generic_binding_count) {
+                                                         u32 generic_binding_count,
+                                                         const ExprValueBinding* bindings) {
     // Helper bodies analyze against a scratch route (empty path), so their
     // req.params / req.param accesses skip capture validation. Instantiation
     // targets the CONCRETE attached route — revalidate here so a helper
@@ -5601,6 +5615,46 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     out.field_inits.len = 0;
     out.args.len = 0;
 
+    if (expr.kind == HirExprKind::BoundValue) {
+        if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        for (const ExprValueBinding* entry = bindings; entry; entry = entry->parent) {
+            if (entry->source != expr.lhs || entry->target == nullptr) continue;
+            out.lhs = entry->target;
+            return out;
+        }
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    }
+    if (expr.kind == HirExprKind::LetIn) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto initializer = instantiate_function_expr(*expr.lhs,
+                                                     route,
+                                                     mod,
+                                                     args,
+                                                     arg_count,
+                                                     generic_bindings,
+                                                     generic_binding_count,
+                                                     bindings);
+        if (!initializer) return core::make_unexpected(initializer.error());
+        if (!route->exprs.push(initializer.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        HirExpr* key = &route->exprs[route->exprs.len - 1];
+        const ExprValueBinding kScoped{expr.lhs, key, bindings};
+        auto body = instantiate_function_expr(*expr.rhs,
+                                              route,
+                                              mod,
+                                              args,
+                                              arg_count,
+                                              generic_bindings,
+                                              generic_binding_count,
+                                              &kScoped);
+        if (!body) return core::make_unexpected(body.error());
+        if (!route->exprs.push(body.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = key;
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
     if (expr.kind == HirExprKind::LocalRef) {
         if (expr.local_index >= arg_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -5614,8 +5668,14 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
 
     if (expr.kind == HirExprKind::ProtocolCall) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto recv = instantiate_function_expr(
-            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto recv = instantiate_function_expr(*expr.lhs,
+                                              route,
+                                              mod,
+                                              args,
+                                              arg_count,
+                                              generic_bindings,
+                                              generic_binding_count,
+                                              bindings);
         if (!recv) return core::make_unexpected(recv.error());
         if (recv->type == HirTypeKind::Generic)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.str_value);
@@ -5659,7 +5719,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                  args,
                                                  arg_count,
                                                  generic_bindings,
-                                                 generic_binding_count);
+                                                 generic_binding_count,
+                                                 bindings);
             if (!arg) return core::make_unexpected(arg.error());
             call_args[call_arg_count++] = arg.value();
         }
@@ -5691,8 +5752,14 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         }
         if (fn.respond_guards.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, fn.name);
-        auto inlined = instantiate_function_expr(
-            fn.body, route, mod, call_args, call_arg_count, impl_bindings, impl_binding_count);
+        auto inlined = instantiate_function_expr(fn.body,
+                                                 route,
+                                                 mod,
+                                                 call_args,
+                                                 call_arg_count,
+                                                 impl_bindings,
+                                                 impl_binding_count,
+                                                 bindings);
         if (!inlined) return core::make_unexpected(inlined.error());
         if (fn.return_type != HirTypeKind::Unknown &&
             (inlined->kind == HirExprKind::Nil || inlined->kind == HirExprKind::Error)) {
@@ -5759,8 +5826,14 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
 
     if (expr.kind == HirExprKind::TupleSlot) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto lhs = instantiate_function_expr(
-            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto lhs = instantiate_function_expr(*expr.lhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (lhs->type != HirTypeKind::Tuple)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -5783,16 +5856,28 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     if (expr.kind == HirExprKind::Or) {
         if (expr.lhs == nullptr || expr.rhs == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto lhs = instantiate_function_expr(
-            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto lhs = instantiate_function_expr(*expr.lhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!lhs->may_nil && !lhs->may_error) {
             HirExpr out_lhs = lhs.value();
             out_lhs.span = expr.span;
             return out_lhs;
         }
-        auto rhs = instantiate_function_expr(
-            *expr.rhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto rhs = instantiate_function_expr(*expr.rhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!rhs) return core::make_unexpected(rhs.error());
         HirExpr out_or = expr;
         if (!route->exprs.push(lhs.value()))
@@ -5810,16 +5895,28 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     }
 
     if (expr.lhs != nullptr) {
-        auto lhs = instantiate_function_expr(
-            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto lhs = instantiate_function_expr(*expr.lhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!route->exprs.push(lhs.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
-        auto rhs = instantiate_function_expr(
-            *expr.rhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto rhs = instantiate_function_expr(*expr.rhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!route->exprs.push(rhs.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
@@ -5832,7 +5929,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                              args,
                                              arg_count,
                                              generic_bindings,
-                                             generic_binding_count);
+                                             generic_binding_count,
+                                             bindings);
         if (!val) return core::make_unexpected(val.error());
         if (!route->exprs.push(val.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
@@ -5843,8 +5941,14 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     for (u32 i = 0; i < expr.args.len; i++) {
-        auto arg = instantiate_function_expr(
-            *expr.args[i], route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto arg = instantiate_function_expr(*expr.args[i],
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!arg) return core::make_unexpected(arg.error());
         if (!route->exprs.push(arg.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
@@ -5907,24 +6011,51 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
                                               NodePool<HirExpr>& exprs,
                                               const HirLocal* locals,
                                               u32 local_count,
-                                              u32 param_count) {
+                                              u32 param_count,
+                                              const ExprValueBinding* bindings = nullptr) {
     HirExpr out = expr;
     out.lhs = nullptr;
     out.rhs = nullptr;
     out.field_inits.len = 0;
     out.args.len = 0;
 
+    if (expr.kind == HirExprKind::BoundValue) {
+        if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        for (const ExprValueBinding* entry = bindings; entry; entry = entry->parent) {
+            if (entry->source != expr.lhs || entry->target == nullptr) continue;
+            out.lhs = entry->target;
+            return out;
+        }
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    }
+    if (expr.kind == HirExprKind::LetIn) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto initializer =
+            normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
+        if (!initializer) return core::make_unexpected(initializer.error());
+        if (!exprs.push(initializer.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        HirExpr* key = &exprs[exprs.len - 1];
+        const ExprValueBinding kScoped{expr.lhs, key, bindings};
+        auto body = normalize_expr(*expr.rhs, exprs, locals, local_count, param_count, &kScoped);
+        if (!body) return core::make_unexpected(body.error());
+        if (!exprs.push(body.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = key;
+        out.rhs = &exprs[exprs.len - 1];
+        return out;
+    }
     if (expr.kind == HirExprKind::LocalRef) {
         if (expr.local_index >= local_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.local_index < param_count) return expr;
         return normalize_expr(
-            locals[expr.local_index].init, exprs, locals, local_count, param_count);
+            locals[expr.local_index].init, exprs, locals, local_count, param_count, bindings);
     }
 
     if (expr.kind == HirExprKind::TupleSlot) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count);
+        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (lhs->type != HirTypeKind::Tuple)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -5943,20 +6074,20 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
     }
 
     if (expr.lhs != nullptr) {
-        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count);
+        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!exprs.push(lhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &exprs[exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
-        auto rhs = normalize_expr(*expr.rhs, exprs, locals, local_count, param_count);
+        auto rhs = normalize_expr(*expr.rhs, exprs, locals, local_count, param_count, bindings);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!exprs.push(rhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.rhs = &exprs[exprs.len - 1];
     }
     for (u32 i = 0; i < expr.field_inits.len; i++) {
-        auto val =
-            normalize_expr(*expr.field_inits[i].value, exprs, locals, local_count, param_count);
+        auto val = normalize_expr(
+            *expr.field_inits[i].value, exprs, locals, local_count, param_count, bindings);
         if (!val) return core::make_unexpected(val.error());
         if (!exprs.push(val.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr::FieldInit init{};
@@ -5966,7 +6097,7 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     for (u32 i = 0; i < expr.args.len; i++) {
-        auto arg = normalize_expr(*expr.args[i], exprs, locals, local_count, param_count);
+        auto arg = normalize_expr(*expr.args[i], exprs, locals, local_count, param_count, bindings);
         if (!arg) return core::make_unexpected(arg.error());
         if (!exprs.push(arg.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         if (!out.args.push(&exprs[exprs.len - 1]))
@@ -6239,10 +6370,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         scratch->allow_respond_effects = saved_allow_respond_effects;
 #if RUT_ENABLE_WEBSOCKET
         if (result && scratch->is_ws_callback) {
-            auto normalized =
-                normalize_expr(result.value(), scratch->exprs, cur_locals, cur_local_count, 1);
-            if (!normalized) return core::make_unexpected(normalized.error());
-            if (const HirExpr* bad = ws_general_disallowed_value(normalized.value(), 0))
+            // Binding references are still in lexical scope here. Validate
+            // phase before folding; receiver lowering is checked after the
+            // whole scoped value tree has been normalized into its owner.
+            if (const HirExpr* bad = ws_general_disallowed_value(result.value(), 0, false))
                 return frontend_error(FrontendError::UnsupportedSyntax, bad->span);
         }
 #endif
@@ -6744,19 +6875,18 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                      user_bound_ident_name(mod, cur_locals, cur_local_count, nullptr, inner.name)))
                     return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
 #endif
+                const bool kSavedUuidInitOk = scratch->uuid_init_ok;
+                if (scratch->is_ws_callback)
+                    scratch->uuid_init_ok =
+                        inner.expr.kind == AstExprKind::Call && inner.expr.name.eq(lit_str("uuid"));
                 auto init = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
+                scratch->uuid_init_ok = kSavedUuidInitOk;
                 if (!init) return core::make_unexpected(init.error());
-#if RUT_ENABLE_WEBSOCKET
-                if (scratch->is_ws_callback) {
-                    auto normalized = normalize_expr(
-                        init.value(), scratch->exprs, cur_locals, cur_local_count, 1);
-                    if (!normalized) return core::make_unexpected(normalized.error());
-                    // Preserve eager callback-let semantics until the shared
-                    // entry represents local evaluation explicitly.
-                    if (!ws_infallible_binding(normalized.value(), 0))
-                        return frontend_error(FrontendError::UnsupportedSyntax, inner.expr.span);
-                }
-#endif
+                if (scratch->is_ws_callback && init->may_error)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.expr.span,
+                        lit_str("error-capable message lets require recovery integration"));
                 // Mirror the route-level let handler's ArrayLit-at-RHS gate
                 // (MIR has no ArrayLit lowering yet).
                 if (init->kind == HirExprKind::ArrayLit)
@@ -6795,12 +6925,38 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 local.error_variant_index = init->error_variant_index;
                 local.shape_index = init->shape_index;
                 local.init = init.value();
+                HirExpr* initializer_key = nullptr;
+#if RUT_ENABLE_WEBSOCKET
+                // A message alias has no runtime carrier. Scalar/Bytes values
+                // use a real lexical binding, including unused nullable work.
+                if (scratch->is_ws_callback && init->type != HirTypeKind::WebSocketMessage) {
+                    if (!scratch->exprs.push(init.value()))
+                        return frontend_error(FrontendError::OutOfMemory, inner.span);
+                    initializer_key = &scratch->exprs[scratch->exprs.len - 1];
+                    local.init.kind = HirExprKind::BoundValue;
+                    local.init.lhs = initializer_key;
+                    local.init.rhs = nullptr;
+                    local.init.args.len = 0;
+                    local.init.field_inits.len = 0;
+                }
+#endif
                 auto inserted = insert_scoped_local(
                     next_locals, next_count, HirRoute::kMaxLocals, local, inner.span);
                 if (!inserted) return core::make_unexpected(inserted.error());
                 if (!scratch->locals.push(local))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
-                return self(self, si + 1, next_locals, next_count, cur_allow_respond_guards);
+                auto body = self(self, si + 1, next_locals, next_count, cur_allow_respond_guards);
+                if (!body || initializer_key == nullptr) return body;
+                if (!scratch->exprs.push(body.value()))
+                    return frontend_error(FrontendError::OutOfMemory, inner.span);
+                HirExpr evaluated = body.value();
+                evaluated.kind = HirExprKind::LetIn;
+                evaluated.span = inner.span;
+                evaluated.lhs = initializer_key;
+                evaluated.rhs = &scratch->exprs[scratch->exprs.len - 1];
+                evaluated.args.len = 0;
+                evaluated.field_inits.len = 0;
+                return evaluated;
             }
             if (inner.kind == AstStmtKind::Expr && !is_last &&
                 inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
@@ -7236,33 +7392,42 @@ static FrontendResult<HirExpr> analyze_ws_value(const AstExpr& expr,
         value.value(), scope.normalized.get(), scope.locals.data, kLocalCount, 1);
 }
 
-static const HirExpr* ws_general_disallowed_value(const HirExpr& expr, u32 depth = 0) {
+static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
+                                                  u32 depth,
+                                                  bool validate_receivers) {
     if (depth > 128) return &expr;
+    // The initializer is checked at LetIn, not again for every reference.
+    // Following reference edges here would expand a shared lexical graph.
+    if (expr.kind == HirExprKind::BoundValue) return nullptr;
     if ((expr.kind >= HirExprKind::ReqHeaderCount && expr.kind <= HirExprKind::ReqMethod &&
          expr.kind != HirExprKind::ConstMethod) ||
-        expr.kind == HirExprKind::Uuid || expr.kind == HirExprKind::WaitResult ||
-        expr.kind == HirExprKind::WaitField || expr.kind == HirExprKind::CacheGet ||
-        expr.kind == HirExprKind::CacheSet || expr.kind == HirExprKind::JsonOp ||
-        expr.kind == HirExprKind::JsonDecode || expr.kind == HirExprKind::RegexMatch ||
-        expr.kind == HirExprKind::HashDigest)
+        expr.kind == HirExprKind::WaitResult || expr.kind == HirExprKind::WaitField ||
+        expr.kind == HirExprKind::CacheGet || expr.kind == HirExprKind::CacheSet ||
+        expr.kind == HirExprKind::JsonOp || expr.kind == HirExprKind::JsonDecode ||
+        expr.kind == HirExprKind::RegexMatch || expr.kind == HirExprKind::HashDigest)
         return &expr;
-    if (expr.kind == HirExprKind::WsMessageField &&
+    if (validate_receivers && expr.kind == HirExprKind::WsMessageField &&
         (expr.lhs == nullptr || expr.lhs->kind != HirExprKind::LocalRef ||
          expr.lhs->local_index != 0 || expr.lhs->type != HirTypeKind::WebSocketMessage ||
          expr.lhs->may_nil || expr.lhs->may_error))
         return &expr;
     if (expr.lhs != nullptr)
-        if (const HirExpr* bad = ws_general_disallowed_value(*expr.lhs, depth + 1)) return bad;
+        if (const HirExpr* bad =
+                ws_general_disallowed_value(*expr.lhs, depth + 1, validate_receivers))
+            return bad;
     if (expr.rhs != nullptr)
-        if (const HirExpr* bad = ws_general_disallowed_value(*expr.rhs, depth + 1)) return bad;
+        if (const HirExpr* bad =
+                ws_general_disallowed_value(*expr.rhs, depth + 1, validate_receivers))
+            return bad;
     for (u32 i = 0; i < expr.args.len; ++i)
         if (expr.args[i] != nullptr)
-            if (const HirExpr* bad = ws_general_disallowed_value(*expr.args[i], depth + 1))
+            if (const HirExpr* bad =
+                    ws_general_disallowed_value(*expr.args[i], depth + 1, validate_receivers))
                 return bad;
     for (u32 i = 0; i < expr.field_inits.len; ++i)
         if (expr.field_inits[i].value != nullptr)
-            if (const HirExpr* bad =
-                    ws_general_disallowed_value(*expr.field_inits[i].value, depth + 1))
+            if (const HirExpr* bad = ws_general_disallowed_value(
+                    *expr.field_inits[i].value, depth + 1, validate_receivers))
                 return bad;
     return nullptr;
 }
@@ -14279,6 +14444,13 @@ static bool const_eval_expr(
     // tree recursion, so we add a fixed headroom on top of
     // local_count for the Eq/Lt/Gt descent.
     if (depth > local_count + HirRoute::kMaxLocals) return false;
+    if (expr.kind == HirExprKind::BoundValue && expr.lhs != nullptr)
+        return const_eval_expr(*expr.lhs, locals, local_count, out, depth + 1);
+    if (expr.kind == HirExprKind::LetIn && expr.lhs != nullptr && expr.rhs != nullptr) {
+        ConstValue initializer{};
+        return const_eval_expr(*expr.lhs, locals, local_count, &initializer, depth + 1) &&
+               const_eval_expr(*expr.rhs, locals, local_count, out, depth + 1);
+    }
     if (expr.kind == HirExprKind::BoolLit) {
         out->type = HirTypeKind::Bool;
         out->bool_value = expr.bool_value;

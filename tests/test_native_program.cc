@@ -4,6 +4,7 @@
 #include "fixtures/signed_request.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
@@ -3381,5 +3382,17 @@ TEST(native_program, websocket_general_expressions_survive_compiler_and_source_r
             }
         }
     }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_eager_bindings_survive_source_removal_and_pool_exhaustion) {
+    Source source;
+    REQUIRE(source.append(test::ws_eager_bindings::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_eager_bindings::check(owner.p->config, _tc);
 }
 #endif

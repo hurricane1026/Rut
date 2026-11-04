@@ -2845,8 +2845,14 @@ without consuming HTTP route/timer slots. Conditional message values use explici
 RIR branches and verified Phi nodes; nullable/error carrier adaptation happens
 on the selected incoming edge. LLVM merges use each predecessor's final helper
 continuation, including helpers that split a block internally. The existing specialized JSON/rewrite
-path remains available; general eager locals, fallible expressions, dynamic
-verdict payloads and close-event context are subsequent work.
+path remains available. Internal LetIn/BoundValue nodes retain callback local
+initialization order and single evaluation. Initializer-node identities are
+rebound into each owning expression pool during normalization/inlining and into
+scoped SSA values during RIR materialization, preventing numeric local-slot
+capture. Message aliases keep their zero-carrier representation. Nullable UUID
+locals use the ordinary runtime allocator/failure contract; ordinary helper
+body lets, general JSON/regex/hash work, dynamic verdict payloads and close-event
+context still require integration.
 
 The message also projects two nominal, closed domains: `kind` is
 `WebSocketMessageKind` (`text`, `binary`), and `direction` is `WebSocketDirection`

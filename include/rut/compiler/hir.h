@@ -253,6 +253,11 @@ enum class HirExprKind : u8 {
     ConstWsCase,
     BytesLit,
     BytesCount,
+    // Lexical evaluation: lhs is evaluated once before rhs. BoundValue refers
+    // to that initializer node identity, so helper inlining cannot capture a
+    // different local with a coincidentally equal slot index.
+    LetIn,
+    BoundValue,
 };
 
 enum class HirTypeKind : u8 {

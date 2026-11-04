@@ -1,6 +1,8 @@
 #include "rut/compiler/mir_build.h"
 
+#include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/compiler/diagnostic.h"
 #include "rut/compiler/hir.h"
 #include "rut/runtime/route_method.h"
 #include <memory>
@@ -466,6 +468,9 @@ struct ForLoopCtx {
         const MirValue* value = nullptr;
     };
     FixedVec<LocalBinding, HirRoute::kMaxLocals> locals;
+    const HirExpr* value_source = nullptr;
+    MirValue* value_target = nullptr;
+    const ForLoopCtx* value_parent = nullptr;
 };
 
 static FrontendResult<MirValue> mir_value(const HirExpr& expr,
@@ -476,6 +481,46 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     v.shape_index = expr.shape_index;
     v.may_nil = expr.may_nil;
     v.may_error = expr.may_error;
+    if (expr.kind == HirExprKind::LetIn) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto initializer = mir_value(*expr.lhs, module, fn, ctx);
+        if (!initializer) return core::make_unexpected(initializer.error());
+        if (!fn->values.push(initializer.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        MirValue* key = &fn->values[fn->values.len - 1];
+        ForLoopCtx scoped = ctx ? *ctx : ForLoopCtx{};
+        scoped.value_source = expr.lhs;
+        scoped.value_target = key;
+        scoped.value_parent = ctx;
+        auto body = mir_value(*expr.rhs, module, fn, &scoped);
+        if (!body) return core::make_unexpected(body.error());
+        if (!fn->values.push(body.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v = body.value();
+        v.kind = MirValueKind::LetIn;
+        v.lhs = key;
+        v.rhs = &fn->values[fn->values.len - 1];
+        v.args.len = 0;
+        v.field_inits.len = 0;
+        return v;
+    }
+    if (expr.kind == HirExprKind::BoundValue) {
+        if (expr.lhs == nullptr || expr.type != expr.lhs->type ||
+            expr.may_nil != expr.lhs->may_nil || expr.may_error != expr.lhs->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        for (const ForLoopCtx* binding = ctx; binding; binding = binding->value_parent) {
+            if (binding->value_source != expr.lhs || binding->value_target == nullptr) continue;
+            v = *binding->value_target;
+            v.kind = MirValueKind::BoundValue;
+            v.lhs = binding->value_target;
+            v.rhs = nullptr;
+            v.args.len = 0;
+            v.field_inits.len = 0;
+            return v;
+        }
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    }
     if (expr.kind == HirExprKind::BoolLit) {
         v.kind = MirValueKind::BoolConst;
         v.type = MirTypeKind::Bool;

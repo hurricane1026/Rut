@@ -48,6 +48,40 @@ def masked_frame(opcode, payload):
     return bytes((0x80 | opcode, 0x80 | len(payload))) + key + masked
 
 
+EAGER_BINDING_DECLARATIONS = r"""
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+"""
+EAGER_BINDING_HANDLER = r"""
+return websocket(ws) { msg in
+    let token = uuid()
+    guard let first = token else { msg.close() }
+    guard let second = token else { msg.close() }
+    guard same(first, second) else { msg.drop() }
+    msg.forward()
+}
+"""
+
+
+def eager_binding_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"eager message binding: {actual=!r}, {expected=!r}")
+
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, b"\0"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xff\0", True))
+    client.sendall(masked_frame(1, b"one") + masked_frame(2, b"two"))
+    expect(peer, (1, b"one", True))
+    expect(peer, (2, b"two", True))
+    peer.sendall(b"\x81\x05reply")
+    expect(client, (1, b"reply", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
 GENERAL_DECLARATIONS = r"""
 func allowed(_ size: i32, _ client: bool) -> bool =>
     !client || bitwise.and(size, 3) == 2
@@ -2033,6 +2067,7 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (EAGER_BINDING_HANDLER, eager_binding_exchange, EAGER_BINDING_DECLARATIONS),
                 (GENERAL_HANDLER, general_expression_exchange, GENERAL_DECLARATIONS),
                 (SCALAR_STRING_HANDLER, scalar_string_exchange, SCALAR_PREDICATE_DECLARATIONS),
                 (SCALAR_BOOL_HANDLER, scalar_bool_exchange, SCALAR_PREDICATE_DECLARATIONS),

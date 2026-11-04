@@ -1,6 +1,7 @@
 #include "deferred_preflight_fixture.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
@@ -46357,5 +46358,93 @@ TEST(frontend, websocket_general_string_comparisons_keep_ordinary_types) {
         REQUIRE(hir);
         CHECK(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu);
     }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_eager_bindings_keep_owned_initializer_identities) {
+    auto tokens = lex(lit(test::ws_eager_bindings::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    ast.reset();
+    auto copied = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    REQUIRE_EQ(copied->routes.len, 4u);
+    for (const auto& route : copied->routes) {
+        REQUIRE(route.ws_handler.general_body_expr < route.exprs.len);
+        u32 initializers = 0;
+        for (u32 i = 0; i < route.exprs.len; ++i) {
+            const auto& expr = route.exprs[i];
+            if (expr.kind == HirExprKind::LetIn) {
+                ++initializers;
+                CHECK(route.exprs.index_of(expr.lhs) != 0xffffffffu);
+                CHECK(route.exprs.index_of(expr.rhs) != 0xffffffffu);
+            }
+            if (expr.kind == HirExprKind::BoundValue)
+                CHECK(route.exprs.index_of(expr.lhs) != 0xffffffffu);
+        }
+        CHECK(initializers != 0u);
+        auto callback = std::make_unique<HirRoute>();
+        callback->is_ws_callback = true;
+        HirLocal result{};
+        result.type = HirTypeKind::I32;
+        result.is_runtime_synthetic = true;
+        result.init = route.exprs[route.ws_handler.general_body_expr];
+        REQUIRE(callback->locals.push(result));
+        callback->control.kind = HirControlKind::Direct;
+        callback->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+        callback->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+        callback->control.direct_term.local_ref_index = 0;
+        auto built = build_mir_route(*copied, *callback);
+        REQUIRE(built);
+        std::unique_ptr<MirModule> mir(built.value());
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(*mir, rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        u32 calls = 0;
+        const auto& function = rir.module.functions[0];
+        for (u32 bi = 0; bi < function.block_count; ++bi)
+            for (u32 ii = 0; ii < function.blocks[bi].inst_count; ++ii)
+                calls += function.blocks[bi].insts[ii].op == rir::Opcode::Uuid;
+        CHECK_EQ(calls, initializers);
+        rir.destroy();
+    }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_uuid_uses_the_same_direct_initializer_contract_as_http) {
+    for (const char* body :
+         {"guard let token = uuid() else { msg.close() } msg.forward()",
+          "let token = uuid().or(\"\") msg.forward()",
+          "let token = uuid(1) msg.forward()",
+          "let token = req.path msg.forward()",
+          "if false { let token = req.path msg.forward() } else { msg.drop() }"}) {
+        std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";
+        source += body;
+        source += " } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_eager_bindings_reject_unhandled_error_initializers) {
+    auto tokens = lex(lit(R"rut(upstream ws
+route GET "/ws" { return websocket(ws) { msg in
+    let failure: i32 = error(7)
+    msg.forward()
+} })rut"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
 }
 #endif

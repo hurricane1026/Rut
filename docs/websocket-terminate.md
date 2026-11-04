@@ -82,8 +82,14 @@ comparisons, local aliases, guards and complete `if`/`else` expressions, includi
 pure conditions beyond the specialized four-clause/32-node forest. It keeps the
 source parser and ordinary local limits; it does not reserve additional HTTP
 route or timer slots. Verdicts remain terminal `forward()`, `drop()` or `close()`
-statements. Argument-bearing verdicts, JSON/regex work and fallible/effectful let
-initializers still use the specialized path or produce a compile error. HTTP
+statements. Scalar and Bytes locals use lexical bindings: an initializer runs
+once at its reached declaration, even if its result is unused, and repeated
+references reuse that value. Nullable values retain their presence channel.
+`let token = uuid()` uses the same direct-initializer contract as HTTP; bind and
+unwrap the token before use. Allocation failure follows its nil branch. The
+message arena is reset for each invocation after output has been copied.
+Error-capable local declarations, argument-bearing verdicts and general
+JSON/regex/hash work still use the specialized path or produce a compile error. HTTP
 access is rejected even in statically unreachable message branches. The shared
 entry emits explicit branches and typed SSA merges: only the chosen arm runs,
 including nested nullable value choices. It does not reuse an eager `select`

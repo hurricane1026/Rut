@@ -29070,3 +29070,147 @@ TEST(jit, websocket_branch_phi_keeps_selected_effects_and_helper_continuations) 
     tc.destroy();
 }
 #endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_lexical_values_evaluate_once_at_the_reached_declaration) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    for (u32 mode : {0u, 1u, 2u}) {
+        auto module = std::make_unique<HirModule>();
+        auto route = std::make_unique<HirRoute>();
+        route->path = lit("/message");
+        route->is_ws_callback = true;
+        auto store = [&](const HirExpr& value) -> HirExpr* {
+            if (!route->exprs.push(value)) return nullptr;
+            return &route->exprs[route->exprs.len - 1];
+        };
+        HirExpr uuid{};
+        uuid.kind = HirExprKind::Uuid;
+        uuid.type = HirTypeKind::Str;
+        uuid.may_nil = true;
+        auto* initializer = store(uuid);
+        REQUIRE(initializer);
+        HirExpr bound = uuid;
+        bound.kind = HirExprKind::BoundValue;
+        bound.lhs = initializer;
+        auto* reference = store(bound);
+        REQUIRE(reference);
+        HirExpr plain{};
+        plain.kind = HirExprKind::ValueOf;
+        plain.type = HirTypeKind::Str;
+        plain.lhs = reference;
+        auto* unwrapped = store(plain);
+        REQUIRE(unwrapped);
+        HirExpr equal{};
+        equal.kind = HirExprKind::Eq;
+        equal.type = HirTypeKind::Bool;
+        equal.lhs = unwrapped;
+        equal.rhs = unwrapped;
+        auto* equality = store(equal);
+        REQUIRE(equality);
+        HirExpr present{};
+        present.kind = HirExprKind::HasValue;
+        present.type = HirTypeKind::Bool;
+        present.lhs = reference;
+        auto* presence = store(present);
+        REQUIRE(presence);
+        HirExpr forward{};
+        forward.kind = HirExprKind::IntLit;
+        forward.type = HirTypeKind::I32;
+        auto* yes = store(forward);
+        HirExpr drop = forward;
+        drop.int_value = 1;
+        auto* no = store(drop);
+        HirExpr close = forward;
+        close.int_value = 2;
+        auto* failed = store(close);
+        REQUIRE(yes && no && failed);
+        HirExpr compare = forward;
+        compare.kind = HirExprKind::IfElse;
+        compare.lhs = equality;
+        compare.rhs = yes;
+        REQUIRE(compare.args.push(no));
+        auto* compared = store(compare);
+        REQUIRE(compared);
+        HirExpr checked = forward;
+        checked.kind = HirExprKind::IfElse;
+        checked.lhs = presence;
+        checked.rhs = compared;
+        REQUIRE(checked.args.push(failed));
+        auto* body = store(checked);
+        REQUIRE(body);
+        HirExpr binding = forward;
+        binding.kind = HirExprKind::LetIn;
+        binding.lhs = initializer;
+        binding.rhs = mode == 0 ? body : yes;
+        auto* evaluated = store(binding);
+        REQUIRE(evaluated);
+        HirExpr root = binding;
+        if (mode == 2) {
+            HirExpr receiver{};
+            receiver.kind = HirExprKind::LocalRef;
+            receiver.type = HirTypeKind::WebSocketMessage;
+            auto* message = store(receiver);
+            REQUIRE(message);
+            HirExpr direction{};
+            direction.kind = HirExprKind::WsMessageField;
+            direction.type = HirTypeKind::Bool;
+            direction.str_value = lit("fromClient");
+            direction.lhs = message;
+            auto* client = store(direction);
+            REQUIRE(client);
+            root.kind = HirExprKind::IfElse;
+            root.lhs = client;
+            root.rhs = evaluated;
+            REQUIRE(root.args.push(yes));
+        }
+        HirLocal result{};
+        result.type = HirTypeKind::I32;
+        result.is_runtime_synthetic = true;
+        result.init = bound;
+        REQUIRE(route->locals.push(result));
+        route->control.kind = HirControlKind::Direct;
+        route->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+        route->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+        route->control.direct_term.local_ref_index = 0;
+        CHECK_FALSE(build_mir_route(*module, *route));  // Reference outside its binder.
+        route->locals[0].init = root;
+        auto copied = std::make_unique<HirRoute>(*route);
+        route.reset();
+        auto built = build_mir_route(*module, *copied);
+        REQUIRE(built);
+        std::unique_ptr<MirModule> mir(built.value());
+        auto mir_copy = std::make_unique<MirModule>(*mir);
+        mir.reset();
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(*mir_copy, rir));
+        mir_copy.reset();
+        copied.reset();
+        module.reset();
+        auto cg = codegen_ws_body(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        auto connection = std::make_unique<ConnectionBase>();
+        REQUIRE(connection->json_arena.init(&pool));
+        for (bool owner : {false, true}) {
+            for (u8 client : {0u, 1u}) {
+                connection->json_arena.destroy();
+                auto returned = HandlerResult::unpack(handler(
+                    owner ? connection.get() : nullptr, nullptr, nullptr, 0, nullptr, 1, client));
+                CHECK_EQ(returned.status_code, mode == 0 && !owner ? 2u : 0u);
+                CHECK_EQ(pool.in_use(), owner && (mode != 2 || client) ? 1u : 0u);
+            }
+        }
+        connection->json_arena.destroy();
+        CHECK_EQ(pool.in_use(), 0u);
+        pool.destroy();
+        rir.destroy();
+        engine.shutdown();
+    }
+}
+#endif

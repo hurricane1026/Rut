@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/common/ws_message.h"
+#include "rut/compiler/mir.h"
 #include "rut/compiler/rir_builder.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/route_method.h"
@@ -1270,6 +1271,23 @@ static FrontendResult<rir::ValueId> emit_ord_for_flat_shape(
                               less_than);
 }
 
+static FrontendResult<rir::ValueId> materialize_local_init(
+    const MirLocal& local,
+    const MirModule& mir,
+    const VariantLoweringInfo* variant_infos,
+    TupleLoweringInfo* tuple_infos,
+    u32* tuple_info_count,
+    ErrorLoweringInfo* error_scalar_infos,
+    ErrorLoweringInfo* error_variant_infos,
+    ErrorLoweringInfo* error_struct_infos,
+    const rir::StructDef* error_struct_def,
+    const rir::StructDef* const* user_struct_defs,
+    rir::Builder& b,
+    const rir::ValueId* locals,
+    u32 local_count,
+    Str func_name,
+    Str source_name);
+
 static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                                       const MirModule& mir,
                                                       const VariantLoweringInfo* variant_infos,
@@ -1288,6 +1306,73 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             shape, variant_infos, tuple_infos, tuple_info_count, user_struct_defs, b, span);
     };
 
+    if (value.kind == MirValueKind::BoundValue) {
+        if (value.lhs == nullptr || value.type != value.lhs->type ||
+            value.may_nil != value.lhs->may_nil || value.may_error != value.lhs->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        for (auto* binding = b.value_bindings; binding; binding = binding->parent)
+            if (binding->key == value.lhs) return binding->value;
+        return frontend_error(FrontendError::UnsupportedSyntax, span);
+    }
+    if (value.kind == MirValueKind::LetIn) {
+        if (value.lhs == nullptr || value.rhs == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        const MirValue& initializer = *value.lhs;
+        MirLocal local{};
+        local.span = span;
+        local.type = initializer.type;
+        local.shape_index = initializer.shape_index;
+        local.may_nil = initializer.may_nil;
+        local.may_error = initializer.may_error;
+        local.variant_index = initializer.variant_index;
+        local.struct_index = initializer.struct_index;
+        local.error_struct_index = initializer.error_struct_index;
+        local.error_variant_index = initializer.error_variant_index;
+        local.tuple_len = initializer.tuple_len;
+        if (local.tuple_len > kMaxMirTupleSlots)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        for (u32 i = 0; i < local.tuple_len; ++i) {
+            local.tuple_types[i] = initializer.tuple_types[i];
+            local.tuple_variant_indices[i] = initializer.tuple_variant_indices[i];
+            local.tuple_struct_indices[i] = initializer.tuple_struct_indices[i];
+        }
+        local.init = initializer;
+        const auto* error_type = error_scalar_infos[static_cast<u32>(MirTypeKind::I32)].error_type;
+        if (error_type == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto evaluated = materialize_local_init(local,
+                                                mir,
+                                                variant_infos,
+                                                tuple_infos,
+                                                tuple_info_count,
+                                                error_scalar_infos,
+                                                error_variant_infos,
+                                                error_struct_infos,
+                                                error_type->struct_def,
+                                                user_struct_defs,
+                                                b,
+                                                locals,
+                                                local_count,
+                                                b.cur_func->name,
+                                                b.mod->name);
+        if (!evaluated) return core::make_unexpected(evaluated.error());
+        const rir::Builder::ValueBinding kBinding{value.lhs, evaluated.value(), b.value_bindings};
+        b.value_bindings = &kBinding;
+        auto result = materialize_value(*value.rhs,
+                                        mir,
+                                        variant_infos,
+                                        tuple_infos,
+                                        tuple_info_count,
+                                        error_scalar_infos,
+                                        error_variant_infos,
+                                        error_struct_infos,
+                                        user_struct_defs,
+                                        b,
+                                        locals,
+                                        local_count,
+                                        span);
+        b.value_bindings = kBinding.parent;
+        return result;
+    }
     if (value.kind == MirValueKind::BoolConst) {
         auto v = b.emit_const_bool(value.bool_value, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
