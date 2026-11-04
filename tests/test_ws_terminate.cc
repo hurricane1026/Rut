@@ -2542,32 +2542,108 @@ TEST(ws_terminate, handler_close_tiny_message_keeps_code_when_room) {
     CHECK_EQ((static_cast<u32>(pl[0]) << 8) | pl[1], 1008u);
 }
 
-// A peer-sent Close leaves the echo at 1000 (unchanged) even when the route configured a
-// different message.close(code) — the peer's own code is relayed verbatim on the forward leg.
-TEST(ws_terminate, peer_close_echo_stays_1000) {
-    WsInspector st = make_state(false);
-    st.close_code = 1008;
-    st.close_reason = {"policy", 6};
-    REQUIRE(st.set_echo_close_reason(st.close_reason));  // handler-only policy, not peer close
-    Recorder r;
-    u8 in[64];
-    const u8 body[] = {0x03, 0xF1};  // 1009 Too Big, from the peer
-    u32 in_len = build(in, WsOpcode::Close, true, false, body, 2);
+TEST(ws_terminate, peer_close_reply_owns_exact_payload_in_both_roles) {
+    for (bool masked : kMaskDirections) {
+        constexpr u32 kPayloadLengths[] = {0, 2, kWsMaxControlPayload};
+        for (u32 body_len : kPayloadLengths) {
+            const bool kNoStatus = body_len == 0;
+            char reason[kWsMaxCloseReasonBytes];
+            memset(reason, 'r', sizeof(reason));
+            reason[0] = 0;
+            reason[120] = static_cast<char>(0xe2);
+            reason[121] = static_cast<char>(0x82);
+            reason[122] = static_cast<char>(0xac);
+            u8 body[kWsMaxControlPayload] = {0x03, 0xf1};  // 1009, distinct from route policy
+            memcpy(body + 2, reason, sizeof(reason));
+            u8 in[256], out[256], mbuf[64], decoded[kWsMaxControlPayload];
+            const u32 in_len = build(in, WsOpcode::Close, true, masked, body, body_len);
+            for (u32 split = 0; split < in_len; ++split) {
+                WsInspector st = make_state(masked);
+                st.close_code = 1008;
+                st.close_reason = lit_str("policy");
+                REQUIRE(st.set_echo_close_reason(st.close_reason));
+                Recorder r;
+                u32 consumed = 0, produced = 0;
+                REQUIRE(ws_inspect(st,
+                                   in,
+                                   split,
+                                   out,
+                                   sizeof(out),
+                                   mbuf,
+                                   sizeof(mbuf),
+                                   record,
+                                   &r,
+                                   &consumed,
+                                   &produced) == WsInspectStatus::Ok);
+                CHECK_EQ(consumed, 0u);  // incomplete controls stay in the receive buffer
+                CHECK_EQ(produced, 0u);
+                CHECK_FALSE(st.received_close);
+                REQUIRE(ws_inspect(st,
+                                   in,
+                                   in_len,
+                                   out,
+                                   sizeof(out),
+                                   mbuf,
+                                   sizeof(mbuf),
+                                   record,
+                                   &r,
+                                   &consumed,
+                                   &produced) == WsInspectStatus::Close);
+                CHECK_EQ(consumed, in_len);
+                CHECK_EQ(r.calls, 0);
+                CHECK(st.received_close);
+                CHECK_EQ(st.echo_close_code, kNoStatus ? 1005u : 1009u);
+                WsFrameHeader header;
+                REQUIRE_EQ(parse_one(out, produced, masked, &header, decoded), produced);
+                CHECK_EQ(header.payload_len, body_len);
+                CHECK(memcmp(decoded, body, body_len) == 0);
+                WsClosePayload owned;
+                REQUIRE(owned.assign(st.echo_close_code, st.echo_close_reason()));
+                WsClosePayload copied = owned;
+                owned = {};
+                st.reset();
+                memset(st.echo_close_storage, 'x', sizeof(st.echo_close_storage));
+                CHECK_FALSE(st.received_close);
+                CHECK_EQ(st.echo_close_code, 1000u);
+                CHECK_EQ(copied.code, kNoStatus ? 1005u : 1009u);
+                CHECK(copied.reason().eq(kNoStatus ? Str{} : Str{reason, body_len - 2}));
+                u64 rng = 0;
+                produced = ws_emit_close_payload(out, sizeof(out), !masked, rng, copied);
+                REQUIRE(produced > 0);
+                REQUIRE_EQ(parse_one(out, produced, !masked, &header, decoded), produced);
+                CHECK_EQ(header.payload_len, body_len);
+                CHECK(memcmp(decoded, body, body_len) == 0);
+                CHECK_EQ(ws_emit_close_payload(out, produced - 1, !masked, rng, copied), 0u);
+            }
+        }
+    }
+}
 
-    u8 out[64], mbuf[64];
-    u32 consumed = 0, produced = 0;
-    WsInspectStatus s = ws_inspect(
-        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
-    CHECK(s == WsInspectStatus::Close);
-    CHECK_EQ(r.calls, 0);  // control frames never reach the handler
-    CHECK(st.echo_close_reason().empty());
-    CHECK_EQ(st.echo_close_code, 1000u);  // echo unchanged by the route's close_code
-    // The peer's 1009 was forwarded verbatim.
-    WsFrameHeader h;
-    u8 pl[8];
-    CHECK(parse_one(out, produced, false, &h, pl) == produced);
-    CHECK(h.opcode == WsOpcode::Close);
-    CHECK_EQ((static_cast<u32>(pl[0]) << 8) | pl[1], 1009u);
+TEST(ws_terminate, close_payload_rejects_invalid_status_reason_and_forged_metadata) {
+    WsClosePayload payload;
+    REQUIRE(payload.assign(1008, lit_str("keep")));
+    const u16 invalid[] = {0, 999, 1004, 1006, 1015, 2000, 5000};
+    for (u16 code : invalid) CHECK_FALSE(payload.assign(code, {}));
+    CHECK_FALSE(payload.assign(1005, lit_str("no status cannot carry a reason")));
+    CHECK_FALSE(payload.assign(1000, {nullptr, 1}));
+    const char bad[] = {static_cast<char>(0xff)};
+    CHECK_FALSE(payload.assign(1000, {bad, sizeof(bad)}));
+    char oversized[kWsMaxCloseReasonBytes + 1]{};
+    CHECK_FALSE(payload.assign(1000, {oversized, sizeof(oversized)}));
+    CHECK_EQ(payload.code, 1008u);
+    CHECK(payload.reason().eq(lit_str("keep")));  // failed assignment cannot corrupt prior state
+    u8 out[256];
+    u64 rng = 0;
+    CHECK_EQ(ws_emit_close_frame(out, sizeof(out), false, rng, 1005), 0u);
+    payload.code = 1005;
+    CHECK_EQ(ws_emit_close_payload(out, sizeof(out), false, rng, payload), 0u);
+    payload.code = 1000;
+    payload.reason_len = 255;
+    CHECK_EQ(ws_emit_close_payload(out, sizeof(out), true, rng, payload), 0u);
+    REQUIRE(payload.assign(1005, {}));
+    CHECK_EQ(ws_emit_close_payload(out, sizeof(out), false, rng, payload), 2u);
+    CHECK_EQ(out[0], 0x88u);
+    CHECK_EQ(out[1], 0u);  // local 1005 is represented by no status bytes on wire
 }
 
 // === Partial frames across chunks ===

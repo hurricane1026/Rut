@@ -567,6 +567,16 @@ bool ws_valid_close_reason(Str reason) {
     return reason.len <= kWsMaxCloseReasonBytes && ws_valid_text_payload(reason);
 }
 
+bool WsClosePayload::assign(u16 status, Str text) {
+    if ((!ws_valid_close_code(status) && status != 1005) || (status == 1005 && !text.empty()) ||
+        !ws_valid_close_reason(text))
+        return false;
+    for (u32 i = 0; i < text.len; ++i) reason_storage[i] = text.ptr[i];
+    reason_len = static_cast<u8>(text.len);
+    code = status;
+    return true;
+}
+
 WsInspectStatus ws_inspect(WsInspector& st,
                            const u8* in,
                            u32 in_len,
@@ -679,10 +689,14 @@ WsInspectStatus ws_inspect(WsInspector& st,
 
             // §7.4/§5.5.1: a Close body, if present, is a 2-byte status code (which must be
             // a valid wire code) followed by a UTF-8 reason. Fail the tunnel otherwise.
-            if (h.opcode == WsOpcode::Close && h.payload_len >= 2) {
-                const u32 code = (static_cast<u32>(cbuf[0]) << 8) | cbuf[1];
-                if (!ws_valid_close_code(code)) return WsInspectStatus::Error;
-                if (!utf8_valid(cbuf + 2, h.payload_len - 2)) return WsInspectStatus::Error;
+            u16 received_code = 1005;
+            if (h.opcode == WsOpcode::Close) {
+                if (h.payload_len == 1) return WsInspectStatus::Error;
+                if (h.payload_len >= 2) {
+                    received_code = static_cast<u16>((static_cast<u16>(cbuf[0]) << 8) | cbuf[1]);
+                    if (!ws_valid_close_code(received_code)) return WsInspectStatus::Error;
+                    if (!utf8_valid(cbuf + 2, h.payload_len - 2)) return WsInspectStatus::Error;
+                }
             }
 
             if (!emit_frame(out,
@@ -697,10 +711,13 @@ WsInspectStatus ws_inspect(WsInspector& st,
             }
             *consumed += static_cast<u32>(frame_total);
             if (h.opcode == WsOpcode::Close) {
-                // Peer-initiated close: the peer's own code was relayed verbatim above; keep
-                // the echo to the other side at 1000 (unchanged behavior — see header).
-                st.echo_close_code = 1000;
-                st.echo_close_reason_len = 0;
+                // Reply to the sender with the same status/reason, including an
+                // empty body. Retain owned bytes before receive storage is recycled.
+                st.echo_close_code = received_code;
+                const Str kReason{reinterpret_cast<const char*>(cbuf + 2),
+                                  h.payload_len == 0 ? 0 : static_cast<u32>(h.payload_len - 2)};
+                if (!st.set_echo_close_reason(kReason)) return WsInspectStatus::Error;
+                st.received_close = true;
                 return WsInspectStatus::Close;
             }
             continue;
@@ -890,6 +907,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 return WsInspectStatus::Error;
             if (!st.set_echo_close_reason(kSelected.reason)) return WsInspectStatus::Error;
             st.echo_close_code = kSelected.code;
+            st.received_close = false;
             st.message_len = 0;
             return WsInspectStatus::Close;
         } else if (action != WsFrameAction::Drop) {
@@ -911,6 +929,17 @@ u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 co
     u32 produced = 0;
     if (!emit_frame(
             out, out_cap, &produced, WsOpcode::Close, body, 2u + reason.len, masked, mask_rng))
+        return 0;
+    return produced;
+}
+
+u32 ws_emit_close_payload(
+    u8* out, u32 out_cap, bool masked, u64& mask_rng, const WsClosePayload& payload) {
+    if (payload.code != 1005)
+        return ws_emit_close_frame(out, out_cap, masked, mask_rng, payload.code, payload.reason());
+    if (payload.reason_len != 0) return 0;
+    u32 produced = 0;
+    if (!emit_frame(out, out_cap, &produced, WsOpcode::Close, nullptr, 0, masked, mask_rng))
         return 0;
     return produced;
 }

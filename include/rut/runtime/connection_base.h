@@ -700,11 +700,10 @@ struct ConnectionBase {
     Str ws_close_reason{};  // pinned route-owned close reason
     const WsClosePolicy* ws_close_policies = nullptr;
     u32 ws_close_policy_count = 0;
-    Str ws_echo_close_reason{};
-    u16 ws_close_code;       // route's message.close(code) status (seeds both inspectors)
-    u16 ws_echo_close_code;  // code for the echo Close (set from the inspector on close)
-    WsInspector ws_c2u;      // client->upstream inspection state (masked)
-    WsInspector ws_u2c;      // upstream->client inspection state (unmasked)
+    WsClosePayload ws_close_payload{};  // owned across inspector/receive-buffer retirement
+    u16 ws_close_code;   // route's message.close(code) status (seeds both inspectors)
+    WsInspector ws_c2u;  // client->upstream inspection state (masked)
+    WsInspector ws_u2c;  // upstream->client inspection state (unmasked)
     // Separate reassembly and output slices per direction. Output remains stable while
     // an asynchronous send is in flight; consumed input is compacted on completion.
     u8* ws_c2u_msg = nullptr;  // client->upstream reassembly slice
@@ -2087,7 +2086,7 @@ struct ConnectionBase {
         ws_close_reason = {};
         ws_close_policies = nullptr;
         ws_close_policy_count = 0;
-        ws_echo_close_reason = {};
+        ws_close_payload = {};
         ws_close_code = 1000;
         ws_forward_text = {};
         ws_handler_output = {};
@@ -2095,7 +2094,6 @@ struct ConnectionBase {
         ws_u2c.dynamic_output = nullptr;
         ws_forward_texts = nullptr;
         ws_forward_text_count = 0;
-        ws_echo_close_code = 1000;
         ws_c2u.reset();
         ws_u2c.reset();
         ws_c2u.message_len = 0;

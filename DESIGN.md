@@ -3411,6 +3411,14 @@ re-read), each with its own buffer for natural backpressure.
   buffer-full `-ENOBUFS` means the overflow was already consumed and discarded,
   so the tunnel fails closed there rather than forwarding a corrupted stream.
 
+- **Terminate-mode Close metadata.** A valid peer Close retains its exact status
+  and UTF-8 reason on both the forwarded frame and the reply to its sender.
+  An absent status is represented internally by 1005 and emitted as an empty
+  body, never as status bytes. The connection owns reply reason storage across
+  inspector reset and deferred sends. This is separate from completion of the
+  closing handshake: the current pump drains outgoing Close frames and does
+  not yet wait for both peer acknowledgements or expose lifecycle callbacks.
+
 - **Connection teardown — drain-then-close (nginx model).** WebSocket shutdown
   is an *application-level* event (the RFC 6455 Close-frame handshake), not a TCP
   half-close. So when either peer closes the underlying TCP connection (FIN), the

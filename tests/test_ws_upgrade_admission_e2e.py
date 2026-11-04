@@ -2687,6 +2687,25 @@ def subprotocol_scenario(server, backend_kind):
     return "pass", ""
 
 
+def peer_close_exchange(from_client, payload):
+    def exchange(client, peer):
+        sender, other = (client, peer) if from_client else (peer, client)
+        frame = masked_frame(8, payload) if from_client else bytes((0x88, len(payload))) + payload
+        # Deliver the complete control header separately from its reason body.
+        sender.sendall(frame[:2])
+        time.sleep(0.01)
+        sender.sendall(frame[2:])
+        expected_reply = (8, payload, not from_client)
+        actual = recv_client_frame(sender)
+        if actual != expected_reply:
+            raise AssertionError(f"peer Close reply changed status/reason: {actual!r}")
+        actual = recv_client_frame(other)
+        if actual != (8, payload, from_client):
+            raise AssertionError(f"forwarded peer Close changed status/reason: {actual!r}")
+    exchange.__name__ = f"peer_close_client={from_client}_payload={len(payload)}"
+    return exchange
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True)
@@ -2694,6 +2713,14 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
+                 peer_close_exchange(True, b""), ""),
+                ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
+                 peer_close_exchange(False, b""), ""),
+                ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
+                 peer_close_exchange(True, b"\x03\xf1\0" + b"r" * 119 + "€".encode()), ""),
+                ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
+                 peer_close_exchange(False, b"\x03\xf1\0" + b"r" * 119 + "€".encode()), ""),
                 (GENERAL_JSON_HANDLER, general_json_exchange, GENERAL_JSON_DECLARATIONS),
                 (GENERAL_REGEX_HANDLER, general_regex_exchange, GENERAL_JSON_DECLARATIONS),
                 (TYPED_JSON_HANDLER, typed_json_exchange, GENERAL_JSON_DECLARATIONS),

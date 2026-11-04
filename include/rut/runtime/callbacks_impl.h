@@ -11163,17 +11163,16 @@ bool ws_drive_close(Loop* loop, Connection& conn) {
     if (conn.ws_upstream_eof) conn.ws_close_upstream_need = false;
     // Client slot (upstream->client, unmasked): send the echo Close if idle.
     if (conn.ws_close_client_need && !conn.ws_upstream_send_pending) {
-        const Str reason = conn.ws_echo_close_reason;
+        const Str reason = conn.ws_close_payload.reason();
         // The slot is idle: its dedicated output slice is stable until this send completes.
         u8* frame = reason.empty() ? conn.ws_close_frame_client : conn.ws_u2c_out;
         const u32 cap = reason.empty() ? sizeof(conn.ws_close_frame_client) : SlicePool::kSliceSize;
         if (!frame) return false;
-        const u32 n = ws_emit_close_frame(frame,
-                                          cap,
-                                          /*masked=*/false,
-                                          conn.ws_u2c.mask_rng,
-                                          conn.ws_echo_close_code,
-                                          reason);
+        const u32 n = ws_emit_close_payload(frame,
+                                            cap,
+                                            /*masked=*/false,
+                                            conn.ws_u2c.mask_rng,
+                                            conn.ws_close_payload);
         if (n == 0 || !client_send(loop, conn, frame, n)) return false;
         conn.ws_upstream_send_pending = true;
         conn.ws_close_client_need = false;
@@ -11181,17 +11180,16 @@ bool ws_drive_close(Loop* loop, Connection& conn) {
     }
     // Upstream slot (client->upstream, masked): send the echo Close if idle.
     if (conn.ws_close_upstream_need && !conn.ws_client_send_pending) {
-        const Str reason = conn.ws_echo_close_reason;
+        const Str reason = conn.ws_close_payload.reason();
         u8* frame = reason.empty() ? conn.ws_close_frame_upstream : conn.ws_c2u_out;
         const u32 cap =
             reason.empty() ? sizeof(conn.ws_close_frame_upstream) : SlicePool::kSliceSize;
         if (!frame) return false;
-        const u32 n = ws_emit_close_frame(frame,
-                                          cap,
-                                          /*masked=*/true,
-                                          conn.ws_c2u.mask_rng,
-                                          conn.ws_echo_close_code,
-                                          reason);
+        const u32 n = ws_emit_close_payload(frame,
+                                            cap,
+                                            /*masked=*/true,
+                                            conn.ws_c2u.mask_rng,
+                                            conn.ws_close_payload);
         if (n == 0 || !loop->submit_send_upstream(conn, frame, n)) return false;
         conn.ws_client_send_pending = true;
         conn.ws_close_upstream_need = false;
@@ -11235,13 +11233,14 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                 // The produced send carries the Close to the upstream; the client must get a
                 // Close back too (handshake). Start the upstream slot in-flight + queue the
                 // client echo, then close once both drain. The echo carries the code the
-                // inspector resolved (handler message.close(code), or 1000 for a peer close).
+                // inspector resolved, preserving a peer status/reason or handler policy.
                 conn.ws_closing = true;
                 ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_upstream_inflight = true;
                 conn.ws_close_client_need = true;
-                conn.ws_echo_close_code = conn.ws_c2u.echo_close_code;
-                conn.ws_echo_close_reason = conn.ws_c2u.echo_close_reason();
+                if (!conn.ws_close_payload.assign(conn.ws_c2u.echo_close_code,
+                                                  conn.ws_c2u.echo_close_reason()))
+                    return false;
             }
             if (!loop->submit_send_upstream(conn, conn.ws_c2u_out, produced)) return false;
             conn.ws_client_send_pending = true;
@@ -11314,13 +11313,14 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
             if (st == WsInspectStatus::Close) {
                 // The produced send carries the Close to the client; the upstream must get a
                 // Close back too. Start the client slot in-flight + queue the upstream echo,
-                // carrying the code the inspector resolved (message.close(code), or 1000).
+                // carrying the status/reason the inspector resolved.
                 conn.ws_closing = true;
                 ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_client_inflight = true;
                 conn.ws_close_upstream_need = true;
-                conn.ws_echo_close_code = conn.ws_u2c.echo_close_code;
-                conn.ws_echo_close_reason = conn.ws_u2c.echo_close_reason();
+                if (!conn.ws_close_payload.assign(conn.ws_u2c.echo_close_code,
+                                                  conn.ws_u2c.echo_close_reason()))
+                    return false;
             }
             if (!client_send(loop, conn, conn.ws_u2c_out, produced)) return false;
             conn.ws_upstream_send_pending = true;

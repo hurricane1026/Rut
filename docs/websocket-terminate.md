@@ -1039,6 +1039,14 @@ Ping/Pong/Close frames bypass the application handler. Control frames may occur
 between fragments without creating an application message. Protocol errors and
 oversized messages fail the tunnel; user code cannot bypass these checks.
 
+A valid peer Close is forwarded and replied to with the same status and UTF-8
+reason. An empty Close body stays empty; the internal no-status value 1005 is
+never encoded on the wire. Reply metadata owns its reason bytes independently
+of receive buffers and inspector reset, including a reply deferred behind an
+existing send. This preserves a peer's reason but does not yet add peer
+acknowledgement waiting: the current close pump still tears down after its
+outgoing Close sends drain. Lifecycle callbacks remain unavailable.
+
 Inspection currently uses bounded single-slice storage (16370 bytes),
 with separate per-direction output buffers. `maxMessageSize` cannot lift that
 storage cap. Supporting larger messages requires a separate buffering design.

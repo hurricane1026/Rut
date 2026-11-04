@@ -78,3 +78,8 @@ registry reorder/removal, and writes retain lexical guard/branch ordering.
 Virtual-clock tests verify the existing per-invocation time latch refreshes for
 the next message in both source and native callbacks. Cache remains lossy and
 per-shard, not session storage.
+
+Peer Close replies now preserve the exact received status/reason, including an
+empty body when no status was sent. Reply bytes are connection-owned across
+inspector reset and deferred sends. Outgoing Close drain remains distinct from
+peer acknowledgement; the lifecycle/closing-handshake criterion stays open.

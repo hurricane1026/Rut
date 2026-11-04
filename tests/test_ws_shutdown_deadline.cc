@@ -61,6 +61,73 @@ u64 ws_yield_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
 }
 }  // namespace
 
+TEST(websocket, deferred_peer_close_reply_survives_inspector_reset) {
+    constexpr bool kDirections[] = {false, true};
+    for (bool from_client : kDirections) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        conn->upstream_fd = 43;
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+        conn->is_ws_tunnel = true;
+        conn->is_ws_terminate = true;
+        conn->ws_handler = &ws_close_handler;  // must never run for a control frame
+        conn->ws_max_message_size = 128;
+        u8 c2u_message[128]{}, c2u_output[256]{};
+        u8 u2c_message[128]{}, u2c_output[256]{};
+        conn->ws_c2u_msg = c2u_message;
+        conn->ws_c2u_out = c2u_output;
+        conn->ws_u2c_msg = u2c_message;
+        conn->ws_u2c_out = u2c_output;
+        conn->ws_c2u.masked = true;
+        conn->ws_c2u.from_client = true;
+        conn->ws_u2c.masked = false;
+        u8 frame[128];
+        const Str reason{"a\0\xe2\x82\xac", 5};
+        u64 rng = 0;
+        const u32 length =
+            ws_emit_close_frame(frame, sizeof(frame), from_client, rng, 1009, reason);
+        REQUIRE(length > 0);
+        if (from_client) {
+            conn->ws_upstream_send_pending = true;  // earlier server output occupies reply slot
+            REQUIRE_EQ(conn->recv_buf.write(frame, length), length);
+            on_ws_client_recv<SmallLoop>(
+                &loop, *conn, make_ev(conn->id, IoEventType::Recv, length));
+            REQUIRE(conn->ws_close_client_need);
+            conn->ws_c2u.reset();
+            on_ws_upstream_to_client_sent<SmallLoop>(
+                &loop, *conn, make_ev(conn->id, IoEventType::Send, 1));
+        } else {
+            conn->ws_client_send_pending = true;
+            REQUIRE_EQ(conn->upstream_recv_buf.write(frame, length), length);
+            on_ws_upstream_recv<SmallLoop>(
+                &loop, *conn, make_ev(conn->id, IoEventType::UpstreamRecv, length));
+            REQUIRE(conn->ws_close_upstream_need);
+            conn->ws_u2c.reset();
+            on_ws_client_to_upstream_sent<SmallLoop>(
+                &loop, *conn, make_ev(conn->id, IoEventType::UpstreamSend, 1));
+        }
+        REQUIRE(conn->ws_closing);
+        REQUIRE(conn->ws_close_client_inflight);
+        REQUIRE(conn->ws_close_upstream_inflight);
+        CHECK_EQ(conn->ws_close_payload.code, 1009u);
+        CHECK(conn->ws_close_payload.reason().eq(reason));
+        const u8* reply = from_client ? u2c_output : c2u_output;
+        WsFrameHeader header;
+        REQUIRE(ws_parse_header(reply, 128, !from_client, &header) == ParseStatus::Complete);
+        CHECK(header.opcode == WsOpcode::Close);
+        REQUIRE_EQ(header.payload_len, 7u);
+        u8 body[7];
+        for (u32 j = 0; j < sizeof(body); ++j) body[j] = reply[header.header_len + j];
+        if (header.masked) ws_unmask(body, sizeof(body), header.mask_key);
+        CHECK_EQ(body[0], 3u);
+        CHECK_EQ(body[1], 241u);
+        CHECK(memcmp(body + 2, reason.ptr, reason.len) == 0);
+    }
+}
+
 TEST(websocket, handler_close_drain_deadline_expires_before_http_yield) {
     SmallLoop loop;
     loop.setup();

@@ -1263,7 +1263,8 @@ return websocket(chat) { message in
 // Close with a status and fixed UTF-8 reason (also accepted in guard branches).
 // Reason length is at most 123 UTF-8 bytes; empty reasons and NUL are supported.
 // Handler closes send the configured code/reason to both peers. Peer closes
-// retain their original forwarding and normal-closure echo behavior.
+// forward and reply with the received status/reason, preserving an empty Close
+// body when no status was sent. Internal 1005 is never sent as a wire status.
 return websocket(chat) { message in
     guard message.fromClient && message.text.contains("secret") else { message.forward() }
     message.close(1008, "policy violation")

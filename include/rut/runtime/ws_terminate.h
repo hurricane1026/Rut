@@ -73,6 +73,18 @@ constexpr bool ws_valid_close_code(u32 code) {
            (code >= 3000 && code <= 4999);
 }
 
+// Owned Close metadata. 1005 represents an absent wire status, never a status
+// encoded on the wire. No view points into receive or callback scratch storage;
+// ordinary copies retain the reason independently.
+struct WsClosePayload {
+    u16 code = 1005;
+    u8 reason_len = 0;
+    char reason_storage[kWsMaxCloseReasonBytes]{};
+
+    Str reason() const { return {reason_storage, reason_len}; }
+    bool assign(u16 status, Str text);
+};
+
 // What the gateway should do with a fully-reassembled data message.
 enum class WsFrameAction : u8 {
     Forward,       // re-serialize the message and send it on
@@ -170,12 +182,9 @@ struct WsInspector {
     u32 forward_text_count = 0;
     u64 mask_rng = 0;          // Reserved for compatibility; masking keys use RAND_bytes.
     u64 max_message_size = 0;  // 0 = unbounded
-    // `message.close(code)` support. close_code (INPUT) is the RFC 6455 status the handler's
-    // Close verdict should put on the wire — set by the caller from the route config (1000 =
-    // Normal Closure default). echo_close_code (OUTPUT) is written by ws_inspect whenever it
-    // returns Close: the code the OPPOSITE leg's echo Close should carry. For a handler Close
-    // it mirrors close_code; for a peer-sent Close it stays 1000 (the echo behavior is
-    // unchanged — the peer's own code is already relayed verbatim on the forward leg).
+    // Handler policy is input; echo metadata is output for the sender's reply.
+    // A peer Close preserves its exact status/reason, with 1005 for no status.
+    // A handler Close uses the selected policy for both legs.
     Str close_reason{};  // immutable route-owned UTF-8, at most 123 bytes
     const WsClosePolicy* close_policies = nullptr;
     u32 close_policy_count = 0;
@@ -190,6 +199,7 @@ struct WsInspector {
     }
     u16 close_code = 1000;
     u16 echo_close_code = 1000;
+    bool received_close = false;  // distinguishes a peer Close from a handler verdict
     // Reject fragmented messages when a caller cannot provide a separate output buffer.
     // The tunnel supplies one and leaves this disabled.
     bool reject_fragmented = false;
@@ -201,6 +211,8 @@ struct WsInspector {
 
     void reset() {
         echo_close_reason_len = 0;
+        echo_close_code = 1000;
+        received_close = false;
         assembler.reset();
         message_len = 0;
         partial_data_frame = false;
@@ -243,5 +255,11 @@ WsInspectStatus ws_inspect(WsInspector& st,
 // gateway→client. Returns bytes written, 0 on overflow or random generator failure.
 u32 ws_emit_close_frame(
     u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code = 1000, Str reason = {});
+
+// Emit owned metadata, preserving an absent status as an empty Close body.
+// Unlike ws_emit_close_frame, this accepts the local-only 1005 representation
+// only with an empty reason; it never writes that number onto the wire.
+u32 ws_emit_close_payload(
+    u8* out, u32 out_cap, bool masked, u64& mask_rng, const WsClosePayload& payload);
 
 }  // namespace rut
