@@ -2451,7 +2451,9 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
-    if (op > static_cast<u32>(json::Op::Sha256HexValid)) return;
+    if (op > static_cast<u32>(json::Op::Sha256HexValid) &&
+        op != static_cast<u32>(json::Op::JwtVerifyEs256))
+        return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
     json::Writer writer{bytes};
@@ -2489,6 +2491,27 @@ extern "C" void rut_helper_json(void* conn,
         char payload[json::kMaxBytes];
         u32 length = 0;
         if (!cfg->rs256->verify(connection->shard_id,
+                                {b, b_len},
+                                document,
+                                {a, a_len},
+                                static_cast<i64>(now.tv_sec),
+                                payload,
+                                sizeof(payload),
+                                length))
+            return;
+        writer.text({payload, length});
+        if (!writer.ok) return;
+    } else if (operation == json::Op::JwtVerifyEs256) {
+        auto* connection = static_cast<ConnectionBase*>(conn);
+        const auto* cfg = connection ? connection->request_config : nullptr;
+        if (!cfg || !cfg->es256) return;
+        struct timespec now{};
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+            now.tv_nsec >= 1000000000)
+            return;
+        char payload[json::kMaxBytes];
+        u32 length = 0;
+        if (!cfg->es256->verify(connection->shard_id,
                                 {b, b_len},
                                 document,
                                 {a, a_len},

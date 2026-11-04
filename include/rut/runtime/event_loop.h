@@ -725,6 +725,7 @@ public:
         // Crypto scratch and thread-local crypto state are warmed on their
         // execution shard, before any accept. A failed row stays fail-closed.
         if (config_ptr && *config_ptr) (void)(*config_ptr)->activate_rs256(shard_id);
+        if (config_ptr && *config_ptr) (void)(*config_ptr)->activate_es256(shard_id);
         backend.add_accept();
         IoEvent events[kMaxEventsPerWait];
 
@@ -781,6 +782,7 @@ public:
         if (cfg && config_ptr) {
             if (*config_ptr && *config_ptr != cfg) (*config_ptr)->cancel_rs256(shard_id);
             (void)cfg->activate_rs256(shard_id);
+            (void)cfg->activate_es256(shard_id);
             *config_ptr = cfg;
         }
 

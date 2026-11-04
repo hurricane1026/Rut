@@ -8,7 +8,7 @@ namespace rut::native {
 // Private, same-build ABI. Artifacts contain executable code and are trusted
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
-constexpr u32 kVersion = 16;
+constexpr u32 kVersion = 17;
 struct StreamHeader {
     u64 magic;
     u32 version;
@@ -50,7 +50,7 @@ inline u32 metadata_offset(const RouteConfig& c) {
                             reinterpret_cast<const u8*>(&c));
 }
 inline u32 metadata_size(const RouteConfig& c) {
-    return static_cast<u32>(reinterpret_cast<const u8*>(&c.rs256_configuration_bytes_used + 1) -
+    return static_cast<u32>(reinterpret_cast<const u8*>(&c.es256_configuration_bytes_used + 1) -
                             reinterpret_cast<const u8*>(&c.upstreams));
 }
 // Explicitly enumerate every configuration byte view. Dispatch views are rebuilt
@@ -111,6 +111,9 @@ bool visit_views(RouteConfig& c, F f) {
     if (c.rs256_configuration_count > Rs256Policies::kMaxPolicies) return false;
     for (u32 i = 0; i < c.rs256_configuration_count; ++i)
         if (!str(c.rs256_configurations[i])) return false;
+    if (c.es256_configuration_count > Es256Policies::kMaxPolicies) return false;
+    for (u32 i = 0; i < c.es256_configuration_count; ++i)
+        if (!str(c.es256_configurations[i])) return false;
     return true;
 }
 }  // namespace rut::native

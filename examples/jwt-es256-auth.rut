@@ -1,0 +1,15 @@
+// JWT_ES256_POLICY is a trusted compile/load-time snapshot, never request data.
+// {"issuer":"https://issuer.example","audience":"orders","kids":["current"],
+//  "jwks":{"keys":[{"kid":"current","kty":"EC","alg":"ES256","crv":"P-256",
+//                   "x":"...32-byte base64url coordinate...",
+//                   "y":"...32-byte base64url coordinate..."}]}}.
+// Optional revokedJtis/issuedAfter are immutable revocation snapshots.
+// This ES256 profile accepts local JWKS only; remoteJwks is rejected.
+import "middleware/auth.rut"
+
+route GET "/orders" {
+    let identity = auth.jwtIdentityEs256(req.authorization.or(""), env("JWT_ES256_POLICY"),
+                                        "orders:read", "orders-issuer-es256")
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
