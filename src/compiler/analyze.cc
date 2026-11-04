@@ -5,6 +5,7 @@
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
 #include "rut/common/ws_control_flow.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/hir.h"
 #include "rut/compiler/lexer.h"
@@ -5739,11 +5740,11 @@ static FrontendResult<HirExpr> ws_lifecycle_sequence(HirRoute& owner,
                                                      const HirExpr& head,
                                                      const HirExpr& tail,
                                                      Span span) {
-    const auto keep = [&](const HirExpr& value) -> HirExpr* {
+    const auto kKeep = [&](const HirExpr& value) -> HirExpr* {
         if (!owner.exprs.push(value)) return nullptr;
         return &owner.exprs[owner.exprs.len - 1];
     };
-    HirExpr* initializer = keep(head);
+    HirExpr* initializer = kKeep(head);
     if (!initializer) return frontend_error(FrontendError::OutOfMemory, span);
     HirExpr reference = head;
     reference.kind = HirExprKind::BoundValue;
@@ -5759,24 +5760,23 @@ static FrontendResult<HirExpr> ws_lifecycle_sequence(HirRoute& owner,
     test.kind = HirExprKind::Eq;
     test.type = HirTypeKind::Bool;
     test.span = span;
-    test.lhs = keep(reference);
-    test.rhs = keep(code);
+    test.lhs = kKeep(reference);
+    test.rhs = kKeep(code);
     if (!test.lhs || !test.rhs) return frontend_error(FrontendError::OutOfMemory, span);
     HirExpr choice{};
     choice.kind = HirExprKind::IfElse;
     choice.type = HirTypeKind::I32;
     choice.span = span;
-    choice.lhs = keep(test);
-    choice.rhs = keep(tail);
-    HirExpr* retained = keep(reference);
-    if (!choice.lhs || !choice.rhs || !retained || !choice.args.push(retained))
+    choice.lhs = kKeep(test);
+    choice.rhs = kKeep(tail);
+    if (!choice.lhs || !choice.rhs || !choice.args.push(kKeep(reference)) || !choice.args[0])
         return frontend_error(FrontendError::OutOfMemory, span);
     HirExpr sequence{};
     sequence.kind = HirExprKind::LetIn;
     sequence.type = HirTypeKind::I32;
     sequence.span = span;
     sequence.lhs = initializer;
-    sequence.rhs = keep(choice);
+    sequence.rhs = kKeep(choice);
     if (!sequence.rhs) return frontend_error(FrontendError::OutOfMemory, span);
     return sequence;
 }
@@ -5938,6 +5938,11 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          const GenericBinding* generic_bindings,
                                                          u32 generic_binding_count,
                                                          const ExprValueBinding* bindings) {
+    // Every instantiated tree needs the destination scope's owning node pool.
+    if (!route)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("helper instantiation requires an expression scope"));
     // Helper bodies analyze against a scratch route (empty path), so their
     // req.params / req.param accesses skip capture validation. Instantiation
     // targets the CONCRETE attached route — revalidate here so a helper
@@ -6816,6 +6821,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 AstStatement effect{};
                 effect.kind = AstStmtKind::Block;
                 effect.span = stmt.span;
+                // AST child lists require mutable statement pointers.
+                // NOLINTNEXTLINE(misc-const-correctness)
                 AstStatement atom = stmt;
                 if (!effect.block_stmts.push(&atom))
                     return frontend_error(FrontendError::TooManyItems, stmt.span);
@@ -9291,12 +9298,10 @@ static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
                 node.accessor = WsLenGuard::Accessor::Len;
                 node.bound = static_cast<u32>(value->int_value);
             }
-        } else if (expr.kind == HirExprKind::Eq && ws_typed_field(*field, lit_str("text")) &&
-                   value->kind == HirExprKind::StrLit) {
-            node.accessor = WsLenGuard::Accessor::TextEqual;
-            node.pattern = value->str_value;
-        } else if (expr.kind == HirExprKind::Eq && ws_typed_field(*field, lit_str("payload")) &&
-                   value->kind == HirExprKind::BytesLit) {
+        } else if (expr.kind == HirExprKind::Eq && ((ws_typed_field(*field, lit_str("text")) &&
+                                                     value->kind == HirExprKind::StrLit) ||
+                                                    (ws_typed_field(*field, lit_str("payload")) &&
+                                                     value->kind == HirExprKind::BytesLit))) {
             node.accessor = WsLenGuard::Accessor::TextEqual;
             node.pattern = value->str_value;
         } else {
@@ -16784,7 +16789,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             if (!scope.locals.push(captured))
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
         }
-        const auto analyze_hook = [&](const AstStatement* body,
+        const auto kAnalyzeHook = [&](const AstStatement* body,
                                       Str name,
                                       WsCallbackPhase phase,
                                       u32& root) -> FrontendResult<void> {
@@ -16839,12 +16844,12 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::OutOfMemory, body->span);
             return {};
         };
-        auto opened = analyze_hook(stmt.ws_open_body,
+        auto opened = kAnalyzeHook(stmt.ws_open_body,
                                    stmt.ws_open_parameter,
                                    WsCallbackPhase::Open,
                                    route->ws_handler.open_body_expr);
         if (!opened) return opened;
-        auto closed = analyze_hook(stmt.ws_close_body,
+        auto closed = kAnalyzeHook(stmt.ws_close_body,
                                    stmt.ws_close_parameter,
                                    WsCallbackPhase::Close,
                                    route->ws_handler.close_body_expr);

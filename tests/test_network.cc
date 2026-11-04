@@ -17631,7 +17631,7 @@ TEST(slice_pool, buffered_response_capacity_covers_each_connection) {
 
     SlicePool pool;
     constexpr u32 kTestBulk = SlicePool::bulk_capacity_for_connections(2);
-    static_assert(kTestBulk == 8u);
+    static_assert(kTestBulk == 12u);  // Four WebSocket data/output buffers plus two codecs.
     REQUIRE(
         pool.init(SlicePool::capacity_for_connections(2), 0, SlicePool::kMaxCachedSlices, kTestBulk)
             .has_value());

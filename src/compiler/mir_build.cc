@@ -3127,23 +3127,23 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         }
 
         if (fn.waits.len != 0 && source_route.decorator_guard_count != 0) {
-            const u32 guard_count = source_route.guards.len;
-            const bool scope = source_route.control.kind == HirControlKind::Direct &&
-                               fn.waits.len <= MirFunction::kMaxWaits;
-            if (!scope) return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+            const u32 kGuardCount = source_route.guards.len;
+            const bool kScope = source_route.control.kind == HirControlKind::Direct &&
+                                fn.waits.len <= MirFunction::kMaxWaits;
+            if (!kScope) return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
 
-            const u32 yield_index = guard_count;
-            const u32 terminal_index = yield_index + 1;
+            const u32 kYieldIndex = kGuardCount;
+            const u32 kTerminalIndex = kYieldIndex + 1;
             u32 guard_fail_index[HirRoute::kMaxGuards]{};
-            u32 fail_cursor = terminal_index + 1;
-            for (u32 gi = 0; gi < guard_count; gi++) {
+            u32 fail_cursor = kTerminalIndex + 1;
+            for (u32 gi = 0; gi < kGuardCount; gi++) {
                 guard_fail_index[gi] = fail_cursor;
                 fail_cursor += guard_fail_block_count(source_route.guards[gi]);
             }
             if (fail_cursor > MirFunction::kMaxBlocks)
                 return frontend_error(FrontendError::TooManyItems, fn.span);
 
-            for (u32 gi = 0; gi < guard_count; gi++) {
+            for (u32 gi = 0; gi < kGuardCount; gi++) {
                 const auto& guard = source_route.guards[gi];
                 MirBlock guard_block{};
                 guard_block.label = gi == 0 ? entry_label() : cont_label();
@@ -3152,7 +3152,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 auto cond = mir_value(guard.cond, module, &fn);
                 if (!cond) return core::make_unexpected(cond.error());
                 guard_block.term.cond = cond.value();
-                guard_block.term.then_block = gi + 1 < guard_count ? gi + 1 : yield_index;
+                guard_block.term.then_block = gi + 1 < kGuardCount ? gi + 1 : kYieldIndex;
                 guard_block.term.else_block = guard_fail_index[gi];
                 if (!fn.blocks.push(guard_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -3175,13 +3175,13 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             if (!fn.blocks.push(terminal_block))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
 
-            for (u32 gi = 0; gi < guard_count; gi++) {
+            for (u32 gi = 0; gi < kGuardCount; gi++) {
                 auto emitted = emit_guard_fail(source_route.guards[gi]);
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
             fn.state_zero_enters_entry = true;
-            fn.resume_terminal_block = terminal_index;
+            fn.resume_terminal_block = kTerminalIndex;
             if (!forward_preflight_metadata_valid(*mir, fn)) {
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -3195,13 +3195,13 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         MirBlock block{};
         block.label = entry_label();
         if (source_route.guards.len != 0) {
-            const u32 guard_count = source_route.guards.len;
+            const u32 kGuardCount = source_route.guards.len;
 
             if (source_route.control.kind == HirControlKind::Direct) {
-                const u32 body_index = guard_count;
+                const u32 kBodyIndex = kGuardCount;
                 u32 guard_fail_index[HirRoute::kMaxGuards]{};
-                u32 fail_cursor = body_index + 1;
-                for (u32 gi = 0; gi < guard_count; gi++) {
+                u32 fail_cursor = kBodyIndex + 1;
+                for (u32 gi = 0; gi < kGuardCount; gi++) {
                     guard_fail_index[gi] = fail_cursor;
                     fail_cursor += guard_fail_block_count(source_route.guards[gi]);
                 }
@@ -3211,12 +3211,12 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 auto cond0 = mir_value(guard0.cond, module, &fn);
                 if (!cond0) return core::make_unexpected(cond0.error());
                 block.term.cond = cond0.value();
-                block.term.then_block = guard_count > 1 ? 1 : body_index;
+                block.term.then_block = kGuardCount > 1 ? 1 : kBodyIndex;
                 block.term.else_block = guard_fail_index[0];
                 if (!fn.blocks.push(block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
 
-                for (u32 gi = 1; gi < guard_count; gi++) {
+                for (u32 gi = 1; gi < kGuardCount; gi++) {
                     MirBlock guard_block{};
                     guard_block.label = cont_label();
                     const auto& guard = source_route.guards[gi];
@@ -3225,7 +3225,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     auto cond = mir_value(guard.cond, module, &fn);
                     if (!cond) return core::make_unexpected(cond.error());
                     guard_block.term.cond = cond.value();
-                    guard_block.term.then_block = gi + 1 < guard_count ? gi + 1 : body_index;
+                    guard_block.term.then_block = gi + 1 < kGuardCount ? gi + 1 : kBodyIndex;
                     guard_block.term.else_block = guard_fail_index[gi];
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -3237,17 +3237,17 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 if (!fn.blocks.push(cont_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
 
-                for (u32 gi = 0; gi < guard_count; gi++) {
+                for (u32 gi = 0; gi < kGuardCount; gi++) {
                     auto emitted = emit_guard_fail(source_route.guards[gi]);
                     if (!emitted) return core::make_unexpected(emitted.error());
                 }
             } else if (source_route.control.kind == HirControlKind::If) {
-                const u32 body_index = guard_count;
-                const u32 then_index = body_index + 1;
-                const u32 else_index = body_index + 2;
+                const u32 kBodyIndex = kGuardCount;
+                const u32 kThenIndex = kBodyIndex + 1;
+                const u32 kElseIndex = kBodyIndex + 2;
                 u32 guard_fail_index[HirRoute::kMaxGuards]{};
-                u32 fail_cursor = body_index + 3;
-                for (u32 gi = 0; gi < guard_count; gi++) {
+                u32 fail_cursor = kBodyIndex + 3;
+                for (u32 gi = 0; gi < kGuardCount; gi++) {
                     guard_fail_index[gi] = fail_cursor;
                     fail_cursor += guard_fail_block_count(source_route.guards[gi]);
                 }
@@ -3257,12 +3257,12 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 auto cond0 = mir_value(guard0.cond, module, &fn);
                 if (!cond0) return core::make_unexpected(cond0.error());
                 block.term.cond = cond0.value();
-                block.term.then_block = guard_count > 1 ? 1 : body_index;
+                block.term.then_block = kGuardCount > 1 ? 1 : kBodyIndex;
                 block.term.else_block = guard_fail_index[0];
                 if (!fn.blocks.push(block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
 
-                for (u32 gi = 1; gi < guard_count; gi++) {
+                for (u32 gi = 1; gi < kGuardCount; gi++) {
                     MirBlock guard_block{};
                     guard_block.label = cont_label();
                     const auto& guard = source_route.guards[gi];
@@ -3271,7 +3271,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     auto cond = mir_value(guard.cond, module, &fn);
                     if (!cond) return core::make_unexpected(cond.error());
                     guard_block.term.cond = cond.value();
-                    guard_block.term.then_block = gi + 1 < guard_count ? gi + 1 : body_index;
+                    guard_block.term.then_block = gi + 1 < kGuardCount ? gi + 1 : kBodyIndex;
                     guard_block.term.else_block = guard_fail_index[gi];
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -3284,8 +3284,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 auto if_cond = mir_value(source_route.control.cond, module, &fn);
                 if (!if_cond) return core::make_unexpected(if_cond.error());
                 cont_block.term.cond = if_cond.value();
-                cont_block.term.then_block = then_index;
-                cont_block.term.else_block = else_index;
+                cont_block.term.then_block = kThenIndex;
+                cont_block.term.else_block = kElseIndex;
                 if (!fn.blocks.push(cont_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
 
@@ -3301,13 +3301,13 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 if (!fn.blocks.push(else_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
 
-                for (u32 gi = 0; gi < guard_count; gi++) {
+                for (u32 gi = 0; gi < kGuardCount; gi++) {
                     auto emitted = emit_guard_fail(source_route.guards[gi]);
                     if (!emitted) return core::make_unexpected(emitted.error());
                 }
             } else if (source_route.control.kind == HirControlKind::Match) {
-                const u32 arm_count = source_route.control.match_arms.len;
-                const u32 test_count = arm_count - 1;
+                const u32 kArmCount = source_route.control.match_arms.len;
+                const u32 kTestCount = kArmCount - 1;
                 u32 arm_block_index[HirControl::kMaxMatchArms]{};
                 u32 arm_body_index[HirControl::kMaxMatchArms]{};
                 u32 arm_then_index[HirControl::kMaxMatchArms]{};
@@ -3315,8 +3315,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 u32 arm_guard_index[HirControl::kMaxMatchArms][HirMatchArm::kMaxPreludeGuards]{};
                 u32 arm_guard_fail_index[HirControl::kMaxMatchArms]
                                         [HirMatchArm::kMaxPreludeGuards]{};
-                u32 next_index = guard_count + test_count;
-                for (u32 ai = 0; ai < arm_count; ai++) {
+                u32 next_index = kGuardCount + kTestCount;
+                for (u32 ai = 0; ai < kArmCount; ai++) {
                     const auto& arm = source_route.control.match_arms[ai];
                     arm_block_index[ai] = next_index++;
                     if (arm.guards.len != 0) {
@@ -3340,7 +3340,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 }
                 u32 guard_fail_index[HirRoute::kMaxGuards]{};
                 u32 fail_cursor = next_index;
-                for (u32 gi = 0; gi < guard_count; gi++) {
+                for (u32 gi = 0; gi < kGuardCount; gi++) {
                     guard_fail_index[gi] = fail_cursor;
                     fail_cursor += guard_fail_block_count(source_route.guards[gi]);
                 }
@@ -3351,12 +3351,12 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 if (!cond0) return core::make_unexpected(cond0.error());
                 block.term.cond = cond0.value();
                 block.term.then_block =
-                    guard_count > 1 ? 1 : (test_count > 0 ? guard_count : arm_block_index[0]);
+                    kGuardCount > 1 ? 1 : (kTestCount > 0 ? kGuardCount : arm_block_index[0]);
                 block.term.else_block = guard_fail_index[0];
                 if (!fn.blocks.push(block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
 
-                for (u32 gi = 1; gi < guard_count; gi++) {
+                for (u32 gi = 1; gi < kGuardCount; gi++) {
                     MirBlock guard_block{};
                     guard_block.label = cont_label();
                     const auto& guard = source_route.guards[gi];
@@ -3366,8 +3366,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     if (!cond) return core::make_unexpected(cond.error());
                     guard_block.term.cond = cond.value();
                     guard_block.term.then_block =
-                        gi + 1 < guard_count ? gi + 1
-                                             : (test_count > 0 ? guard_count : arm_block_index[0]);
+                        gi + 1 < kGuardCount ? gi + 1
+                                             : (kTestCount > 0 ? kGuardCount : arm_block_index[0]);
                     guard_block.term.else_block = guard_fail_index[gi];
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -3376,12 +3376,12 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 auto subject = mir_value(source_route.control.match_expr, module, &fn);
                 if (!subject) return core::make_unexpected(subject.error());
                 auto arm_fallthrough_target = [&](u32 ai) -> FrontendResult<u32> {
-                    if (ai + 1 < test_count) return guard_count + ai + 1;
-                    if (ai + 1 < arm_count) return arm_block_index[ai + 1];
+                    if (ai + 1 < kTestCount) return kGuardCount + ai + 1;
+                    if (ai + 1 < kArmCount) return arm_block_index[ai + 1];
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           source_route.control.match_arms[ai].span);
                 };
-                for (u32 ai = 0; ai < test_count; ai++) {
+                for (u32 ai = 0; ai < kTestCount; ai++) {
                     MirBlock test_block{};
                     test_block.label = ai == 0 ? cont_label() : match_test_label();
                     const auto& arm = source_route.control.match_arms[ai];
@@ -3394,12 +3394,12 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     test_block.term.rhs = arm_pattern.value();
                     test_block.term.then_block = arm_block_index[ai];
                     test_block.term.else_block =
-                        ai + 1 < test_count ? guard_count + ai + 1 : arm_block_index[test_count];
+                        ai + 1 < kTestCount ? kGuardCount + ai + 1 : arm_block_index[kTestCount];
                     if (!fn.blocks.push(test_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
 
-                for (u32 ai = 0; ai < arm_count; ai++) {
+                for (u32 ai = 0; ai < kArmCount; ai++) {
                     MirBlock case_block{};
                     const auto& arm = source_route.control.match_arms[ai];
                     case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
@@ -3475,7 +3475,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     }
                 }
 
-                for (u32 gi = 0; gi < guard_count; gi++) {
+                for (u32 gi = 0; gi < kGuardCount; gi++) {
                     auto emitted = emit_guard_fail(source_route.guards[gi]);
                     if (!emitted) return core::make_unexpected(emitted.error());
                 }
@@ -3504,16 +3504,16 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             if (!fn.blocks.push(else_block))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
         } else if (source_route.control.kind == HirControlKind::Match) {
-            const u32 arm_count = source_route.control.match_arms.len;
-            const u32 test_count = arm_count - 1;
+            const u32 kArmCount = source_route.control.match_arms.len;
+            const u32 kTestCount = kArmCount - 1;
             u32 arm_block_index[HirControl::kMaxMatchArms]{};
             u32 arm_body_index[HirControl::kMaxMatchArms]{};
             u32 arm_then_index[HirControl::kMaxMatchArms]{};
             u32 arm_else_index[HirControl::kMaxMatchArms]{};
             u32 arm_guard_index[HirControl::kMaxMatchArms][HirMatchArm::kMaxPreludeGuards]{};
             u32 arm_guard_fail_index[HirControl::kMaxMatchArms][HirMatchArm::kMaxPreludeGuards]{};
-            u32 next_index = test_count;
-            for (u32 ai = 0; ai < arm_count; ai++) {
+            u32 next_index = kTestCount;
+            for (u32 ai = 0; ai < kArmCount; ai++) {
                 const auto& arm = source_route.control.match_arms[ai];
                 arm_block_index[ai] = next_index++;
                 if (arm.guards.len != 0) {
@@ -3538,12 +3538,12 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             auto subject = mir_value(source_route.control.match_expr, module, &fn);
             if (!subject) return core::make_unexpected(subject.error());
             auto arm_fallthrough_target = [&](u32 ai) -> FrontendResult<u32> {
-                if (ai + 1 < test_count) return ai + 1;
-                if (ai + 1 < arm_count) return arm_block_index[ai + 1];
+                if (ai + 1 < kTestCount) return ai + 1;
+                if (ai + 1 < kArmCount) return arm_block_index[ai + 1];
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       source_route.control.match_arms[ai].span);
             };
-            if (test_count == 0) {
+            if (kTestCount == 0) {
                 MirBlock case_block{};
                 const auto& arm = source_route.control.match_arms[0];
                 case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
@@ -3618,7 +3618,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
             } else {
-                for (u32 ai = 0; ai < test_count; ai++) {
+                for (u32 ai = 0; ai < kTestCount; ai++) {
                     MirBlock test_block{};
                     test_block.label = match_test_label();
                     const auto& arm = source_route.control.match_arms[ai];
@@ -3631,12 +3631,12 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     test_block.term.rhs = arm_pattern.value();
                     test_block.term.then_block = arm_block_index[ai];
                     test_block.term.else_block =
-                        ai + 1 < test_count ? ai + 1 : arm_block_index[test_count];
+                        ai + 1 < kTestCount ? ai + 1 : arm_block_index[kTestCount];
                     if (!fn.blocks.push(test_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
 
-                for (u32 ai = 0; ai < arm_count; ai++) {
+                for (u32 ai = 0; ai < kArmCount; ai++) {
                     MirBlock case_block{};
                     const auto& arm = source_route.control.match_arms[ai];
                     case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();

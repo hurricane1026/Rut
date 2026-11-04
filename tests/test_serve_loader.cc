@@ -4946,7 +4946,7 @@ TEST(serve_loader, attach_ws_terminate_to_jit_is_exact_and_fail_atomic) {
         "/ws", kRouteMethodGet, source_route.fn, false, ForwardPreflightMode::None, 0));
     REQUIRE(config.add_proxy("/proxy", 'G', upstream.value()));
     const auto handler = source_route.ws_frame_handler;
-    const u32 capacity = kWsTerminateMessageCapacity;
+    const u32 capacity = kWsMaxMessageCapacity;
     CHECK_FALSE(
         config.attach_ws_terminate_to_jit(0, "/wrong", 'G', upstream.value(), handler, capacity));
     CHECK_FALSE(

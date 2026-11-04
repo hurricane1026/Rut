@@ -2868,7 +2868,8 @@ upstream receive on io_uring, so multiple CQEs cannot overflow receive storage
 before the inspection callback drains it. Literal bytes and JSON Pointer paths are
 copied into the loaded program's retained arena; native artifacts relocate both
 views, so neither mode retains temporary HIR views. The native artifact format
-version is 14 following the JSON stringify recipe tag extension. Encoding copies
+version is 18, including the JSON recipes, authentication metadata and WebSocket
+lifecycle entries. Encoding copies
 the prefix, dynamic source, and suffix directly into the existing output slice,
 then masks that frame; no concatenation buffer or message-time allocation is
 introduced.
@@ -3468,7 +3469,7 @@ re-read), each with its own buffer for natural backpressure.
   is void. Shared lexical IR evaluates each branch once before continuation,
   without duplicating the rest of the body into every branch. Open may call
   `connection.close(...)` to enter normal bounded closing before messages;
-  close callbacks cannot reopen closing or yield. Native metadata version 16
+  close callbacks cannot reopen closing or yield. Native metadata version 18
   relocates both hook symbols and retains their regex/config ownership.
 
 - **Connection teardown — drain-then-close (nginx model).** WebSocket shutdown

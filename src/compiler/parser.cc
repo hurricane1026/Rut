@@ -3,6 +3,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
+#include "rut/compiler/ast.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_method.h"
 #if RUT_ENABLE_WEBSOCKET
