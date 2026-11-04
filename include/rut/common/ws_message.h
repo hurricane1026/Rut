@@ -14,10 +14,23 @@ enum class WsMessageFieldId : u8 {
     FromClient,
     IsText,
     IsBinary,
+    ConnectionRemoteAddr,
+    ConnectionRemotePort,
+    ConnectionIsTls,
+    ConnectionSubprotocol,
 };
 
 constexpr bool ws_message_field_valid(u32 field) {
-    return field <= static_cast<u32>(WsMessageFieldId::IsBinary);
+    return field <= static_cast<u32>(WsMessageFieldId::ConnectionSubprotocol);
+}
+
+constexpr bool ws_message_field_is_string(WsMessageFieldId field) {
+    return field == WsMessageFieldId::Payload || field == WsMessageFieldId::ConnectionSubprotocol;
+}
+
+constexpr bool ws_message_field_is_bool(WsMessageFieldId field) {
+    return field == WsMessageFieldId::FromClient || field == WsMessageFieldId::IsText ||
+           field == WsMessageFieldId::IsBinary || field == WsMessageFieldId::ConnectionIsTls;
 }
 
 }  // namespace rut

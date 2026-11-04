@@ -814,14 +814,31 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     if (expr.kind == HirExprKind::WsMessageField) {
         // A borrowed message has no stored runtime carrier. After ordinary
         // helper normalization, its projections must retain the callback input.
-        if (expr.may_nil || expr.may_error || expr.lhs == nullptr ||
-            expr.lhs->kind != HirExprKind::LocalRef || expr.lhs->local_index != 0 ||
-            expr.lhs->type != HirTypeKind::WebSocketMessage || expr.lhs->may_nil ||
-            expr.lhs->may_error)
+        const HirExpr* receiver = expr.lhs;
+        const bool kConnection = receiver && receiver->type == HirTypeKind::WebSocketConnection;
+        if (kConnection) {
+            if (receiver->kind != HirExprKind::WsMessageField ||
+                !receiver->str_value.eq(lit_str("connection")) || receiver->may_nil ||
+                receiver->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            receiver = receiver->lhs;
+        }
+        if (expr.may_nil || expr.may_error || receiver == nullptr ||
+            receiver->kind != HirExprKind::LocalRef || receiver->local_index != 0 ||
+            receiver->type != HirTypeKind::WebSocketMessage || receiver->may_nil ||
+            receiver->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         v.kind = MirValueKind::WsMessageField;
         v.str_value = expr.str_value;
         v.type = mir_type_kind(expr.type);
+        if (kConnection) {
+            if ((expr.str_value.eq(lit_str("remoteAddr")) && expr.type == HirTypeKind::IP) ||
+                (expr.str_value.eq(lit_str("remotePort")) && expr.type == HirTypeKind::I32) ||
+                (expr.str_value.eq(lit_str("isTls")) && expr.type == HirTypeKind::Bool) ||
+                (expr.str_value.eq(lit_str("subprotocol")) && expr.type == HirTypeKind::Str))
+                return v;
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
         const bool kText = expr.str_value.eq(lit_str("text"));
         const bool kBytes = expr.str_value.eq(lit_str("payload"));
         const bool kBool = expr.str_value.eq(lit_str("fromClient")) ||

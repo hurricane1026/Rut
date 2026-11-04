@@ -4,6 +4,7 @@
 #include "fixtures/signed_request.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_connection_context.h"
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_error_guard_match.h"
@@ -3363,5 +3364,17 @@ TEST(native_program, websocket_error_scalar_bindings_keep_false_zero_and_absence
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     test::ws_error_scalars::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_connection_context_keeps_owned_metadata_and_helper_types) {
+    Source source;
+    REQUIRE(source.append(test::ws_connection_context::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_connection_context::check(_tc, owner.p->config);
 }
 #endif

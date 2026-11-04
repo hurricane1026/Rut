@@ -5,6 +5,7 @@
 #include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
+#include "rut/common/ws_message.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/auth.h"
@@ -2335,6 +2336,24 @@ extern "C" void rut_helper_ws_begin_message(void* conn) {
     connection.json_arena.destroy();
     connection.jit_response_body = {};
     connection.jit_response_body_valid = false;
+}
+
+extern "C" u32 rut_helper_ws_connection_scalar(void* conn, u32 field) {
+    if (!conn) return 0;
+    const auto& connection = *static_cast<const ConnectionBase*>(conn);
+    const auto kField = static_cast<WsMessageFieldId>(field);
+    if (kField == WsMessageFieldId::ConnectionRemoteAddr) return connection.peer_addr;
+    if (kField == WsMessageFieldId::ConnectionRemotePort) return connection.peer_port;
+    if (kField == WsMessageFieldId::ConnectionIsTls) return connection.tls_active ? 1u : 0u;
+    return 0;
+}
+
+extern "C" void rut_helper_ws_connection_subprotocol(void* conn,
+                                                     const char** out_ptr,
+                                                     u32* out_len) {
+    const Str kProtocol = conn ? static_cast<const ConnectionBase*>(conn)->ws_subprotocol : Str{};
+    *out_ptr = kProtocol.ptr;
+    *out_len = kProtocol.len;
 }
 
 extern "C" u32 rut_helper_ws_forward(void* conn, const char* payload, u32 len, u8 opcode) {

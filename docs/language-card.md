@@ -869,6 +869,11 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // Fields: fromClient/isText/isBinary: bool; len: i32; text: str (raw payload bytes,
 // also for Binary); payload: Bytes (the complete encoded/raw bytes).
 // payload.count / payload.isEmpty measure bytes; there is no implicit text conversion.
+// connection: borrowed WebSocketConnection. remoteAddr: IP, remotePort: i32,
+// isTls: bool and subprotocol: str describe the downstream client connection
+// in both message directions. No selected subprotocol is the empty String.
+// Connection aliases/helper parameters borrow this callback, just like messages;
+// compare their scalar fields, rather than the complete connection value.
 // kind: WebSocketMessageKind.text / .binary; direction:
 // WebSocketDirection.clientToUpstream / .upstreamToClient. Fully qualified cases
 // support ==/!= and generic Eq with their own type, without ordering/coercion.
@@ -895,7 +900,7 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // if let or .or(default). guard match handles named Error cases and requires
 // a final wildcard, as in HTTP. Unwrap before using a success value; nil and
 // Error stay distinct. Response/effect/yield helpers, cache work and
-// connection/close contexts still need integration. uuid() retains HTTP's
+// open/close event contexts still need integration. uuid() retains HTTP's
 // direct-let initializer restriction; failures are nil and must be unwrapped.
 //
 // JSON uses the same optional API as HTTP: parse/get/at/scalars/kind/count/keys,

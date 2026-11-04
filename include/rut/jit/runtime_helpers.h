@@ -317,6 +317,9 @@ rut::u8 rut_helper_str_contains(const char* text,
 void rut_helper_ws_begin_message(void* conn);
 rut::u32 rut_helper_ws_forward(void* conn, const char* payload, rut::u32 len, rut::u8 opcode);
 rut::u32 rut_helper_ws_close(void* conn, rut::i32 code, const char* reason, rut::u32 len);
+// Downstream connection metadata, borrowed only during the synchronous message callback.
+rut::u32 rut_helper_ws_connection_scalar(void* conn, rut::u32 field);
+void rut_helper_ws_connection_subprotocol(void* conn, const char** out_ptr, rut::u32* out_len);
 
 // Validate a bounded complete JSON payload without publishing a document or allocating.
 rut::u8 rut_helper_ws_json_valid(const char* payload, rut::u64 len);

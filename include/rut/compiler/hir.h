@@ -296,6 +296,7 @@ enum class HirTypeKind : u8 {
     // Borrowed complete Text/Binary message; only message callbacks supply values.
     // It has no HTTP/MIR storage representation and cannot outlive the callback.
     WebSocketMessage,
+    WebSocketConnection,
     WebSocketMessageKind,
     WebSocketDirection,
     // Raw octets. Runtime views use the existing pointer/length carrier;
@@ -305,6 +306,10 @@ enum class HirTypeKind : u8 {
 
 constexpr bool is_ws_enum_type(HirTypeKind type) {
     return type == HirTypeKind::WebSocketMessageKind || type == HirTypeKind::WebSocketDirection;
+}
+
+constexpr bool is_ws_borrowed_type(HirTypeKind type) {
+    return type == HirTypeKind::WebSocketMessage || type == HirTypeKind::WebSocketConnection;
 }
 
 inline constexpr u32 kMaxTupleSlots = 10;

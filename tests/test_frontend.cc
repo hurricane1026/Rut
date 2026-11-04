@@ -1,6 +1,7 @@
 #include "deferred_preflight_fixture.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_connection_context.h"
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_error_guard_match.h"
@@ -47003,4 +47004,65 @@ route GET "/" { return 200 }
         REQUIRE(ast);
         CHECK_FALSE(analyze_file_heap(ast.value()));
     }
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_connection_context_preserves_owned_receivers_and_rejects_escape) {
+    auto tokens = lex(lit(test::ws_connection_context::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto owned_ast = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*owned_ast);
+    REQUIRE(hir);
+    owned_ast.reset();
+    auto owned_hir = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    check_general_ws_rir(*owned_hir, _tc);
+    for (const char* body : {
+             "msg.forward(msg.connection)",
+             "guard msg.connection == msg.connection else { msg.drop() } msg.forward()",
+             "let conn = msg.connection guard conn.fromClient else { msg.drop() } msg.forward()",
+             "msg.connection.close()",
+             "msg.forward(retained(msg.connection).subprotocol)",
+         }) {
+        std::string source = R"rut(upstream ws
+func retained(_ connection: WebSocketConnection) -> WebSocketConnection {
+    let unused = sha256(connection.subprotocol)
+    connection
+}
+route GET "/" { return websocket(ws) { msg in )rut";
+        source += body;
+        source += " } }";
+        auto bad_tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(bad_tokens);
+        auto bad_ast = parse_file_heap(bad_tokens.value());
+        REQUIRE(bad_ast);
+        CHECK_FALSE(analyze_file_heap(bad_ast.value()));
+    }
+}
+#endif
+
+TEST(frontend, ip_values_use_shared_helper_signature_resolution) {
+    const char* source = R"rut(
+func identity(_ value: IP) -> IP => value
+func same(_ lhs: IP, _ rhs: IP) -> bool => lhs == rhs
+route GET "/" {
+    let value: IP = identity(req.remoteAddr)
+    if same(value, req.remoteAddr) { return 200 } else { return 500 }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
 }

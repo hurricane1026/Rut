@@ -265,10 +265,12 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::I32:
         case HirTypeKind::Str:
         case HirTypeKind::Bytes:
+        case HirTypeKind::IP:
         case HirTypeKind::Json:
         case HirTypeKind::Generic:
         case HirTypeKind::Unknown:
         case HirTypeKind::WebSocketMessage:
+        case HirTypeKind::WebSocketConnection:
         case HirTypeKind::WebSocketMessageKind:
         case HirTypeKind::WebSocketDirection:
             return true;
@@ -360,12 +362,11 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.tuple_len = tuple_len;
     shape.array_elem_shape_index =
         type == HirTypeKind::Array ? array_elem_shape_index : 0xffffffffu;
-    shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
-                        type == HirTypeKind::I64 || type == HirTypeKind::Str ||
-                        type == HirTypeKind::Json || type == HirTypeKind::Method ||
-                        type == HirTypeKind::ByteSize || type == HirTypeKind::IP ||
-                        type == HirTypeKind::Response || type == HirTypeKind::WebSocketMessage ||
-                        is_ws_enum_type(type) || type == HirTypeKind::Bytes;
+    shape.is_concrete =
+        type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::I64 ||
+        type == HirTypeKind::Str || type == HirTypeKind::Json || type == HirTypeKind::Method ||
+        type == HirTypeKind::ByteSize || type == HirTypeKind::IP || type == HirTypeKind::Response ||
+        is_ws_borrowed_type(type) || is_ws_enum_type(type) || type == HirTypeKind::Bytes;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -1999,10 +2000,12 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"str", 3})) return HirTypeKind::Str;
     if (name.eq(lit_str("Bytes"))) return HirTypeKind::Bytes;
     if (name.eq({"Method", 6})) return HirTypeKind::Method;
+    if (name.eq(lit_str("IP"))) return HirTypeKind::IP;
     if (name.eq({"Json", 4})) return HirTypeKind::Json;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
 #if RUT_ENABLE_WEBSOCKET
     if (name.eq(lit_str("WebSocketMessage"))) return HirTypeKind::WebSocketMessage;
+    if (name.eq(lit_str("WebSocketConnection"))) return HirTypeKind::WebSocketConnection;
     if (name.eq(lit_str("WebSocketMessageKind"))) return HirTypeKind::WebSocketMessageKind;
     if (name.eq(lit_str("WebSocketDirection"))) return HirTypeKind::WebSocketDirection;
 #endif
@@ -5813,12 +5816,12 @@ struct LexicalCallArguments {
             (!uses_lexical_values(route) && !hir_has_string_construction(value)))
             return {};
         const bool kEvaluated = call_argument_needs_evaluation(value);
-        if (value.type == HirTypeKind::WebSocketMessage && kEvaluated)
+        if (is_ws_borrowed_type(value.type) && kEvaluated)
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 value.span,
                 lit_str("a borrowed message alias cannot carry runtime initialization"));
-        if (value.type == HirTypeKind::WebSocketMessage || !kEvaluated) return {};
+        if (is_ws_borrowed_type(value.type) || !kEvaluated) return {};
         if (!route->exprs.push(value))
             return frontend_error(FrontendError::OutOfMemory, value.span);
         HirExpr* key = &route->exprs[route->exprs.len - 1];
@@ -7301,7 +7304,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 auto init = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 scratch->uuid_init_ok = kSavedUuidInitOk;
                 if (!init) return core::make_unexpected(init.error());
-                if (uses_lexical_values(scratch) && init->type == HirTypeKind::WebSocketMessage &&
+                if (uses_lexical_values(scratch) && is_ws_borrowed_type(init->type) &&
                     call_argument_needs_evaluation(init.value()))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax,
@@ -7348,7 +7351,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 HirExpr* initializer_key = nullptr;
                 // A message alias has no runtime carrier. Scalar/Bytes values
                 // use a real lexical binding, including unused nullable work.
-                if (uses_lexical_values(scratch) && init->type != HirTypeKind::WebSocketMessage &&
+                if (uses_lexical_values(scratch) && !is_ws_borrowed_type(init->type) &&
                     (scratch->is_ws_callback || call_argument_needs_evaluation(init.value()))) {
                     if (!scratch->exprs.push(init.value()))
                         return frontend_error(FrontendError::OutOfMemory, inner.span);
@@ -7911,11 +7914,20 @@ static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
         expr.kind == HirExprKind::WaitResult || expr.kind == HirExprKind::WaitField ||
         expr.kind == HirExprKind::CacheGet || expr.kind == HirExprKind::CacheSet)
         return &expr;
-    if (validate_receivers && expr.kind == HirExprKind::WsMessageField &&
-        (expr.lhs == nullptr || expr.lhs->kind != HirExprKind::LocalRef ||
-         expr.lhs->local_index != 0 || expr.lhs->type != HirTypeKind::WebSocketMessage ||
-         expr.lhs->may_nil || expr.lhs->may_error))
-        return &expr;
+    if (validate_receivers && expr.kind == HirExprKind::WsMessageField) {
+        const HirExpr* receiver = expr.lhs;
+        if (receiver && receiver->type == HirTypeKind::WebSocketConnection) {
+            if (receiver->kind != HirExprKind::WsMessageField ||
+                !receiver->str_value.eq(lit_str("connection")) || receiver->may_nil ||
+                receiver->may_error)
+                return &expr;
+            receiver = receiver->lhs;
+        }
+        if (!receiver || receiver->kind != HirExprKind::LocalRef || receiver->local_index != 0 ||
+            receiver->type != HirTypeKind::WebSocketMessage || receiver->may_nil ||
+            receiver->may_error)
+            return &expr;
+    }
     if (expr.lhs != nullptr)
         if (const HirExpr* bad =
                 ws_general_disallowed_value(*expr.lhs, depth + 1, validate_receivers))
@@ -7950,8 +7962,8 @@ static bool ws_infallible_binding(const HirExpr& expr, u32 depth = 0) {
     if (expr.kind == HirExprKind::IfElse) {
         // Boolean helpers may choose between any supported infallible predicates.
         // Fallible work remains excluded from ordinary eager-let substitution.
-        return expr.type != HirTypeKind::WebSocketMessage && expr.lhs && expr.rhs &&
-               expr.args.len == 1 && expr.args[0] && ws_infallible_binding(*expr.lhs, depth + 1) &&
+        return !is_ws_borrowed_type(expr.type) && expr.lhs && expr.rhs && expr.args.len == 1 &&
+               expr.args[0] && ws_infallible_binding(*expr.lhs, depth + 1) &&
                ws_infallible_binding(*expr.rhs, depth + 1) &&
                ws_infallible_binding(*expr.args[0], depth + 1);
     }
@@ -11038,6 +11050,26 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         auto base = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!base) return core::make_unexpected(base.error());
 #if RUT_ENABLE_WEBSOCKET
+        if (base->type == HirTypeKind::WebSocketConnection) {
+            if (base->may_nil || base->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (expr.name.eq(lit_str("remoteAddr")))
+                out.type = HirTypeKind::IP;
+            else if (expr.name.eq(lit_str("remotePort")))
+                out.type = HirTypeKind::I32;
+            else if (expr.name.eq(lit_str("isTls")))
+                out.type = HirTypeKind::Bool;
+            else if (expr.name.eq(lit_str("subprotocol")))
+                out.type = HirTypeKind::Str;
+            else
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            out.kind = HirExprKind::WsMessageField;
+            out.str_value = expr.name;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
         if (base->type == HirTypeKind::WebSocketMessage) {
             if (base->may_nil || base->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -11054,6 +11086,8 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.type = HirTypeKind::WebSocketMessageKind;
             else if (expr.name.eq(lit_str("direction")))
                 out.type = HirTypeKind::WebSocketDirection;
+            else if (expr.name.eq(lit_str("connection")))
+                out.type = HirTypeKind::WebSocketConnection;
             else
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             out.kind = HirExprKind::WsMessageField;
@@ -12185,8 +12219,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   lit_str("logical negation requires an unwrapped bool"));
-        if (lhs->type == HirTypeKind::WebSocketMessage ||
-            rhs->type == HirTypeKind::WebSocketMessage)
+        if (is_ws_borrowed_type(lhs->type) || is_ws_borrowed_type(rhs->type))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   lit_str("compare message fields, not borrowed messages"));

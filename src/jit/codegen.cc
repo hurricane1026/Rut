@@ -1047,7 +1047,51 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::WsMessageField: {
             const auto kField = static_cast<WsMessageFieldId>(inst.imm.i32_val);
             LLVMValueRef value = nullptr;
-            if (kField == WsMessageFieldId::Payload) {
+            if (kField == WsMessageFieldId::ConnectionSubprotocol) {
+                LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty};
+                LLVMTypeRef type =
+                    LLVMFunctionType(LLVMVoidTypeInContext(c.llvm_ctx), params, 3, 0);
+                LLVMValueRef helper =
+                    LLVMGetNamedFunction(c.llvm_mod, "rut_helper_ws_connection_subprotocol");
+                if (!helper)
+                    helper =
+                        LLVMAddFunction(c.llvm_mod, "rut_helper_ws_connection_subprotocol", type);
+                LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "connection.protocol.ptr");
+                LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "connection.protocol.len");
+                LLVMValueRef args[] = {c.param_conn, ptr, len};
+                LLVMBuildCall2(c.builder, type, helper, args, 3, "");
+                value = LLVMGetUndef(c.str_ty);
+                value = LLVMBuildInsertValue(
+                    c.builder,
+                    value,
+                    LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "connection.protocol.data"),
+                    0,
+                    "connection.protocol");
+                value = LLVMBuildInsertValue(
+                    c.builder,
+                    value,
+                    LLVMBuildLoad2(c.builder, c.i32_ty, len, "connection.protocol.size"),
+                    1,
+                    "connection.protocol");
+            } else if (kField == WsMessageFieldId::ConnectionRemoteAddr ||
+                       kField == WsMessageFieldId::ConnectionRemotePort ||
+                       kField == WsMessageFieldId::ConnectionIsTls) {
+                LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty};
+                LLVMTypeRef type = LLVMFunctionType(c.i32_ty, params, 2, 0);
+                LLVMValueRef helper =
+                    LLVMGetNamedFunction(c.llvm_mod, "rut_helper_ws_connection_scalar");
+                if (!helper)
+                    helper = LLVMAddFunction(c.llvm_mod, "rut_helper_ws_connection_scalar", type);
+                LLVMValueRef args[] = {c.param_conn,
+                                       LLVMConstInt(c.i32_ty, static_cast<u32>(kField), 0)};
+                value = LLVMBuildCall2(c.builder, type, helper, args, 2, "connection.scalar");
+                if (kField == WsMessageFieldId::ConnectionIsTls)
+                    value = LLVMBuildICmp(c.builder,
+                                          LLVMIntNE,
+                                          value,
+                                          LLVMConstInt(c.i32_ty, 0, 0),
+                                          "connection.tls");
+            } else if (kField == WsMessageFieldId::Payload) {
                 value = LLVMGetUndef(c.str_ty);
                 value = LLVMBuildInsertValue(c.builder, value, c.param_req_data, 0, "msg.ptr");
                 value = LLVMBuildInsertValue(c.builder, value, c.param_req_len, 1, "msg.len");

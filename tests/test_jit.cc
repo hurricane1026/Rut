@@ -306,6 +306,11 @@ TEST(jit, helpers_sanity) {
 
 TEST(jit, websocket_message_inputs_reuse_general_expression_codegen) {
     using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    auto connection = std::make_unique<ConnectionBase>();
+    connection->peer_addr = 0x01020304u;
+    connection->peer_port = 43210;
+    connection->tls_active = true;
+    connection->ws_subprotocol = lit("chat-v1");
     for (u32 id = 0; ws_message_field_valid(id); ++id) {
         const auto field = static_cast<WsMessageFieldId>(id);
         TestContext tc;
@@ -316,9 +321,12 @@ TEST(jit, websocket_message_inputs_reuse_general_expression_codegen) {
         auto entry = V(b.create_block(fn, lit("entry")));
         b.set_insert_point(fn, entry);
         auto input = V(b.emit_ws_message_field(field));
-        if (field == WsMessageFieldId::Payload) input = V(b.emit_str_length(input));
-        if (field == WsMessageFieldId::FromClient || field == WsMessageFieldId::IsText ||
-            field == WsMessageFieldId::IsBinary) {
+        if (ws_message_field_is_string(field)) input = V(b.emit_str_length(input));
+        if (field == WsMessageFieldId::ConnectionRemoteAddr) {
+            auto expected = V(b.emit_const_i32(0x01020304));
+            input = V(b.emit_cmp(Opcode::CmpEq, input, expected));
+        }
+        if (ws_message_field_is_bool(field) || field == WsMessageFieldId::ConnectionRemoteAddr) {
             auto yes = V(b.emit_const_i32(1));
             auto no = V(b.emit_const_i32(0));
             input = V(b.emit_select(input, yes, no));
@@ -340,13 +348,17 @@ TEST(jit, websocket_message_inputs_reuse_general_expression_codegen) {
                 const u32 expected =
                     field == WsMessageFieldId::Payload || field == WsMessageFieldId::Length
                         ? sizeof(bytes)
-                    : field == WsMessageFieldId::Kind       ? opcode - 1u
-                    : field == WsMessageFieldId::Direction  ? 1u - client
-                    : field == WsMessageFieldId::FromClient ? client
-                    : field == WsMessageFieldId::IsText     ? opcode == 1u
-                                                            : opcode == 2u;
-                auto result = HandlerResult::unpack(
-                    handler(nullptr, nullptr, bytes, sizeof(bytes), nullptr, opcode, client));
+                    : field == WsMessageFieldId::Kind                  ? opcode - 1u
+                    : field == WsMessageFieldId::Direction             ? 1u - client
+                    : field == WsMessageFieldId::FromClient            ? client
+                    : field == WsMessageFieldId::IsText                ? opcode == 1u
+                    : field == WsMessageFieldId::IsBinary              ? opcode == 2u
+                    : field == WsMessageFieldId::ConnectionRemoteAddr  ? 1u
+                    : field == WsMessageFieldId::ConnectionRemotePort  ? 43210u
+                    : field == WsMessageFieldId::ConnectionSubprotocol ? 7u
+                                                                       : 1u;
+                auto result = HandlerResult::unpack(handler(
+                    connection.get(), nullptr, bytes, sizeof(bytes), nullptr, opcode, client));
                 CHECK_EQ(result.status_code, 200u + expected);
             }
         }

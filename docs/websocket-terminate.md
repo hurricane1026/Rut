@@ -82,6 +82,27 @@ response effects cannot run inside a message predicate. The borrowed message
 has no storage carrier outside its synchronous callback, and comparing entire
 messages is rejected. Close-event values remain subsequent work.
 
+`message.connection` has the borrowed type `WebSocketConnection`. Its
+`remoteAddr: IP`, `remotePort: i32`, `isTls: bool` and `subprotocol: str` fields
+identify the downstream client connection in either message direction. The
+port is the host-order client port; TLS describes the downstream transport.
+The selected subprotocol is an empty String when none was negotiated. Values
+come from the live connection after admission, without retaining HTTP request
+views. Ordinary helpers and immutable aliases can project these fields;
+connection values cannot be compared, published or retained outside the callback.
+String outputs are copied into owned send storage before asynchronous I/O.
+The existing IP type now supports ordinary function signatures for HTTP and
+message helpers alike. This adds no IP parser or constructor.
+
+```swift
+func secure(_ connection: WebSocketConnection) -> bool => connection.isTls
+// Within the message callback:
+// let connection = message.connection
+// guard secure(connection) else { message.drop() }
+// message.forward(connection.subprotocol)
+```
+
+
 Pure scalar callbacks also lower through the shared MIR/RIR and LLVM backend.
 This entry supports ordinary integer arithmetic and bitwise helpers, String
 comparisons, local aliases, guards and complete `if`/`else` expressions, including

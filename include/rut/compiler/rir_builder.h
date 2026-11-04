@@ -523,11 +523,10 @@ struct Builder {
     Result<ValueId> emit_ws_message_field(WsMessageFieldId field, SourceLoc loc = {}) {
         if (!ws_message_field_valid(static_cast<u32>(field)))
             return core::make_unexpected(RirError::InvalidState);
-        const bool kBool = field == WsMessageFieldId::FromClient ||
-                           field == WsMessageFieldId::IsText || field == WsMessageFieldId::IsBinary;
-        const TypeKind kKind = field == WsMessageFieldId::Payload ? TypeKind::Str
-                               : kBool                            ? TypeKind::Bool
-                                                                  : TypeKind::I32;
+        const bool kBool = ws_message_field_is_bool(field);
+        const TypeKind kKind = ws_message_field_is_string(field) ? TypeKind::Str
+                               : kBool                           ? TypeKind::Bool
+                                                                 : TypeKind::I32;
         auto* ty = TRY(make_type(kKind));
         auto result = TRY(emit(Opcode::WsMessageField, ty, loc));
         result.inst->imm.i32_val = static_cast<i32>(field);

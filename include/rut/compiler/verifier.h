@@ -902,13 +902,11 @@ inline VerifyResult verify_function(const Function* fn,
             }
             if (inst.op == Opcode::WsMessageField) {
                 const u32 kField = static_cast<u32>(inst.imm.i32_val);
-                const bool kBool = kField == static_cast<u32>(WsMessageFieldId::FromClient) ||
-                                   kField == static_cast<u32>(WsMessageFieldId::IsText) ||
-                                   kField == static_cast<u32>(WsMessageFieldId::IsBinary);
-                const TypeKind kExpected = kField == static_cast<u32>(WsMessageFieldId::Payload)
-                                               ? TypeKind::Str
-                                           : kBool ? TypeKind::Bool
-                                                   : TypeKind::I32;
+                const auto kFieldId = static_cast<WsMessageFieldId>(kField);
+                const bool kBool = ws_message_field_is_bool(kFieldId);
+                const TypeKind kExpected = ws_message_field_is_string(kFieldId) ? TypeKind::Str
+                                           : kBool                              ? TypeKind::Bool
+                                                                                : TypeKind::I32;
                 const Type* type = inst.result != kNoValue && inst.result.id < fn->value_count &&
                                            fn->values != nullptr
                                        ? fn->values[inst.result.id].type

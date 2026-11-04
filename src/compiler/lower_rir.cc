@@ -1802,13 +1802,22 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             field = WsMessageFieldId::IsText;
         else if (value.str_value.eq(lit_str("isBinary")))
             field = WsMessageFieldId::IsBinary;
+        else if (value.str_value.eq(lit_str("remoteAddr")))
+            field = WsMessageFieldId::ConnectionRemoteAddr;
+        else if (value.str_value.eq(lit_str("remotePort")))
+            field = WsMessageFieldId::ConnectionRemotePort;
+        else if (value.str_value.eq(lit_str("isTls")))
+            field = WsMessageFieldId::ConnectionIsTls;
+        else if (value.str_value.eq(lit_str("subprotocol")))
+            field = WsMessageFieldId::ConnectionSubprotocol;
         else
             return frontend_error(FrontendError::UnsupportedSyntax, span);
-        const bool kBool = field == WsMessageFieldId::FromClient ||
-                           field == WsMessageFieldId::IsText || field == WsMessageFieldId::IsBinary;
-        const MirTypeKind kExpected = field == WsMessageFieldId::Payload ? MirTypeKind::Str
-                                      : kBool                            ? MirTypeKind::Bool
-                                                                         : MirTypeKind::I32;
+        const bool kBool = ws_message_field_is_bool(field);
+        const MirTypeKind kExpected = ws_message_field_is_string(field) ? MirTypeKind::Str
+                                      : field == WsMessageFieldId::ConnectionRemoteAddr
+                                          ? MirTypeKind::IP
+                                      : kBool ? MirTypeKind::Bool
+                                              : MirTypeKind::I32;
         if (value.type != kExpected || value.may_nil || value.may_error || value.lhs != nullptr ||
             value.rhs != nullptr || value.args.len != 0 || value.field_inits.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, span);

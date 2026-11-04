@@ -390,6 +390,33 @@ def nominal_match_exchange(client, peer):
     expect(peer, (8, b"\x03\xe8", True))
 
 
+CONNECTION_DECLARATIONS = r"""
+func clientPeer(_ connection: WebSocketConnection) -> IP => connection.remoteAddr
+func connectionLabel(_ connection: WebSocketConnection) -> str {
+    if connection.isTls { "tls:" + connection.subprotocol }
+    else { "plain:" + connection.subprotocol }
+}
+"""
+CONNECTION_HANDLER = r"""
+return websocket(ws) { msg in
+    let connection = msg.connection
+    guard connection.remotePort > 0 else { msg.close(1011) }
+    guard clientPeer(connection) == clientPeer(msg.connection) else { msg.close(1011) }
+    msg.forward(connectionLabel(connection))
+}
+"""
+
+
+def connection_exchange(client, peer, expected=b"plain:"):
+    for value in (b"one", b"two"):
+        client.sendall(masked_frame(1, value))
+        if recv_client_frame(peer) != (1, expected, True):
+            raise AssertionError("message connection metadata changed after upgrade")
+        peer.sendall(bytes((0x81, len(value))) + value)
+        if recv_client_frame(client) != (1, expected, False):
+            raise AssertionError("message direction changed downstream connection metadata")
+
+
 ERROR_VALUE_DECLARATIONS = r"""
 func resultValue(_ text: str) -> str {
     let unused = sha256(text)
@@ -1580,7 +1607,7 @@ def typed_message_exchange(client, peer):
 
 
 def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
-                                exchange=binary_exchange, declarations=""):
+                                exchange=binary_exchange, declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-binary-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -1600,11 +1627,11 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
             raise AssertionError(f"{backend_kind} binary replacement server failed:\n{text}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
-                client.sendall(REQUEST)
+                client.sendall(request)
                 with upstream.accept()[0] as peer:
                     peer.settimeout(3)
                     recv_until(peer, b"\r\n\r\n")
-                    peer.sendall(WS_RESPONSE_HEADERS)
+                    peer.sendall(response)
                     if not recv_until(client, b"\r\n\r\n").startswith(b"HTTP/1.1 101"):
                         raise AssertionError("binary replacement handshake failed")
                     exchange(client, peer)
@@ -1620,7 +1647,7 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
 
 def native_binary_source_removal_scenario(server, compiler, backend_kind,
                                          handler=BINARY_HANDLER, exchange=binary_exchange,
-                                         declarations=""):
+                                         declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-native-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -1665,12 +1692,12 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind,
                 if not recv_http_response(client).startswith(b"HTTP/1.1 400"):
                     raise AssertionError("native source-removed artifact accepted malformed handshake")
             with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
-                client.sendall(REQUEST)
+                client.sendall(request)
                 with upstream.accept()[0] as peer:
                     peer.settimeout(3)
                     if not recv_until(peer, b"\r\n\r\n").startswith(b"GET /ws "):
                         raise AssertionError("native artifact did not forward valid handshake")
-                    peer.sendall(WS_RESPONSE_HEADERS)
+                    peer.sendall(response)
                     if not recv_until(client, b"\r\n\r\n").startswith(b"HTTP/1.1 101"):
                         raise AssertionError("native artifact did not relay valid 101")
                     exchange(client, peer)
@@ -2291,7 +2318,7 @@ def tls_passthrough_scenario(server, backend_kind):
     return "pass", ""
 
 
-def tls_terminate_handshake_scenario(server, backend_kind):
+def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False):
     cert = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_cert.pem")
     key = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_key.pem")
     backend = socket.socket()
@@ -2303,6 +2330,9 @@ def tls_terminate_handshake_scenario(server, backend_kind):
         f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
         'route GET "/ws" { return websocket(ws) { message in message.drop() } }\n'
     )
+    if connection_context:
+        source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+                  + CONNECTION_DECLARATIONS + '\nroute GET "/ws" { ' + CONNECTION_HANDLER + '}\n')
     with tempfile.TemporaryDirectory(prefix="rut-ws-tls-terminate-") as temp:
         path = os.path.join(temp, "route.rut")
         with open(path, "w", encoding="utf-8") as route_file:
@@ -2356,14 +2386,17 @@ def tls_terminate_handshake_scenario(server, backend_kind):
             response = recv_until(valid_client, b"\r\n\r\n")
             if not response.startswith(b"HTTP/1.1 101"):
                 raise AssertionError(f"TLS valid terminate handshake failed: {response!r}")
-            valid_client.sendall(masked_frame(1, b"DROP"))
-            peer.settimeout(0.25)
-            try:
-                leaked = peer.recv(4096)
-            except TimeoutError:
-                leaked = b""
-            if leaked:
-                raise AssertionError(f"TLS terminate DROP reached backend: {leaked!r}")
+            if connection_context:
+                connection_exchange(valid_client, peer, b"tls:")
+            else:
+                valid_client.sendall(masked_frame(1, b"DROP"))
+                peer.settimeout(0.25)
+                try:
+                    leaked = peer.recv(4096)
+                except TimeoutError:
+                    leaked = b""
+                if leaked:
+                    raise AssertionError(f"TLS terminate DROP reached backend: {leaked!r}")
         finally:
             if peer is not None:
                 peer.close()
@@ -2630,6 +2663,7 @@ def main():
                 (STRING_HELPER_HANDLER, string_helper_exchange, STRING_HELPER_DECLARATIONS),
                 (NOMINAL_MATCH_HANDLER, nominal_match_exchange, NOMINAL_MATCH_DECLARATIONS),
                 (ERROR_VALUE_HANDLER, error_value_exchange, ERROR_VALUE_DECLARATIONS),
+                (CONNECTION_HANDLER, connection_exchange, CONNECTION_DECLARATIONS),
                 (ERROR_MATCH_HANDLER, error_match_exchange, ERROR_MATCH_DECLARATIONS),
                 (ERROR_MATCH_HANDLER, error_match_exchange, ERROR_MATCH_IMPLICIT_DECLARATIONS),
                 (ERROR_FIELDS_HANDLER, error_fields_exchange, ERROR_FIELDS_DECLARATIONS),
@@ -2675,6 +2709,20 @@ def main():
                     if status != "pass":
                         raise AssertionError(f"callback scope: {details}")
                     print(f"PASS {backend} {exchange.__name__} native={native}")
+        for native in (False, True):
+            handler = CONNECTION_HANDLER.replace("websocket(ws)", 'websocket(ws, subprotocol: "chat")')
+            request = REQUEST[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n"
+            response = WS_RESPONSE_HEADERS[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n"
+            exchange = lambda client, peer: connection_exchange(client, peer, b"plain:chat")
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, handler, exchange, CONNECTION_DECLARATIONS,
+                    request=request, response=response)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, handler, exchange, CONNECTION_DECLARATIONS,
+                    request=request, response=response)
+            print(f"{status.upper()} {backend} connection negotiated subprotocol native={native}: {details}")
         for native in (False, True):
             if native:
                 status, details = native_binary_source_removal_scenario(
@@ -2798,6 +2846,8 @@ def main():
             print(f"SKIP {backend}: {details.strip()}")
         else:
             print(f"PASS {backend} TLS passthrough")
+        status, details = tls_terminate_handshake_scenario(args.server, backend, connection_context=True)
+        print(f"{status.upper()} {backend} TLS connection context: {details}")
         status, details = tls_terminate_handshake_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")

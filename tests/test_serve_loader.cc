@@ -1,5 +1,6 @@
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_connection_context.h"
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_error_guard_match.h"
@@ -9829,6 +9830,19 @@ TEST(serve_loader, websocket_error_scalar_bindings_keep_false_zero_and_absence_d
     REQUIRE(load_rut_program(path.c_str(), program, error));
     REQUIRE_EQ(unlink(path.c_str()), 0);
     test::ws_error_scalars::check(_tc, program.config);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_connection_context_keeps_owned_metadata_and_helper_types) {
+    const auto path = write_file(
+        "/tmp/rut_ws_connection_context", "app.rut", test::ws_connection_context::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_connection_context::check(_tc, program.config);
     program.destroy();
 }
 #endif

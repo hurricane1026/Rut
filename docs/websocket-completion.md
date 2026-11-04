@@ -66,3 +66,8 @@ aliases and helper-local recovery. `guard let`, `if let`, `.or(default)` and
 named-error `guard match` share ordinary analysis; the latter retains HTTP's
 final-wildcard rule. Reached producers run once even for unused results.
 Response/effect/yield helper semantics and the broad criteria remain open.
+
+Message connection context now projects typed downstream IP/port, TLS and the
+negotiated subprotocol through ordinary borrowed helper/alias analysis. Values
+come from the live connection in either direction; no HTTP request views escape
+admission. The combined lifecycle criterion remains open for open/close events.

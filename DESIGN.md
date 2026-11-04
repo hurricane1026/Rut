@@ -2940,6 +2940,18 @@ locals use the ordinary runtime allocator/failure contract; ordinary helper
 body lets, general error work and close-event context still require
 integration. Dynamic output, digest/HMAC and general JSON use shared IR.
 
+`message.connection` projects a borrowed `WebSocketConnection` with downstream
+client `remoteAddr: IP`, `remotePort: i32`, `isTls: bool` and selected
+`subprotocol: str` (empty when absent). These identify the same downstream
+connection in both directions. The compiler uses ordinary helper signatures
+and lexical aliases; the connection view has no stored MIR carrier and cannot
+outlive the synchronous callback. Scalar projections use typed message inputs
+and runtime helpers reading the live connection, rather than HTTP request
+parsing or expired request views. Subprotocol storage remains pinned by the
+active route configuration and output publication copies it before async sends.
+The IP type is available to ordinary HTTP/helper signatures as well. Open/close
+event contexts and session state remain separate work.
+
 The message also projects two nominal, closed domains: `kind` is
 `WebSocketMessageKind` (`text`, `binary`), and `direction` is `WebSocketDirection`
 (`clientToUpstream`, `upstreamToClient`). Fully qualified case references,
