@@ -701,10 +701,12 @@ TEST(native_program, links_with_closed_stderr) {
     const int saved_stderr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
     REQUIRE(saved_stderr >= 0);
     REQUIRE_EQ(close(STDERR_FILENO), 0);
-    const bool loaded = load(source, *owner.p);
+    char error[512]{};
+    const bool loaded = load_native_program(source.path, *owner.p, error, sizeof(error));
     const bool restored = dup2(saved_stderr, STDERR_FILENO) == STDERR_FILENO;
     close(saved_stderr);
     REQUIRE(restored);
+    if (!loaded) fprintf(stderr, "closed-stderr load failed: %s\n", error);
     CHECK(loaded);
 }
 
