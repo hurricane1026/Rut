@@ -4,6 +4,7 @@
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
+#include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
@@ -46377,7 +46378,7 @@ TEST(frontend, websocket_eager_bindings_keep_owned_initializer_identities) {
         for (u32 i = 0; i < route.exprs.len; ++i) {
             const auto& expr = route.exprs[i];
             if (expr.kind == HirExprKind::LetIn) {
-                ++initializers;
+                if (expr.lhs && expr.lhs->kind == HirExprKind::Uuid) ++initializers;
                 CHECK(route.exprs.index_of(expr.lhs) != 0xffffffffu);
                 CHECK(route.exprs.index_of(expr.rhs) != 0xffffffffu);
             }
@@ -46449,52 +46450,58 @@ route GET "/ws" { return websocket(ws) { msg in
 
 #if RUT_ENABLE_WEBSOCKET
 TEST(frontend, websocket_dynamic_outputs_preserve_owned_ir_and_reject_phase_leaks) {
-    auto tokens = lex(lit(test::ws_dynamic_output::kSource));
-    REQUIRE(tokens);
-    auto ast = parse_file_heap(tokens.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    ast.reset();
-    auto copied = std::make_unique<HirModule>(hir.value());
-    hir.reset();
-    REQUIRE_EQ(copied->routes.len, 5u);
-    for (const auto& route : copied->routes) {
-        REQUIRE(route.ws_handler.general_body_expr < route.exprs.len);
-        CHECK(route.ws_handler.forward_payload.source == HirWsTextSource::Dynamic);
-        auto callback = std::make_unique<HirRoute>();
-        callback->is_ws_callback = true;
-        HirLocal result{};
-        result.is_runtime_synthetic = true;
-        result.type = HirTypeKind::I32;
-        result.init = route.exprs[route.ws_handler.general_body_expr];
-        REQUIRE(callback->locals.push(result));
-        callback->control.kind = HirControlKind::Direct;
-        callback->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
-        callback->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
-        callback->control.direct_term.local_ref_index = 0;
-        auto mir = build_mir_route(*copied, *callback);
-        REQUIRE(mir);
-        HeapFrontendResult<MirModule> owner{mir.value()};
-        auto function = std::make_unique<MirFunction>(owner->functions[0]);
-        owner->functions[0] = static_cast<MirFunction&&>(*function);
-        FrontendRirModule rir{};
-        REQUIRE(lower_to_rir(owner.value(), rir));
-        CHECK(rir::verify_module(rir.module).ok);
-        const auto& body = rir.module.functions[0];
-        CHECK(function_has_op(body, rir::Opcode::WsForward) ||
-              function_has_op(body, rir::Opcode::WsClose));
-        rir.destroy();
+    for (const char* source : {test::ws_dynamic_output::kSource, test::ws_hash_output::kSource}) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        ast.reset();
+        auto copied = std::make_unique<HirModule>(hir.value());
+        hir.reset();
+        REQUIRE_EQ(copied->routes.len, 5u);
+        for (const auto& route : copied->routes) {
+            REQUIRE(route.ws_handler.general_body_expr < route.exprs.len);
+            CHECK(route.ws_handler.forward_payload.source == HirWsTextSource::Dynamic);
+            auto callback = std::make_unique<HirRoute>();
+            callback->is_ws_callback = true;
+            HirLocal result{};
+            result.is_runtime_synthetic = true;
+            result.type = HirTypeKind::I32;
+            result.init = route.exprs[route.ws_handler.general_body_expr];
+            REQUIRE(callback->locals.push(result));
+            callback->control.kind = HirControlKind::Direct;
+            callback->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+            callback->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+            callback->control.direct_term.local_ref_index = 0;
+            auto mir = build_mir_route(*copied, *callback);
+            REQUIRE(mir);
+            HeapFrontendResult<MirModule> owner{mir.value()};
+            auto function = std::make_unique<MirFunction>(owner->functions[0]);
+            owner->functions[0] = static_cast<MirFunction&&>(*function);
+            FrontendRirModule rir{};
+            REQUIRE(lower_to_rir(owner.value(), rir));
+            CHECK(rir::verify_module(rir.module).ok);
+            const auto& body = rir.module.functions[0];
+            CHECK(function_has_op(body, rir::Opcode::WsForward) ||
+                  function_has_op(body, rir::Opcode::WsClose));
+            rir.destroy();
+        }
     }
-    for (const char* body : {"let token = uuid() msg.forward(token)",
-                             "msg.forward(req.path)",
-                             "msg.close(1000, req.path)",
-                             "msg.close(66536, msg.text)",
-                             "msg.close(-64536, msg.text)",
-                             "if true { msg.forward() } else { msg.close(1000, req.path) }",
-                             "msg.close(msg.len, msg.payload)",
-                             "msg.forward(msg.len)",
-                             "msg.drop(msg.payload)"}) {
+    for (const char* body :
+         {"let token = uuid() msg.forward(token)",
+          "msg.forward(sha256(msg.text))",
+          "guard let d = sha256(msg.payload) else { msg.close() } msg.forward(d)",
+          "guard let d = sha256(req.path) else { msg.close() } msg.forward(d)",
+          "msg.forward(req.path)",
+          "msg.close(1000, req.path)",
+          "msg.close(66536, msg.text)",
+          "msg.close(-64536, msg.text)",
+          "if true { msg.forward() } else { msg.close(1000, req.path) }",
+          "msg.close(msg.len, msg.payload)",
+          "msg.forward(msg.len)",
+          "msg.drop(msg.payload)"}) {
         std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";
         source += body;
         source += " } }";

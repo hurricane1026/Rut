@@ -613,6 +613,15 @@ return websocket(chat) { msg in
 }
 ```
 
+Existing fixed-algorithm digest/HMAC functions also accept the raw-byte
+`message.text` view. For example, `guard let digest = sha256(msg.text) else {
+msg.close(1011) }` can precede `msg.forward(digest)`. The result is optional
+lowercase hex, allocated in the existing bounded message arena. Both guard-let
+and if-let evaluate a reached initializer once, reusing it for the presence test
+and narrowed reads; untaken branches perform no work. Exhaustion follows the
+chosen nil branch. Binary data, including NUL and non-UTF-8 bytes, is hashed
+exactly; this does not implicitly convert Bytes or add a new crypto algorithm.
+
 Dynamic code/reason arguments use `msg.close(code, reason)` with an unwrapped
 `i32` and `str`. Known invalid values remain compile errors; invalid runtime
 code/reason or dynamic Text output closes with 1011. Oversized dynamic output

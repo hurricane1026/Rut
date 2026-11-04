@@ -1254,6 +1254,15 @@ return websocket(chat) { message in
     guard let value = token else { message.close() }
     message.forward(value)
 }
+// Existing digest/HMAC builtins accept the message's byte-oriented text view.
+// They return optional lowercase hex strings; guard/if-let initializers execute
+// once on the reached path, and pool exhaustion follows the failure branch.
+return websocket(chat) { message in
+    guard let digest = sha256(message.text) else { message.close(1011) }
+    message.forward(digest)
+}
+// hmacSha256("key", message.text) uses the existing fixed-algorithm HMAC API.
+// Bytes values need an explicit supported text view; there is no implicit conversion.
 // Dynamic close arguments are an unwrapped i32 and str, with the same valid wire
 // codes and 123-byte UTF-8 reason limit. Invalid fixed arguments are compile errors;
 // invalid runtime code/reason closes with 1011. Dynamic output over maxMessageSize

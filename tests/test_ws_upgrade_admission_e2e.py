@@ -48,6 +48,43 @@ def masked_frame(opcode, payload):
     return bytes((0x80 | opcode, 0x80 | len(payload))) + key + masked
 
 
+HASH_OUTPUT_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        guard let digest = sha256(msg.text) else { msg.close() }
+        msg.forward(digest)
+    } else {
+        if let digest = hmacSha256("key", msg.text) { msg.forward(digest) }
+        else { msg.close() }
+    }
+}
+"""
+
+
+def hash_output_exchange(client, peer):
+    import hashlib
+    import hmac
+
+    messages = (b"a\0b", b"\xff", b"")
+    client.sendall(b"".join(masked_frame(2, payload) for payload in messages))
+    for payload in messages:
+        expected = (1, hashlib.sha256(payload).hexdigest().encode(), True)
+        actual = recv_client_frame(peer)
+        if actual != expected:
+            raise AssertionError(f"message hash: {actual=!r}, {expected=!r}")
+    peer.sendall(b"\x82\x03a\0b" + b"\x89\x01p" + b"\x82\x00")
+    for expected in (
+            (1, hmac.new(b"key", b"a\0b", hashlib.sha256).hexdigest().encode(), False),
+            (9, b"p", False),
+            (1, hmac.new(b"key", b"", hashlib.sha256).hexdigest().encode(), False)):
+        actual = recv_client_frame(client)
+        if actual != expected:
+            raise AssertionError(f"message HMAC: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    if recv_client_frame(peer) != (8, b"\x03\xe8", True):
+        raise AssertionError("hash callback altered control close")
+
+
 DYNAMIC_OUTPUT_DECLARATIONS = r"""
 func outputBytes(_ m: WebSocketMessage) -> Bytes {
     if m.len == 3 { m.payload } else { b"\x00\xff" }
@@ -2145,6 +2182,7 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (HASH_OUTPUT_HANDLER, hash_output_exchange, ""),
                 (DYNAMIC_OUTPUT_HANDLER, dynamic_output_exchange, DYNAMIC_OUTPUT_DECLARATIONS),
                 (DYNAMIC_BOUND_HANDLER, dynamic_bound_exchange, ""),
                 (DYNAMIC_UTF8_HANDLER, dynamic_utf8_exchange, ""),

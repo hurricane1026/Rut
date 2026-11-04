@@ -2607,6 +2607,18 @@ the incoming kind. The specialized `message.text` affix recipe applies the same
 UTF-8 rule to valid Binary payloads. No implicit conversion or interpolation is
 introduced. Values borrowed from HTTP admission remain prohibited.
 
+Message callback `guard let` and `if let` initializers with runtime presence
+use the same lexical `LetIn`/`BoundValue` representation as callback locals.
+The producer is evaluated once before its presence check; success-path reads
+reuse that value. Known nil/error branches retain their existing static typing
+and pruning. A surrounding untaken branch performs no initialization.
+The existing digest and HMAC builtins are available on plain message strings,
+including raw Binary `message.text` bytes; optional hex results use the message
+arena and its existing crypto budget. Pool failure remains nil and follows the
+source's declared guard/else branch. No new crypto dependency or conversion is
+introduced. General JSON/regex/error integration and helper-internal lexical
+semantics remain separate completion work.
+
 `message.close(code, reason)` also accepts runtime plain `i32` and `str` values.
 Known invalid codes and reasons remain compile errors. Runtime invalid codes
 are checked before narrowing; an invalid code/reason or invalid dynamic Text

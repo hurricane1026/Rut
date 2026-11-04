@@ -6380,6 +6380,38 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         return result;
     };
 
+    auto bind_message_initializer = [&](HirExpr& value,
+                                        const HirLocal* scope,
+                                        u32 count,
+                                        Span span) -> FrontendResult<HirExpr*> {
+        // Presence tests and narrowed reads must share a reached producer. Keep
+        // known nil/error handling on its existing dead-branch typing path.
+        if (!scratch->is_ws_callback ||
+            known_value_state(value, scope, count, 0) != KnownValueState::Unknown)
+            return static_cast<HirExpr*>(nullptr);
+        if (!scratch->exprs.push(value)) return frontend_error(FrontendError::OutOfMemory, span);
+        HirExpr* initializer = &scratch->exprs[scratch->exprs.len - 1];
+        value.kind = HirExprKind::BoundValue;
+        value.lhs = initializer;
+        value.rhs = nullptr;
+        value.args.len = 0;
+        value.field_inits.len = 0;
+        return initializer;
+    };
+    auto finish_message_initializer =
+        [&](HirExpr* initializer, const HirExpr& body, Span span) -> FrontendResult<HirExpr> {
+        if (!initializer) return body;
+        if (!scratch->exprs.push(body)) return frontend_error(FrontendError::OutOfMemory, span);
+        HirExpr out = body;
+        out.kind = HirExprKind::LetIn;
+        out.span = span;
+        out.lhs = initializer;
+        out.rhs = &scratch->exprs[scratch->exprs.len - 1];
+        out.args.len = 0;
+        out.field_inits.len = 0;
+        return out;
+    };
+
     auto analyze_function_match_pattern = [&](const AstExpr& pattern_expr,
                                               const HirExpr& subject_expr,
                                               const HirLocal* cur_locals,
@@ -6484,6 +6516,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         for (u32 i = 0; i < local_count; i++) then_scoped[i] = locals[i];
         u32 then_count = local_count;
         HirExpr cond_expr{};
+        HirExpr* initializer_key = nullptr;
         if (stmt.bind_value) {
             auto bound = analyze_function_expr(stmt.expr, locals, local_count, binding);
             if (!bound) return core::make_unexpected(bound.error());
@@ -6493,6 +6526,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                  user_bound_ident_name(mod, locals, local_count, binding, stmt.name)))
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
 #endif
+            auto cached = bind_message_initializer(bound.value(), locals, local_count, stmt.span);
+            if (!cached) return core::make_unexpected(cached.error());
+            initializer_key = cached.value();
             auto cond = build_guard_cond_from_analyzed(bound.value(),
                                                        stmt.expr.span,
                                                        scratch,
@@ -6605,7 +6641,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             return frontend_error(FrontendError::OutOfMemory, stmt.span);
         if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
             return frontend_error(FrontendError::TooManyItems, stmt.span);
-        return out;
+        return finish_message_initializer(initializer_key, out, stmt.span);
     }
 
     if (stmt.kind == AstStmtKind::Match && stmt.is_const) {
@@ -7175,6 +7211,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                      user_bound_ident_name(mod, cur_locals, cur_local_count, binding, inner.name)))
                     return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
 #endif
+                HirExpr* initializer_key = nullptr;
+                if (inner.bind_value) {
+                    auto cached = bind_message_initializer(
+                        bound.value(), cur_locals, cur_local_count, inner.span);
+                    if (!cached) return core::make_unexpected(cached.error());
+                    initializer_key = cached.value();
+                }
                 auto cond = build_guard_cond_from_analyzed(bound.value(),
                                                            inner.expr.span,
                                                            scratch,
@@ -7281,7 +7324,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (inner.match_arms.len != 0) {
                     else_expr = analyze_function_guard_match_expr(
                         inner.match_arms, bound.value(), cur_locals, cur_local_count);
-                } else {
+                } else if (inner.else_stmt != nullptr) {
                     else_expr = analyze_function_body_stmt(*inner.else_stmt,
                                                            scratch,
                                                            mod,
@@ -7330,7 +7373,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return frontend_error(FrontendError::OutOfMemory, inner.span);
                 if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
-                return out;
+                return finish_message_initializer(initializer_key, out, inner.span);
             }
             if (!is_last && inner.kind != AstStmtKind::Let && inner.kind != AstStmtKind::Guard)
                 return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
@@ -7453,7 +7496,7 @@ static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
         expr.kind == HirExprKind::WaitResult || expr.kind == HirExprKind::WaitField ||
         expr.kind == HirExprKind::CacheGet || expr.kind == HirExprKind::CacheSet ||
         expr.kind == HirExprKind::JsonOp || expr.kind == HirExprKind::JsonDecode ||
-        expr.kind == HirExprKind::RegexMatch || expr.kind == HirExprKind::HashDigest)
+        expr.kind == HirExprKind::RegexMatch)
         return &expr;
     if (validate_receivers && expr.kind == HirExprKind::WsMessageField &&
         (expr.lhs == nullptr || expr.lhs->kind != HirExprKind::LocalRef ||

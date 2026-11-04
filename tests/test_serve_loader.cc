@@ -3,6 +3,7 @@
 #include "fixtures/ws_dynamic_output.h"
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
+#include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 // Tests for the .rut program loader (src/serve_loader.cc): the bridge that
@@ -9863,6 +9864,18 @@ TEST(serve_loader, websocket_dynamic_outputs_survive_source_removal_and_pool_exh
     REQUIRE(load_rut_program(path.c_str(), program, err));
     REQUIRE_EQ(unlink(path.c_str()), 0);
     test::ws_dynamic_output::check(program.config, _tc);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_hash_bindings_evaluate_once_and_handle_pool_exhaustion) {
+    auto path = write_file("/tmp/rut_ws_hash_output", "app.rut", test::ws_hash_output::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_hash_output::check(program.config, _tc);
     program.destroy();
 }
 #endif
