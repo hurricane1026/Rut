@@ -797,5 +797,8 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [x] Bounded Rut/JIT/native-artifact header verification prefix and automatic
   per-shard worker startup/reload/shutdown lifecycle using timer suspension.
 - [ ] Direct completion-FD backend integration if needed beyond timer polling.
+- [x] Fixed-account password-to-JWT login composition in Rut, with terminal
+  result-to-Identity mapping, process-shared peer-IP admission, fresh jti,
+  bounded lifetime/scope, no-store token response and protected-route validation.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
-  rate limits, rehash migration and session/JWT login composition.
+  account-level abuse policies, rehash migration and persistent sessions/refresh.

@@ -1723,6 +1723,40 @@ user lookup/persistence, registration, reset/change, automatic rehash and sessio
 or JWT login orchestration are not implemented by it. Basic auth keeps its
 existing static credential semantics.
 
+### Fixed-account password/JWT composition
+
+`auth.passwordIdentity(result, consumerId, credentialId)` maps the terminal result
+of the prefix to an `Identity` with method `"password"`. Only result `1` succeeds;
+`0` returns 401 with `Cache-Control: no-store`, `-2` returns 504, and unavailable
+or unknown states return 503. Empty configured IDs return 503. This pure Rut
+helper performs no KDF and accepts an ordinary integer; call it only with the
+actual verifier result. Neither integers nor constructible Identity values carry
+authentication provenance.
+
+[password-jwt-login.rut](../examples/password-jwt-login.rut) composes existing
+primitives for one configured account. `PASSWORD_HASH`, `PASSWORD_SUBJECT` and
+`JWT_ISSUE_KEY` resolve at load/compile time. Its POST `/login` route uses the
+actual peer IP with a process-shared `@rateLimit`: five initial attempts, then
+one per twelve seconds. Admission runs before the handler/KDF; missing,
+duplicate and incorrect credentials spend the same budget. Forwarding and
+identity headers do not select the account or limiter key. Limits are bounded
+and process-local, with the collision semantics documented above; there is no
+cross-node quota or durable lockout.
+
+After verification, the route generates a UUID v4 `jti` and issues HS256 for
+the trusted subject, issuer `rut-password-login`, audience `orders`, scope
+`orders.read` and a 300-second lifetime. The compact JWT response has Content-Type
+`application/jwt`, `Cache-Control: no-store` and `Pragma: no-cache`. The GET
+`/private` route pins HS256, validates issuer/audience and age/lifetime, then
+requires the configured scope. Serve the login route over TLS. Provision hashes
+offline with the native random-salt API and protect resolved native artifacts.
+
+This is a fixed-account composition, without registration, password reset/change,
+a user database, refresh tokens, cookies or a durable session/revocation store.
+Changing the password prevents future login with the previous password; already
+issued tokens retain their original lifetime unless separately revoked or their
+signing key is removed. There is no implicit logout or password-change revocation.
+
 ## JWT resource-server claims profile
 
 `jwtDecode(token, secret)` retains its existing signature-only semantics.

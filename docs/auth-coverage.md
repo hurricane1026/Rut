@@ -15,7 +15,8 @@ whether a competing open-source edition includes them.
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
-| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and login/session orchestration |
+| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
+| Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived scoped HS256 token and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and RS256 policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | ES keys, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
@@ -783,14 +784,14 @@ claim of compatibility with PHC, modular crypt or another application's record
 format. `password_hash` sets the length to zero on failure and leaves the
 output buffer unchanged; `password_verify` returns false for invalid records
 and wrong passwords. Their timings differ for malformed and valid records;
-only the derived-key comparison is constant-time. Account enumeration, rate
-limits and uniform authentication responses belong to the future caller.
+only the derived-key comparison is constant-time. Account enumeration, abuse
+controls and uniform authentication responses belong to the application policy.
 
 The existing `test_hash` target includes independent Python `hashlib` PBKDF2
 vectors, binary and long-key passwords, rejection/buffer bounds, and incorrect
 password cases. User registration, password changes/resets, automatic rehash,
-pepper management, a durable user registry and session/JWT login flows remain
-unimplemented.
+pepper management, a durable user registry and persistent sessions/refresh remain
+unimplemented. The fixed-account password/JWT composition below is supported.
 
 The salt-generating overload is exercised through the same internal callback
 pattern as `generate_uuid`: deterministic entropy and partial/error injection
@@ -1013,4 +1014,39 @@ native bridge tests cover HTTP/2 stream isolation, cancellation and deadlines.
 This is a fixed-record verifier, not a durable account system. Provision hashes
 offline using the random-salt native API; use TLS for credential transport and
 apply application abuse controls. Registration, lookup, password reset/change,
-rehash migration and session/JWT login orchestration remain open work.
+rehash migration and persistent session/refresh orchestration remain open work.
+The fixed-account JWT composition below is supported.
+
+## Fixed-account password-to-JWT login
+
+The shipped [password/JWT example](../examples/password-jwt-login.rut) combines
+the existing prefix, `auth.passwordIdentity`, UUID generation, scoped HS256
+issuance and strict resource-server checks. The [language card](language-card.md#fixed-account-passwordjwt-composition)
+records its transport, status mapping, identity provenance and lifetime contract.
+No keyword, dependency, worker mechanism or token algorithm is added.
+
+The login decorator shares one peer-IP quota across this process's shards. It
+runs before worker submission, so rejected requests do not allocate a password
+task. Missing, duplicate and incorrect credentials also spend admission budget;
+spoofed `X-Forwarded-For` and identity headers do not select the bucket/account.
+The built-in limiter remains bounded and process-local; account lockout and
+cross-node abuse controls are separate acceptance work.
+
+`test_password_login_epoll` and `test_password_login_io_uring` start the actual
+CLI with two shards and verified local TLS using the pinned-library certificate
+fixture. They compile the shipped program and import, remove both source files,
+then verify login and protected access. Python's standard-library HMAC and JSON
+code independently checks the issued signature, exact claims, UUID v4 jti,
+trusted subject, scope and 300-second lifetime. Repeated login must issue
+different IDs. Tests also cover invalid/missing/duplicate credentials, aggregate
+quota and Retry-After, spoofed identity/forwarding fields, tampered signatures,
+algorithm pinning, issuer/audience/time/lifetime rejection, insufficient scope,
+duplicate Authorization, empty configured subject, short signing key and password
+timeout. Failed login never emits a token response. JIT policy tests require
+unknown result values to fail closed and validate both configured IDs.
+
+Password replacement only changes future password verification. Previously
+issued JWTs keep their original expiry unless separately revoked or their
+signing key is removed. This profile adds no refresh token, cookie, logout,
+registration or password-change endpoint, account database, persistent session
+or durable token-revocation state.

@@ -28405,3 +28405,58 @@ TEST(jit, password_header_prefix_suspends_before_effects_and_resumes_once) {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, password_identity_maps_terminal_results_and_rejects_untrusted_states) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/password-jwt-login.rut";
+    struct Case {
+        const char* arguments;
+        u16 status;
+    };
+    const Case cases[] = {{"1, \"alice\", \"password-v1\"", 204},
+                          {"0, \"alice\", \"password-v1\"", 401},
+                          {"-1, \"alice\", \"password-v1\"", 503},
+                          {"-2, \"alice\", \"password-v1\"", 504},
+                          {"2, \"alice\", \"password-v1\"", 503},
+                          {"-3, \"alice\", \"password-v1\"", 503},
+                          {"1, \"\", \"password-v1\"", 503},
+                          {"1, \"alice\", \"\"", 503},
+                          {"0, \"\", \"password-v1\"", 503}};
+    std::string source = "import \"middleware/auth.rut\"\n";
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        source +=
+            "route GET \"/" + std::to_string(i) + "\" { let identity = auth.passwordIdentity(";
+        source += cases[i].arguments;
+        source +=
+            ") guard identity.consumerId == \"alice\" && "
+            "identity.credentialId == \"password-v1\" && identity.method == \"password\" "
+            "else { return 500 } return 204 }\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const char request[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const auto name = "handler_route_" + std::to_string(i);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+        REQUIRE(handler);
+        HandlerCtx ctx{};
+        const auto result = HandlerResult::unpack(handler(
+            nullptr, &ctx, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+        CHECK_EQ(result.status_code, cases[i].status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}

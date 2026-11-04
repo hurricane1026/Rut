@@ -9392,5 +9392,26 @@ adoption. Join drains leftover mailboxes. Service lifetime spans reloads,
 retired RCU readers and stop/join; shutdown joins and wipes it after loop
 termination. Native artifact version 16 preserves the requirement and uses the
 shared helper relocation allowlist. Hash provisioning stays native/offline;
-user persistence, password lifecycle and login orchestration remain separate work.
+user persistence, password lifecycle and persistent sessions remain separate work.
 See the language card and auth coverage ledger for the transport and limits.
+
+### Fixed-account password-to-JWT composition
+
+`auth.passwordIdentity` maps only terminal success `1` to a configured Identity;
+rejection `0`, deadline `-2` and other/unavailable states become 401, 504 and 503.
+Empty consumer/credential IDs fail closed. This pure Rut function carries no
+provenance for arbitrary caller-supplied integers or constructible identities.
+The shipped login example calls it immediately after the password prefix.
+
+A process-shared peer-IP route decorator meters admission before the KDF. After
+success, existing UUID and HS256 issuance helpers create a fresh jti and a
+300-second token with a trusted subject, issuer, audience and scope. Token
+responses disable caching; protected access pins HS256 and checks claims,
+maximum age/lifetime and scope. This composes existing language/runtime behavior
+without a new keyword, dependency or synchronous shard operation. Two-shard TLS
+regressions use native-loaded code after source/import deletion on both backends.
+
+The account is a compile-time configuration snapshot. Durable user storage,
+registration/reset/change, account lockout, refresh/logout and session/revocation
+persistence remain separate work. Password replacement does not invalidate
+already-issued tokens by itself.

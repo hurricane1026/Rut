@@ -8,6 +8,19 @@ struct Identity {
     method: str
 }
 
+// Pass only the terminal result of a first-route-let passwordVerifyHeader call.
+// This maps its result; it does not verify a password or prove provenance for a
+// caller-supplied integer. Consumer/credential IDs come from trusted config.
+func passwordIdentity(_ result: i32, _ consumerId: str, _ credentialId: str) -> Identity {
+    let denied = response(401)
+    denied.set("Cache-Control", "no-store")
+    guard consumerId != "" && credentialId != "" else { respond 503 }
+    guard result != -2 else { respond 504 }
+    guard result == 0 || result == 1 else { respond 503 }
+    guard result == 1 else { respond denied }
+    Identity(consumerId: consumerId, credentialId: credentialId, method: "password")
+}
+
 // Trusted static configuration, never populated from request headers or JSON.
 // Empty secrets disable individual methods; IDs remain stable during revocation.
 struct ConsumerCredentials {
