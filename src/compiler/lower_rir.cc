@@ -1,5 +1,7 @@
 #include "rut/compiler/lower_rir.h"
 
+#include "rut/common/types.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/rir_builder.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/route_method.h"
@@ -1617,6 +1619,36 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         auto v = b.emit_req_path_only({span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
+    }
+    if (value.kind == MirValueKind::WsMessageField) {
+        WsMessageFieldId field{};
+        if (value.str_value.eq(lit_str("text")) || value.str_value.eq(lit_str("payload")))
+            field = WsMessageFieldId::Payload;
+        else if (value.str_value.eq(lit_str("len")))
+            field = WsMessageFieldId::Length;
+        else if (value.str_value.eq(lit_str("kind")))
+            field = WsMessageFieldId::Kind;
+        else if (value.str_value.eq(lit_str("direction")))
+            field = WsMessageFieldId::Direction;
+        else if (value.str_value.eq(lit_str("fromClient")))
+            field = WsMessageFieldId::FromClient;
+        else if (value.str_value.eq(lit_str("isText")))
+            field = WsMessageFieldId::IsText;
+        else if (value.str_value.eq(lit_str("isBinary")))
+            field = WsMessageFieldId::IsBinary;
+        else
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        const bool kBool = field == WsMessageFieldId::FromClient ||
+                           field == WsMessageFieldId::IsText || field == WsMessageFieldId::IsBinary;
+        const MirTypeKind kExpected = field == WsMessageFieldId::Payload ? MirTypeKind::Str
+                                      : kBool                            ? MirTypeKind::Bool
+                                                                         : MirTypeKind::I32;
+        if (value.type != kExpected || value.may_nil || value.may_error || value.lhs != nullptr ||
+            value.rhs != nullptr || value.args.len != 0 || value.field_inits.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto result = b.emit_ws_message_field(field, {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
     }
     if (value.kind == MirValueKind::ReqBody) {
         auto v = b.emit_req_body({span.line, span.col});

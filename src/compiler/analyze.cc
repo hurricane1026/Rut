@@ -5899,11 +5899,11 @@ static FrontendResult<void> instantiate_function_respond_guards(
     return {};
 }
 
-static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
-                                                       HirFunction* fn,
-                                                       const HirLocal* locals,
-                                                       u32 local_count,
-                                                       u32 param_count) {
+static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
+                                              NodePool<HirExpr>& exprs,
+                                              const HirLocal* locals,
+                                              u32 local_count,
+                                              u32 param_count) {
     HirExpr out = expr;
     out.lhs = nullptr;
     out.rhs = nullptr;
@@ -5914,13 +5914,13 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
         if (expr.local_index >= local_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.local_index < param_count) return expr;
-        return normalize_function_expr(
-            locals[expr.local_index].init, fn, locals, local_count, param_count);
+        return normalize_expr(
+            locals[expr.local_index].init, exprs, locals, local_count, param_count);
     }
 
     if (expr.kind == HirExprKind::TupleSlot) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto lhs = normalize_function_expr(*expr.lhs, fn, locals, local_count, param_count);
+        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (lhs->type != HirTypeKind::Tuple)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -5932,49 +5932,54 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
             out_elem.span = expr.span;
             return out_elem;
         }
-        if (!fn->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
-        out.lhs = &fn->exprs[fn->exprs.len - 1];
+        if (!exprs.push(lhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &exprs[exprs.len - 1];
         out.span = expr.span;
         return out;
     }
 
     if (expr.lhs != nullptr) {
-        auto lhs = normalize_function_expr(*expr.lhs, fn, locals, local_count, param_count);
+        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count);
         if (!lhs) return core::make_unexpected(lhs.error());
-        if (!fn->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
-        out.lhs = &fn->exprs[fn->exprs.len - 1];
+        if (!exprs.push(lhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &exprs[exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
-        auto rhs = normalize_function_expr(*expr.rhs, fn, locals, local_count, param_count);
+        auto rhs = normalize_expr(*expr.rhs, exprs, locals, local_count, param_count);
         if (!rhs) return core::make_unexpected(rhs.error());
-        if (!fn->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
-        out.rhs = &fn->exprs[fn->exprs.len - 1];
+        if (!exprs.push(rhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.rhs = &exprs[exprs.len - 1];
     }
     for (u32 i = 0; i < expr.field_inits.len; i++) {
-        auto val = normalize_function_expr(
-            *expr.field_inits[i].value, fn, locals, local_count, param_count);
+        auto val =
+            normalize_expr(*expr.field_inits[i].value, exprs, locals, local_count, param_count);
         if (!val) return core::make_unexpected(val.error());
-        if (!fn->exprs.push(val.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        if (!exprs.push(val.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr::FieldInit init{};
         init.name = expr.field_inits[i].name;
-        init.value = &fn->exprs[fn->exprs.len - 1];
+        init.value = &exprs[exprs.len - 1];
         if (!out.field_inits.push(init))
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     for (u32 i = 0; i < expr.args.len; i++) {
-        auto arg = normalize_function_expr(*expr.args[i], fn, locals, local_count, param_count);
+        auto arg = normalize_expr(*expr.args[i], exprs, locals, local_count, param_count);
         if (!arg) return core::make_unexpected(arg.error());
-        if (!fn->exprs.push(arg.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
-        if (!out.args.push(&fn->exprs[fn->exprs.len - 1]))
+        if (!exprs.push(arg.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        if (!out.args.push(&exprs[exprs.len - 1]))
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     out.span = expr.span;
     return out;
+}
+
+// Function and protocol callback expressions share normalization; their owning
+// expression pools determine lifetime, without introducing another value engine.
+static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
+                                                       HirFunction* fn,
+                                                       const HirLocal* locals,
+                                                       u32 local_count,
+                                                       u32 param_count) {
+    return normalize_expr(expr, fn->exprs, locals, local_count, param_count);
 }
 
 static FrontendResult<void> collect_function_response_effects(HirFunction* fn,

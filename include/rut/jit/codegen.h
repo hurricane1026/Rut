@@ -36,6 +36,12 @@ u32 format_handler_symbol(Str name, char* out, u32 out_size);
 // Returns {module, context, true} on success, {null, null, false} on error.
 CodegenResult codegen(const rir::Module& rir_mod);
 
+// A synchronous message entry uses ordinary RIR evaluation, with two additional
+// private u8 inputs after HandlerFn's five parameters: opcode and direction.
+// The returned module is owned by the caller. A supplied context is borrowed;
+// otherwise the result owns its newly created context, as with codegen().
+CodegenResult codegen_ws_body(const rir::Module& rir_mod, LLVMContextRef shared_context = nullptr);
+
 // Format the JIT symbol for a WebSocket message handler (ws_handler_<id>).
 // Returns the output length excluding the trailing '\0'.
 u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size);

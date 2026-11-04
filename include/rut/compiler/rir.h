@@ -11,6 +11,7 @@
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/common/upstream_tls.h"
+#include "rut/common/ws_message.h"
 #include "rut/runtime/arena.h"
 
 namespace rut {
@@ -162,6 +163,7 @@ enum class Opcode : u8 {
     ReqMethod,               // %r = req.method               → Method
     ReqPath,                 // %r = req.path                 → str
     ReqPathOnly,             // %r = req.pathOnly             → str
+    WsMessageField,          // typed synchronous callback input, WsMessageFieldId immediate
     ReqBody,                 // %r = req.body                 → str
     ReqKeepAlive,            // %r = req.keepAlive            → bool
     ReqChunked,              // %r = req.chunked              → bool

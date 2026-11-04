@@ -114,6 +114,7 @@ enum class MirValueKind : u8 {
     SignedRequestValid,
     JwtClaimsValidWithLifetime,
     BytesCount,
+    WsMessageField,
 };
 
 enum class MirTypeKind : u8 {

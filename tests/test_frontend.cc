@@ -172,6 +172,110 @@ static HeapFrontendResult<MirModule> build_mir_heap_for_internal_propagation(
     return {mir.value()};
 }
 
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_inputs_lower_through_shared_typed_mir_and_rir) {
+    const char* source = R"rut(
+func score(_ msg: WebSocketMessage) -> i32 => msg.payload.count * 2 + msg.len
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    auto callback = std::make_unique<HirRoute>();
+    callback->path = lit("/message");
+    callback->is_ws_callback = true;
+    HirLocal result{};
+    result.name = lit("decision");
+    result.type = HirTypeKind::I32;
+    result.ref_index = 0;
+    result.init = hir->functions[0].body;
+    REQUIRE(callback->locals.push(result));
+    callback->control.kind = HirControlKind::Direct;
+    callback->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+    callback->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+    callback->control.direct_term.local_ref_index = 0;
+    auto lowered = build_mir_route(hir.value(), *callback);
+    REQUIRE(lowered);
+    HeapFrontendResult<MirModule> mir{lowered.value()};
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    u32 message_reads = 0;
+    const auto& function = rir.module.functions[0];
+    for (u32 bi = 0; bi < function.block_count; ++bi)
+        for (u32 ii = 0; ii < function.blocks[bi].inst_count; ++ii)
+            if (function.blocks[bi].insts[ii].op == rir::Opcode::WsMessageField) ++message_reads;
+    CHECK_EQ(message_reads, 2u);
+    rir.destroy();
+    MirValue* payload = nullptr;
+    for (u32 i = 0; i < mir->functions[0].values.len; ++i) {
+        auto& value = mir->functions[0].values[i];
+        if (value.kind == MirValueKind::WsMessageField && value.str_value.eq(lit("payload")))
+            payload = &value;
+    }
+    REQUIRE(payload != nullptr);
+    payload->type = MirTypeKind::I32;
+    FrontendRirModule malformed{};
+    CHECK_FALSE(lower_to_rir(mir.value(), malformed));
+    malformed.destroy();
+    payload->type = MirTypeKind::Str;
+
+    // Type and receiver validation remain at the MIR boundary too, rather than
+    // accepting a forged view or manufacturing a stored message carrier.
+    HirExpr* field = nullptr;
+    for (u32 i = 0; i < hir->functions[0].exprs.len; ++i)
+        if (hir->functions[0].exprs[i].kind == HirExprKind::WsMessageField)
+            field = &hir->functions[0].exprs[i];
+    REQUIRE(field != nullptr);
+    const HirTypeKind kType = field->type;
+    field->type = HirTypeKind::I64;
+    CHECK_FALSE(build_mir_route(hir.value(), *callback));
+    field->type = kType;
+    REQUIRE(field->lhs != nullptr);
+    field->lhs->local_index = 1;
+    CHECK_FALSE(build_mir_route(hir.value(), *callback));
+}
+
+#endif
+
+TEST(frontend, mir_standalone_entry_keeps_module_dependencies_and_route_semantics) {
+    const char* source = R"rut(
+upstream backend at "127.0.0.1:9000"
+func allowed(_ value: str) -> bool => value == "allow"
+route GET "/first" { return 200 }
+timer tick, every: 1s { }
+route GET "/selected" {
+    let token = req.header("X-Token").or("")
+    guard allowed(token) else { return 403 }
+    return forward(backend, load_balance: .roundRobin)
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 3u);
+    auto lowered = build_mir_route(hir.value(), hir->routes[2]);
+    REQUIRE(lowered);
+    HeapFrontendResult<MirModule> mir{lowered.value()};
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK(mir->functions[0].path.eq(lit("/selected")));
+    CHECK_FALSE(mir->functions[0].is_timer);
+    CHECK_EQ(mir->upstreams.len, 1u);
+    CHECK(mir->functions[0].blocks.len > 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(rir.module.functions[0].route_pattern.eq(lit("/selected")));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, listen_declaration_preserves_span_and_bounds) {
     for (const char* source : {"listen :0\n", "listen : 0\n", "listen :00000\n"}) {
         auto lexed = lex(lit(source));

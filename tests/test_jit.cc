@@ -3,6 +3,7 @@
 #include "fixtures/jwt_secret_rotation.h"
 #include "fixtures/signed_request.h"
 #include "framing_selection_preflight_fixture.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -301,6 +302,74 @@ TEST(jit, helpers_sanity) {
     CHECK(out_ptr != nullptr);
     CHECK(out_len == 7);
     CHECK(__builtin_memcmp(out_ptr, "payload", 7) == 0);
+}
+
+TEST(jit, websocket_message_inputs_reuse_general_expression_codegen) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    for (u32 id = 0; ws_message_field_valid(id); ++id) {
+        const auto field = static_cast<WsMessageFieldId>(id);
+        TestContext tc;
+        REQUIRE(tc.init());
+        Builder b;
+        b.init(&tc.mod);
+        auto* fn = V(b.create_function(lit("message_input"), lit("/"), 'G'));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        b.set_insert_point(fn, entry);
+        auto input = V(b.emit_ws_message_field(field));
+        if (field == WsMessageFieldId::Payload) input = V(b.emit_str_length(input));
+        if (field == WsMessageFieldId::FromClient || field == WsMessageFieldId::IsText ||
+            field == WsMessageFieldId::IsBinary) {
+            auto yes = V(b.emit_const_i32(1));
+            auto no = V(b.emit_const_i32(0));
+            input = V(b.emit_select(input, yes, no));
+        }
+        auto base = V(b.emit_const_i32(200));
+        auto status = V(b.emit_arith(Opcode::Add, base, input));
+        VOK(b.emit_ret_status(status));
+        CHECK_FALSE(codegen(tc.mod).ok);  // An HTTP entry cannot consume message inputs.
+        auto cg = codegen_ws_body(tc.mod);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_message_input"));
+        REQUIRE(handler);
+        const u8 bytes[] = {0, 255, 195, 169};
+        for (u8 opcode : {1u, 2u}) {
+            for (u8 client : {0u, 1u}) {
+                const u32 expected =
+                    field == WsMessageFieldId::Payload || field == WsMessageFieldId::Length
+                        ? sizeof(bytes)
+                    : field == WsMessageFieldId::Kind       ? opcode - 1u
+                    : field == WsMessageFieldId::Direction  ? 1u - client
+                    : field == WsMessageFieldId::FromClient ? client
+                    : field == WsMessageFieldId::IsText     ? opcode == 1u
+                                                            : opcode == 2u;
+                auto result = HandlerResult::unpack(
+                    handler(nullptr, nullptr, bytes, sizeof(bytes), nullptr, opcode, client));
+                CHECK_EQ(result.status_code, 200u + expected);
+            }
+        }
+        engine.shutdown();
+        tc.destroy();
+    }
+}
+
+TEST(jit, websocket_body_rejects_http_reads_and_keeps_borrowed_llvm_context_alive) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("bad_message"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    V(b.emit_req_body());
+    VOK(b.emit_ret_status(200));
+    LLVMContextRef context = LLVMContextCreate();
+    CHECK_FALSE(codegen_ws_body(tc.mod, context).ok);
+    CHECK(LLVMInt32TypeInContext(context) != nullptr);
+    LLVMContextDispose(context);
+    tc.destroy();
 }
 
 TEST(jit, bytes_count_reads_the_full_raw_length_without_text_decoding) {

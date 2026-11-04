@@ -1,8 +1,10 @@
 #include "rut/jit/codegen.h"
 
 #include "rut/common/ws_control_flow.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
+#include "rut/compiler/verifier.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
@@ -74,6 +76,9 @@ struct Ctx {
 
     // Handler function type: i64 (ptr, ptr, ptr, i32, ptr)
     LLVMTypeRef handler_fn_ty;
+    bool ws_body_mode = false;
+    LLVMValueRef param_ws_opcode = nullptr;
+    LLVMValueRef param_ws_from_client = nullptr;
 
     // Current RIR function (set per-function, for type lookups).
     const rir::Function* cur_fn;
@@ -179,8 +184,8 @@ struct Ctx {
         result_ty = i64_ty;
 
         // Handler fn: i64 (ptr %conn, ptr %ctx, ptr %req_data, i32 %req_len, ptr %arena)
-        LLVMTypeRef param_types[] = {ptr_ty, ptr_ty, ptr_ty, i32_ty, ptr_ty};
-        handler_fn_ty = LLVMFunctionType(result_ty, param_types, 5, 0);
+        LLVMTypeRef param_types[] = {ptr_ty, ptr_ty, ptr_ty, i32_ty, ptr_ty, i8_ty, i8_ty};
+        handler_fn_ty = LLVMFunctionType(result_ty, param_types, ws_body_mode ? 7 : 5, 0);
     }
 
     // ── Lazy Helper Declaration ────────────────────────────────────
@@ -1008,6 +1013,38 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             strval = LLVMBuildInsertValue(c.builder, strval, p, 0, "path_only.s.ptr");
             strval = LLVMBuildInsertValue(c.builder, strval, l, 1, "path_only.s.len");
             c.set_value(inst.result, strval);
+            break;
+        }
+        case rir::Opcode::WsMessageField: {
+            const auto kField = static_cast<WsMessageFieldId>(inst.imm.i32_val);
+            LLVMValueRef value = nullptr;
+            if (kField == WsMessageFieldId::Payload) {
+                value = LLVMGetUndef(c.str_ty);
+                value = LLVMBuildInsertValue(c.builder, value, c.param_req_data, 0, "msg.ptr");
+                value = LLVMBuildInsertValue(c.builder, value, c.param_req_len, 1, "msg.len");
+            } else if (kField == WsMessageFieldId::Length) {
+                value = c.param_req_len;
+            } else {
+                const bool kDirection =
+                    kField == WsMessageFieldId::Direction || kField == WsMessageFieldId::FromClient;
+                LLVMValueRef flag = LLVMBuildICmp(
+                    c.builder,
+                    kDirection ? LLVMIntNE : LLVMIntEQ,
+                    kDirection ? c.param_ws_from_client : c.param_ws_opcode,
+                    LLVMConstInt(
+                        c.i8_ty, kDirection ? 0 : (kField == WsMessageFieldId::IsText ? 1 : 2), 0),
+                    "msg.flag");
+                if (kField == WsMessageFieldId::Kind || kField == WsMessageFieldId::Direction) {
+                    value = LLVMBuildSelect(c.builder,
+                                            flag,
+                                            LLVMConstInt(c.i32_ty, kDirection ? 0 : 1, 0),
+                                            LLVMConstInt(c.i32_ty, kDirection ? 1 : 0, 0),
+                                            "msg.case");
+                } else {
+                    value = flag;
+                }
+            }
+            c.set_value(inst.result, value);
             break;
         }
         case rir::Opcode::ReqBody: {
@@ -2797,6 +2834,12 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     LLVMSetValueName2(c.param_req_data, "req_data", 8);
     LLVMSetValueName2(c.param_req_len, "req_len", 7);
     LLVMSetValueName2(c.param_arena, "arena", 5);
+    if (c.ws_body_mode) {
+        c.param_ws_opcode = LLVMGetParam(func, 5);
+        c.param_ws_from_client = LLVMGetParam(func, 6);
+        LLVMSetValueName2(c.param_ws_opcode, "message_kind", 12);
+        LLVMSetValueName2(c.param_ws_from_client, "from_client", 11);
+    }
 
     // Reset per-function maps
     c.value_map_cap = fn.value_cap;
@@ -2949,18 +2992,37 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
 // ── Module Codegen ─────────────────────────────────────────────────
 
-CodegenResult codegen(const rir::Module& rir_mod) {
+static CodegenResult codegen_impl(const rir::Module& rir_mod,
+                                  LLVMContextRef shared_context,
+                                  bool ws_body_mode) {
+    if (ws_body_mode && (rir_mod.func_count != 1 || !rir::verify_module(rir_mod).ok))
+        return {nullptr, nullptr, false};
     // This variadic RIR operation is emitted by the trusted builder, but keep
     // direct/malformed module callers from indexing beyond its operand list.
     if (rir_mod.func_count > 0 && rir_mod.functions == nullptr) return {nullptr, nullptr, false};
     for (u32 fi = 0; fi < rir_mod.func_count; ++fi) {
         const rir::Function& fn = rir_mod.functions[fi];
+        if (ws_body_mode && (fn.yield_count != 0 || fn.is_timer || rir_function_uses_parse(fn)))
+            return {nullptr, nullptr, false};
         if (fn.block_count > 0 && fn.blocks == nullptr) return {nullptr, nullptr, false};
         for (u32 bi = 0; bi < fn.block_count; ++bi) {
             const rir::Block& block = fn.blocks[bi];
             if (block.inst_count > 0 && block.insts == nullptr) return {nullptr, nullptr, false};
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
+                // Neither HTTP inputs nor HTTP mutation/response effects belong
+                // to an application-message invocation, including hidden helper
+                // accesses. Context slots are compiler storage, not HTTP values.
+                if (ws_body_mode && inst.op >= rir::Opcode::ReqHeaderCount &&
+                    inst.op <= rir::Opcode::ReqSetTargetTransform &&
+                    inst.op != rir::Opcode::WsMessageField &&
+                    inst.op != rir::Opcode::CtxLoadSlotI32)
+                    return {nullptr, nullptr, false};
+                if (inst.op == rir::Opcode::WsMessageField) {
+                    if (!ws_body_mode || inst.operand_count != 0 ||
+                        !ws_message_field_valid(static_cast<u32>(inst.imm.i32_val)))
+                        return {nullptr, nullptr, false};
+                }
                 if (inst.op == rir::Opcode::ReqTlsClientCertSha256) {
                     if (inst.operand_count != 0 || inst.result == rir::kNoValue ||
                         inst.result.id >= fn.value_count || fn.values == nullptr)
@@ -3049,7 +3111,8 @@ CodegenResult codegen(const rir::Module& rir_mod) {
         if (!rir::password_prefix_valid(rir_mod.functions[i])) return {nullptr, nullptr, false};
     static std::atomic<u32> next_regex_module_id{1};
     Ctx c{};
-    c.llvm_ctx = LLVMContextCreate();
+    c.ws_body_mode = ws_body_mode;
+    c.llvm_ctx = shared_context != nullptr ? shared_context : LLVMContextCreate();
     c.llvm_mod = LLVMModuleCreateWithNameInContext(
         rir_mod.name.ptr ? rir_mod.name.ptr : "rue_module", c.llvm_ctx);
     c.builder = LLVMCreateBuilderInContext(c.llvm_ctx);
@@ -3111,11 +3174,19 @@ CodegenResult codegen(const rir::Module& rir_mod) {
 
     if (!ok) {
         LLVMDisposeModule(c.llvm_mod);
-        LLVMContextDispose(c.llvm_ctx);
+        if (shared_context == nullptr) LLVMContextDispose(c.llvm_ctx);
         return {nullptr, nullptr, false};
     }
 
     return {c.llvm_mod, c.llvm_ctx, true};
+}
+
+CodegenResult codegen(const rir::Module& rir_mod) {
+    return codegen_impl(rir_mod, nullptr, false);
+}
+
+CodegenResult codegen_ws_body(const rir::Module& rir_mod, LLVMContextRef shared_context) {
+    return codegen_impl(rir_mod, shared_context, true);
 }
 
 u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size) {

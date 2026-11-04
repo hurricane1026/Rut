@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/hash.h"
@@ -507,6 +508,20 @@ struct Builder {
     Result<ValueId> emit_req_path_only(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
         return TRY(emit(Opcode::ReqPathOnly, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_ws_message_field(WsMessageFieldId field, SourceLoc loc = {}) {
+        if (!ws_message_field_valid(static_cast<u32>(field)))
+            return core::make_unexpected(RirError::InvalidState);
+        const bool kBool = field == WsMessageFieldId::FromClient ||
+                           field == WsMessageFieldId::IsText || field == WsMessageFieldId::IsBinary;
+        const TypeKind kKind = field == WsMessageFieldId::Payload ? TypeKind::Str
+                               : kBool                            ? TypeKind::Bool
+                                                                  : TypeKind::I32;
+        auto* ty = TRY(make_type(kKind));
+        auto result = TRY(emit(Opcode::WsMessageField, ty, loc));
+        result.inst->imm.i32_val = static_cast<i32>(field);
+        return result.vid;
     }
 
     Result<ValueId> emit_req_body(SourceLoc loc = {}) {

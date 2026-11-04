@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/request_policy.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_printer.h"
@@ -48,6 +49,7 @@ enum class VerifyIssueCode : u8 {
     InvalidJwtClaimsLifetime,
     InvalidPasswordPrefix,
     InvalidStrLength,
+    InvalidWsMessageField,
 };
 
 struct VerifyIssue {
@@ -762,6 +764,25 @@ inline VerifyResult verify_function(const Function* fn,
         }
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const Instruction& inst = block.insts[ii];
+            if (inst.op == Opcode::WsMessageField) {
+                const u32 kField = static_cast<u32>(inst.imm.i32_val);
+                const bool kBool = kField == static_cast<u32>(WsMessageFieldId::FromClient) ||
+                                   kField == static_cast<u32>(WsMessageFieldId::IsText) ||
+                                   kField == static_cast<u32>(WsMessageFieldId::IsBinary);
+                const TypeKind kExpected = kField == static_cast<u32>(WsMessageFieldId::Payload)
+                                               ? TypeKind::Str
+                                           : kBool ? TypeKind::Bool
+                                                   : TypeKind::I32;
+                const Type* type = inst.result != kNoValue && inst.result.id < fn->value_count &&
+                                           fn->values != nullptr
+                                       ? fn->values[inst.result.id].type
+                                       : nullptr;
+                if (!ws_message_field_valid(kField) || inst.operand_count != 0 || type == nullptr ||
+                    type->kind != kExpected || type->inner != nullptr ||
+                    type->struct_def != nullptr)
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidWsMessageField, function_index, bi, ii);
+            }
             if (inst.op == Opcode::StrLength) {
                 const auto kExactType = [&](ValueId id, TypeKind kind) {
                     if (id == kNoValue || id.id >= fn->value_count || fn->values == nullptr)
@@ -1655,6 +1676,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidPasswordPrefix";
         case VerifyIssueCode::InvalidJwtClaimsLifetime:
             return "InvalidJwtClaimsLifetime";
+        case VerifyIssueCode::InvalidWsMessageField:
+            return "InvalidWsMessageField";
         case VerifyIssueCode::InvalidStrLength:
             return "InvalidStrLength";
     }

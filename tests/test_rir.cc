@@ -1,3 +1,4 @@
+#include "rut/common/ws_message.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
@@ -2532,6 +2533,39 @@ TEST(RirBuilder, StandardWebhookFiveOperands) {
     pb.init(print_buf, sizeof(print_buf), -1);
     print_function(pb, *fn);
     CHECK(std::string(print_buf, pb.len).find("auth.standard_webhook_valid") != std::string::npos);
+    ctx.destroy();
+}
+
+TEST(RirVerifier, WebSocketMessageFieldsCheckIdentityArityAndResultType) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("message_inputs"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    CHECK_FALSE(b.emit_ws_message_field(static_cast<WsMessageFieldId>(255)));
+    for (u32 field = 0; ws_message_field_valid(field); ++field)
+        V(b.emit_ws_message_field(static_cast<WsMessageFieldId>(field)));
+    VOK(b.emit_ret_status(200));
+    REQUIRE(verify_function(fn).ok);
+    Instruction& op = fn->entry()->insts[0];
+    const ValueId kResult = op.result;
+    op.imm.i32_val = -1;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsMessageField);
+    op.imm.i32_val = static_cast<i32>(WsMessageFieldId::Payload);
+    op.operand_count = 1;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsMessageField);
+    op.operand_count = 0;
+    op.result = fn->entry()->insts[1].result;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsMessageField);
+    op.result = kResult;
+    CHECK(verify_function(fn).ok);
+    char output[2048];
+    PrintBuf print;
+    print.init(output, sizeof(output), -1);
+    print_function(print, *fn);
+    CHECK(std::string(output, print.len).find("ws.message.field 0") != std::string::npos);
     ctx.destroy();
 }
 
