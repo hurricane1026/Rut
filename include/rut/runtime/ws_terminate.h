@@ -85,6 +85,21 @@ struct WsClosePayload {
     bool assign(u16 status, Str text);
 };
 
+// Each WebSocket leg has its own received Close status (RFC 6455 section 7.1.5).
+// 1006 means no valid Close frame was received; 1005 means an empty Close frame.
+// Views borrow connection-owned storage only until connection teardown returns.
+struct WsPeerCloseContext {
+    u16 code = 1006;
+    Str reason{};
+    bool received = false;
+};
+
+struct WsSessionCloseContext {
+    WsPeerCloseContext client{};
+    WsPeerCloseContext upstream{};
+    bool was_clean = false;
+};
+
 // What the gateway should do with a fully-reassembled data message.
 enum class WsFrameAction : u8 {
     Forward,       // re-serialize the message and send it on

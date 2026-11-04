@@ -706,6 +706,15 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     cbuf, static_cast<u32>(h.payload_len), received_code, received_reason))
                 return WsInspectStatus::Error;
 
+            if (h.opcode == WsOpcode::Close) {
+                // Receipt is independent of whether the reply can be emitted.
+                // Teardown must still report the validated peer status on an
+                // output-capacity or masking failure.
+                st.echo_close_code = received_code;
+                if (!st.set_echo_close_reason(received_reason)) return WsInspectStatus::Error;
+                st.received_close = true;
+            }
+
             if (!emit_frame(out,
                             out_cap,
                             produced,
@@ -717,14 +726,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 return WsInspectStatus::Error;
             }
             *consumed += static_cast<u32>(frame_total);
-            if (h.opcode == WsOpcode::Close) {
-                // Reply to the sender with the same status/reason, including an
-                // empty body. Retain owned bytes before receive storage is recycled.
-                st.echo_close_code = received_code;
-                if (!st.set_echo_close_reason(received_reason)) return WsInspectStatus::Error;
-                st.received_close = true;
-                return WsInspectStatus::Close;
-            }
+            if (h.opcode == WsOpcode::Close) return WsInspectStatus::Close;
             continue;
         }
 

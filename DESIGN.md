@@ -3432,7 +3432,12 @@ re-read), each with its own buffer for natural backpressure.
   downstream leg; fatal TLS errors still terminate the connection. A validated
   WebSocket Close is application EOF and the TCP connection is terminal, so
   local TLS shutdown does not wait for a second TLS alert. The same shutdown
-  deadline bounds blocked alert output. Lifecycle callbacks remain pending.
+  deadline bounds blocked alert output. Received Close metadata is retained
+  independently for each leg, separately from the initiating local policy.
+  Each reports its first received status/reason, 1005 for an empty Close and
+  1006 when no valid Close was received; clean closure requires both handshakes.
+  These connection-owned views remain valid during pre-teardown cleanup, even
+  after an inspector reset. Language lifecycle callbacks remain pending.
 
 - **Connection teardown — drain-then-close (nginx model).** WebSocket shutdown
   is an *application-level* event (the RFC 6455 Close-frame handshake), not a TCP

@@ -11174,7 +11174,8 @@ bool ws_receive_closing(Loop* loop, Connection& conn) {
             ws_read_closing(inspector, input.data(), input.len(), ping, &ping_len, &consumed);
         if (kStatus == WsClosingRead::Error) return false;
         consume(consumed);
-        if (kStatus == WsClosingRead::Close) received = true;
+        if (kStatus == WsClosingRead::Close && !conn.ws_record_peer_close(FromClient, inspector))
+            return false;
         if (kStatus == WsClosingRead::Ping) {
             u8* frame = FromClient ? conn.ws_close_frame_client : conn.ws_close_frame_upstream;
             u64& rng = FromClient ? conn.ws_u2c.mask_rng : conn.ws_c2u.mask_rng;
@@ -11326,6 +11327,8 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                                               &conn,
                                               &consumed,
                                               &produced);
+        if (conn.ws_c2u.received_close && !conn.ws_record_peer_close(true, conn.ws_c2u))
+            return false;
         if (st == WsInspectStatus::Error) return false;  // caller closes
         if (produced > 0) {
             conn.ws_c2u_consumed = consumed;
@@ -11335,7 +11338,6 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                 // client echo, then await both peers. The echo carries the code the
                 // inspector resolved, preserving a peer status/reason or handler policy.
                 conn.ws_closing = true;
-                conn.ws_close_client_received = conn.ws_c2u.received_close;
                 ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_upstream_inflight = true;
                 conn.ws_close_client_need = true;
@@ -11410,6 +11412,8 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
                                               &conn,
                                               &consumed,
                                               &produced);
+        if (conn.ws_u2c.received_close && !conn.ws_record_peer_close(false, conn.ws_u2c))
+            return false;
         if (st == WsInspectStatus::Error) return false;
         if (produced > 0) {
             conn.ws_u2c_consumed = consumed;
@@ -11418,7 +11422,6 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
                 // Close back too. Start the client slot in-flight + queue the upstream echo,
                 // carrying the status/reason the inspector resolved.
                 conn.ws_closing = true;
-                conn.ws_close_upstream_received = conn.ws_u2c.received_close;
                 ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_client_inflight = true;
                 conn.ws_close_upstream_need = true;

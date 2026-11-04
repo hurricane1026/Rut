@@ -60,6 +60,10 @@ struct WsCloseObservation {
     bool client_received = false;
     bool upstream_received = false;
     u16 original_code = 0;
+    u16 client_code = 0;
+    u16 upstream_code = 0;
+    bool client_reason_ack = false;
+    bool upstream_reason_ack = false;
 };
 WsCloseObservation ws_close_observation;
 void ws_observe_close(void*, Connection& c) {
@@ -68,6 +72,11 @@ void ws_observe_close(void*, Connection& c) {
     ws_close_observation.client_received = c.ws_close_client_received;
     ws_close_observation.upstream_received = c.ws_close_upstream_received;
     ws_close_observation.original_code = c.ws_close_payload.code;
+    const auto kContext = c.ws_session_close_context();
+    ws_close_observation.client_code = kContext.client.code;
+    ws_close_observation.upstream_code = kContext.upstream.code;
+    ws_close_observation.client_reason_ack = kContext.client.reason.eq(lit_str("ack"));
+    ws_close_observation.upstream_reason_ack = kContext.upstream.reason.eq(lit_str("ack"));
 }
 
 struct WsClosingFixture {
@@ -226,6 +235,10 @@ TEST(websocket, close_waits_for_both_acknowledgements_and_preserves_first_cause)
         CHECK(ws_close_observation.client_received);
         CHECK(ws_close_observation.upstream_received);
         CHECK_EQ(ws_close_observation.original_code, 1000u);
+        CHECK_EQ(ws_close_observation.client_code, 3001u);
+        CHECK_EQ(ws_close_observation.upstream_code, 3002u);
+        CHECK(ws_close_observation.client_reason_ack);
+        CHECK(ws_close_observation.upstream_reason_ack);
     }
 }
 
@@ -308,6 +321,104 @@ TEST(websocket, closing_eof_without_ack_is_abnormal_and_other_leg_can_finish) {
     CHECK_FALSE(ws_close_observation.clean);
     CHECK_FALSE(ws_close_observation.client_received);
     CHECK(ws_close_observation.upstream_received);
+    CHECK_EQ(ws_close_observation.client_code, 1006u);
+    CHECK_EQ(ws_close_observation.upstream_code, 3002u);
+}
+
+TEST(websocket, close_context_owns_each_first_peer_reason_independently) {
+    constexpr bool kDirections[] = {false, true};
+    for (bool from_client : kDirections) {
+        WsClosingFixture f;
+        f.setup();
+        REQUIRE(f.start());
+        f.sent(true);
+        f.sent(false);
+        const Str kReason{"a\0\xe2\x82\xac", 5};
+        u8 frame[128];
+        u64 rng = 0;
+        const u32 kLength =
+            ws_emit_close_frame(frame, sizeof(frame), from_client, rng, 3003, kReason);
+        REQUIRE(kLength != 0);
+        REQUIRE(f.receive(from_client, frame, kLength));
+        auto& inspector = from_client ? f.conn->ws_c2u : f.conn->ws_u2c;
+        inspector.reset();
+        REQUIRE(inspector.set_echo_close_reason(lit_str("different")));
+        inspector.echo_close_code = 4000;
+        inspector.received_close = true;
+        REQUIRE(f.conn->ws_record_peer_close(from_client, inspector));
+        const auto kContext = f.conn->ws_session_close_context();
+        const auto& peer = from_client ? kContext.client : kContext.upstream;
+        const auto& other = from_client ? kContext.upstream : kContext.client;
+        CHECK(peer.received);
+        CHECK_EQ(peer.code, 3003u);
+        CHECK(peer.reason.eq(kReason));
+        CHECK_FALSE(other.received);
+        CHECK_EQ(other.code, 1006u);
+        CHECK(other.reason.empty());
+        CHECK_FALSE(kContext.was_clean);
+        CHECK_EQ(f.conn->ws_close_payload.code, 1000u);
+        REQUIRE(f.acknowledge(!from_client));
+        CHECK_EQ(f.conn->fd, -1);
+        CHECK(ws_close_observation.clean);
+        CHECK_EQ(
+            from_client ? ws_close_observation.client_code : ws_close_observation.upstream_code,
+            3003u);
+    }
+}
+
+TEST(websocket, close_context_distinguishes_empty_close_from_missing_and_resets) {
+    WsClosingFixture f;
+    f.setup();
+    REQUIRE(f.start());
+    f.sent(true);
+    f.sent(false);
+    const u8 kEmptyClose[] = {0x88, 0x80, 1, 2, 3, 4};
+    REQUIRE(f.receive(true, kEmptyClose, sizeof(kEmptyClose)));
+    const auto kContext = f.conn->ws_session_close_context();
+    CHECK_EQ(kContext.client.code, 1005u);
+    CHECK(kContext.client.received);
+    CHECK(kContext.client.reason.empty());
+    CHECK_EQ(kContext.upstream.code, 1006u);
+    CHECK_FALSE(kContext.upstream.received);
+    // A timeout observes the received status without claiming a clean session.
+    f.loop.close_conn(*f.conn);
+    CHECK_EQ(ws_close_observation.client_code, 1005u);
+    CHECK_EQ(ws_close_observation.upstream_code, 1006u);
+    CHECK_FALSE(ws_close_observation.clean);
+    const auto kReset = f.conn->ws_session_close_context();
+    CHECK_EQ(kReset.client.code, 1006u);
+    CHECK_EQ(kReset.upstream.code, 1006u);
+    CHECK_FALSE(kReset.was_clean);
+}
+
+TEST(websocket, close_context_records_valid_receipt_even_when_reply_cannot_fit) {
+    WsClosingFixture f;
+    f.setup();
+    u8 frame[32];
+    u64 rng = 0;
+    const u32 kLength = ws_emit_close_frame(frame, sizeof(frame), true, rng, 3005, lit_str("peer"));
+    REQUIRE(kLength != 0);
+    u32 consumed = 0, produced = 0;
+    // Valid receive, failed send capacity. This is still a received Close,
+    // while the session remains unclean because the reply never completed.
+    CHECK(ws_inspect(f.conn->ws_c2u,
+                     frame,
+                     kLength,
+                     f.c2u_output,
+                     0,
+                     f.c2u_message,
+                     sizeof(f.c2u_message),
+                     f.conn->ws_handler,
+                     f.conn,
+                     &consumed,
+                     &produced) == WsInspectStatus::Error);
+    CHECK_EQ(produced, 0u);
+    REQUIRE(f.conn->ws_record_peer_close(true, f.conn->ws_c2u));
+    const auto kContext = f.conn->ws_session_close_context();
+    CHECK_EQ(kContext.client.code, 3005u);
+    CHECK(kContext.client.reason.eq(lit_str("peer")));
+    CHECK(kContext.client.received);
+    CHECK_FALSE(kContext.was_clean);
 }
 
 TEST(websocket, malformed_close_ack_fails_without_waiting_for_more_input) {

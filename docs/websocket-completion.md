@@ -87,3 +87,9 @@ fixed deadline. Downstream FIN is independent of upstream progress. TLS now
 flushes local close_notify before FIN using existing output ownership, with
 strict source/native wire tests and bounded failure/cancellation handling.
 Lifecycle callbacks remain open.
+
+The runtime now retains each leg's first received Close status/reason separately
+from local closing policy, including empty (1005) and absent (1006) cases.
+Pre-teardown cleanup borrows this owned metadata; inspector reset and deferred
+sends cannot overwrite it. This is the runtime foundation for close context;
+language lifecycle callbacks remain pending.

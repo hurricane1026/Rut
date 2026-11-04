@@ -701,6 +701,10 @@ struct ConnectionBase {
     const WsClosePolicy* ws_close_policies = nullptr;
     u32 ws_close_policy_count = 0;
     WsClosePayload ws_close_payload{};  // owned across inspector/receive-buffer retirement
+    // Received peer statuses are independent of the initiating local policy.
+    // Retain them even if an inspector or receive buffer is reset while draining.
+    WsClosePayload ws_client_close_payload{};
+    WsClosePayload ws_upstream_close_payload{};
     u16 ws_close_code;   // route's message.close(code) status (seeds both inspectors)
     WsInspector ws_c2u;  // client->upstream inspection state (masked)
     WsInspector ws_u2c;  // upstream->client inspection state (unmasked)
@@ -729,6 +733,25 @@ struct ConnectionBase {
     bool ws_tls_shutdown_need_read = false;
     bool ws_client_write_shutdown = false;
     bool ws_close_handshake_complete = false;
+    bool ws_record_peer_close(bool from_client, const WsInspector& inspector) {
+        bool& received = from_client ? ws_close_client_received : ws_close_upstream_received;
+        if (received) return true;  // the first valid peer Close wins
+        if (!inspector.received_close) return false;
+        auto& payload = from_client ? ws_client_close_payload : ws_upstream_close_payload;
+        if (!payload.assign(inspector.echo_close_code, inspector.echo_close_reason())) return false;
+        received = true;
+        return true;
+    }
+    WsSessionCloseContext ws_session_close_context() const {
+        WsSessionCloseContext context{};
+        if (ws_close_client_received)
+            context.client = {ws_client_close_payload.code, ws_client_close_payload.reason(), true};
+        if (ws_close_upstream_received)
+            context.upstream = {
+                ws_upstream_close_payload.code, ws_upstream_close_payload.reason(), true};
+        context.was_clean = ws_close_handshake_complete;
+        return context;
+    }
     // Dedicated inline control storage is never reused while its send is pending.
     u8 ws_close_frame_client[kWsMaxHeaderSize + kWsMaxControlPayload];
     u8 ws_close_frame_upstream[kWsMaxHeaderSize + kWsMaxControlPayload];
@@ -2091,6 +2114,8 @@ struct ConnectionBase {
         ws_close_policies = nullptr;
         ws_close_policy_count = 0;
         ws_close_payload = {};
+        ws_client_close_payload = {};
+        ws_upstream_close_payload = {};
         ws_close_code = 1000;
         ws_forward_text = {};
         ws_handler_output = {};
