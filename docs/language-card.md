@@ -885,6 +885,13 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // predicates support these fields, bool literals/equality (either order),
 // Boolean composition, len/literal comparisons, text/literal equality and
 // text.matches(re). Ordinary type checking is shared with HTTP helpers.
+// A bool helper may return if selector { predicateA } else { predicateB },
+// including nested if expressions with two nonconstant arms. The selector and
+// exactly one arm execute once; negation applies to the selected Boolean result.
+// These helpers also initialize ordinary lets when every selector/arm is in the
+// infallible immutable subset, and can select paths inside nullable helpers.
+// Regex calls remain guard-time predicates, not ordinary let initializers.
+// Selectors, both arms and selection nodes share the same 32-node budget.
 // The callback parameter may use any identifier; `message` is not implicitly
 // bound when another name is chosen. Immutable callback lets support typed scalar
 // literals/projections, message aliases, byte counts, comparisons and Boolean

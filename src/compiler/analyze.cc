@@ -7323,13 +7323,10 @@ static bool ws_infallible_binding(const HirExpr& expr, u32 depth = 0) {
     if (expr.kind == HirExprKind::WsMessageField || expr.kind == HirExprKind::BytesCount)
         return expr.lhs && ws_infallible_binding(*expr.lhs, depth + 1);
     if (expr.kind == HirExprKind::IfElse) {
-        // The ordinary analyzer represents lazy &&/|| with a Boolean
-        // constant in one arm. Match the predicate lowerer's same subset.
+        // Boolean helpers may choose between any supported infallible predicates.
+        // Fallible work remains excluded from ordinary eager-let substitution.
         return expr.type == HirTypeKind::Bool && expr.lhs && expr.rhs && expr.args.len == 1 &&
-               expr.args[0] &&
-               (expr.rhs->kind == HirExprKind::BoolLit ||
-                expr.args[0]->kind == HirExprKind::BoolLit) &&
-               ws_infallible_binding(*expr.lhs, depth + 1) &&
+               expr.args[0] && ws_infallible_binding(*expr.lhs, depth + 1) &&
                ws_infallible_binding(*expr.rhs, depth + 1) &&
                ws_infallible_binding(*expr.args[0], depth + 1);
     }
@@ -8370,6 +8367,18 @@ static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
         node.accessor = kConstant ? WsLenGuard::Accessor::Or : WsLenGuard::Accessor::And;
         node.lhs = lhs.value();
         node.rhs = rhs.value();
+    } else if (expr.kind == HirExprKind::IfElse && expr.lhs && expr.rhs && expr.args.len == 1 &&
+               expr.args[0]) {
+        auto selector = kChild(*expr.lhs);
+        if (!selector) return core::make_unexpected(selector.error());
+        auto yes = kChild(*expr.rhs);
+        if (!yes) return core::make_unexpected(yes.error());
+        auto no = kChild(*expr.args[0]);
+        if (!no) return core::make_unexpected(no.error());
+        node.accessor = WsLenGuard::Accessor::BoolSelect;
+        node.bound = selector.value();
+        node.lhs = yes.value();
+        node.rhs = no.value();
     } else if (expr.kind == HirExprKind::BoolLit) {
         node.accessor = WsLenGuard::Accessor::Constant;
         node.bound = expr.bool_value ? 1u : 0u;

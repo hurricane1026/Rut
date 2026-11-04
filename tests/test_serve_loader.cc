@@ -1,3 +1,4 @@
+#include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_optional_values.h"
 // Tests for the .rut program loader (src/serve_loader.cc): the bridge that
@@ -6438,6 +6439,16 @@ route GET "/ws" { return websocket(ws) { msg in
                   (client ? WsFrameAction::ForwardText : WsFrameAction::Drop));
         }
     }
+}
+
+TEST(serve_loader, websocket_bool_select_survives_source_removal) {
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_bool_select").string();
+    auto path = write_file(dir, "app.rut", test::ws_bool_select::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    test::ws_bool_select::check(_tc, program.config);
 }
 
 TEST(serve_loader, websocket_borrowed_binary_survives_source_removal) {

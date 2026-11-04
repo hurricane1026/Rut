@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_optional_values.h"
 #include "framing_selection_preflight_fixture.h"
@@ -5587,6 +5588,86 @@ TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ name in ... }`")));
+}
+
+TEST(frontend, websocket_bool_select_uses_ordinary_helpers_lets_and_optional_selectors) {
+    auto tokens = lex(lit(test::ws_bool_select::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto copied = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*copied);
+    REQUIRE(hir);
+    copied.reset();
+    REQUIRE_EQ(hir->routes.len, 6u);
+    for (u32 i = 0; i < 5; ++i) {
+        CHECK_EQ(hir->routes[i].locals.len, 0u);
+        bool selected = false;
+        for (const auto& node : hir->routes[i].ws_handler.len_guards)
+            selected |= node.accessor == WsLenGuard::Accessor::BoolSelect;
+        CHECK(selected);
+    }
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, websocket_bool_select_keeps_the_condition_node_budget) {
+    for (u32 terms : {6u, 7u}) {
+        std::string source = R"rut(upstream ws
+func choose(_ msg: WebSocketMessage) -> bool {
+    if msg.fromClient { msg.isText } else { msg.isBinary }
+}
+route GET "/ws" { return websocket(ws) { msg in guard )rut";
+        for (u32 i = 0; i < terms; ++i) {
+            if (i) source += " && ";
+            source += "choose(msg)";
+        }
+        source += " else { msg.drop() } msg.forward() } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (terms == 6) {
+            REQUIRE(hir);
+            CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 29u);
+        } else {
+            REQUIRE_FALSE(hir);
+            CHECK(hir.error().code == FrontendError::TooManyItems);
+        }
+    }
+}
+
+TEST(frontend, websocket_bool_select_lets_reject_fallible_work_even_in_unused_branches) {
+    const char* definitions[] = {
+        R"rut(func pick(_ msg: WebSocketMessage) -> bool {
+            if msg.fromClient { msg.text.matches(re"ok") } else { msg.isBinary }
+        })rut",
+        R"rut(func pick(_ msg: WebSocketMessage) -> bool {
+            if msg.text.matches(re"ok") { msg.isText } else { msg.isBinary }
+        })rut",
+        R"rut(func pick(_ msg: WebSocketMessage) -> bool {
+            if msg.fromClient { msg.len } else { msg.isBinary }
+        })rut"};
+    for (const char* definition : definitions) {
+        std::string source = "upstream ws\n";
+        source += definition;
+        source += R"rut(
+route GET "/ws" { return websocket(ws) { msg in
+    let unused = pick(msg)
+    msg.forward()
+} })rut";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
 }
 
 TEST(frontend, websocket_borrowed_binary_uses_message_values_and_owned_recipes) {

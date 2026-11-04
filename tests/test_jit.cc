@@ -33,6 +33,7 @@
 #include <fstream>
 #include <memory>
 
+#include <llvm-c/Core.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <pthread.h>
@@ -20730,6 +20731,146 @@ TEST(jit_dispatch, null_handler_returns_error_outcome) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_bool_select_evaluates_selector_and_one_arm_once) {
+    for (u8 negate : {0, 1}) {
+        WsLenGuardSpec nodes[4]{};
+        for (u32 i = 0; i < 3; ++i) {
+            nodes[i].accessor = 10;  // call a replaceable JSON-validity probe
+            nodes[i].is_operand = true;
+        }
+        nodes[3].accessor = 37;
+        nodes[3].bound = 0;
+        nodes[3].lhs = 1;
+        nodes[3].rhs = 2;
+        nodes[3].negate = negate;
+        nodes[3].verdict = 1;
+        auto generated = codegen_ws_handler(0, nodes, 4, 0);
+        REQUIRE(generated.ok);
+        // Replace the declared helper inside this test module with an observable
+        // counter. The selector returns its flag; either arm returns the value.
+        LLVMValueRef probe = LLVMGetNamedFunction(generated.mod, "rut_helper_ws_json_valid");
+        REQUIRE(probe);
+        LLVMSetValueName2(probe, "select_probe", 12);
+        LLVMSetLinkage(probe, LLVMInternalLinkage);
+        auto builder = LLVMCreateBuilderInContext(generated.ctx);
+        REQUIRE(builder);
+        LLVMPositionBuilderAtEnd(builder,
+                                 LLVMAppendBasicBlockInContext(generated.ctx, probe, "entry"));
+        auto i8_ty = LLVMInt8TypeInContext(generated.ctx);
+        auto i32_ty = LLVMInt32TypeInContext(generated.ctx);
+        auto data = LLVMGetParam(probe, 0);
+        auto before = LLVMBuildLoad2(builder, i32_ty, data, "before");
+        auto next = LLVMBuildAdd(builder, before, LLVMConstInt(i32_ty, 1, 0), "next");
+        LLVMBuildStore(builder, next, data);
+        LLVMValueRef selector_offset = LLVMConstInt(i32_ty, sizeof(u32), 0);
+        LLVMValueRef value_offset = LLVMConstInt(i32_ty, sizeof(u32) + sizeof(u8), 0);
+        auto selector_ptr =
+            LLVMBuildGEP2(builder, i8_ty, data, &selector_offset, 1, "selector.ptr");
+        auto value_ptr = LLVMBuildGEP2(builder, i8_ty, data, &value_offset, 1, "value.ptr");
+        auto selector = LLVMBuildLoad2(builder, i8_ty, selector_ptr, "selector");
+        auto value = LLVMBuildLoad2(builder, i8_ty, value_ptr, "value");
+        auto first = LLVMBuildICmp(builder, LLVMIntEQ, before, LLVMConstInt(i32_ty, 0, 0), "first");
+        LLVMBuildRet(builder, LLVMBuildSelect(builder, first, selector, value, "selected"));
+        LLVMDisposeBuilder(builder);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(generated.mod, generated.ctx));
+        const auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+        REQUIRE(handler);
+        struct Probe {
+            u32 calls;
+            u8 selector;
+            u8 value;
+        };
+        static_assert(offsetof(Probe, selector) == sizeof(u32));
+        static_assert(offsetof(Probe, value) == sizeof(u32) + sizeof(u8));
+        for (u8 selected : {0, 1}) {
+            for (u8 result : {0, 1}) {
+                Probe state{0, selected, result};
+                CHECK(handler(nullptr,
+                              WsOpcode::Text,
+                              reinterpret_cast<const u8*>(&state),
+                              sizeof(state),
+                              true) == (static_cast<bool>(result) != static_cast<bool>(negate)
+                                            ? WsFrameAction::Forward
+                                            : WsFrameAction::Drop));
+                CHECK_EQ(state.calls, 2u);
+            }
+        }
+        engine.shutdown();
+    }
+}
+
+TEST(jit, websocket_bool_select_skips_inactive_errors_and_preserves_reached_errors) {
+    for (u8 negate : {0, 1}) {
+        WsLenGuardSpec nodes[4]{};
+        nodes[0].accessor = 2;
+        nodes[0].cmp = 2;
+        nodes[0].bound = 1;
+        nodes[1].accessor = 6;
+        nodes[1].pattern = "allow";
+        nodes[1].pattern_len = 5;
+        nodes[2].accessor = 34;
+        nodes[2].value = "^allow$";
+        nodes[2].value_len = 7;
+        for (u32 i = 0; i < 3; ++i) nodes[i].is_operand = true;
+        nodes[3].accessor = 37;
+        nodes[3].bound = 0;
+        nodes[3].lhs = 1;
+        nodes[3].rhs = 2;
+        nodes[3].negate = negate;
+        nodes[3].verdict = 1;
+        auto generated = codegen_ws_handler(0, nodes, 4, 0);
+        REQUIRE(generated.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(generated.mod, generated.ctx));
+        const auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+        REQUIRE(handler);
+        const auto run = [&](const char* text, bool client) {
+            return handler(
+                nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(text), strlen(text), client);
+        };
+        CHECK(run("allow", true) == (negate ? WsFrameAction::Drop : WsFrameAction::Forward));
+        CHECK(run("deny", true) == (negate ? WsFrameAction::Forward : WsFrameAction::Drop));
+        CHECK(run("allow", false) == WsFrameAction::Close);
+        CHECK(run("\"allow\"", false) == (negate ? WsFrameAction::Drop : WsFrameAction::Forward));
+        CHECK(run("\"deny\"", false) == (negate ? WsFrameAction::Forward : WsFrameAction::Drop));
+        engine.shutdown();
+    }
+}
+
+TEST(jit, websocket_bool_select_rejects_cycles_sharing_orphans_and_control_operands) {
+    for (u32 invalid = 0; invalid < 9; ++invalid) {
+        WsLenGuardSpec nodes[4]{};
+        for (u32 i = 0; i < 3; ++i) {
+            nodes[i].accessor = 35;
+            nodes[i].bound = 1;
+            nodes[i].is_operand = true;
+        }
+        nodes[3].accessor = 37;
+        nodes[3].bound = 0;
+        nodes[3].lhs = 1;
+        nodes[3].rhs = 2;
+        if (invalid == 1) nodes[3].bound = 3;  // selector cycle
+        if (invalid == 2) nodes[3].bound = 4;  // forward selector
+        if (invalid == 3) nodes[3].bound = 1;  // shared selector/then child, orphan zero
+        if (invalid == 4) nodes[3].rhs = 1;    // shared arms, orphan two
+        if (invalid == 5) nodes[0].is_operand = false;
+        if (invalid == 6) nodes[0].pass_target = kWsControlDefault;
+        if (invalid == 7) nodes[3].is_operand = true;  // orphan compound
+        if (invalid == 8) nodes[3].accessor = 38;      // unknown accessor
+        auto generated = codegen_ws_handler(0, nodes, 4, 0);
+        if (invalid == 0) {
+            REQUIRE(generated.ok);
+            dispose_module(generated.mod, generated.ctx);
+        } else {
+            CHECK_FALSE(generated.ok);
+            if (generated.ok) dispose_module(generated.mod, generated.ctx);
+        }
+    }
+}
+
 TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     WsLenGuardSpec nodes[3]{};
     nodes[0].accessor = 2;
@@ -21188,7 +21329,7 @@ TEST(jit, websocket_json_regex_storage_validation) {
     auto cg = codegen_ws_handler(0, &node, 1, 0);
     REQUIRE(cg.ok);
     dispose_module(cg.mod, cg.ctx);
-    node.accessor = 37;
+    node.accessor = 38;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
 }
 

@@ -238,6 +238,87 @@ def borrowed_binary_exchange(client, peer):
     expect(client, (8, b"\x03\xe8", False))
 
 
+
+BOOL_SELECT_DECLARATIONS = r"""
+func accepted(_ client: bool, _ text: bool, _ size: i32) -> bool {
+    if client { text && size <= 4 } else { !text || size == 0 }
+}
+func scanned(_ msg: WebSocketMessage) -> bool {
+    if msg.fromClient { msg.text.matches(re"^ok$") }
+    else { msg.text.matches(re"^server$") }
+}
+route POST "/shared" {
+    guard accepted(true, req.bodyBytes.isEmpty, req.bodyBytes.count) else { return 403 }
+    return 200
+}
+"""
+BOOL_SELECT_HANDLER = r"""
+return websocket(ws) { msg in
+    guard msg.text != "CLOSE" else { msg.close(1000) }
+    let allowed: bool = accepted(msg.fromClient, msg.isText, msg.payload.count)
+    guard !allowed == false else { msg.drop() }
+    msg.forward(msg.payload)
+}
+"""
+BOOL_SELECT_REGEX_HANDLER = r"""
+return websocket(ws) { msg in
+    guard msg.text != "CLOSE" else { msg.close(1000) }
+    guard scanned(msg) else { msg.drop() }
+    msg.forward()
+}
+"""
+
+
+def bool_select_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"Boolean selection: {actual=!r}, {expected=!r}")
+
+    for data, status in ((b"", b"200"), (b"ok", b"403"), (b"\0\xff", b"403")):
+        with socket.create_connection(client.getpeername(), timeout=3) as http:
+            http.sendall(b"POST /shared HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Length: " +
+                         str(len(data)).encode() + b"\r\n\r\n" + data)
+            response = recv_http_response(http)
+            if not response.startswith(b"HTTP/1.1 " + status):
+                raise AssertionError(f"shared Boolean helper: {data=!r}, {response=!r}")
+    first = bytearray(masked_frame(1, b"\xc3"))
+    first[0] &= 0x7f
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, b"\xa9"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xc3\xa9", True))
+    client.sendall(masked_frame(1, b"longer") + masked_frame(2, b"\0\xff") +
+                   masked_frame(1, b"") + masked_frame(1, b"ok"))
+    expect(peer, (2, b"", True))
+    expect(peer, (2, b"ok", True))
+    peer.sendall(b"\x81\x06denied\x82\x02\0\xff\x81\x00")
+    expect(client, (2, b"\0\xff", False))
+    expect(client, (2, b"", False))
+    client.sendall(masked_frame(1, b"CLOSE"))
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
+def bool_select_regex_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"Boolean regex selection: {actual=!r}, {expected=!r}")
+
+    client.sendall(masked_frame(1, b"server") + masked_frame(2, b"\xff") + masked_frame(1, b"ok"))
+    expect(peer, (1, b"ok", True))
+    peer.sendall(b"\x82\x02ok\x81\x06server")
+    expect(client, (1, b"server", False))
+    first = bytearray(masked_frame(2, b"o"))
+    first[0] &= 0x7f
+    client.sendall(first + masked_frame(9, b"p") + masked_frame(0, b"k"))
+    expect(peer, (9, b"p", True))
+    expect(peer, (2, b"ok", True))
+    client.sendall(masked_frame(1, b"CLOSE"))
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
 NESTED_JSON_HANDLER = r"""
 return websocket(ws) { message in
     guard let document = json.parse(message.text) else { message.close(1007) }
@@ -1813,6 +1894,8 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (BOOL_SELECT_HANDLER, bool_select_exchange, BOOL_SELECT_DECLARATIONS),
+                (BOOL_SELECT_REGEX_HANDLER, bool_select_regex_exchange, BOOL_SELECT_DECLARATIONS),
                 (BORROWED_BINARY_HANDLER, borrowed_binary_exchange, BORROWED_BINARY_DECLARATIONS),
                 (OPTIONAL_DEFAULT_HANDLER, optional_default_exchange, OPTIONAL_VALUE_DECLARATIONS),
                 (OPTIONAL_BYTES_HANDLER, optional_bytes_exchange, OPTIONAL_VALUE_DECLARATIONS),

@@ -77,9 +77,11 @@ struct WsLenGuardSpec {
                   //                                34=JsonStringRegex (path + regex in value)
                   //                                35=Constant (bound is 0 or 1)
                   //                                36=BoolEqual (lhs/rhs, evaluated once each)
+                  //                                37=BoolSelect (bound selector, lhs true, rhs
+                  //                                false)
     u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
     u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
-                  // FromClient: 1 (client→upstream leg)
+                  // FromClient: 1 (client→upstream leg); BoolSelect: selector child index
     u8 verdict;   // WsFrameAction yielded when the guard CONDITION is false
     // TextMatch/TextEqual/TextPrefix/TextSuffix/TextContains: regex or decoded literal (pattern_len
     // is authoritative).

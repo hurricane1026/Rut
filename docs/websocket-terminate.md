@@ -66,6 +66,30 @@ has no storage carrier outside its synchronous callback, and comparing entire
 messages is rejected. General arithmetic and close-event values remain
 subsequent work.
 
+Boolean helpers may use ordinary `if`/`else` to select between two supported
+predicates, including nested conditionals. The selector evaluates once and only
+the selected arm runs:
+
+```swift
+func accepted(_ client: bool, _ text: bool, _ size: i32) -> bool {
+    if client { text && size <= 4 } else { !text || size == 0 }
+}
+// Inside callback:
+// let allowed: bool = accepted(msg.fromClient, msg.isText, msg.payload.count)
+// guard allowed else { msg.drop() }
+// msg.forward()
+```
+
+The same typed helper can accept HTTP scalar arguments. Infallible immutable
+Boolean results may initialize callback lets and feed nullable-helper selectors.
+Predicate helpers may select between regex scans when called from a guard;
+ordinary lets still reject regex/fallible work in any arm, including unused lets.
+Negation changes the selected result, and reached decode errors retain their
+existing close behavior. The selector, both arm trees and one selection node count
+toward 32 condition nodes; one helper call remains one source clause. The compiler
+adds no runtime value storage or native-format field. Arithmetic, effectful helpers
+and general callback computation remain unsupported.
+
 `message.kind` has type `WebSocketMessageKind`, whose cases are
 `WebSocketMessageKind.text` and `WebSocketMessageKind.binary`. `message.direction`
 has type `WebSocketDirection`, with cases `WebSocketDirection.clientToUpstream`

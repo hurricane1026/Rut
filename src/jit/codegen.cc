@@ -3153,7 +3153,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
     u32 sequential_roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 36 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 37 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
         if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 34) ||
@@ -3174,10 +3174,14 @@ bool emit_ws_handler(LLVMModuleRef mod,
         if (guards[i].accessor == 23 &&
             (guards[i].int_bound < -2147483648LL || guards[i].int_bound > 2147483647LL))
             return false;
-        if (guards[i].accessor == 4 || guards[i].accessor == 5 || guards[i].accessor == 36) {
-            const u32 children[2] = {guards[i].lhs, guards[i].rhs};
-            for (u32 child : children) {
-                if (child >= i || !guards[child].is_operand || ++parents[child] != 1) return false;
+        if (guards[i].accessor == 4 || guards[i].accessor == 5 || guards[i].accessor == 36 ||
+            guards[i].accessor == 37) {
+            const u32 kChildren[3] = {guards[i].lhs, guards[i].rhs, guards[i].bound};
+            const u32 kCount = guards[i].accessor == 37 ? 3u : 2u;
+            for (u32 j = 0; j < kCount; ++j) {
+                const u32 kChild = kChildren[j];
+                if (kChild >= i || !guards[kChild].is_operand || ++parents[kChild] != 1)
+                    return false;
             }
         }
         // Source clauses remain bounded by the frontend. Explicit forward roots
@@ -3242,6 +3246,16 @@ bool emit_ws_handler(LLVMModuleRef mod,
             LLVMBasicBlockRef tmp = yes;
             yes = no;
             no = tmp;
+        }
+        if (guards[i].accessor == 37) {
+            LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(ctx, fn, "select.then");
+            LLVMBasicBlockRef else_block = LLVMAppendBasicBlockInContext(ctx, fn, "select.else");
+            self(self, guards[i].bound, then_block, else_block);
+            LLVMPositionBuilderAtEnd(builder, then_block);
+            self(self, guards[i].lhs, yes, no);
+            LLVMPositionBuilderAtEnd(builder, else_block);
+            self(self, guards[i].rhs, yes, no);
+            return;
         }
         if (guards[i].accessor == 36) {
             // Equality evaluates both operands once. Keep the LHS value in SSA

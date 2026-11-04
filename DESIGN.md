@@ -2896,6 +2896,25 @@ pure helper results that normalize to exact-byte literals, as well as the comple
 borrowed message payload. Close reasons
 keep their literal-only contract; close codes accept constant integer aliases.
 
+Boolean helper results support ordinary `if`/`else` expressions with two
+nonconstant predicate arms, including nesting and generic/helper composition.
+Both branches use the existing message predicate subset. The selector evaluates
+once, followed by exactly one arm; outer negation inverts the chosen result,
+without converting a reached decode/scan error into a Boolean value. Helpers with
+infallible immutable selectors and arms may also initialize callback lets or feed
+nullable-helper conditions. Regex/JSON and other fallible work remain excluded
+from ordinary let substitution, including unused lets; guarded predicate calls
+retain their reached evaluation and error behavior.
+
+Lowering reuses normalized HIR IfElse and appends one BoolSelect node with three
+owned postorder operands: bound is the selector index, lhs/rhs are true/false
+indices. The JIT validates all three backward references and single ownership,
+then emits branch control flow rather than an eager LLVM select. It does not
+expand the selector into two Boolean clauses. All children and the selection node
+share the existing 32-node forest budget, with no extra source clause, runtime
+state, helper symbol, handler ABI field or native-layout change. The existing
+constant-arm And/Or lowering remains compact.
+
 The lexical scope includes compile-time admission constants and is discarded at
 the callback boundary. Locals require fresh names across lets, captures and JSON
 proof aliases; the `json` namespace cannot be a local let. The parameter may

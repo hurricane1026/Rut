@@ -1155,13 +1155,14 @@ struct WsLenGuard {
         JsonStringifyContains,
         JsonStringRegex,
         Constant,
-        BoolEqual
+        BoolEqual,
+        BoolSelect
     };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
     Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
-    u32 bound = 0;  // Len: the byte literal message.len is compared to. Opcode: the WsOpcode value.
+    u32 bound = 0;  // Len: literal bound; Opcode: wire value; BoolSelect: selector child index.
     // TextMatch/TextEqual/TextPrefix/TextSuffix/TextContains: regex or decoded literal, valid
     // through codegen. JsonHasPath/JsonStringValid: decoded JSON Pointer.
     // JsonStringEqual/Prefix/Suffix/Contains: pattern is the pointer and value is the
@@ -1174,7 +1175,8 @@ struct WsLenGuard {
     Str value{};
     i64 int_bound = 0;    // JsonIntCompare: i64 bound; JsonCountCompare: validated i32 bound.
     bool negate = false;  // invert this node's condition, including an entire subtree
-    // Compound conditions reference earlier nodes in the handler's postorder array.
+    // Compound conditions reference earlier nodes. BoolSelect uses bound/lhs/rhs
+    // for its selector/true/false operands, each owned exactly once.
     u32 lhs = 0;
     u32 rhs = 0;
     bool is_operand = false;              // only roots execute as source-level guards
