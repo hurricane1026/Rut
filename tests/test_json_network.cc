@@ -2713,3 +2713,88 @@ route GET "/" {
     loop->free_conn(*conn);
     pool.destroy();
 }
+
+TEST(json_network, rs256_explicit_type_rejects_cross_purpose_tokens) {
+    test::Rs256Fixture fixture;
+    REQUIRE(fixture.init());
+    std::string policy(fixture.policy.ptr, fixture.policy.len - 1);
+    policy += R"(,"requiredType":"at+jwt"})";
+    char source[8192];
+    json::Writer writer{source, sizeof(source) - 1};
+    writer.text(lit_str(R"rut(import "middleware/auth.rut"
+route GET "/" {
+    let identity = auth.jwtIdentityRs256(req.authorization.or(""), )rut"));
+    REQUIRE(json::quote({policy.data(), static_cast<u32>(policy.size())}, writer));
+    writer.text(lit_str(R"rut(, "read", "issuer-rs256")
+    let user = identity.consumerId
+    return response(200, body: user)
+}
+)rut"));
+    REQUIRE(writer.ok);
+    source[writer.len] = '\0';
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/jwt-rs256-auth.rut";
+    JsonProgram program;
+    REQUIRE(program.init(source, source_path.c_str()));
+    REQUIRE(program.config->activate_rs256(0));
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    conn->json_arena.backend.pool = &pool;
+    const struct {
+        const char* header;
+        u32 status;
+    } cases[] = {
+        {R"({"alg":"RS256","kid":"current","typ":"at+jwt"})", 200},
+        {R"({"alg":"RS256","kid":"current","typ":"JWT"})", 401},
+        {R"({"alg":"RS256","kid":"current"})", 401},
+        {R"({"alg":"RS256","kid":"current","typ":null})", 401},
+        {R"({"alg":"RS256","kid":"current","typ":"AT+JWT"})", 401},
+        {R"({"alg":"RS256","kid":"current","typ":"application/at+jwt"})", 401},
+        {R"({"alg":"RS256","kid":"current","cty":"at+jwt"})", 401},
+        {R"({"alg":"RS256","kid":"current","typ":"at+jwt","t\u0079p":"at+jwt"})", 401},
+        {R"({"alg":"RS256","kid":"current","t\u0079p":"at\u002bjwt"})", 200},
+    };
+    for (const auto& item : cases) {
+        char token[4096];
+        // A payload claim/HTTP field named typ must never satisfy the policy.
+        const Str claims = lit_str(
+            R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"scope":"read","typ":"at+jwt"})");
+        const Str signed_token = fixture.sign(cstr(item.header), claims, token);
+        REQUIRE(signed_token.len);
+        const std::string request =
+            "GET / HTTP/1.1\r\nHost: test\r\nX-Consumer-ID: attacker\r\ntyp: at+jwt\r\n"
+            "Authorization: Bearer " +
+            std::string(signed_token.ptr, signed_token.len) + "\r\n\r\n";
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        test_fault::ScopedSyscallFault clock(
+            test_fault::fixed_clock_gettime(CLOCK_REALTIME, 100, 0));
+        const auto result = invoke_jit_handler(
+            program.handler(), conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        CHECK_EQ(result.status_code, item.status);
+        handle_jit_outcome(loop.get(), *conn, result, program.handler(), true);
+        const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+        if (item.status == 200) {
+            CHECK(response.ends_with("alice"));
+        } else {
+            CHECK(response.find("alice") == std::string::npos);
+            CHECK(response.find("WWW-Authenticate: Bearer") != std::string::npos);
+            CHECK(!conn->jit_response_body_valid);
+        }
+    }
+    loop->free_conn(*conn);
+    pool.destroy();
+}

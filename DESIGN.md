@@ -9485,3 +9485,26 @@ In-flight readers keep their generation and its cache expiration. Native artifac
 version 17 serializes owned policy bytes and reconstructs keys after compiler
 exit; mutable crypto workspaces and pointers are never serialized. This adds verification,
 not ES256 signing, OIDC, online revocation, persistent sessions or replay state.
+
+
+### Configuration-owned RS256 explicit token type
+
+`Crypto.jwtRs256(token, policy)` accepts optional trusted `requiredType`. It is a
+nonempty string of at most 128 decoded visible ASCII bytes, owned by the immutable
+configuration. The shared compact JWS verifier requires an exact decoded match
+against protected-header `typ` before publishing claims. Only the signature over
+that header and payload together can authenticate the type; neither payload
+claims, `cty`, nor HTTP headers can satisfy it. Missing/malformed/mismatching
+values and duplicate decoded header names reject. Algorithm and approved-key
+selection remain pinned; all existing claims/revocation/time rules still run.
+
+The application policy intentionally uses case-sensitive exact bytes without
+media-type aliases or normalization. Omission retains the previous behavior.
+Malformed configuration fails loading; failure invalidates document/source/count,
+output length and selected kid. The optional native verifier parameter uses the
+same bounds, scratch and failure-publication contract. No new language keyword,
+builtin, dependency, allocation or mutable shard state is needed. JIT and native
+artifacts carry this policy through the existing configuration owner, including
+remote-key refresh. See [RFC 8725 section 3.11](https://www.rfc-editor.org/rfc/rfc8725.html#section-3.11)
+for explicit typing; this is a bounded application policy, not full OAuth access
+token profile conformance or nested-token support.

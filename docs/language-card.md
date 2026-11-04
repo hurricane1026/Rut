@@ -2479,3 +2479,27 @@ In-flight readers keep their generation and its cache expiration. Native artifac
 version 17 serializes owned policy bytes and reconstructs keys after compiler
 exit; mutable crypto workspaces and pointers are never serialized. This adds verification,
 not ES256 signing, OIDC, online revocation, persistent sessions or replay state.
+
+
+### RS256 protected token type policy
+
+The `Crypto.jwtRs256(token, policy)` configuration accepts an explicit type:
+
+Optional `requiredType` pins the signed protected-header `typ` to one trusted
+nonempty string of at most 128 decoded visible ASCII bytes (0x21–0x7e). For
+example, add `"requiredType":"at+jwt"` when that is the exact type your issuer
+uses. Missing, wrong-type, empty or mismatching token `typ` rejects before claims
+publication; duplicate decoded header names also reject. Escaped JSON names and
+values compare after decoding. A payload `typ`, `cty` or HTTP header cannot
+satisfy this policy. Signature, approved kid, issuer/audience/time, revocation
+and scope checks still apply.
+
+Matching is exact and case-sensitive: `JWT`, `AT+JWT` and `application/at+jwt`
+are distinct from `at+jwt`. This deliberately narrow allowlist performs no media
+type normalization or alias expansion. Pin the precise wire value agreed with
+the issuer. Invalid configuration (empty, non-string, whitespace/control/non-ASCII,
+oversize or duplicate names) rejects loading; omission preserves existing header
+handling. Configuration owns the type bytes under the same RCU lifecycle as its
+keys. This implements explicit application type binding following
+[RFC 8725 section 3.11](https://www.rfc-editor.org/rfc/rfc8725.html#section-3.11),
+not the complete OAuth JWT access-token profile or nested JWT handling.

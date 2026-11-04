@@ -2049,6 +2049,18 @@ route GET "/" {
     return 200
 }
 )rut"));
+    char typed_bytes[8192];
+    json::Writer typed{typed_bytes};
+    typed.text({fixture.policy.ptr, fixture.policy.len - 1});
+    typed.text(lit_str(R"(,"requiredType":"at+jwt"})"));
+    REQUIRE(typed.ok);
+    source_text.text(lit_str(R"rut(route GET "/typed" {
+    guard let claims = Crypto.jwtRs256(bearerToken(req.authorization.or("")).or(""), )rut"));
+    REQUIRE(json::quote({typed_bytes, typed.len}, source_text));
+    source_text.text(lit_str(R"rut() else { return 401 }
+    return 200
+}
+)rut"));
     REQUIRE(source_text.ok);
     source_bytes[source_text.len] = '\0';
     Source source;
@@ -2058,7 +2070,7 @@ route GET "/" {
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     auto& config = owner.p->config;
-    REQUIRE_EQ(config.rs256_configuration_count, 2u);
+    REQUIRE_EQ(config.rs256_configuration_count, 3u);
     REQUIRE(config.rs256);
     auto* connection = owner.arena.alloc_t<ConnectionBase>();
     REQUIRE(connection);
@@ -2119,6 +2131,18 @@ route GET "/" {
         REQUIRE(signed_token.len);
         CHECK_EQ(run(), 200u);  // The original policy has no revocation requirements.
         CHECK_EQ(run(1), i == 0 ? 200u : 401u);
+    }
+    const Str types[] = {
+        test::Rs256Fixture::header,
+        lit_str(R"({"alg":"RS256","kid":"current","typ":"JWT"})"),
+        lit_str(R"({"alg":"RS256","kid":"current","typ":"at+jwt"})"),
+        lit_str(R"({"alg":"RS256","kid":"current","t\u0079p":"at\u002bjwt"})"),
+    };
+    for (u32 i = 0; i < 4; ++i) {
+        signed_token = fixture.sign(types[i], member_claims, token);
+        REQUIRE(signed_token.len);
+        CHECK_EQ(run(), 200u);
+        CHECK_EQ(run(2), i >= 2 ? 200u : 401u);
     }
     connection->json_arena.destroy();
     pool.destroy();

@@ -1,3 +1,5 @@
+// Optional "requiredType":"at+jwt" pins the exact signed protected-header typ.
+// Configure the issuer's actual type; no case folding or media-type aliases apply.
 // JWT_RS256_POLICY is read once while compiling/loading this configuration.
 // Supply a trusted JSON document with issuer, audience, approved kids and jwks:
 // {"issuer":"https://issuer.example","audience":"orders",

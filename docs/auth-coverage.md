@@ -1097,3 +1097,22 @@ compiler exit/source removal, shard activation, scope/group denial and revocatio
 ES256 also supports the bounded remote JWKS refresh described above. Signing,
 discovery, online revocation and durable sessions remain open; no full JWT/OIDC
 milestone completion is claimed.
+
+
+## RS256 protected token type binding
+
+Optional trusted `requiredType` binds a route's RS256 policy to an exact signed
+protected-header `typ`. This helps separate token uses under an issuer/key trust
+domain, following [RFC 8725 section 3.11](https://www.rfc-editor.org/rfc/rfc8725.html#section-3.11).
+The type is 1–128 decoded visible ASCII bytes; matching is case-sensitive with
+no media-type normalization or alias expansion. Omission preserves prior behavior.
+It is not a complete OAuth access-token or OIDC ID-token profile.
+
+Runtime tests cover two approved keys, two shards, independent typed/untyped
+policies, escaped names/values, duplicate keys, absent/non-string/wrong types,
+case/prefix/media-type mismatches, forged signatures, strict configuration bounds,
+owned bytes and warmed allocation-free verification. HTTP/JIT tests verify 401
+Bearer challenges and no identity publication; payload/HTTP `typ` and JOSE `cty`
+cannot substitute for the protected field. Native artifacts preserve type checks
+after compiler exit and source removal. All ordinary signature, claims, snapshot
+revocation and token time limits still apply, including remote-JWKS mode.
