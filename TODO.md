@@ -794,7 +794,8 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   connection/request generation fencing and shared terminal/close cancellation.
 - [x] Native HTTP/2 stream binding, protocol-tagged task keys and stream-local
   reset/terminal cancellation, retaining the existing single async slot.
-- [ ] Rut/JIT/native-artifact exposure and automatic application worker
-  configuration/lifecycle; direct FD integration if needed beyond timer polling.
+- [x] Bounded Rut/JIT/native-artifact header verification prefix and automatic
+  per-shard worker startup/reload/shutdown lifecycle using timer suspension.
+- [ ] Direct completion-FD backend integration if needed beyond timer polling.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
   rate limits, rehash migration and session/JWT login composition.

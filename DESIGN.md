@@ -9319,8 +9319,8 @@ Passwords are exact nonempty bytes up to 1024 bytes; output is a strict
 123-byte ASCII record. Derived keys and HMAC scratch are cleansed, with
 constant-time key comparison. This adds no language surface or dependency.
 These deliberately slow synchronous APIs belong off the shard event loop.
-Gateway worker ownership, Rut/JIT integration, user persistence and
-account/password lifecycle remain future work; Basic auth retains its existing
+The following sections define worker ownership and Rut integration; user
+persistence and account/password lifecycle remain future work; Basic auth retains its existing
 static credential contract. See [auth coverage](docs/auth-coverage.md#native-password-storage-primitive)
 for the full format, ownership, validation and failure contract.
 
@@ -9340,9 +9340,9 @@ idle polling and a nonblocking completion pipe. `PasswordRequest` supplies
 monotonic deadline checks (including completed-but-expired success), terminal
 result consumption and explicit close/reload cancellation. The producer drains
 notifications before polling adapters; worker stop joins before closing pipe
-ends. No connection/request pointers cross threads. Rut/JIT integration still
-needs gateway FD/timer registration, request suspension/resumption and
-reload-safe worker ownership. See the auth ledger for exact lifecycle and limits.
+ends. No connection/request pointers cross threads. Gateway timer suspension and
+reload-safe shard ownership are described below. See the auth ledger for exact
+lifecycle and limits.
 
 ### Optional native HTTP/1 password bridge
 
@@ -9355,8 +9355,8 @@ failure, new request generation and the CRTP close path cancel abandoned work.
 POD TLS bindings are saved/restored across nested handler calls; no connection
 layout or packed handler ABI changes. Service ownership is independent of RCU
 configuration lifetime and remains with the loop's caller. Native HTTP/2 support uses a stream-specific binding and the existing single
-async slot as described below. Compiler/loader exposure and automatic CLI
-configuration are still pending. See the auth coverage ledger for the lifecycle
+async slot as described below. Compiled Rut routes can require this service and activate it automatically
+as described below. See the auth coverage ledger for the lifecycle
 contract and disconnect-observation limits.
 
 ### Native HTTP/2 password stream ownership
@@ -9369,5 +9369,28 @@ A stream-scoped guard retains work only for successful Timer suspension/re-arm;
 all other exits cancel that exact stream key. RST_STREAM cancels only its own
 task, and connection close/free cancels the connection's entire task set. The
 existing one-suspended-stream and RCU epoch contracts are preserved without
-new connection fields or handler ABI values. This remains a native embedding
-API; Rut/JIT/compiler exposure and automatic lifecycle configuration are pending.
+new connection fields or handler ABI values. The bounded Rut header prefix uses the same native service and stream binding.
+
+### Rut password prefix and automatic shard ownership
+
+`passwordVerifyHeader(header, record, timeoutMs) -> i32` uses a canonical
+compile-time policy and a singleton request header. Only the first direct route
+`let` may initialize from it; explicit waits in that route are rejected. Pending
+returns an existing Timer yield (state zero, at most 10 ms), re-entering only
+constants before polling the original job. No later effect runs before the
+terminal result. Success/rejection/unavailable/deadline map to 1/0/-1/-2.
+The RIR verifier and codegen independently validate the single entry prefix,
+argument/result types, canonical policy and absence of backedges into it.
+Parse/time scopes are released on the early suspension return. There is no new
+keyword, handler ABI, dependency or synchronous shard KDF.
+
+Compiled route metadata activates one embedded eight-slot `PasswordGateway` per
+requiring shard. Startup and first requiring live reload prepare it on the
+control thread; a service mailbox is published before its config. The consumer
+exchanges config first, then service, and binds the service before config
+adoption. Join drains leftover mailboxes. Service lifetime spans reloads,
+retired RCU readers and stop/join; shutdown joins and wipes it after loop
+termination. Native artifact version 16 preserves the requirement and uses the
+shared helper relocation allowlist. Hash provisioning stays native/offline;
+user persistence, password lifecycle and login orchestration remain separate work.
+See the language card and auth coverage ledger for the transport and limits.

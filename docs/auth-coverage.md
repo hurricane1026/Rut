@@ -15,7 +15,7 @@ whether a competing open-source edition includes them.
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
-| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters and native HTTP/1 + HTTP/2 timer bridges | Rut/JIT/native-artifact integration, automatic application lifecycle, user registry and password lifecycle |
+| Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and login/session orchestration |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and RS256 policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | ES keys, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
@@ -746,11 +746,10 @@ cross-node synchronization, online Token revocation, signing or JWE.
 
 `rut::password_hash` and `rut::password_verify` in
 [`password.h`](../include/rut/runtime/password.h) are synchronous native C++
-primitives for offline provisioning or an independently scheduled worker. They
-are **not exposed to Rut, JIT handlers, native-program helpers or Basic auth**.
+primitives for offline provisioning or an independently scheduled worker. Hash creation remains native; request verification uses the bounded Rut header
+prefix described below. These synchronous primitives are not Basic auth helpers.
 Do not invoke them on an event-loop shard: 600,000 HMAC rounds can block other
-connections. `PasswordWorker` now supplies a bounded native verification worker; event-loop
-wakeups and handler resumption are still required before request-path integration.
+connections. `PasswordWorker` supplies the bounded worker used by the gateway timer bridge.
 
 The fixed profile is PBKDF2-HMAC-SHA256 (RFC 8018), 600,000 iterations, a
 16-byte salt and a 32-byte derived key. No dependency or
@@ -838,10 +837,9 @@ bound is promised when the OS deschedules the thread.
 
 The idle worker scans at one-millisecond intervals, following the existing
 background flusher polling model. A borrowed nonblocking, close-on-exec pipe FD
-now signals completion and cancellation cleanup. Handler suspension/resumption,
-registration in gateway backends, timeout/connection-close wiring,
-worker ownership during configuration reload and error-to-HTTP mapping are
-future integration work; no Rut password login API is advertised yet. Password
+now signals completion and cancellation cleanup. The gateway bridge supplies timer suspension,
+deadlines and connection/stream cancellation. The Rut prefix adds automatic
+shard ownership and explicit status mapping as described below. Password
 hash creation remains an offline synchronous operation, not a worker job.
 
 `test_hash` covers copied-input lifetime, queue saturation, cancellation of
@@ -894,8 +892,8 @@ worker/request adapters to trusted native HTTP/1 and HTTP/2 `HandlerFn` routes. 
 owner starts one service, binds `loop.password_gateway` after loop init and
 before run, and keeps it alive until the loop and all connections are stopped.
 It is independent of RCU configuration objects; task inputs are copied rather
-than retaining policy records or request views. It is opt-in for native
-embedders: the CLI/compiler does not create or configure it automatically.
+than retaining policy records or request views. Native embedders can bind a service explicitly; requiring compiled Rut routes
+automatically create one per shard, as described below.
 
 Shared HTTP/1 dispatch and resume establish an invocation-local service binding
 using POD thread-local pointers, restoring the previous binding on every exit.
@@ -979,3 +977,40 @@ stream's wrong credentials in one batch and requires no response for the reset
 stream. Focused tests cover stream-binding restoration, busy-context integrity
 and unrelated-stream reset isolation. Rut/JIT/native-artifact helper exposure
 and automatic service configuration remain outstanding.
+
+## Rut password verification and worker lifecycle
+
+`passwordVerifyHeader(header, record, timeoutMs) -> i32` is a bounded asynchronous
+prefix, supported by Rut, ORC JIT and relocated native artifacts. The
+[language card](language-card.md#password-verification-prefix) defines its exact
+placement, compile-time policy, transport and status contract. The compiler
+requires the first route `let` and no explicit waits. The independent RIR
+verifier and code generator also require a single constant-only entry prefix,
+valid canonical policy, scalar i32 result and no branch back into entry. Pending
+returns the existing Timer yield with state zero; later effects execute only
+once a terminal result is consumed. Parse-cache and time-latch scopes are
+released on both suspension and ordinary return. The packed handler ABI is
+unchanged. Native artifact version 16 records the route's worker requirement;
+the helper is in the shared ORC/native relocation allowlist.
+
+`Shard` lazily starts its embedded service on the lifecycle/control thread before
+spawning a requiring config or publishing the first requiring reload. The loop
+consumes the config mailbox before the service mailbox, then binds the service
+before adopting that config. This preserves publication ordering even if a reload
+races with a maintenance pass. `join()` also drains unconsumed mailboxes. The
+worker survives reload, disabling routes and stop/join so older RCU readers and
+pending request deadlines retain their service. Final shutdown cancels tasks,
+joins the active KDF, wipes slots and closes descriptors after shard termination.
+Ordinary shards that never require password verification start no extra worker.
+
+Tests cover frontend placement/policy rejection, forged RIR and independent
+codegen rejection, no route effects while suspended, correct and incorrect
+credentials, duplicate/missing fields, automatic startup/reload/join/shutdown,
+and relocated execution after compiler exit and source removal. A real CLI
+smoke test covers epoll and io_uring without manual service binding. Existing
+native bridge tests cover HTTP/2 stream isolation, cancellation and deadlines.
+
+This is a fixed-record verifier, not a durable account system. Provision hashes
+offline using the random-salt native API; use TLS for credential transport and
+apply application abuse controls. Registration, lookup, password reset/change,
+rehash migration and session/JWT login orchestration remain open work.

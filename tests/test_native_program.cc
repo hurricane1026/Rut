@@ -6,9 +6,11 @@
 #include "rut/jit/native_helper_symbols.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_program.h"
+#include "rut/runtime/access_log.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/ebpf_plan.h"
+#include "rut/runtime/password_gateway.h"
 #include "rut/runtime/slice_pool.h"
 #include "test.h"
 #include <filesystem>
@@ -390,6 +392,56 @@ TEST(native_program, code_and_views_survive_compiler_exit_and_source_removal) {
     REQUIRE_EQ(c.header_pool_used, 1u);
     CHECK((Str{c.header_keys[0].data, c.header_keys[0].len}.eq(lit_str("X-Native"))));
     CHECK((Str{c.header_values[0].data, c.header_values[0].len}.eq(lit_str("yes"))));
+}
+
+TEST(native_program, password_header_suspends_after_compiler_exit_and_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(route GET "/login" {
+        let result = passwordVerifyHeader("X-Password", "$rut-pbkdf2-sha256$600000$000102030405060708090a0b0c0d0e0f$3bc37118e625093e9b79ed08930ea7af7389591233fdd92dddf369371e60dbc0", 5000)
+        match result {
+            1 => {
+                req.set("X-Authenticated", "yes")
+                return 200
+            }
+            _ => return 401
+        }
+    })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE(owner.p->config.requires_password_gateway());
+    PasswordGateway gateway;
+    REQUIRE(gateway.start().has_value());
+    ConnectionBase conn{};
+    conn.reset();
+    conn.fd = 42;
+    conn.id = 1;
+    conn.handler_gen = 1;
+    conn.transition_to_exec_handler_wait();
+    jit::HandlerCtx ctx{};
+    const char request[] = "GET /login HTTP/1.1\r\nHost: test\r\nX-Password: password\r\n\r\n";
+    const u64 deadline = monotonic_us() + 10000000;
+    bool suspended = false;
+    for (;;) {
+        PasswordHandlerScope binding(&gateway, &conn);
+        const auto result = jit::HandlerResult::unpack(owner.p->config.routes[0].fn(
+            &conn, &ctx, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+        if (result.action != jit::HandlerAction::Yield) {
+            CHECK_EQ(result.status_code, 200u);
+            break;
+        }
+        suspended = true;
+        CHECK_EQ(conn.req_header_override_count, 0u);
+        REQUIRE(result.yield_kind == jit::YieldKind::Timer);
+        CHECK_EQ(result.next_state, 0u);
+        REQUIRE(result.yield_payload_u32() > 0 && result.yield_payload_u32() <= 10);
+        REQUIRE(monotonic_us() < deadline);
+        usleep(result.yield_payload_u32() * 1000);
+    }
+    CHECK(suspended);
+    CHECK_EQ(conn.req_header_override_count, 1u);
+    CHECK_EQ(gateway.active_requests(), 0u);
 }
 
 TEST(native_program, jwt_issue_helper_survives_native_artifact_source_removal) {

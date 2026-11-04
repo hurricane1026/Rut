@@ -90,6 +90,55 @@ TEST(shard_control, control_block_init_zero) {
     ShardControlBlock cb{};
     CHECK(cb.pending_config == nullptr);
     CHECK(cb.pending_jit == nullptr);
+    CHECK(cb.pending_password_gateway == nullptr);
+}
+
+TEST_F(ShardF, password_gateway_starts_lazily_on_reload_and_survives_join) {
+    REQUIRE(self.ok);
+    RouteConfig cfg{};
+    cfg.route_count = 1;
+    cfg.routes[0].action = RouteAction::JitHandler;
+    cfg.routes[0].needs_password_gateway = 1;
+    REQUIRE(self.shard.spawn().has_value());
+    CHECK_FALSE(self.shard.password_gateway_started);
+    REQUIRE(self.shard.reload_config_unchecked(&cfg));
+    self.shard.stop();
+    self.shard.join();
+    CHECK(self.shard.password_gateway_started);
+    CHECK(self.shard.loop->password_gateway == &self.shard.automatic_password_gateway);
+    CHECK(self.shard.active_config == &cfg);
+    CHECK(self.shard.control.pending_password_gateway == nullptr);
+    REQUIRE(self.shard.spawn().has_value());
+    self.shard.stop();
+    self.shard.join();
+    CHECK(self.shard.password_gateway_started);
+    self.shard.shutdown();
+    self.ok = false;
+    CHECK_FALSE(self.shard.password_gateway_started);
+    CHECK(self.shard.loop == nullptr);
+}
+
+TEST_F(ShardF, password_gateway_startup_rejects_invalid_metadata) {
+    REQUIRE(self.ok);
+    RouteConfig cfg{};
+    cfg.route_count = 1;
+    cfg.routes[0].action = RouteAction::JitHandler;
+    cfg.routes[0].needs_password_gateway = 2;
+    self.shard.route_config = &cfg;
+    CHECK_FALSE(self.shard.spawn().has_value());
+    CHECK_FALSE(self.shard.password_gateway_started);
+    CHECK_FALSE(self.shard.reload_config_unchecked(&cfg));
+    cfg.routes[0].needs_password_gateway = 1;
+    cfg.routes[0].action = RouteAction::Static;
+    CHECK_FALSE(self.shard.spawn().has_value());
+    cfg.routes[0].action = RouteAction::JitHandler;
+    REQUIRE(self.shard.spawn().has_value());
+    self.shard.stop();
+    self.shard.join();
+    CHECK(self.shard.password_gateway_started);
+    CHECK(self.shard.loop->password_gateway == &self.shard.automatic_password_gateway);
+    self.shard.shutdown();
+    self.ok = false;
 }
 
 TEST(shard_control, control_block_config_write_read) {

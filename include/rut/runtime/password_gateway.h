@@ -18,7 +18,8 @@ struct PasswordGatewayReply {
 
 // Optional, per-loop, native HTTP password service. Lifecycle owner starts it
 // before transferring it to the shard and stops it only after loop termination.
-// Bind loop.password_gateway once before run; do not replace while running.
+// Bind before run, or publish a newly started service through ShardControlBlock
+// before adopting its requiring config. Do not replace an active service.
 // verify/cancel/active_requests run exclusively on the owner shard (or after
 // reclaiming it at shutdown). No configuration or connection pointer is retained
 // by the worker/service.
@@ -71,7 +72,7 @@ private:
     bool engaged = false;
 };
 
-// Trusted native HandlerFn API; not yet a Rut/JIT/native-artifact helper.
+// Native HandlerFn API, also used by the bounded Rut/JIT header helper.
 // First call copies credentials; subsequent calls for this request only poll the
 // existing task (credential/timeout arguments cannot replace/extend it).
 // Pending handlers MUST return TimerYield(retry_ms); never busy-loop or forward

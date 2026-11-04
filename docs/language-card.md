@@ -1677,6 +1677,52 @@ after authentication, as in the example. Replacement removes every client-suppli
 field with that name. Runtime values are validated and copied into bounded
 request-owned storage; invalid values or exhausted storage fail forwarding closed.
 
+## Password verification prefix
+
+`passwordVerifyHeader(header, record, timeoutMs) -> i32` is supported as the
+initializer of the first direct route `let`. All three arguments must resolve
+at compile time: a 1–128-byte HTTP field-name token, a canonical fixed-profile
+password record, and an integer timeout of 1–60000 milliseconds. `env("...")`
+may supply the record at compilation/load time. A user function may shadow the
+builtin. Calls in helpers, guards, later statements, timers or pipelines, and
+routes containing explicit `wait`, are rejected. No new keyword is added.
+
+```rut
+route POST "/login" {
+    let result = passwordVerifyHeader("X-Password", env("PASSWORD_HASH"), 5000)
+    guard result != -1 else { return 503 }
+    guard result != -2 else { return 504 }
+    guard result == 1 else { return 401 }
+    return 200
+}
+```
+
+The helper reads exactly one case-insensitive matching request header. Missing,
+duplicate, empty or over-1024-byte credentials return `0`. HTTP parsing applies
+its normal field-value whitespace rules; this transport is not an arbitrary
+binary password API. Serve credential routes over TLS.
+
+The result is `1` for a match, `0` for rejection, `-1` for unavailable service
+or exhausted capacity, and `-2` when the original monotonic deadline expires.
+Only `1` authenticates. Pending verification suspends before later route effects
+and retries the constant-only prefix using existing timer yields (at most 10 ms).
+It never runs PBKDF2 on the shard, extends a deadline on retry or exposes Pending
+to Rut. At exact expiry even a completed match is rejected.
+
+Each requiring shard automatically owns one worker and eight task slots. Startup
+or the first requiring reload starts it off-shard before publishing the config.
+The service survives config retirement and stop/join, and joins/wipes on shard
+shutdown. HTTP/1 request generations and HTTP/2 stream IDs fence abandoned work;
+HTTP/2 retains its existing single suspended stream limit. Compiler/JIT/native
+artifact metadata carries this requirement. See
+[the password example](../examples/password-header-auth.rut) and
+[auth coverage](auth-coverage.md#rut-password-verification-and-worker-lifecycle).
+
+Hash creation remains an offline native API. This prefix uses one fixed record;
+user lookup/persistence, registration, reset/change, automatic rehash and session
+or JWT login orchestration are not implemented by it. Basic auth keeps its
+existing static credential semantics.
+
 ## JWT resource-server claims profile
 
 `jwtDecode(token, secret)` retains its existing signature-only semantics.

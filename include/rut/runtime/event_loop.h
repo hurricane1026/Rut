@@ -773,6 +773,11 @@ public:
         // Single atomic exchange per slot: read + clear in one op.
         // nullptr = no update; non-null = apply.
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
+        // A prepared worker is published before its requiring config. Acquire
+        // config FIRST, then service, so config adoption cannot outrun binding.
+        if (auto* passwords =
+                control->pending_password_gateway.exchange(nullptr, std::memory_order_acq_rel))
+            this->password_gateway = passwords;
         if (cfg && config_ptr) {
             if (*config_ptr && *config_ptr != cfg) (*config_ptr)->cancel_rs256(shard_id);
             (void)cfg->activate_rs256(shard_id);

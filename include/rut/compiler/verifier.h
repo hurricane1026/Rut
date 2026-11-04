@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/request_policy.h"
+#include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_printer.h"
 #include "rut/jit/handler_abi.h"
@@ -45,6 +46,7 @@ enum class VerifyIssueCode : u8 {
     InvalidHttpCachePolicy,
     InvalidPreRoutePolicyId,
     InvalidJwtClaimsLifetime,
+    InvalidPasswordPrefix,
 };
 
 struct VerifyIssue {
@@ -721,6 +723,9 @@ inline VerifyResult verify_function(const Function* fn,
         return verify_fail(
             summary, VerifyIssueCode::TooManyYieldStates, function_index, 0, 0, fn->yield_count);
     }
+
+    if (!password_prefix_valid(*fn))
+        return verify_fail(summary, VerifyIssueCode::InvalidPasswordPrefix, function_index);
 
     summary.block_count = fn->block_count;
 
@@ -1632,6 +1637,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "UnreachableBlock";
         case VerifyIssueCode::InvalidForwardPreflight:
             return "InvalidForwardPreflight";
+        case VerifyIssueCode::InvalidPasswordPrefix:
+            return "InvalidPasswordPrefix";
         case VerifyIssueCode::InvalidJwtClaimsLifetime:
             return "InvalidJwtClaimsLifetime";
     }
