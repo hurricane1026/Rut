@@ -2397,7 +2397,11 @@ extern "C" void rut_helper_ws_close_reason(void* conn,
 extern "C" void rut_helper_ws_connection_subprotocol(void* conn,
                                                      const char** out_ptr,
                                                      u32* out_len) {
-    const Str kProtocol = conn ? static_cast<const ConnectionBase*>(conn)->ws_subprotocol : Str{};
+    const auto* connection = static_cast<const ConnectionBase*>(conn);
+    const Str kProtocol = !connection ? Str{}
+                          : connection->ws_negotiated_subprotocol.len
+                              ? connection->ws_negotiated_subprotocol
+                              : connection->ws_subprotocol;
     *out_ptr = kProtocol.ptr;
     *out_len = kProtocol.len;
 }

@@ -19,6 +19,7 @@ enum class WsDeflateStatus : u8 { Ok, Limit, Error };
 WsDeflateCodec* ws_deflate_create(SlicePool& pool, WsDeflateOptions options);
 void ws_deflate_destroy(SlicePool& pool, WsDeflateCodec* codec);
 u32 ws_deflate_storage_used(const WsDeflateCodec& codec);
+bool ws_deflate_matches(const WsDeflateCodec& codec, WsDeflateOptions options);
 
 // Wire work has its own bound, so streams made of empty blocks cannot bypass
 // the decoded-message budget. It admits normal incompressible DEFLATE overhead.

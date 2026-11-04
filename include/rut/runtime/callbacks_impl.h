@@ -1681,7 +1681,8 @@ bool ws_prepare_handshake_before_forward(Loop* loop, Connection& conn) {
                                                                      slice,
                                                                      SlicePool::kSliceSize,
                                                                      &offers_len,
-                                                                     conn.ws_subprotocol);
+                                                                     conn.ws_subprotocol,
+                                                                     &conn.ws_downstream_deflate);
         if (result != WsHandshakeRequestResult::Ready) {
             loop->free_ws_handshake_slice(slice);
             switch (result) {
@@ -1699,6 +1700,7 @@ bool ws_prepare_handshake_before_forward(Loop* loop, Connection& conn) {
             }
             return false;
         }
+        conn.ws_client_header_len = conn.req_header_end;
         if (conn.ws_subprotocol.len != 0) {
             const u32 kOldHeader = conn.req_header_end;
             const u32 kNewHeader = ws_restrict_subprotocol(
@@ -3217,6 +3219,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_open_handler = ws_term ? route->ws_open_handler : nullptr;
     conn.ws_close_handler = ws_term ? route->ws_close_handler : nullptr;
     conn.ws_subprotocol = ws_term ? route->ws_subprotocol : Str{};
+    conn.ws_negotiated_subprotocol = {};
+    conn.ws_downstream_deflate = {};
+    conn.ws_upstream_deflate = {};
     conn.ws_max_message_size = ws_term ? route->ws_max_message_size : 0;
     conn.ws_close_code = ws_term ? route->ws_close_code : 1000;
     conn.ws_close_reason = ws_term ? route->ws_close_reason : Str{};
@@ -8599,8 +8604,22 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         }
     }
 #if RUT_ENABLE_WEBSOCKET
-    // Terminate routes must not let the backend negotiate a per-message extension.
-    if (conn.is_ws_terminate_route && conn.req_wants_upgrade) strip_ws_extensions(conn);
+    // The gateway negotiates its client role independently of the downstream.
+    // A retry snapshot already contains this canonical offer.
+    if (conn.is_ws_terminate_route && conn.req_wants_upgrade && conn.retry_req_send_len == 0) {
+        const u32 kOldHeader = conn.req_header_end;
+        const u32 kOldTotal = conn.recv_buf.len();
+        const u32 kNewHeader = ws_rewrite_extensions(
+            conn.recv_slice, kOldHeader, kOldTotal, conn.recv_buf.capacity(), kWsDeflateOffer);
+        if (!kNewHeader) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.recv_buf.set_len(kOldTotal - kOldHeader + kNewHeader);
+        conn.req_header_end = kNewHeader;
+        if (conn.req_initial_send_len >= kOldHeader)
+            conn.req_initial_send_len = conn.req_initial_send_len - kOldHeader + kNewHeader;
+    }
 #endif
     // Pick the request source. A retried fresh connect (after a reused socket died
     // post-send) has retry_req_send_len > 0: recv_buf was reset at request-sent, so
@@ -10997,6 +11016,8 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_c2u.reset();
         conn.ws_c2u.masked = true;       // client->upstream is client-role on both ends → masked
         conn.ws_c2u.from_client = true;  // this leg is the client→upstream direction
+        conn.ws_c2u.decoder = conn.ws_downstream_codec;
+        conn.ws_c2u.encoder = conn.ws_upstream_codec;
         conn.ws_c2u.max_message_size = kCap;
         conn.ws_c2u.dynamic_output = &conn.ws_handler_output;
         conn.ws_c2u.forward_text = conn.ws_forward_text;
@@ -11010,6 +11031,8 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_u2c.reset();
         conn.ws_u2c.masked = false;       // upstream->client is server-role on both ends → unmasked
         conn.ws_u2c.from_client = false;  // this leg is the upstream→client direction
+        conn.ws_u2c.decoder = conn.ws_upstream_codec;
+        conn.ws_u2c.encoder = conn.ws_downstream_codec;
         conn.ws_u2c.max_message_size = kCap;
         conn.ws_u2c.dynamic_output = &conn.ws_handler_output;
         conn.ws_u2c.forward_text = conn.ws_forward_text;
@@ -11311,7 +11334,15 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
 #if RUT_ENABLE_WEBSOCKET
     if (conn.ws_closing) return ws_drive_close(loop, conn);
 #endif
-    if (conn.recv_buf.len() == 0) return true;
+    if (conn.recv_buf.len() == 0) {
+        // Another completion in this CQ batch may already have inspected the
+        // bytes copied for this terminal recv. Its callback must still restore
+        // the bounded receive owner even though no application input remains.
+        if (conn.is_ws_terminate && !conn.ws_client_send_pending && !conn.ws_client_eof &&
+            !conn.ws_upstream_eof)
+            return ws_resume_client_recv(loop, conn);
+        return true;
+    }
     if (conn.ws_client_send_pending) return ws_pause_client_recv(loop, conn);
 #if RUT_ENABLE_WEBSOCKET
     if (conn.is_ws_terminate) {
@@ -11391,7 +11422,14 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
 #if RUT_ENABLE_WEBSOCKET
     if (conn.ws_closing) return ws_drive_close(loop, conn);
 #endif
-    if (conn.upstream_recv_buf.len() == 0) return true;
+    if (conn.upstream_recv_buf.len() == 0) {
+        if (conn.is_ws_terminate && !conn.ws_upstream_send_pending && !conn.ws_client_eof &&
+            !conn.ws_upstream_eof) {
+            conn.upstream_recv_paused_for_send = false;
+            return loop->submit_recv_upstream(conn);
+        }
+        return true;
+    }
     if (conn.ws_upstream_send_pending) {
         return ws_pause_upstream_recv(loop, conn);
     }
@@ -11587,11 +11625,28 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.recv_paused_for_send = false;
         if (conn.recv_buf.len() > 0) {
             if (!ws_try_send_client_to_upstream(loop, conn)) close_conn_if_live(loop, conn);
+            if constexpr (requires(Loop* candidate, Connection& c) {
+                              candidate->process_buffered_tls_input(c);
+                          }) {
+                // A control send can park a partially decrypted TLS record.
+                // Its ciphertext was already received, so arming the socket
+                // alone cannot resume it. This completion runs outside the
+                // TLS decrypt callback; return immediately after driving it.
+                if (conn.fd >= 0 && !conn.ws_client_send_pending)
+                    (void)loop->process_buffered_tls_input(conn);
+            }
             return;
         }
         // Resume client recv (paused for this send), and pump the opposite direction.
         if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn)) {
             close_conn_if_live(loop, conn);
+            return;
+        }
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->process_buffered_tls_input(c);
+                      }) {
+            if (conn.fd >= 0 && !conn.ws_client_send_pending)
+                (void)loop->process_buffered_tls_input(conn);
         }
         return;
     }
@@ -11801,8 +11856,10 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     // the access-log request size would depend on packet framing. Trim to the
     // parsed header length (an upgrade request has no body).
     if (conn.req_header_end > 0) {
-        conn.downstream_req_size = conn.req_header_end;
-        conn.req_size = conn.req_header_end;
+        const u32 kHeaderLength =
+            conn.ws_client_header_len ? conn.ws_client_header_len : conn.req_header_end;
+        conn.downstream_req_size = kHeaderLength;
+        conn.req_size = kHeaderLength;
     }
     on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_sent_len);
     // The HTTP request is complete at the 101: release the upstream max_inflight
@@ -15459,18 +15516,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 !ws_handshake_response_matches(resp,
                                                conn.ws_handshake_slice,
                                                conn.ws_handshake_offers_len,
-                                               conn.ws_subprotocol)) {
+                                               conn.ws_subprotocol,
+                                               &conn.ws_upstream_deflate)) {
                 loop->close_conn(conn);
                 return;
             }
             conn.ws_handshake_phase = WsHandshakePhase::Validated;
         }
 #endif
-        // The 101 is authoritative for what was actually negotiated (the request's offer
-        // is only a proposal). Record whether the backend selected WebSocket — terminate
-        // arms on THIS, not the request — and refuse a response extension terminate can't
-        // honor (ws_inspect rejects RSV1 compressed frames), so we never send the client a
-        // 101 advertising an extension that would break the first compressed frame.
+        // Upstream and downstream are independent WebSocket endpoints. The
+        // validated upstream agreement drives only that leg's codecs; the
+        // client receives its own accepted offer in retained header storage.
         conn.resp_upgrade_is_websocket = false;
         bool resp_has_ws_ext = false;
         for (u32 i = 0; i < resp.header_count; i++) {
@@ -15483,7 +15539,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 if (vl.len > 0) resp_has_ws_ext = true;
             }
         }
-        if (conn.is_ws_terminate_route && resp_has_ws_ext) {
+        if (conn.is_ws_terminate_route && resp_has_ws_ext && !conn.ws_upstream_deflate.enabled) {
             loop->close_conn(conn);  // backend negotiated an extension terminate can't process
             return;
         }
@@ -15498,6 +15554,50 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             }
             upgrade_response = conn.response_header_buf.data();
             upgrade_response_len = conn.response_header_buf.len();
+        }
+        if (conn.is_ws_terminate_route) {
+            const bool kResourcesReady = [&]() {
+                if constexpr (requires(Loop* candidate, Connection& c) {
+                                  candidate->alloc_ws_terminate_bufs(c);
+                              }) {
+                    return loop->alloc_response_header_buf(conn) &&
+                           loop->alloc_ws_terminate_bufs(conn);
+                }
+                return false;
+            }();
+            if (!kResourcesReady) {
+                loop->close_conn(conn);
+                return;
+            }
+            if (upgrade_response != conn.response_header_buf.data()) {
+                conn.response_header_buf.reset();
+                if (conn.response_header_buf.write(upgrade_response, upgrade_response_len) !=
+                    upgrade_response_len) {
+                    loop->close_conn(conn);
+                    return;
+                }
+            }
+            char extension[192]{};
+            const u32 kExtensionLength = ws_format_deflate_agreement(
+                conn.ws_downstream_deflate, extension, sizeof(extension));
+            if (conn.ws_downstream_deflate.enabled && !kExtensionLength) {
+                loop->close_conn(conn);
+                return;
+            }
+            const u32 kRewritten = ws_rewrite_extensions(conn.response_header_slice,
+                                                         conn.response_header_buf.len(),
+                                                         conn.response_header_buf.len(),
+                                                         conn.response_header_buf.capacity(),
+                                                         {extension, kExtensionLength});
+            if (!kRewritten) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.response_header_buf.set_len(kRewritten);
+            conn.ws_negotiated_subprotocol =
+                ws_selected_subprotocol(conn.response_header_buf.data(), kRewritten);
+            upgrade_response = conn.response_header_buf.data();
+            upgrade_response_len = kRewritten;
         }
         conn.ws_upgrade_sent_len = upgrade_response_len;
         conn.ws_pre_tunnel_upstream_closed = false;

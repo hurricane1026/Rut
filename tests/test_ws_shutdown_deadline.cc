@@ -658,57 +658,69 @@ TEST(websocket, async_deadline_retains_output_until_target_and_cancel_retire) {
     constexpr u32 kLimits[] = {kWsTerminateMessageCapacity, kWsMaxMessageCapacity};
     constexpr bool kOrders[] = {false, true};
     for (u32 limit : kLimits) {
-        for (bool cancel_first : kOrders) {
-            MmapLoopOwner<EventLoop<AsyncMockBackend>> owner;
-            REQUIRE(owner.loop != nullptr);
-            auto* loop = owner.loop;
-            REQUIRE(loop->init(0, -1, 0, 64).has_value());
-            owner.mark_initialized();
-            auto* conn = loop->alloc_conn();
-            REQUIRE(conn != nullptr);
-            const u32 kBulkBefore = loop->pool.bulk_available();
-            conn->ws_max_message_size = limit;
-            REQUIRE(loop->alloc_ws_terminate_bufs(*conn));
-            u8* const kOutput = conn->ws_c2u_out;
-            REQUIRE(kOutput != nullptr);
-            const u32 kLength = limit + kWsMaxHeaderSize;
-            kOutput[0] = 0x5a;
-            kOutput[kLength - 1] = 0xa5;
-            CHECK_EQ(loop->pool.is_bulk(kOutput), limit > kWsTerminateMessageCapacity);
-            REQUIRE(loop->submit_send(*conn, kOutput, kLength));
-            CHECK_EQ(conn->pending_ops, 1u);
-            conn->is_ws_tunnel = true;
-            conn->ws_shutdown_deadline_armed = true;
-            loop->timer.add(conn, kWsShutdownDrainTimeoutSeconds);
-            const u32 kConnId = conn->id;
+        for (bool with_codecs : kOrders) {
+            for (bool cancel_first : kOrders) {
+                MmapLoopOwner<EventLoop<AsyncMockBackend>> owner;
+                REQUIRE(owner.loop != nullptr);
+                auto* loop = owner.loop;
+                REQUIRE(loop->init(0, -1, 0, 64).has_value());
+                owner.mark_initialized();
+                auto* conn = loop->alloc_conn();
+                REQUIRE(conn != nullptr);
+                const u32 kBulkBefore = loop->pool.bulk_available();
+                conn->ws_max_message_size = limit;
+                conn->ws_downstream_deflate.enabled = with_codecs;
+                conn->ws_upstream_deflate.enabled = with_codecs;
+                REQUIRE(loop->alloc_ws_terminate_bufs(*conn));
+                CHECK_EQ(conn->ws_downstream_codec != nullptr, with_codecs);
+                CHECK_EQ(conn->ws_upstream_codec != nullptr, with_codecs);
+                u8* const kOutput = conn->ws_c2u_out;
+                REQUIRE(kOutput != nullptr);
+                const u32 kLength = limit + kWsMaxHeaderSize;
+                kOutput[0] = 0x5a;
+                kOutput[kLength - 1] = 0xa5;
+                CHECK_EQ(loop->pool.is_bulk(kOutput), limit > kWsTerminateMessageCapacity);
+                REQUIRE(loop->submit_send(*conn, kOutput, kLength));
+                CHECK_EQ(conn->pending_ops, 1u);
+                conn->is_ws_tunnel = true;
+                conn->ws_shutdown_deadline_armed = true;
+                loop->timer.add(conn, kWsShutdownDrainTimeoutSeconds);
+                const u32 kConnId = conn->id;
 
-            loop->dispatch(make_ev(
-                0, IoEventType::Timeout, static_cast<i32>(kWsShutdownDrainTimeoutSeconds + 1)));
-            CHECK_EQ(conn->fd, -1);
-            CHECK_EQ(conn->pending_ops, 2u);
-            CHECK_EQ(conn->ws_c2u_out, kOutput);
-            CHECK_EQ(loop->active_count(), 1u);
-            CHECK_EQ(loop->backend.count_ops(MockOp::Cancel), 1u);
-            // The parser's CPU storage is free, while both outputs remain owned.
-            if (limit > kWsTerminateMessageCapacity)
-                CHECK_EQ(loop->pool.bulk_available(), kBulkBefore - 2u);
-            loop->dispatch(make_ev(
-                kConnId, IoEventType::Send, cancel_first ? -ECANCELED : static_cast<i32>(kLength)));
-            CHECK_EQ(conn->pending_ops, 1u);
-            CHECK_EQ(conn->ws_c2u_out, kOutput);
-            CHECK_EQ(loop->active_count(), 1u);
-            CHECK_EQ(kOutput[0], 0x5au);
-            CHECK_EQ(kOutput[kLength - 1], 0xa5u);
-            loop->dispatch(make_ev(
-                kConnId, IoEventType::Send, cancel_first ? static_cast<i32>(kLength) : -ECANCELED));
-            CHECK_EQ(loop->active_count(), 0u);
-            CHECK_EQ(conn->ws_c2u_out, nullptr);
-            CHECK_EQ(loop->pool.bulk_available(), kBulkBefore);
-            auto* reused = loop->alloc_conn();
-            REQUIRE(reused != nullptr);
-            CHECK_EQ(reused->id, kConnId);
-            CHECK_FALSE(reused->ws_shutdown_deadline_armed);
-            loop->free_conn(*reused);
+                loop->dispatch(make_ev(
+                    0, IoEventType::Timeout, static_cast<i32>(kWsShutdownDrainTimeoutSeconds + 1)));
+                CHECK_EQ(conn->fd, -1);
+                CHECK_EQ(conn->pending_ops, 2u);
+                CHECK_EQ(conn->ws_c2u_out, kOutput);
+                CHECK_EQ(loop->active_count(), 1u);
+                CHECK_EQ(loop->backend.count_ops(MockOp::Cancel), 1u);
+                // The parser's CPU storage is free, while both outputs remain owned.
+                CHECK(conn->ws_downstream_codec == nullptr);
+                CHECK(conn->ws_upstream_codec == nullptr);
+                CHECK_EQ(loop->pool.bulk_available(),
+                         limit > kWsTerminateMessageCapacity ? kBulkBefore - 2u : kBulkBefore);
+                loop->dispatch(make_ev(kConnId,
+                                       IoEventType::Send,
+                                       cancel_first ? -ECANCELED : static_cast<i32>(kLength)));
+                CHECK_EQ(conn->pending_ops, 1u);
+                CHECK_EQ(conn->ws_c2u_out, kOutput);
+                CHECK_EQ(loop->active_count(), 1u);
+                CHECK_EQ(kOutput[0], 0x5au);
+                CHECK_EQ(kOutput[kLength - 1], 0xa5u);
+                loop->dispatch(make_ev(kConnId,
+                                       IoEventType::Send,
+                                       cancel_first ? static_cast<i32>(kLength) : -ECANCELED));
+                CHECK_EQ(loop->active_count(), 0u);
+                CHECK_EQ(conn->ws_c2u_out, nullptr);
+                CHECK_EQ(loop->pool.bulk_available(), kBulkBefore);
+                auto* reused = loop->alloc_conn();
+                REQUIRE(reused != nullptr);
+                CHECK_EQ(reused->id, kConnId);
+                CHECK_FALSE(reused->ws_shutdown_deadline_armed);
+                CHECK_FALSE(reused->ws_downstream_deflate.enabled);
+                CHECK_FALSE(reused->ws_upstream_deflate.enabled);
+                loop->free_conn(*reused);
+            }
         }
     }
 }
@@ -963,6 +975,49 @@ TEST(websocket, iouring_bulk_reads_keep_downstream_ring_and_bound_each_submissio
     CHECK_FALSE(loop->backend.add_recv_once(conn->fd, conn->id, 0));
     CHECK_FALSE(loop->backend.add_recv_once(-1, conn->id, 1));
     CHECK_FALSE(loop->backend.add_recv_once(conn->fd, loop->connection_capacity, 1));
+}
+
+TEST(websocket, iouring_terminal_receive_rearms_after_another_callback_consumed_its_bytes) {
+    MmapLoopOwner<IoUringEventLoop> owner;
+    REQUIRE(owner.loop != nullptr);
+    auto* loop = owner.loop;
+    if (!init_iouring_loop_with_retry(*loop, "WebSocket consumed terminal", 64))
+        SKIP("io_uring unavailable");
+    owner.mark_initialized();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    SocketPairOwner client, upstream;
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, client.fds), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, upstream.fds), 0);
+    conn->fd = client.fds[0];
+    client.fds[0] = -1;
+    conn->upstream_fd = upstream.fds[0];
+    upstream.fds[0] = -1;
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    conn->upstream_episode = 1;
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->ws_max_message_size = kWsMaxMessageCapacity;
+    conn->set_slots(&on_ws_client_recv<IoUringEventLoop>,
+                    &on_ws_upstream_to_client_sent<IoUringEventLoop>,
+                    &on_ws_upstream_recv<IoUringEventLoop>,
+                    &on_ws_client_to_upstream_sent<IoUringEventLoop>);
+    // Backend.wait copied this positive terminal's bytes before dispatch. An
+    // opposite send completion has already inspected and consumed that prefix.
+    REQUIRE_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_EQ(conn->upstream_recv_buf.len(), 0u);
+    on_ws_client_recv<IoUringEventLoop>(loop, *conn, make_ev(conn->id, IoEventType::Recv, 16));
+    CHECK(conn->recv_armed);
+    on_ws_upstream_recv<IoUringEventLoop>(
+        loop, *conn, make_ev(conn->id, IoEventType::UpstreamRecv, 16));
+    CHECK(conn->upstream_recv_armed);
+    CHECK_EQ(conn->pending_ops, 2u);
+    CHECK_FALSE(conn->ws_client_send_pending);
+    CHECK_FALSE(conn->ws_upstream_send_pending);
+    // Repeated pumps share the existing receive owners rather than duplicating SQEs.
+    CHECK(ws_try_send_client_to_upstream(loop, *conn));
+    CHECK(ws_try_send_upstream_to_client(loop, *conn));
+    CHECK_EQ(conn->pending_ops, 2u);
 }
 
 TEST(websocket, iouring_dispatch_expires_shutdown_deadline_before_http_yield) {

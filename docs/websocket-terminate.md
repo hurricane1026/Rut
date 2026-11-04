@@ -626,9 +626,10 @@ mode requires one matching `Sec-WebSocket-Accept`, computed from the request key
 and validates a selected protocol: it may be absent, but if present must be one
 single offered token. Response Upgrade must select exactly one
 `Upgrade: websocket` field, Connection must contain an exact `Upgrade` list item,
-and the header block must be complete and untruncated. A nonempty
-`Sec-WebSocket-Extensions` response is rejected because terminate mode does not
-negotiate extensions. A non-101 response follows ordinary HTTP forwarding.
+and the header block must be complete and untruncated. Extension selection is
+validated independently on each leg as described below. Unknown response
+extensions or invalid parameters close before any 101 is published. A non-101
+response follows ordinary HTTP forwarding.
 These terminate-only checks do not make the engine a full RFC 6455
 implementation; Origin remains explicit application policy. A failed backend
 101 closes before any 101 bytes are sent; the runtime does not synthesize a 502
@@ -1111,3 +1112,40 @@ helpers, optional/error guards, String predicates, Cache effects and time retain
 their compiler semantics. Bare `return` ends a hook and a hook may fall through;
 `guard` failure must exit. Request captures, yielding and view escape remain
 compile errors. Native artifacts carry separate relocated hook symbols.
+
+
+## Per-message compression
+
+Terminate mode negotiates RFC 7692 `permessage-deflate` independently with the
+client and upstream. It can translate between compressed and uncompressed legs.
+No DSL option or keyword is required. Bare passthrough still treats frames and
+extensions as opaque bytes.
+
+The client receives an agreement selected from its own offers, never the upstream
+agreement. Repeated fields, alternative offers and quoted parameters are parsed
+with bounded HTTP grammar. Unsupported offers can be declined; malformed grammar
+fails admission. The upstream receives the gateway's canonical offer:
+`permessage-deflate; client_no_context_takeover; client_max_window_bits`.
+Its actual response determines receive window/history behavior. All window sizes
+8 through 15 are supported. Outgoing messages reset their compressor history;
+received history is retained unless that leg agreed to no context takeover,
+including when the application drops a message.
+
+The callback sees the complete decoded payload, with ordinary Text UTF-8 checks.
+`maxMessageSize` limits decoded input and rewritten output. Compressed wire input
+has a separate bounded work budget of `max + max / 8 + 1024` bytes per message.
+RSV1 is valid only on negotiated initial data frames; continuation frames and
+controls cannot set it. Ping/Pong can interleave compressed fragments. Output is
+compressed only when the result is smaller and fits owned output storage;
+incompressible messages retain their original uncompressed frame and full size
+limit. No partial or invalid decoded message reaches application code.
+
+Each negotiated leg atomically reserves one existing 256 KiB bulk slice for its
+encoder and decoder before sending 101. Large routes additionally reserve four
+bulk message/output slices; default-sized data buffers remain ordinary slices.
+Pool exhaustion rejects the upgrade with no smaller-limit fallback. CPU codec
+storage is released at teardown; asynchronous output remains owned until its send
+and cancellation complete. The codec is a private, pinned static C zlib build
+with pool-backed allocation, with no process heap allocator or system zlib link.
+Closing validates bounded framing and peer Close while discarding application
+data without invoking the decoder or callback.

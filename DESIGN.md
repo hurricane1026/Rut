@@ -3401,11 +3401,28 @@ re-read), each with its own buffer for natural backpressure.
   combined after validation as unique case-sensitive ASCII tokens. Before
   sending backend 101, the runtime checks one matching Accept and, if selected,
   one protocol token from the offers, alongside the existing complete-header,
-  exact Upgrade/Connection, and no-extension checks. Invalid requests close with
+  exact Upgrade/Connection, and independent RFC 7692 extension checks. Invalid requests close with
   400/426 before upstream connect; an invalid backend 101 closes before any 101
   bytes are sent. Non-101 responses use ordinary HTTP forwarding. Origin stays
   explicit application policy. Bare passthrough routes keep generic Upgrade
   behavior. This supported subset is not full RFC 6455 conformance.
+
+- **Terminate compression.** `permessage-deflate` is negotiated independently on
+  each leg, with windows 8 through 15 and actual-response context semantics.
+  The gateway replaces extension fields rather than relaying the other leg's
+  agreement. Before publishing 101, each enabled leg atomically acquires one
+  existing 256 KiB bulk slice for a private pinned static C zlib codec with a
+  bounded custom allocator. Message inspection sees decoded bytes; its existing
+  maximum bounds both decoded input and final output. Compressed input also has
+  a per-message wire-work budget of `max + max / 8 + 1024`. Received history is
+  retained across dropped messages unless no-context was agreed. Encoding resets
+  per message and falls back to the original uncompressed output when compression
+  is not beneficial or does not fit. RSV1 is legal only on negotiated initial
+  data frames. Controls and ordinary closing ownership are unchanged. The owned
+  rewritten 101 retains selected subprotocol metadata through session teardown;
+  input header consumption preserves any coalesced first frame. Bounded io_uring
+  reads cover the initial 101 and the active compressed/bulk session, including
+  terminal CQEs whose data another callback already consumed.
 
 - **Backpressure.** Each direction pauses its read while its paired send drains,
   so a slow peer applies TCP flow control to the fast one. Buffered bytes are

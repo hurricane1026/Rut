@@ -3,6 +3,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/ws_extensions.h"
 
 namespace rut {
 
@@ -26,12 +27,14 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
                                               u8* storage,
                                               u32 storage_capacity,
                                               u32* out_offers_len,
-                                              Str required_subprotocol = {});
+                                              Str required_subprotocol = {},
+                                              WsDeflateAgreement* downstream_deflate = nullptr);
 
 bool ws_handshake_response_matches(const ParsedResponse& response,
                                    const u8* storage,
                                    u32 offers_len,
-                                   Str required_subprotocol = {});
+                                   Str required_subprotocol = {},
+                                   WsDeflateAgreement* upstream_deflate = nullptr);
 
 // Restrict validated request protocol fields to one required offer, without growing
 // the header or touching the coalesced WebSocket bytes. Returns the new header length.

@@ -20,6 +20,7 @@ struct Buffers {
     Connection conn{};
     Buffers() { conn.reset(); }
     ~Buffers() {
+        conn.free_ws_codecs(pool);
         if (conn.ws_c2u_msg) pool.free(conn.ws_c2u_msg);
         if (conn.ws_u2c_msg) pool.free(conn.ws_u2c_msg);
         if (conn.ws_c2u_out) pool.free(conn.ws_c2u_out);
@@ -75,6 +76,31 @@ TEST(ws_bulk, allocation_is_atomic_and_never_falls_back_to_a_smaller_limit) {
             CHECK_EQ(owner.pool.bulk_available(), 0u);
             // Existing send storage cannot be rebound under a live owner.
             owner.conn.ws_max_message_size = kWsTerminateMessageCapacity;
+            CHECK_FALSE(owner.conn.alloc_ws_buffers(owner.pool));
+            CHECK_EQ(owner.pool.bulk_available(), 0u);
+        }
+    }
+}
+
+TEST(ws_bulk, negotiated_codecs_join_atomic_bulk_admission_and_reject_live_parameter_changes) {
+    for (u32 budget : {4u, 5u, 6u}) {
+        Buffers owner;
+        REQUIRE(owner.pool.init(16, 0, 0, budget));
+        owner.conn.ws_max_message_size = kWsMaxMessageCapacity;
+        owner.conn.ws_downstream_deflate.enabled = true;
+        owner.conn.ws_upstream_deflate.enabled = true;
+        const bool admitted = owner.conn.alloc_ws_buffers(owner.pool);
+        CHECK_EQ(admitted, budget == 6u);
+        if (!admitted) {
+            CHECK_EQ(owner.pool.bulk_available(), budget);
+            CHECK(owner.conn.ws_c2u_msg == nullptr);
+            CHECK(owner.conn.ws_u2c_out == nullptr);
+            CHECK(owner.conn.ws_downstream_codec == nullptr);
+            CHECK(owner.conn.ws_upstream_codec == nullptr);
+        } else {
+            CHECK_EQ(owner.pool.bulk_available(), 0u);
+            CHECK(owner.conn.alloc_ws_buffers(owner.pool));
+            owner.conn.ws_downstream_deflate.client_window = 14;
             CHECK_FALSE(owner.conn.alloc_ws_buffers(owner.pool));
             CHECK_EQ(owner.pool.bulk_available(), 0u);
         }

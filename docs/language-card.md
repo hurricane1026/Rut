@@ -981,7 +981,8 @@ return websocket(chat) { message in
 // Protocol offers may use repeated fields or
 // comma lists; nonempty ASCII tokens must be unique case-sensitively. A backend
 // 101 is sent only with one matching Accept, a selected protocol that was offered
-// (if any), exact Upgrade/Connection checks, a complete header, and no extensions.
+// (if any), exact Upgrade/Connection checks, a complete header, and valid
+// independently negotiated permessage-deflate (or no extension).
 // Invalid 101 closes before send. Non-101 remains ordinary HTTP; Origin stays an
 // explicit application guard. Bare websocket(chat) passthrough keeps generic
 // Upgrade behavior. This bounded supported shape is not full RFC 6455 conformance.
@@ -995,6 +996,12 @@ return websocket(chat, subprotocol: "graphql-transport-ws", maxMessageSize: 4kb)
     message.forward()
 }
 // Omitting subprotocol keeps optional, backend-selected negotiation.
+// message.connection.subprotocol reports the actual selected token in either case.
+// Terminate mode independently negotiates RFC 7692 permessage-deflate on each leg.
+// The callback sees decoded payloads; maxMessageSize bounds decoded input/output.
+// Window sizes 8...15 and received context takeover are supported. Incompressible
+// output falls back to uncompressed frames without reducing the message limit.
+// Each negotiated leg reserves one 256 KiB pool slice before publishing 101.
 
 // The runtime bounds a graceful Close or clean-EOF drain to about five
 // seconds; a healthy quiet tunnel has no idle timeout.

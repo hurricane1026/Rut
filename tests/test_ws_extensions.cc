@@ -2,6 +2,7 @@
 #include "test.h"
 #include <cstring>
 #include <string>
+#include <vector>
 
 using namespace rut;
 
@@ -137,6 +138,61 @@ TEST(ws_extensions, canonical_values_round_trip_every_window_pair_without_overwr
             CHECK_EQ(memcmp(value, short_value, length), 0);
         }
     }
+}
+
+TEST(ws_extensions, header_rewrite_preserves_coalesced_frames_when_growing_or_shrinking) {
+    for (u32 fields = 0; fields <= 2; ++fields) {
+        for (bool offer : {false, true}) {
+            std::string header = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n";
+            for (u32 i = 0; i < fields; ++i)
+                header += "sEc-WebSocket-Extensions: stale; parameter=old\r\n";
+            header += "Sec-WebSocket-Protocol: \tchat \t\r\nX-End: unchanged\r\n\r\n";
+            static constexpr char kTail[] = "\xc1\x0a\0Sec-WebSocket-Extensions: EARLY\r\n";
+            const std::string tail(kTail, sizeof(kTail) - 1);
+            const auto original = header + tail;
+            std::vector<u8> buffer(1024, 0x5a);
+            memcpy(buffer.data(), original.data(), original.size());
+            const u32 length = ws_rewrite_extensions(buffer.data(),
+                                                     static_cast<u32>(header.size()),
+                                                     static_cast<u32>(original.size()),
+                                                     1024,
+                                                     offer ? kWsDeflateOffer : Str{});
+            REQUIRE(length != 0);
+            CHECK_EQ(memcmp(buffer.data() + length, tail.data(), tail.size()), 0);
+            const std::string rewritten(reinterpret_cast<const char*>(buffer.data()), length);
+            CHECK(rewritten.find("stale") == std::string::npos);
+            CHECK_EQ(rewritten.find("Sec-WebSocket-Extensions:") != std::string::npos, offer);
+            CHECK(ws_selected_subprotocol(buffer.data(), length).eq(lit_str("chat")));
+            CHECK_EQ(buffer[1023], 0x5au);
+        }
+    }
+}
+
+TEST(ws_extensions, failed_header_rewrites_leave_the_original_request_intact) {
+    const std::string original = "GET /ws HTTP/1.1\r\nHost: test\r\n\r\nEARLY";
+    std::vector<u8> buffer(original.begin(), original.end());
+    const u32 header = static_cast<u32>(original.size()) - 5;
+    CHECK_EQ(ws_rewrite_extensions(buffer.data(),
+                                   header,
+                                   static_cast<u32>(buffer.size()),
+                                   static_cast<u32>(buffer.size()),
+                                   kWsDeflateOffer),
+             0u);
+    CHECK_EQ(memcmp(buffer.data(), original.data(), original.size()), 0);
+    CHECK_EQ(ws_rewrite_extensions(buffer.data(),
+                                   header,
+                                   static_cast<u32>(buffer.size()),
+                                   static_cast<u32>(buffer.size()),
+                                   lit_str("bad\r\nInjected: x")),
+             0u);
+    CHECK_EQ(memcmp(buffer.data(), original.data(), original.size()), 0);
+    CHECK_EQ(ws_rewrite_extensions(buffer.data(),
+                                   header - 1,
+                                   static_cast<u32>(buffer.size()),
+                                   static_cast<u32>(buffer.size()),
+                                   {}),
+             0u);
+    CHECK_EQ(memcmp(buffer.data(), original.data(), original.size()), 0);
 }
 
 int main(int argc, char** argv) {

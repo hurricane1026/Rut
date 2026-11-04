@@ -121,6 +121,12 @@ u32 ws_deflate_storage_used(const WsDeflateCodec& codec) {
     return codec.used;
 }
 
+bool ws_deflate_matches(const WsDeflateCodec& codec, WsDeflateOptions options) {
+    return !codec.failed && codec.options.receive_window == options.receive_window &&
+           codec.options.send_window == options.send_window &&
+           codec.options.receive_no_context_takeover == options.receive_no_context_takeover;
+}
+
 bool ws_inflate_begin(WsDeflateCodec& codec, u32 decoded_limit) {
     if (codec.failed || codec.decoding || !ws_valid_message_capacity(decoded_limit)) return false;
     if (codec.options.receive_no_context_takeover && inflateReset(&codec.decoder) != Z_OK)

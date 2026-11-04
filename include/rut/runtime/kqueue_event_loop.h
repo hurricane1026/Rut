@@ -620,6 +620,7 @@ public:
         if (c.send_slice) pool.free(c.send_slice);
         if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
         if (c.response_header_slice) pool.free(c.response_header_slice);
+        c.free_ws_codecs(pool);
         if (c.ws_c2u_msg) pool.free(c.ws_c2u_msg);
         if (c.ws_u2c_msg) pool.free(c.ws_u2c_msg);
         if (c.ws_c2u_out) pool.free(c.ws_c2u_out);

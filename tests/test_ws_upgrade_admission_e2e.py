@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import zlib
 
 
 REQUEST = (
@@ -42,11 +43,11 @@ UNSOLICITED_PROTOCOL_RESPONSE = (
 )
 
 
-def wire_frame(opcode, payload, masked=False, fin=True):
+def wire_frame(opcode, payload, masked=False, fin=True, compressed=False):
     key = b"\x12\x34\x56\x78" if masked else b""
     size = len(payload)
     length = bytes((size,)) if size < 126 else (b"\x7e" + size.to_bytes(2, "big") if size <= 65535 else b"\x7f" + size.to_bytes(8, "big"))
-    header = bytes(((0x80 if fin else 0) | opcode, length[0] | (0x80 if masked else 0))) + length[1:]
+    header = bytes(((0x80 if fin else 0) | (0x40 if compressed else 0) | opcode, length[0] | (0x80 if masked else 0))) + length[1:]
     body = bytes(value ^ key[index & 3] for index, value in enumerate(payload)) if masked else payload
     return header + key + body
 
@@ -1653,7 +1654,8 @@ def typed_message_exchange(client, peer):
 
 
 def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
-                                exchange=binary_exchange, declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS):
+                                exchange=binary_exchange, declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS,
+                                tls=False, validate_request=None, validate_response=None):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-binary-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -1661,10 +1663,20 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
         path = os.path.join(temp, "route.rut")
         with open(path, "w", encoding="utf-8") as route_file:
             route_file.write(
-                f'listen 127.0.0.1:0\n'
-                f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+                ('' if tls else 'listen 127.0.0.1:0\n')
+                + f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
                 + declarations + '\nroute GET "/ws" {\n' + handler + '}\n')
-        process, port, diagnostic = launch(server, path, backend_kind)
+        context = None
+        extra_args = ()
+        if tls:
+            fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+            extra_args = ("0", "--tls-cert", os.path.join(fixtures, "localhost_cert.pem"),
+                          "--tls-key", os.path.join(fixtures, "localhost_key.pem"))
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.set_alpn_protocols(["http/1.1"])
+        process, port, diagnostic = launch(server, path, backend_kind, extra_args)
         if process is None:
             text = diagnostic.decode(errors="replace")
             if backend_kind == "io_uring" and \
@@ -1672,14 +1684,21 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
                 return "skip", text
             raise AssertionError(f"{backend_kind} binary replacement server failed:\n{text}")
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+            raw = socket.create_connection(("127.0.0.1", port), timeout=3)
+            client_socket = context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=False) if context else raw
+            with client_socket as client:
                 client.sendall(request)
                 with upstream.accept()[0] as peer:
                     peer.settimeout(3)
-                    recv_until(peer, b"\r\n\r\n")
+                    received = recv_until(peer, b"\r\n\r\n")
+                    if validate_request:
+                        validate_request(received)
                     peer.sendall(response)
-                    if not recv_http_response(client).startswith(b"HTTP/1.1 101"):
+                    received = recv_http_response(client)
+                    if not received.startswith(b"HTTP/1.1 101"):
                         raise AssertionError("binary replacement handshake failed")
+                    if validate_response:
+                        validate_response(received)
                     exchange(client, peer)
         finally:
             process.terminate()
@@ -1693,7 +1712,8 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
 
 def native_binary_source_removal_scenario(server, compiler, backend_kind,
                                          handler=BINARY_HANDLER, exchange=binary_exchange,
-                                         declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS, tls=False):
+                                         declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS, tls=False,
+                                         validate_request=None, validate_response=None):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-native-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -1755,11 +1775,17 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind,
                 client.sendall(request)
                 with upstream.accept()[0] as peer:
                     peer.settimeout(3)
-                    if not recv_until(peer, b"\r\n\r\n").startswith(b"GET /ws "):
+                    received = recv_until(peer, b"\r\n\r\n")
+                    if not received.startswith(b"GET /ws "):
                         raise AssertionError("native artifact did not forward valid handshake")
+                    if validate_request:
+                        validate_request(received)
                     peer.sendall(response)
-                    if not recv_http_response(client).startswith(b"HTTP/1.1 101"):
+                    received = recv_http_response(client)
+                    if not received.startswith(b"HTTP/1.1 101"):
                         raise AssertionError("native artifact did not relay valid 101")
+                    if validate_response:
+                        validate_response(received)
                     exchange(client, peer)
         finally:
             process.terminate()
@@ -1781,7 +1807,7 @@ def recv_exact(sock, length):
     return bytes(data)
 
 
-def recv_client_frame(sock):
+def recv_client_frame(sock, metadata=False):
     first, second = recv_exact(sock, 2)
     length = second & 0x7F
     if length == 126:
@@ -1799,6 +1825,12 @@ def recv_client_frame(sock):
     if mask_key:
         for index in range(length):
             payload[index] ^= mask_key[index & 3]
+    if first & 0x30:
+        raise AssertionError("unexpected reserved frame bits")
+    if metadata:
+        return first & 0x0F, bytes(payload), bool(mask_key), bool(first & 0x80), bool(first & 0x40)
+    if first & 0x40:
+        raise AssertionError("compressed frame without a negotiated test decoder")
     return first & 0x0F, bytes(payload), bool(mask_key)
 
 
@@ -2734,6 +2766,197 @@ def subprotocol_scenario(server, backend_kind):
     return "pass", ""
 
 
+class CompressionPeer:
+    def __init__(self, enabled, masked, window=15, send_no_context=False, receive_no_context=False):
+        self.enabled = enabled
+        self.masked = masked
+        self.window = window
+        self.send_no_context = send_no_context
+        self.receive_no_context = receive_no_context
+        self.encoder = self.new_encoder()
+        self.decoder = zlib.decompressobj(wbits=-window)
+
+    def new_encoder(self):
+        return zlib.compressobj(wbits=-max(self.window, 9),
+                                strategy=zlib.Z_HUFFMAN_ONLY if self.window == 8 else zlib.Z_DEFAULT_STRATEGY)
+
+    def frame(self, opcode, payload, compress=True, fragmented=False):
+        encoded = self.enabled and compress and opcode in (1, 2)
+        if encoded:
+            if self.send_no_context:
+                self.encoder = self.new_encoder()
+            payload = self.encoder.compress(payload) + self.encoder.flush(zlib.Z_SYNC_FLUSH)
+            if not payload.endswith(b"\0\0\xff\xff"):
+                raise AssertionError("reference compressor did not sync flush")
+            payload = payload[:-4]
+        if fragmented:
+            half = max(1, len(payload) // 2)
+            return (wire_frame(opcode, payload[:half], masked=self.masked, fin=False, compressed=encoded)
+                    + wire_frame(9, b"inside", masked=self.masked)
+                    + wire_frame(0, payload[half:], masked=self.masked))
+        return wire_frame(opcode, payload, masked=self.masked, compressed=encoded)
+
+    def receive(self, sock, opcode, payload, compressed=None):
+        kind, body, masked, fin, encoded = recv_client_frame(sock, metadata=True)
+        if kind != opcode or masked == self.masked or not fin:
+            raise AssertionError(f"compression endpoint framing: {kind=} {masked=} {fin=}")
+        if encoded:
+            if not self.enabled or opcode not in (1, 2):
+                raise AssertionError("unnegotiated or compressed control frame")
+            if self.receive_no_context:
+                self.decoder = zlib.decompressobj(wbits=-self.window)
+            body = self.decoder.decompress(body + b"\0\0\xff\xff", 262131)
+            if self.decoder.unconsumed_tail or self.decoder.unused_data:
+                raise AssertionError("invalid or unbounded gateway compression output")
+        if compressed is not None and encoded != compressed:
+            raise AssertionError(f"unexpected compression choice: {encoded=} expected={compressed}")
+        if body != payload:
+            raise AssertionError(f"compression changed message: received={len(body)} expected={len(payload)}")
+
+
+def compression_scenario(server, compiler, backend, downstream, upstream, native=False, tls=False,
+                         window=15, no_context=False, dynamic=False, coalesced=False, maximum=False,
+                         coalesced_maximum=False):
+    client_peer = CompressionPeer(downstream, True, window, no_context, True)
+    upstream_peer = CompressionPeer(upstream, False, window, no_context, no_context)
+    parameters = (f"; server_max_window_bits={window}; client_max_window_bits={window}".encode())
+    client_offer = b"permessage-deflate" + parameters
+    server_choice = b"permessage-deflate" + parameters
+    if no_context:
+        client_offer += b"; client_no_context_takeover"
+        server_choice += b"; client_no_context_takeover; server_no_context_takeover"
+    request = REQUEST[:-2] + (b"Sec-WebSocket-Extensions: " + client_offer + b"\r\n" if downstream else b"") + b"\r\n"
+    response = WS_RESPONSE_HEADERS[:-2] + (b"Sec-WebSocket-Extensions: " + server_choice + b"\r\n" if upstream else b"") + b"\r\n"
+    early_client, early_upstream = b"keep:" + b"Hello" * 1000, b"keep:" + b"World" * 2000
+    early_upstream_kind = 1
+    if coalesced_maximum:
+        early_upstream = os.urandom(262130)
+        early_upstream_kind = 2
+    if coalesced:
+        request += client_peer.frame(1, early_client)
+        response += upstream_peer.frame(early_upstream_kind, early_upstream)
+    action = "msg.forward(chosen(msg.payload, msg.text))" if dynamic else "msg.forward()"
+    handler = ("return websocket(ws, maxMessageSize: 262130b) { msg in\n"
+               "if msg.isText && msg.text.hasPrefix(\"drop:\") { msg.drop() }\n"
+               + action + "\n}")
+
+    def validate_request(header):
+        values = [line.split(b":", 1)[1].strip() for line in header.split(b"\r\n")
+                  if line.lower().startswith(b"sec-websocket-extensions:")]
+        if values != [b"permessage-deflate; client_no_context_takeover; client_max_window_bits"]:
+            raise AssertionError(f"upstream offer did not belong to the gateway: {values!r}")
+
+    def validate_response(header):
+        values = [line.split(b":", 1)[1].strip() for line in header.split(b"\r\n")
+                  if line.lower().startswith(b"sec-websocket-extensions:")]
+        if len(values) != int(downstream):
+            raise AssertionError(f"downstream agreement copied the upstream: {values!r}")
+        if downstream:
+            if b"server_no_context_takeover" not in values[0] or \
+                    f"server_max_window_bits={window}".encode() not in values[0] or \
+                    f"client_max_window_bits={window}".encode() not in values[0]:
+                raise AssertionError(f"downstream window/no-context agreement changed: {values!r}")
+            if (b"client_no_context_takeover" in values[0]) != no_context:
+                raise AssertionError("client no-context hint did not match its agreement")
+
+    def exchange(client, peer):
+        def output_kind(kind):
+            return 2 if dynamic and kind in (1, 2) else kind
+        if coalesced:
+            upstream_peer.receive(peer, output_kind(1), early_client)
+            client_peer.receive(client, output_kind(early_upstream_kind), early_upstream)
+        for source, target, sender, receiver in ((client, peer, client_peer, upstream_peer),
+                                                 (peer, client, upstream_peer, client_peer)):
+            repeated = b"dictionary:" + b"Hello" * 1000
+            source.sendall(sender.frame(1, b"drop:" + repeated))
+            source.sendall(sender.frame(9, b"after-drop"))
+            receiver.receive(target, 9, b"after-drop", compressed=False)
+            # The next compressed message can reference bytes from the dropped one.
+            source.sendall(sender.frame(1, b"keep:" + repeated))
+            receiver.receive(target, output_kind(1), b"keep:" + repeated)
+            source.sendall(sender.frame(1, b"raw:" + repeated, compress=False))
+            receiver.receive(target, output_kind(1), b"raw:" + repeated)
+            text = b"keep:" + b"x" * 16378 + "€".encode() + b"y" * 20000
+            source.sendall(sender.frame(1, text, fragmented=True))
+            receiver.receive(target, 9, b"inside", compressed=False)
+            receiver.receive(target, output_kind(1), text)
+            target.sendall(receiver.frame(10, b"inside"))
+            sender.receive(source, 10, b"inside", compressed=False)
+            if maximum:
+                arbitrary = os.urandom(262130)
+                source.sendall(sender.frame(2, arbitrary))
+                receiver.receive(target, 2, arbitrary, compressed=False)
+            else:
+                arbitrary = b"\xff\0binary" * 1024
+                source.sendall(sender.frame(2, arbitrary))
+                receiver.receive(target, 2, arbitrary)
+        client.sendall(client_peer.frame(8, b"\x03\xe8"))
+        upstream_peer.receive(peer, 8, b"\x03\xe8", compressed=False)
+        client_peer.receive(client, 8, b"\x03\xe8", compressed=False)
+        peer.sendall(upstream_peer.frame(8, b"\x03\xe8"))
+        if client.recv(1) != b"":
+            raise AssertionError("compressed session did not complete its close handshake")
+
+    declarations = BULK_DYNAMIC_DECLARATIONS if dynamic else ""
+    if native:
+        return native_binary_source_removal_scenario(server, compiler, backend, handler, exchange,
+                                                     declarations, request, response, tls=tls,
+                                                     validate_request=validate_request,
+                                                     validate_response=validate_response)
+    return binary_replacement_scenario(server, backend, handler, exchange, declarations, request,
+                                       response, tls=tls, validate_request=validate_request,
+                                       validate_response=validate_response)
+
+
+def compression_rejection_scenario(server, compiler, backend, failure, from_client, native=False,
+                                   tls=False):
+    extension = b"Sec-WebSocket-Extensions: permessage-deflate\r\n"
+    request = REQUEST[:-2] + (b"" if failure == "unnegotiated" else extension) + b"\r\n"
+    response = WS_RESPONSE_HEADERS[:-2] + (b"" if failure == "unnegotiated" else extension) + b"\r\n"
+
+    def exchange(client, peer):
+        source, target = (client, peer) if from_client else (peer, client)
+        sender = CompressionPeer(True, from_client)
+        if failure == "malformed":
+            wire = wire_frame(1, b"\xff", masked=from_client, compressed=True)
+        elif failure == "control":
+            wire = wire_frame(9, b"bad", masked=from_client, compressed=True)
+        elif failure == "utf8":
+            wire = sender.frame(1, b"\xff")
+        elif failure == "limit":
+            wire = sender.frame(2, b"x" * 33)
+        elif failure == "unnegotiated":
+            wire = sender.frame(1, b"not negotiated")
+        else:
+            raise AssertionError(f"unknown compression failure {failure}")
+        source.sendall(wire)
+        for endpoint in (target, source):
+            try:
+                leaked = endpoint.recv(4096)
+            except (ConnectionResetError, ssl.SSLEOFError):
+                leaked = b""
+            if leaked:
+                raise AssertionError(f"invalid compressed message reached application/output: {leaked!r}")
+
+    handler = 'return websocket(ws, maxMessageSize: 32b) { msg in msg.forward("handler ran") }'
+    runner = native_binary_source_removal_scenario if native else binary_replacement_scenario
+    prefix = (server, compiler, backend) if native else (server, backend)
+    return runner(*prefix, handler, exchange, request=request, response=response, tls=tls)
+
+
+def negotiated_connection_scenario(server, compiler, backend, native=False, tls=False):
+    request = REQUEST[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n"
+    response = WS_RESPONSE_HEADERS[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n"
+
+    def exchange(client, peer):
+        connection_exchange(client, peer, b"tls:chat" if tls else b"plain:chat")
+
+    runner = native_binary_source_removal_scenario if native else binary_replacement_scenario
+    prefix = (server, compiler, backend) if native else (server, backend)
+    return runner(*prefix, CONNECTION_HANDLER, exchange, CONNECTION_DECLARATIONS,
+                  request=request, response=response, tls=tls)
+
+
 BULK_HANDLER = "return websocket(ws, maxMessageSize: 262130b) { msg in msg.forward() }"
 BULK_DYNAMIC_DECLARATIONS = r'''func chosen(_ bytes: Bytes, _ text: str) -> Bytes {
  let unused = sha256(text)
@@ -2975,6 +3198,37 @@ def main():
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
+        for native in (False, True):
+            for tls in (False, True):
+                for downstream in (False, True):
+                    for upstream in (False, True):
+                        status, details = compression_scenario(
+                            args.server, args.compiler, backend, downstream, upstream,
+                            native=native, tls=tls, dynamic=True, coalesced=True)
+                        print(f"{status.upper()} {backend} compression native={native} TLS={tls} "
+                              f"downstream={downstream} upstream={upstream}: {details}")
+                status, details = negotiated_connection_scenario(
+                    args.server, args.compiler, backend, native=native, tls=tls)
+                print(f"{status.upper()} {backend} peer-selected protocol native={native} TLS={tls}: {details}")
+                for upstream in (False, True):
+                    status, details = compression_scenario(
+                        args.server, args.compiler, backend, True, upstream,
+                        native=native, tls=tls, coalesced=True, coalesced_maximum=True)
+                    print(f"{status.upper()} {backend} coalesced maximum native={native} TLS={tls} "
+                          f"upstream={upstream}: {details}")
+                for window in (8, 15):
+                    status, details = compression_scenario(
+                        args.server, args.compiler, backend, True, True, native=native, tls=tls,
+                        window=window, no_context=True, maximum=True)
+                    print(f"{status.upper()} {backend} compression boundaries native={native} "
+                          f"TLS={tls} window={window}: {details}")
+                for failure in ("malformed", "control", "utf8", "limit", "unnegotiated"):
+                    for from_client in (False, True):
+                        status, details = compression_rejection_scenario(
+                            args.server, args.compiler, backend, failure, from_client,
+                            native=native, tls=tls)
+                        print(f"{status.upper()} {backend} compression reject={failure} "
+                              f"client={from_client} native={native} TLS={tls}: {details}")
         for handler, exchange, declarations in (
                 ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
                  peer_close_exchange(True, b""), ""),

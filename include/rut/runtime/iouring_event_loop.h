@@ -3335,6 +3335,7 @@ public:
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
         // kernel op), so reclaim them now. Output slices can be owned by a send and
         // are reclaimed only after pending operations drain.
+        c.free_ws_codecs(pool);
         if (c.ws_c2u_msg) {
             pool.free(c.ws_c2u_msg);
             c.ws_c2u_msg = nullptr;
@@ -3532,7 +3533,8 @@ public:
             return true;
         }
         const bool kBoundedWs = c.is_ws_tunnel && c.is_ws_terminate &&
-                                c.ws_max_message_size > kWsTerminateMessageCapacity;
+                                (c.ws_max_message_size > kWsTerminateMessageCapacity ||
+                                 c.ws_downstream_codec || c.ws_upstream_codec);
         const u32 kAvailable = c.tls_active ? c.tls_in_buf.write_avail() : c.recv_buf.write_avail();
         const bool kSubmitted = kBoundedWs ? backend.add_recv_once(c.fd, c.id, kAvailable)
                                            : backend.add_recv(c.fd, c.id);
@@ -4563,12 +4565,23 @@ public:
     // by pipeline_advance/recover; it does not change the recv primitive.
     [[nodiscard]] bool use_one_shot_upstream_recv(const Connection& c) const {
 #if RUT_ENABLE_WEBSOCKET
+        // A server may coalesce its first full-sized frame with the 101. Bound
+        // the initial response read too: no tunnel callback can drain data
+        // while multishot CQEs are still filling the HTTP header buffer.
+        if (c.is_ws_terminate_route && c.req_wants_upgrade && !c.is_ws_tunnel &&
+            c.protocol == ConnProtocol::Http11 &&
+            c.ws_handshake_phase == WsHandshakePhase::Prepared && c.ws_handshake_slice &&
+            c.fd >= 0 && c.upstream_fd >= 0 && valid_upstream_episode(c.upstream_episode) &&
+            !c.upstream_episode_quarantined && !c.upstream_abandoned &&
+            (c.on_upstream_recv == &on_upstream_response<Self> ||
+             c.on_upstream_recv == &on_early_upstream_recvd_send_inflight<Self>))
+            return true;
         // A fixed rewrite can expand several tiny inputs into multiple full
         // output batches. Bound each upstream read by available receive space:
         // multishot CQEs otherwise append before callbacks can drain that space.
         if (c.is_ws_tunnel && c.is_ws_terminate &&
-            (c.ws_max_message_size > kWsTerminateMessageCapacity ||
-             (c.ws_has_nonempty_rewrite() && !c.ws_closing)) &&
+            (c.ws_max_message_size > kWsTerminateMessageCapacity || c.ws_downstream_codec ||
+             c.ws_upstream_codec || (c.ws_has_nonempty_rewrite() && !c.ws_closing)) &&
             c.fd >= 0 && c.upstream_fd >= 0 && c.on_upstream_recv == &on_ws_upstream_recv<Self> &&
             valid_upstream_episode(c.upstream_episode) && !c.upstream_episode_quarantined &&
             !c.upstream_abandoned)

@@ -1039,6 +1039,7 @@ public:
         c.ws_handshake_phase = WsHandshakePhase::None;
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
         // kernel op), so reclaim them now regardless of the async deferred path below.
+        c.free_ws_codecs(pool);
         if (c.ws_c2u_msg) {
             pool.free(c.ws_c2u_msg);
             c.ws_c2u_msg = nullptr;

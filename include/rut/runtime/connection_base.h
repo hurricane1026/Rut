@@ -20,6 +20,8 @@
 #include "rut/runtime/listener_context.h"
 #include "rut/runtime/response_body_chain.h"
 #include "rut/runtime/tls_engine.h"
+#include "rut/runtime/ws_deflate.h"
+#include "rut/runtime/ws_extensions.h"
 #include "rut/runtime/ws_terminate.h"
 
 #ifdef __linux__
@@ -650,6 +652,7 @@ struct ConnectionBase {
     // Bytes actually sent for the 101 header block after response mutations.
     // Access logging and capture account this length, not the upstream prefix.
     u32 ws_upgrade_sent_len;
+    u32 ws_client_header_len = 0;  // before gateway subprotocol/extension rewrites
     // Upstream closed during pre-tunnel 101 handling and should be closed once
     // tunnel mode is fully entered (after preserving buffered early bytes).
     bool ws_pre_tunnel_upstream_closed;
@@ -678,7 +681,12 @@ struct ConnectionBase {
     u8* ws_handshake_slice = nullptr;
     u32 ws_handshake_offers_len = 0;
     WsHandshakePhase ws_handshake_phase = WsHandshakePhase::None;
-    Str ws_subprotocol{};  // immutable route-owned policy, pinned with request_config
+    Str ws_subprotocol{};             // immutable route-owned policy, pinned with request_config
+    Str ws_negotiated_subprotocol{};  // borrowed from the retained owned 101 header
+    WsDeflateAgreement ws_downstream_deflate{};
+    WsDeflateAgreement ws_upstream_deflate{};
+    WsDeflateCodec* ws_downstream_codec = nullptr;
+    WsDeflateCodec* ws_upstream_codec = nullptr;
     WsMessageHandlerFn ws_open_handler = nullptr;
     WsMessageHandlerFn ws_close_handler = nullptr;
     bool ws_session_started = false;
@@ -725,12 +733,33 @@ struct ConnectionBase {
     bool alloc_ws_buffers(SlicePool& pool) {
         if (ws_max_message_size > kWsMaxMessageCapacity) return false;
         const u32 kCapacity = ws_buffer_capacity();
+        const WsDeflateOptions kDownstream{ws_downstream_deflate.client_window,
+                                           ws_downstream_deflate.server_window,
+                                           ws_downstream_deflate.client_no_context_takeover};
+        const WsDeflateOptions kUpstream{ws_upstream_deflate.server_window,
+                                         ws_upstream_deflate.client_window,
+                                         ws_upstream_deflate.server_no_context_takeover};
+#if RUT_ENABLE_WEBSOCKET
+        const bool kCodecsMatch =
+            (ws_downstream_deflate.enabled
+                 ? ws_downstream_codec && ws_deflate_matches(*ws_downstream_codec, kDownstream)
+                 : ws_downstream_codec == nullptr) &&
+            (ws_upstream_deflate.enabled
+                 ? ws_upstream_codec && ws_deflate_matches(*ws_upstream_codec, kUpstream)
+                 : ws_upstream_codec == nullptr);
+#else
+        const bool kCodecsMatch = !ws_downstream_codec && !ws_upstream_codec;
+        (void)kDownstream;
+        (void)kUpstream;
+        if (ws_downstream_deflate.enabled || ws_upstream_deflate.enabled) return false;
+#endif
         if (ws_c2u_msg || ws_u2c_msg || ws_c2u_out || ws_u2c_out)
-            return ws_c2u_msg && ws_u2c_msg && ws_c2u_out && ws_u2c_out &&
+            return kCodecsMatch && ws_c2u_msg && ws_u2c_msg && ws_c2u_out && ws_u2c_out &&
                    pool.capacity_of(ws_c2u_msg) == kCapacity &&
                    pool.capacity_of(ws_u2c_msg) == kCapacity &&
                    pool.capacity_of(ws_c2u_out) == kCapacity &&
                    pool.capacity_of(ws_u2c_out) == kCapacity;
+        if (ws_downstream_codec || ws_upstream_codec) return false;
         // These allocations become mutable reassembly and asynchronous send storage.
         // NOLINTNEXTLINE(misc-const-correctness)
         u8* buffers[4]{};
@@ -741,11 +770,40 @@ struct ConnectionBase {
                 return false;
             }
         }
+#if RUT_ENABLE_WEBSOCKET
+        WsDeflateCodec* const kDownstreamCodec =
+            ws_downstream_deflate.enabled ? ws_deflate_create(pool, kDownstream) : nullptr;
+        WsDeflateCodec* const kUpstreamCodec =
+            ws_upstream_deflate.enabled ? ws_deflate_create(pool, kUpstream) : nullptr;
+        if ((ws_downstream_deflate.enabled && !kDownstreamCodec) ||
+            (ws_upstream_deflate.enabled && !kUpstreamCodec)) {
+            ws_deflate_destroy(pool, kDownstreamCodec);
+            ws_deflate_destroy(pool, kUpstreamCodec);
+            for (u8* buffer : buffers) pool.free(buffer);
+            return false;
+        }
+        ws_downstream_codec = kDownstreamCodec;
+        ws_upstream_codec = kUpstreamCodec;
+#endif
         ws_c2u_msg = buffers[0];
         ws_u2c_msg = buffers[1];
         ws_c2u_out = buffers[2];
         ws_u2c_out = buffers[3];
         return true;
+    }
+    void free_ws_codecs(SlicePool& pool) {
+#if RUT_ENABLE_WEBSOCKET
+        ws_deflate_destroy(pool, ws_downstream_codec);
+        ws_deflate_destroy(pool, ws_upstream_codec);
+#else
+        (void)pool;
+#endif
+        ws_downstream_codec = nullptr;
+        ws_upstream_codec = nullptr;
+        ws_c2u.decoder = nullptr;
+        ws_c2u.encoder = nullptr;
+        ws_u2c.decoder = nullptr;
+        ws_u2c.encoder = nullptr;
     }
     u32 ws_c2u_consumed;  // recv_buf bytes consumed by the in-flight c->u send
     u32 ws_u2c_consumed;  // upstream_recv_buf bytes consumed by the in-flight u->c send
@@ -2130,6 +2188,7 @@ struct ConnectionBase {
         ws_upstream_send_len = 0;
         ws_upgrade_response_len = 0;
         ws_upgrade_sent_len = 0;
+        ws_client_header_len = 0;
         ws_pre_tunnel_upstream_closed = false;
         ws_client_eof = false;
         ws_upstream_eof = false;
@@ -2141,6 +2200,11 @@ struct ConnectionBase {
         ws_handshake_offers_len = 0;
         ws_handshake_phase = WsHandshakePhase::None;
         ws_subprotocol = {};
+        ws_negotiated_subprotocol = {};
+        ws_downstream_deflate = {};
+        ws_upstream_deflate = {};
+        ws_downstream_codec = nullptr;
+        ws_upstream_codec = nullptr;
         ws_handler = nullptr;
         ws_open_handler = nullptr;
         ws_close_handler = nullptr;
@@ -2158,6 +2222,10 @@ struct ConnectionBase {
         ws_handler_output = {};
         ws_c2u.dynamic_output = nullptr;
         ws_u2c.dynamic_output = nullptr;
+        ws_c2u.decoder = nullptr;
+        ws_c2u.encoder = nullptr;
+        ws_u2c.decoder = nullptr;
+        ws_u2c.encoder = nullptr;
         ws_forward_texts = nullptr;
         ws_forward_text_count = 0;
         ws_c2u.reset();

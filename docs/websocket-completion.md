@@ -14,9 +14,9 @@ does not turn target syntax into supported syntax. The language card and
   WebSocket upstream connections on rejection and no request-view capture.
 - [ ] General message expressions, local evaluation and control flow through the
   normal compiler; preserve short-circuit, optional/error and helper semantics.
-- [ ] General bounded Text/Binary output with owned asynchronous send storage.
+- [x] General bounded Text/Binary output with owned asynchronous send storage.
 - [x] Connection and close context with explicit callback/session lifetimes.
-- [ ] RFC 7692 compression negotiation and bounded encode/decode resources.
+- [x] RFC 7692 compression negotiation and bounded encode/decode resources.
 - [x] Bounded messages beyond a single I/O slice, backpressure and cancellation.
 - [ ] Interoperability and malformed-input validation for both Linux backends,
   source/JIT and native programs, feature-disabled builds and sanitizer checks.
@@ -117,5 +117,24 @@ compresses destination output. Recompression uses the completed message buffer
 only after copying the result into disjoint owned send storage; bounded attempts
 retain the original frame for incompressible fallback. Controls remain uncompressed,
 and closing discards application bytes without running the codec. Extension
-negotiation and session codec ownership are not yet wired, so compression remains
-unchecked above and is not advertised to peers.
+negotiation and session ownership now run independently on each leg, with atomic
+codec admission before 101 and teardown integrated with deferred output ownership.
+Source/native × TLS × both Linux backends cover independent negotiation, dropped
+history, fragmented data/control interleaving, windows 8/15, incompressible maximum
+messages, a maximum frame coalesced with 101, invalid streams, UTF-8 and decoded
+limits. The maximum-frame test found and fixes an io_uring completion-order stall:
+another callback can consume bytes copied for a terminal recv, so the empty-input
+callback must still restore its receive owner. Full regression/sanitizer and final
+review evidence is recorded separately before checking the broad criteria.
+
+
+Session compression validation now passes 462 end-to-end cases with no skips.
+Normal and ASan/UBSan runs pass codec/inspection, extension grammar/rewrite,
+frame, bulk allocation and asynchronous shutdown tests. A WebSocket/JIT-disabled
+build and its inspection baseline also pass, and both ordinary runtime binaries
+retain a libc-only ELF dependency list. The remaining language audit compares
+against implemented ordinary expression/helper behavior: source interpolation
+and non-response statement effects inside helpers currently fail in both HTTP
+and WebSocket, so they are shared language limitations rather than an accepted
+WebSocket behavior. Phase-specific Request/Response access and yielding remain
+explicitly unavailable after upgrade.
