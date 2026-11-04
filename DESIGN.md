@@ -2662,7 +2662,8 @@ in the final verdict or a guard else-branch. It reuses the existing exact-byte
 literal decoder and its 4096-byte decoded limit; it must also fit `maxMessageSize`.
 The adjacent `b"..."` form accepts raw bytes and the escapes `\n`, `\r`,
 `\t`, `\\`, `\"`, and `\xHH`; NUL is `\x00`. Empty and non-UTF-8 payloads are valid.
-Concatenation, variable references, Unicode escapes and interpolation are rejected.
+Immutable Bytes aliases and pure helpers normalized to these literals are also
+accepted. Concatenation, dynamic Bytes, Unicode escapes and interpolation are rejected.
 Text or Binary input becomes Binary output; ordinary string replacements still
 produce Text. Bare `forward()` keeps the original message, and control frames
 bypass the handler. Malformed Text input remains a protocol error before dispatch.
@@ -2889,8 +2890,9 @@ infallible reads preserves eager-let semantics without introducing deferred
 fallible work or runtime storage. Predicates consume normalized HIR in the
 existing bounded lowerer; aliases never enter the HTTP route's local storage.
 Message aliases can receive verdicts, and text aliases can feed the existing
-text recipe and JSON parse guards. Fixed Binary output and close reasons keep
-their literal-only contracts; close codes accept constant integer aliases.
+text recipe and JSON parse guards. Fixed Binary output accepts Bytes aliases and
+pure helper results that normalize to exact-byte literals; borrowed dynamic Bytes output remains absent. Close reasons
+keep their literal-only contract; close codes accept constant integer aliases.
 
 The lexical scope includes compile-time admission constants and is discarded at
 the callback boundary. Locals require fresh names across lets, captures and JSON
@@ -3014,6 +3016,25 @@ cycle and action checks remain. Compiler source clauses stay bounded separately.
 JSON mutations, dynamic pointer expressions, general optional computations and
 initializer-less shorthand bindings remain absent. No runtime storage, native
 format, accessor tag or handler ABI is added.
+
+Ordinary optional helper results now use the same bounded continuation lowering.
+Successful leaves may be the existing infallible immutable subset: scalar/Bytes
+literals, borrowed message/field aliases, byte counts, supported comparisons and
+Boolean composition. A leaf stores a private descriptor pointing into the callback
+normalization pool; publishing it adds only a compiler-local immutable binding.
+Scoped ValueOf proofs can supply later selectors, message text parsing and literal
+JSON pointers. Each selected alternative retains its own normalized value; false,
+zero and empty text/Bytes remain present. Callback arm exit restores both value
+and JSON alias scopes. No borrowed view escapes the synchronous message callback.
+
+Inside nullable helpers, ordinary eager `.or(fallback)` / `any(value, fallback)`
+may lower to presence alternatives only when the fallback normalizes to that
+infallible immutable subset. Omitting its evaluation on a present path cannot
+change effects or errors. Regex scans, HTTP/state effects and other fallible
+fallback work are rejected, preserving ordinary evaluation/error semantics.
+General optional locals and computations remain absent. Compile-time Bytes aliases
+and helper results also feed the existing LiteralBinary recipe; borrowing a
+message payload does not make dynamic Binary output supported.
 
 A branch sequence tracks its entry and pending continuation edge. A guard's
 success edge or an early if's false edge is patched to the next source condition,

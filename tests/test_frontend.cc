@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/ws_optional_values.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
 #include "rut/compiler/analyze.h"
@@ -5585,6 +5586,90 @@ TEST(frontend, parse_rejects_websocket_block_without_message_binding) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ name in ... }`")));
+}
+
+TEST(frontend, websocket_optional_values_keep_owned_proofs_and_plain_concept_types) {
+    auto tokens = lex(lit(test::ws_optional_values::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto copied = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*copied);
+    REQUIRE(hir);
+    copied.reset();
+    REQUIRE_EQ(hir->routes.len, 8u);
+    for (const auto& route : hir->routes) CHECK_EQ(route.locals.len, 0u);
+    CHECK(hir->routes[4].ws_handler.forward_payload.source == HirWsTextSource::LiteralBinary);
+    CHECK(hir->routes[7].ws_handler.len_guards.len <= HirWsHandler::kMaxConditionNodes);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, websocket_optional_values_reject_scope_effects_and_dynamic_payloads) {
+    const char* bodies[] = {
+        "if let text = maybeText(msg) { msg.drop() } else { msg.forward(text) }",
+        "if let text = maybeText(msg) { msg.drop() } msg.forward(text)",
+        "guard let text = maybeText(msg) else { msg.forward(text) } msg.forward()",
+        "if let text = maybeText(msg) { let alias = text msg.drop() } else { msg.forward(alias) }",
+        "guard let bytes = maybeBytes(msg) else { msg.drop() } msg.forward(bytes)",
+        "if let value = identity(false) { msg.forward() } else { msg.drop() }",
+        "guard let root = json.parse(msg.text) else { msg.drop() } "
+        "guard let text = fallback(msg, root) else { msg.drop() } msg.forward()",
+        "guard let text = dynamicPointer(msg) else { msg.drop() } msg.forward(text)"};
+    const char* definitions = R"rut(upstream ws
+func identity<T>(_ value: T) -> T => value
+func maybeText(_ msg: WebSocketMessage) -> str { if msg.fromClient { msg.text } else { nil } }
+func maybeBytes(_ msg: WebSocketMessage) -> Bytes { if msg.fromClient { msg.payload } else { nil } }
+func fallback(_ msg: WebSocketMessage, _ root: Json) -> bool {
+    guard msg.isText else { nil }
+    json.bool(root).or(msg.text.matches(re"ok"))
+}
+func dynamicPointer(_ msg: WebSocketMessage) -> str {
+    guard let pointer = maybeText(msg) else { nil }
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = json.get(root, pointer) else { nil }
+    json.string(field)
+}
+)rut";
+    for (const char* body : bodies) {
+        std::string source = definitions;
+        source += "route GET \"/ws\" { return websocket(ws) { msg in ";
+        source += body;
+        source += " } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+}
+
+TEST(frontend, websocket_optional_values_keep_ordinary_clause_limit) {
+    for (u32 count : {3u, 4u}) {
+        std::string source = R"rut(upstream ws
+func maybeText(_ msg: WebSocketMessage) -> str { if msg.fromClient { msg.text } else { nil } }
+route GET "/ws" { return websocket(ws) { msg in
+    guard let text = maybeText(msg) else { msg.drop() }
+)rut";
+        for (u32 i = 0; i < count; ++i) source += "guard text == \"ok\" else { msg.drop() }\n";
+        source += "msg.forward(text) } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (count == 3)
+            REQUIRE(hir);
+        else {
+            REQUIRE_FALSE(hir);
+            CHECK(hir.error().code == FrontendError::TooManyItems);
+        }
+    }
 }
 
 TEST(frontend, websocket_value_choices_specialize_guard_if_and_early_continuations) {

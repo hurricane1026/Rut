@@ -930,6 +930,14 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // Present null/false values do not take optional-binding fallbacks. Copies count
 // original source clauses once, but generated control/condition nodes and absence
 // joins share 32 nodes; all recipes share the existing bounded policy tables.
+// Nullable pure helpers may also return supported infallible immutable values:
+// scalar/Bytes literals, borrowed message/fields, byte counts and supported
+// comparisons/Boolean composition. Ordinary if-let/guard-let publishes these
+// values only on success. False, zero and empty str/Bytes are present.
+// Scoped helper bindings can feed later selectors, message text parsing and
+// literal JSON pointers. Within nullable helpers, .or(default) / any(value, default)
+// accepts the same infallible immutable defaults. Ordinary eager semantics are
+// preserved: regex scans, effects and other fallible defaults remain rejected.
 // JSON mutations, dynamic pointers, general optional computations, binding
 // shorthand, loops and general computation remain unsupported.
 func messageDocument(_ msg: WebSocketMessage) -> Json => json.parse(msg.text)
@@ -1169,16 +1177,18 @@ return websocket(chat, maxMessageSize: 4kb) { message in
     message.forward("message replaced")
 }
 
-// Fixed Binary replacement reuses exact-byte literals. It accepts arbitrary bytes,
+// Fixed Binary replacement reuses exact-byte literals, including immutable aliases
+// and pure helper results normalized to those literals. It accepts arbitrary bytes,
 // including NUL and invalid UTF-8, and emits Binary even for Text input.
 return websocket(chat, maxMessageSize: 4kb) { message in
     guard message.fromClient else { message.forward() }
     guard message.len != 0 else { message.forward(b"") }
     message.forward(b"\x00\xff")
 }
-// A replacement must be one adjacent b"..." literal, at most 4096 decoded bytes,
-// and fit maxMessageSize. Supported escapes: \n, \r, \t, \\, \" and \xHH (NUL is \x00).
-// No byte concatenation, variables, Unicode escapes or interpolation are accepted.
+// A replacement must normalize to one adjacent b"..." literal, at most 4096 decoded
+// bytes, and fit maxMessageSize. Supported escapes: \n, \r, \t, \\, \" and \xHH (NUL is \x00).
+// Byte concatenation, dynamic Bytes output, Unicode escapes and interpolation
+// remain unsupported.
 // Guard branches choose independent Text/Binary replacements; bare forward()
 // preserves the original type and payload. Invalid Text input is still rejected.
 

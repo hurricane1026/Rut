@@ -85,6 +85,81 @@ def binary_exchange(client, peer):
     expect(client, (8, b"\x03\xe8", False))
 
 
+
+OPTIONAL_VALUE_DECLARATIONS = r"""
+func safeName(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    json.string(root).or("fallback")
+}
+func bytesIfClient(_ msg: WebSocketMessage) -> Bytes {
+    if msg.fromClient { b"\x00\xff" }
+    else { if msg.isText { b"" } else { nil } }
+}
+"""
+
+OPTIONAL_DEFAULT_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let name = safeName(msg) else { msg.drop() }
+    guard !name.isEmpty else { msg.forward("empty") }
+    msg.forward("[" + name + "]")
+}
+"""
+
+OPTIONAL_BYTES_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let bytes = bytesIfClient(msg) else { msg.drop() }
+    msg.forward(bytes)
+}
+"""
+
+
+def optional_default_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"optional default: {actual=!r}, {expected=!r}")
+
+    payload = b'"a\\u0000b"'
+    first = bytearray(masked_frame(1, payload[:4]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, payload[4:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"[a\0b]", True))
+    client.sendall(masked_frame(1, b'""') + masked_frame(2, b"null") +
+                   masked_frame(1, b"broken") + masked_frame(1, b"false"))
+    expect(peer, (1, b"empty", True))
+    expect(peer, (1, b"[fallback]", True))
+    expect(peer, (1, b"[fallback]", True))
+    peer.sendall(b'\x82\x02""\x81\x040.00\x81\x06broken\x81\x04"ok"')
+    expect(client, (1, b"empty", False))
+    expect(client, (1, b"[fallback]", False))
+    expect(client, (1, b"[ok]", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def optional_bytes_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"optional Bytes: {actual=!r}, {expected=!r}")
+
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, b"\0"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\0\xff", True))
+    client.sendall(masked_frame(1, b"") + masked_frame(1, b"ok"))
+    expect(peer, (2, b"\0\xff", True))
+    expect(peer, (2, b"\0\xff", True))
+    # Absent server Binary is dropped; present empty Bytes emits an empty Binary.
+    peer.sendall(b"\x82\x01\xff\x81\x00\x81\x02ok")
+    expect(client, (2, b"", False))
+    expect(client, (2, b"", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
 NESTED_JSON_HANDLER = r"""
 return websocket(ws) { message in
     guard let document = json.parse(message.text) else { message.close(1007) }
@@ -1660,6 +1735,8 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (OPTIONAL_DEFAULT_HANDLER, optional_default_exchange, OPTIONAL_VALUE_DECLARATIONS),
+                (OPTIONAL_BYTES_HANDLER, optional_bytes_exchange, OPTIONAL_VALUE_DECLARATIONS),
                 (CHOICE_GUARD_HANDLER, choice_guard_exchange, CHOICE_DECLARATIONS),
                 (CHOICE_EARLY_HANDLER, choice_early_exchange, CHOICE_DECLARATIONS),
                 (HELPER_BINDING_HANDLER, helper_binding_exchange, HELPER_BINDING_DECLARATIONS),

@@ -161,7 +161,9 @@ and short-circuit behavior. An unused initializer is still checked.
 Message aliases may receive verdicts. A borrowed text alias may feed the existing
 text rewrite or `json.parse` guard; JSON guard aliases retain their existing
 proof and scope rules. Close codes may use constant integer aliases, while close
-reasons and fixed Binary replacements retain their existing literal-only forms.
+reasons retain their existing literal-only form. Fixed Binary replacements also
+accept immutable Bytes aliases and pure helper results normalized to literals;
+borrowed dynamic Bytes output remains unsupported.
 None of these aliases allocate runtime storage, retain a message beyond the
 callback, or become HTTP route locals. Compile-time HTTP admission constants
 remain capturable; request-borrowed values do not.
@@ -362,6 +364,46 @@ another supported JSON projection. General optional computations remain unsuppor
 may accept the borrowed message or its text, or an earlier validated JSON alias;
 it cannot supply an unrelated JSON document. Initializer-less shorthand bindings
 remain unsupported.
+
+Optional bindings also accept ordinary nullable pure helpers whose successful
+results normalize to the supported infallible immutable values: scalar and Bytes
+literals, borrowed message/field aliases, byte counts, supported comparisons and
+Boolean composition. The same values can flow through scoped helper bindings and
+selectors; a successful literal string may supply a JSON pointer. These use normal
+concept types and typing, including generic Eq helpers. Message aliases may receive
+verdicts; borrowed text aliases support existing text predicates and rewrites.
+
+```swift
+func clientText(_ msg: WebSocketMessage) -> str {
+    if msg.fromClient { msg.text } else { nil }
+}
+func safeName(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    json.string(root).or("fallback")
+}
+func replacement(_ msg: WebSocketMessage) -> Bytes {
+    if msg.fromClient { b"\x00\xff" } else { nil }
+}
+// Separate callback examples:
+// if let text = clientText(msg) { msg.forward("<" + text + ">") }
+// else { msg.forward() }
+// guard let name = safeName(msg) else { msg.drop() }
+// msg.forward("[" + name + "]")
+// guard let bytes = replacement(msg) else { msg.drop() }
+// msg.forward(bytes)
+```
+
+Within nullable helpers, `.or(default)` and `any(value, default)` support defaults
+that normalize to the same infallible immutable subset. They retain ordinary eager
+language semantics: this lowering is allowed only where skipping evaluation of a
+default cannot change effects or errors. Regex scans, HTTP/state operations and
+other fallible defaults remain rejected. A valid JSON value of the wrong scalar
+kind selects the default; malformed JSON in the example returns absence before
+reaching it. False, zero and empty defaults remain present. Literal Bytes aliases
+and pure helper results emit fixed Binary messages, including empty or non-UTF-8
+bytes. Borrowed Bytes may be inspected but cannot yet supply dynamic replacement
+output. General optional callback locals, arbitrary calculations and constant-string
+regex predicates remain unsupported. Existing source, graph and recipe limits apply.
 
 Presence is separate from truthiness: a valid `false`, `0`, empty string or empty
 collection count binds successfully. A JSON `null` node is present for parse,
