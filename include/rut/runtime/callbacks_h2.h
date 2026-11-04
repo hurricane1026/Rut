@@ -1191,6 +1191,18 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     return true;
 }
 
+// Cancels only the current stream's task on any terminal/failure exit. Another
+// parked stream must not be affected by an unrelated stream's response/reset.
+struct H2PasswordTaskGuard {
+    PasswordGateway* gateway;
+    u32 connection;
+    u32 stream;
+    bool retain = false;
+    ~H2PasswordTaskGuard() {
+        if (gateway && !retain) gateway->cancel_request(connection, password_h2_generation(stream));
+    }
+};
+
 // Invoke a JIT handler given the assembled HTTP/1 request bytes (headers, plus
 // body for POST), then serialize its response. A timer yield (wait(ms)) or
 // forwarding outcome parks the stream for async continuation; event yields are
@@ -1208,6 +1220,12 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     bool request_forwardable,
                     bool is_head = false,
                     const ParsedRequest* open_request = nullptr) {
+    auto* passwords = request_password_gateway(d.loop);
+    if (passwords && d.conn->h2->async_stream != 0 && d.conn->h2->async_stream != stream_id) {
+        h2_emit_status(d, stream_id, 503);
+        return;
+    }
+    H2PasswordTaskGuard password_task{passwords, d.conn->id, stream_id};
     bool retain_json = false;
     struct JsonLifetime {
         Connection* conn;
@@ -1238,8 +1256,14 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     ctx->route_param_count = param_count;
     for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = params[i];
 
-    JitDispatchOutcome kOutcome = invoke_jit_handler(
-        route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
+    JitDispatchOutcome kOutcome = invoke_jit_handler(route->fn,
+                                                     static_cast<void*>(d.conn),
+                                                     *ctx,
+                                                     synth,
+                                                     synth_len,
+                                                     /*arena=*/nullptr,
+                                                     passwords,
+                                                     stream_id);
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
         if (kOutcome.policy_bundle_id != 0) {
             if (cfg == nullptr || !cfg->policy_bundle_id_is_valid(kOutcome.policy_bundle_id)) {
@@ -1282,8 +1306,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                               is_head,
                               open_request))
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
-        else
+        else {
             retain_json = true;
+            password_task.retain = true;
+        }
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
@@ -1975,6 +2001,8 @@ inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*
 template <typename Loop>
 void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error err) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if (auto* passwords = request_password_gateway(d->loop))
+        passwords->cancel_request(d->conn->id, password_h2_generation(stream_id));
     if constexpr (requires {
                       d->loop->grpc_upstreams;
                       d->loop->pool.alloc_bulk();
@@ -2378,6 +2406,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     // (mirrors the HTTP/1 resume_jit_handler).
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     const u32 kStreamId = h2->async_stream;
+    H2PasswordTaskGuard password_task{request_password_gateway(loop), conn.id, kStreamId};
     const bool kIsHead = h2->async_is_head;
     auto* ctx = conn.jit_ctx();
     ctx->state = conn.handler_state;
@@ -2397,7 +2426,9 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                                      *ctx,
                                                      h2->pending_synth,
                                                      h2->async_synth_len,
-                                                     /*arena=*/nullptr);
+                                                     /*arena=*/nullptr,
+                                                     request_password_gateway(loop),
+                                                     kStreamId);
 
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
         if (kOutcome.policy_bundle_id != 0) {
@@ -2444,7 +2475,10 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         retain_json = true;
         h2->async_timer_ms = kOutcome.timer_ms;
         h2->async_state = static_cast<u16>(kOutcome.next_state);
-        if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
+        if (!h2_arm_async_timer<Loop>(loop, conn))
+            loop->close_conn(conn);
+        else
+            password_task.retain = true;
         return;
     }
 

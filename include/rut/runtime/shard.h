@@ -101,6 +101,8 @@ struct Shard {
 
     // Thread
     pthread_t thread = 0;
+    PasswordGateway automatic_password_gateway;
+    bool password_gateway_started = false;
     bool thread_spawned = false;  // true between spawn() and join()
 
     // Initialize shard: mmap EventLoop, init backend + arena.
@@ -387,8 +389,16 @@ struct Shard {
         // Validate before seeding so a rejected config is never left installed.
         const RouteConfig* seed = active_config ? active_config : route_config;
         if (seed != nullptr &&
-            (!seed->rate_limit_ids_valid() || !seed->forward_policy_tables_valid()))
+            (!seed->rate_limit_ids_valid() || !seed->forward_policy_tables_valid() ||
+             !seed->password_gateway_metadata_valid()))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+        if (seed && seed->requires_password_gateway()) {
+            if constexpr (!requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                              event_loop.password_gateway = gateway;
+                          }) {
+                return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+            }
+        }
         active_config = seed;
 
         pthread_attr_t attr;
@@ -424,9 +434,32 @@ struct Shard {
         (void)pin_cpu;  // macOS development shards run without CPU affinity.
 #endif
 
+        const bool kStartedPasswordNow =
+            !password_gateway_started && seed && seed->requires_password_gateway();
+        if (seed && seed->requires_password_gateway()) {
+            auto ready = prepare_password_gateway();
+            if (!ready) {
+                pthread_attr_destroy(&attr);
+                return ready;
+            }
+            if constexpr (requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                              event_loop.password_gateway = gateway;
+                          })
+                loop->password_gateway = &automatic_password_gateway;
+        }
         i32 rc = pthread_create(&thread, &attr, thread_entry, this);
         pthread_attr_destroy(&attr);
-        if (rc != 0) return core::make_unexpected(Error::make(rc, Error::Source::Thread));
+        if (rc != 0) {
+            if (kStartedPasswordNow) {
+                automatic_password_gateway.stop();
+                password_gateway_started = false;
+                if constexpr (requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                                  event_loop.password_gateway = gateway;
+                              })
+                    loop->password_gateway = nullptr;
+            }
+            return core::make_unexpected(Error::make(rc, Error::Source::Thread));
+        }
         thread_spawned = true;
         return {};
     }
@@ -470,8 +503,17 @@ struct Shard {
     // or rate-limit namespaces fail full validation is still refused (returns
     // false, nothing installed).
     bool reload_config_unchecked(const RouteConfig* cfg) {
-        if (cfg != nullptr && (!cfg->rate_limit_ids_valid() || !cfg->forward_policy_tables_valid()))
+        if (cfg != nullptr &&
+            (!cfg->rate_limit_ids_valid() || !cfg->forward_policy_tables_valid() ||
+             !cfg->password_gateway_metadata_valid()))
             return false;
+        if (cfg && cfg->requires_password_gateway()) {
+            if constexpr (!requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                              event_loop.password_gateway = gateway;
+                          }) {
+                return false;
+            }
+        }
         if (!thread_spawned) {
             // No thread — direct apply. The running path's poll_command() drains
             // the idle pool on every config adopt; this not-running path must do
@@ -485,6 +527,11 @@ struct Shard {
         }
         // Thread may be running or exiting. Queue atomically.
         // If thread consumes it — good. If not, join() applies it.
+        if (cfg && cfg->requires_password_gateway() && !password_gateway_started) {
+            if (!prepare_password_gateway()) return false;
+            control.pending_password_gateway.store(&automatic_password_gateway,
+                                                   std::memory_order_release);
+        }
         control.pending_config.store(cfg, std::memory_order_release);
         return true;
     }
@@ -506,6 +553,13 @@ struct Shard {
             // Apply any pending updates the thread didn't consume.
             // Thread is guaranteed gone — no race.
             auto* cfg = control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
+            if (auto* passwords =
+                    control.pending_password_gateway.exchange(nullptr, std::memory_order_acq_rel))
+                if constexpr (requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                                  event_loop.password_gateway = gateway;
+                              }) {
+                    if (loop) loop->password_gateway = passwords;
+                }
             if (cfg) {
                 // Mirror poll_command(): adopting a config on the not-running join
                 // path must also drop idle sockets parked under the old config, or
@@ -529,6 +583,14 @@ struct Shard {
     void shutdown() {
         stop();
         join();
+        automatic_password_gateway.stop();
+        password_gateway_started = false;
+        control.pending_password_gateway.store(nullptr, std::memory_order_relaxed);
+        if constexpr (requires(EventLoopType& event_loop, PasswordGateway* gateway) {
+                          event_loop.password_gateway = gateway;
+                      }) {
+            if (loop) loop->password_gateway = nullptr;
+        }
         if (loop) loop->live_access_log = nullptr;
         if (live_log_host_ring && live_log_lease.load(std::memory_order_acquire) == nullptr) {
             live_log_host_ring->~SourceLiveAccessLogHostRing();
@@ -572,6 +634,12 @@ struct Shard {
     }
 
 private:
+    core::Expected<void, Error> prepare_password_gateway() {
+        if (password_gateway_started) return {};
+        auto ready = automatic_password_gateway.start();
+        if (ready) password_gateway_started = true;
+        return ready;
+    }
 #if defined(__linux__) && !defined(__GLIBC__)
     i32 start_cpu = -1;
 #endif

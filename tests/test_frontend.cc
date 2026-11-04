@@ -44051,3 +44051,109 @@ TEST(frontend, websocket_guard_replacement_respects_max_message_size) {
 }
 
 #endif
+
+TEST(frontend, password_header_prefix_and_forged_rir_rejection) {
+    const char source[] = R"rut(route GET "/login" {
+        let result = passwordVerifyHeader("X-Password", "$rut-pbkdf2-sha256$600000$000102030405060708090a0b0c0d0e0f$3bc37118e625093e9b79ed08930ea7af7389591233fdd92dddf369371e60dbc0", 5000)
+        guard result == 1 else { return 401 }
+        return 200
+    })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    REQUIRE(rir::function_uses_password(fn));
+    REQUIRE(rir::password_prefix_valid(fn));
+    rir::Instruction* check = nullptr;
+    u32 index = 0;
+    for (u32 i = 0; i < fn.blocks[0].inst_count; ++i)
+        if (rir::is_password_prefix(fn.blocks[0].insts[i])) {
+            check = &fn.blocks[0].insts[i];
+            index = i;
+        }
+    REQUIRE(check != nullptr);
+    REQUIRE(index > 0);
+    const auto before = fn.blocks[0].insts[0].op;
+    fn.blocks[0].insts[0].op = rir::Opcode::TimeNowMicros;
+    CHECK(!rir::password_prefix_valid(fn));
+    CHECK(!rir::verify_module(rir.module).ok);
+    fn.blocks[0].insts[0].op = before;
+    const auto count = check->operand_count;
+    check->operand_count = 2;
+    CHECK(!rir::password_prefix_valid(fn));
+    check->operand_count = count;
+    fn.is_timer = true;
+    CHECK(!rir::password_prefix_valid(fn));
+    fn.is_timer = false;
+    fn.yield_count = 1;
+    CHECK(!rir::password_prefix_valid(fn));
+    fn.yield_count = 0;
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, password_header_rejects_unsafe_positions_and_policy) {
+    const std::string call =
+        "passwordVerifyHeader(\"X-Password\", "
+        "\"$rut-pbkdf2-sha256$600000$000102030405060708090a0b0c0d0e0f$"
+        "3bc37118e625093e9b79ed08930ea7af7389591233fdd92dddf369371e60dbc0\", 5000)";
+    const std::string invalid[] = {
+        "route GET \"/\" { guard " + call + " == 1 else { return 401 } return 200 }",
+        "route GET \"/\" { let prior = 1 let result = " + call + " return 200 }",
+        "route GET \"/\" { let result = " + call + " wait(1ms) return 200 }",
+        "func check() -> i32 => " + call + "\nroute GET \"/\" { return 200 }",
+        "route GET \"/\" { let result = passwordVerifyHeader(\"Bad Header\", \"invalid\", 5000) "
+        "return 200 }",
+        "route GET \"/\" { let result = passwordVerifyHeader(\"X-Password\", \"invalid\", 0) "
+        "return 200 }",
+    };
+    for (const auto& source : invalid) {
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    const std::string record =
+        "\"$rut-pbkdf2-sha256$600000$000102030405060708090a0b0c0d0e0f$"
+        "3bc37118e625093e9b79ed08930ea7af7389591233fdd92dddf369371e60dbc0\"";
+    for (const char* args : {"\"Bad Header\", HASH, 5000",
+                             "\"\", HASH, 5000",
+                             "req.path, HASH, 5000",
+                             "\"X-Password\", HASH, 0",
+                             "\"X-Password\", HASH, 60001",
+                             "\"X-Password\", HASH, req.body.len"}) {
+        std::string arguments(args);
+        arguments.replace(arguments.find("HASH"), 4, record);
+        const std::string source =
+            "route GET \"/\" { let result = passwordVerifyHeader(" + arguments + ") return 200 }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+    // Ordinary user functions retain normal call semantics and need no worker.
+    const auto shadowed =
+        lex(lit("func passwordVerifyHeader(_ n: i32) -> i32 => n\n"
+                "route GET \"/\" { let n = passwordVerifyHeader(200) return 200 }"));
+    REQUIRE(shadowed);
+    auto ast = parse_file_heap(shadowed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(!rir::function_uses_password(rir.module.functions[0]));
+    rir.destroy();
+}

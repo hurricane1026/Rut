@@ -17,6 +17,7 @@
 #include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/jwt_hs256.h"
+#include "rut/runtime/password_gateway.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/signed_request.h"
 #include "rut/runtime/uuid.h"
@@ -331,6 +332,32 @@ i32 rut_helper_req_header_count(const u8* req_data, u32 req_len, const char* nam
         if (http_header_name_eq_ci(header.name.ptr, header.name.len, name, name_len)) ++count;
     }
     return count;
+}
+
+extern "C" u64 rut_helper_password_verify_header(void* connection,
+                                                 const u8* data,
+                                                 u32 length,
+                                                 const char* header,
+                                                 u32 header_length,
+                                                 const char* record,
+                                                 u32 record_length,
+                                                 u32 timeout_ms) {
+    if (!password_header_policy_valid({header, header_length}, {record, record_length}, timeout_ms))
+        return 0xffffffffu;
+    u8 present = 0;
+    const char* password = nullptr;
+    u32 password_length = 0;
+    rut_helper_req_unique_header(
+        data, length, header, header_length, &present, &password, &password_length);
+    if (!present || password_length == 0 || password_length > kPasswordMaxBytes) return 0;
+    const auto reply = verify_password_for_request(
+        connection, {password, password_length}, {record, record_length}, timeout_ms);
+    if (reply.status == PasswordRequestStatus::Pending)
+        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+    if (reply.status == PasswordRequestStatus::Matched) return 1;
+    if (reply.status == PasswordRequestStatus::Rejected) return 0;
+    if (reply.status == PasswordRequestStatus::TimedOut) return 0xfffffffeu;
+    return 0xffffffffu;
 }
 
 void rut_helper_req_unique_header(const u8* req_data,

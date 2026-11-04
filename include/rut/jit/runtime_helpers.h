@@ -83,6 +83,17 @@ rut::i32 rut_helper_req_header_count(const rut::u8* req_data,
                                      const char* name,
                                      rut::u32 name_len);
 
+// Low 32 bits: 1/0/-1/-2, or 0x80000000 while pending. High 32 bits:
+// pending retry milliseconds. The worker owns credential copies across yields.
+rut::u64 rut_helper_password_verify_header(void* connection,
+                                           const rut::u8* data,
+                                           rut::u32 length,
+                                           const char* header,
+                                           rut::u32 header_length,
+                                           const char* record,
+                                           rut::u32 record_length,
+                                           rut::u32 timeout_ms);
+
 // Absent unless exactly one field with this name exists (case-insensitive).
 void rut_helper_req_unique_header(const rut::u8* req_data,
                                   rut::u32 req_len,

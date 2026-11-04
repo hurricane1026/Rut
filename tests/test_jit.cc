@@ -28325,3 +28325,138 @@ TEST(jit, hs256_issue_with_id_and_scope_codegen_rejects_malformed_seventh_operan
     fn->values[result.id].type = original_result;
     tc.destroy();
 }
+
+TEST(jit, password_header_prefix_suspends_before_effects_and_resumes_once) {
+    const char source[] = R"rut(route GET "/login" {
+        let result = passwordVerifyHeader("X-Password", "$rut-pbkdf2-sha256$600000$000102030405060708090a0b0c0d0e0f$3bc37118e625093e9b79ed08930ea7af7389591233fdd92dddf369371e60dbc0", 5000)
+        match result {
+            1 => {
+                req.set("X-Authenticated", "yes")
+                return 200
+            }
+            _ => return 401
+        }
+    })rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& prefix = rir.module.functions[0].blocks[0].insts[0];
+    const auto saved_op = prefix.op;
+    prefix.op = Opcode::TimeNowMicros;
+    CHECK_FALSE(codegen(rir.module).ok);
+    prefix.op = saved_op;
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(register_jit_routes(*config, rir.module, engine));
+    CHECK(config->requires_password_gateway());
+    PasswordGateway gateway;
+    REQUIRE(gateway.start().has_value());
+    ConnectionBase conn{};
+    conn.reset();
+    conn.fd = 42;
+    conn.id = 1;
+    conn.handler_gen = 1;
+    conn.transition_to_exec_handler_wait();
+    HandlerCtx ctx{};
+    auto run = [&](const char* header) {
+        conn.req_header_override_count = 0;
+        const std::string request =
+            std::string("GET /login HTTP/1.1\r\nHost: localhost\r\n") + header + "\r\n";
+        const u64 deadline = monotonic_us() + 10000000;
+        for (;;) {
+            PasswordHandlerScope scope(&gateway, &conn);
+            auto result = HandlerResult::unpack(handler(&conn,
+                                                        &ctx,
+                                                        reinterpret_cast<const u8*>(request.data()),
+                                                        static_cast<u32>(request.size()),
+                                                        nullptr));
+            if (result.action != HandlerAction::Yield) return result.status_code;
+            CHECK_EQ(conn.req_header_override_count, 0u);
+            CHECK(result.yield_kind == YieldKind::Timer);
+            CHECK(result.next_state == 0);
+            CHECK(result.yield_payload_u32() > 0 && result.yield_payload_u32() <= 10);
+            if (monotonic_us() > deadline) return static_cast<u16>(599);
+            usleep(result.yield_payload_u32() * 1000);
+        }
+    };
+    CHECK(run("X-Password: password\r\n") == 200);
+    CHECK_EQ(conn.req_header_override_count, 1u);
+    ++conn.handler_gen;
+    CHECK(run("X-Password: wrong\r\n") == 401);
+    CHECK_EQ(conn.req_header_override_count, 0u);
+    ++conn.handler_gen;
+    CHECK(run("X-Password: password\r\nx-password: password\r\n") == 401);
+    ++conn.handler_gen;
+    CHECK(run("") == 401);
+    gateway.stop();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, password_identity_maps_terminal_results_and_rejects_untrusted_states) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/password-jwt-login.rut";
+    struct Case {
+        const char* arguments;
+        u16 status;
+    };
+    const Case cases[] = {{"1, \"alice\", \"password-v1\"", 204},
+                          {"0, \"alice\", \"password-v1\"", 401},
+                          {"-1, \"alice\", \"password-v1\"", 503},
+                          {"-2, \"alice\", \"password-v1\"", 504},
+                          {"2, \"alice\", \"password-v1\"", 503},
+                          {"-3, \"alice\", \"password-v1\"", 503},
+                          {"1, \"\", \"password-v1\"", 503},
+                          {"1, \"alice\", \"\"", 503},
+                          {"0, \"\", \"password-v1\"", 503}};
+    std::string source = "import \"middleware/auth.rut\"\n";
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        source +=
+            "route GET \"/" + std::to_string(i) + "\" { let identity = auth.passwordIdentity(";
+        source += cases[i].arguments;
+        source +=
+            ") guard identity.consumerId == \"alice\" && "
+            "identity.credentialId == \"password-v1\" && identity.method == \"password\" "
+            "else { return 500 } return 204 }\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const char request[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const auto name = "handler_route_" + std::to_string(i);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+        REQUIRE(handler);
+        HandlerCtx ctx{};
+        const auto result = HandlerResult::unpack(handler(
+            nullptr, &ctx, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+        CHECK_EQ(result.status_code, cases[i].status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}

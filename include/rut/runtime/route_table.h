@@ -131,10 +131,11 @@ struct RouteEntry {
 
     // Action
     RouteAction action;
-    u16 upstream_id;              // Proxy target or the fixed WebSocket JIT forward target
-    u16 status_code;              // status code (if action == Static, e.g., 200, 404)
-    jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
-    bool needs_req_body = false;  // JIT handler reads req.body and needs the full body buffered
+    u16 upstream_id;                // Proxy target or the fixed WebSocket JIT forward target
+    u16 status_code;                // status code (if action == Static, e.g., 200, 404)
+    jit::HandlerFn fn = nullptr;    // JIT-compiled handler (if action == JitHandler)
+    u8 needs_password_gateway = 0;  // serialized native feature requirement (0/1)
+    bool needs_req_body = false;    // JIT handler reads req.body and needs the full body buffered
     // Per-route rate limit (fixed window). Empty rule set = unlimited. Each rule
     // allows `max` requests per `window_sec` metered by its own key (IP / header
     // / query / cookie / param tuple; empty key = per-client-IP). A request must
@@ -1742,6 +1743,22 @@ public:
         return true;
     }
 
+    // Native artifacts and hand-built configs must use a canonical feature flag.
+    bool password_gateway_metadata_valid() const {
+        if (route_count > kMaxRoutes) return false;
+        for (u32 i = 0; i < route_count; ++i)
+            if (routes[i].needs_password_gateway > 1 ||
+                (routes[i].needs_password_gateway && routes[i].action != RouteAction::JitHandler))
+                return false;
+        return true;
+    }
+    bool requires_password_gateway() const {
+        if (!password_gateway_metadata_valid()) return false;
+        for (u32 i = 0; i < route_count; ++i)
+            if (routes[i].needs_password_gateway) return true;
+        return false;
+    }
+
     // Publication trust boundary for hand-built or compiler-produced routes.
     // Every route must carry IDs computed from exactly its current semantic
     // policy; stale nonzero IDs and malformed POD bounds are rejected.
@@ -1965,6 +1982,7 @@ private:
         r.status_code = 0;
         r.fn = fn;
         r.needs_req_body = needs_req_body;
+        r.needs_password_gateway = 0;
         r.forward_preflight_mode = forward_preflight_mode;
         r.preflight_forward_policy_bundle_id = preflight_forward_policy_bundle_id;
         if (!populate_dispatch_state(r)) {

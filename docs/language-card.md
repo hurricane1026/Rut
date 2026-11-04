@@ -1677,6 +1677,88 @@ after authentication, as in the example. Replacement removes every client-suppli
 field with that name. Runtime values are validated and copied into bounded
 request-owned storage; invalid values or exhausted storage fail forwarding closed.
 
+## Password verification prefix
+
+`passwordVerifyHeader(header, record, timeoutMs) -> i32` is supported as the
+initializer of the first direct route `let`. All three arguments must resolve
+at compile time: a 1–128-byte HTTP field-name token, a canonical fixed-profile
+password record, and an integer timeout of 1–60000 milliseconds. `env("...")`
+may supply the record at compilation/load time. A user function may shadow the
+builtin. Calls in helpers, guards, later statements, timers or pipelines, and
+routes containing explicit `wait`, are rejected. No new keyword is added.
+
+```rut
+route POST "/login" {
+    let result = passwordVerifyHeader("X-Password", env("PASSWORD_HASH"), 5000)
+    guard result != -1 else { return 503 }
+    guard result != -2 else { return 504 }
+    guard result == 1 else { return 401 }
+    return 200
+}
+```
+
+The helper reads exactly one case-insensitive matching request header. Missing,
+duplicate, empty or over-1024-byte credentials return `0`. HTTP parsing applies
+its normal field-value whitespace rules; this transport is not an arbitrary
+binary password API. Serve credential routes over TLS.
+
+The result is `1` for a match, `0` for rejection, `-1` for unavailable service
+or exhausted capacity, and `-2` when the original monotonic deadline expires.
+Only `1` authenticates. Pending verification suspends before later route effects
+and retries the constant-only prefix using existing timer yields (at most 10 ms).
+It never runs PBKDF2 on the shard, extends a deadline on retry or exposes Pending
+to Rut. At exact expiry even a completed match is rejected.
+
+Each requiring shard automatically owns one worker and eight task slots. Startup
+or the first requiring reload starts it off-shard before publishing the config.
+The service survives config retirement and stop/join, and joins/wipes on shard
+shutdown. HTTP/1 request generations and HTTP/2 stream IDs fence abandoned work;
+HTTP/2 retains its existing single suspended stream limit. Compiler/JIT/native
+artifact metadata carries this requirement. See
+[the password example](../examples/password-header-auth.rut) and
+[auth coverage](auth-coverage.md#rut-password-verification-and-worker-lifecycle).
+
+Hash creation remains offline, through the native API or the
+[`rut-password` provisioning tool](password-provisioning.md). The tool is not a
+Rut builtin and cannot run on the shard. This prefix uses one fixed record;
+user lookup/persistence, registration, reset/change, automatic rehash and session
+or JWT login orchestration are not implemented by it. Basic auth keeps its
+existing static credential semantics.
+
+### Fixed-account password/JWT composition
+
+`auth.passwordIdentity(result, consumerId, credentialId)` maps the terminal result
+of the prefix to an `Identity` with method `"password"`. Only result `1` succeeds;
+`0` returns 401 with `Cache-Control: no-store`, `-2` returns 504, and unavailable
+or unknown states return 503. Empty configured IDs return 503. This pure Rut
+helper performs no KDF and accepts an ordinary integer; call it only with the
+actual verifier result. Neither integers nor constructible Identity values carry
+authentication provenance.
+
+[password-jwt-login.rut](../examples/password-jwt-login.rut) composes existing
+primitives for one configured account. `PASSWORD_HASH`, `PASSWORD_SUBJECT` and
+`JWT_ISSUE_KEY` resolve at load/compile time. Its POST `/login` route uses the
+actual peer IP with a process-shared `@rateLimit`: five initial attempts, then
+one per twelve seconds. Admission runs before the handler/KDF; missing,
+duplicate and incorrect credentials spend the same budget. Forwarding and
+identity headers do not select the account or limiter key. Limits are bounded
+and process-local, with the collision semantics documented above; there is no
+cross-node quota or durable lockout.
+
+After verification, the route generates a UUID v4 `jti` and issues HS256 for
+the trusted subject, issuer `rut-password-login`, audience `orders`, scope
+`orders.read` and a 300-second lifetime. The compact JWT response has Content-Type
+`application/jwt`, `Cache-Control: no-store` and `Pragma: no-cache`. The GET
+`/private` route pins HS256, validates issuer/audience and age/lifetime, then
+requires the configured scope. Serve the login route over TLS. Provision hashes
+offline with the native random-salt API and protect resolved native artifacts.
+
+This is a fixed-account composition, without registration, password reset/change,
+a user database, refresh tokens, cookies or a durable session/revocation store.
+Changing the password prevents future login with the previous password; already
+issued tokens retain their original lifetime unless separately revoked or their
+signing key is removed. There is no implicit logout or password-change revocation.
+
 ## JWT resource-server claims profile
 
 `jwtDecode(token, secret)` retains its existing signature-only semantics.

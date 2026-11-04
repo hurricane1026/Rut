@@ -24,6 +24,7 @@ struct Error {
         RouteTable,  // RouteTable capacity exceeded
         HttpParser,  // HTTP parse error (invalid input)
         Kqueue,      // kqueue/kevent failed
+        Pipe,        // worker notification pipe setup failed
     };
     Source source;
 

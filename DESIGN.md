@@ -9310,12 +9310,127 @@ outside this bounded profile.
 
 The native C++ `password_hash`/`password_verify` APIs implement one fixed,
 versioned PBKDF2-HMAC-SHA256 storage profile using existing stack-only HMAC:
-600,000 rounds, a caller-generated random 16-byte salt and a 32-byte key.
+600,000 rounds, a random 16-byte salt and a 32-byte key. The preferred native
+overload generates the salt via the OS CSPRNG, using a single nonblocking
+`getrandom` read on Linux or `getentropy` on macOS; entropy error/interruption
+or short read fails closed without writing output. Trusted callers may still
+supply an explicit salt.
 Passwords are exact nonempty bytes up to 1024 bytes; output is a strict
 123-byte ASCII record. Derived keys and HMAC scratch are cleansed, with
 constant-time key comparison. This adds no language surface or dependency.
 These deliberately slow synchronous APIs belong off the shard event loop.
-Worker scheduling, Rut/JIT integration, salt generation, user persistence and
-account/password lifecycle remain future work; Basic auth retains its existing
+The following sections define worker ownership and Rut integration; user
+persistence and account/password lifecycle remain future work; Basic auth retains its existing
 static credential contract. See [auth coverage](docs/auth-coverage.md#native-password-storage-primitive)
 for the full format, ownership, validation and failure contract.
+
+### Bounded native password worker
+
+`PasswordWorker` owns a pthread and eight fixed-capacity job/result slots. One
+shard producer copies credentials and exchanges state via acquire/release
+publication; worker-local copies are wiped before a result is published or a
+cancelled slot is released. No request views or connection pointers cross
+threads. Owner/slot/generation tokens reject stale and foreign operations,
+including after restart. Cancellation invalidates tokens immediately, skips
+pending jobs when possible and discards running KDF results. Completed results
+retain capacity until consumed or cancelled. Lifecycle start/stop run outside
+active shard use; stop joins the active KDF and wipes all slots. No heap or
+mutex waits are added to submission/poll/cancel. The worker uses one-millisecond
+idle polling and a nonblocking completion pipe. `PasswordRequest` supplies
+monotonic deadline checks (including completed-but-expired success), terminal
+result consumption and explicit close/reload cancellation. The producer drains
+notifications before polling adapters; worker stop joins before closing pipe
+ends. No connection/request pointers cross threads. Gateway timer suspension and
+reload-safe shard ownership are described below. See the auth ledger for exact
+lifecycle and limits.
+
+### Optional native HTTP/1 password bridge
+
+A caller-owned `PasswordGateway` may be bound to the shared loop before run.
+Trusted native handlers use `verify_password_for_request` under an invocation-
+local binding and yield the existing Timer kind while Pending (at most 10 ms,
+clamped to the original deadline). Worker entries use connection ID plus handler
+generation and copied input. Non-Timer terminal dispatch, timer scheduling
+failure, new request generation and the CRTP close path cancel abandoned work.
+POD TLS bindings are saved/restored across nested handler calls; no connection
+layout or packed handler ABI changes. Service ownership is independent of RCU
+configuration lifetime and remains with the loop's caller. Native HTTP/2 support uses a stream-specific binding and the existing single
+async slot as described below. Compiled Rut routes can require this service and activate it automatically
+as described below. See the auth coverage ledger for the lifecycle
+contract and disconnect-observation limits.
+
+### Native HTTP/2 password stream ownership
+
+HTTP/2 dispatch and resume bind the live client stream ID for the native
+password helper. The service uses a protocol-tagged 64-bit key to keep stream
+IDs distinct from HTTP/1 request generations. A competing stream is refused
+before it can reset shared handler slots or displace the async owner's task.
+A stream-scoped guard retains work only for successful Timer suspension/re-arm;
+all other exits cancel that exact stream key. RST_STREAM cancels only its own
+task, and connection close/free cancels the connection's entire task set. The
+existing one-suspended-stream and RCU epoch contracts are preserved without
+new connection fields or handler ABI values. The bounded Rut header prefix uses the same native service and stream binding.
+
+### Rut password prefix and automatic shard ownership
+
+`passwordVerifyHeader(header, record, timeoutMs) -> i32` uses a canonical
+compile-time policy and a singleton request header. Only the first direct route
+`let` may initialize from it; explicit waits in that route are rejected. Pending
+returns an existing Timer yield (state zero, at most 10 ms), re-entering only
+constants before polling the original job. No later effect runs before the
+terminal result. Success/rejection/unavailable/deadline map to 1/0/-1/-2.
+The RIR verifier and codegen independently validate the single entry prefix,
+argument/result types, canonical policy and absence of backedges into it.
+Parse/time scopes are released on the early suspension return. There is no new
+keyword, handler ABI, dependency or synchronous shard KDF.
+
+Compiled route metadata activates one embedded eight-slot `PasswordGateway` per
+requiring shard. Startup and first requiring live reload prepare it on the
+control thread; a service mailbox is published before its config. The consumer
+exchanges config first, then service, and binds the service before config
+adoption. Join drains leftover mailboxes. Service lifetime spans reloads,
+retired RCU readers and stop/join; shutdown joins and wipes it after loop
+termination. Native artifact version 16 preserves the requirement and uses the
+shared helper relocation allowlist. Hash provisioning stays native/offline;
+user persistence, password lifecycle and persistent sessions remain separate work.
+See the language card and auth coverage ledger for the transport and limits.
+
+### Fixed-account password-to-JWT composition
+
+`auth.passwordIdentity` maps only terminal success `1` to a configured Identity;
+rejection `0`, deadline `-2` and other/unavailable states become 401, 504 and 503.
+Empty consumer/credential IDs fail closed. This pure Rut function carries no
+provenance for arbitrary caller-supplied integers or constructible identities.
+The shipped login example calls it immediately after the password prefix.
+
+A process-shared peer-IP route decorator meters admission before the KDF. After
+success, existing UUID and HS256 issuance helpers create a fresh jti and a
+300-second token with a trusted subject, issuer, audience and scope. Token
+responses disable caching; protected access pins HS256 and checks claims,
+maximum age/lifetime and scope. This composes existing language/runtime behavior
+without a new keyword, dependency or synchronous shard operation. Two-shard TLS
+regressions use native-loaded code after source/import deletion on both backends.
+
+The account is a compile-time configuration snapshot. Durable user storage,
+registration/reset/change, account lockout, refresh/logout and session/revocation
+persistence remain separate work. Password replacement does not invalidate
+already-issued tokens by itself.
+
+### Offline password provisioning command
+
+`rut-password` links the existing native password/crypto implementation without
+LLVM or a C++ standard/ABI runtime. It is available with JIT disabled and applies
+the existing static-runtime link option. Passwords enter only through stdin;
+interactive mode suppresses echo, handles configured erase/kill/EOF keys, and
+restores terminal attributes after normal, error or caught cancellation exits.
+Redirected input preserves 1–1024 exact bytes. Fixed stack scratch is cleansed.
+Hashing remains off-shard.
+
+Optional record files are newly created in a protected caller-owned directory.
+A 0600 same-directory temporary record is synced, closed and atomically linked
+into an absent destination, then unlinked and the directory synced. The target
+is never replaced; publication/sync errors remain explicit, including a completed
+record whose final cleanup or directory sync failed. Verification reads only a
+bounded canonical regular record, without following final symlinks. These are
+offline provisioning files, not a mutable account registry or session database.
+See the provisioning guide for exact input, exit, persistence and cleanup limits.

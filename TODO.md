@@ -784,7 +784,23 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 
 - [x] Native off-shard PBKDF2-HMAC-SHA256 fixed-profile hash/verify primitives,
   canonical bounded records, constant-time key comparison and independent vectors.
-- [ ] CSPRNG salt generation and bounded worker execution/cancellation before
-  exposing slow password verification to Rut/JIT/native-program handlers.
+- [x] Native password hashing overload with OS CSPRNG salt generation,
+  deterministic entropy/failure tests and fail-closed output handling.
+- [x] Native bounded password verification worker with owned input copies,
+  generation tokens, backpressure, cancellation and shutdown cleanup.
+- [x] Native completion FD and request deadline/cancel adapter, with idle FD
+  wakeup, exact-deadline rejection, reset/reuse and descriptor lifecycle tests.
+- [x] Optional native HTTP/1 gateway bridge using existing timer-yield resume,
+  connection/request generation fencing and shared terminal/close cancellation.
+- [x] Native HTTP/2 stream binding, protocol-tagged task keys and stream-local
+  reset/terminal cancellation, retaining the existing single async slot.
+- [x] Bounded Rut/JIT/native-artifact header verification prefix and automatic
+  per-shard worker startup/reload/shutdown lifecycle using timer suspension.
+- [ ] Direct completion-FD backend integration if needed beyond timer polling.
+- [x] Fixed-account password-to-JWT login composition in Rut, with terminal
+  result-to-Identity mapping, process-shared peer-IP admission, fresh jti,
+  bounded lifetime/scope, no-store token response and protected-route validation.
+- [x] Offline rut-password hash/verify CLI with hidden terminal input, exact
+  redirected bytes, cleansed scratch and private atomic no-replace record files.
 - [ ] Durable user/credential lifecycle, registration, password change/reset,
-  rate limits, rehash migration and session/JWT login composition.
+  account-level abuse policies, rehash migration and persistent sessions/refresh.

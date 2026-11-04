@@ -9,6 +9,7 @@
 #include "rut/compiler/parser.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/password.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/rs256_policy.h"
 #include "rut/runtime/slice_pool.h"
@@ -10054,6 +10055,38 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
+    if (expr.name.eq(lit_str("passwordVerifyHeader")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr auto kDetail = lit_str(
+            "passwordVerifyHeader requires the first route let, fixed header/hash/timeoutMs, and "
+            "no explicit wait");
+        if (!route || !route->password_init_ok || binding != nullptr || expr.args.len != 3 ||
+            pipe_lhs || first_arg_override)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr values[3];
+        for (u32 i = 0; i < 3; ++i) {
+            if (!expr.args[i])
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            auto value = analyze_expr(*expr.args[i], route, mod, locals, local_count, nullptr);
+            if (!value) return core::make_unexpected(value.error());
+            values[i] = value.value();
+        }
+        if (values[0].kind != HirExprKind::StrLit || values[1].kind != HirExprKind::StrLit ||
+            values[2].kind != HirExprKind::IntLit || values[2].int_value < 1 ||
+            values[2].int_value > 60000 ||
+            !password_header_policy_valid(
+                values[0].str_value, values[1].str_value, static_cast<u32>(values[2].int_value)))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        route->has_password_prefix = true;
+        return make_json_op(json::Op::PasswordVerifyHeader,
+                            HirTypeKind::I32,
+                            false,
+                            &values[0],
+                            &values[1],
+                            &values[2],
+                            expr.span,
+                            route);
+    }
     if (expr.name.eq(lit_str("uuid")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 0 || pipe_lhs != nullptr || first_arg_override != nullptr)
@@ -21538,6 +21571,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     can_be_used_for_iter(can_be_used_for_iter, stmt.name, si + 1);
                 const bool saved_allow_respond_effects = route.allow_respond_effects;
                 route.allow_respond_effects = !used_for_iter;
+                route.password_init_ok =
+                    si == 0 && route.locals.len == 0 && route.guards.len == 0 && !route.is_timer &&
+                    !route.is_helper_scratch && stmt.expr.kind == AstExprKind::Call &&
+                    stmt.expr.name.eq(lit_str("passwordVerifyHeader"));
                 route.uuid_init_ok = !used_for_iter && !seen_for && !seen_wait && !route.is_timer &&
                                      !route.is_helper_scratch &&
                                      stmt.expr.kind == AstExprKind::Call &&
@@ -21565,6 +21602,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                route.locals.len,
                                                                nullptr)));
                 route.uuid_init_ok = false;
+                route.password_init_ok = false;
                 route.allow_respond_effects = saved_allow_respond_effects;
                 if (!init) return core::make_unexpected(init.error());
                 if (init.value().type == HirTypeKind::Array) {
@@ -22241,6 +22279,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                : ForwardPreflightMode::AfterRequestFramingSelection;
         }
 
+        if (route.has_password_prefix && route.waits.len != 0)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                route.span,
+                lit_str("passwordVerifyHeader routes cannot contain explicit wait"));
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /
         // kCacheWaitDetail above) catch direct spellings, but not
         // TimeNowMicros or CacheGet/CacheSet trees inlined from helper

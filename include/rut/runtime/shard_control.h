@@ -5,6 +5,7 @@
 
 namespace rut {
 
+class PasswordGateway;
 struct RouteConfig;  // forward declare
 struct CaptureRing;  // forward declare
 
@@ -14,7 +15,9 @@ struct CaptureRing;  // forward declare
 // pointer type keeps the atomic<CaptureRing*> interface clean.
 static inline CaptureRing* kCaptureDisable = reinterpret_cast<CaptureRing*>(1);
 
-// Per-shard control block. Config, JIT, and capture have independent atomic slots.
+// Per-shard control block. Each update has its own atomic slot. A newly started
+// password service is published before its requiring config; consumers exchange
+// config before service, then install the service before adopting the config.
 // nullptr = no pending update. Non-null = fire-and-forget update.
 // Producer: pending_config.store(ptr, release)
 // Consumer: pending_config.exchange(nullptr, acq_rel)
@@ -22,6 +25,7 @@ static inline CaptureRing* kCaptureDisable = reinterpret_cast<CaptureRing*>(1);
 struct alignas(64) ShardControlBlock {
     std::atomic<const RouteConfig*> pending_config{nullptr};
     std::atomic<void*> pending_jit{nullptr};
+    std::atomic<PasswordGateway*> pending_password_gateway{nullptr};
     std::atomic<CaptureRing*> pending_capture{nullptr};
 };
 

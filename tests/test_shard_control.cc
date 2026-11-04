@@ -90,6 +90,55 @@ TEST(shard_control, control_block_init_zero) {
     ShardControlBlock cb{};
     CHECK(cb.pending_config == nullptr);
     CHECK(cb.pending_jit == nullptr);
+    CHECK(cb.pending_password_gateway == nullptr);
+}
+
+TEST_F(ShardF, password_gateway_starts_lazily_on_reload_and_survives_join) {
+    REQUIRE(self.ok);
+    RouteConfig cfg{};
+    cfg.route_count = 1;
+    cfg.routes[0].action = RouteAction::JitHandler;
+    cfg.routes[0].needs_password_gateway = 1;
+    REQUIRE(self.shard.spawn().has_value());
+    CHECK_FALSE(self.shard.password_gateway_started);
+    REQUIRE(self.shard.reload_config_unchecked(&cfg));
+    self.shard.stop();
+    self.shard.join();
+    CHECK(self.shard.password_gateway_started);
+    CHECK(self.shard.loop->password_gateway == &self.shard.automatic_password_gateway);
+    CHECK(self.shard.active_config == &cfg);
+    CHECK(self.shard.control.pending_password_gateway == nullptr);
+    REQUIRE(self.shard.spawn().has_value());
+    self.shard.stop();
+    self.shard.join();
+    CHECK(self.shard.password_gateway_started);
+    self.shard.shutdown();
+    self.ok = false;
+    CHECK_FALSE(self.shard.password_gateway_started);
+    CHECK(self.shard.loop == nullptr);
+}
+
+TEST_F(ShardF, password_gateway_startup_rejects_invalid_metadata) {
+    REQUIRE(self.ok);
+    RouteConfig cfg{};
+    cfg.route_count = 1;
+    cfg.routes[0].action = RouteAction::JitHandler;
+    cfg.routes[0].needs_password_gateway = 2;
+    self.shard.route_config = &cfg;
+    CHECK_FALSE(self.shard.spawn().has_value());
+    CHECK_FALSE(self.shard.password_gateway_started);
+    CHECK_FALSE(self.shard.reload_config_unchecked(&cfg));
+    cfg.routes[0].needs_password_gateway = 1;
+    cfg.routes[0].action = RouteAction::Static;
+    CHECK_FALSE(self.shard.spawn().has_value());
+    cfg.routes[0].action = RouteAction::JitHandler;
+    REQUIRE(self.shard.spawn().has_value());
+    self.shard.stop();
+    self.shard.join();
+    CHECK(self.shard.password_gateway_started);
+    CHECK(self.shard.loop->password_gateway == &self.shard.automatic_password_gateway);
+    self.shard.shutdown();
+    self.ok = false;
 }
 
 TEST(shard_control, control_block_config_write_read) {
@@ -659,6 +708,39 @@ TEST(shard_control, spawn_rejects_invalid_seed_without_installing_it) {
     shard.join();
     shard.shutdown();
     close(lfd);
+}
+
+TEST(shard_control, password_config_rejected_for_loop_without_gateway_capability) {
+    struct ProbeLoop {
+        void run() {}
+        void set_capture(CaptureRing*) {}
+    } probe;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/password", kRouteMethodGet, 200));
+    cfg.routes[0].action = RouteAction::JitHandler;
+    cfg.routes[0].needs_password_gateway = 1;
+
+    Shard<ProbeLoop> shard;
+    shard.loop = &probe;
+    CHECK_FALSE(shard.reload_config(&cfg, 1));
+    CHECK(shard.active_config == nullptr);
+    CHECK_FALSE(shard.password_gateway_started);
+    CHECK(shard.control.pending_config.load(std::memory_order_acquire) == nullptr);
+    CHECK(shard.control.pending_password_gateway.load(std::memory_order_acquire) == nullptr);
+
+    shard.route_config = &cfg;
+    CHECK_FALSE(shard.spawn().has_value());
+    CHECK(shard.active_config == nullptr);
+    CHECK_FALSE(shard.password_gateway_started);
+    shard.route_config = nullptr;
+    REQUIRE(shard.spawn().has_value());
+    CHECK_FALSE(shard.reload_config(&cfg, 1));
+    CHECK(shard.active_config == nullptr);
+    CHECK_FALSE(shard.password_gateway_started);
+    CHECK(shard.control.pending_config.load(std::memory_order_acquire) == nullptr);
+    CHECK(shard.control.pending_password_gateway.load(std::memory_order_acquire) == nullptr);
+    shard.join();
+    shard.loop = nullptr;
 }
 
 TEST(shard_control, shard_reload_config) {

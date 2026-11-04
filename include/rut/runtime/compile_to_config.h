@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/compiler/password_profile.h"
 #include "rut/runtime/json.h"
 
 // Bridge header: copy the RIR module's declarative content (upstreams
@@ -307,6 +308,8 @@ inline bool register_verified_jit_routes(RouteConfig& cfg,
                                                  fn.forward_preflight_mode,
                                                  fn.preflight_forward_policy_bundle_id))
                 return false;
+            target.routes[target.route_count - 1].needs_password_gateway =
+                rir::function_uses_password(fn) ? 1 : 0;
             // @rateLimit decorators → stacked token-bucket rules, each with its own
             // metering key (the route just added is at index route_count - 1).
             if (fn.rate_limit.count > 0) {

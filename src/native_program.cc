@@ -310,16 +310,28 @@ bool load_native_program(const char* source,
         close(channel[0]);
         return fail("cannot start rut-compile");
     }
-    if (setpgid(child, child) != 0 && errno != EACCES && errno != ESRCH) {
+    if (setpgid(child, child) != 0) {
         const int kErrorNumber = errno;
-        char message[96];
-        snprintf(
-            message, sizeof(message), "cannot isolate compiler process (errno=%d)", kErrorNumber);
-        kill(child, SIGKILL);
-        while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+        bool child_group_ready = kErrorNumber == ESRCH;
+        // The child establishes its group before exec, but this call races that
+        // setup and exit. A permission error alone cannot distinguish a group
+        // already established by the child from a real isolation failure.
+        if (kErrorNumber == EACCES || kErrorNumber == EPERM) {
+            const pid_t kGroup = getpgid(child);
+            child_group_ready = kGroup == child || (kGroup < 0 && errno == ESRCH);
         }
-        close(channel[0]);
-        return fail(message);
+        if (!child_group_ready) {
+            char message[96];
+            snprintf(message,
+                     sizeof(message),
+                     "cannot isolate compiler process (errno=%d)",
+                     kErrorNumber);
+            kill(child, SIGKILL);
+            while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+            }
+            close(channel[0]);
+            return fail(message);
+        }
     }
     struct Child {
         pid_t pid;

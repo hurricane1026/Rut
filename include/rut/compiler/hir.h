@@ -1227,6 +1227,8 @@ struct HirRoute {
     // UUID generation is only supported in a direct route-let initializer.
     // A raw guard-let expression is currently materialized twice.
     bool uuid_init_ok = false;
+    bool password_init_ok = false;
+    bool has_password_prefix = false;
     struct DecoratorRef {
         Span span{};
         Str name{};

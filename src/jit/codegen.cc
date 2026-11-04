@@ -1,5 +1,6 @@
 #include "rut/jit/codegen.h"
 
+#include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/hash.h"
@@ -1806,6 +1807,51 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+            if (kJsonOp == json::Op::PasswordVerifyHeader) {
+                LLVMTypeRef params[] = {
+                    c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty, c.i32_ty};
+                LLVMTypeRef ft = LLVMFunctionType(c.i64_ty, params, 8, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_password_verify_header");
+                if (!helper)
+                    helper = LLVMAddFunction(c.llvm_mod, "rut_helper_password_verify_header", ft);
+                const auto header = c.get_value(inst.operand(0));
+                const auto record = c.get_value(inst.operand(1));
+                LLVMValueRef args[] = {
+                    c.param_conn,
+                    c.param_req_data,
+                    c.param_req_len,
+                    LLVMBuildExtractValue(c.builder, header, 0, "password.header.ptr"),
+                    LLVMBuildExtractValue(c.builder, header, 1, "password.header.len"),
+                    LLVMBuildExtractValue(c.builder, record, 0, "password.record.ptr"),
+                    LLVMBuildExtractValue(c.builder, record, 1, "password.record.len"),
+                    c.get_value(inst.operand(2))};
+                auto reply = LLVMBuildCall2(c.builder, ft, helper, args, 8, "password.reply");
+                auto status = LLVMBuildTrunc(c.builder, reply, c.i32_ty, "password.status");
+                auto pending = LLVMBuildICmp(c.builder,
+                                             LLVMIntEQ,
+                                             status,
+                                             LLVMConstInt(c.i32_ty, 0x80000000u, 0),
+                                             "password.pending");
+                auto parent = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+                auto suspend =
+                    LLVMAppendBasicBlockInContext(c.llvm_ctx, parent, "password.suspend");
+                auto ready = LLVMAppendBasicBlockInContext(c.llvm_ctx, parent, "password.ready");
+                LLVMBuildCondBr(c.builder, pending, suspend, ready);
+                LLVMPositionBuilderAtEnd(c.builder, suspend);
+                auto ms = LLVMBuildLShr(
+                    c.builder, reply, LLVMConstInt(c.i64_ty, 32, 0), "password.retry");
+                auto packed = LLVMBuildOr(
+                    c.builder,
+                    LLVMBuildShl(c.builder, ms, LLVMConstInt(c.i64_ty, 8, 0), "password.ms"),
+                    c.make_result_yield(0, static_cast<u8>(YieldKind::Timer), 0),
+                    "password.yield");
+                c.emit_parse_unprime();
+                c.emit_time_unlatch();
+                LLVMBuildRet(c.builder, packed);
+                LLVMPositionBuilderAtEnd(c.builder, ready);
+                c.set_value(inst.result, status);
+                break;
+            }
             if (kJsonOp == json::Op::JwtIssueHs256 || kJsonOp == json::Op::JwtIssueHs256WithId ||
                 kJsonOp == json::Op::JwtIssueHs256WithIdAndScope) {
                 const bool kWithId = kJsonOp != json::Op::JwtIssueHs256;
@@ -2679,6 +2725,7 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
         const auto& blk = fn.blocks[bi];
         if (!blk.insts) continue;
         for (u32 ii = 0; ii < blk.inst_count; ii++) {
+            if (rir::is_password_prefix(blk.insts[ii])) return true;
             switch (blk.insts[ii].op) {
                 case rir::Opcode::ReqHeaderCount:
                 case rir::Opcode::ReqUniqueHeader:
@@ -2992,6 +3039,8 @@ CodegenResult codegen(const rir::Module& rir_mod) {
             }
         }
     }
+    for (u32 i = 0; i < rir_mod.func_count; ++i)
+        if (!rir::password_prefix_valid(rir_mod.functions[i])) return {nullptr, nullptr, false};
     static std::atomic<u32> next_regex_module_id{1};
     Ctx c{};
     c.llvm_ctx = LLVMContextCreate();

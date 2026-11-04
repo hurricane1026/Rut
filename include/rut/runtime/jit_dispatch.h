@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/password_gateway.h"
 
 namespace rut {
 
@@ -163,11 +164,20 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                                              jit::HandlerCtx& ctx,
                                              const u8* req_data,
                                              u32 req_len,
-                                             void* arena) {
+                                             void* arena,
+                                             PasswordGateway* password_gateway = nullptr,
+                                             u32 password_stream_id = 0) {
     JitDispatchOutcome out{};
     if (fn == nullptr) return out;  // Kind::Error by default
 
-    const u64 packed = fn(conn, &ctx, req_data, req_len, arena);
+    u64 packed = 0;
+    if (password_gateway != nullptr) {
+        PasswordHandlerScope password_scope(password_gateway, conn, password_stream_id);
+        packed = fn(conn, &ctx, req_data, req_len, arena);
+    } else {
+        // Ordinary handlers retain the original path without TLS binding work.
+        packed = fn(conn, &ctx, req_data, req_len, arena);
+    }
     const auto r = jit::HandlerResult::unpack(packed);
 
     switch (r.action) {

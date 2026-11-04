@@ -1,10 +1,18 @@
 #include "rut/runtime/password.h"
 
+#include "password_internal.h"
 #include "rut/common/types.h"
 #include "rut/runtime/hash.h"
 
 #include <openssl/crypto.h>
 #include <stddef.h>
+#ifdef __linux__
+#include <sys/random.h>
+#elif defined(__APPLE__)
+#include <sys/random.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace rut {
 namespace {
@@ -89,6 +97,17 @@ bool password_hash(Str password, Str salt, char* output, u32 capacity, u32& outp
     }
     OPENSSL_cleanse(key, sizeof(key));
     return kOk;
+}
+
+bool password_hash(Str password, char* output, u32 capacity, u32& output_len) {
+    return detail::password_hash_random(
+        password, output, capacity, output_len, [](u8* bytes, u32 count) -> i32 {
+#ifdef __linux__
+            return static_cast<i32>(getrandom(bytes, count, GRND_NONBLOCK));
+#else
+            return getentropy(bytes, count) == 0 ? static_cast<i32>(count) : -1;
+#endif
+        });
 }
 
 bool password_verify(Str password, Str record) {
