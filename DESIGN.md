@@ -2837,8 +2837,13 @@ HTTP reads, state/header mutations and HTTP response effects cannot execute
 in the message phase; helpers with discarded statement effects are rejected
 as well. Message verdicts remain callback statements. This introduces neither
 an HTTP storage representation for messages nor permission to retain a message
-past its synchronous callback. Close-event values and the general
-expression/control-flow surface remain subsequent work.
+past its synchronous callback. A shared compiler entry now lowers pure scalar
+callback expressions through MIR/RIR and a private synchronous message ABI in
+the same LLVM module as HTTP handlers. It supports integer arithmetic/bitwise
+operations, String comparisons, local aliases, guards and full if/else values,
+without consuming HTTP route/timer slots. The existing specialized JSON/rewrite
+path remains available; general eager locals, fallible expressions, dynamic
+verdict payloads and close-event context are subsequent work.
 
 The message also projects two nominal, closed domains: `kind` is
 `WebSocketMessageKind` (`text`, `binary`), and `direction` is `WebSocketDirection`

@@ -312,6 +312,10 @@ rut::u8 rut_helper_str_contains(const char* text,
                                 const char* needle,
                                 rut::u32 needle_len);
 
+// Begin a synchronous post-upgrade message evaluation. The previous message's
+// temporary values have already been copied into owned send storage.
+void rut_helper_ws_begin_message(void* conn);
+
 // Validate a bounded complete JSON payload without publishing a document or allocating.
 rut::u8 rut_helper_ws_json_valid(const char* payload, rut::u64 len);
 rut::u8 rut_helper_ws_json_has_path(const char* payload,

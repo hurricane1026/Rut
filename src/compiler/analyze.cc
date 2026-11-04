@@ -3505,6 +3505,10 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          u32 generic_binding_count);
 static FrontendResult<HirExpr> normalize_function_expr(
     const HirExpr& expr, HirFunction* fn, const HirLocal* locals, u32 local_count, u32 param_count);
+#if RUT_ENABLE_WEBSOCKET
+static const HirExpr* ws_general_disallowed_value(const HirExpr& expr, u32 depth);
+static bool ws_infallible_binding(const HirExpr& expr, u32 depth);
+#endif
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
                                                           HirRoute* scratch,
                                                           const HirModule& mod,
@@ -6233,6 +6237,15 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         scratch->allow_respond_effects = false;
         auto result = analyze_expr(expr, scratch, mod, cur_locals, cur_local_count, cur_binding);
         scratch->allow_respond_effects = saved_allow_respond_effects;
+#if RUT_ENABLE_WEBSOCKET
+        if (result && scratch->is_ws_callback) {
+            auto normalized =
+                normalize_expr(result.value(), scratch->exprs, cur_locals, cur_local_count, 1);
+            if (!normalized) return core::make_unexpected(normalized.error());
+            if (const HirExpr* bad = ws_general_disallowed_value(normalized.value(), 0))
+                return frontend_error(FrontendError::UnsupportedSyntax, bad->span);
+        }
+#endif
         return result;
     };
 
@@ -6248,10 +6261,40 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         return result;
     };
 
+#if RUT_ENABLE_WEBSOCKET
+    if (stmt.kind == AstStmtKind::Expr && scratch->is_ws_callback) {
+        const AstExpr& call = stmt.expr;
+        if (call.kind != AstExprKind::MethodCall || call.lhs == nullptr || call.args.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        auto receiver = analyze_function_expr(*call.lhs, locals, local_count, binding);
+        if (!receiver) return core::make_unexpected(receiver.error());
+        auto current = normalize_expr(receiver.value(), scratch->exprs, locals, local_count, 1);
+        if (!current) return core::make_unexpected(current.error());
+        if (current->kind != HirExprKind::LocalRef || current->local_index != 0 ||
+            current->type != HirTypeKind::WebSocketMessage || current->may_nil ||
+            current->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        HirExpr verdict{};
+        verdict.kind = HirExprKind::IntLit;
+        verdict.type = HirTypeKind::I32;
+        verdict.span = call.span;
+        if (call.name.eq(lit_str("forward")))
+            verdict.int_value = static_cast<u8>(WsVerdict::Forward);
+        else if (call.name.eq(lit_str("drop")))
+            verdict.int_value = static_cast<u8>(WsVerdict::Drop);
+        else if (call.name.eq(lit_str("close")))
+            verdict.int_value = static_cast<u8>(WsVerdict::Close);
+        else
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        return verdict;
+    }
+#endif
     if (stmt.kind == AstStmtKind::Expr)
         return analyze_function_expr(stmt.expr, locals, local_count, binding);
 
     if (stmt.kind == AstStmtKind::If) {
+        if (stmt.then_stmt == nullptr || stmt.else_stmt == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
         // `if let name = expr { then } else { else }`: the condition folds to
         // `HasValue(expr)` (via analyze_guard_cond), and the narrowed binding is
         // injected into the THEN-branch scope only. The else branch and the
@@ -6264,6 +6307,12 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         if (stmt.bind_value) {
             auto bound = analyze_function_expr(stmt.expr, locals, local_count, binding);
             if (!bound) return core::make_unexpected(bound.error());
+#if RUT_ENABLE_WEBSOCKET
+            if (scratch->is_ws_callback &&
+                ((!bound->may_nil && !bound->may_error) || stmt.name.eq(lit_str("json")) ||
+                 user_bound_ident_name(mod, locals, local_count, binding, stmt.name)))
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+#endif
             auto cond = build_guard_cond_from_analyzed(bound.value(),
                                                        stmt.expr.span,
                                                        scratch,
@@ -6684,18 +6733,30 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (cur_allow_respond_guards)
                     return analyze_expr(
                         expr, scratch, mod, expr_locals, expr_local_count, expr_binding);
-                const bool saved_allow_respond_effects = scratch->allow_respond_effects;
-                scratch->allow_respond_effects = false;
-                auto result =
-                    analyze_expr(expr, scratch, mod, expr_locals, expr_local_count, expr_binding);
-                scratch->allow_respond_effects = saved_allow_respond_effects;
-                return result;
+                return analyze_function_expr(expr, expr_locals, expr_local_count, expr_binding);
             };
             const auto& inner = *stmt.block_stmts[si];
             const bool is_last = si + 1 == stmt.block_stmts.len;
             if (inner.kind == AstStmtKind::Let && !is_last) {
+#if RUT_ENABLE_WEBSOCKET
+                if (scratch->is_ws_callback &&
+                    (inner.name.eq(lit_str("json")) ||
+                     user_bound_ident_name(mod, cur_locals, cur_local_count, nullptr, inner.name)))
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+#endif
                 auto init = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 if (!init) return core::make_unexpected(init.error());
+#if RUT_ENABLE_WEBSOCKET
+                if (scratch->is_ws_callback) {
+                    auto normalized = normalize_expr(
+                        init.value(), scratch->exprs, cur_locals, cur_local_count, 1);
+                    if (!normalized) return core::make_unexpected(normalized.error());
+                    // Preserve eager callback-let semantics until the shared
+                    // entry represents local evaluation explicitly.
+                    if (!ws_infallible_binding(normalized.value(), 0))
+                        return frontend_error(FrontendError::UnsupportedSyntax, inner.expr.span);
+                }
+#endif
                 // Mirror the route-level let handler's ArrayLit-at-RHS gate
                 // (MIR has no ArrayLit lowering yet).
                 if (init->kind == HirExprKind::ArrayLit)
@@ -6903,6 +6964,12 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             if (inner.kind == AstStmtKind::Guard && !is_last) {
                 auto bound = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
+#if RUT_ENABLE_WEBSOCKET
+                if (scratch->is_ws_callback && inner.bind_value &&
+                    ((!bound->may_nil && !bound->may_error) || inner.name.eq(lit_str("json")) ||
+                     user_bound_ident_name(mod, cur_locals, cur_local_count, binding, inner.name)))
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+#endif
                 auto cond = build_guard_cond_from_analyzed(bound.value(),
                                                            inner.expr.span,
                                                            scratch,
@@ -7169,6 +7236,36 @@ static FrontendResult<HirExpr> analyze_ws_value(const AstExpr& expr,
         value.value(), scope.normalized.get(), scope.locals.data, kLocalCount, 1);
 }
 
+static const HirExpr* ws_general_disallowed_value(const HirExpr& expr, u32 depth = 0) {
+    if (depth > 128) return &expr;
+    if ((expr.kind >= HirExprKind::ReqHeaderCount && expr.kind <= HirExprKind::ReqMethod &&
+         expr.kind != HirExprKind::ConstMethod) ||
+        expr.kind == HirExprKind::Uuid || expr.kind == HirExprKind::WaitResult ||
+        expr.kind == HirExprKind::WaitField || expr.kind == HirExprKind::CacheGet ||
+        expr.kind == HirExprKind::CacheSet || expr.kind == HirExprKind::JsonOp ||
+        expr.kind == HirExprKind::JsonDecode || expr.kind == HirExprKind::RegexMatch)
+        return &expr;
+    if (expr.kind == HirExprKind::WsMessageField &&
+        (expr.lhs == nullptr || expr.lhs->kind != HirExprKind::LocalRef ||
+         expr.lhs->local_index != 0 || expr.lhs->type != HirTypeKind::WebSocketMessage ||
+         expr.lhs->may_nil || expr.lhs->may_error))
+        return &expr;
+    if (expr.lhs != nullptr)
+        if (const HirExpr* bad = ws_general_disallowed_value(*expr.lhs, depth + 1)) return bad;
+    if (expr.rhs != nullptr)
+        if (const HirExpr* bad = ws_general_disallowed_value(*expr.rhs, depth + 1)) return bad;
+    for (u32 i = 0; i < expr.args.len; ++i)
+        if (expr.args[i] != nullptr)
+            if (const HirExpr* bad = ws_general_disallowed_value(*expr.args[i], depth + 1))
+                return bad;
+    for (u32 i = 0; i < expr.field_inits.len; ++i)
+        if (expr.field_inits[i].value != nullptr)
+            if (const HirExpr* bad =
+                    ws_general_disallowed_value(*expr.field_inits[i].value, depth + 1))
+                return bad;
+    return nullptr;
+}
+
 static bool ws_infallible_binding(const HirExpr& expr, u32 depth = 0) {
     if (depth >= HirWsHandler::kMaxConditionNodes || expr.may_nil || expr.may_error) return false;
     if (expr.kind == HirExprKind::BoolLit || expr.kind == HirExprKind::IntLit ||
@@ -7182,11 +7279,21 @@ static bool ws_infallible_binding(const HirExpr& expr, u32 depth = 0) {
     if (expr.kind == HirExprKind::IfElse) {
         // Boolean helpers may choose between any supported infallible predicates.
         // Fallible work remains excluded from ordinary eager-let substitution.
-        return expr.type == HirTypeKind::Bool && expr.lhs && expr.rhs && expr.args.len == 1 &&
-               expr.args[0] && ws_infallible_binding(*expr.lhs, depth + 1) &&
+        return expr.type != HirTypeKind::WebSocketMessage && expr.lhs && expr.rhs &&
+               expr.args.len == 1 && expr.args[0] && ws_infallible_binding(*expr.lhs, depth + 1) &&
                ws_infallible_binding(*expr.rhs, depth + 1) &&
                ws_infallible_binding(*expr.args[0], depth + 1);
     }
+    if (expr.kind == HirExprKind::WidenI64)
+        return expr.lhs && ws_infallible_binding(*expr.lhs, depth + 1);
+    if (expr.kind == HirExprKind::Add || expr.kind == HirExprKind::Sub ||
+        expr.kind == HirExprKind::Mul || expr.kind == HirExprKind::Div ||
+        expr.kind == HirExprKind::Mod || expr.kind == HirExprKind::BitAnd ||
+        expr.kind == HirExprKind::BitOr || expr.kind == HirExprKind::BitXor ||
+        expr.kind == HirExprKind::BitShl || expr.kind == HirExprKind::BitShr ||
+        expr.kind == HirExprKind::MaxInt || expr.kind == HirExprKind::MinInt)
+        return expr.lhs && expr.rhs && ws_infallible_binding(*expr.lhs, depth + 1) &&
+               ws_infallible_binding(*expr.rhs, depth + 1);
     return (expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
             expr.kind == HirExprKind::Gt || expr.kind == HirExprKind::Or) &&
            expr.lhs && expr.rhs && ws_infallible_binding(*expr.lhs, depth + 1) &&
@@ -15751,79 +15858,134 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             if (!scope.locals.push(captured))
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
         }
-        WsJsonBindings documents{};
-        const AstStatement* body = stmt.then_stmt;
-        if (body == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-        u32 conditional_count = 0;
-        const AstExpr* default_call = nullptr;
-        if (body->kind == AstStmtKind::Expr) {
-            default_call = &body->expr;
-        } else if (body->kind == AstStmtKind::If) {
-            return analyze_ws_if(*body, *route, mod, documents, scope, true, conditional_count);
-        } else if (body->kind == AstStmtKind::Block) {
-            const u32 stmt_count = body->block_stmts.len;
-            if (stmt_count == 0)
-                return frontend_error(FrontendError::UnsupportedSyntax, body->span);
-            for (u32 i = 0; i + 1 < stmt_count; i++) {  // bindings and guards precede the verdict
-                const AstStatement* gs = body->block_stmts[i];
-                if (gs && gs->kind == AstStmtKind::Let) {
-                    auto binding = analyze_ws_binding(*gs, scope, mod, documents);
-                    if (!binding) return core::make_unexpected(binding.error());
-                    continue;
-                }
-                if (gs && gs->kind == AstStmtKind::If) {
-                    auto branch =
-                        analyze_ws_if(*gs, *route, mod, documents, scope, false, conditional_count);
-                    if (!branch) return core::make_unexpected(branch.error());
-                    continue;
-                }
-                if (gs == nullptr || gs->kind != AstStmtKind::Guard || gs->else_stmt == nullptr ||
-                    gs->else_stmt->kind != AstStmtKind::Expr)
-                    return frontend_error(FrontendError::UnsupportedSyntax,
-                                          gs ? gs->span : body->span);
-                if (++conditional_count > HirWsHandler::kMaxLenGuards)
-                    return frontend_error(FrontendError::TooManyItems, gs->span);
-                auto gv = analyze_message_guard_verdict(
-                    gs->else_stmt->expr, *route, mod, documents, scope);
-                if (!gv) return core::make_unexpected(gv.error());
-                if (gs->bind_value) {
-                    auto value = analyze_ws_json_initializer(*gs, *route, mod, documents, scope);
-                    if (!value) return core::make_unexpected(value.error());
-                    if (ws_optional_has_choices(value.value())) {
-                        auto tail = ws_remaining_body(*body, i + 1);
-                        auto selected = analyze_ws_choice_guard(*gs,
-                                                                value.value(),
-                                                                gv.value(),
-                                                                tail,
-                                                                *route,
-                                                                mod,
-                                                                documents,
-                                                                scope,
-                                                                true,
-                                                                conditional_count);
-                        if (!selected) return core::make_unexpected(selected.error());
-                        return {};
+        const HirWsHandler kHandler = route->ws_handler;
+        const u32 kExprCount = route->exprs.len;
+        const u32 kCaptureCount = scope.locals.len;
+        auto analyze_legacy = [&]() -> FrontendResult<void> {
+            WsJsonBindings documents{};
+            const AstStatement* body = stmt.then_stmt;
+            if (body == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            u32 conditional_count = 0;
+            const AstExpr* default_call = nullptr;
+            if (body->kind == AstStmtKind::Expr) {
+                default_call = &body->expr;
+            } else if (body->kind == AstStmtKind::If) {
+                return analyze_ws_if(*body, *route, mod, documents, scope, true, conditional_count);
+            } else if (body->kind == AstStmtKind::Block) {
+                const u32 kStmtCount = body->block_stmts.len;
+                if (kStmtCount == 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax, body->span);
+                for (u32 i = 0; i + 1 < kStmtCount;
+                     i++) {  // bindings and guards precede the verdict
+                    const AstStatement* gs = body->block_stmts[i];
+                    if (gs && gs->kind == AstStmtKind::Let) {
+                        auto binding = analyze_ws_binding(*gs, scope, mod, documents);
+                        if (!binding) return core::make_unexpected(binding.error());
+                        continue;
                     }
-                    auto binding = analyze_ws_json_binding_value(
-                        *gs, value.value(), gv.value(), *route, mod, documents, scope);
-                    if (!binding) return core::make_unexpected(binding.error());
-                } else {
-                    auto g = analyze_message_condition(
-                        gs->expr, gv.value(), *route, mod, documents, scope);
-                    if (!g) return core::make_unexpected(g.error());
+                    if (gs && gs->kind == AstStmtKind::If) {
+                        auto branch = analyze_ws_if(
+                            *gs, *route, mod, documents, scope, false, conditional_count);
+                        if (!branch) return core::make_unexpected(branch.error());
+                        continue;
+                    }
+                    if (gs == nullptr || gs->kind != AstStmtKind::Guard ||
+                        gs->else_stmt == nullptr || gs->else_stmt->kind != AstStmtKind::Expr)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              gs ? gs->span : body->span);
+                    if (++conditional_count > HirWsHandler::kMaxLenGuards)
+                        return frontend_error(FrontendError::TooManyItems, gs->span);
+                    auto gv = analyze_message_guard_verdict(
+                        gs->else_stmt->expr, *route, mod, documents, scope);
+                    if (!gv) return core::make_unexpected(gv.error());
+                    if (gs->bind_value) {
+                        auto value =
+                            analyze_ws_json_initializer(*gs, *route, mod, documents, scope);
+                        if (!value) return core::make_unexpected(value.error());
+                        if (ws_optional_has_choices(value.value())) {
+                            auto tail = ws_remaining_body(*body, i + 1);
+                            auto selected = analyze_ws_choice_guard(*gs,
+                                                                    value.value(),
+                                                                    gv.value(),
+                                                                    tail,
+                                                                    *route,
+                                                                    mod,
+                                                                    documents,
+                                                                    scope,
+                                                                    true,
+                                                                    conditional_count);
+                            if (!selected) return core::make_unexpected(selected.error());
+                            return {};
+                        }
+                        auto binding = analyze_ws_json_binding_value(
+                            *gs, value.value(), gv.value(), *route, mod, documents, scope);
+                        if (!binding) return core::make_unexpected(binding.error());
+                    } else {
+                        auto g = analyze_message_condition(
+                            gs->expr, gv.value(), *route, mod, documents, scope);
+                        if (!g) return core::make_unexpected(g.error());
+                    }
                 }
+                const AstStatement* last = body->block_stmts[kStmtCount - 1];
+                if (last && last->kind == AstStmtKind::If)
+                    return analyze_ws_if(
+                        *last, *route, mod, documents, scope, true, conditional_count);
+                if (last == nullptr || last->kind != AstStmtKind::Expr)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          last ? last->span : body->span);
+                default_call = &last->expr;
+            } else {
+                return frontend_error(FrontendError::UnsupportedSyntax, body->span);
             }
-            const AstStatement* last = body->block_stmts[stmt_count - 1];
-            if (last && last->kind == AstStmtKind::If)
-                return analyze_ws_if(*last, *route, mod, documents, scope, true, conditional_count);
-            if (last == nullptr || last->kind != AstStmtKind::Expr)
-                return frontend_error(FrontendError::UnsupportedSyntax,
-                                      last ? last->span : body->span);
-            default_call = &last->expr;
-        } else {
-            return frontend_error(FrontendError::UnsupportedSyntax, body->span);
-        }
-        return analyze_ws_default_verdict(*default_call, *route, mod, documents, scope);
+            return analyze_ws_default_verdict(*default_call, *route, mod, documents, scope);
+        };
+        auto legacy = analyze_legacy();
+        if (legacy || (legacy.error().code != FrontendError::UnsupportedSyntax &&
+                       legacy.error().code != FrontendError::TooManyItems))
+            return legacy;
+        route->ws_handler = kHandler;
+        route->exprs.len = kExprCount;
+        if (kCaptureCount > HirRoute::kMaxLocals) return legacy;
+        auto generic = std::unique_ptr<WsCallbackScope>(new (std::nothrow) WsCallbackScope{});
+        if (!generic) return frontend_error(FrontendError::OutOfMemory, stmt.span);
+        generic->route->is_ws_callback = true;
+        for (u32 i = 0; i < kCaptureCount; ++i)
+            if (!generic->locals.push(scope.locals[i]))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        auto result = [&]() -> FrontendResult<void> {
+            if (stmt.then_stmt == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            auto expression = analyze_function_body_stmt(*stmt.then_stmt,
+                                                         generic->route.get(),
+                                                         mod,
+                                                         generic->locals.data,
+                                                         generic->locals.len,
+                                                         nullptr,
+                                                         false);
+            if (!expression) return core::make_unexpected(expression.error());
+            HirLocal all_locals[HirRoute::kMaxLocals * 2]{};
+            u32 count = 0;
+            for (u32 i = 0; i < generic->locals.len; ++i) all_locals[count++] = generic->locals[i];
+            for (u32 i = 0; i < generic->route->locals.len; ++i)
+                all_locals[count++] = generic->route->locals[i];
+            auto normalized =
+                normalize_expr(expression.value(), route->exprs, all_locals, count, 1);
+            if (!normalized) return core::make_unexpected(normalized.error());
+            if (normalized->type != HirTypeKind::I32 || normalized->may_nil ||
+                normalized->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            if (const HirExpr* bad = ws_general_disallowed_value(normalized.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax, bad->span);
+            const u32 kRoot = route->exprs.len;
+            if (!route->exprs.push(normalized.value()))
+                return frontend_error(FrontendError::OutOfMemory, stmt.span);
+            route->ws_handler.general_body_expr = kRoot;
+            return {};
+        }();
+        if (result) return result;
+        route->ws_handler = kHandler;
+        route->exprs.len = kExprCount;
+        return result.error().code == FrontendError::OutOfMemory ? result : legacy;
     }
 #endif
 

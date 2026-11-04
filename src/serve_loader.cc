@@ -21,6 +21,9 @@
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn
 #endif
 
+#include <memory>
+#include <new>
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -303,6 +306,63 @@ bool load_rut_program(const char* path,
         for (u32 i = 0; i < ir.hir->routes.len; i++) {
             const HirWsHandler& h = ir.hir->routes[i].ws_handler;
             if (!ir.hir->routes[i].is_ws_terminate) continue;
+            if (h.general_body_expr != 0xffffffffu) {
+                const HirRoute& source_route = ir.hir->routes[i];
+                if (h.general_body_expr >= source_route.exprs.len) {
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                auto callback = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
+                if (!callback) {
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                callback->path = source_route.path;
+                callback->method = source_route.method;
+                callback->is_ws_callback = true;
+                callback->span = h.span;
+                HirLocal result{};
+                result.type = HirTypeKind::I32;
+                result.ref_index = 0;
+                result.is_runtime_synthetic = true;
+                result.span = h.span;
+                result.init = source_route.exprs[h.general_body_expr];
+                if (!callback->locals.push(result)) {
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                callback->control.kind = HirControlKind::Direct;
+                callback->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+                callback->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+                callback->control.direct_term.local_ref_index = 0;
+                callback->control.direct_term.span = h.span;
+                err.stage = LoadStage::BuildMir;
+                auto built = build_mir_route(*ir.hir, *callback);
+                if (!built) {
+                    set_load_diag(err, built.error());
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                const std::unique_ptr<MirModule> kCallbackMir(built.value());
+                FrontendRirModule callback_rir{};
+                err.stage = LoadStage::Lower;
+                auto lowered_callback = lower_to_rir(*kCallbackMir, callback_rir);
+                if (!lowered_callback) {
+                    set_load_diag(err, lowered_callback.error());
+                    callback_rir.destroy();
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                err.stage = LoadStage::Codegen;
+                const bool kEmitted = jit::emit_ws_body(cg.mod, cg.ctx, callback_rir.module, ws_n);
+                callback_rir.destroy();
+                if (!kEmitted) {
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                ++ws_n;
+                continue;
+            }
             static_assert(HirWsHandler::kMaxConditionNodes == jit::WsLenGuardSpec::kMaxConditions);
             static_assert(HirWsHandler::kMaxLenGuards == jit::WsLenGuardSpec::kMaxGuards);
             jit::WsLenGuardSpec guards[HirWsHandler::kMaxConditionNodes];

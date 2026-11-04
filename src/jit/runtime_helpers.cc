@@ -2283,6 +2283,16 @@ extern "C" u8 rut_helper_ws_json_valid(const char* payload, u64 len) {
     return ws_valid_json_payload(reinterpret_cast<const u8*>(payload), len) ? 1u : 0u;
 }
 
+extern "C" void rut_helper_ws_begin_message(void* conn) {
+    if (conn == nullptr) return;
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    // Admission is complete before a message callback can run. Keep the shard
+    // pool binding while returning all previous evaluation slices to that pool.
+    connection.json_arena.destroy();
+    connection.jit_response_body = {};
+    connection.jit_response_body_valid = false;
+}
+
 extern "C" u8 rut_helper_ws_json_string_regex_at_path(
     const char* payload, u64 len, const char* path, u32 path_len, void* database) {
     return static_cast<u8>(ws_json_scan_string_at_path(

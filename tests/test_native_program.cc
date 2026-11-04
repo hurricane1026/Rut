@@ -4,6 +4,7 @@
 #include "fixtures/signed_request.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
@@ -3340,3 +3341,41 @@ route GET "/" {
     connection->json_arena.destroy();
     pool.destroy();
 }
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_general_expressions_survive_compiler_and_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_general_expressions::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 3u);
+    const auto http = owner.p->config.routes[0];
+    CHECK_EQ(
+        invoke(http, "POST /http HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\n\r\nx").status_code,
+        200u);
+    CHECK_EQ(invoke(http, "POST /http HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\nxx")
+                 .status_code,
+             403u);
+    const auto handler = owner.p->config.routes[1].ws_frame_handler;
+    const auto guards = owner.p->config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    REQUIRE(guards);
+    const u8 payload[13] = {0, 255};
+    for (bool client : {false, true}) {
+        for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (u32 len : {0u, 1u, 2u, 5u, 9u, 12u}) {
+                const auto expected =
+                    len == 12 ? WsFrameAction::Close
+                    : (client && len % 4 != 1) || (opcode == WsOpcode::Text && len == 5)
+                        ? WsFrameAction::Drop
+                        : WsFrameAction::Forward;
+                CHECK(handler(nullptr, opcode, payload, len, client) == expected);
+                CHECK(guards(nullptr, opcode, payload, len, client) ==
+                      (len < 5 ? WsFrameAction::Drop : WsFrameAction::Forward));
+            }
+        }
+    }
+}
+#endif

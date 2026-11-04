@@ -355,6 +355,87 @@ TEST(jit, websocket_message_inputs_reuse_general_expression_codegen) {
     }
 }
 
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_shared_body_links_with_http_and_preserves_callback_abi) {
+    TestContext http;
+    TestContext message;
+    REQUIRE(http.init());
+    REQUIRE(message.init());
+    Builder b;
+    b.init(&http.mod);
+    auto* fn = V(b.create_function(lit("http_peer"), lit("/http"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto path = V(b.emit_req_path());
+    auto prefix = V(b.emit_const_str(lit("/http")));
+    auto accepted = V(b.emit_str_has_prefix(path, prefix));
+    auto ok = V(b.emit_const_i32(200));
+    auto bad = V(b.emit_const_i32(404));
+    auto status = V(b.emit_select(accepted, ok, bad));
+    VOK(b.emit_ret_status(status));
+    auto cg = codegen(http.mod);
+    REQUIRE(cg.ok);
+
+    b.init(&message.mod);
+    fn = V(b.create_function(lit("message_peer"), lit("/ws"), 'G'));
+    entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto payload = V(b.emit_ws_message_field(WsMessageFieldId::Payload));
+    prefix = V(b.emit_const_str(lit("allow")));
+    accepted = V(b.emit_str_has_prefix(payload, prefix));
+    ok = V(b.emit_const_i32(static_cast<i32>(WsFrameAction::Forward)));
+    bad = V(b.emit_const_i32(static_cast<i32>(WsFrameAction::Drop)));
+    status = V(b.emit_select(accepted, ok, bad));
+    VOK(b.emit_ret_status(status));
+    REQUIRE(emit_ws_body(cg.mod, cg.ctx, message.mod, 9));
+    CHECK_FALSE(emit_ws_body(cg.mod, cg.ctx, message.mod, 9));
+    // Both modules' IR pools may retire before the combined code is compiled.
+    message.destroy();
+    http.destroy();
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto http_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_http_peer"));
+    auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_9"));
+    REQUIRE(http_handler);
+    REQUIRE(handler);
+    const char request[] = "GET /http HTTP/1.1\r\nHost: test\r\n\r\n";
+    auto result = HandlerResult::unpack(http_handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    const u8 allowed[] = {'a', 'l', 'l', 'o', 'w', 0, 255};
+    CHECK(handler(nullptr, WsOpcode::Text, allowed, 5, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, allowed, sizeof(allowed), false) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, true) == WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Ping, allowed, 5, true) == WsFrameAction::Close);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 1, true) == WsFrameAction::Close);
+    CHECK(handler(nullptr, WsOpcode::Text, allowed, 0x80000000ull, true) == WsFrameAction::Close);
+
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto connection = std::make_unique<ConnectionBase>();
+    u8* pending_send = pool.alloc();
+    REQUIRE(pending_send);
+    REQUIRE(connection->json_arena.init(&pool));
+    REQUIRE(connection->json_arena.alloc(64));
+    connection->jit_response_body = lit("old");
+    connection->jit_response_body_valid = true;
+    CHECK_EQ(pool.in_use(), 2u);
+    CHECK(handler(connection.get(), WsOpcode::Text, allowed, 5, true) == WsFrameAction::Forward);
+    CHECK_EQ(pool.in_use(), 1u);
+    CHECK(connection->json_arena.current == nullptr);
+    CHECK(connection->json_arena.backend.pool == &pool);
+    CHECK_FALSE(connection->jit_response_body_valid);
+    pending_send[0] = 17;
+    CHECK_EQ(pending_send[0], 17u);
+    pool.free(pending_send);
+    connection->json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+}
+#endif
+
 TEST(jit, websocket_body_rejects_http_reads_and_keeps_borrowed_llvm_context_alive) {
     TestContext tc;
     REQUIRE(tc.init());

@@ -423,7 +423,7 @@ if(RUT_ENABLE_JIT)
         # `target` provides TargetMachine creation. Required for static LLVM
         # installs where these aren't pulled in transitively.
         llvm_map_components_to_libnames(LLVM_LIBS
-            core bitreader bitwriter orcjit orcshared orctargetprocess native support passes target)
+            core bitreader bitwriter linker orcjit orcshared orctargetprocess native support passes target)
     endif()
     target_link_libraries(rut_jit ${LLVM_LIBS})
 

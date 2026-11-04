@@ -46,6 +46,14 @@ CodegenResult codegen_ws_body(const rir::Module& rir_mod, LLVMContextRef shared_
 // Returns the output length excluding the trailing '\0'.
 u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size);
 
+// Link a separately lowered synchronous body into the route module and expose
+// it through the existing ws_handler_<id> callback ABI. No HTTP route is added.
+// Failure leaves the module unpublishable; its owner must dispose it.
+bool emit_ws_body(LLVMModuleRef module,
+                  LLVMContextRef context,
+                  const rir::Module& body,
+                  u32 handler_id);
+
 // Postorder message-condition forest, mirroring WsLenGuard without a HIR dependency.
 struct WsLenGuardSpec {
     static constexpr u32 kMaxConditions = 32;

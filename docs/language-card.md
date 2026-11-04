@@ -867,6 +867,13 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // Conditions support !, &&, ||, parentheses and left-to-right short-circuiting.
 // ! binds tighter than comparisons; && binds tighter than ||.
 // At most 32 condition nodes (leaf predicates + binary operators); nesting is bounded.
+// Pure scalar callbacks can also use the ordinary MIR/RIR compiler entry:
+// integer arithmetic, bitwise helpers, String comparisons, immutable aliases,
+// guards and complete if/else expressions with bare message verdicts. The
+// four-clause/32-node forest is a specialized-path bound, not a bound on these
+// general pure predicates. The source parser and ordinary local limits apply.
+// General JSON/regex work, effectful/fallible let initializers and dynamic
+// argument-bearing verdicts still require further integration.
 // `message` has the built-in borrowed type WebSocketMessage. It is supplied only
 // by this callback, never constructed or stored as an HTTP/connection value.
 // Fields: fromClient/isText/isBinary: bool, len: i32 (payload bytes), text: str

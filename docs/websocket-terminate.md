@@ -45,7 +45,8 @@ Nested callback declarations and `chain after` response mutations remain
 unsupported. HTTP bindings cannot be captured by the message handler or its
 rewrite expressions; only compile-time constant values cross that boundary.
 This prevents request-buffer and request-arena views from escaping their lifetime.
-The message handler retains its independent four-clause limit.
+The specialized JSON/rewrite path retains its four-clause limit. Pure scalar
+callbacks can use the shared compiler entry described below.
 
 The message callback receives a borrowed `WebSocketMessage`. Its Boolean
 fields are `fromClient`, `isText` and `isBinary`; `len` is an `i32` byte count
@@ -73,8 +74,17 @@ length/literal comparisons, text/literal equality and text regex matches.
 An imported helper works through the normal import namespace. HTTP reads and
 response effects cannot run inside a message predicate. The borrowed message
 has no storage carrier outside its synchronous callback, and comparing entire
-messages is rejected. General arithmetic and close-event values remain
-subsequent work.
+messages is rejected. Close-event values remain subsequent work.
+
+Pure scalar callbacks also lower through the shared MIR/RIR and LLVM backend.
+This entry supports ordinary integer arithmetic and bitwise helpers, String
+comparisons, local aliases, guards and complete `if`/`else` expressions, including
+pure conditions beyond the specialized four-clause/32-node forest. It keeps the
+source parser and ordinary local limits; it does not reserve additional HTTP
+route or timer slots. Verdicts remain terminal `forward()`, `drop()` or `close()`
+statements. Argument-bearing verdicts, JSON/regex work and fallible/effectful let
+initializers still use the specialized path or produce a compile error. HTTP
+access is rejected even in statically unreachable message branches.
 
 Boolean helpers may use ordinary `if`/`else` to select between two supported
 predicates, including nested conditionals. The selector evaluates once and only

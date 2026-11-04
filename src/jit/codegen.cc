@@ -8,10 +8,13 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/ws_frame.h"
+#include "rut/runtime/ws_terminate.h"
 #include <atomic>
 #include <cstddef>
 
 #include <llvm-c/Core.h>
+#include <llvm-c/Linker.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3018,6 +3021,11 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                     inst.op != rir::Opcode::WsMessageField &&
                     inst.op != rir::Opcode::CtxLoadSlotI32)
                     return {nullptr, nullptr, false};
+                if (ws_body_mode &&
+                    (inst.op == rir::Opcode::RetForward ||
+                     inst.op == rir::Opcode::RetForwardBundle ||
+                     inst.op == rir::Opcode::RetRedirect || inst.op == rir::Opcode::RespBody))
+                    return {nullptr, nullptr, false};
                 if (inst.op == rir::Opcode::WsMessageField) {
                     if (!ws_body_mode || inst.operand_count != 0 ||
                         !ws_message_field_valid(static_cast<u32>(inst.imm.i32_val)))
@@ -3208,6 +3216,147 @@ u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size) {
     for (u32 i = 0; i < nd && pos + 1 < out_size; i++) out[pos++] = digits[nd - 1 - i];
     out[pos] = '\0';
     return pos;
+}
+
+bool emit_ws_body(LLVMModuleRef module,
+                  LLVMContextRef context,
+                  const rir::Module& body,
+                  u32 handler_id) {
+    if (module == nullptr || context == nullptr || LLVMGetModuleContext(module) != context ||
+        body.func_count != 1 || body.functions == nullptr)
+        return false;
+    char wrapper_name[64];
+    const u32 kNameLen = format_ws_handler_symbol(handler_id, wrapper_name, sizeof(wrapper_name));
+    if (kNameLen == 0 || LLVMGetNamedFunction(module, wrapper_name) != nullptr) return false;
+    char body_name[80];
+    __builtin_memcpy(body_name, wrapper_name, kNameLen);
+    static constexpr char kSuffix[] = "_body";
+    __builtin_memcpy(body_name + kNameLen, kSuffix, sizeof(kSuffix));
+    const Str kBodyName{body_name, kNameLen + static_cast<u32>(sizeof(kSuffix) - 1)};
+    char body_symbol[256];
+    if (format_handler_symbol(kBodyName, body_symbol, sizeof(body_symbol)) == 0 ||
+        LLVMGetNamedFunction(module, body_symbol) != nullptr)
+        return false;
+    rir::Function function = body.functions[0];
+    function.name = kBodyName;
+    rir::Module isolated = body;
+    isolated.functions = &function;
+    auto generated = codegen_ws_body(isolated, context);
+    if (!generated.ok) return false;
+    // Linking consumes the source module on both success and failure. Its
+    // context is borrowed from the destination throughout.
+    if (LLVMLinkModules2(module, generated.mod) != 0) return false;
+    LLVMValueRef callee = LLVMGetNamedFunction(module, body_symbol);
+    if (callee == nullptr) return false;
+
+    LLVMTypeRef ptr_ty = LLVMPointerTypeInContext(context, 0);
+    LLVMTypeRef i8_ty = LLVMInt8TypeInContext(context);
+    LLVMTypeRef i32_ty = LLVMInt32TypeInContext(context);
+    LLVMTypeRef i64_ty = LLVMInt64TypeInContext(context);
+    LLVMTypeRef wrapper_params[] = {ptr_ty, i8_ty, ptr_ty, i64_ty, i8_ty};
+    LLVMTypeRef wrapper_type = LLVMFunctionType(i8_ty, wrapper_params, 5, 0);
+    LLVMValueRef wrapper = LLVMAddFunction(module, wrapper_name, wrapper_type);
+    LLVMBuilderRef builder = LLVMCreateBuilderInContext(context);
+    if (builder == nullptr) return false;
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(context, wrapper, "entry");
+    LLVMBasicBlockRef evaluate = LLVMAppendBasicBlockInContext(context, wrapper, "evaluate");
+    LLVMBasicBlockRef invalid = LLVMAppendBasicBlockInContext(context, wrapper, "invalid");
+    LLVMPositionBuilderAtEnd(builder, entry);
+    LLVMValueRef conn = LLVMGetParam(wrapper, 0);
+    LLVMValueRef opcode = LLVMGetParam(wrapper, 1);
+    LLVMValueRef payload = LLVMGetParam(wrapper, 2);
+    LLVMValueRef length = LLVMGetParam(wrapper, 3);
+    LLVMValueRef from_client = LLVMGetParam(wrapper, 4);
+    LLVMValueRef is_text = LLVMBuildICmp(builder,
+                                         LLVMIntEQ,
+                                         opcode,
+                                         LLVMConstInt(i8_ty, static_cast<u8>(WsOpcode::Text), 0),
+                                         "text");
+    LLVMValueRef is_binary =
+        LLVMBuildICmp(builder,
+                      LLVMIntEQ,
+                      opcode,
+                      LLVMConstInt(i8_ty, static_cast<u8>(WsOpcode::Binary), 0),
+                      "binary");
+    LLVMValueRef kind_ok = LLVMBuildOr(builder, is_text, is_binary, "kind.ok");
+    LLVMValueRef length_ok = LLVMBuildICmp(
+        builder, LLVMIntULE, length, LLVMConstInt(i64_ty, 0x7fffffffu, 0), "length.ok");
+    LLVMValueRef empty =
+        LLVMBuildICmp(builder, LLVMIntEQ, length, LLVMConstInt(i64_ty, 0, 0), "empty");
+    LLVMValueRef nonnull =
+        LLVMBuildICmp(builder, LLVMIntNE, payload, LLVMConstNull(ptr_ty), "nonnull");
+    LLVMValueRef data_ok = LLVMBuildOr(builder, empty, nonnull, "data.ok");
+    LLVMValueRef valid = LLVMBuildAnd(
+        builder, kind_ok, LLVMBuildAnd(builder, length_ok, data_ok, "size.ok"), "input.ok");
+    LLVMBuildCondBr(builder, valid, evaluate, invalid);
+    LLVMPositionBuilderAtEnd(builder, invalid);
+    LLVMBuildRet(builder, LLVMConstInt(i8_ty, static_cast<u8>(WsFrameAction::Close), 0));
+    LLVMPositionBuilderAtEnd(builder, evaluate);
+    LLVMValueRef zero_byte = LLVMGetNamedGlobal(module, "__rut_ws_empty");
+    if (zero_byte == nullptr) {
+        zero_byte = LLVMAddGlobal(module, i8_ty, "__rut_ws_empty");
+        LLVMSetInitializer(zero_byte, LLVMConstInt(i8_ty, 0, 0));
+        LLVMSetGlobalConstant(zero_byte, 1);
+        LLVMSetLinkage(zero_byte, LLVMPrivateLinkage);
+    }
+    LLVMValueRef safe_payload = LLVMBuildSelect(builder, nonnull, payload, zero_byte, "payload");
+    LLVMTypeRef frame_type = LLVMArrayType(i8_ty, sizeof(HandlerCtx));
+    LLVMValueRef frame = LLVMBuildAlloca(builder, frame_type, "message.ctx");
+    LLVMSetAlignment(frame, alignof(HandlerCtx));
+    LLVMBuildMemSet(builder,
+                    frame,
+                    LLVMConstInt(i8_ty, 0, 0),
+                    LLVMConstInt(i64_ty, sizeof(HandlerCtx), 0),
+                    alignof(HandlerCtx));
+    LLVMTypeRef begin_params[] = {ptr_ty};
+    LLVMTypeRef begin_type = LLVMFunctionType(LLVMVoidTypeInContext(context), begin_params, 1, 0);
+    LLVMValueRef begin = LLVMGetNamedFunction(module, "rut_helper_ws_begin_message");
+    if (begin == nullptr)
+        begin = LLVMAddFunction(module, "rut_helper_ws_begin_message", begin_type);
+    LLVMValueRef begin_args[] = {conn};
+    LLVMBuildCall2(builder, begin_type, begin, begin_args, 1, "");
+    LLVMValueRef args[] = {conn,
+                           frame,
+                           safe_payload,
+                           LLVMBuildTrunc(builder, length, i32_ty, "length"),
+                           LLVMConstNull(ptr_ty),
+                           opcode,
+                           from_client};
+    LLVMValueRef result =
+        LLVMBuildCall2(builder, LLVMGlobalGetValueType(callee), callee, args, 7, "decision");
+    LLVMValueRef action = LLVMBuildAnd(builder, result, LLVMConstInt(i64_ty, 0xffu, 0), "action");
+    LLVMValueRef action_ok =
+        LLVMBuildICmp(builder,
+                      LLVMIntEQ,
+                      action,
+                      LLVMConstInt(i64_ty, static_cast<u8>(HandlerAction::ReturnStatus), 0),
+                      "action.ok");
+    LLVMValueRef extra = LLVMBuildAnd(
+        builder, result, LLVMConstInt(i64_ty, ~static_cast<u64>(0xffffffu), 0), "extra");
+    LLVMValueRef extra_ok =
+        LLVMBuildICmp(builder, LLVMIntEQ, extra, LLVMConstInt(i64_ty, 0, 0), "extra.ok");
+    LLVMValueRef verdict =
+        LLVMBuildAnd(builder,
+                     LLVMBuildLShr(builder, result, LLVMConstInt(i64_ty, 8, 0), "status"),
+                     LLVMConstInt(i64_ty, 0xffffu, 0),
+                     "verdict");
+    LLVMValueRef verdict_ok =
+        LLVMBuildICmp(builder,
+                      LLVMIntULE,
+                      verdict,
+                      LLVMConstInt(i64_ty, static_cast<u8>(WsFrameAction::ForwardTextPolicy3), 0),
+                      "verdict.ok");
+    LLVMValueRef output_ok = LLVMBuildAnd(
+        builder, action_ok, LLVMBuildAnd(builder, extra_ok, verdict_ok, "value.ok"), "output.ok");
+    LLVMValueRef selected =
+        LLVMBuildSelect(builder,
+                        output_ok,
+                        LLVMBuildTrunc(builder, verdict, i8_ty, "verdict.byte"),
+                        LLVMConstInt(i8_ty, static_cast<u8>(WsFrameAction::Close), 0),
+                        "output");
+    LLVMBuildRet(builder, selected);
+    LLVMDisposeBuilder(builder);
+    return true;
 }
 
 bool emit_ws_handler(LLVMModuleRef mod,

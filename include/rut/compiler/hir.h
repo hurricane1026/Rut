@@ -1209,6 +1209,9 @@ struct HirWsTextRewrite {
 };
 
 struct HirWsHandler {
+    // A normalized shared-IR entry lives in the owning route's expression pool.
+    // The index preserves ordinary HirRoute copy/move rebasing and ownership.
+    u32 general_body_expr = 0xffffffffu;
     Str parameter_name = lit_str("message");  // analyzer-only lexical binding
     WsVerdict default_verdict = WsVerdict::Forward;
     // Postorder condition forest with forward-only root control targets. Unset

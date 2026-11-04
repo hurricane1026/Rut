@@ -1,5 +1,6 @@
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 // Tests for the .rut program loader (src/serve_loader.cc): the bridge that
@@ -9762,4 +9763,49 @@ TEST(serve_loader, websocket_mixed_guard_text_and_close_policies) {
     program.destroy();
 }
 
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_general_expressions_share_http_helpers_and_own_code) {
+    auto path = write_file("/tmp/rut_ws_general", "app.rut", test::ws_general_expressions::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    REQUIRE_EQ(program.config.route_count, 3u);
+    const auto http = program.config.routes[0].fn;
+    REQUIRE(http);
+    for (const char* body : {"x", "xx", "xxxxx"}) {
+        std::string request = "POST /http HTTP/1.1\r\nHost: test\r\nContent-Length: ";
+        request += std::to_string(strlen(body));
+        request += "\r\n\r\n";
+        request += body;
+        auto result = jit::HandlerResult::unpack(http(nullptr,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(request.data()),
+                                                      static_cast<u32>(request.size()),
+                                                      nullptr));
+        CHECK_EQ(result.status_code, strlen(body) == 2 ? 403u : 200u);
+    }
+    const auto handler = program.config.routes[1].ws_frame_handler;
+    const auto guards = program.config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    REQUIRE(guards);
+    const u8 payload[13] = {0, 255};
+    for (bool client : {false, true}) {
+        for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (u32 len : {0u, 1u, 2u, 5u, 9u, 12u}) {
+                const auto expected =
+                    len == 12 ? WsFrameAction::Close
+                    : (client && len % 4 != 1) || (opcode == WsOpcode::Text && len == 5)
+                        ? WsFrameAction::Drop
+                        : WsFrameAction::Forward;
+                CHECK(handler(nullptr, opcode, payload, len, client) == expected);
+                CHECK(guards(nullptr, opcode, payload, len, client) ==
+                      (len < 5 ? WsFrameAction::Drop : WsFrameAction::Forward));
+            }
+        }
+    }
+    program.destroy();
+}
 #endif

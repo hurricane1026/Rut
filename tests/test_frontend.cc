@@ -1,6 +1,7 @@
 #include "deferred_preflight_fixture.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
@@ -5887,7 +5888,7 @@ TEST(frontend, websocket_bool_select_uses_ordinary_helpers_lets_and_optional_sel
     rir.destroy();
 }
 
-TEST(frontend, websocket_bool_select_keeps_the_condition_node_budget) {
+TEST(frontend, websocket_bool_select_uses_shared_entry_after_fast_path_node_budget) {
     for (u32 terms : {6u, 7u}) {
         std::string source = R"rut(upstream ws
 func choose(_ msg: WebSocketMessage) -> bool {
@@ -5908,8 +5909,8 @@ route GET "/ws" { return websocket(ws) { msg in guard )rut";
             REQUIRE(hir);
             CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 29u);
         } else {
-            REQUIRE_FALSE(hir);
-            CHECK(hir.error().code == FrontendError::TooManyItems);
+            REQUIRE(hir);
+            CHECK(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu);
         }
     }
 }
@@ -6912,7 +6913,7 @@ TEST(frontend, websocket_nested_if_rejects_incomplete_paths_effects_and_scope_le
     }
 }
 
-TEST(frontend, websocket_nested_if_shares_four_clause_and_thirty_two_node_budgets) {
+TEST(frontend, websocket_nested_if_uses_shared_entry_after_fast_path_budgets) {
     for (u32 count : {4u, 5u}) {
         std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";
         for (u32 i = 0; i < count; ++i) source += "if msg.isText { ";
@@ -6924,8 +6925,8 @@ TEST(frontend, websocket_nested_if_shares_four_clause_and_thirty_two_node_budget
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        CHECK_EQ(hir.has_value(), count == 4);
-        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu, count > 4);
     }
     for (u32 leaves : {15u, 16u}) {
         std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in ";
@@ -6939,8 +6940,8 @@ TEST(frontend, websocket_nested_if_shares_four_clause_and_thirty_two_node_budget
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        CHECK_EQ(hir.has_value(), leaves == 15);
-        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu, leaves > 15);
     }
 }
 
@@ -7090,8 +7091,8 @@ TEST(frontend, websocket_if_conditions_share_guard_node_and_parser_bounds) {
             continue;
         }
         auto hir = analyze_file_heap(ast.value());
-        CHECK_EQ(hir.has_value(), count == 4);
-        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu, count > 4);
     }
     for (u32 leaves : {16u, 17u}) {
         std::string source =
@@ -7104,8 +7105,8 @@ TEST(frontend, websocket_if_conditions_share_guard_node_and_parser_bounds) {
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        CHECK_EQ(hir.has_value(), leaves == 16);
-        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu, leaves > 16);
     }
     const char* too_many = R"rut(upstream ws
 route GET "/ws" { return websocket(ws) { msg in
@@ -7262,7 +7263,7 @@ route GET "/http" { guard secret else { return 403 } return 200 }
     CHECK_FALSE(analyze_file_heap(ast.value()));
 }
 
-TEST(frontend, websocket_callback_binding_limits_do_not_expand_guard_or_node_limits) {
+TEST(frontend, websocket_callback_bindings_retain_capacity_and_share_general_guard_entry) {
     for (u32 count : {0u, 16u}) {
         std::string source =
             "upstream ws\nfunc identity<T>(_ value: T) -> T => value\nroute GET \"/ws\" {\n";
@@ -7290,8 +7291,8 @@ TEST(frontend, websocket_callback_binding_limits_do_not_expand_guard_or_node_lim
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
-        CHECK_EQ(hir.has_value(), leaves == 16);
-        if (!hir) CHECK(hir.error().code == FrontendError::TooManyItems);
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu, leaves > 16);
     }
 
     std::string source =
@@ -7304,8 +7305,8 @@ TEST(frontend, websocket_callback_binding_limits_do_not_expand_guard_or_node_lim
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK(hir.error().code == FrontendError::TooManyItems);
+    REQUIRE(hir);
+    CHECK(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu);
 }
 
 TEST(frontend, websocket_json_document_field_presence) {
@@ -9364,8 +9365,6 @@ TEST(frontend, analyze_websocket_text_literal_conditions) {
 
 TEST(frontend, analyze_websocket_text_literal_rejects_invalid_shapes) {
     for (const char* condition : {"message.text == 1",
-                                  "message.text == message.text",
-                                  "message.text < \"ping\"",
                                   "message.text.isEmpty()",
                                   "message.text.hasPrefix",
                                   "message.binary.hasSuffix(\"x\")",
@@ -9420,7 +9419,7 @@ TEST(frontend, analyze_websocket_text_prefix_suffix_conditions) {
     }
 }
 
-TEST(frontend, analyze_websocket_condition_limits) {
+TEST(frontend, analyze_websocket_condition_forest_overflow_uses_shared_entry) {
     // Sixteen leaves + fifteen binary nodes fit; the next leaf exceeds the budget.
     for (u32 leaves : {16u, 17u}) {
         std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
@@ -9436,8 +9435,8 @@ TEST(frontend, analyze_websocket_condition_limits) {
             REQUIRE(hir);
             CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 31u);
         } else {
-            REQUIRE(!hir);
-            CHECK(hir.error().code == FrontendError::TooManyItems);
+            REQUIRE(hir);
+            CHECK(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu);
         }
     }
     // The node budget is shared across source guards: 31 + 1 fits, 31 + 2 does not.
@@ -9458,11 +9457,11 @@ TEST(frontend, analyze_websocket_condition_limits) {
             REQUIRE(hir);
             CHECK_EQ(hir->routes[0].ws_handler.len_guards.len, 32u);
         } else {
-            REQUIRE(!hir);
-            CHECK(hir.error().code == FrontendError::TooManyItems);
+            REQUIRE(hir);
+            CHECK(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu);
         }
     }
-    // Four source guards remain the limit regardless of their condition sizes.
+    // A fifth pure guard uses the general entry instead of the four-clause fast path.
     std::string source = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in\n";
     for (u32 i = 0; i < 5; i++) source += "guard message.isText else { message.drop() }\n";
     source += "message.forward()\n} }\n";
@@ -9471,8 +9470,8 @@ TEST(frontend, analyze_websocket_condition_limits) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
-    CHECK(hir.error().code == FrontendError::TooManyItems);
+    REQUIRE(hir);
+    CHECK(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu);
 }
 
 TEST(frontend, analyze_websocket_compound_rejects_invalid_operands) {
@@ -46293,3 +46292,60 @@ TEST(frontend, password_header_rejects_unsafe_positions_and_policy) {
     CHECK(!rir::function_uses_password(rir.module.functions[0]));
     rir.destroy();
 }
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_general_expressions_preserve_owned_ir_after_copy) {
+    auto tokens = lex(lit(test::ws_general_expressions::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    ast.reset();
+    auto copied = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    REQUIRE_EQ(copied->routes.len, 3u);
+    for (u32 route_index : {1u, 2u}) {
+        const auto& route = copied->routes[route_index];
+        REQUIRE_EQ(route.locals.len, 0u);
+        REQUIRE(route.ws_handler.general_body_expr < route.exprs.len);
+        auto callback = std::make_unique<HirRoute>();
+        callback->is_ws_callback = true;
+        HirLocal result{};
+        result.is_runtime_synthetic = true;
+        result.type = HirTypeKind::I32;
+        result.init = route.exprs[route.ws_handler.general_body_expr];
+        REQUIRE(callback->locals.push(result));
+        callback->control.kind = HirControlKind::Direct;
+        callback->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+        callback->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+        callback->control.direct_term.local_ref_index = 0;
+        auto mir = build_mir_route(*copied, *callback);
+        REQUIRE(mir);
+        HeapFrontendResult<MirModule> owner{mir.value()};
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(owner.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        CHECK(rir.module.functions[0].value_count > 1u);
+        rir.destroy();
+    }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_general_string_comparisons_keep_ordinary_types) {
+    for (const char* condition : {"msg.text == msg.text", "msg.text < \"ping\""}) {
+        std::string source =
+            "upstream ws\nroute GET \"/ws\" { return websocket(ws) { msg in guard ";
+        source += condition;
+        source += " else { msg.drop() } msg.forward() } }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK(hir->routes[0].ws_handler.general_body_expr != 0xffffffffu);
+    }
+}
+#endif

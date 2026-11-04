@@ -48,6 +48,44 @@ def masked_frame(opcode, payload):
     return bytes((0x80 | opcode, 0x80 | len(payload))) + key + masked
 
 
+GENERAL_DECLARATIONS = r"""
+func allowed(_ size: i32, _ client: bool) -> bool =>
+    !client || bitwise.and(size, 3) == 2
+"""
+GENERAL_HANDLER = r"""
+return websocket(ws) { msg in
+    let size = msg.payload.count + 1
+    guard size >= 1 else { msg.close() }
+    guard size <= 12 else { msg.close() }
+    guard allowed(size, msg.fromClient) else { msg.drop() }
+    if msg.isText && msg.len == 5 { msg.drop() } else { msg.forward() }
+}
+"""
+
+
+def general_expression_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"general message expression: {actual=!r}, {expected=!r}")
+
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, b""))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xff", True))
+    client.sendall(masked_frame(1, b"xx") + masked_frame(1, b"xxxxx") +
+                   masked_frame(2, b"\0\xffabc") + masked_frame(9, b"END"))
+    expect(peer, (2, b"\0\xffabc", True))
+    expect(peer, (9, b"END", True))
+    peer.sendall(b"\x82\x02\0\xff\x81\x05xxxxx\x8a\x03END")
+    expect(client, (2, b"\0\xff", False))
+    expect(client, (10, b"END", False))
+    client.sendall(masked_frame(1, b"xxxxxxxxxxxx"))
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
 BINARY_HANDLER = r'''
 return websocket(ws) { message in
     guard message.len != 0 else { message.forward(b"") }
@@ -1995,6 +2033,7 @@ def main():
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
+                (GENERAL_HANDLER, general_expression_exchange, GENERAL_DECLARATIONS),
                 (SCALAR_STRING_HANDLER, scalar_string_exchange, SCALAR_PREDICATE_DECLARATIONS),
                 (SCALAR_BOOL_HANDLER, scalar_bool_exchange, SCALAR_PREDICATE_DECLARATIONS),
                 (BOOL_SELECT_HANDLER, bool_select_exchange, BOOL_SELECT_DECLARATIONS),
