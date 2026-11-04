@@ -8,6 +8,7 @@
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_general_json.h"
+#include "fixtures/ws_general_regex.h"
 #include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
@@ -3433,5 +3434,15 @@ TEST(native_program, websocket_general_json_values_survive_source_removal_and_po
     REQUIRE(load(source, *owner.p));
     REQUIRE_EQ(unlink(source.path), 0);
     test::ws_general_json::check(owner.p->config, _tc);
+}
+
+TEST(native_program, websocket_general_regex_uses_shared_values_after_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_general_regex::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_general_regex::check(owner.p->config, _tc);
 }
 #endif

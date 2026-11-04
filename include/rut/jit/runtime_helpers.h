@@ -416,6 +416,10 @@ void* rut_helper_regex_deserialize(const char* bytes, rut::u64 length);
 // Full regular-expression match using a precompiled database.
 rut::u8 rut_helper_str_regex_match(const char* s, rut::u32 s_len, void* db);
 
+// Full-match tri-state result: 0 no match, 1 match, 2 scan/resource failure.
+// Message callbacks must close on failure before applying Boolean operators.
+rut::u8 rut_helper_str_regex_result(const char* s, rut::u32 s_len, void* db);
+
 // Returns 1 when the Vectorscan backend is available.
 rut::u8 rut_helper_regex_backend_available();
 

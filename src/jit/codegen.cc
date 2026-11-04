@@ -698,12 +698,15 @@ struct Ctx {
         return fn_str_cmp;
     }
 
-    // u8 rut_helper_str_regex_match(ptr, i32, ptr)
+    // u8 regex helper(ptr, i32, ptr); message mode retains scan failures.
     LLVMValueRef get_str_regex_match() {
         if (!fn_str_regex_match) {
             LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty};
             LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 3, 0);
-            fn_str_regex_match = LLVMAddFunction(llvm_mod, "rut_helper_str_regex_match", ft);
+            fn_str_regex_match = LLVMAddFunction(
+                llvm_mod,
+                ws_body_mode ? "rut_helper_str_regex_result" : "rut_helper_str_regex_match",
+                ft);
         }
         return fn_str_regex_match;
     }
@@ -1725,8 +1728,23 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef fn = c.get_str_regex_match();
             LLVMValueRef r =
                 LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 3, "rx");
+            if (c.ws_body_mode) {
+                LLVMValueRef function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+                auto* scanned = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "rx.ok");
+                auto* failed = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "rx.error");
+                LLVMValueRef valid = LLVMBuildICmp(
+                    c.builder, LLVMIntULE, r, LLVMConstInt(c.i8_ty, 1, 0), "rx.valid");
+                LLVMBuildCondBr(c.builder, valid, scanned, failed);
+                LLVMPositionBuilderAtEnd(c.builder, failed);
+                // The private message body uses the ordinary packed return ABI.
+                // Close before a negation or continuation can consume the result.
+                const u64 kClosed = static_cast<u64>(HandlerAction::ReturnStatus) |
+                                    (static_cast<u64>(WsFrameAction::Close) << 8);
+                LLVMBuildRet(c.builder, LLVMConstInt(c.i64_ty, kClosed, 0));
+                LLVMPositionBuilderAtEnd(c.builder, scanned);
+            }
             LLVMValueRef b =
-                LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "rx.bool");
+                LLVMBuildICmp(c.builder, LLVMIntEQ, r, LLVMConstInt(c.i8_ty, 1, 0), "rx.bool");
             c.set_value(inst.result, b);
             break;
         }
@@ -3312,9 +3330,25 @@ bool emit_ws_body(LLVMModuleRef module,
     isolated.functions = &function;
     auto generated = codegen_ws_body(isolated, context);
     if (!generated.ok) return false;
+    // Patterns are startup metadata consumed by JitEngine, rather than IR
+    // operands. The linker drops otherwise-unused private globals, so retain
+    // their unique names across this link and restore private linkage afterward.
+    static constexpr char kRegexPatternPrefix[] = "__rut_regex_pattern_";
+    const auto kIsRegexPattern = [](LLVMValueRef global) {
+        size_t size = 0;
+        const char* name = LLVMGetValueName2(global, &size);
+        return size >= sizeof(kRegexPatternPrefix) - 1 &&
+               __builtin_memcmp(name, kRegexPatternPrefix, sizeof(kRegexPatternPrefix) - 1) == 0;
+    };
+    for (LLVMValueRef global = LLVMGetFirstGlobal(generated.mod); global;
+         global = LLVMGetNextGlobal(global))
+        if (kIsRegexPattern(global)) LLVMSetLinkage(global, LLVMExternalLinkage);
     // Linking consumes the source module on both success and failure. Its
     // context is borrowed from the destination throughout.
     if (LLVMLinkModules2(module, generated.mod) != 0) return false;
+    for (LLVMValueRef global = LLVMGetFirstGlobal(module); global;
+         global = LLVMGetNextGlobal(global))
+        if (kIsRegexPattern(global)) LLVMSetLinkage(global, LLVMPrivateLinkage);
     LLVMValueRef callee = LLVMGetNamedFunction(module, body_symbol);
     if (callee == nullptr) return false;
 
@@ -3521,7 +3555,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
     if (!builder) return false;
     LLVMPositionBuilderAtEnd(builder, entry);
 
-    // u8 rut_helper_str_regex_match(ptr payload, i32 len, ptr db) — shared with HTTP handlers;
+    // u8 tri-state regex helper(ptr payload, i32 len, ptr db);
     // get-or-declare so we don't duplicate a decl the HTTP codegen already put in this module.
     LLVMTypeRef rx_params[3] = {ptr_ty, i32_ty, ptr_ty};
     LLVMTypeRef rx_fn_ty = LLVMFunctionType(i8_ty, rx_params, 3, 0);
@@ -3904,12 +3938,21 @@ bool emit_ws_handler(LLVMModuleRef mod,
                 cond = LLVMBuildICmp(
                     builder, LLVMIntEQ, result, LLVMConstInt(i8_ty, 1, 0), "json.regex.matches");
             } else {
-                LLVMValueRef rx_fn = LLVMGetNamedFunction(mod, "rut_helper_str_regex_match");
-                if (!rx_fn) rx_fn = LLVMAddFunction(mod, "rut_helper_str_regex_match", rx_fn_ty);
+                LLVMValueRef rx_fn = LLVMGetNamedFunction(mod, "rut_helper_str_regex_result");
+                if (!rx_fn) rx_fn = LLVMAddFunction(mod, "rut_helper_str_regex_result", rx_fn_ty);
                 LLVMValueRef len32 = LLVMBuildTrunc(builder, len, i32_ty, "len32");
                 LLVMValueRef rx_args[3] = {payload, len32, db};
                 LLVMValueRef result = LLVMBuildCall2(builder, rx_fn_ty, rx_fn, rx_args, 3, "rx");
-                cond = LLVMBuildICmp(builder, LLVMIntNE, result, LLVMConstInt(i8_ty, 0, 0), "rx.m");
+                auto* scanned = LLVMAppendBasicBlockInContext(ctx, fn, "rx.ok");
+                auto* failed = LLVMAppendBasicBlockInContext(ctx, fn, "rx.error");
+                LLVMValueRef valid = LLVMBuildICmp(
+                    builder, LLVMIntULE, result, LLVMConstInt(i8_ty, 1, 0), "rx.valid");
+                LLVMBuildCondBr(builder, valid, scanned, failed);
+                LLVMPositionBuilderAtEnd(builder, failed);
+                LLVMBuildRet(builder,
+                             LLVMConstInt(i8_ty, static_cast<u8>(WsFrameAction::Close), 0));
+                LLVMPositionBuilderAtEnd(builder, scanned);
+                cond = LLVMBuildICmp(builder, LLVMIntEQ, result, LLVMConstInt(i8_ty, 1, 0), "rx.m");
             }
         } else if (guards[i].accessor >= 6) {  // TextEqual / TextPrefix / TextSuffix / TextContains
             // Check the full 64-bit length before reading a literal-sized view.

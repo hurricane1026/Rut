@@ -4,6 +4,7 @@
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_general_json.h"
+#include "fixtures/ws_general_regex.h"
 #include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
@@ -9889,6 +9890,16 @@ TEST(serve_loader, websocket_general_json_values_survive_source_removal_and_pool
     REQUIRE(load_rut_program(path.c_str(), program, err));
     REQUIRE_EQ(unlink(path.c_str()), 0);
     test::ws_general_json::check(program.config, _tc);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_general_regex_uses_shared_values_after_source_removal) {
+    auto path = write_file("/tmp/rut_ws_general_regex", "app.rut", test::ws_general_regex::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_general_regex::check(program.config, _tc);
     program.destroy();
 }
 #endif

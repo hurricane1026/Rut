@@ -29214,3 +29214,116 @@ TEST(jit, websocket_lexical_values_evaluate_once_at_the_reached_declaration) {
     }
 }
 #endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_general_regex_errors_close_before_negation_and_skip_untaken_scans) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    for (bool fault : {false, true}) {
+        for (u32 mode : {0u, 1u, 2u}) {
+            TestContext tc;
+            REQUIRE(tc.init());
+            Builder b;
+            b.init(&tc.mod);
+            auto* fn = V(b.create_function(lit("regex_message"), lit("/"), 'G'));
+            auto entry = V(b.create_block(fn, lit("entry")));
+            auto scan = V(b.create_block(fn, lit("scan")));
+            auto skip = V(b.create_block(fn, lit("skip")));
+            b.set_insert_point(fn, entry);
+            auto client = V(b.emit_ws_message_field(WsMessageFieldId::FromClient));
+            VOK(b.emit_br(client, scan, skip));
+            b.set_insert_point(fn, scan);
+            auto text = V(b.emit_ws_message_field(WsMessageFieldId::Payload));
+            auto match = V(b.emit_str_regex_match(text, lit("a.*")));
+            if (mode == 1) {
+                auto no = V(b.emit_const_bool(false));
+                match = V(b.emit_cmp(Opcode::CmpEq, match, no));
+            }
+            auto yes = V(b.emit_const_i32(0));
+            auto no = V(b.emit_const_i32(1));
+            auto verdict = mode == 2 ? yes : V(b.emit_select(match, yes, no));
+            VOK(b.emit_ret_status(verdict));
+            b.set_insert_point(fn, skip);
+            VOK(b.emit_ret_status(0));
+            auto cg = codegen_ws_body(tc.mod);
+            REQUIRE(cg.ok);
+            if (fault) {
+                // Inject the runtime's documented scan-failure status into this
+                // module only. No production fault switch or global state.
+                auto helper = LLVMGetNamedFunction(cg.mod, "rut_helper_str_regex_result");
+                REQUIRE(helper);
+                LLVMSetLinkage(helper, LLVMInternalLinkage);
+                auto block = LLVMAppendBasicBlockInContext(cg.ctx, helper, "failed");
+                auto builder = LLVMCreateBuilderInContext(cg.ctx);
+                REQUIRE(builder);
+                LLVMPositionBuilderAtEnd(builder, block);
+                LLVMBuildRet(builder, LLVMConstInt(LLVMInt8TypeInContext(cg.ctx), 2, 0));
+                LLVMDisposeBuilder(builder);
+            }
+            JitEngine engine;
+            REQUIRE(engine.init());
+            REQUIRE(engine.compile(cg.mod, cg.ctx));
+            auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_regex_message"));
+            REQUIRE(handler);
+            for (const char* input : {"allow", "bad"}) {
+                for (u8 client : {0u, 1u}) {
+                    auto result = HandlerResult::unpack(handler(nullptr,
+                                                                nullptr,
+                                                                reinterpret_cast<const u8*>(input),
+                                                                strlen(input),
+                                                                nullptr,
+                                                                1,
+                                                                client));
+                    const bool kMatch = input[0] == 'a';
+                    const u16 expected =
+                        !client     ? 0
+                        : fault     ? 2
+                        : mode == 2 ? 0
+                                    : static_cast<u16>((mode == 1 ? !kMatch : kMatch) ? 0 : 1);
+                    CHECK(result.action == HandlerAction::ReturnStatus);
+                    CHECK_EQ(result.status_code, expected);
+                }
+            }
+            engine.shutdown();
+            tc.destroy();
+        }
+    }
+    CHECK_EQ(rut_helper_str_regex_result("x", 1, nullptr), 2u);
+    void* db = rut_helper_regex_compile("x", 1);
+    REQUIRE(db);
+    CHECK_EQ(rut_helper_str_regex_result(nullptr, 0, db), 2u);
+    CHECK_EQ(rut_helper_str_regex_result("x", 1, db), 1u);
+    CHECK_EQ(rut_helper_str_regex_result("y", 1, db), 0u);
+    rut_helper_regex_free(db);
+}
+
+TEST(jit, websocket_recipe_regex_errors_close_before_negation) {
+    for (u8 negate : {0u, 1u}) {
+        WsLenGuardSpec node{};
+        node.accessor = 3;
+        node.verdict = 1;
+        node.negate = negate;
+        node.pattern = "x";
+        node.pattern_len = 1;
+        auto cg = codegen_ws_handler(0, &node, 1, 0);
+        REQUIRE(cg.ok);
+        auto helper = LLVMGetNamedFunction(cg.mod, "rut_helper_str_regex_result");
+        REQUIRE(helper);
+        LLVMSetLinkage(helper, LLVMInternalLinkage);
+        auto block = LLVMAppendBasicBlockInContext(cg.ctx, helper, "failed");
+        auto builder = LLVMCreateBuilderInContext(cg.ctx);
+        REQUIRE(builder);
+        LLVMPositionBuilderAtEnd(builder, block);
+        LLVMBuildRet(builder, LLVMConstInt(LLVMInt8TypeInContext(cg.ctx), 2, 0));
+        LLVMDisposeBuilder(builder);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+        REQUIRE(handler);
+        for (const char* input : {"x", "y"})
+            CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(input), 1, true) ==
+                  WsFrameAction::Close);
+        engine.shutdown();
+    }
+}
+#endif

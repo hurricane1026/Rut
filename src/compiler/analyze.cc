@@ -7496,8 +7496,7 @@ static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
     if ((expr.kind >= HirExprKind::ReqHeaderCount && expr.kind <= HirExprKind::ReqMethod &&
          expr.kind != HirExprKind::ConstMethod) ||
         expr.kind == HirExprKind::WaitResult || expr.kind == HirExprKind::WaitField ||
-        expr.kind == HirExprKind::CacheGet || expr.kind == HirExprKind::CacheSet ||
-        expr.kind == HirExprKind::RegexMatch)
+        expr.kind == HirExprKind::CacheGet || expr.kind == HirExprKind::CacheSet)
         return &expr;
     if (validate_receivers && expr.kind == HirExprKind::WsMessageField &&
         (expr.lhs == nullptr || expr.lhs->kind != HirExprKind::LocalRef ||

@@ -89,8 +89,7 @@ references reuse that value. Nullable values retain their presence channel.
 unwrap the token before use. Allocation failure follows its nil branch. The
 message arena is reset for each invocation after output has been copied.
 General JSON, digest/HMAC and argument-bearing verdicts also use shared IR, as
-described below. Error-capable local declarations and general regex combinations
-remain pending. HTTP
+described below. Error-capable local declarations remain pending. HTTP
 access is rejected even in statically unreachable message branches. The shared
 entry emits explicit branches and typed SSA merges: only the chosen arm runs,
 including nested nullable value choices. It does not reuse an eager `select`
@@ -113,13 +112,13 @@ func accepted(_ client: bool, _ text: bool, _ size: i32) -> bool {
 The same typed helper can accept HTTP scalar arguments. Infallible immutable
 Boolean results may initialize callback lets and feed nullable-helper selectors.
 Predicate helpers may select between regex scans when called from a guard;
-ordinary lets still reject regex/fallible work in any arm, including unused lets.
+ordinary lets also accept scans through shared IR, including unused lets.
 Negation changes the selected result, and reached decode errors retain their
 existing close behavior. The selector, both arm trees and one selection node count
 toward 32 condition nodes; one helper call remains one source clause. The compiler
 adds no runtime value storage or native-format field for that recipe. Other
-scalar arithmetic and general JSON expressions use shared IR; effectful helpers
-and general regex combinations remain pending.
+scalar arithmetic, general JSON and regex expressions use shared IR; effectful
+helpers remain pending.
 
 `message.kind` has type `WebSocketMessageKind`, whose cases are
 `WebSocketMessageKind.text` and `WebSocketMessageKind.binary`. `message.direction`
@@ -174,7 +173,7 @@ Imported helpers retain their literal bytes after the imported AST disappears. L
 the existing binary escape rules and 4096-byte decoded limit; the message view
 still spans the full single-slice payload, up to 16370 bytes. Equality/inequality
 and generic `Eq` compare exact bytes in either operand order. Comparisons with
-`str`, implicit conversions, regex scans, ordering, concatenation and indexing
+`str`, implicit conversions, Bytes regex scans, ordering, concatenation and indexing
 are unsupported. Payload inspections currently lower literal equality, view
 reflexivity, count/literal comparisons and emptiness into the bounded condition
 forest. General `msg.forward(bytes)` accepts an unwrapped Bytes expression and
@@ -209,9 +208,9 @@ expressions, message aliases and projections, ordinary optional values, JSON
 operations and digest/HMAC results. Bindings are immutable and visible
 only after their declaration, through the remainder of this callback. Names
 must be fresh across callback lets, JSON guard aliases and captured admission
-constants; `json` is unavailable as a local let name. HTTP reads/effects, general
-regex scans and error-capable lets remain unavailable. An unused initializer is
-still checked and reached nullable work still runs once.
+constants; `json` is unavailable as a local let name. HTTP reads/effects and
+error-capable lets remain unavailable. An unused initializer is still checked
+and reached nullable work still runs once.
 
 Message aliases may receive verdicts. A borrowed text alias may feed the existing
 text rewrite or `json.parse` guard; JSON guard aliases retain their existing
@@ -366,7 +365,7 @@ return websocket(chat) { msg in
 The same String predicate may take `req.body` in HTTP. Bool helpers, including
 conditional Boolean helpers, retain false-versus-absence semantics. String equality
 helpers work on decoded strings, exact numberText, compact stringify output and
-kind names; regex helpers currently support decoded JSON String only. I32 count
+kind names; general regex helpers accept any unwrapped String source. I32 count
 values support Eq/Ord helpers with constant bounds. Integer comparisons may also
 use compile-time helper results as bounds, including full-width inferred I64
 values. This adds no I64 parameter annotations or generic binding support.
@@ -374,8 +373,8 @@ values. This adds no I64 parameter annotations or generic binding support.
 The scalar must already be unwrapped in the current scope. A helper cannot hide
 an optional extraction without unwrapping or use a binding from a sibling/failure
 arm. Shared IR supports independent Json values, String ordering, dynamic scalar
-pairs, JSON lets and scalar arithmetic. NumberText/stringify regex and effects
-still require integration. The specialized projection path needs no additional
+pairs, JSON lets, scalar arithmetic and regex on unwrapped String sources.
+Effects still require integration. The specialized projection path needs no additional
 runtime value storage.
 
 This helper subset normalizes to one parse/get/scalar projection over the same
@@ -480,14 +479,15 @@ func replacement(_ msg: WebSocketMessage) -> Bytes {
 Within nullable helpers, `.or(default)` and `any(value, default)` support defaults
 that normalize to the same infallible immutable subset. They retain ordinary eager
 language semantics: this lowering is allowed only where skipping evaluation of a
-default cannot change effects or errors. Regex scans, HTTP/state operations and
-other fallible defaults remain rejected. A valid JSON value of the wrong scalar
+default cannot change effects or errors in the specialized recipe. Richer JSON
+and regex defaults use shared IR with eager evaluation; HTTP/state effects remain
+unavailable. A valid JSON value of the wrong scalar
 kind selects the default; malformed JSON in the example returns absence before
 reaching it. False, zero and empty defaults remain present. Literal Bytes aliases
 and pure helper results emit fixed Binary messages, including empty or non-UTF-8
 bytes. Complete borrowed message Bytes may also supply Binary output as described
-below. General optional callback locals, arbitrary calculations and constant-string
-regex predicates remain unsupported. Existing source, graph and recipe limits apply.
+below. General optional locals, scalar calculations and constant-string regex
+inputs use shared IR with ordinary source/local bounds.
 
 Presence is separate from truthiness: a valid `false`, `0`, empty string or empty
 collection count binds successfully. A JSON `null` node is present for parse,
@@ -623,6 +623,21 @@ and narrowed reads; untaken branches perform no work. Exhaustion follows the
 chosen nil branch. Binary data, including NUL and non-UTF-8 bytes, is hashed
 exactly; this does not implicitly convert Bytes or add a new crypto algorithm.
 
+### General regex expressions
+
+`value.matches(re"pattern")` accepts an unwrapped String from message text,
+ordinary helper output or JSON extraction/rendering. It uses the existing
+Vectorscan full-match backend; patterns remain literals and Bytes do not convert
+implicitly. Generic callbacks support regex lets (including unused results),
+Boolean composition, selected branches and sources outside the recipe's
+four-clause/32-node tables.
+
+A scan/resource failure closes the connection before negation or any subsequent
+verdict. Both general IR and the raw-text recipe retain this failure state.
+Untaken branches and short-circuited operands perform no scan. Reached unused
+lets still execute. Databases remain owned by the loaded configuration and are
+serialized with native programs; message values retain callback lifetimes.
+
 ### General JSON expressions
 
 Message callbacks support the same optional JSON operations as HTTP: dynamic
@@ -652,7 +667,7 @@ results share the existing 256KiB arena budget. Data-message bounds still apply.
 The four-clause/32-node restrictions in the specialized recipe descriptions
 below concern those tables, not the general JSON API. Richer non-regex JSON
 callbacks lower through shared MIR/RIR with ordinary source/local limits.
-General regex combinations and helper-internal single evaluation remain pending.
+Helper-internal single evaluation remains pending.
 
 Dynamic code/reason arguments use `msg.close(code, reason)` with an unwrapped
 `i32` and `str`. Known invalid values remain compile errors; invalid runtime

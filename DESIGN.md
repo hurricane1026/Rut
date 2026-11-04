@@ -2614,14 +2614,27 @@ bounds and the 256KiB intermediate-arena budget remain in force.
 The four-clause/32-node JSON predicate forest and fixed policy tables describe
 the specialized recipe lowering below. Their source shapes remain fast paths;
 callbacks outside those shapes use shared IR with ordinary parser/local bounds.
-Regex combinations outside the recipe, general error-capable lets and
-helper-internal evaluation still require integration. A synthesized logical
+General error-capable lets and helper-internal evaluation still require
+integration. A synthesized logical
 negation is distinguished from optional equality in the common analyzer:
 `!optionalBool` rejects until unwrapped; `optionalBool == false` remains a plain
 Boolean equality result. HTTP capability evidence is recorded at recursive
 expression analysis before folding and propagated through helper metadata and
 HIR copies, so an unused argument or folded helper read cannot bypass the
 message phase boundary.
+
+General regex expressions lower through the existing `StrRegexMatch` operation
+with the ordinary literal-pattern and unwrapped-String checks. Message codegen
+uses the shared Vectorscan scanner's tri-state helper (match/no-match/failure),
+branches on failure and returns Close before Boolean negation or a continuation
+can consume it. The raw-text specialized recipe uses the same failure contract;
+ordinary HTTP retains its existing Boolean helper. Selected branches and logical
+short circuits skip unreached scans. A reached unused regex let still scans, and
+therefore still closes on failure. Normal JSON decoding may supply independent
+String, numberText, stringify or kind values. Regex globals already have unique
+module identities, so linking multiple callbacks and HTTP entries retains each
+owned database and native artifact metadata. No new regex library or syntax is
+introduced.
 
 General synchronous callbacks also accept `message.forward(value)` with an
 unwrapped `str` or `Bytes` expression, including conditional pure-helper results,
@@ -2640,7 +2653,7 @@ The existing digest and HMAC builtins are available on plain message strings,
 including raw Binary `message.text` bytes; optional hex results use the message
 arena and its existing crypto budget. Pool failure remains nil and follows the
 source's declared guard/else branch. No new crypto dependency or conversion is
-introduced. General regex/error integration and helper-internal lexical
+introduced. General error integration and helper-internal lexical
 semantics remain separate completion work.
 
 `message.close(code, reason)` also accepts runtime plain `i32` and `str` values.
@@ -2917,7 +2930,7 @@ rebound into each owning expression pool during normalization/inlining and into
 scoped SSA values during RIR materialization, preventing numeric local-slot
 capture. Message aliases keep their zero-carrier representation. Nullable UUID
 locals use the ordinary runtime allocator/failure contract; ordinary helper
-body lets, general regex/error work and close-event context still require
+body lets, general error work and close-event context still require
 integration. Dynamic output, digest/HMAC and general JSON use shared IR.
 
 The message also projects two nominal, closed domains: `kind` is
@@ -2983,9 +2996,9 @@ Both branches use the existing message predicate subset. The selector evaluates
 once, followed by exactly one arm; outer negation inverts the chosen result,
 without converting a reached decode/scan error into a Boolean value. Helpers with
 infallible immutable selectors and arms may also initialize callback lets or feed
-nullable-helper conditions. Regex/JSON and other fallible work remain excluded
-from ordinary let substitution, including unused lets; guarded predicate calls
-retain their reached evaluation and error behavior.
+nullable-helper conditions. Callback regex/JSON locals use lexical shared IR
+rather than recipe substitution, including reached unused work; guarded predicate
+calls retain their reached evaluation and error behavior.
 
 Lowering reuses normalized HIR IfElse and appends one BoolSelect node with three
 owned postorder operands: bound is the selector index, lhs/rhs are true/false

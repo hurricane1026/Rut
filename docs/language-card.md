@@ -877,8 +877,8 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // Names are fresh within the callback (json is reserved); bindings never escape
 // their lexical continuation or become HTTP locals. Captured admission constants
 // retain a separate 16-local budget. Each source block has at most eight statements.
-// Error-capable lets, helper-internal single evaluation, general regex/cache work
-// and connection/close contexts still need integration. uuid() retains HTTP's
+// Error-capable lets, helper-internal single evaluation, cache work and
+// connection/close contexts still need integration. uuid() retains HTTP's
 // direct-let initializer restriction; failures are nil and must be unwrapped.
 //
 // JSON uses the same optional API as HTTP: parse/get/at/scalars/kind/count/keys,
@@ -895,9 +895,11 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // literal text equality/isEmpty/hasPrefix/hasSuffix/contains, and JSON projection
 // predicates/rewrites. Text predicates operate on raw bytes; add isText to filter
 // the kind. Empty literal needles match, escapes decode, and Unicode is not normalized.
-// Regex matches the complete value; patterns are literals. Reached decode/scan
-// errors close before negation. Regex-containing callbacks still use the existing
-// four-clause / 32-node recipe limits; regex with general JSON needs further work.
+// Regex matches the complete value through the existing Vectorscan backend;
+// patterns are literals and input must be an unwrapped str. Reached scan errors
+// close before negation, including unused lets. Ordinary JSON strings, numberText,
+// stringify and kind results may feed matches. Regex callbacks use specialized
+// recipe lowering when possible; richer callbacks use shared IR too.
 // Ordinary expressions outside that specialized subset use shared IR rather than
 // inheriting the recipe's clause/node/policy-table limits. Parser/local bounds apply.
 // Early-if false paths and guard success paths resume in their current arm; a

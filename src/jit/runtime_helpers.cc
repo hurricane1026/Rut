@@ -2049,6 +2049,10 @@ static u8 regex_match_result(const char* s, u32 s_len, void* db) {
     return ctx.matched ? 1 : 0;
 }
 
+u8 rut_helper_str_regex_result(const char* s, u32 s_len, void* db) {
+    return regex_match_result(s, s_len, db);
+}
+
 u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
     return regex_match_result(s, s_len, db) == 1 ? 1u : 0u;
 }

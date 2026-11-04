@@ -112,6 +112,7 @@
     X(rut_helper_str_eq)                              \
     X(rut_helper_str_cmp)                             \
     X(rut_helper_str_regex_match)                     \
+    X(rut_helper_str_regex_result)                    \
     X(rut_helper_str_trim_prefix)                     \
     X(rut_helper_resp_body)                           \
     X(rut_helper_json)                                \

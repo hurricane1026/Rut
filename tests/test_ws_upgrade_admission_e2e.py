@@ -92,6 +92,40 @@ def general_json_exchange(client, peer):
         raise AssertionError("malformed JSON did not run its explicit 1007 close")
 
 
+GENERAL_REGEX_HANDLER = r"""
+guard req.path.matches(re"/.*") else { return 403 }
+return websocket(ws) { msg in
+    let path = jsonPath(msg.fromClient)
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    guard let selected = json.get(root, path) else { msg.drop() }
+    guard let text = json.string(selected) else { msg.drop() }
+    let allowed = text.matches(re"a.*")
+    guard allowed else { msg.drop() }
+    msg.forward(text)
+}
+"""
+
+
+def general_regex_exchange(client, peer):
+    first = b'{"name":"a\\u0000b"}'
+    fragment = bytearray(masked_frame(2, first[:7]))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"p") + masked_frame(0, first[7:]) +
+                   masked_frame(1, b'{"name":"bad"}') + masked_frame(1, b'{"name":"answer"}'))
+    for expected in ((9, b"p", True), (1, b"a\0b", True), (1, b"answer", True)):
+        actual = recv_client_frame(peer)
+        if actual != expected:
+            raise AssertionError(f"general regex output: {actual=!r}, {expected=!r}")
+    bad, good = b'{"reply":"bad"}', b'{"reply":"answer"}'
+    peer.sendall(bytes((0x81, len(bad))) + bad + bytes((0x82, len(good))) + good)
+    if recv_client_frame(client) != (1, b"answer", False):
+        raise AssertionError("general regex selected the wrong upstream JSON text")
+    client.sendall(masked_frame(1, b"{"))
+    if recv_client_frame(client) != (8, b"\x03\xef", False) or \
+            recv_client_frame(peer) != (8, b"\x03\xef", True):
+        raise AssertionError("invalid JSON preceding general regex did not close")
+
+
 TYPED_JSON_HANDLER = r"""
 return websocket(ws) { msg in
     guard let root = json.parse(msg.text) else { msg.close(1007) }
@@ -2281,6 +2315,7 @@ def main():
     for backend in ("epoll", "io_uring"):
         for handler, exchange, declarations in (
                 (GENERAL_JSON_HANDLER, general_json_exchange, GENERAL_JSON_DECLARATIONS),
+                (GENERAL_REGEX_HANDLER, general_regex_exchange, GENERAL_JSON_DECLARATIONS),
                 (TYPED_JSON_HANDLER, typed_json_exchange, GENERAL_JSON_DECLARATIONS),
                 (JSON_LIFETIME_HANDLER, json_lifetime_exchange, ""),
                 (HASH_OUTPUT_HANDLER, hash_output_exchange, ""),

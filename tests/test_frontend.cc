@@ -5,6 +5,7 @@
 #include "fixtures/ws_eager_bindings.h"
 #include "fixtures/ws_general_expressions.h"
 #include "fixtures/ws_general_json.h"
+#include "fixtures/ws_general_regex.h"
 #include "fixtures/ws_hash_output.h"
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
@@ -5867,8 +5868,8 @@ route GET "/ws" { return websocket(ws) { msg in
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto analyzed = analyze_file_heap(ast.value());
-        const bool kAccepted =
-            json_case_0 == 5u || json_case_0 == 7u || json_case_0 == 8u || json_case_0 == 11u;
+        const bool kAccepted = json_case_0 == 5u || json_case_0 == 7u || json_case_0 == 8u ||
+                               json_case_0 == 9u || json_case_0 == 10u || json_case_0 == 11u;
         CHECK_EQ(analyzed.has_value(), kAccepted);
         if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
         ++json_case_0;
@@ -5954,7 +5955,7 @@ route GET "/ws" { return websocket(ws) { msg in guard )rut";
     }
 }
 
-TEST(frontend, websocket_bool_select_lets_reject_fallible_work_even_in_unused_branches) {
+TEST(frontend, websocket_bool_select_lets_use_general_regex_and_reject_mixed_types) {
     const char* definitions[] = {
         R"rut(func pick(_ msg: WebSocketMessage) -> bool {
             if msg.fromClient { msg.text.matches(re"ok") } else { msg.isBinary }
@@ -5965,6 +5966,7 @@ TEST(frontend, websocket_bool_select_lets_reject_fallible_work_even_in_unused_br
         R"rut(func pick(_ msg: WebSocketMessage) -> bool {
             if msg.fromClient { msg.len } else { msg.isBinary }
         })rut"};
+    u32 definition_index = 0;
     for (const char* definition : definitions) {
         std::string source = "upstream ws\n";
         source += definition;
@@ -5977,7 +5979,10 @@ route GET "/ws" { return websocket(ws) { msg in
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_EQ(hir.has_value(), definition_index != 2u);
+        if (hir) check_general_ws_rir(hir.value(), _tc);
+        ++definition_index;
     }
 }
 
@@ -6087,7 +6092,7 @@ func dynamicPointer(_ msg: WebSocketMessage) -> str {
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         auto analyzed = analyze_file_heap(ast.value());
-        const bool kAccepted = json_case_0 == 7u;
+        const bool kAccepted = json_case_0 == 6u || json_case_0 == 7u;
         CHECK_EQ(analyzed.has_value(), kAccepted);
         if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
         ++json_case_0;
@@ -7296,7 +7301,7 @@ route GET "/ws" { return websocket(ws) { msg in msg.forward() } }
         auto ast = parse_file_heap(tokens.value());
         if (ast) {
             auto analyzed = analyze_file_heap(ast.value());
-            const bool kAccepted = json_case_0 == 10u;
+            const bool kAccepted = json_case_0 == 9u || json_case_0 == 10u;
             CHECK_EQ(analyzed.has_value(), kAccepted);
             if (analyzed && kAccepted) check_general_ws_rir(analyzed.value(), _tc);
             ++json_case_0;
@@ -7788,7 +7793,12 @@ TEST(frontend, websocket_json_string_regex_rejects_optional_and_non_string_sourc
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
-        CHECK_FALSE(analyze_file_heap(ast.value()));
+        auto hir = analyze_file_heap(ast.value());
+        const bool kString = std::string_view(accessor) == "numberText" ||
+                             std::string_view(accessor) == "stringify" ||
+                             std::string_view(accessor) == "kind";
+        CHECK_EQ(hir.has_value(), kString);
+        if (hir) check_general_ws_rir(hir.value(), _tc);
     }
 }
 
@@ -46653,7 +46663,9 @@ TEST(frontend, logical_negation_requires_a_plain_bool_for_every_protocol) {
                                 std::string_view(operation) != "!!value" &&
                                 std::string_view(operation) != "!value == false";
             CHECK_EQ(hir.has_value(), kValid);
+#if RUT_ENABLE_WEBSOCKET
             if (hir && websocket) check_general_ws_rir(hir.value(), _tc);
+#endif
         }
     }
 }
@@ -46707,5 +46719,22 @@ func messageOnly(_ req: WebSocketMessage) -> i32 => req.len
     ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     CHECK(analyze_file_heap(ast.value()));
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, websocket_general_regex_keeps_owned_ir_and_unwrapped_string_types) {
+    auto tokens = lex(lit(test::ws_general_regex::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto copy = std::make_unique<AstFile>(ast.value());
+    ast.reset();
+    auto hir = analyze_file_heap(*copy);
+    REQUIRE(hir);
+    copy.reset();
+    auto owned = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    check_general_ws_rir(*owned, _tc);
 }
 #endif
