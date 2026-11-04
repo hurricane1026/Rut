@@ -4,6 +4,9 @@ set_property(CACHE SIMD_ARCH PROPERTY STRINGS auto scalar sse2 avx2 avx512 neon 
 
 # Pinned static TLS/crypto libraries; never use the host OpenSSL installation.
 include(${PROJECT_SOURCE_DIR}/cmake/RutOpenSSL.cmake)
+if(RUT_ENABLE_WEBSOCKET)
+    include(${PROJECT_SOURCE_DIR}/cmake/RutWebSocketZlib.cmake)
+endif()
 
 if(SIMD_ARCH STREQUAL "auto")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
@@ -160,6 +163,7 @@ add_library(rut_runtime STATIC
     runtime/hpack.cc
     runtime/chunked_parser.cc
     runtime/ws_frame.cc
+    runtime/ws_deflate.cc
     runtime/ws_handshake.cc
     runtime/ws_terminate.cc
     runtime/access_log.cc
@@ -189,13 +193,16 @@ target_include_directories(rut_runtime PUBLIC
 # those, so a blanket flag would break the test/bench harness and third_party — the
 # runtime itself is warn_unused_result-clean.
 target_compile_options(rut_runtime PRIVATE -Werror=unused-result)
-target_link_libraries(rut_runtime
+target_link_libraries(rut_runtime PUBLIC
     rut_crypto
     zstd_compress
     ssl
     crypto
     Threads::Threads
 )
+if(RUT_ENABLE_WEBSOCKET)
+    target_link_libraries(rut_runtime PRIVATE rut_ws_zlib)
+endif()
 
 # Shared project harness contracts. This layer intentionally has no compiler,
 # JIT, or runtime dependency beyond common value types; mode-specific adapters
@@ -373,7 +380,8 @@ if(RUT_ENABLE_JIT)
     file(GLOB_RECURSE _RUT_NATIVE_ABI_FILES CONFIGURE_DEPENDS
         "${PROJECT_SOURCE_DIR}/src/*.cc" "${PROJECT_SOURCE_DIR}/include/rut/*.h")
     list(APPEND _RUT_NATIVE_ABI_FILES "${PROJECT_SOURCE_DIR}/CMakeLists.txt"
-        "${PROJECT_SOURCE_DIR}/src/CMakeLists.txt")
+        "${PROJECT_SOURCE_DIR}/src/CMakeLists.txt"
+        "${PROJECT_SOURCE_DIR}/cmake/RutWebSocketZlib.cmake")
     list(SORT _RUT_NATIVE_ABI_FILES)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_RUT_NATIVE_ABI_FILES})
     set(_RUT_NATIVE_ABI_INPUT "${CMAKE_SYSTEM_PROCESSOR};${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_BUILD_TYPE};${CMAKE_CXX_FLAGS};${LLVM_PACKAGE_VERSION};${RUT_ENABLE_WEBSOCKET};${RUT_ENABLE_EBPF}")

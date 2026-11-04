@@ -107,3 +107,11 @@ its downstream ring and cancellation validation. Tests cover allocation rollback
 whole-message callbacks, 64-bit wire lengths, UTF-8 across fragments, interleaved
 controls, deferred-send retirement and source/native × TLS × both backends.
 The end-to-end matrix now contains 310 passing cases; RFC 7692 is still open.
+
+The internal RFC 7692 raw-DEFLATE codec now uses a pinned static C zlib with
+`Z_SOLO` and a custom allocator confined to one existing bulk slice per leg.
+The existing compress-only zstd cannot supply DEFLATE. The codec tests cover
+RFC vectors, received context history, BFINAL streams, negotiated window sizes,
+decoded/wire work budgets and incompressible output fallback. This foundation
+is not yet connected to extension negotiation or frame processing; compression
+remains unchecked above and is not advertised to peers.
