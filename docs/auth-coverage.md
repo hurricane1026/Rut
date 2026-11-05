@@ -28,7 +28,7 @@ whether a competing open-source edition includes them.
 | OIDC login / session | Pending | Discovery validation, authorization-code + PKCE, state/nonce, redirect validation, ID-token verification, secure cookies, logout and refresh |
 | Gateway OAuth2 endpoints | Pending | Authorization/token grants, client authentication, consent/redirect binding, code single use, token expiry/revocation and persistent state |
 | Upstream OAuth token | Pending | Client credentials/token exchange, audience/scope, per-shard cache with bounded refresh coordination, cancellation and secret-safe logs |
-| mTLS identity | Inbound mandatory client certificate verification with startup CA bundle; verified SHA-256 fingerprint exposed to Rut/JIT/native requests; static pinned identity and two-pin credential rotation helpers; epoll and io_uring HTTP/1 and HTTP/2 loopback tests; TLS 1.2/1.3 valid, absent, wrong-CA and expired certificate cases; ordinary TLS and cleartext spoof-header rejection; keepalive/reset, pin RCU update, bounded HTTP/2 refusal/retry, and source-unlinked native artifact evidence | Dynamic identity mapping, CRL/OCSP and durable revocation |
+| mTLS identity | Inbound mandatory client certificate verification with startup CA bundle; verified SHA-256 fingerprint exposed to Rut/JIT/native requests; static pinned identity, two-pin credential rotation and two-Consumer certificate mapping helpers; epoll and io_uring HTTP/1 and HTTP/2 loopback tests; TLS 1.2/1.3 valid, absent, wrong-CA and expired certificate cases; ordinary TLS and cleartext spoof-header rejection; keepalive/reset, pin RCU update, bounded HTTP/2 refusal/retry, and source-unlinked native artifact evidence | Dynamic identity mapping, CRL/OCSP and durable revocation |
 | LDAP | Pending | Direct LDAP protocol, TLS, bind/search escaping, limits/timeouts, credential hygiene; an HTTP bridge does not satisfy this row |
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
 | Keycloak / Casdoor | Pending | Explicit supported OIDC/OAuth2 or provider protocols and conformance fixtures, role mapping and outage behavior |
@@ -1162,6 +1162,32 @@ The client allow policy is static until configuration adoption. It neither prove
 the presenter's possession of a client secret/key nor implements full RFC 9068,
 OAuth/OIDC login, token exchange, durable revocation or replay tracking.
 
+
+## Bounded mTLS Consumer mapping
+
+`mtls.identity` accepts two trusted `mtls.Consumer` records,
+matching only the verified connection's certificate fingerprint and returning
+that record's Consumer/credential IDs. Empty pins disable slots, while Consumer
+IDs must remain nonempty/distinct and credential IDs nonempty. Enabled pins
+must be canonical lowercase SHA-256 hex and have unique ownership. Bad metadata,
+two disabled slots or duplicate enabled pins return 503 before matching; no
+verified/matching certificate returns 403 when the request reaches routing.
+Client headers cannot supply identity. Existing Consumer/group authorization
+remains separate and can reject an authenticated Consumer with 403.
+
+The JIT request matrix exercises both identities, disabled/unknown fingerprints,
+ambiguous ownership, every metadata field, invalid TLS connection states, forged
+headers and Consumer allow/deny ordering. Native-loaded two-shard TLS tests use
+two distinct certificate DER fingerprints on epoll/io_uring, remove source and
+module files after load, check exact identity/credential output and denied
+cross-Consumer access, and reject missing client certificates. The second public
+certificate reuses the test key with different signed subject and serial number; no new
+private key or system OpenSSL CLI dependency is introduced.
+
+Mapping is static until replacement config adoption, with existing RCU reader
+semantics. It adds no persistent Consumer registry, SAN mapping, automatic CA
+reload, CRL/OCSP or distributed revocation. See
+[mtls-consumers-auth.rut](../examples/mtls-consumers-auth.rut).
 
 ## Static mTLS pin rotation
 

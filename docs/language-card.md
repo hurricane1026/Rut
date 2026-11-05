@@ -577,6 +577,38 @@ adopted route policy. This rotates the route's pin allowlist, not the listener C
 bundle, which still requires restart to change. It provides no automatic rotation
 timer, certificate issuance, CRL/OCSP service or cross-node revocation protocol.
 
+### Two-Consumer mTLS identity mapping
+
+Import `"middleware/mtls.rut"` for this composition. It imports the base auth
+module and exposes the existing Identity and Consumer/group policy helpers
+under the `mtls` namespace, for example `mtls.requireConsumer`. A separate base
+`auth.rut` import is unnecessary.
+
+`mtls.Consumer(consumerId: ..., sha256: ..., credentialId: ...)` is a
+trusted static record. `mtls.identity(first, second)` maps the
+verified TLS certificate fingerprint to one of two distinct Consumers. Both
+Consumer IDs must be nonempty and different, and both credential IDs must be
+nonempty even when a pin is disabled. Empty pins disable individual slots;
+at least one must remain enabled. Every enabled pin must be exactly 64 lowercase
+hex bytes. A nonempty pin cannot belong to both records. All configuration is
+validated before reading or matching the connection identity; ambiguity or
+invalid metadata returns 503 even if a different slot would match.
+
+The helper reads only `req.tlsClientCertSha256` and returns the matched record's
+Consumer/credential IDs with method `mtls`. Missing/unverified/unmatched
+certificates return 403 if routing is reached; a mandatory-mTLS listener can
+reject them during the handshake. Identity headers cannot select a record.
+Use the returned Identity with `requireConsumer`, `denyConsumer` or group policy
+to apply authorization after authentication. The [runnable example](../examples/mtls-consumers-auth.rut)
+allows both Consumers at `/private` and only the first at `/first-only`.
+
+Records are compiled configuration, not a Consumer registry. Disabling a pin
+and adopting a replacement config retires it for subsequent requests; existing
+RCU readers finish on their original snapshot. CA trust still belongs to the
+listener and requires restart to change. This adds no guest fallback, CA reload,
+SAN mapping, CRL/OCSP or durable revocation. Do not construct records from
+untrusted request data; ordinary Identity values have no verification provenance.
+
 Upstream connections are shared per shard/config/upstream/backend and multiplex
 RPCs from different downstream clients. Incomplete HTTP/2 input promotes the
 connection's receive slice to 256 KiB when less than 16 KiB of tail space remains;

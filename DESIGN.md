@@ -9133,6 +9133,31 @@ so missing/invalid credentials remain 401. Identity is a constructible ordinary
 struct, not a compiler-enforced proof of authentication. These helpers do not
 provide a dynamic group/role registry or Consumer membership lifecycle.
 
+### Two-Consumer mTLS identity mapping
+
+The ordinary `mtls.Consumer` record contains trusted `consumerId`, `sha256`
+and `credentialId` fields. `mtls.identity(first, second)` maps
+one verified connection fingerprint to a bounded pair of Consumers. Validate
+both nonempty/distinct Consumer IDs, both nonempty credential IDs, at least one
+enabled pin, canonical enabled pins and unique pin ownership before examining
+the request. Empty pins disable slots without disabling metadata validation.
+Configuration errors return 503, including duplicate enabled pins even when the
+presented certificate would otherwise match. Both slot comparisons use the
+existing crypto equality helper; only matched configuration publishes Identity
+metadata (`method: "mtls"`). Missing/unverified/unknown fingerprints return 403
+at routing; handshake enforcement remains the listener's responsibility.
+
+Consumer allow/deny/group policies compose after this mapping. Spoofed headers
+never select identity. Records remain compiled immutable snapshots with existing
+RCU adoption semantics; CA bundle updates still require listener restart.
+Tests cover distinct identities, disabled/retired slots, ambiguous ownership,
+invalid metadata before matching, failed TLS state and allow/deny composition.
+Two-shard TLS/native tests use two different certificate DER fingerprints,
+remove program/module sources after load, and exercise epoll and io_uring.
+The second certificate fixture uses the existing test key with different
+signed subject and serial number; it is not evidence of private-key rotation.
+No registry, SAN mapping or revocation service is added.
+
 ### JWT claims policy over existing signature verification
 
 `jwtDecode` continues to return signature-verified Json without silently imposing

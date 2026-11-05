@@ -659,6 +659,10 @@ configure_file(
     COPYONLY
 )
 
+# Distinct certificate identity using the existing localhost test private key.
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/fixtures/mtls_second_cert.pem
+    ${RUT_TLS_TESTDATA_DIR}/mtls_second_cert.pem COPYONLY)
+
 add_custom_target(test_tls_fixtures DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY})
 target_compile_definitions(test_network PRIVATE RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}")
 add_dependencies(test_network test_tls_fixtures)
@@ -3949,6 +3953,15 @@ if(RUT_ENABLE_JIT)
                         --source ${PROJECT_SOURCE_DIR}/examples/jwt-client-auth.rut
                         --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${jwt_client_backend})
                 set_tests_properties(test_jwt_client_auth_${jwt_client_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
+            endforeach()
+            foreach(mtls_consumer_backend epoll io_uring)
+                add_test(NAME test_mtls_consumers_${mtls_consumer_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_consumers.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/mtls-consumers-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${mtls_consumer_backend})
+                set_tests_properties(test_mtls_consumers_${mtls_consumer_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
             endforeach()
             foreach(mtls_rotation_backend epoll io_uring)

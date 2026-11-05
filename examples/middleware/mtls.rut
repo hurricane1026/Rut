@@ -1,0 +1,30 @@
+import Crypto
+import "auth.rut"
+
+// A trusted, static certificate-to-Consumer mapping. Empty pins disable slots;
+// all metadata remains required. Each enabled pin has exactly one owner.
+struct Consumer {
+    consumerId: str
+    sha256: str
+    credentialId: str
+}
+
+func identity(_ first: Consumer, _ second: Consumer) -> auth.Identity {
+    guard first.consumerId != "" && second.consumerId != "" &&
+          first.consumerId != second.consumerId && first.credentialId != "" &&
+          second.credentialId != "" && (first.sha256 != "" || second.sha256 != "") else {
+        respond 503
+    }
+    guard (first.sha256 == "" || Crypto.sha256HexValid(first.sha256)) &&
+          (second.sha256 == "" || Crypto.sha256HexValid(second.sha256)) &&
+          (first.sha256 == "" || first.sha256 != second.sha256) else { respond 503 }
+    guard let presented = req.tlsClientCertSha256 else { respond 403 }
+    let firstMatches = Crypto.equal(presented, first.sha256)
+    let secondMatches = Crypto.equal(presented, second.sha256)
+    guard firstMatches || secondMatches else { respond 403 }
+    match firstMatches {
+        true => auth.Identity(consumerId: first.consumerId, credentialId: first.credentialId, method: "mtls")
+        _ => auth.Identity(consumerId: second.consumerId, credentialId: second.credentialId, method: "mtls")
+    }
+}
+
