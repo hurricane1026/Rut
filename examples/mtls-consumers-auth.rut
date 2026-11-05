@@ -1,0 +1,24 @@
+// Start with --tls-cert SERVER_CERT --tls-key SERVER_KEY --tls-client-ca CA_BUNDLE.
+// Both enabled pins must be distinct canonical lowercase SHA-256 certificate hashes.
+// Empty pins disable individual slots; all metadata remains mandatory.
+import "middleware/mtls.rut"
+
+func clientIdentity() -> mtls.Identity {
+    mtls.identity(
+        mtls.Consumer(consumerId: env("MTLS_FIRST_CONSUMER"),
+                      sha256: env("MTLS_FIRST_PIN"), credentialId: env("MTLS_FIRST_ID")),
+        mtls.Consumer(consumerId: env("MTLS_SECOND_CONSUMER"),
+                      sha256: env("MTLS_SECOND_PIN"), credentialId: env("MTLS_SECOND_ID")))
+}
+
+route GET "/private" {
+    let identity = clientIdentity()
+    let consumer = identity.consumerId
+    return response(200, body: consumer)
+}
+
+route GET "/first-only" {
+    let identity = mtls.requireConsumer(clientIdentity(), env("MTLS_FIRST_CONSUMER"))
+    let consumer = identity.consumerId
+    return response(200, body: consumer)
+}

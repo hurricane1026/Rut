@@ -3007,6 +3007,125 @@ TEST(json_network, jwt_client_binding_requires_signed_client_claim_and_preserves
     pool.destroy();
 }
 
+TEST(json_network, mtls_consumer_mapping_rejects_ambiguous_ownership_and_composes_authorization) {
+    const std::string first(64, 'a'), second(64, 'b'), invalid(64, 'A');
+    const std::string configs[][6] = {
+        {first, "alice", "alice-cert", second, "bob", "bob-cert"},
+        {"", "alice", "alice-cert", second, "bob", "bob-cert"},
+        {first, "alice", "alice-cert", "", "bob", "bob-cert"},
+        {first, "alice", "alice-cert", first, "bob", "bob-cert"},
+        {first, "alice", "alice-cert", second, "alice", "bob-cert"},
+        {first, "alice", "alice-cert", invalid, "bob", "bob-cert"},
+        {"short", "alice", "alice-cert", second, "bob", "bob-cert"},
+        {"", "alice", "alice-cert", "", "bob", "bob-cert"},
+        {first, "", "alice-cert", second, "bob", "bob-cert"},
+        {first, "alice", "", second, "bob", "bob-cert"},
+        {first, "alice", "alice-cert", second, "", "bob-cert"},
+        {first, "alice", "alice-cert", second, "bob", ""},
+    };
+    std::string source = "import \"middleware/mtls.rut\"\n";
+    const auto mapping = [](const std::string* c) {
+        return "mtls.identity(mtls.Consumer(consumerId: \"" + c[1] + "\", sha256: \"" + c[0] +
+               "\", credentialId: \"" + c[2] + "\"), mtls.Consumer(consumerId: \"" + c[4] +
+               "\", sha256: \"" + c[3] + "\", credentialId: \"" + c[5] + "\"))";
+    };
+    for (u32 i = 0; i < 12; ++i) {
+        source +=
+            "route GET \"/" + std::to_string(i) + "\" {\nlet identity = " + mapping(configs[i]);
+        source +=
+            "\nguard identity.method == \"mtls\" else { return 500 }\n"
+            "guard (identity.consumerId == \"alice\" && identity.credentialId == \"alice-cert\") "
+            "|| "
+            "(identity.consumerId == \"bob\" && identity.credentialId == \"bob-cert\") else { "
+            "return 500 }\n"
+            "let credential = identity.credentialId\n"
+            "return response(200, body: credential)\n}\n";
+    }
+    source += "route GET \"/allow\" {\nlet identity = mtls.requireConsumer(" + mapping(configs[0]) +
+              ", \"alice\")\nlet consumer = identity.consumerId\nreturn response(200, body: "
+              "consumer)\n}\n";
+    source += "route GET \"/deny\" {\nlet identity = mtls.denyConsumer(" + mapping(configs[0]) +
+              ", \"alice\")\nlet consumer = identity.consumerId\nreturn response(200, body: "
+              "consumer)\n}\n";
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/mtls-consumers-auth.rut";
+    JsonProgram program;
+    REQUIRE(program.init(source.c_str(), source_path.c_str()));
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    conn->json_arena.backend.pool = &pool;
+    const auto run = [&](u32 route,
+                         char fingerprint,
+                         bool tls,
+                         bool handshake,
+                         bool verified,
+                         u32 expected,
+                         const char* body = "") {
+        conn->tls_active = tls;
+        conn->tls_handshake_complete = handshake;
+        conn->tls_client_cert_sha256_valid = verified;
+        __builtin_memset(
+            conn->tls_client_cert_sha256, fingerprint, sizeof(conn->tls_client_cert_sha256));
+        const std::string request =
+            "GET / HTTP/1.1\r\nHost: test\r\nX-Client-Cert-Sha256: " + first +
+            "\r\nX-Consumer-ID: alice\r\nX-Credential-ID: alice-cert\r\n\r\n";
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        const auto outcome = invoke_jit_handler(program.config->routes[route].fn,
+                                                conn,
+                                                *ctx,
+                                                conn->recv_buf.data(),
+                                                conn->recv_buf.len(),
+                                                nullptr);
+        CHECK_EQ(outcome.status_code, expected);
+        if (expected == 200) {
+            CHECK(conn->jit_response_body_valid);
+            CHECK(conn->jit_response_body.eq(cstr(body)));
+        } else {
+            CHECK(!conn->jit_response_body_valid);
+        }
+    };
+    run(0, 'a', true, true, true, 200, "alice-cert");
+    run(0, 'b', true, true, true, 200, "bob-cert");
+    run(0, 'c', true, true, true, 403);
+    run(1, 'a', true, true, true, 403);
+    run(1, 'b', true, true, true, 200, "bob-cert");
+    run(2, 'a', true, true, true, 200, "alice-cert");
+    run(2, 'b', true, true, true, 403);
+    for (u32 route = 3; route < 12; ++route) {
+        run(route, 'a', true, true, true, 503);
+        run(route, 'b', true, true, true, 503);
+        run(route, 'a', false, false, false, 503);
+    }
+    run(0, 'a', false, false, false, 403);
+    run(0, 'a', true, false, true, 403);
+    run(0, 'a', true, true, false, 403);
+    run(0, 'a', false, true, true, 403);
+    run(12, 'a', true, true, true, 200, "alice");
+    run(12, 'b', true, true, true, 403);
+    run(13, 'a', true, true, true, 403);
+    run(13, 'b', true, true, true, 200, "bob");
+    run(12, 'c', true, true, true, 403);
+    run(0, 'a', true, true, true, 200, "alice-cert");
+    conn->tls_active = false;
+    conn->tls_handshake_complete = false;
+    conn->tls_client_cert_sha256_valid = false;
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
 TEST(json_network, rotating_mtls_pins_validate_configuration_and_map_only_verified_certificates) {
     const std::string first(64, 'a'), second(64, 'b'), invalid(64, 'A');
     const std::string configurations[][5] = {
