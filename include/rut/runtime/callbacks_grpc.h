@@ -41,6 +41,10 @@ void h2ws_h1_received(void*, Connection&, IoEvent);
 template <typename Loop>
 bool h2ws_h1_tls_finished(Loop*, Connection&);
 
+template <typename Loop>
+void h1ws_h2_received(void*, Connection&, IoEvent);
+inline u32 h1ws_h2_response(Connection&, const hpack::Header*, u32, bool, u8*, u32);
+
 inline GrpcExchange* grpc_find(Http2Conn& h, u32 id) {
     for (auto* x : h.grpc.streams)
         if (x && (h.grpc.upstream ? x->upstream_stream : x->downstream_stream) == id) return x;
@@ -242,7 +246,8 @@ void grpc_connection_closed(void* lp, Connection& conn) {
         for (auto*& x : g.streams) {
             if (!x) continue;
             x->upstream = nullptr;
-            if (!x->response_end) x->failure = 14;
+            if (!x->failure && (!x->response_end || (x->websocket && !x->request_end_sent)))
+                x->failure = 14;
             x->response_end = true;
             Connection* down = x->downstream;
             grpc_release_backend_active(*x);
@@ -537,12 +542,20 @@ void grpc_response_headers(
             }
         }
         if (!x->failure)
-            x->response_headers_len = http2_write_headers(x->response_headers,
-                                                          sizeof(x->response_headers),
-                                                          x->downstream_stream,
-                                                          filtered,
-                                                          filtered_n,
-                                                          end);
+            x->response_headers_len =
+                x->downstream && x->downstream->h2->grpc.websocket_http1_downstream
+                    ? h1ws_h2_response(*x->downstream,
+                                       filtered,
+                                       filtered_n,
+                                       accepted,
+                                       x->response_headers,
+                                       sizeof(x->response_headers))
+                    : http2_write_headers(x->response_headers,
+                                          sizeof(x->response_headers),
+                                          x->downstream_stream,
+                                          filtered,
+                                          filtered_n,
+                                          end);
         if (!x->response_headers_len) x->failure = 13;
         x->ws_accepted = accepted && !x->failure;
         if (x->ws_accepted && !x->ws)
@@ -722,7 +735,8 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
 }
 template <typename Loop>
 void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
-    if (auto* x = grpc_find(h, sid); x && !x->response_end) {
+    if (auto* x = grpc_find(h, sid);
+        x && (!x->response_end || (x->websocket && !x->request_end_sent))) {
         switch (static_cast<u32>(error)) {
             case static_cast<u32>(Http2Error::Cancel):
                 x->failure = 1;
@@ -1488,6 +1502,16 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
 template <typename Loop>
 void grpc_kick_downstream(Loop* loop, Connection& down) {
     if (!down.h2 || down.h2->grpc.busy || down.on_send || down.h2->async_stream) return;
+    if constexpr (requires {
+                      loop->pool.alloc_bulk();
+                      loop->upstream_release(u16{});
+                  }) {
+        if (down.h2->grpc.websocket_http1_downstream) {
+            h1ws_h2_received<Loop>(
+                static_cast<void*>(loop), down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
+            return;
+        }
+    }
     on_h2_data<Loop>(static_cast<void*>(loop), down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
 }
 
@@ -1543,6 +1567,15 @@ void grpc_request_trailers(void* ctx, Http2Conn& h, u32 sid, const hpack::Header
     }
 }
 
+inline bool grpc_h1_ws_expired(const GrpcProxyState& state, u64 now) {
+    if (!state.websocket_http1_downstream) return false;
+    for (auto* x : state.streams)
+        if (x && x->deadline_us && now >= x->deadline_us &&
+            (x->ws_accepted || x->response_headers_sent))
+            return true;
+    return false;
+}
+
 template <typename Loop>
 void grpc_refresh_timer(Loop* loop, Connection& conn) {
     auto& g = conn.h2->grpc;
@@ -1565,6 +1598,10 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
         return;
     } else if (!loop->arm_throttle_timer(conn, delay * 1000)) {
         g.timer_deadline_us = 0;
+        if (g.websocket_http1_downstream && conn.on_send) {
+            loop->close_conn(conn);
+            return;
+        }
         struct UpstreamSnapshot {
             Connection* conn;
             Http2Conn* h2;
@@ -1633,6 +1670,10 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
     conn.yield_armed = false;
     conn.h2->grpc.timer_deadline_us = 0;
     const u64 now = monotonic_us();
+    if (grpc_h1_ws_expired(conn.h2->grpc, now)) {
+        loop->close_conn(conn);
+        return;
+    }
     Http2Conn* downstream_h2 = conn.h2;
     const u32 downstream_handler_gen = conn.handler_gen;
     struct UpstreamSnapshot {
@@ -1681,6 +1722,10 @@ template <typename Loop>
 void grpc_tick(Loop* loop, Connection& conn) {
     auto& h = *conn.h2;
     const u64 now = monotonic_us();
+    if (grpc_h1_ws_expired(h.grpc, now)) {
+        loop->close_conn(conn);
+        return;
+    }
     if (h.grpc.upstream) {
         const bool stale_config =
             h.grpc.active == 0 && loop->config_ptr && *loop->config_ptr != conn.request_config;
@@ -1750,4 +1795,5 @@ bool grpc_start_synth(H2Dispatch<Loop>& d,
 
 }  // namespace rut
 
+#include "rut/runtime/callbacks_h1_ws_h2.h"
 #include "rut/runtime/callbacks_h2_ws.h"

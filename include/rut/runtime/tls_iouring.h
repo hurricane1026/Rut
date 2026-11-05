@@ -425,6 +425,7 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     }
     if constexpr (requires {
                       loop->grpc_upstreams;
+                      loop->pool.alloc_bulk();
                       loop->upstream_release(u16{});
                   }) {
         if (c.h2 && c.h2->grpc.websocket_http1 && c.h2->grpc.tls_verified) {
@@ -557,7 +558,8 @@ void tls_process(Self* loop, Connection& c) {
             }
             if (st == TlsOp::WantRead) break;  // drained all complete records
             if (st == TlsOp::Closed) {
-                const bool kBridge = c.h2 && c.h2->grpc.websocket_http1;
+                const bool kBridge =
+                    c.h2 && (c.h2->grpc.websocket_http1 || c.h2->grpc.websocket_http1_downstream);
                 if (c.recv_buf.len() == 0 && !kBridge && !(c.is_ws_terminate && c.ws_closing)) {
                     loop->close_conn(c);
                     return;
@@ -579,7 +581,8 @@ void tls_process(Self* loop, Connection& c) {
         c.tls_in_buf.consume(kConsumed);
         const bool kHasControlOutput = tls_engine_output_len(c.tls_engine) > 0;
         if (kHasControlOutput) c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));
-        if (saw_close_notify && c.h2 && c.h2->grpc.websocket_http1) {
+        if (saw_close_notify && c.h2 &&
+            (c.h2->grpc.websocket_http1 || c.h2->grpc.websocket_http1_downstream)) {
             c.h2->grpc.websocket_http1_eof = true;
             // A response can arrive before its opening-write CQE. Preserve the
             // parked send continuation; its completion invokes the adapter and
@@ -878,6 +881,15 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
             c.tls_pending_on_recv(loop, c, ev);
             return;
         }
+    }
+    if (ev.result == 0 && c.h2 &&
+        (c.h2->grpc.websocket_http1 || c.h2->grpc.websocket_http1_downstream) &&
+        c.h2->grpc.websocket_http1_eof && c.tls_pending_on_recv &&
+        c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>) {
+        // A raced TCP FIN after a verified close_notify is a read half-close.
+        // The bridge still owns the independent write side and its queued data.
+        c.tls_pending_on_recv(loop, c, ev);
+        return;
     }
     if (ev.result <= 0) {  // peer EOF or recv error
         // A body send may have a valid TLS prefix already copied into tls_in_buf

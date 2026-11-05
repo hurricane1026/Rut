@@ -283,7 +283,8 @@ bool ws_h2_process(GrpcExchange& exchange, bool from_client) {
         length -= consumed;
         if (length) __builtin_memmove(input, input + consumed, length);
         Connection* owner = from_client ? exchange.downstream : exchange.upstream;
-        if (owner && owner->h2 && !owner->h2->grpc.websocket_http1)
+        if (owner && owner->h2 && !owner->h2->grpc.websocket_http1 &&
+            !owner->h2->grpc.websocket_http1_downstream)
             owner->h2->consume_data(
                 from_client ? exchange.downstream_stream : exchange.upstream_stream, consumed);
     }

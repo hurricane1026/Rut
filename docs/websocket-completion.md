@@ -61,9 +61,11 @@ workaround or alternate syntax is advertised.
 - [x] Independent flow control, cancellation and half-close on multiplexed streams.
 - [x] H2-to-H1 WebSocket handshake and transport translation, including verified TLS.
 - [x] Per-stream message/connection/close callbacks, owned outputs and compression.
+- [x] H1 GET Upgrade to H2 upstream translation, opaque/inspected and plaintext/TLS.
 
 Ordinary request-body consumers remain outside CONNECT tunnel semantics and get
-503. Reverse H1-downstream to H2-upstream WebSocket bridging remains pending.
+503. H1-downstream to H2-upstream bridging uses the same callbacks and pooled
+stream transport, including TLS, handshake validation and independent cancellation.
 See the [HTTP/2 transport guide](websocket-terminate.md#http2-transport).
 
 ## Evidence and remaining delivery checks
@@ -76,6 +78,17 @@ cover messages larger than a flow-control window, input-credit return,
 independent compression legs, owned dynamic output, acceptance/send completion,
 Close metadata, truncated-frame EOF and allocation rollback. The native callback
 baseline remains unchanged; H2 native wire execution has not been separately tested.
+Reverse-bridge real-socket tests cover coalesced pre-101 messages, actual FIN/TLS
+close_notify after Close, two H1 clients sharing one H2 session, and malformed
+Key/version, local admission denial, upstream subprotocol failure, absent settings
+and opening deadlines. Capacity rejection checks that no CONNECT reaches the
+upstream, existing tunnels continue, and shutdown releases concurrency slots and
+configuration epochs. The full network test target also compiles the reduced
+Loop fixtures, guarding against accidental bridge-template instantiation.
+
+The latest HTTP/2 frame, connection and gRPC/WebSocket transport run passed
+19 + 111 + 102 cases. The same three suites passed under ASan/UBSan with leak
+detection, and with JIT/WebSocket disabled (feature cases skipped).
 
 After synchronization with current main, the wire suite passed 462 cases with
 no skips. Full frontend (1259 tests), JIT (603), native artifact (81), loader

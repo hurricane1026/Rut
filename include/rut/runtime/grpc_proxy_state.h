@@ -120,6 +120,7 @@ struct GrpcProxyState {
     u64 timer_deadline_us;
     bool upstream;
     bool websocket_http1;  // one dedicated TCP/TLS upstream, using the same bounded mapping
+    bool websocket_http1_downstream;  // one H1 upgraded client mapped to an H2 stream
     bool websocket_http1_eof;
     bool websocket_http1_headers;
     bool connecting;
@@ -136,7 +137,7 @@ struct GrpcProxyState {
         active = cursor = control_len = pending_cancel_count = 0;
         connected_at_us = idle_since_us = timer_deadline_us = 0;
         upstream = connecting = busy = preface_sent = session_failure_recorded = false;
-        websocket_http1 = false;
+        websocket_http1 = websocket_http1_downstream = false;
         websocket_http1_eof = websocket_http1_headers = false;
     }
 };

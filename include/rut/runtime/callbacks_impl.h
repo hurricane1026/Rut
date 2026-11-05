@@ -1552,9 +1552,6 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
 template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev);
 
-template <typename Loop>
-bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len);
-
 #if RUT_ENABLE_WEBSOCKET
 template <typename Loop>
 bool ws_retire_handshake_storage(Loop* loop, Connection& conn) {
@@ -3242,6 +3239,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             return;
         conn.state = ConnState::Proxying;
         auto& target = config->upstreams[route->upstream_id];
+        if (target.http2 && h1ws_h2_start(loop, conn, route, route->upstream_id)) return;
         if (target.http2 || target.tls.enabled) {
             conn.pending_handler_fn = nullptr;
             conn.resp_status = 503;
@@ -5117,6 +5115,8 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             auto& target = config->upstreams[outcome.upstream_id];
+            if (target.http2 && h1ws_h2_start(loop, conn, selected_route, outcome.upstream_id))
+                return;
             if (target.http2 || target.tls.enabled) {
                 conn.pending_handler_fn = nullptr;
                 conn.resp_status = 503;
@@ -11164,6 +11164,7 @@ void ws_arm_shutdown_deadline(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 bool ws_handle_timer_tick(Loop* loop, Connection& conn) {
+    if (conn.h2 && conn.h2->grpc.websocket_http1_downstream) return false;
     if (conn.ws_shutdown_deadline_armed) {
         const u32 kRemaining = ws_shutdown_deadline_remaining(conn, loop->timer.cursor);
         if (kRemaining == 0) {
@@ -11237,9 +11238,11 @@ template <typename Loop>
 bool ws_finish_tls_shutdown(Loop* loop, Connection& conn) {
     if constexpr (requires {
                       loop->grpc_upstreams;
+                      loop->pool.alloc_bulk();
                       loop->upstream_release(u16{});
                   }) {
-        if (conn.h2 && conn.h2->grpc.websocket_http1) return h2ws_h1_tls_finished(loop, conn);
+        if (conn.h2 && (conn.h2->grpc.websocket_http1 || conn.h2->grpc.websocket_http1_downstream))
+            return h2ws_h1_tls_finished(loop, conn);
     }
     conn.ws_tls_shutdown_pending = false;
     conn.ws_tls_shutdown_need_read = false;
@@ -11266,8 +11269,13 @@ template <typename Loop>
 bool ws_drive_close(Loop* loop, Connection& conn) {
     if constexpr (requires {
                       loop->grpc_upstreams;
+                      loop->pool.alloc_bulk();
                       loop->upstream_release(u16{});
                   }) {
+        if (conn.h2 && conn.h2->grpc.websocket_http1_downstream) {
+            h1ws_h2_received<Loop>(loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0});
+            return true;
+        }
         if (conn.h2 && conn.h2->grpc.websocket_http1) {
             h2ws_h1_drive(loop, conn);
             return true;

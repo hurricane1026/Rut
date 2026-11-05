@@ -51,7 +51,12 @@ bool h2ws_h1_tls_finished(Loop* loop, Connection& c) {
     c.ws_upstream_send_pending = false;
     c.on_send = nullptr;
     if (::shutdown(c.fd, SHUT_WR) != 0) return false;
-    if (auto* x = grpc_find(*c.h2, 1)) x->request_end_sent = true;
+    if (auto* x = grpc_find(*c.h2, 1)) {
+        if (c.h2->grpc.websocket_http1_downstream)
+            x->response_end_sent = true;
+        else
+            x->request_end_sent = true;
+    }
     c.ws_client_write_shutdown = true;
     (void)loop;
     return true;

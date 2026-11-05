@@ -2582,8 +2582,9 @@ the gateway sends a fresh GET Upgrade, validates its Key/Accept and selected
 subprotocol, and maps 101 to downstream status 200. Connection-specific headers
 are removed; rejection bodies retain their bounded HTTP framing. TLS verifies the
 configured identity, requires h2 for H2, and accepts http/1.1 or absent ALPN for H1.
-Ordinary H1 forwarding to a TLS upstream remains an explicit 503; this increment
-only wires that TLS capability through the H2 WebSocket adapter.
+Ordinary forwarding to an H1 TLS upstream remains an explicit 503; that capability
+is wired through the H2-downstream WebSocket adapter. H1 WebSocket clients may
+use H2 upstreams with verified TLS as well.
 
 Accepted HEADERS keep the stream open for duplex DATA, bounded queues and
 independent flow control. Opaque forwarding preserves frame bytes. Inspection
@@ -2599,7 +2600,14 @@ corresponding send completions. Closing has a fixed five-second deadline and
 stream's state and credit; post-acceptance failure uses CANCEL. Ordinary HTTP and
 other tunnels may share the downstream connection. The existing exchange machinery
 adds no gRPC metadata or metrics for WebSocket. Ordinary request-body consumers
-still return 503; H1 downstream to H2 upstream WebSocket bridging remains pending.
+still return 503. H1 GET Upgrade can also use an H2 upstream: validate the client
+handshake before upstream work, omit connection-specific and Key/Accept fields
+from Extended CONNECT, and generate H1 101/Accept only after validated H2 acceptance.
+Each H1 client maps to one independently cancelled H2 stream; pooled H2 sessions
+can be shared by H1 and H2 clients. After stream creation succeeds, the H1 request
+epoch transfers to the tunnel while its opening request completes, preserving
+callback/configuration ownership. Failed creation uses ordinary HTTP completion
+and releases the original request epoch once.
 See [the transport guide](docs/websocket-terminate.md#http2-transport).
 
 Terminate routes support a required subprotocol using

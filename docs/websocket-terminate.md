@@ -39,10 +39,14 @@ for an opened session and releases stream-owned resources without resetting sibl
 
 An H2 upstream without the setting gets 503 without an Extended CONNECT request.
 Ordinary request-body-dependent handlers get 503 before DATA can be mistaken for
-an HTTP body. H1 downstream to H2 upstream WebSocket translation is still pending.
-H1 TLS upstream support here belongs to the H2 WebSocket bridge; ordinary H1
-forwarding to TLS still returns 503. Builds disabling WebSocket do not advertise
-the setting. This adds no keyword, codec or dependency.
+an HTTP body. H1 GET Upgrade also bridges to H2 upstreams: the client handshake
+is validated before opening an upstream stream, H2 2xx becomes H1 101 with the
+client's Accept, and client FIN/Close or cancellation affects only that H2 stream.
+Callbacks and compression use the same bounded stream context. Multiple H1
+clients can share the pooled H2 upstream without sharing message state.
+H1 TLS upstream support here belongs to the H2-downstream WebSocket bridge;
+ordinary HTTP forwarding to an H1 TLS upstream still returns 503. Builds disabling
+WebSocket do not advertise the setting. This adds no keyword, codec or dependency.
 
 ## Surface and HTTP admission
 

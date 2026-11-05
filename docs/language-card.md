@@ -900,7 +900,8 @@ route "/ws" { return websocket(chatH2) }
 // Independent flow control, END_STREAM and RST_STREAM preserve sibling requests.
 // TLS H1 upstreams validate identity and negotiate http/1.1 (or no ALPN); H2 requires h2.
 // Ordinary request-body consumers still get 503: CONNECT DATA belongs to the tunnel.
-// HTTP/1.1 downstream to H2 upstream WebSocket bridging remains unsupported.
+// H1 GET Upgrade also bridges to H2 upstreams, translating H2 2xx back to a validated 101.
+// Both directions retain bounded DATA buffering, cancellation and per-leg close semantics.
 // No frame binding, opcode, FIN, masking, continuation or ping/pong API is exposed.
 return websocket(chat)
 

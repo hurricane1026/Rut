@@ -304,6 +304,55 @@ TEST(http2_websocket, required_subprotocol_rejects_before_accepting_and_at_upstr
 }
 #endif
 
+TEST(http2_websocket, h1_response_translation_owns_accept_and_excludes_hop_fields) {
+    auto connection = std::make_unique<Connection>();
+    connection->reset();
+    u8 expected[] = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+    connection->ws_handshake_slice = expected;
+    const hpack::Header headers[] = {{lit_str(":status"), lit_str("200")},
+                                     {lit_str("sec-websocket-protocol"), lit_str("chat")},
+                                     {lit_str("connection"), lit_str("keep-alive")},
+                                     {lit_str("content-length"), lit_str("0")}};
+    u8 output[512];
+    const u32 size = h1ws_h2_response(*connection, headers, 4, true, output, sizeof(output));
+    REQUIRE(size != 0);
+    expected[0] = 'x';
+    ParsedResponse response{};
+    HttpResponseParser parser{};
+    REQUIRE(parser.parse(output, size, &response) == ParseStatus::Complete);
+    CHECK_EQ(response.status_code, 101u);
+    bool accept = false, protocol = false;
+    for (u32 i = 0; i < response.header_count; ++i) {
+        const auto& h = response.headers[i];
+        CHECK(!http_header_name_eq_ci(h.name.ptr, h.name.len, "content-length", 14));
+        if (http_header_name_eq_ci(h.name.ptr, h.name.len, "sec-websocket-accept", 20))
+            accept = h.value.eq(lit_str("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+        if (http_header_name_eq_ci(h.name.ptr, h.name.len, "sec-websocket-protocol", 22))
+            protocol = h.value.eq(lit_str("chat"));
+    }
+    CHECK(accept);
+    CHECK(protocol);
+    CHECK_EQ(h1ws_h2_response(*connection, headers, 4, true, output, 16), 0u);
+    connection->ws_handshake_slice = nullptr;
+}
+
+TEST(http2_websocket, h1_request_translation_strips_connection_nominated_fields) {
+    ParsedRequest request{};
+    request.headers[request.header_count++] = {
+        lit_str("Connection"), lit_str("Upgrade, X-Hop , keep-alive"), {}};
+    for (const Str name : {lit_str("connection"),
+                           lit_str("Upgrade"),
+                           lit_str("X-Hop"),
+                           lit_str("Sec-WebSocket-Key"),
+                           lit_str("Host"),
+                           lit_str("TE"),
+                           lit_str("Content-Length")})
+        CHECK(h1ws_h2_hop_header(request, name));
+    CHECK(!h1ws_h2_hop_header(request, lit_str("Origin")));
+    CHECK(!h1ws_h2_hop_header(request, lit_str("Sec-WebSocket-Version")));
+    CHECK(!h1ws_h2_hop_header(request, lit_str("Sec-WebSocket-Protocol")));
+}
+
 TEST(http2_websocket, extended_connect_pseudo_headers_are_explicit_and_strict) {
     const hpack::Header valid[] = {{{":method", 7}, {"CONNECT", 7}},
                                    {{":protocol", 9}, {"websocket", 9}},
