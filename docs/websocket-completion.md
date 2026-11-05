@@ -76,8 +76,13 @@ payload output and connection/onOpen helpers, required subprotocols, rejection
 body framing, sibling-stream admission and cancellation. Stream-engine tests
 cover messages larger than a flow-control window, input-credit return,
 independent compression legs, owned dynamic output, acceptance/send completion,
-Close metadata, truncated-frame EOF and allocation rollback. The native callback
-baseline remains unchanged; H2 native wire execution has not been separately tested.
+Close metadata, truncated-frame EOF and allocation rollback. A dedicated native
+wire harness links the production native loader without LLVM. It compiles through
+rut-compile, removes the source before opening sockets, and runs the same 27 H2
+WebSocket checks, including both backends, plaintext/TLS and both bridge directions.
+The serving process checks that no LLVM image is loaded. Follow-up HTTP requests
+observe Cache writes from onClose, verifying exactly-once execution and the close
+code/wasClean facts after stream cancellation and clean Close handshakes.
 Reverse-bridge real-socket tests cover coalesced pre-101 messages, actual FIN/TLS
 close_notify after Close, two H1 clients sharing one H2 session, and malformed
 Key/version, local admission denial, upstream subprotocol failure, absent settings
@@ -87,8 +92,9 @@ configuration epochs. The full network test target also compiles the reduced
 Loop fixtures, guarding against accidental bridge-template instantiation.
 
 The latest HTTP/2 frame, connection and gRPC/WebSocket transport run passed
-19 + 111 + 102 cases. The same three suites passed under ASan/UBSan with leak
-detection, and with JIT/WebSocket disabled (feature cases skipped).
+19 + 111 + 102 cases, plus the 27 native harness checks. The original three
+runtime suites passed under ASan/UBSan with leak detection, and with JIT/WebSocket
+disabled (feature cases skipped).
 
 After synchronization with current main, the wire suite passed 462 cases with
 no skips. Full frontend (1259 tests), JIT (603), native artifact (81), loader

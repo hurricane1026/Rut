@@ -4276,6 +4276,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
     add_test(NAME test_grpc_proxy COMMAND test_grpc_proxy)
     set_tests_properties(test_grpc_proxy PROPERTIES LABELS "network" TIMEOUT 60)
+
+    if(RUT_ENABLE_JIT AND RUT_ENABLE_WEBSOCKET)
+        # Exercise the same wire scenarios using source-free native artifacts.
+        # This serving harness links the native loader, without the JIT/LLVM.
+        add_executable(test_http2_websocket_native test_grpc_proxy.cc)
+        target_include_directories(test_http2_websocket_native PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+        target_link_libraries(test_http2_websocket_native rut_native_loader nghttp2_ref)
+        target_compile_definitions(test_http2_websocket_native PRIVATE
+            RUT_GRPC_NATIVE=1 RUT_GRPC_JIT=0
+            RUT_GRPC_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+        set_target_properties(test_http2_websocket_native PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/src" ENABLE_EXPORTS ON)
+        add_dependencies(test_http2_websocket_native rut-compile)
+        add_test(NAME test_http2_websocket_native
+            COMMAND test_http2_websocket_native --filter=http2_websocket)
+        set_tests_properties(test_http2_websocket_native PROPERTIES
+            LABELS "network;native" TIMEOUT 60)
+    endif()
 endif()
 
 # UUID formatting and entropy failure semantics have no LLVM/TLS dependencies.

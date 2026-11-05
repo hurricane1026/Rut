@@ -1,4 +1,5 @@
 #include "posix.h"
+#include "rut/common/types.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
@@ -10,17 +11,27 @@
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
-#if RUT_GRPC_JIT
+#if RUT_GRPC_NATIVE
+#include "rut/native_program.h"
+
+#include <link.h>
+#elif RUT_GRPC_JIT
 #include "rut/serve_loader.h"
 #endif
 #include <atomic>
 #include <cstdlib>
 #include <memory>
 
+#include <errno.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 using namespace rut;
 
@@ -31,6 +42,69 @@ bool grpc_temp_template(char* path, size_t capacity, const char* name) {
     const int length = snprintf(path, capacity, "%s/%s", directory, name);
     return length >= 0 && static_cast<size_t>(length) < capacity;
 }
+
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+struct WebSocketWireProgram {
+#if RUT_GRPC_NATIVE
+    using Program = NativeProgram;
+    static constexpr bool kNative = true;
+#else
+    using Program = LoadedProgram;
+    static constexpr bool kNative = false;
+#endif
+    std::unique_ptr<Program> program = std::make_unique<Program>();
+    ~WebSocketWireProgram() { program->destroy(); }
+    bool load(const char* source, u32 length) {
+        char path[256];
+        if (!grpc_temp_template(path, sizeof(path), "rut-websocket-wire-XXXXXX")) return false;
+        const int kFile = mkstemp(path);
+        if (kFile < 0) return false;
+        u32 written = 0;
+        while (written < length) {
+            const ssize_t kAmount = write(kFile, source + written, length - written);
+            if (kAmount < 0 && errno == EINTR) continue;
+            if (kAmount <= 0) break;
+            written += static_cast<u32>(kAmount);
+        }
+        close(kFile);
+#if RUT_GRPC_NATIVE
+        char error[512]{};
+        const bool kLoaded =
+            written == length && load_native_program(path, *program, error, sizeof(error));
+        if (!kLoaded) fprintf(stderr, "Native WebSocket config failed: %s\n", error);
+#else
+        LoadError error{};
+        const bool kLoaded = written == length && load_rut_program(path, *program, error);
+        if (!kLoaded)
+            fprintf(stderr,
+                    "WebSocket config failed: stage=%u detail=%s\n",
+                    static_cast<u32>(error.stage),
+                    error.detail_buf);
+#endif
+        // load_native_program reaps the compiler before returning. Every socket
+        // and callback below must work using the artifact after source removal.
+        const bool kRemoved = unlink(path) == 0 && access(path, F_OK) < 0 && errno == ENOENT;
+        if (!kLoaded || !kRemoved) return false;
+#if RUT_GRPC_NATIVE
+        bool llvm_loaded = false;
+        dl_iterate_phdr(
+            [](dl_phdr_info* image, size_t, void* raw) {
+                if (strstr(image->dlpi_name, "libLLVM")) *static_cast<bool*>(raw) = true;
+                return 0;
+            },
+            &llvm_loaded);
+        if (llvm_loaded || !program->library || program->artifact_fd < 0) {
+            fprintf(stderr, "Native wire harness must own an artifact without loading LLVM\n");
+            return false;
+        }
+        activate_native_program(*program);
+#else
+        activate_rut_program(*program);
+#endif
+        return true;
+    }
+};
+#endif
 
 template <typename Call>
 inline bool grpc_test_ssl_call(SSL* ssl,
@@ -706,7 +780,7 @@ struct Client {
         bool wire_message = false;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
              meta = false, trailer = false;
-    } rpcs[17];
+    } rpcs[18];
     nghttp2_session* session = nullptr;
     bool goaway = false;
     int fd = -1;
@@ -1004,22 +1078,15 @@ void websocket_h2_case(rut::test::TestCase* _tc,
     REQUIRE(cfg->add_static("/health", 'G', 204));
     shard->route_config = cfg.get();
     if (opening_timeout) shard->loop->upstream_timeout = 1;
-#if RUT_GRPC_JIT
-    auto compiled = std::make_unique<LoadedProgram>();
-    struct ProgramCleanup {
-        LoadedProgram* program;
-        ~ProgramCleanup() { program->destroy(); }
-    } cleanup{compiled.get()};
-    if (!tls) {
-        char path[256];
-        REQUIRE(grpc_temp_template(path, sizeof(path), "rut-h2-websocket-XXXXXX"));
-        const int file = mkstemp(path);
-        REQUIRE(file >= 0);
-        char source[1536];
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+    WebSocketWireProgram compiled;
+    if (!tls || WebSocketWireProgram::kNative) {
+        char source[4096];
         const int len = snprintf(
             source,
             sizeof(source),
-            "upstream chat { host: \"127.0.0.1\", port: %u%s }\n"
+            "let closedCounts = Cache<IP, i64>(capacity: 64)\n"
+            "upstream chat { host: \"127.0.0.1\", port: %u%s%s }\n"
             "route \"/ws\" { return websocket(chat) }\n"
             "route \"/jit\" { guard req.header(\"x-deny\").or(\"no\") == \"no\" "
             "else { return 403 } return websocket(chat) }\n"
@@ -1027,24 +1094,26 @@ void websocket_h2_case(rut::test::TestCase* _tc,
             "route \"/inspect\" { return websocket(chat) { message in "
             "guard message.connection.subprotocol == \"chat\" else { message.close(1008) } "
             "message.forward(message.payload) } onOpen: { connection in "
-            "guard connection.remotePort > 0 else { connection.close(1008) } } }\n"
+            "guard connection.remotePort > 0 else { connection.close(1008) } } "
+            "onClose: { closed in "
+            "guard closed.code == 1006 && !closed.wasClean else { return } "
+            "let key = closed.connection.remoteAddr "
+            "closedCounts.set(key, closedCounts.get(key).or(0) + 1) } }\n"
             "route \"/required\" { return websocket(chat, subprotocol: \"chat\") "
             "{ message in message.forward() } }\n"
-            "route GET \"/health\" { return 204 }\n",
+            "route GET \"/health\" { return 204 }\n"
+            "route GET \"/ordinary\" { return forward(chat, load_balance: .roundRobin) }\n"
+            "route GET \"/closed\" { if closedCounts.get(req.remoteAddr).or(0) == 1 "
+            "{ return 204 } else { return 500 } }\n",
             get_port(server->listen_fd),
-            http1 ? "" : ", protocol: .http2");
-        const bool written = write(file, source, len) == len;
-        close(file);
-        LoadError error;
-        const bool loaded = written && load_rut_program(path, *compiled, error);
-        unlink(path);
-        if (!loaded)
-            fprintf(stderr,
-                    "HTTP/2 WebSocket config did not compile: stage=%u detail=%s\n",
-                    static_cast<u32>(error.stage),
-                    error.detail_buf);
-        REQUIRE(loaded);
-        shard->route_config = &compiled->config;
+            http1 ? "" : ", protocol: .http2",
+            tls ? ", tls: { ca: \"" RUT_GRPC_FIXTURES
+                  "/localhost_cert.pem\", "
+                  "server_name: \"localhost\" }"
+                : "");
+        REQUIRE(len > 0 && static_cast<u32>(len) < sizeof(source));
+        REQUIRE(compiled.load(source, static_cast<u32>(len)));
+        shard->route_config = &compiled.program->config;
     }
 #endif
     TlsServerContext* tls_server = nullptr;
@@ -1199,6 +1268,20 @@ void websocket_h2_case(rut::test::TestCase* _tc,
                             CHECK_EQ(server->accepts.load(), accepted);
                         }
                     }
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+                    if (!tls || WebSocketWireProgram::kNative) {
+                        const nghttp2_nv kClosed[] = {nv(":method", "GET"),
+                                                      nv(":scheme", tls ? "https" : "http"),
+                                                      nv(":authority", "ws.test"),
+                                                      nv(":path", "/closed")};
+                        const u32 kObserver = http1 ? (tls ? 17u : 16u) : 12u;
+                        CHECK_EQ(nghttp2_submit_request(
+                                     client.session, nullptr, kClosed, 4, nullptr, nullptr),
+                                 static_cast<i32>(kObserver * 2 + 1));
+                        CHECK(client.until(kObserver, true));
+                        CHECK_EQ(client.rpcs[kObserver].http_status, 204u);
+                    }
+#endif
                     CHECK(!client.goaway);
                 }
             }
@@ -1384,37 +1467,36 @@ void h1_websocket_h2_case(rut::test::TestCase* _tc,
     REQUIRE(config->add_static("/deny", 'G', 403));
     shard->route_config = config.get();
     if (opening_timeout) shard->loop->upstream_timeout = 1;
-#if RUT_GRPC_JIT
-    auto compiled = std::make_unique<LoadedProgram>();
-    struct Cleanup {
-        LoadedProgram* program;
-        ~Cleanup() { program->destroy(); }
-    } cleanup{compiled.get()};
-    if (!tls) {
-        char path[256];
-        REQUIRE(grpc_temp_template(path, sizeof(path), "rut-h1-h2-websocket-XXXXXX"));
-        const int file = mkstemp(path);
-        REQUIRE(file >= 0);
-        char source[1024];
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+    WebSocketWireProgram compiled;
+    if (!tls || WebSocketWireProgram::kNative) {
+        char source[4096];
         const int length = snprintf(
             source,
             sizeof(source),
-            "upstream chat { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
+            "let closedCounts = Cache<IP, i64>(capacity: 64)\n"
+            "upstream chat { host: \"127.0.0.1\", port: %u, protocol: .http2%s }\n"
             "route GET \"/ws\" { return websocket(chat) }\n"
             "route GET \"/inspect\" { return websocket(chat) { message in "
             "guard message.connection.subprotocol == \"chat\" else { message.close(1008) } "
             "message.forward(message.payload) } onOpen: { connection in "
-            "guard connection.remotePort > 0 else { connection.close(1008) } } }\n"
-            "route GET \"/deny\" { return 403 }\n",
-            get_port(server->listen_fd));
-        const bool written = write(file, source, length) == length;
-        close(file);
-        LoadError error{};
-        const bool loaded = written && load_rut_program(path, *compiled, error);
-        unlink(path);
-        REQUIRE(loaded);
-        compiled->config.upstreams[0].max_inflight = 2;
-        shard->route_config = &compiled->config;
+            "guard connection.remotePort > 0 else { connection.close(1008) } } "
+            "onClose: { closed in "
+            "guard closed.code == 1000 && closed.upstreamCode == 1000 && closed.wasClean "
+            "else { return } let key = closed.connection.remoteAddr "
+            "closedCounts.set(key, closedCounts.get(key).or(0) + 1) } }\n"
+            "route GET \"/deny\" { return 403 }\n"
+            "route GET \"/closed\" { if closedCounts.get(req.remoteAddr).or(0) == 1 "
+            "{ return 204 } else { return 500 } }\n",
+            get_port(server->listen_fd),
+            tls ? ", tls: { ca: \"" RUT_GRPC_FIXTURES
+                  "/localhost_cert.pem\", "
+                  "server_name: \"localhost\" }"
+                : "");
+        REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(source));
+        REQUIRE(compiled.load(source, static_cast<u32>(length)));
+        compiled.program->config.upstreams[0].max_inflight = 2;
+        shard->route_config = &compiled.program->config;
     }
 #endif
     TlsServerContext* tls_server = nullptr;
@@ -1527,6 +1609,19 @@ void h1_websocket_h2_case(rut::test::TestCase* _tc,
                 }
                 CHECK(!client.read_more());
                 CHECK(client.eof);
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+                if (inspect && (!tls || WebSocketWireProgram::kNative)) {
+                    H1WebSocketClient observer;
+                    CHECK(observer.init(get_port(lfd), tls));
+                    static constexpr char kClosed[] =
+                        "GET /closed HTTP/1.1\r\nHost: ws.test\r\nConnection: close\r\n\r\n";
+                    CHECK(observer.send_bytes(reinterpret_cast<const u8*>(kClosed),
+                                              sizeof(kClosed) - 1));
+                    ParsedResponse observed{};
+                    CHECK(observer.header(&observed));
+                    CHECK_EQ(observed.status_code, 204u);
+                }
+#endif
                 // The first stream's FIN/Close must not cancel its sibling.
                 CHECK(sibling.send_bytes(message, sizeof(message)));
                 CHECK(sibling.body(echoed, sizeof(echoed)));
