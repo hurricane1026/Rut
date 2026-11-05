@@ -77,8 +77,9 @@ struct SlicePool {
     // pointer here by address, so release sites need not know which kind
     // they hold. Exhaustion is not an error: callers keep slices.
     static constexpr u32 kBulkSliceSize = 256 * 1024;
-    static constexpr u32 kBulkPerConnection = 4;  // bulk buffers reserved per connection
-    static constexpr u32 kMaxBulkSlices = 4096;   // hard cap: 1 GiB VA per pool
+    // Large WebSocket sessions can own four message/output buffers and two codecs.
+    static constexpr u32 kBulkPerConnection = 6;
+    static constexpr u32 kMaxBulkSlices = 4096;  // hard cap: 1 GiB VA per pool
     // Returned bulk buffers kept resident for reuse: at most 16 MiB of idle
     // retention per pool, the size of the former fixed bulk set. Returns past
     // this are discarded (MADV_DONTNEED), so a burst that touched many bulk

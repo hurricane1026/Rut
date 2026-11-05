@@ -1,14 +1,21 @@
 #include "rut/jit/codegen.h"
 
+#include "rut/common/ws_control_flow.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
+#include "rut/compiler/verifier.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/ws_frame.h"
+#include "rut/runtime/ws_terminate.h"
 #include <atomic>
 #include <cstddef>
 
 #include <llvm-c/Core.h>
+#include <llvm-c/Linker.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,9 +80,13 @@ struct Ctx {
 
     // Handler function type: i64 (ptr, ptr, ptr, i32, ptr)
     LLVMTypeRef handler_fn_ty;
+    bool ws_body_mode = false;
+    LLVMValueRef param_ws_opcode = nullptr;
+    LLVMValueRef param_ws_from_client = nullptr;
 
     // Current RIR function (set per-function, for type lookups).
     const rir::Function* cur_fn;
+    const rir::Module* source_module;
 
     // Function parameters (set per-function)
     LLVMValueRef param_conn;
@@ -178,8 +189,8 @@ struct Ctx {
         result_ty = i64_ty;
 
         // Handler fn: i64 (ptr %conn, ptr %ctx, ptr %req_data, i32 %req_len, ptr %arena)
-        LLVMTypeRef param_types[] = {ptr_ty, ptr_ty, ptr_ty, i32_ty, ptr_ty};
-        handler_fn_ty = LLVMFunctionType(result_ty, param_types, 5, 0);
+        LLVMTypeRef param_types[] = {ptr_ty, ptr_ty, ptr_ty, i32_ty, ptr_ty, i8_ty, i8_ty};
+        handler_fn_ty = LLVMFunctionType(result_ty, param_types, ws_body_mode ? 7 : 5, 0);
     }
 
     // ── Lazy Helper Declaration ────────────────────────────────────
@@ -523,22 +534,22 @@ struct Ctx {
         return fn_req_remote_addr;
     }
 
-    // void rut_helper_cache_get(i32, i32, ptr, ptr)
+    // void rut_helper_cache_get_bound(i32, i64 identity, i32, ptr, ptr)
     LLVMValueRef get_cache_get() {
         if (!fn_cache_get) {
-            LLVMTypeRef params[] = {i32_ty, i32_ty, ptr_ty, ptr_ty};
-            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
-            fn_cache_get = LLVMAddFunction(llvm_mod, "rut_helper_cache_get", ft);
+            LLVMTypeRef params[] = {i32_ty, i64_ty, i32_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 5, 0);
+            fn_cache_get = LLVMAddFunction(llvm_mod, "rut_helper_cache_get_bound", ft);
         }
         return fn_cache_get;
     }
 
-    // void rut_helper_cache_set(i32, i32, i64)
+    // void rut_helper_cache_set_bound(i32, i64 identity, i32, i64)
     LLVMValueRef get_cache_set() {
         if (!fn_cache_set) {
-            LLVMTypeRef params[] = {i32_ty, i32_ty, i64_ty};
-            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
-            fn_cache_set = LLVMAddFunction(llvm_mod, "rut_helper_cache_set", ft);
+            LLVMTypeRef params[] = {i32_ty, i64_ty, i32_ty, i64_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
+            fn_cache_set = LLVMAddFunction(llvm_mod, "rut_helper_cache_set_bound", ft);
         }
         return fn_cache_set;
     }
@@ -689,12 +700,15 @@ struct Ctx {
         return fn_str_cmp;
     }
 
-    // u8 rut_helper_str_regex_match(ptr, i32, ptr)
+    // u8 regex helper(ptr, i32, ptr); message mode retains scan failures.
     LLVMValueRef get_str_regex_match() {
         if (!fn_str_regex_match) {
             LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty};
             LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 3, 0);
-            fn_str_regex_match = LLVMAddFunction(llvm_mod, "rut_helper_str_regex_match", ft);
+            fn_str_regex_match = LLVMAddFunction(
+                llvm_mod,
+                ws_body_mode ? "rut_helper_str_regex_result" : "rut_helper_str_regex_match",
+                ft);
         }
         return fn_str_regex_match;
     }
@@ -1007,6 +1021,135 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             strval = LLVMBuildInsertValue(c.builder, strval, p, 0, "path_only.s.ptr");
             strval = LLVMBuildInsertValue(c.builder, strval, l, 1, "path_only.s.len");
             c.set_value(inst.result, strval);
+            break;
+        }
+        case rir::Opcode::WsForward:
+        case rir::Opcode::WsClose: {
+            const bool kForward = inst.op == rir::Opcode::WsForward;
+            LLVMValueRef payload = c.get_value(inst.operands[kForward ? 0 : 1]);
+            LLVMValueRef ptr = LLVMBuildExtractValue(c.builder, payload, 0, "ws.output.ptr");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, payload, 1, "ws.output.len");
+            LLVMTypeRef params_forward[] = {c.ptr_ty, c.ptr_ty, c.i32_ty, c.i8_ty};
+            LLVMTypeRef params_close[] = {c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
+            LLVMTypeRef ft =
+                LLVMFunctionType(c.i32_ty, kForward ? params_forward : params_close, 4, 0);
+            const char* name = kForward ? "rut_helper_ws_forward" : "rut_helper_ws_close";
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, name);
+            if (!fn) fn = LLVMAddFunction(c.llvm_mod, name, ft);
+            LLVMValueRef args_forward[] = {
+                c.param_conn, ptr, len, LLVMConstInt(c.i8_ty, inst.imm.i32_val, 0)};
+            LLVMValueRef args_close[] = {
+                c.param_conn, kForward ? nullptr : c.get_value(inst.operands[0]), ptr, len};
+            c.set_value(
+                inst.result,
+                LLVMBuildCall2(
+                    c.builder, ft, fn, kForward ? args_forward : args_close, 4, "ws.output"));
+            break;
+        }
+        case rir::Opcode::WsMessageField: {
+            const auto kField = static_cast<WsMessageFieldId>(inst.imm.i32_val);
+            LLVMValueRef value = nullptr;
+            if (kField == WsMessageFieldId::CloseReason ||
+                kField == WsMessageFieldId::CloseUpstreamReason) {
+                LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty, c.ptr_ty, c.ptr_ty};
+                LLVMTypeRef type =
+                    LLVMFunctionType(LLVMVoidTypeInContext(c.llvm_ctx), params, 4, 0);
+                LLVMValueRef helper =
+                    LLVMGetNamedFunction(c.llvm_mod, "rut_helper_ws_close_reason");
+                if (!helper)
+                    helper = LLVMAddFunction(c.llvm_mod, "rut_helper_ws_close_reason", type);
+                LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "close.reason.ptr");
+                LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "close.reason.len");
+                LLVMValueRef args[] = {
+                    c.param_conn, LLVMConstInt(c.i32_ty, static_cast<u32>(kField), 0), ptr, len};
+                LLVMBuildCall2(c.builder, type, helper, args, 4, "");
+                value = LLVMGetUndef(c.str_ty);
+                value = LLVMBuildInsertValue(
+                    c.builder,
+                    value,
+                    LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "close.reason.data"),
+                    0,
+                    "close.reason");
+                value = LLVMBuildInsertValue(
+                    c.builder,
+                    value,
+                    LLVMBuildLoad2(c.builder, c.i32_ty, len, "close.reason.size"),
+                    1,
+                    "close.reason");
+            } else if (kField == WsMessageFieldId::ConnectionSubprotocol) {
+                LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty};
+                LLVMTypeRef type =
+                    LLVMFunctionType(LLVMVoidTypeInContext(c.llvm_ctx), params, 3, 0);
+                LLVMValueRef helper =
+                    LLVMGetNamedFunction(c.llvm_mod, "rut_helper_ws_connection_subprotocol");
+                if (!helper)
+                    helper =
+                        LLVMAddFunction(c.llvm_mod, "rut_helper_ws_connection_subprotocol", type);
+                LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "connection.protocol.ptr");
+                LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "connection.protocol.len");
+                LLVMValueRef args[] = {c.param_conn, ptr, len};
+                LLVMBuildCall2(c.builder, type, helper, args, 3, "");
+                value = LLVMGetUndef(c.str_ty);
+                value = LLVMBuildInsertValue(
+                    c.builder,
+                    value,
+                    LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "connection.protocol.data"),
+                    0,
+                    "connection.protocol");
+                value = LLVMBuildInsertValue(
+                    c.builder,
+                    value,
+                    LLVMBuildLoad2(c.builder, c.i32_ty, len, "connection.protocol.size"),
+                    1,
+                    "connection.protocol");
+            } else if (kField == WsMessageFieldId::ConnectionRemoteAddr ||
+                       kField == WsMessageFieldId::ConnectionRemotePort ||
+                       kField == WsMessageFieldId::ConnectionIsTls ||
+                       kField == WsMessageFieldId::CloseCode ||
+                       kField == WsMessageFieldId::CloseUpstreamCode ||
+                       kField == WsMessageFieldId::CloseWasClean) {
+                LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty};
+                LLVMTypeRef type = LLVMFunctionType(c.i32_ty, params, 2, 0);
+                LLVMValueRef helper =
+                    LLVMGetNamedFunction(c.llvm_mod, "rut_helper_ws_connection_scalar");
+                if (!helper)
+                    helper = LLVMAddFunction(c.llvm_mod, "rut_helper_ws_connection_scalar", type);
+                LLVMValueRef args[] = {c.param_conn,
+                                       LLVMConstInt(c.i32_ty, static_cast<u32>(kField), 0)};
+                value = LLVMBuildCall2(c.builder, type, helper, args, 2, "connection.scalar");
+                if (ws_message_field_is_bool(kField))
+                    value = LLVMBuildICmp(c.builder,
+                                          LLVMIntNE,
+                                          value,
+                                          LLVMConstInt(c.i32_ty, 0, 0),
+                                          "connection.tls");
+            } else if (kField == WsMessageFieldId::Payload) {
+                value = LLVMGetUndef(c.str_ty);
+                value = LLVMBuildInsertValue(c.builder, value, c.param_req_data, 0, "msg.ptr");
+                value = LLVMBuildInsertValue(c.builder, value, c.param_req_len, 1, "msg.len");
+            } else if (kField == WsMessageFieldId::Length) {
+                value = c.param_req_len;
+            } else {
+                const bool kDirection =
+                    kField == WsMessageFieldId::Direction || kField == WsMessageFieldId::FromClient;
+                LLVMValueRef flag = LLVMBuildICmp(
+                    c.builder,
+                    kDirection ? LLVMIntNE : LLVMIntEQ,
+                    kDirection ? c.param_ws_from_client : c.param_ws_opcode,
+                    LLVMConstInt(
+                        c.i8_ty, kDirection ? 0 : (kField == WsMessageFieldId::IsText ? 1 : 2), 0),
+                    "msg.flag");
+                if (kField == WsMessageFieldId::Kind || kField == WsMessageFieldId::Direction) {
+                    value = LLVMBuildSelect(c.builder,
+                                            flag,
+                                            LLVMConstInt(c.i32_ty, kDirection ? 0 : 1, 0),
+                                            LLVMConstInt(c.i32_ty, kDirection ? 1 : 0, 0),
+                                            "msg.case");
+                } else {
+                    value = flag;
+                }
+            }
+            c.set_value(inst.result, value);
             break;
         }
         case rir::Opcode::ReqBody: {
@@ -1604,6 +1747,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         // ── String operations ──
+        case rir::Opcode::StrLength:
+            c.set_value(
+                inst.result,
+                LLVMBuildExtractValue(c.builder, c.get_value(inst.operand(0)), 1, "bytes.count"));
+            break;
         case rir::Opcode::BearerMatches:
         case rir::Opcode::BasicMatches:
         case rir::Opcode::StrConstantTimeEqual: {
@@ -1627,6 +1775,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, b);
             break;
         }
+        case rir::Opcode::StrPredicate:
         case rir::Opcode::StrHasPrefix: {
             LLVMValueRef s = c.get_value(inst.operands[0]);
             LLVMValueRef pfx = c.get_value(inst.operands[1]);
@@ -1635,16 +1784,81 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef p_ptr = LLVMBuildExtractValue(c.builder, pfx, 0, "p.ptr");
             LLVMValueRef p_len = LLVMBuildExtractValue(c.builder, pfx, 1, "p.len");
             LLVMValueRef args[] = {s_ptr, s_len, p_ptr, p_len};
-            LLVMValueRef r = LLVMBuildCall2(c.builder,
-                                            LLVMGlobalGetValueType(c.get_str_has_prefix()),
-                                            c.get_str_has_prefix(),
-                                            args,
-                                            4,
-                                            "hp");
+            if (inst.op == rir::Opcode::StrPredicate && inst.imm.i32_val == 3) {
+                c.set_value(
+                    inst.result,
+                    LLVMBuildICmp(
+                        c.builder, LLVMIntEQ, s_len, LLVMConstInt(c.i32_ty, 0, 0), "str.empty"));
+                break;
+            }
+            LLVMValueRef helper = c.get_str_has_prefix();
+            if (inst.op == rir::Opcode::StrPredicate && inst.imm.i32_val != 0) {
+                const char* name =
+                    inst.imm.i32_val == 1 ? "rut_helper_str_has_suffix" : "rut_helper_str_contains";
+                helper = LLVMGetNamedFunction(c.llvm_mod, name);
+                if (!helper) {
+                    LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
+                    helper =
+                        LLVMAddFunction(c.llvm_mod, name, LLVMFunctionType(c.i8_ty, params, 4, 0));
+                }
+            }
+            LLVMValueRef r =
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 4, "hp");
             // Convert u8 result to i1 for branch usage
             LLVMValueRef b =
                 LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "hp.bool");
             c.set_value(inst.result, b);
+            break;
+        }
+        case rir::Opcode::StrInterpolate: {
+            LLVMTypeRef array_ty = LLVMArrayType2(c.str_ty, inst.operand_count);
+            LLVMValueRef parts = LLVMBuildAlloca(c.builder, array_ty, "concat.parts");
+            for (u32 i = 0; i < inst.operand_count; ++i) {
+                LLVMValueRef indices[] = {LLVMConstInt(c.i32_ty, 0, 0),
+                                          LLVMConstInt(c.i32_ty, i, 0)};
+                LLVMValueRef slot =
+                    LLVMBuildGEP2(c.builder, array_ty, parts, indices, 2, "concat.part");
+                LLVMBuildStore(c.builder, c.get_value(inst.operand(i)), slot);
+            }
+            LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.ptr_ty};
+            LLVMTypeRef type = LLVMFunctionType(c.i8_ty, params, 6, 0);
+            LLVMValueRef helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_str_concat");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_str_concat", type);
+            LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "concat.ptr");
+            LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "concat.len");
+            LLVMValueRef args[] = {c.param_conn,
+                                   c.param_arena,
+                                   parts,
+                                   LLVMConstInt(c.i32_ty, inst.operand_count, 0),
+                                   ptr,
+                                   len};
+            LLVMValueRef result = LLVMBuildCall2(c.builder, type, helper, args, 6, "concat.ok");
+            LLVMValueRef function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+            auto* success = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "concat.success");
+            auto* failure = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "concat.failure");
+            LLVMValueRef valid = LLVMBuildICmp(
+                c.builder, LLVMIntNE, result, LLVMConstInt(c.i8_ty, 0, 0), "concat.valid");
+            LLVMBuildCondBr(c.builder, valid, success, failure);
+            LLVMPositionBuilderAtEnd(c.builder, failure);
+            c.emit_parse_unprime();
+            const u64 kFailed =
+                static_cast<u64>(HandlerAction::ReturnStatus) |
+                (static_cast<u64>(c.ws_body_mode ? static_cast<u32>(WsFrameAction::Close) : 500u)
+                 << 8);
+            LLVMBuildRet(c.builder, LLVMConstInt(c.i64_ty, kFailed, 0));
+            LLVMPositionBuilderAtEnd(c.builder, success);
+            LLVMValueRef text = LLVMGetUndef(c.str_ty);
+            text = LLVMBuildInsertValue(c.builder,
+                                        text,
+                                        LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "concat.data"),
+                                        0,
+                                        "concat.text.ptr");
+            text = LLVMBuildInsertValue(c.builder,
+                                        text,
+                                        LLVMBuildLoad2(c.builder, c.i32_ty, len, "concat.size"),
+                                        1,
+                                        "concat.text.len");
+            c.set_value(inst.result, text);
             break;
         }
         case rir::Opcode::StrRegexMatch: {
@@ -1656,8 +1870,23 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef fn = c.get_str_regex_match();
             LLVMValueRef r =
                 LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 3, "rx");
+            if (c.ws_body_mode) {
+                LLVMValueRef function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+                auto* scanned = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "rx.ok");
+                auto* failed = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "rx.error");
+                LLVMValueRef valid = LLVMBuildICmp(
+                    c.builder, LLVMIntULE, r, LLVMConstInt(c.i8_ty, 1, 0), "rx.valid");
+                LLVMBuildCondBr(c.builder, valid, scanned, failed);
+                LLVMPositionBuilderAtEnd(c.builder, failed);
+                // The private message body uses the ordinary packed return ABI.
+                // Close before a negation or continuation can consume the result.
+                const u64 kClosed = static_cast<u64>(HandlerAction::ReturnStatus) |
+                                    (static_cast<u64>(WsFrameAction::Close) << 8);
+                LLVMBuildRet(c.builder, LLVMConstInt(c.i64_ty, kClosed, 0));
+                LLVMPositionBuilderAtEnd(c.builder, scanned);
+            }
             LLVMValueRef b =
-                LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "rx.bool");
+                LLVMBuildICmp(c.builder, LLVMIntEQ, r, LLVMConstInt(c.i8_ty, 1, 0), "rx.bool");
             c.set_value(inst.result, b);
             break;
         }
@@ -2206,15 +2435,19 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::CacheGet: {
             LLVMValueRef instance =
                 LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            const u32 kIndex = static_cast<u32>(inst.imm.i32_val);
+            const Str kName = c.source_module->cache_instances[kIndex].name;
+            LLVMValueRef identity =
+                LLVMConstInt(c.i64_ty, cache_instance_identity(kName.ptr, kName.len), 0);
             LLVMValueRef key = c.get_value(inst.operands[0]);
             LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "cache.has");
             LLVMValueRef out_val = LLVMBuildAlloca(c.builder, c.i64_ty, "cache.val");
-            LLVMValueRef args[] = {instance, key, out_has, out_val};
+            LLVMValueRef args[] = {instance, identity, key, out_has, out_val};
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_cache_get()),
                            c.get_cache_get(),
                            args,
-                           4,
+                           5,
                            "");
             LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "cache.h");
             LLVMValueRef v = LLVMBuildLoad2(c.builder, c.i64_ty, out_val, "cache.v");
@@ -2229,14 +2462,18 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::CacheSet: {
             LLVMValueRef instance =
                 LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            const u32 kIndex = static_cast<u32>(inst.imm.i32_val);
+            const Str kName = c.source_module->cache_instances[kIndex].name;
+            LLVMValueRef identity =
+                LLVMConstInt(c.i64_ty, cache_instance_identity(kName.ptr, kName.len), 0);
             LLVMValueRef key = c.get_value(inst.operands[0]);
             LLVMValueRef val = c.get_value(inst.operands[1]);
-            LLVMValueRef args[] = {instance, key, val};
+            LLVMValueRef args[] = {instance, identity, key, val};
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_cache_set()),
                            c.get_cache_set(),
                            args,
-                           3,
+                           4,
                            "");
             // The instruction's value echoes the stored i64.
             c.set_value(inst.result, val);
@@ -2403,6 +2640,12 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 LLVMValueRef v = LLVMBuildExtractValue(c.builder, opt, 1, "uw.payload");
                 c.set_value(inst.result, v);
             }
+            break;
+        }
+        case rir::Opcode::Phi: {
+            LLVMValueRef value = LLVMBuildPhi(
+                c.builder, c.map_type(c.cur_fn->values[inst.result.id].type), "merge.value");
+            c.set_value(inst.result, value);
             break;
         }
         case rir::Opcode::Select: {
@@ -2791,6 +3034,12 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     LLVMSetValueName2(c.param_req_data, "req_data", 8);
     LLVMSetValueName2(c.param_req_len, "req_len", 7);
     LLVMSetValueName2(c.param_arena, "arena", 5);
+    if (c.ws_body_mode) {
+        c.param_ws_opcode = LLVMGetParam(func, 5);
+        c.param_ws_from_client = LLVMGetParam(func, 6);
+        LLVMSetValueName2(c.param_ws_opcode, "message_kind", 12);
+        LLVMSetValueName2(c.param_ws_from_client, "from_client", 11);
+    }
 
     // Reset per-function maps
     c.value_map_cap = fn.value_cap;
@@ -2800,6 +3049,8 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // maps from the existing compiler arena instead of hitting a Phase 1 cap.
     LLVMValueRef small_values[512]{};
     LLVMBasicBlockRef small_blocks[64]{};
+    // LLVM's opaque mutable block handles are required by LLVMAddIncoming.
+    LLVMBasicBlockRef small_exits[64]{};  // NOLINT(misc-const-correctness)
     struct MapStorage {
         MmapArena arena;
         ~MapStorage() { arena.destroy(); }
@@ -2809,7 +3060,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         fn.value_cap <= 512 ? small_values : maps.arena.alloc_array<LLVMValueRef>(fn.value_cap);
     c.block_map =
         fn.block_cap <= 64 ? small_blocks : maps.arena.alloc_array<LLVMBasicBlockRef>(fn.block_cap);
-    if (!c.value_map || !c.block_map) return false;
+    LLVMBasicBlockRef* exits =
+        fn.block_cap <= 64 ? small_exits : maps.arena.alloc_array<LLVMBasicBlockRef>(fn.block_cap);
+    if (!c.value_map || !c.block_map || !exits) return false;
 
     // Create all basic blocks upfront (forward references from Br/Jmp).
     for (u32 i = 0; i < fn.block_count; i++) {
@@ -2936,6 +3189,23 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         if (!blk.terminator()) {
             LLVMBuildUnreachable(c.builder);
         }
+        // Helpers may split LLVM blocks internally. A RIR edge leaves the
+        // helper's continuation, not necessarily its original entry block.
+        exits[blk.id.id] = LLVMGetInsertBlock(c.builder);
+    }
+    // Resolve incoming edges after every producer and helper continuation is
+    // available; RIR block IDs need not be in dependency order.
+    for (u32 bi = 0; bi < fn.block_count; ++bi) {
+        const auto& block = fn.blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ++ii) {
+            const auto& inst = block.insts[ii];
+            if (inst.op != rir::Opcode::Phi) continue;
+            LLVMValueRef values[] = {c.get_value(inst.operands[0]), c.get_value(inst.operands[1])};
+            LLVMBasicBlockRef incoming[] = {exits[inst.imm.block_targets[0].id],
+                                            exits[inst.imm.block_targets[1].id]};
+            if (!values[0] || !values[1] || !incoming[0] || !incoming[1]) return false;
+            LLVMAddIncoming(c.get_value(inst.result), values, incoming, 2);
+        }
     }
 
     return true;
@@ -2943,18 +3213,70 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
 // ── Module Codegen ─────────────────────────────────────────────────
 
-CodegenResult codegen(const rir::Module& rir_mod) {
+static CodegenResult codegen_impl(const rir::Module& rir_mod,
+                                  LLVMContextRef shared_context,
+                                  bool ws_body_mode) {
+    if (ws_body_mode && (rir_mod.func_count != 1 || !rir::verify_module(rir_mod).ok))
+        return {nullptr, nullptr, false};
     // This variadic RIR operation is emitted by the trusted builder, but keep
     // direct/malformed module callers from indexing beyond its operand list.
     if (rir_mod.func_count > 0 && rir_mod.functions == nullptr) return {nullptr, nullptr, false};
     for (u32 fi = 0; fi < rir_mod.func_count; ++fi) {
         const rir::Function& fn = rir_mod.functions[fi];
+        bool has_phi = false;
+        if (ws_body_mode && (fn.yield_count != 0 || fn.is_timer || rir_function_uses_parse(fn)))
+            return {nullptr, nullptr, false};
         if (fn.block_count > 0 && fn.blocks == nullptr) return {nullptr, nullptr, false};
         for (u32 bi = 0; bi < fn.block_count; ++bi) {
             const rir::Block& block = fn.blocks[bi];
             if (block.inst_count > 0 && block.insts == nullptr) return {nullptr, nullptr, false};
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
+                has_phi |= inst.op == rir::Opcode::Phi;
+                if (!rir::valid_string_instruction(fn, inst)) return {nullptr, nullptr, false};
+                if (inst.op == rir::Opcode::CacheGet || inst.op == rir::Opcode::CacheSet) {
+                    const u32 kIndex = static_cast<u32>(inst.imm.i32_val);
+                    if (kIndex >= rir_mod.cache_instance_count ||
+                        kIndex >= rir::Module::kMaxCacheInstances)
+                        return {nullptr, nullptr, false};
+                    const Str kName = rir_mod.cache_instances[kIndex].name;
+                    if (!kName.ptr || kName.len == 0 || kName.len > 31)
+                        return {nullptr, nullptr, false};
+                }
+                // Neither HTTP inputs nor HTTP mutation/response effects belong
+                // to an application-message invocation, including hidden helper
+                // accesses. Context slots are compiler storage, not HTTP values.
+                if (ws_body_mode && inst.op >= rir::Opcode::ReqHeaderCount &&
+                    inst.op <= rir::Opcode::ReqSetTargetTransform &&
+                    inst.op != rir::Opcode::WsMessageField &&
+                    inst.op != rir::Opcode::CtxLoadSlotI32)
+                    return {nullptr, nullptr, false};
+                if (ws_body_mode &&
+                    (inst.op == rir::Opcode::RetForward ||
+                     inst.op == rir::Opcode::RetForwardBundle ||
+                     inst.op == rir::Opcode::RetRedirect || inst.op == rir::Opcode::RespBody))
+                    return {nullptr, nullptr, false};
+                if (inst.op == rir::Opcode::WsForward || inst.op == rir::Opcode::WsClose) {
+                    const bool kForward = inst.op == rir::Opcode::WsForward;
+                    const auto kExactType = [&](rir::ValueId id, rir::TypeKind kind) {
+                        if (id == rir::kNoValue || id.id >= fn.value_count || !fn.values)
+                            return false;
+                        const auto* type = fn.values[id.id].type;
+                        return type && type->kind == kind && !type->inner && !type->struct_def;
+                    };
+                    if (!ws_body_mode || inst.operand_count != (kForward ? 1u : 2u) ||
+                        inst.extra_operands || !kExactType(inst.result, rir::TypeKind::I32) ||
+                        !kExactType(inst.operands[0],
+                                    kForward ? rir::TypeKind::Str : rir::TypeKind::I32) ||
+                        (kForward ? inst.imm.i32_val != 1 && inst.imm.i32_val != 2
+                                  : !kExactType(inst.operands[1], rir::TypeKind::Str)))
+                        return {nullptr, nullptr, false};
+                }
+                if (inst.op == rir::Opcode::WsMessageField) {
+                    if (!ws_body_mode || inst.operand_count != 0 ||
+                        !ws_message_field_valid(static_cast<u32>(inst.imm.i32_val)))
+                        return {nullptr, nullptr, false};
+                }
                 if (inst.op == rir::Opcode::ReqTlsClientCertSha256) {
                     if (inst.operand_count != 0 || inst.result == rir::kNoValue ||
                         inst.result.id >= fn.value_count || fn.values == nullptr)
@@ -3038,12 +3360,15 @@ CodegenResult codegen(const rir::Module& rir_mod) {
                 }
             }
         }
+        if (has_phi && !rir::verify_function(&fn).ok) return {nullptr, nullptr, false};
     }
     for (u32 i = 0; i < rir_mod.func_count; ++i)
         if (!rir::password_prefix_valid(rir_mod.functions[i])) return {nullptr, nullptr, false};
     static std::atomic<u32> next_regex_module_id{1};
     Ctx c{};
-    c.llvm_ctx = LLVMContextCreate();
+    c.ws_body_mode = ws_body_mode;
+    c.source_module = &rir_mod;
+    c.llvm_ctx = shared_context != nullptr ? shared_context : LLVMContextCreate();
     c.llvm_mod = LLVMModuleCreateWithNameInContext(
         rir_mod.name.ptr ? rir_mod.name.ptr : "rue_module", c.llvm_ctx);
     c.builder = LLVMCreateBuilderInContext(c.llvm_ctx);
@@ -3105,11 +3430,19 @@ CodegenResult codegen(const rir::Module& rir_mod) {
 
     if (!ok) {
         LLVMDisposeModule(c.llvm_mod);
-        LLVMContextDispose(c.llvm_ctx);
+        if (shared_context == nullptr) LLVMContextDispose(c.llvm_ctx);
         return {nullptr, nullptr, false};
     }
 
     return {c.llvm_mod, c.llvm_ctx, true};
+}
+
+CodegenResult codegen(const rir::Module& rir_mod) {
+    return codegen_impl(rir_mod, nullptr, false);
+}
+
+CodegenResult codegen_ws_body(const rir::Module& rir_mod, LLVMContextRef shared_context) {
+    return codegen_impl(rir_mod, shared_context, true);
 }
 
 u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size) {
@@ -3133,24 +3466,197 @@ u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size) {
     return pos;
 }
 
+u32 format_ws_callback_symbol(u32 id, WsCallbackPhase phase, char* out, u32 out_size) {
+    char message[64];
+    const u32 kLength = format_ws_handler_symbol(id, message, sizeof(message));
+    const char* suffix = phase == WsCallbackPhase::Open    ? "_open"
+                         : phase == WsCallbackPhase::Close ? "_close"
+                                                           : "";
+    u32 extra = 0;
+    while (suffix[extra]) ++extra;
+    if (!out || out_size <= kLength + extra) return 0;
+    __builtin_memcpy(out, message, kLength);
+    __builtin_memcpy(out + kLength, suffix, extra + 1);
+    return kLength + extra;
+}
+
+bool emit_ws_body(LLVMModuleRef module,
+                  LLVMContextRef context,
+                  const rir::Module& body,
+                  u32 handler_id,
+                  WsCallbackPhase phase) {
+    if (module == nullptr || context == nullptr || LLVMGetModuleContext(module) != context ||
+        body.func_count != 1 || body.functions == nullptr)
+        return false;
+    char wrapper_name[64];
+    const u32 kNameLen =
+        format_ws_callback_symbol(handler_id, phase, wrapper_name, sizeof(wrapper_name));
+    if (kNameLen == 0 || LLVMGetNamedFunction(module, wrapper_name) != nullptr) return false;
+    char body_name[80];
+    __builtin_memcpy(body_name, wrapper_name, kNameLen);
+    static constexpr char kSuffix[] = "_body";
+    __builtin_memcpy(body_name + kNameLen, kSuffix, sizeof(kSuffix));
+    const Str kBodyName{body_name, kNameLen + static_cast<u32>(sizeof(kSuffix) - 1)};
+    char body_symbol[256];
+    if (format_handler_symbol(kBodyName, body_symbol, sizeof(body_symbol)) == 0 ||
+        LLVMGetNamedFunction(module, body_symbol) != nullptr)
+        return false;
+    rir::Function function = body.functions[0];
+    function.name = kBodyName;
+    rir::Module isolated = body;
+    isolated.functions = &function;
+    auto generated = codegen_ws_body(isolated, context);
+    if (!generated.ok) return false;
+    // Patterns are startup metadata consumed by JitEngine, rather than IR
+    // operands. The linker drops otherwise-unused private globals, so retain
+    // their unique names across this link and restore private linkage afterward.
+    static constexpr char kRegexPatternPrefix[] = "__rut_regex_pattern_";
+    const auto kIsRegexPattern = [](LLVMValueRef global) {
+        size_t size = 0;
+        const char* name = LLVMGetValueName2(global, &size);
+        return size >= sizeof(kRegexPatternPrefix) - 1 &&
+               __builtin_memcmp(name, kRegexPatternPrefix, sizeof(kRegexPatternPrefix) - 1) == 0;
+    };
+    for (LLVMValueRef global = LLVMGetFirstGlobal(generated.mod); global;
+         global = LLVMGetNextGlobal(global))
+        if (kIsRegexPattern(global)) LLVMSetLinkage(global, LLVMExternalLinkage);
+    // Linking consumes the source module on both success and failure. Its
+    // context is borrowed from the destination throughout.
+    if (LLVMLinkModules2(module, generated.mod) != 0) return false;
+    for (LLVMValueRef global = LLVMGetFirstGlobal(module); global;
+         global = LLVMGetNextGlobal(global))
+        if (kIsRegexPattern(global)) LLVMSetLinkage(global, LLVMPrivateLinkage);
+    LLVMValueRef callee = LLVMGetNamedFunction(module, body_symbol);
+    if (callee == nullptr) return false;
+
+    LLVMTypeRef ptr_ty = LLVMPointerTypeInContext(context, 0);
+    LLVMTypeRef i8_ty = LLVMInt8TypeInContext(context);
+    LLVMTypeRef i32_ty = LLVMInt32TypeInContext(context);
+    LLVMTypeRef i64_ty = LLVMInt64TypeInContext(context);
+    LLVMTypeRef wrapper_params[] = {ptr_ty, i8_ty, ptr_ty, i64_ty, i8_ty};
+    LLVMTypeRef wrapper_type = LLVMFunctionType(i8_ty, wrapper_params, 5, 0);
+    LLVMValueRef wrapper = LLVMAddFunction(module, wrapper_name, wrapper_type);
+    LLVMBuilderRef builder = LLVMCreateBuilderInContext(context);
+    if (builder == nullptr) return false;
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(context, wrapper, "entry");
+    LLVMBasicBlockRef evaluate = LLVMAppendBasicBlockInContext(context, wrapper, "evaluate");
+    LLVMBasicBlockRef invalid = LLVMAppendBasicBlockInContext(context, wrapper, "invalid");
+    LLVMPositionBuilderAtEnd(builder, entry);
+    LLVMValueRef conn = LLVMGetParam(wrapper, 0);
+    LLVMValueRef opcode = LLVMGetParam(wrapper, 1);
+    LLVMValueRef payload = LLVMGetParam(wrapper, 2);
+    LLVMValueRef length = LLVMGetParam(wrapper, 3);
+    LLVMValueRef from_client = LLVMGetParam(wrapper, 4);
+    LLVMValueRef is_text = LLVMBuildICmp(builder,
+                                         LLVMIntEQ,
+                                         opcode,
+                                         LLVMConstInt(i8_ty, static_cast<u8>(WsOpcode::Text), 0),
+                                         "text");
+    LLVMValueRef is_binary =
+        LLVMBuildICmp(builder,
+                      LLVMIntEQ,
+                      opcode,
+                      LLVMConstInt(i8_ty, static_cast<u8>(WsOpcode::Binary), 0),
+                      "binary");
+    LLVMValueRef kind_ok = LLVMBuildOr(builder, is_text, is_binary, "kind.ok");
+    LLVMValueRef length_ok = LLVMBuildICmp(
+        builder, LLVMIntULE, length, LLVMConstInt(i64_ty, 0x7fffffffu, 0), "length.ok");
+    LLVMValueRef empty =
+        LLVMBuildICmp(builder, LLVMIntEQ, length, LLVMConstInt(i64_ty, 0, 0), "empty");
+    LLVMValueRef nonnull =
+        LLVMBuildICmp(builder, LLVMIntNE, payload, LLVMConstNull(ptr_ty), "nonnull");
+    LLVMValueRef data_ok = LLVMBuildOr(builder, empty, nonnull, "data.ok");
+    LLVMValueRef valid = LLVMBuildAnd(
+        builder, kind_ok, LLVMBuildAnd(builder, length_ok, data_ok, "size.ok"), "input.ok");
+    LLVMBuildCondBr(builder, valid, evaluate, invalid);
+    LLVMPositionBuilderAtEnd(builder, invalid);
+    LLVMBuildRet(builder, LLVMConstInt(i8_ty, static_cast<u8>(WsFrameAction::Close), 0));
+    LLVMPositionBuilderAtEnd(builder, evaluate);
+    LLVMValueRef zero_byte = LLVMGetNamedGlobal(module, "__rut_ws_empty");
+    if (zero_byte == nullptr) {
+        zero_byte = LLVMAddGlobal(module, i8_ty, "__rut_ws_empty");
+        LLVMSetInitializer(zero_byte, LLVMConstInt(i8_ty, 0, 0));
+        LLVMSetGlobalConstant(zero_byte, 1);
+        LLVMSetLinkage(zero_byte, LLVMPrivateLinkage);
+    }
+    LLVMValueRef safe_payload = LLVMBuildSelect(builder, nonnull, payload, zero_byte, "payload");
+    LLVMTypeRef frame_type = LLVMArrayType(i8_ty, sizeof(HandlerCtx));
+    LLVMValueRef frame = LLVMBuildAlloca(builder, frame_type, "message.ctx");
+    LLVMSetAlignment(frame, alignof(HandlerCtx));
+    LLVMBuildMemSet(builder,
+                    frame,
+                    LLVMConstInt(i8_ty, 0, 0),
+                    LLVMConstInt(i64_ty, sizeof(HandlerCtx), 0),
+                    alignof(HandlerCtx));
+    LLVMTypeRef begin_params[] = {ptr_ty};
+    LLVMTypeRef begin_type = LLVMFunctionType(LLVMVoidTypeInContext(context), begin_params, 1, 0);
+    LLVMValueRef begin = LLVMGetNamedFunction(module, "rut_helper_ws_begin_message");
+    if (begin == nullptr)
+        begin = LLVMAddFunction(module, "rut_helper_ws_begin_message", begin_type);
+    LLVMValueRef begin_args[] = {conn};
+    LLVMBuildCall2(builder, begin_type, begin, begin_args, 1, "");
+    LLVMValueRef args[] = {conn,
+                           frame,
+                           safe_payload,
+                           LLVMBuildTrunc(builder, length, i32_ty, "length"),
+                           LLVMConstNull(ptr_ty),
+                           opcode,
+                           from_client};
+    LLVMValueRef result =
+        LLVMBuildCall2(builder, LLVMGlobalGetValueType(callee), callee, args, 7, "decision");
+    LLVMValueRef action = LLVMBuildAnd(builder, result, LLVMConstInt(i64_ty, 0xffu, 0), "action");
+    LLVMValueRef action_ok =
+        LLVMBuildICmp(builder,
+                      LLVMIntEQ,
+                      action,
+                      LLVMConstInt(i64_ty, static_cast<u8>(HandlerAction::ReturnStatus), 0),
+                      "action.ok");
+    LLVMValueRef extra = LLVMBuildAnd(
+        builder, result, LLVMConstInt(i64_ty, ~static_cast<u64>(0xffffffu), 0), "extra");
+    LLVMValueRef extra_ok =
+        LLVMBuildICmp(builder, LLVMIntEQ, extra, LLVMConstInt(i64_ty, 0, 0), "extra.ok");
+    LLVMValueRef verdict =
+        LLVMBuildAnd(builder,
+                     LLVMBuildLShr(builder, result, LLVMConstInt(i64_ty, 8, 0), "status"),
+                     LLVMConstInt(i64_ty, 0xffffu, 0),
+                     "verdict");
+    LLVMValueRef verdict_ok =
+        LLVMBuildICmp(builder,
+                      LLVMIntULE,
+                      verdict,
+                      LLVMConstInt(i64_ty, static_cast<u8>(WsFrameAction::CloseDynamic), 0),
+                      "verdict.ok");
+    LLVMValueRef output_ok = LLVMBuildAnd(
+        builder, action_ok, LLVMBuildAnd(builder, extra_ok, verdict_ok, "value.ok"), "output.ok");
+    LLVMValueRef selected =
+        LLVMBuildSelect(builder,
+                        output_ok,
+                        LLVMBuildTrunc(builder, verdict, i8_ty, "verdict.byte"),
+                        LLVMConstInt(i8_ty, static_cast<u8>(WsFrameAction::Close), 0),
+                        "output");
+    LLVMBuildRet(builder, selected);
+    LLVMDisposeBuilder(builder);
+    return true;
+}
+
 bool emit_ws_handler(LLVMModuleRef mod,
                      LLVMContextRef ctx,
                      u8 default_verdict,
                      const WsLenGuardSpec* guards,
                      u32 guard_count,
                      u32 id) {
-    if (!mod || !ctx || guard_count > WsLenGuardSpec::kMaxConditions ||
+    if (!mod || !ctx || default_verdict > 11 || guard_count > WsLenGuardSpec::kMaxConditions ||
         (guard_count != 0 && !guards))
         return false;
     // A bounded forest, in postorder: every operand has exactly one parent. Validate
     // before recursive emission so malformed specs cannot create cycles or code expansion.
     u8 parents[WsLenGuardSpec::kMaxConditions]{};
-    u32 roots = 0;
+    u32 sequential_roots = 0;
     for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].accessor > 33 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
+        if (guards[i].accessor > 37 || guards[i].cmp > 2 || guards[i].verdict == 3 ||
             guards[i].verdict > 11)
             return false;
-        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 33) ||
+        if ((guards[i].accessor == 11 || (guards[i].accessor >= 12 && guards[i].accessor <= 34) ||
              guards[i].accessor == 3 || (guards[i].accessor >= 6 && guards[i].accessor <= 9)) &&
             guards[i].pattern_len != 0 && !guards[i].pattern)
             return false;
@@ -3159,22 +3665,50 @@ bool emit_ws_handler(LLVMModuleRef mod,
              (guards[i].accessor >= 30 && guards[i].accessor <= 33)) &&
             guards[i].value_len != 0 && !guards[i].value)
             return false;
+        if (guards[i].accessor == 34 && (!guards[i].value || guards[i].value_len == 0))
+            return false;
         if ((guards[i].accessor == 24 || guards[i].accessor == 29) && guards[i].value_len != 0)
             return false;
         if (guards[i].accessor == 18 && guards[i].bound > 1) return false;
+        if (guards[i].accessor == 35 && guards[i].bound > 1) return false;
         if (guards[i].accessor == 23 &&
             (guards[i].int_bound < -2147483648LL || guards[i].int_bound > 2147483647LL))
             return false;
-        if (guards[i].accessor == 4 || guards[i].accessor == 5) {
-            const u32 children[2] = {guards[i].lhs, guards[i].rhs};
-            for (u32 child : children) {
-                if (child >= i || !guards[child].is_operand || ++parents[child] != 1) return false;
+        if (guards[i].accessor == 4 || guards[i].accessor == 5 || guards[i].accessor == 36 ||
+            guards[i].accessor == 37) {
+            const u32 kChildren[3] = {guards[i].lhs, guards[i].rhs, guards[i].bound};
+            const u32 kCount = guards[i].accessor == 37 ? 3u : 2u;
+            for (u32 j = 0; j < kCount; ++j) {
+                const u32 kChild = kChildren[j];
+                if (kChild >= i || !guards[kChild].is_operand || ++parents[kChild] != 1)
+                    return false;
             }
         }
-        if (!guards[i].is_operand && ++roots > WsLenGuardSpec::kMaxGuards) return false;
+        // Source clauses remain bounded by the frontend. Explicit forward roots
+        // also represent specialized value alternatives within those clauses.
+        if (!guards[i].is_operand && guards[i].pass_target == kWsControlNext &&
+            guards[i].fail_target == kWsControlNext &&
+            ++sequential_roots > WsLenGuardSpec::kMaxGuards)
+            return false;
     }
     for (u32 i = 0; i < guard_count; i++) {
         if (guards[i].is_operand && parents[i] != 1) return false;
+        const u32 kTargets[2] = {guards[i].pass_target, guards[i].fail_target};
+        for (const u32 kTargetValue : kTargets) {
+            if (kTargetValue == kWsControlNext) continue;
+            if (guards[i].is_operand) return false;
+            if (kTargetValue == kWsControlDefault) continue;
+            if (ws_control_is_return(kTargetValue)) {
+                const u32 kAction = ws_control_value(kTargetValue);
+                if (kAction == 3 || kAction > 11) return false;
+            } else if (ws_control_is_after(kTargetValue)) {
+                const u32 kBoundary = ws_control_value(kTargetValue);
+                if (kBoundary <= i || kBoundary > guard_count) return false;
+            } else if (kTargetValue <= i || kTargetValue >= guard_count ||
+                       guards[kTargetValue].is_operand) {
+                return false;
+            }
+        }
     }
     LLVMTypeRef i8_ty = LLVMInt8TypeInContext(ctx);
     LLVMTypeRef i64_ty = LLVMInt64TypeInContext(ctx);
@@ -3198,7 +3732,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
     if (!builder) return false;
     LLVMPositionBuilderAtEnd(builder, entry);
 
-    // u8 rut_helper_str_regex_match(ptr payload, i32 len, ptr db) — shared with HTTP handlers;
+    // u8 tri-state regex helper(ptr payload, i32 len, ptr db);
     // get-or-declare so we don't duplicate a decl the HTTP codegen already put in this module.
     LLVMTypeRef rx_params[3] = {ptr_ty, i32_ty, ptr_ty};
     LLVMTypeRef rx_fn_ty = LLVMFunctionType(i8_ty, rx_params, 3, 0);
@@ -3213,6 +3747,42 @@ bool emit_ws_handler(LLVMModuleRef mod,
             yes = no;
             no = tmp;
         }
+        if (guards[i].accessor == 37) {
+            LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(ctx, fn, "select.then");
+            LLVMBasicBlockRef else_block = LLVMAppendBasicBlockInContext(ctx, fn, "select.else");
+            self(self, guards[i].bound, then_block, else_block);
+            LLVMPositionBuilderAtEnd(builder, then_block);
+            self(self, guards[i].lhs, yes, no);
+            LLVMPositionBuilderAtEnd(builder, else_block);
+            self(self, guards[i].rhs, yes, no);
+            return;
+        }
+        if (guards[i].accessor == 36) {
+            // Equality evaluates both operands once. Keep the LHS value in SSA
+            // while emitting the RHS, including its own short-circuit branches.
+            LLVMBasicBlockRef left_yes = LLVMAppendBasicBlockInContext(ctx, fn, "eq.left.yes");
+            LLVMBasicBlockRef left_no = LLVMAppendBasicBlockInContext(ctx, fn, "eq.left.no");
+            LLVMBasicBlockRef left_done = LLVMAppendBasicBlockInContext(ctx, fn, "eq.left.done");
+            self(self, guards[i].lhs, left_yes, left_no);
+            LLVMPositionBuilderAtEnd(builder, left_yes);
+            LLVMBuildBr(builder, left_done);
+            LLVMPositionBuilderAtEnd(builder, left_no);
+            LLVMBuildBr(builder, left_done);
+            LLVMPositionBuilderAtEnd(builder, left_done);
+            LLVMTypeRef bool_ty = LLVMInt1TypeInContext(ctx);
+            LLVMValueRef left = LLVMBuildPhi(builder, bool_ty, "eq.left");
+            LLVMValueRef values[2] = {LLVMConstInt(bool_ty, 1, 0), LLVMConstInt(bool_ty, 0, 0)};
+            LLVMBasicBlockRef blocks[2] = {left_yes, left_no};
+            LLVMAddIncoming(left, values, blocks, 2);
+            LLVMBasicBlockRef right_yes = LLVMAppendBasicBlockInContext(ctx, fn, "eq.right.yes");
+            LLVMBasicBlockRef right_no = LLVMAppendBasicBlockInContext(ctx, fn, "eq.right.no");
+            self(self, guards[i].rhs, right_yes, right_no);
+            LLVMPositionBuilderAtEnd(builder, right_yes);
+            LLVMBuildCondBr(builder, left, yes, no);
+            LLVMPositionBuilderAtEnd(builder, right_no);
+            LLVMBuildCondBr(builder, left, no, yes);
+            return;
+        }
         if (guards[i].accessor == 4 || guards[i].accessor == 5) {
             LLVMBasicBlockRef rhs = LLVMAppendBasicBlockInContext(ctx, fn, "guard.rhs");
             if (guards[i].accessor == 4)
@@ -3224,7 +3794,9 @@ bool emit_ws_handler(LLVMModuleRef mod,
             return;
         }
         LLVMValueRef cond;
-        if (guards[i].accessor == 11) {  // JsonHasPath: presence includes a JSON null node.
+        if (guards[i].accessor == 35) {
+            cond = LLVMConstInt(LLVMInt1TypeInContext(ctx), guards[i].bound, 0);
+        } else if (guards[i].accessor == 11) {  // JsonHasPath: presence includes a JSON null node.
             LLVMTypeRef json_params[4] = {ptr_ty, i64_ty, ptr_ty, i32_ty};
             LLVMTypeRef json_ty = LLVMFunctionType(i8_ty, json_params, 4, 0);
             LLVMValueRef json_fn = LLVMGetNamedFunction(mod, "rut_helper_ws_json_has_path");
@@ -3489,7 +4061,10 @@ bool emit_ws_handler(LLVMModuleRef mod,
                 LLVMBuildCall2(builder, ty, fn, args, kValidOnly ? 4 : 7, "json.stringify");
             cond = LLVMBuildICmp(
                 builder, LLVMIntNE, result, LLVMConstInt(i8_ty, 0, 0), "json.stringify.matches");
-        } else if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
+        } else if (guards[i].accessor == 3 || guards[i].accessor == 34) {
+            const bool kJsonString = guards[i].accessor == 34;
+            const char* pattern = kJsonString ? guards[i].value : guards[i].pattern;
+            const u32 kPatternLen = kJsonString ? guards[i].value_len : guards[i].pattern_len;
             // Emit the pattern + db globals JIT finalization compiles & back-patches. The `ws<id>`
             // suffix keeps these distinct from the HTTP regex globals already in this module.
             char pat_name[96];
@@ -3497,8 +4072,8 @@ bool emit_ws_handler(LLVMModuleRef mod,
             snprintf(pat_name, sizeof(pat_name), "__rut_regex_pattern_ws%u_%u", id, regex_seq);
             snprintf(db_name, sizeof(db_name), "__rut_regex_db_ws%u_%u", id, regex_seq);
             regex_seq++;
-            LLVMValueRef str_const = LLVMConstStringInContext(
-                ctx, guards[i].pattern, guards[i].pattern_len, /*DontNullTerminate=*/0);
+            LLVMValueRef str_const =
+                LLVMConstStringInContext(ctx, pattern, kPatternLen, /*DontNullTerminate=*/0);
             LLVMValueRef pat_global = LLVMAddGlobal(mod, LLVMTypeOf(str_const), pat_name);
             LLVMSetInitializer(pat_global, str_const);
             LLVMSetGlobalConstant(pat_global, 1);
@@ -3507,15 +4082,55 @@ bool emit_ws_handler(LLVMModuleRef mod,
             LLVMValueRef db_global = LLVMAddGlobal(mod, ptr_ty, db_name);
             LLVMSetLinkage(db_global, LLVMExternalLinkage);
 
-            LLVMValueRef rx_fn = LLVMGetNamedFunction(mod, "rut_helper_str_regex_match");
-            if (!rx_fn) rx_fn = LLVMAddFunction(mod, "rut_helper_str_regex_match", rx_fn_ty);
             LLVMValueRef db = LLVMBuildLoad2(builder, ptr_ty, db_global, "regex.db");
-            LLVMValueRef len32 = LLVMBuildTrunc(builder, len, i32_ty, "len32");
-            LLVMValueRef rx_args[3] = {payload, len32, db};
-            LLVMValueRef r = LLVMBuildCall2(builder, rx_fn_ty, rx_fn, rx_args, 3, "rx");
-            LLVMValueRef is_match =
-                LLVMBuildICmp(builder, LLVMIntNE, r, LLVMConstInt(i8_ty, 0, 0), "rx.m");
-            cond = is_match;
+            if (kJsonString) {
+                LLVMTypeRef json_params[5] = {ptr_ty, i64_ty, ptr_ty, i32_ty, ptr_ty};
+                LLVMTypeRef json_ty = LLVMFunctionType(i8_ty, json_params, 5, 0);
+                LLVMValueRef scan_fn =
+                    LLVMGetNamedFunction(mod, "rut_helper_ws_json_string_regex_at_path");
+                if (!scan_fn)
+                    scan_fn =
+                        LLVMAddFunction(mod, "rut_helper_ws_json_string_regex_at_path", json_ty);
+                LLVMValueRef path_bytes = LLVMConstStringInContext(
+                    ctx, guards[i].pattern ? guards[i].pattern : "", guards[i].pattern_len, 1);
+                LLVMValueRef path = LLVMAddGlobal(mod, LLVMTypeOf(path_bytes), "json.regex.path");
+                LLVMSetInitializer(path, path_bytes);
+                LLVMSetGlobalConstant(path, 1);
+                LLVMSetLinkage(path, LLVMPrivateLinkage);
+                LLVMSetUnnamedAddress(path, LLVMGlobalUnnamedAddr);
+                LLVMValueRef args[5] = {
+                    payload, len, path, LLVMConstInt(i32_ty, guards[i].pattern_len, 0), db};
+                LLVMValueRef result =
+                    LLVMBuildCall2(builder, json_ty, scan_fn, args, 5, "json.regex");
+                LLVMBasicBlockRef scanned = LLVMAppendBasicBlockInContext(ctx, fn, "json.regex.ok");
+                LLVMBasicBlockRef error =
+                    LLVMAppendBasicBlockInContext(ctx, fn, "json.regex.error");
+                LLVMValueRef valid = LLVMBuildICmp(
+                    builder, LLVMIntULE, result, LLVMConstInt(i8_ty, 1, 0), "json.regex.valid");
+                LLVMBuildCondBr(builder, valid, scanned, error);
+                LLVMPositionBuilderAtEnd(builder, error);
+                // Decode and regex resource errors close before applying logical negation.
+                LLVMBuildRet(builder, LLVMConstInt(i8_ty, 2, 0));  // WsFrameAction::Close
+                LLVMPositionBuilderAtEnd(builder, scanned);
+                cond = LLVMBuildICmp(
+                    builder, LLVMIntEQ, result, LLVMConstInt(i8_ty, 1, 0), "json.regex.matches");
+            } else {
+                LLVMValueRef rx_fn = LLVMGetNamedFunction(mod, "rut_helper_str_regex_result");
+                if (!rx_fn) rx_fn = LLVMAddFunction(mod, "rut_helper_str_regex_result", rx_fn_ty);
+                LLVMValueRef len32 = LLVMBuildTrunc(builder, len, i32_ty, "len32");
+                LLVMValueRef rx_args[3] = {payload, len32, db};
+                LLVMValueRef result = LLVMBuildCall2(builder, rx_fn_ty, rx_fn, rx_args, 3, "rx");
+                auto* scanned = LLVMAppendBasicBlockInContext(ctx, fn, "rx.ok");
+                auto* failed = LLVMAppendBasicBlockInContext(ctx, fn, "rx.error");
+                LLVMValueRef valid = LLVMBuildICmp(
+                    builder, LLVMIntULE, result, LLVMConstInt(i8_ty, 1, 0), "rx.valid");
+                LLVMBuildCondBr(builder, valid, scanned, failed);
+                LLVMPositionBuilderAtEnd(builder, failed);
+                LLVMBuildRet(builder,
+                             LLVMConstInt(i8_ty, static_cast<u8>(WsFrameAction::Close), 0));
+                LLVMPositionBuilderAtEnd(builder, scanned);
+                cond = LLVMBuildICmp(builder, LLVMIntEQ, result, LLVMConstInt(i8_ty, 1, 0), "rx.m");
+            }
         } else if (guards[i].accessor >= 6) {  // TextEqual / TextPrefix / TextSuffix / TextContains
             // Check the full 64-bit length before reading a literal-sized view.
             // Prefix/suffix comparisons never read beyond a short message.
@@ -3591,17 +4206,41 @@ bool emit_ws_handler(LLVMModuleRef mod,
         }
         LLVMBuildCondBr(builder, cond, yes, no);
     };
-    // Only roots are source guards. Preserve first-failing-guard verdict order.
-    for (u32 i = 0; i < guard_count; i++) {
-        if (guards[i].is_operand) continue;
-        LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(ctx, fn, "cont");
-        LLVMBasicBlockRef els = LLVMAppendBasicBlockInContext(ctx, fn, "else");
-        emit_condition(emit_condition, i, cont, els);
-        LLVMPositionBuilderAtEnd(builder, els);
-        LLVMBuildRet(builder, LLVMConstInt(i8_ty, guards[i].verdict, /*SignExtend=*/0));
-        LLVMPositionBuilderAtEnd(builder, cont);
+    // Conditions retain their postorder operand trees. Root control edges are
+    // strictly forward, so nested arms never re-evaluate a parent or form loops.
+    LLVMBasicBlockRef blocks[WsLenGuardSpec::kMaxConditions]{};
+    LLVMBasicBlockRef default_block = LLVMAppendBasicBlockInContext(ctx, fn, "default");
+    for (u32 i = 0; i < guard_count; ++i)
+        if (!guards[i].is_operand) blocks[i] = LLVMAppendBasicBlockInContext(ctx, fn, "condition");
+    const auto kNext = [&](u32 start) {
+        for (u32 i = start; i < guard_count; ++i)
+            if (blocks[i]) return blocks[i];
+        return default_block;
+    };
+    const auto kTarget = [&](u32 target, u32 source, bool pass) {
+        if (target == kWsControlNext && pass) return kNext(source + 1);
+        if (target == kWsControlDefault) return default_block;
+        if (ws_control_is_after(target)) return kNext(ws_control_value(target));
+        if (target == kWsControlNext || ws_control_is_return(target)) {
+            LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(ctx, fn, "verdict");
+            LLVMPositionBuilderAtEnd(builder, done);
+            const u32 kAction =
+                target == kWsControlNext ? guards[source].verdict : ws_control_value(target);
+            LLVMBuildRet(builder, LLVMConstInt(i8_ty, kAction, 0));
+            return done;
+        }
+        return blocks[target];
+    };
+    LLVMBuildBr(builder, kNext(0));
+    for (u32 i = 0; i < guard_count; ++i) {
+        if (!blocks[i]) continue;
+        const auto kYes = kTarget(guards[i].pass_target, i, true);
+        const auto kNo = kTarget(guards[i].fail_target, i, false);
+        LLVMPositionBuilderAtEnd(builder, blocks[i]);
+        emit_condition(emit_condition, i, kYes, kNo);
     }
-    LLVMBuildRet(builder, LLVMConstInt(i8_ty, default_verdict, /*SignExtend=*/0));
+    LLVMPositionBuilderAtEnd(builder, default_block);
+    LLVMBuildRet(builder, LLVMConstInt(i8_ty, default_verdict, 0));
     LLVMDisposeBuilder(builder);
     return true;
 }

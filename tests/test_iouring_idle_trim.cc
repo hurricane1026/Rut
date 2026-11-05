@@ -1159,13 +1159,12 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // Affix recipes retain a suffix view and dynamic-source tag. JSON source paths increase
     // WsTextRewrite from 40 to 56 bytes in three connection-owned recipes (+48 bytes total).
     // The opening-handshake owner adds 16 bytes: the slice pointer, offers length,
-    // phase, and alignment padding. Its scratch slice is retired before four WS
-    // inspection slices are armed, so the six-slice ordinary reserve is unchanged.
-    // Keep the bounded layout explicit so future owner fields cannot grow it unnoticed.
+    // phase, and alignment padding. Keep the bounded layout explicit so future owner
+    // fields cannot grow it unnoticed; admission tests cover the handshake lifetime.
     // Required subprotocol negotiation pins one additional route-owned Str (+16 bytes).
-    // Verified inbound mTLS identity adds 64 bytes per connection. Existing struct
-    // padding absorbs the valid flag, so the measured slot growth is exactly 64 bytes.
-    CHECK_EQ(sizeof(Connection), 4648u);
+    // Verified inbound mTLS identity accounts for 64 bytes; struct padding absorbs its
+    // valid flag. The measured current 64-bit Connection layout is 5656 bytes.
+    CHECK_EQ(sizeof(Connection), 5656u);
 }
 
 TEST(iouring_idle_trim,

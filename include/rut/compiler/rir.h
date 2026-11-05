@@ -11,6 +11,7 @@
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/common/upstream_tls.h"
+#include "rut/common/ws_message.h"
 #include "rut/runtime/arena.h"
 
 namespace rut {
@@ -162,6 +163,7 @@ enum class Opcode : u8 {
     ReqMethod,               // %r = req.method               → Method
     ReqPath,                 // %r = req.path                 → str
     ReqPathOnly,             // %r = req.pathOnly             → str
+    WsMessageField,          // typed synchronous callback input, WsMessageFieldId immediate
     ReqBody,                 // %r = req.body                 → str
     ReqKeepAlive,            // %r = req.keepAlive            → bool
     ReqChunked,              // %r = req.chunked              → bool
@@ -204,6 +206,7 @@ enum class Opcode : u8 {
     HttpOriginListAllows,
     HashDigest,
     StrConstantTimeEqual,  // bounded byte equality; public lengths, secret contents
+    StrPredicate,          // two Str operands, predicate id 0/1/2/3: prefix/suffix/contains/isEmpty
     StrHasPrefix,          // %r = str.has_prefix %s, %pfx    → bool
     StrTrimPrefix,         // %r = str.trim_prefix %s, %pfx   → str
     StrRegexMatch,         // %r = str.regex_match %s, "re"   → bool
@@ -307,6 +310,13 @@ enum class Opcode : u8 {
     //                               digest, body, key_id, key) → bool
     SignedRequestValid,
     JwtClaimsValidWithLifetime,
+    // Length of the existing pointer/u32-length carrier, with no payload read.
+    StrLength,
+    // Two-edge SSA merge. operands are values; block_targets are their
+    // predecessor blocks. Phi instructions precede ordinary merge-block work.
+    Phi,
+    WsForward,  // Str carrier operand; Text/Binary opcode immediate; I32 action
+    WsClose,    // I32 code and Str reason operands; I32 action
 };
 
 // ── Instruction ─────────────────────────────────────────────────────

@@ -20,6 +20,8 @@
 #include "rut/runtime/listener_context.h"
 #include "rut/runtime/response_body_chain.h"
 #include "rut/runtime/tls_engine.h"
+#include "rut/runtime/ws_deflate.h"
+#include "rut/runtime/ws_extensions.h"
 #include "rut/runtime/ws_terminate.h"
 
 #ifdef __linux__
@@ -650,6 +652,7 @@ struct ConnectionBase {
     // Bytes actually sent for the 101 header block after response mutations.
     // Access logging and capture account this length, not the upstream prefix.
     u32 ws_upgrade_sent_len;
+    u32 ws_client_header_len = 0;  // before gateway subprotocol/extension rewrites
     // Upstream closed during pre-tunnel 101 handling and should be closed once
     // tunnel mode is fully entered (after preserving buffered early bytes).
     bool ws_pre_tunnel_upstream_closed;
@@ -678,14 +681,26 @@ struct ConnectionBase {
     u8* ws_handshake_slice = nullptr;
     u32 ws_handshake_offers_len = 0;
     WsHandshakePhase ws_handshake_phase = WsHandshakePhase::None;
-    Str ws_subprotocol{};           // immutable route-owned policy, pinned with request_config
+    Str ws_subprotocol{};             // immutable route-owned policy, pinned with request_config
+    Str ws_negotiated_subprotocol{};  // borrowed from the retained owned 101 header
+    WsDeflateAgreement ws_downstream_deflate{};
+    WsDeflateAgreement ws_upstream_deflate{};
+    WsDeflateCodec* ws_downstream_codec = nullptr;
+    WsDeflateCodec* ws_upstream_codec = nullptr;
+    WsMessageHandlerFn ws_open_handler = nullptr;
+    WsMessageHandlerFn ws_close_handler = nullptr;
+    bool ws_session_started = false;
+    bool ws_session_close_notified = false;
     WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
-    u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
+    u32 ws_max_message_size;        // configured bounded payload size
     const WsTextRewrite* ws_forward_texts = nullptr;
     u32 ws_forward_text_count = 0;
+    WsHandlerOutput ws_handler_output{};
     WsTextRewrite ws_forward_text{};  // route-owned replacement view, pinned with the route config
     bool ws_has_nonempty_rewrite() const {
-        if (ws_forward_text.prefix.len != 0 || ws_forward_text.suffix.len != 0) return true;
+        if (ws_forward_text.source == WsTextSource::Dynamic || ws_forward_text.prefix.len != 0 ||
+            ws_forward_text.suffix.len != 0)
+            return true;
         if (ws_forward_text_count > kWsMaxForwardTexts ||
             (ws_forward_text_count != 0 && !ws_forward_texts))
             return true;
@@ -697,35 +712,140 @@ struct ConnectionBase {
     Str ws_close_reason{};  // pinned route-owned close reason
     const WsClosePolicy* ws_close_policies = nullptr;
     u32 ws_close_policy_count = 0;
-    Str ws_echo_close_reason{};
-    u16 ws_close_code;       // route's message.close(code) status (seeds both inspectors)
-    u16 ws_echo_close_code;  // code for the echo Close (set from the inspector on close)
-    WsInspector ws_c2u;      // client->upstream inspection state (masked)
-    WsInspector ws_u2c;      // upstream->client inspection state (unmasked)
+    WsClosePayload ws_close_payload{};  // owned across inspector/receive-buffer retirement
+    // Received peer statuses are independent of the initiating local policy.
+    // Retain them even if an inspector or receive buffer is reset while draining.
+    WsClosePayload ws_client_close_payload{};
+    WsClosePayload ws_upstream_close_payload{};
+    u16 ws_close_code;   // route's message.close(code) status (seeds both inspectors)
+    WsInspector ws_c2u;  // client->upstream inspection state (masked)
+    WsInspector ws_u2c;  // upstream->client inspection state (unmasked)
     // Separate reassembly and output slices per direction. Output remains stable while
     // an asynchronous send is in flight; consumed input is compacted on completion.
     u8* ws_c2u_msg = nullptr;  // client->upstream reassembly slice
     u8* ws_u2c_msg = nullptr;  // upstream->client reassembly slice
     u8* ws_c2u_out = nullptr;  // client->upstream output, retained until send completion
     u8* ws_u2c_out = nullptr;  // upstream->client output, retained until send completion
-    u32 ws_c2u_consumed;       // recv_buf bytes consumed by the in-flight c->u send
-    u32 ws_u2c_consumed;       // upstream_recv_buf bytes consumed by the in-flight u->c send
-    // Bidirectional Close handshake (RFC 6455 §5.5.1). When a Close is determined (a peer
-    // sent Close, or the handler returned Close), terminate sends a Close frame to BOTH
-    // peers and tears the connection down only once both Close sends have drained — so a
-    // policy/peer close is graceful (the initiating client sees a Close, not EOF/1006). Per
-    // send slot: `_need` = a Close still to submit on this slot, `_inflight` = a Close is
-    // draining on it. close_conn fires when ws_closing and neither need nor inflight is set
-    // on either slot. The forward Close (emitted by ws_inspect) starts its slot _inflight;
-    // the echo Close (built into ws_close_frame_*) is submitted on the opposite slot.
+    u32 ws_buffer_capacity() const {
+        return ws_max_message_size > kWsTerminateMessageCapacity ? SlicePool::kBulkSliceSize
+                                                                 : SlicePool::kSliceSize;
+    }
+    bool alloc_ws_buffers(SlicePool& pool) {
+        if (ws_max_message_size > kWsMaxMessageCapacity) return false;
+        const u32 kCapacity = ws_buffer_capacity();
+        const WsDeflateOptions kDownstream{ws_downstream_deflate.client_window,
+                                           ws_downstream_deflate.server_window,
+                                           ws_downstream_deflate.client_no_context_takeover};
+        const WsDeflateOptions kUpstream{ws_upstream_deflate.server_window,
+                                         ws_upstream_deflate.client_window,
+                                         ws_upstream_deflate.server_no_context_takeover};
+#if RUT_ENABLE_WEBSOCKET
+        const bool kCodecsMatch =
+            (ws_downstream_deflate.enabled
+                 ? ws_downstream_codec && ws_deflate_matches(*ws_downstream_codec, kDownstream)
+                 : ws_downstream_codec == nullptr) &&
+            (ws_upstream_deflate.enabled
+                 ? ws_upstream_codec && ws_deflate_matches(*ws_upstream_codec, kUpstream)
+                 : ws_upstream_codec == nullptr);
+#else
+        const bool kCodecsMatch = !ws_downstream_codec && !ws_upstream_codec;
+        (void)kDownstream;
+        (void)kUpstream;
+        if (ws_downstream_deflate.enabled || ws_upstream_deflate.enabled) return false;
+#endif
+        if (ws_c2u_msg || ws_u2c_msg || ws_c2u_out || ws_u2c_out)
+            return kCodecsMatch && ws_c2u_msg && ws_u2c_msg && ws_c2u_out && ws_u2c_out &&
+                   pool.capacity_of(ws_c2u_msg) == kCapacity &&
+                   pool.capacity_of(ws_u2c_msg) == kCapacity &&
+                   pool.capacity_of(ws_c2u_out) == kCapacity &&
+                   pool.capacity_of(ws_u2c_out) == kCapacity;
+        if (ws_downstream_codec || ws_upstream_codec) return false;
+        // These allocations become mutable reassembly and asynchronous send storage.
+        // NOLINTNEXTLINE(misc-const-correctness)
+        u8* buffers[4]{};
+        for (u32 i = 0; i < 4; ++i) {
+            buffers[i] = kCapacity == SlicePool::kSliceSize ? pool.alloc() : pool.alloc_bulk();
+            if (!buffers[i]) {
+                for (u32 j = 0; j < i; ++j) pool.free(buffers[j]);
+                return false;
+            }
+        }
+#if RUT_ENABLE_WEBSOCKET
+        WsDeflateCodec* const kDownstreamCodec =
+            ws_downstream_deflate.enabled ? ws_deflate_create(pool, kDownstream) : nullptr;
+        WsDeflateCodec* const kUpstreamCodec =
+            ws_upstream_deflate.enabled ? ws_deflate_create(pool, kUpstream) : nullptr;
+        if ((ws_downstream_deflate.enabled && !kDownstreamCodec) ||
+            (ws_upstream_deflate.enabled && !kUpstreamCodec)) {
+            ws_deflate_destroy(pool, kDownstreamCodec);
+            ws_deflate_destroy(pool, kUpstreamCodec);
+            for (u8* buffer : buffers) pool.free(buffer);
+            return false;
+        }
+        ws_downstream_codec = kDownstreamCodec;
+        ws_upstream_codec = kUpstreamCodec;
+#endif
+        ws_c2u_msg = buffers[0];
+        ws_u2c_msg = buffers[1];
+        ws_c2u_out = buffers[2];
+        ws_u2c_out = buffers[3];
+        return true;
+    }
+    void free_ws_codecs(SlicePool& pool) {
+#if RUT_ENABLE_WEBSOCKET
+        ws_deflate_destroy(pool, ws_downstream_codec);
+        ws_deflate_destroy(pool, ws_upstream_codec);
+#else
+        (void)pool;
+#endif
+        ws_downstream_codec = nullptr;
+        ws_upstream_codec = nullptr;
+        ws_c2u.decoder = nullptr;
+        ws_c2u.encoder = nullptr;
+        ws_u2c.decoder = nullptr;
+        ws_u2c.encoder = nullptr;
+    }
+    u32 ws_c2u_consumed;  // recv_buf bytes consumed by the in-flight c->u send
+    u32 ws_u2c_consumed;  // upstream_recv_buf bytes consumed by the in-flight u->c send
+    // Each leg tracks Close send completion independently of peer acknowledgement.
+    // After local initiation only closing controls are processed; application
+    // callbacks stop. The original shutdown deadline also bounds acknowledgement.
     bool ws_closing;
-    bool ws_close_client_need;        // Close still to send on the client slot (u->c)
-    bool ws_close_client_inflight;    // a Close is draining on the client slot
-    bool ws_close_upstream_need;      // Close still to send on the upstream slot (c->u)
-    bool ws_close_upstream_inflight;  // a Close is draining on the upstream slot
-    u8 ws_close_frame_client[12];     // echo Close frame to the client (unmasked, persists during
-                                      // send)
-    u8 ws_close_frame_upstream[12];   // echo Close frame to the upstream (masked)
+    bool ws_close_client_need;
+    bool ws_close_client_inflight;
+    bool ws_close_upstream_need;
+    bool ws_close_upstream_inflight;
+    bool ws_close_client_received = false;
+    bool ws_close_upstream_received = false;
+    bool ws_close_client_sent = false;
+    bool ws_close_upstream_sent = false;
+    bool ws_tls_shutdown_pending = false;
+    bool ws_tls_shutdown_generated = false;
+    bool ws_tls_shutdown_need_read = false;
+    bool ws_client_write_shutdown = false;
+    bool ws_close_handshake_complete = false;
+    bool ws_record_peer_close(bool from_client, const WsInspector& inspector) {
+        bool& received = from_client ? ws_close_client_received : ws_close_upstream_received;
+        if (received) return true;  // the first valid peer Close wins
+        if (!inspector.received_close) return false;
+        auto& payload = from_client ? ws_client_close_payload : ws_upstream_close_payload;
+        if (!payload.assign(inspector.echo_close_code, inspector.echo_close_reason())) return false;
+        received = true;
+        return true;
+    }
+    WsSessionCloseContext ws_session_close_context() const {
+        WsSessionCloseContext context{};
+        if (ws_close_client_received)
+            context.client = {ws_client_close_payload.code, ws_client_close_payload.reason(), true};
+        if (ws_close_upstream_received)
+            context.upstream = {
+                ws_upstream_close_payload.code, ws_upstream_close_payload.reason(), true};
+        context.was_clean = ws_close_handshake_complete;
+        return context;
+    }
+    // Dedicated inline control storage is never reused while its send is pending.
+    u8 ws_close_frame_client[kWsMaxHeaderSize + kWsMaxControlPayload];
+    u8 ws_close_frame_upstream[kWsMaxHeaderSize + kWsMaxControlPayload];
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -2068,6 +2188,7 @@ struct ConnectionBase {
         ws_upstream_send_len = 0;
         ws_upgrade_response_len = 0;
         ws_upgrade_sent_len = 0;
+        ws_client_header_len = 0;
         ws_pre_tunnel_upstream_closed = false;
         ws_client_eof = false;
         ws_upstream_eof = false;
@@ -2079,17 +2200,34 @@ struct ConnectionBase {
         ws_handshake_offers_len = 0;
         ws_handshake_phase = WsHandshakePhase::None;
         ws_subprotocol = {};
+        ws_negotiated_subprotocol = {};
+        ws_downstream_deflate = {};
+        ws_upstream_deflate = {};
+        ws_downstream_codec = nullptr;
+        ws_upstream_codec = nullptr;
         ws_handler = nullptr;
+        ws_open_handler = nullptr;
+        ws_close_handler = nullptr;
+        ws_session_started = false;
+        ws_session_close_notified = false;
         ws_max_message_size = 0;
         ws_close_reason = {};
         ws_close_policies = nullptr;
         ws_close_policy_count = 0;
-        ws_echo_close_reason = {};
+        ws_close_payload = {};
+        ws_client_close_payload = {};
+        ws_upstream_close_payload = {};
         ws_close_code = 1000;
         ws_forward_text = {};
+        ws_handler_output = {};
+        ws_c2u.dynamic_output = nullptr;
+        ws_u2c.dynamic_output = nullptr;
+        ws_c2u.decoder = nullptr;
+        ws_c2u.encoder = nullptr;
+        ws_u2c.decoder = nullptr;
+        ws_u2c.encoder = nullptr;
         ws_forward_texts = nullptr;
         ws_forward_text_count = 0;
-        ws_echo_close_code = 1000;
         ws_c2u.reset();
         ws_u2c.reset();
         ws_c2u.message_len = 0;
@@ -2105,6 +2243,15 @@ struct ConnectionBase {
         ws_close_client_inflight = false;
         ws_close_upstream_need = false;
         ws_close_upstream_inflight = false;
+        ws_close_client_received = false;
+        ws_close_upstream_received = false;
+        ws_close_client_sent = false;
+        ws_close_upstream_sent = false;
+        ws_tls_shutdown_pending = false;
+        ws_tls_shutdown_generated = false;
+        ws_tls_shutdown_need_read = false;
+        ws_client_write_shutdown = false;
+        ws_close_handshake_complete = false;
         idle_trim_examined = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;

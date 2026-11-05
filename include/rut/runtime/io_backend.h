@@ -43,7 +43,7 @@ static constexpr u32 kProvidedBufSize = 4096;  // 4KB per buffer
 // Buffer group ID for provided buffer ring
 static constexpr u16 kBufGroupId = 0;
 
-// Dedicated provided buffer ring for bounded one-shot upstream recvs. Each
+// Shared large provided buffer ring for bounded upstream one-shot recvs. Each
 // buffer matches one upstream receive slice, so a response body moves in
 // slice-sized steps instead of 4 KiB steps. Buffer ids continue after the
 // ordinary ring's ids: a CQE's buffer id alone identifies the owning ring.

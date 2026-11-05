@@ -51,6 +51,13 @@ inline void observe_iouring_tls_low_water_resume() {
 // Defined in callbacks_impl.h — the HTTP recv entrypoint we hand plaintext to.
 template <class Self>
 void on_header_received(void* lp, Connection& conn, IoEvent ev);
+template <class Self>
+void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev);
+template <class Self>
+bool ws_drive_close(Self* loop, Connection& conn);
+template <class Self>
+bool ws_finish_tls_shutdown(Self* loop, Connection& conn);
+
 // Defined in callbacks_impl.h — proxy body fully forwarded: release the upstream
 // slot, complete the request, continue keep-alive. Shared with the io_uring-TLS
 // owned-buffer drain path (tls_on_out_drain).
@@ -279,6 +286,15 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         c, [](auto& value, const auto& reset_value) { value = reset_value; });
     c.tls_out_buf.consume(kDrainedLen);
 
+    if constexpr (requires { loop->advance_ws_tls_shutdown(c); }) {
+        if (c.ws_tls_shutdown_pending) {
+            if (!loop->advance_ws_tls_shutdown(c) ||
+                (!c.ws_tls_shutdown_pending && !ws_drive_close(loop, c)))
+                loop->close_conn(c);
+            return;
+        }
+    }
+
     // A request-body overflow prefix can contain an app record behind control
     // output (for example a TLS 1.3 KeyUpdate response). Resume its deferred
     // classification only after the kernel no longer owns tls_out_buf.
@@ -426,6 +442,14 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
 template <class Self>
 void tls_process(Self* loop, Connection& c) {
     if (c.tls_out_inflight) return;  // can't touch tls_out_buf mid-send
+    if constexpr (requires { loop->advance_ws_tls_shutdown(c); }) {
+        if (c.ws_tls_shutdown_pending) {
+            if (!loop->advance_ws_tls_shutdown(c) ||
+                (!c.ws_tls_shutdown_pending && !ws_drive_close(loop, c)))
+                loop->close_conn(c);
+            return;
+        }
+    }
     tls_engine_set_input(c.tls_engine, c.tls_in_buf.data(), c.tls_in_buf.len());
 
     if (!c.tls_engine.handshake_done) {
@@ -517,7 +541,7 @@ void tls_process(Self* loop, Connection& c) {
             }
             if (st == TlsOp::WantRead) break;  // drained all complete records
             if (st == TlsOp::Closed) {
-                if (c.recv_buf.len() == 0) {
+                if (c.recv_buf.len() == 0 && !(c.is_ws_terminate && c.ws_closing)) {
                     loop->close_conn(c);
                     return;
                 }
@@ -538,6 +562,23 @@ void tls_process(Self* loop, Connection& c) {
         c.tls_in_buf.consume(kConsumed);
         const bool kHasControlOutput = tls_engine_output_len(c.tls_engine) > 0;
         if (kHasControlOutput) c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));
+        if constexpr (requires { loop->advance_ws_tls_shutdown(c); }) {
+            if (saw_close_notify && c.is_ws_terminate && c.ws_closing &&
+                c.tls_pending_on_recv == &on_ws_client_recv<Self>) {
+                c.ws_client_eof = true;
+                if (c.recv_buf.len() <= kBefore) {
+                    if (kHasControlOutput && !tls_ensure_draining<Self>(loop, c)) {
+                        loop->close_conn(c);
+                        return;
+                    }
+                    IoEvent eof{};
+                    eof.conn_id = c.id;
+                    eof.type = IoEventType::Recv;
+                    c.tls_pending_on_recv(loop, c, eof);
+                    return;
+                }
+            }
+        }
         if (c.recv_buf.len() <= kBefore) {
             if (kConsumed > 0 && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>) {
                 tls_resume_pending_send_recv<Self>(loop, c, {});
@@ -799,6 +840,13 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty))) {
         tls_discard_abandoned_input<Self>(loop, c);
         return;
+    }
+    if constexpr (requires { loop->advance_ws_tls_shutdown(c); }) {
+        if (ev.result == 0 && c.is_ws_terminate && c.ws_closing && !c.ws_tls_shutdown_need_read &&
+            c.tls_pending_on_recv == &on_ws_client_recv<Self>) {
+            c.tls_pending_on_recv(loop, c, ev);
+            return;
+        }
     }
     if (ev.result <= 0) {  // peer EOF or recv error
         // A body send may have a valid TLS prefix already copied into tls_in_buf

@@ -1,3 +1,4 @@
+#include "rut/common/ws_message.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
@@ -2535,6 +2536,79 @@ TEST(RirBuilder, StandardWebhookFiveOperands) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, WebSocketMessageFieldsCheckIdentityArityAndResultType) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("message_inputs"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    CHECK_FALSE(b.emit_ws_message_field(static_cast<WsMessageFieldId>(255)));
+    for (u32 field = 0; ws_message_field_valid(field); ++field)
+        V(b.emit_ws_message_field(static_cast<WsMessageFieldId>(field)));
+    VOK(b.emit_ret_status(200));
+    REQUIRE(verify_function(fn).ok);
+    Instruction& op = fn->entry()->insts[0];
+    const ValueId kResult = op.result;
+    op.imm.i32_val = -1;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsMessageField);
+    op.imm.i32_val = static_cast<i32>(WsMessageFieldId::Payload);
+    op.operand_count = 1;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsMessageField);
+    op.operand_count = 0;
+    op.result = fn->entry()->insts[1].result;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsMessageField);
+    op.result = kResult;
+    CHECK(verify_function(fn).ok);
+    char output[2048];
+    PrintBuf print;
+    print.init(output, sizeof(output), -1);
+    print_function(print, *fn);
+    CHECK(std::string(output, print.len).find("ws.message.field 0") != std::string::npos);
+    ctx.destroy();
+}
+
+TEST(RirVerifier, StrLengthChecksCarrierArityAndResultType) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("bytes_count"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto bytes = V(b.emit_const_str({"\0\xff", 2}));
+    auto wrong = V(b.emit_const_i32(1));
+    CHECK_FALSE(b.emit_str_length(wrong));
+    auto result = V(b.emit_str_length(bytes));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(verify_function(fn).ok);
+    Instruction* op = nullptr;
+    for (u32 i = 0; i < fn->entry()->inst_count; ++i)
+        if (fn->entry()->insts[i].op == Opcode::StrLength) op = &fn->entry()->insts[i];
+    REQUIRE(op);
+    for (u32 count : {0u, 2u}) {
+        op->operand_count = count;
+        auto checked = verify_function(fn);
+        CHECK_FALSE(checked.ok);
+        CHECK(checked.issue.code == VerifyIssueCode::InvalidStrLength);
+    }
+    op->operand_count = 1;
+    op->operands[0] = wrong;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidStrLength);
+    op->operands[0] = bytes;
+    op->result = bytes;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidStrLength);
+    op->result = result;
+    CHECK(verify_function(fn).ok);
+    char output[1024];
+    PrintBuf print;
+    print.init(output, sizeof(output), -1);
+    print_function(print, *fn);
+    CHECK(std::string(output, print.len).find("str.length") != std::string::npos);
+    ctx.destroy();
+}
+
 TEST(RirVerifier, JwtClaimsLifetimeChecksArityAndTypes) {
     TestContext ctx;
     REQUIRE(ctx.init());
@@ -2679,4 +2753,167 @@ TEST(RirBuilder, JwtIssueHs256WithIdAndScopeUsesSevenOperandsAndValidatesTypes) 
     args[4] = saved_scope;
     VOK(b.emit_ret_status(204));
     ctx.destroy();
+}
+
+TEST(RirBuilder, PhiValidatesEdgesTypesAndIncomingDominance) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("branches"), lit("/"), 'G'));
+    const auto entry = V(b.create_block(fn, lit("entry")));
+    const auto merge = V(b.create_block(fn, lit("merge")));
+    const auto left = V(b.create_block(fn, lit("left")));
+    const auto right = V(b.create_block(fn, lit("right")));
+    b.set_insert_point(fn, entry);
+    auto condition = V(b.emit_const_bool(true));
+    auto shared = V(b.emit_const_i32(203));
+    VOK(b.emit_br(condition, left, right));
+    b.set_insert_point(fn, left);
+    auto first = V(b.emit_const_i32(201));
+    VOK(b.emit_jmp(merge));
+    b.set_insert_point(fn, right);
+    auto second = V(b.emit_const_i32(202));
+    VOK(b.emit_jmp(merge));
+    b.set_insert_point(fn, merge);
+    CHECK_FALSE(b.emit_phi(first, left, condition, right));
+    CHECK_FALSE(b.emit_phi(first, left, second, left));
+    CHECK_FALSE(b.emit_phi(first, merge, second, right));
+    CHECK_FALSE(b.emit_phi(first, left, kNoValue, right));
+    auto selected = V(b.emit_phi(first, left, second, right));
+    VOK(b.emit_ret_status(selected));
+    REQUIRE(verify_function(fn).ok);
+    auto& phi = fn->blocks[merge.id].insts[0];
+    char text[256];
+    PrintBuf buf{};
+    buf.init(text, sizeof(text), -1);
+    print_instruction(buf, phi, *fn);
+    CHECK(std::string(text, buf.len).find("phi") != std::string::npos);
+    phi.operands[0] = shared;
+    CHECK(verify_function(fn).ok);
+    phi.operands[0] = first;
+    phi.operand_count = 3;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    phi.operand_count = 2;
+    phi.imm.block_targets[1] = left;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    phi.imm.block_targets[1] = right;
+    phi.operands[1] = first;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    phi.operands[1] = second;
+    const Type* saved = fn->values[second.id].type;
+    fn->values[second.id].type = V(b.make_type(TypeKind::Bool));
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    fn->values[second.id].type = saved;
+    REQUIRE(verify_function(fn).ok);
+    // A third predecessor cannot be omitted from a two-input merge.
+    auto extra = V(b.create_block(fn, lit("extra")));
+    b.set_insert_point(fn, extra);
+    VOK(b.emit_jmp(merge));
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidPhi);
+    tc.destroy();
+}
+
+TEST(RirVerifier, WebSocketOutputChecksCarrierOpcodeArityAndResultType) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("output"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto payload = V(b.emit_const_str(lit("payload")));
+    auto code = V(b.emit_const_i32(1000));
+    CHECK_FALSE(b.emit_ws_forward(code, 1));
+    CHECK_FALSE(b.emit_ws_forward(payload, 9));
+    CHECK_FALSE(b.emit_ws_close(payload, payload));
+    CHECK_FALSE(b.emit_ws_close(code, code));
+    auto forward = V(b.emit_ws_forward(payload, 2));
+    auto close = V(b.emit_ws_close(code, payload));
+    VOK(b.emit_ret_status(200));
+    REQUIRE(verify_function(fn).ok);
+    Instruction& output = fn->entry()->insts[2];
+    const Instruction saved = output;
+    for (u32 mode = 0; mode < 5; ++mode) {
+        output = saved;
+        if (mode == 0) output.imm.i32_val = 3;
+        if (mode == 1) output.operand_count = 0;
+        if (mode == 2) output.operands[0] = code;
+        if (mode == 3) output.result = payload;
+        if (mode == 4) output.extra_operands = &code;
+        CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsOutput);
+    }
+    output = saved;
+    Instruction& closing = fn->entry()->insts[3];
+    closing.operands[1] = code;
+    CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidWsOutput);
+    closing.operands[1] = payload;
+    REQUIRE(verify_function(fn).ok);
+    CHECK(fn->values[forward.id].type->kind == TypeKind::I32);
+    CHECK(fn->values[close.id].type->kind == TypeKind::I32);
+    char output_text[2048];
+    PrintBuf print;
+    print.init(output_text, sizeof(output_text), -1);
+    print_function(print, *fn);
+    CHECK(std::string(output_text, print.len).find("ws.forward 2, %0") != std::string::npos);
+    CHECK(std::string(output_text, print.len).find("ws.close %1, %0") != std::string::npos);
+    ctx.destroy();
+}
+
+TEST(RirVerifier, StringOperationsRejectForgedCarriersArityAndPredicateIds) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("strings"), lit("/"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto text = V(b.emit_const_str(lit("text")));
+    auto number = V(b.emit_const_i32(1));
+    CHECK_FALSE(b.emit_str_predicate(text, number, 0));
+    CHECK_FALSE(b.emit_str_predicate(number, text, 0));
+    CHECK_FALSE(b.emit_str_predicate(text, text, 4));
+    ValueId parts[65];
+    for (auto& part : parts) part = text;
+    CHECK_FALSE(b.emit_str_interpolate(parts, 0));
+    CHECK_FALSE(b.emit_str_interpolate(parts, 65));
+    CHECK_FALSE(b.emit_str_interpolate(nullptr, 2));
+    parts[0] = number;
+    CHECK_FALSE(b.emit_str_interpolate(parts, 2));
+    parts[0] = text;
+    V(b.emit_str_predicate(text, text, 3));
+    V(b.emit_str_interpolate(parts, 2));
+    V(b.emit_str_interpolate(parts, 64));
+    VOK(b.emit_ret_status(200));
+    REQUIRE(verify_function(fn).ok);
+    for (u32 index : {2u, 3u, 4u}) {
+        auto& instruction = fn->entry()->insts[index];
+        const Instruction saved = instruction;
+        for (u32 mode = 0; mode < 6; ++mode) {
+            instruction = saved;
+            if (mode == 0) instruction.operand_count = 0;
+            if (mode == 1) instruction.operand_count = 65;
+            if (mode == 2) instruction.operands[0] = number;
+            if (mode == 3) instruction.result = number;
+            if (mode == 4) {
+                if (index == 2)
+                    instruction.imm.i32_val = 4;
+                else if (index == 3)
+                    instruction.operands[1] = kNoValue;
+                else
+                    instruction.extra_operands = nullptr;
+            }
+            if (mode == 5) {
+                if (index == 4)
+                    instruction.extra_operands[0] = number;
+                else
+                    instruction.extra_operands = &number;
+            }
+            CHECK(verify_function(fn).issue.code == VerifyIssueCode::InvalidStringOperation);
+            if (mode == 5 && index == 4) instruction.extra_operands[0] = text;
+        }
+        instruction = saved;
+        REQUIRE(verify_function(fn).ok);
+    }
+    tc.destroy();
 }

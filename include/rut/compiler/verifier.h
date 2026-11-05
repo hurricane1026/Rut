@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/request_policy.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_printer.h"
@@ -47,6 +48,11 @@ enum class VerifyIssueCode : u8 {
     InvalidPreRoutePolicyId,
     InvalidJwtClaimsLifetime,
     InvalidPasswordPrefix,
+    InvalidStrLength,
+    InvalidStringOperation,
+    InvalidWsMessageField,
+    InvalidWsOutput,
+    InvalidPhi,
 };
 
 struct VerifyIssue {
@@ -66,6 +72,30 @@ struct VerifySummary {
     u32 yield_count = 0;
     u32 branch_edge_count = 0;
 };
+
+// Shared boundary validation for the bounded String operations. Codegen also
+// checks direct RIR clients before indexing operands or allocating LLVM arrays.
+inline bool valid_string_instruction(const Function& fn, const Instruction& inst) {
+    if (inst.op != Opcode::StrPredicate && inst.op != Opcode::StrInterpolate) return true;
+    if (inst.operand_count <= kMaxInlineOperands && inst.extra_operands) return false;
+    const auto kExact = [&](ValueId id, TypeKind kind) {
+        if (id == kNoValue || id.id >= fn.value_count || !fn.values) return false;
+        const Type* type = fn.values[id.id].type;
+        return type && type->kind == kind && !type->inner && !type->struct_def;
+    };
+    if (inst.op == Opcode::StrPredicate) {
+        return inst.operand_count == 2 && inst.imm.i32_val >= 0 && inst.imm.i32_val <= 3 &&
+               kExact(inst.result, TypeKind::Bool) && kExact(inst.operand(0), TypeKind::Str) &&
+               kExact(inst.operand(1), TypeKind::Str);
+    }
+    if (inst.operand_count == 0 || inst.operand_count > 64 ||
+        (inst.operand_count > kMaxInlineOperands && !inst.extra_operands) ||
+        !kExact(inst.result, TypeKind::Str))
+        return false;
+    for (u32 i = 0; i < inst.operand_count; ++i)
+        if (!kExact(inst.operand(i), TypeKind::Str)) return false;
+    return true;
+}
 
 struct VerifyOptions {
     // Rut route automata should not carry dead blocks: dead IR makes later
@@ -699,6 +729,98 @@ inline VerifyHandlerCheckResult verify_handler_runtime_states(
     return result;
 }
 
+// Phi inputs must be available on their incoming edge. Reject a path from
+// entry to that edge which bypasses the defining block. This bounded walk
+// avoids trusting numeric block ordering (nested expression merges are not
+// necessarily appended in dependency order).
+inline bool verify_phi_dominates(const Function& fn, BlockId definition, BlockId edge) {
+    if (definition.id >= fn.block_count || edge.id >= fn.block_count) return false;
+    if (definition == edge || definition.id == 0) return true;
+    constexpr u32 kMaxBlocks = 4096;
+    if (fn.block_count > kMaxBlocks) return false;
+    bool visited[kMaxBlocks]{};
+    u32 pending[kMaxBlocks]{};
+    u32 count = 0;
+    pending[count++] = 0;
+    visited[0] = true;
+    while (count != 0) {
+        const u32 kId = pending[--count];
+        if (kId == edge.id) return false;
+        const Block& block = fn.blocks[kId];
+        if (block.insts == nullptr || block.inst_count == 0) return false;
+        const Instruction* term = block.terminator();
+        if (term == nullptr) return false;
+        const u32 kSuccessors = term->op == Opcode::Br ? 2u : term->op == Opcode::Jmp ? 1u : 0u;
+        for (u32 i = 0; i < kSuccessors; ++i) {
+            const u32 kNext = term->imm.block_targets[i].id;
+            if (kNext >= fn.block_count) return false;
+            if (kNext == definition.id || visited[kNext]) continue;
+            visited[kNext] = true;
+            pending[count++] = kNext;
+        }
+    }
+    return true;
+}
+
+inline bool verify_phi_types_equal(const Type* first, const Type* second, u32 depth = 0) {
+    if (first == nullptr || second == nullptr || depth > 64 || first->kind != second->kind ||
+        first->kind == TypeKind::Void || first->kind > TypeKind::Array)
+        return false;
+    if (first->kind == TypeKind::Optional || first->kind == TypeKind::Array)
+        return verify_phi_types_equal(first->inner, second->inner, depth + 1);
+    if (first->kind == TypeKind::Struct)
+        return first->struct_def != nullptr && first->struct_def == second->struct_def;
+    return first->inner == nullptr && second->inner == nullptr && first->struct_def == nullptr &&
+           second->struct_def == nullptr;
+}
+
+inline bool verify_phi(const Function& fn, u32 block_index, u32 inst_index) {
+    const Block& block = fn.blocks[block_index];
+    const Instruction& inst = block.insts[inst_index];
+    // Resume entries have additional runtime predecessors. They require a
+    // separate persisted-value analysis before using ordinary synchronous SSA.
+    if (fn.yield_count != 0 || inst.operand_count != 2 || fn.values == nullptr ||
+        inst.result == kNoValue || inst.result.id >= fn.value_count)
+        return false;
+    for (u32 i = 0; i < inst_index; ++i)
+        if (block.insts[i].op != Opcode::Phi) return false;
+    const Value& result = fn.values[inst.result.id];
+    if (result.def_block.id != block_index || result.def_inst != inst_index) return false;
+    const BlockId kFirst = inst.imm.block_targets[0];
+    const BlockId kSecond = inst.imm.block_targets[1];
+    if (kFirst == kSecond || kFirst.id >= fn.block_count || kSecond.id >= fn.block_count ||
+        kFirst.id == block_index || kSecond.id == block_index)
+        return false;
+    u32 predecessors = 0;
+    for (u32 bi = 0; bi < fn.block_count; ++bi) {
+        const Block& source = fn.blocks[bi];
+        if (source.inst_count == 0 || source.insts == nullptr) return false;
+        const Instruction* term = source.terminator();
+        if (term == nullptr) return false;
+        const u32 kTargets = term->op == Opcode::Br ? 2u : term->op == Opcode::Jmp ? 1u : 0u;
+        bool reaches = false;
+        for (u32 i = 0; i < kTargets; ++i) reaches |= term->imm.block_targets[i].id == block_index;
+        if (!reaches) continue;
+        if (bi != kFirst.id && bi != kSecond.id) return false;
+        ++predecessors;
+    }
+    if (predecessors != 2) return false;
+    for (u32 i = 0; i < 2; ++i) {
+        const ValueId kId = inst.operands[i];
+        if (kId == kNoValue || kId == inst.result || kId.id >= fn.value_count) return false;
+        const Value& value = fn.values[kId.id];
+        if (value.def_block.id >= fn.block_count ||
+            !verify_phi_types_equal(result.type, value.type))
+            return false;
+        const Block& definition = fn.blocks[value.def_block.id];
+        if (definition.insts == nullptr || value.def_inst >= definition.inst_count ||
+            definition.insts[value.def_inst].result != kId ||
+            !verify_phi_dominates(fn, value.def_block, inst.imm.block_targets[i]))
+            return false;
+    }
+    return true;
+}
+
 inline VerifyResult verify_function(const Function* fn,
                                     u32 function_index = 0,
                                     VerifyOptions options = {}) {
@@ -761,6 +883,58 @@ inline VerifyResult verify_function(const Function* fn,
         }
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const Instruction& inst = block.insts[ii];
+            if (inst.op == Opcode::Phi && !verify_phi(*fn, bi, ii))
+                return verify_fail(summary, VerifyIssueCode::InvalidPhi, function_index, bi, ii);
+            if (inst.op == Opcode::WsForward || inst.op == Opcode::WsClose) {
+                const auto kExactType = [&](ValueId id, TypeKind kind) {
+                    if (id == kNoValue || id.id >= fn->value_count || !fn->values) return false;
+                    const Type* type = fn->values[id.id].type;
+                    return type && type->kind == kind && !type->inner && !type->struct_def;
+                };
+                const bool kForward = inst.op == Opcode::WsForward;
+                if (inst.operand_count != (kForward ? 1u : 2u) || inst.extra_operands ||
+                    !kExactType(inst.result, TypeKind::I32) ||
+                    !kExactType(inst.operands[0], kForward ? TypeKind::Str : TypeKind::I32) ||
+                    (kForward ? inst.imm.i32_val != 1 && inst.imm.i32_val != 2
+                              : !kExactType(inst.operands[1], TypeKind::Str)))
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidWsOutput, function_index, bi, ii);
+            }
+            if (inst.op == Opcode::WsMessageField) {
+                const u32 kField = static_cast<u32>(inst.imm.i32_val);
+                const auto kFieldId = static_cast<WsMessageFieldId>(kField);
+                const bool kBool = ws_message_field_is_bool(kFieldId);
+                const TypeKind kExpected = ws_message_field_is_string(kFieldId) ? TypeKind::Str
+                                           : kFieldId == WsMessageFieldId::ConnectionRemoteAddr
+                                               ? TypeKind::IP
+                                           : kBool ? TypeKind::Bool
+                                                   : TypeKind::I32;
+                const Type* type = inst.result != kNoValue && inst.result.id < fn->value_count &&
+                                           fn->values != nullptr
+                                       ? fn->values[inst.result.id].type
+                                       : nullptr;
+                if (!ws_message_field_valid(kField) || inst.operand_count != 0 || type == nullptr ||
+                    type->kind != kExpected || type->inner != nullptr ||
+                    type->struct_def != nullptr)
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidWsMessageField, function_index, bi, ii);
+            }
+            if (!valid_string_instruction(*fn, inst))
+                return verify_fail(
+                    summary, VerifyIssueCode::InvalidStringOperation, function_index, bi, ii);
+            if (inst.op == Opcode::StrLength) {
+                const auto kExactType = [&](ValueId id, TypeKind kind) {
+                    if (id == kNoValue || id.id >= fn->value_count || fn->values == nullptr)
+                        return false;
+                    const Type* type = fn->values[id.id].type;
+                    return type != nullptr && type->kind == kind && type->inner == nullptr &&
+                           type->struct_def == nullptr;
+                };
+                if (inst.operand_count != 1 || !kExactType(inst.result, TypeKind::I32) ||
+                    !kExactType(inst.operand(0), TypeKind::Str))
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidStrLength, function_index, bi, ii);
+            }
             if (inst.op != Opcode::JwtClaimsValidWithLifetime) continue;
             auto exact_type = [&](ValueId id, TypeKind kind) {
                 if (id == kNoValue || id.id >= fn->value_count || fn->values == nullptr)
@@ -1641,6 +1815,16 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidPasswordPrefix";
         case VerifyIssueCode::InvalidJwtClaimsLifetime:
             return "InvalidJwtClaimsLifetime";
+        case VerifyIssueCode::InvalidPhi:
+            return "InvalidPhi";
+        case VerifyIssueCode::InvalidWsOutput:
+            return "InvalidWsOutput";
+        case VerifyIssueCode::InvalidWsMessageField:
+            return "InvalidWsMessageField";
+        case VerifyIssueCode::InvalidStringOperation:
+            return "InvalidStringOperation";
+        case VerifyIssueCode::InvalidStrLength:
+            return "InvalidStrLength";
     }
     return "Unknown";
 }

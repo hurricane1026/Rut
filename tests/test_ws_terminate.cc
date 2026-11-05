@@ -9,8 +9,61 @@
 #include "test.h"
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 using namespace rut;
+
+TEST(ws_terminate, json_string_scanner_is_synchronous_bounded_and_recovers) {
+    using Result = WsJsonStringScanResult;
+    struct Probe {
+        u32 calls = 0;
+        Str expected;
+        Result result = Result::Match;
+        bool correct = true;
+    };
+    Probe probe{0, {"a\0\xe2\x82\xac", 5}, Result::Match};
+    auto scan = [](void* context, Str decoded) -> Result {
+        auto& p = *static_cast<Probe*>(context);
+        ++p.calls;
+        p.correct &= decoded.eq(p.expected);
+        return p.result;
+    };
+    const char* payload = R"({"a/b":{"\u0000":"a\u0000\u20ac"}})";
+    const Str path{"/a~1b/\0", 7};
+    auto inspect = [&](const char* text, u64 len, Str at) {
+        return ws_json_scan_string_at_path(
+            reinterpret_cast<const u8*>(text), len, at, scan, &probe);
+    };
+    CHECK_EQ(inspect(payload, strlen(payload), path), Result::Match);
+    CHECK_EQ(probe.calls, 1u);
+    probe.result = Result::NoMatch;
+    CHECK_EQ(inspect(payload, strlen(payload), path), Result::NoMatch);
+    probe.result = Result::Error;
+    CHECK_EQ(inspect(payload, strlen(payload), path), Result::Error);
+    const char* invalid[] = {
+        "{", "{}", "null", "123", "false", "[]", "\"\\ud800\"", "{\"x\":1,\"x\":2}"};
+    for (const char* bad : invalid) {
+        CHECK_EQ(inspect(bad, strlen(bad), path), Result::Error);
+    }
+    CHECK_EQ(inspect(payload, strlen(payload), {nullptr, 1}), Result::Error);
+    CHECK_EQ(inspect(payload, strlen(payload), {"/x", json::kMaxBytes + 1}), Result::Error);
+    CHECK_EQ(inspect(nullptr, 0x100000001ULL, path), Result::Error);
+    CHECK_EQ(inspect(reinterpret_cast<const char*>(1), 0x100000001ULL, path), Result::Error);
+    CHECK_EQ(ws_json_scan_string_at_path(
+                 reinterpret_cast<const u8*>(payload), strlen(payload), path, nullptr, &probe),
+             Result::Error);
+    CHECK_EQ(probe.calls, 3u);
+    char oversized[json::kMaxBytes + 1]{};
+    CHECK_EQ(inspect(oversized, sizeof(oversized), {}), Result::Error);
+    probe.expected = {};
+    probe.result = Result::Match;
+    CHECK_EQ(inspect("\"\"", 2, {}), Result::Match);
+    CHECK_EQ(probe.calls, 4u);
+    probe.expected = {"a\0\xe2\x82\xac", 5};
+    CHECK_EQ(inspect(payload, strlen(payload), path), Result::Match);
+    CHECK_EQ(probe.calls, 5u);
+    CHECK(probe.correct);
+}
 
 TEST(ws_terminate, json_payload_validation_bounds_and_recovery) {
     auto valid = [](const char* text, u64 len) {
@@ -1257,6 +1310,232 @@ TEST(ws_terminate, fixed_text_rewrite_fails_closed_on_invalid_output) {
     }
 }
 
+TEST(ws_terminate, borrowed_binary_copies_payload_for_default_and_branch_recipes) {
+    const Str payloads[] = {{}, {"A\0B", 3}, {"\xc3\xa9", 2}, {"\0\xff", 2}};
+    for (bool masked : kMaskDirections) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (Str bytes : payloads) {
+                for (WsFrameAction action :
+                     {WsFrameAction::ForwardText, WsFrameAction::ForwardTextPolicy0}) {
+                    auto st = make_state(masked);
+                    st.forward_text = {{}, {}, {}, WsTextSource::MessageBytes};
+                    const WsTextRewrite branch = st.forward_text;
+                    st.forward_texts = &branch;
+                    st.forward_text_count = 1;
+                    Recorder r;
+                    r.verdict = action;
+                    u8 in[32], out[32], msg[32], decoded[32];
+                    const u32 n = build(
+                        in, op, true, masked, reinterpret_cast<const u8*>(bytes.ptr), bytes.len);
+                    u32 used = 0, produced = 0;
+                    const auto status = ws_inspect(st,
+                                                   in,
+                                                   n,
+                                                   out,
+                                                   sizeof(out),
+                                                   msg,
+                                                   sizeof(msg),
+                                                   record,
+                                                   &r,
+                                                   &used,
+                                                   &produced);
+                    if (op == WsOpcode::Text && !ws_valid_text_payload(bytes)) {
+                        CHECK(status == WsInspectStatus::Error);
+                        CHECK_EQ(r.calls, 0);
+                        CHECK_EQ(produced, 0u);
+                        continue;
+                    }
+                    REQUIRE(status == WsInspectStatus::Ok);
+                    CHECK_EQ(used, n);
+                    CHECK_EQ(r.calls, 1);
+                    CHECK_EQ(r.last_len, bytes.len);
+                    CHECK_EQ(r.last_from_client, masked);
+                    memset(in, 0xee, sizeof(in));
+                    memset(msg, 0xee, sizeof(msg));
+                    WsFrameHeader h{};
+                    REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+                    CHECK(h.opcode == WsOpcode::Binary);
+                    CHECK(h.fin);
+                    CHECK_EQ(h.payload_len, bytes.len);
+                    if (bytes.len) CHECK(memcmp(decoded, bytes.ptr, bytes.len) == 0);
+                }
+            }
+        }
+    }
+}
+
+TEST(ws_terminate, borrowed_binary_reassembles_partial_frames_and_relays_controls) {
+    for (bool masked : kMaskDirections) {
+        auto st = make_state(masked);
+        st.forward_text = {{}, {}, {}, WsTextSource::MessageBytes};
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        u8 in[64], out[64], msg[64], decoded[64];
+        const u8 first[] = {'A'}, ping[] = {'P'}, last[] = {0, 0xc3, 0xa9};
+        const u32 fragment = build(in, WsOpcode::Text, false, masked, first, sizeof(first));
+        const u32 control = build(in + fragment, WsOpcode::Ping, true, masked, ping, sizeof(ping));
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           fragment + control,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, fragment + control);
+        CHECK_EQ(r.calls, 0);
+        WsFrameHeader h{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(h.opcode == WsOpcode::Ping);
+        CHECK_EQ(decoded[0], 'P');
+        const u32 n = build(in, WsOpcode::Continuation, true, masked, last, sizeof(last));
+        const u32 split = n - 2;
+        REQUIRE(
+            ws_inspect(
+                st, in, split, out, sizeof(out), msg, sizeof(msg), record, &r, &used, &produced) ==
+            WsInspectStatus::Ok);
+        CHECK_EQ(used, split);
+        CHECK_EQ(produced, 0u);
+        CHECK_EQ(r.calls, 0);
+        CHECK(st.partial_data_frame);
+        REQUIRE(ws_inspect(st,
+                           in + split,
+                           n - split,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, n - split);
+        CHECK_EQ(r.calls, 1);
+        CHECK_FALSE(st.partial_data_frame);
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(h.opcode == WsOpcode::Binary);
+        CHECK_EQ(h.payload_len, 4u);
+        CHECK(memcmp(decoded, "A\0\xc3\xa9", 4) == 0);
+    }
+}
+
+TEST(ws_terminate, borrowed_binary_waits_for_output_drain_without_repeating_handler) {
+    for (bool masked : kMaskDirections) {
+        auto st = make_state(masked);
+        st.forward_text = {{}, {}, {}, WsTextSource::MessageBytes};
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        const u8 bytes[] = {0xff, 0, 1, 2, 3, 4, 5, 6};
+        u8 in[64], out[16], msg[32], decoded[32];
+        const u32 one = build(in, WsOpcode::Binary, true, masked, bytes, sizeof(bytes));
+        const u32 two = build(in + one, WsOpcode::Binary, true, masked, bytes, sizeof(bytes));
+        u32 used = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           one + two,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, one);
+        CHECK_EQ(r.calls, 1);
+        WsFrameHeader h{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(h.opcode == WsOpcode::Binary);
+        CHECK(memcmp(decoded, bytes, sizeof(bytes)) == 0);
+        REQUIRE(ws_inspect(st,
+                           in + one,
+                           two,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           record,
+                           &r,
+                           &used,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(used, two);
+        CHECK_EQ(r.calls, 2);
+        REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+        CHECK(memcmp(decoded, bytes, sizeof(bytes)) == 0);
+    }
+}
+
+TEST(ws_terminate, borrowed_binary_checks_metadata_capacity_and_output_bounds) {
+    const WsTextRewrite invalid[] = {{{"x", 1}, {}, {}, WsTextSource::MessageBytes},
+                                     {{}, {"x", 1}, {}, WsTextSource::MessageBytes},
+                                     {{}, {}, {"/x", 2}, WsTextSource::MessageBytes},
+                                     {{nullptr, 1}, {}, {}, WsTextSource::MessageBytes},
+                                     {{}, {}, {}, static_cast<WsTextSource>(255)}};
+    for (const auto& recipe : invalid) {
+        CHECK_FALSE(ws_valid_text_rewrite(recipe, kWsTerminateMessageCapacity));
+        auto st = make_state(false);
+        st.forward_text = recipe;
+        Recorder r;
+        r.verdict = WsFrameAction::ForwardText;
+        u8 in[] = {0x82, 0}, out[16], msg[16];
+        u32 used = 0, produced = 0;
+        CHECK(ws_inspect(st,
+                         in,
+                         sizeof(in),
+                         out,
+                         sizeof(out),
+                         msg,
+                         sizeof(msg),
+                         record,
+                         &r,
+                         &used,
+                         &produced) == WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
+    }
+    for (bool masked : kMaskDirections) {
+        u8 bytes[kWsTerminateMessageCapacity], in[SlicePool::kSliceSize];
+        u8 out[SlicePool::kSliceSize], msg[sizeof(bytes)], decoded[sizeof(bytes)];
+        memset(bytes, 0xff, sizeof(bytes));
+        const u32 n = build(in, WsOpcode::Binary, true, masked, bytes, sizeof(bytes));
+        for (u32 scenario = 0; scenario < 4; ++scenario) {
+            auto st = make_state(masked);
+            st.max_message_size = scenario == 1 ? sizeof(bytes) - 1 : sizeof(bytes);
+            st.forward_text = {{}, {}, {}, WsTextSource::MessageBytes};
+            Recorder r;
+            r.verdict = WsFrameAction::ForwardText;
+            u32 used = 0, produced = 0;
+            const auto status = ws_inspect(st,
+                                           in,
+                                           n,
+                                           out,
+                                           scenario == 2 ? n - 1 : sizeof(out),
+                                           msg,
+                                           scenario == 3 ? sizeof(msg) - 1 : sizeof(msg),
+                                           record,
+                                           &r,
+                                           &used,
+                                           &produced);
+            if (scenario) {
+                CHECK(status == WsInspectStatus::Error);
+                CHECK_EQ(produced, 0u);
+                CHECK_EQ(r.calls, scenario == 2 ? 1 : 0);
+            } else {
+                REQUIRE(status == WsInspectStatus::Ok);
+                CHECK_EQ(used, n);
+                WsFrameHeader h{};
+                REQUIRE_EQ(parse_one(out, produced, masked, &h, decoded), produced);
+                CHECK(h.opcode == WsOpcode::Binary);
+                CHECK_EQ(h.payload_len, sizeof(bytes));
+                CHECK(memcmp(decoded, bytes, sizeof(bytes)) == 0);
+            }
+        }
+    }
+}
+
 TEST(ws_terminate, binary_replacement_single_slice_limit_and_invalid_input) {
     char bytes[kWsTerminateMessageCapacity];
     memset(bytes, 0xff, sizeof(bytes));
@@ -2037,7 +2316,7 @@ TEST(ws_terminate, handler_close_reason_and_echo_serialize_both_roles) {
         CHECK_EQ(payload[0], 3u);
         CHECK_EQ(payload[1], 240u);
         CHECK(memcmp(payload + 2, reason, sizeof(reason)) == 0);
-        CHECK(st.echo_close_reason.eq(st.close_reason));
+        CHECK(st.echo_close_reason().eq(st.close_reason));
         u64 rng = 0;
         produced = ws_emit_close_frame(
             out, sizeof(out), !masked, rng, st.echo_close_code, st.close_reason);
@@ -2084,7 +2363,7 @@ TEST(ws_terminate, branch_close_policies_select_code_reason_and_echo) {
                 CHECK(memcmp(payload + 2, policies[index].reason.ptr, policies[index].reason.len) ==
                       0);
             CHECK_EQ(st.echo_close_code, policies[index].code);
-            CHECK(st.echo_close_reason.eq(policies[index].reason));
+            CHECK(st.echo_close_reason().eq(policies[index].reason));
         }
     }
 }
@@ -2263,33 +2542,257 @@ TEST(ws_terminate, handler_close_tiny_message_keeps_code_when_room) {
     CHECK_EQ((static_cast<u32>(pl[0]) << 8) | pl[1], 1008u);
 }
 
-// A peer-sent Close leaves the echo at 1000 (unchanged) even when the route configured a
-// different message.close(code) — the peer's own code is relayed verbatim on the forward leg.
-TEST(ws_terminate, peer_close_echo_stays_1000) {
-    WsInspector st = make_state(false);
-    st.close_code = 1008;
-    st.close_reason = {"policy", 6};
-    st.echo_close_reason =
-        st.close_reason;  // would only apply to a HANDLER close, not this peer close
-    Recorder r;
-    u8 in[64];
-    const u8 body[] = {0x03, 0xF1};  // 1009 Too Big, from the peer
-    u32 in_len = build(in, WsOpcode::Close, true, false, body, 2);
+TEST(ws_terminate, peer_close_reply_owns_exact_payload_in_both_roles) {
+    for (bool masked : kMaskDirections) {
+        constexpr u32 kPayloadLengths[] = {0, 2, kWsMaxControlPayload};
+        for (u32 body_len : kPayloadLengths) {
+            const bool kNoStatus = body_len == 0;
+            char reason[kWsMaxCloseReasonBytes];
+            memset(reason, 'r', sizeof(reason));
+            reason[0] = 0;
+            reason[120] = static_cast<char>(0xe2);
+            reason[121] = static_cast<char>(0x82);
+            reason[122] = static_cast<char>(0xac);
+            u8 body[kWsMaxControlPayload] = {0x03, 0xf1};  // 1009, distinct from route policy
+            memcpy(body + 2, reason, sizeof(reason));
+            u8 in[256], out[256], mbuf[64], decoded[kWsMaxControlPayload];
+            const u32 in_len = build(in, WsOpcode::Close, true, masked, body, body_len);
+            for (u32 split = 0; split < in_len; ++split) {
+                WsInspector st = make_state(masked);
+                st.close_code = 1008;
+                st.close_reason = lit_str("policy");
+                REQUIRE(st.set_echo_close_reason(st.close_reason));
+                Recorder r;
+                u32 consumed = 0, produced = 0;
+                REQUIRE(ws_inspect(st,
+                                   in,
+                                   split,
+                                   out,
+                                   sizeof(out),
+                                   mbuf,
+                                   sizeof(mbuf),
+                                   record,
+                                   &r,
+                                   &consumed,
+                                   &produced) == WsInspectStatus::Ok);
+                CHECK_EQ(consumed, 0u);  // incomplete controls stay in the receive buffer
+                CHECK_EQ(produced, 0u);
+                CHECK_FALSE(st.received_close);
+                REQUIRE(ws_inspect(st,
+                                   in,
+                                   in_len,
+                                   out,
+                                   sizeof(out),
+                                   mbuf,
+                                   sizeof(mbuf),
+                                   record,
+                                   &r,
+                                   &consumed,
+                                   &produced) == WsInspectStatus::Close);
+                CHECK_EQ(consumed, in_len);
+                CHECK_EQ(r.calls, 0);
+                CHECK(st.received_close);
+                CHECK_EQ(st.echo_close_code, kNoStatus ? 1005u : 1009u);
+                WsFrameHeader header;
+                REQUIRE_EQ(parse_one(out, produced, masked, &header, decoded), produced);
+                CHECK_EQ(header.payload_len, body_len);
+                CHECK(memcmp(decoded, body, body_len) == 0);
+                WsClosePayload owned;
+                REQUIRE(owned.assign(st.echo_close_code, st.echo_close_reason()));
+                WsClosePayload copied = owned;
+                owned = {};
+                st.reset();
+                memset(st.echo_close_storage, 'x', sizeof(st.echo_close_storage));
+                CHECK_FALSE(st.received_close);
+                CHECK_EQ(st.echo_close_code, 1000u);
+                CHECK_EQ(copied.code, kNoStatus ? 1005u : 1009u);
+                CHECK(copied.reason().eq(kNoStatus ? Str{} : Str{reason, body_len - 2}));
+                u64 rng = 0;
+                produced = ws_emit_close_payload(out, sizeof(out), !masked, rng, copied);
+                REQUIRE(produced > 0);
+                REQUIRE_EQ(parse_one(out, produced, !masked, &header, decoded), produced);
+                CHECK_EQ(header.payload_len, body_len);
+                CHECK(memcmp(decoded, body, body_len) == 0);
+                CHECK_EQ(ws_emit_close_payload(out, produced - 1, !masked, rng, copied), 0u);
+            }
+        }
+    }
+}
 
-    u8 out[64], mbuf[64];
-    u32 consumed = 0, produced = 0;
-    WsInspectStatus s = ws_inspect(
-        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
-    CHECK(s == WsInspectStatus::Close);
-    CHECK_EQ(r.calls, 0);  // control frames never reach the handler
-    CHECK(st.echo_close_reason.empty());
-    CHECK_EQ(st.echo_close_code, 1000u);  // echo unchanged by the route's close_code
-    // The peer's 1009 was forwarded verbatim.
-    WsFrameHeader h;
-    u8 pl[8];
-    CHECK(parse_one(out, produced, false, &h, pl) == produced);
-    CHECK(h.opcode == WsOpcode::Close);
-    CHECK_EQ((static_cast<u32>(pl[0]) << 8) | pl[1], 1009u);
+TEST(ws_terminate, close_payload_rejects_invalid_status_reason_and_forged_metadata) {
+    WsClosePayload payload;
+    REQUIRE(payload.assign(1008, lit_str("keep")));
+    const u16 invalid[] = {0, 999, 1004, 1006, 1015, 2000, 5000};
+    for (u16 code : invalid) CHECK_FALSE(payload.assign(code, {}));
+    CHECK_FALSE(payload.assign(1005, lit_str("no status cannot carry a reason")));
+    CHECK_FALSE(payload.assign(1000, {nullptr, 1}));
+    const char bad[] = {static_cast<char>(0xff)};
+    CHECK_FALSE(payload.assign(1000, {bad, sizeof(bad)}));
+    char oversized[kWsMaxCloseReasonBytes + 1]{};
+    CHECK_FALSE(payload.assign(1000, {oversized, sizeof(oversized)}));
+    CHECK_EQ(payload.code, 1008u);
+    CHECK(payload.reason().eq(lit_str("keep")));  // failed assignment cannot corrupt prior state
+    u8 out[256];
+    u64 rng = 0;
+    CHECK_EQ(ws_emit_close_frame(out, sizeof(out), false, rng, 1005), 0u);
+    payload.code = 1005;
+    CHECK_EQ(ws_emit_close_payload(out, sizeof(out), false, rng, payload), 0u);
+    payload.code = 1000;
+    payload.reason_len = 255;
+    CHECK_EQ(ws_emit_close_payload(out, sizeof(out), true, rng, payload), 0u);
+    REQUIRE(payload.assign(1005, {}));
+    CHECK_EQ(ws_emit_close_payload(out, sizeof(out), false, rng, payload), 2u);
+    CHECK_EQ(out[0], 0x88u);
+    CHECK_EQ(out[1], 0u);  // local 1005 is represented by no status bytes on wire
+}
+
+TEST(ws_terminate, closing_reader_handles_fragmented_data_controls_and_split_close) {
+    for (bool masked : kMaskDirections) {
+        u8 wire[256];
+        const u8 first[] = {'a', 'b', 'c'}, last[] = {'d', 'e', 'f'};
+        const u8 ping[] = {'p', 0, 'q'};
+        const u8 close[] = {3, 241, 'w', 'h', 'y'};
+        u32 length = build(wire, WsOpcode::Binary, false, masked, first, sizeof(first));
+        length += build(wire + length, WsOpcode::Ping, true, masked, ping, sizeof(ping));
+        length += build(wire + length, WsOpcode::Continuation, true, masked, last, sizeof(last));
+        length += build(wire + length, WsOpcode::Pong, true, masked, ping, sizeof(ping));
+        length += build(wire + length, WsOpcode::Close, true, masked, close, sizeof(close));
+        for (u32 chunk_size = 1; chunk_size <= length; ++chunk_size) {
+            auto st = make_state(masked);
+            st.max_message_size = 128;
+            u8 buffered[256], control[kWsMaxControlPayload], pong[256], decoded[128];
+            u32 source = 0, used = 0, pings = 0;
+            bool closed = false;
+            while (source < length && !closed) {
+                const u32 take = length - source < chunk_size ? length - source : chunk_size;
+                memcpy(buffered + used, wire + source, take);
+                used += take;
+                source += take;
+                for (;;) {
+                    u32 consumed = 0, ping_len = 0;
+                    const WsClosingRead status =
+                        ws_read_closing(st, buffered, used, control, &ping_len, &consumed);
+                    REQUIRE(status != WsClosingRead::Error);
+                    REQUIRE(consumed <= used);
+                    memmove(buffered, buffered + consumed, used - consumed);
+                    used -= consumed;
+                    if (status == WsClosingRead::Ping) {
+                        ++pings;
+                        CHECK_EQ(ping_len, sizeof(ping));
+                        CHECK(memcmp(control, ping, sizeof(ping)) == 0);
+                        u64 rng = 0;
+                        const u32 n =
+                            ws_emit_pong_frame(pong, sizeof(pong), !masked, rng, control, ping_len);
+                        WsFrameHeader header;
+                        REQUIRE_EQ(parse_one(pong, n, !masked, &header, decoded), n);
+                        CHECK(header.opcode == WsOpcode::Pong);
+                        CHECK(memcmp(decoded, ping, sizeof(ping)) == 0);
+                        continue;
+                    }
+                    closed = status == WsClosingRead::Close;
+                    break;
+                }
+            }
+            CHECK(closed);
+            CHECK_EQ(pings, 1u);
+            CHECK(st.received_close);
+            CHECK_EQ(st.echo_close_code, 1009u);
+            memset(buffered, 'x', sizeof(buffered));
+            CHECK(st.echo_close_reason().eq(lit_str("why")));
+            u32 consumed = 1, ping_len = 1;
+            CHECK(ws_read_closing(st, buffered, sizeof(buffered), control, &ping_len, &consumed) ==
+                  WsClosingRead::Close);
+            CHECK_EQ(consumed, 0u);  // caller discards everything following the first Close
+            CHECK_EQ(ping_len, 0u);
+        }
+    }
+}
+
+TEST(ws_terminate, closing_reader_continues_a_partially_inspected_data_frame) {
+    for (bool masked : kMaskDirections) {
+        auto st = make_state(masked);
+        Recorder recorder;
+        u8 wire[128], output[256], message[64], ping[kWsMaxControlPayload];
+        const u8 data[] = {'a', 'b', 'c', 'd', 'e', 'f'};
+        u32 n = build(wire, WsOpcode::Text, false, masked, data, sizeof(data));
+        const u32 first_len = n - 3;
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           wire,
+                           first_len,
+                           output,
+                           sizeof(output),
+                           message,
+                           sizeof(message),
+                           record,
+                           &recorder,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        REQUIRE_EQ(consumed, first_len);
+        REQUIRE(st.partial_data_frame);
+        n += build(wire + n, WsOpcode::Continuation, true, masked, data, sizeof(data));
+        n += build(wire + n, WsOpcode::Close, true, masked, nullptr, 0);
+        u32 ping_len = 0;
+        REQUIRE(ws_read_closing(st, wire + first_len, n - first_len, ping, &ping_len, &consumed) ==
+                WsClosingRead::Close);
+        CHECK_EQ(consumed, n - first_len);
+        CHECK_EQ(recorder.calls, 0);
+        CHECK_EQ(st.echo_close_code, 1005u);
+        CHECK(st.received_close);
+        CHECK_FALSE(st.partial_data_frame);
+    }
+}
+
+TEST(ws_terminate, closing_reader_fails_invalid_controls_and_announced_data_bounds) {
+    for (bool masked : kMaskDirections) {
+        const u8 bad_bodies[][3] = {{3, 238, 0}, {3, 232, 255}};
+        for (const auto& body : bad_bodies) {
+            auto st = make_state(masked);
+            u8 wire[128], ping[kWsMaxControlPayload];
+            const u32 length = build(wire, WsOpcode::Close, true, masked, body, sizeof(body));
+            u32 consumed = 0, ping_len = 0;
+            CHECK(ws_read_closing(st, wire, length, ping, &ping_len, &consumed) ==
+                  WsClosingRead::Error);
+            CHECK_FALSE(st.received_close);
+        }
+        for (bool fragmented : kMaskDirections) {
+            auto st = make_state(masked);
+            st.max_message_size = 128;
+            st.assembler.in_fragmented = fragmented;
+            st.assembler.accumulated_len = fragmented ? 127 : 0;
+            u8 header[kWsMaxHeaderSize], ping[kWsMaxControlPayload];
+            const u32 n = ws_write_header(header,
+                                          fragmented ? WsOpcode::Continuation : WsOpcode::Binary,
+                                          true,
+                                          masked,
+                                          kKeyIn,
+                                          fragmented ? 2 : 129);
+            u32 consumed = 0, ping_len = 0;
+            CHECK(ws_read_closing(st, header, n, ping, &ping_len, &consumed) ==
+                  WsClosingRead::Error);
+            CHECK_EQ(consumed, 0u);  // reject using the header before reading its payload
+        }
+    }
+}
+
+TEST(ws_terminate, closing_reader_rejects_forged_partial_control_state_and_pong_bounds) {
+    auto st = make_state(false);
+    st.partial_data_frame = true;
+    st.partial_header = {};
+    st.partial_header.opcode = WsOpcode::Ping;
+    st.partial_header.payload_len = 1;
+    u8 input[1]{}, control[kWsMaxControlPayload], output[256];
+    u32 consumed = 0, ping_len = 0;
+    CHECK(ws_read_closing(st, input, sizeof(input), control, &ping_len, &consumed) ==
+          WsClosingRead::Error);
+    CHECK_EQ(consumed, 0u);
+    u64 rng = 0;
+    CHECK_EQ(ws_emit_pong_frame(output, sizeof(output), false, rng, nullptr, 1), 0u);
+    CHECK_EQ(ws_emit_pong_frame(output, sizeof(output), true, rng, control, 126), 0u);
+    CHECK_EQ(ws_emit_pong_frame(output, 1, false, rng, nullptr, 0), 0u);
+    CHECK_EQ(ws_emit_pong_frame(output, sizeof(output), false, rng, nullptr, 0), 2u);
+    CHECK_EQ(output[0], 0x8au);
+    CHECK_EQ(output[1], 0u);
 }
 
 // === Partial frames across chunks ===
@@ -2606,7 +3109,7 @@ TEST(ws_terminate, affix_rewrite_reassembles_preserves_control_and_masks_both_ro
     }
 }
 
-TEST(ws_terminate, affix_rewrite_rejects_binary_size_utf8_and_truncated_output) {
+TEST(ws_terminate, affix_rewrite_rejects_invalid_binary_text_size_utf8_and_truncated_output) {
     const char bad[] = {static_cast<char>(0xff)};
     for (u32 invalid = 0; invalid < 6; invalid++) {
         auto st = make_state(false);
@@ -2625,7 +3128,7 @@ TEST(ws_terminate, affix_rewrite_rejects_binary_size_utf8_and_truncated_output) 
         if (invalid == 5) {
             st.forward_text = {{oversized, sizeof(oversized)}, {}, {}, WsTextSource::MessageText};
         }
-        const u8 input[] = {'x'};
+        const u8 input[] = {invalid == 0 ? static_cast<u8>(0xff) : static_cast<u8>('x')};
         u8 in[32], out[128], msg[32];
         const u32 n = build(in, op, true, false, input, 1);
         u32 used = 0, produced = 0;
@@ -2706,5 +3209,211 @@ TEST(ws_terminate, affix_rewrite_accepts_single_slice_limit_both_roles) {
         CHECK(memcmp(payload, prefix, sizeof(prefix)) == 0);
         CHECK_EQ(payload[sizeof(prefix)], static_cast<u8>('x'));
         CHECK_EQ(payload[sizeof(prefix) + 1], static_cast<u8>('!'));
+    }
+}
+
+TEST(ws_terminate, dynamic_output_is_copied_and_backpressure_precedes_callback) {
+    struct Output {
+        WsHandlerOutput publication{};
+        char bytes[100]{};
+        u32 calls = 0;
+    };
+    auto callback = [](void* ctx, WsOpcode, const u8*, u64, bool) {
+        auto& output = *static_cast<Output*>(ctx);
+        ++output.calls;
+        memset(output.bytes, static_cast<int>('a' + output.calls), sizeof(output.bytes));
+        output.publication = {{output.bytes, sizeof(output.bytes)}, 1000, WsOpcode::Binary, true};
+        return WsFrameAction::ForwardDynamic;
+    };
+    for (bool masked : {false, true}) {
+        Output output{};
+        WsInspector st = make_state(masked);
+        st.max_message_size = 128;
+        st.forward_text.source = WsTextSource::Dynamic;
+        st.dynamic_output = &output.publication;
+        u8 in[64], out[512], msg[128], decoded[128];
+        u32 size = build(in, WsOpcode::Text, true, masked, reinterpret_cast<const u8*>("x"), 1);
+        size += build(in + size, WsOpcode::Text, true, masked, reinterpret_cast<const u8*>("y"), 1);
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           size,
+                           out,
+                           200,
+                           msg,
+                           sizeof(msg),
+                           callback,
+                           &output,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(output.calls, 1u);
+        CHECK_LT(consumed, size);
+        CHECK_FALSE(output.publication.ready);
+        WsFrameHeader header{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &header, decoded), produced);
+        CHECK(header.opcode == WsOpcode::Binary);
+        CHECK_EQ(header.payload_len, 100u);
+        CHECK_EQ(decoded[0], 'b');
+        const u32 first = consumed;
+        REQUIRE(ws_inspect(st,
+                           in + first,
+                           size - first,
+                           out,
+                           200,
+                           msg,
+                           sizeof(msg),
+                           callback,
+                           &output,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(output.calls, 2u);
+        CHECK_EQ(consumed, size - first);
+        REQUIRE_EQ(parse_one(out, produced, masked, &header, decoded), produced);
+        CHECK_EQ(decoded[0], 'c');
+        // Both outputs fit together. The second callback overwrites its scratch,
+        // but it cannot alter the already-serialized first message.
+        REQUIRE(ws_inspect(st,
+                           in,
+                           size,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           callback,
+                           &output,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        CHECK_EQ(output.calls, 4u);
+        const u32 first_frame = parse_one(out, produced, masked, &header, decoded);
+        REQUIRE(first_frame);
+        CHECK_EQ(decoded[0], 'd');
+        REQUIRE_EQ(parse_one(out + first_frame, produced - first_frame, masked, &header, decoded),
+                   produced - first_frame);
+        CHECK_EQ(decoded[0], 'e');
+    }
+}
+
+TEST(ws_terminate, dynamic_close_owns_echo_reason_after_callback_storage_retires) {
+    struct Output {
+        WsHandlerOutput publication{};
+        char reason[5] = {'a', 0, 'b', 'c', 'd'};
+    };
+    for (bool masked : {false, true}) {
+        Output output{};
+        WsInspector st = make_state(masked);
+        st.forward_text.source = WsTextSource::Dynamic;
+        st.dynamic_output = &output.publication;
+        auto callback = [](void* ctx, WsOpcode, const u8*, u64, bool) {
+            auto& output = *static_cast<Output*>(ctx);
+            output.publication = {
+                {output.reason, sizeof(output.reason)}, 1008, WsOpcode::Close, true};
+            return WsFrameAction::CloseDynamic;
+        };
+        u8 in[32], out[160], msg[32], decoded[128];
+        const u32 size =
+            build(in, WsOpcode::Text, true, masked, reinterpret_cast<const u8*>("x"), 1);
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           in,
+                           size,
+                           out,
+                           sizeof(out),
+                           msg,
+                           sizeof(msg),
+                           callback,
+                           &output,
+                           &consumed,
+                           &produced) == WsInspectStatus::Close);
+        memset(output.reason, 'x', sizeof(output.reason));
+        output.publication = {};
+        CHECK_EQ(st.echo_close_code, 1008u);
+        CHECK(st.echo_close_reason().eq({"a\0bcd", 5}));
+        auto copied = st;
+        st.reset();
+        CHECK(copied.echo_close_reason().eq({"a\0bcd", 5}));
+        CHECK(st.echo_close_reason().empty());
+        WsFrameHeader header{};
+        REQUIRE_EQ(parse_one(out, produced, masked, &header, decoded), produced);
+        CHECK(header.opcode == WsOpcode::Close);
+        CHECK_EQ(header.payload_len, 7u);
+        CHECK_EQ(decoded[0], 3u);
+        CHECK_EQ(decoded[1], 240u);
+        CHECK(memcmp(decoded + 2, "a\0bcd", 5) == 0);
+    }
+}
+
+TEST(ws_terminate, dynamic_output_rejects_missing_stale_or_invalid_publications) {
+    for (u32 mode = 0; mode < 7; ++mode) {
+        struct Output {
+            WsHandlerOutput value{};
+            u32 mode;
+        } output{{}, mode};
+        WsInspector st = make_state(false);
+        st.max_message_size = 32;
+        st.forward_text.source = WsTextSource::Dynamic;
+        st.dynamic_output = &output.value;
+        output.value = {{"stale", 5}, 1000, WsOpcode::Text, true};
+        auto callback = [](void* ctx, WsOpcode, const u8*, u64, bool) {
+            auto& output = *static_cast<Output*>(ctx);
+            if (output.mode == 0) return WsFrameAction::ForwardDynamic;
+            output.value = {{"x", 1}, 1000, WsOpcode::Text, true};
+            if (output.mode == 1) output.value.payload = {"\xff", 1};
+            if (output.mode == 2) output.value.payload = {nullptr, 1};
+            if (output.mode == 3) output.value.payload.len = 33;
+            if (output.mode == 4) output.value.opcode = WsOpcode::Ping;
+            if (output.mode == 5) output.value.close_code = 1005;
+            if (output.mode == 6) output.value.payload.len = 124;
+            return output.mode >= 5 ? WsFrameAction::CloseDynamic : WsFrameAction::ForwardDynamic;
+        };
+        u8 in[32], out[160], msg[32];
+        const u32 size =
+            build(in, WsOpcode::Binary, true, false, reinterpret_cast<const u8*>("x"), 1);
+        u32 consumed = 0, produced = 0;
+        CHECK(ws_inspect(st,
+                         in,
+                         size,
+                         out,
+                         sizeof(out),
+                         msg,
+                         sizeof(msg),
+                         callback,
+                         &output,
+                         &consumed,
+                         &produced) == WsInspectStatus::Error);
+        CHECK_EQ(produced, 0u);
+    }
+    WsTextRewrite marker{};
+    marker.source = WsTextSource::Dynamic;
+    CHECK(ws_valid_text_rewrite(marker, 32));
+    marker.prefix = lit_str("");
+    CHECK_FALSE(ws_valid_text_rewrite(marker, 32));
+}
+
+TEST(ws_terminate, text_affixes_validate_and_retag_utf8_binary_input) {
+    for (bool masked : {false, true}) {
+        WsInspector st = make_state(masked);
+        st.forward_text = {{"<", 1}, {">", 1}, {}, WsTextSource::MessageText};
+        Recorder recorder;
+        recorder.verdict = WsFrameAction::ForwardText;
+        const u8 payload[] = {'a', 0, 0xe2, 0x82, 0xac};
+        u8 input[32], output[64], message[32], decoded[32];
+        const u32 size = build(input, WsOpcode::Binary, true, masked, payload, sizeof(payload));
+        u32 consumed = 0, produced = 0;
+        REQUIRE(ws_inspect(st,
+                           input,
+                           size,
+                           output,
+                           sizeof(output),
+                           message,
+                           sizeof(message),
+                           record,
+                           &recorder,
+                           &consumed,
+                           &produced) == WsInspectStatus::Ok);
+        WsFrameHeader header{};
+        REQUIRE_EQ(parse_one(output, produced, masked, &header, decoded), produced);
+        CHECK(header.opcode == WsOpcode::Text);
+        CHECK_EQ(header.payload_len, 7u);
+        CHECK(memcmp(decoded, "<a\0\xe2\x82\xac>", 7) == 0);
     }
 }

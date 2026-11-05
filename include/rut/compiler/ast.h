@@ -73,6 +73,7 @@ enum class AstStmtKind : u8 {
     // identifier; `then_stmt` = the parsed message-handler body block (reused like For).
     // The body's per-message verdicts (forward/drop/close) are a follow-up slice.
     WsTerminate,
+    ReturnVoid,  // callback-local bare return; currently lifecycle closures only
     If,
     Match,
     Block,
@@ -253,8 +254,13 @@ struct AstStatement {
     Str name{};
     bool bind_value = false;
     // WsTerminate only: the `maxMessageSize:` kwarg in bytes (`websocket(x, maxMessageSize: 8kb)`),
-    // 0 when omitted (the loader then uses the engine default); explicit values fit one slice.
-    // Carried to HirWsHandler.
+    // 0 when omitted (the loader then uses the engine default); explicit values fit bounded pool
+    // storage. Carried to HirWsHandler.
+    AstStatement* ws_open_body = nullptr;
+    AstStatement* ws_close_body = nullptr;
+    Str ws_open_parameter{};
+    Str ws_close_parameter{};
+    Str ws_parameter_name{};  // callback-scoped parameter, WsTerminate only
     u32 ws_max_message_size = 0;
     Str ws_subprotocol{};  // raw literal; null means omitted
     Span ws_subprotocol_span{};
@@ -1062,6 +1068,8 @@ private:
         if (stmt.has_type) rebase_type_ref(other, stmt.type);
         if (stmt.has_response_body) rebase_response_body(other, stmt.response_body);
         rebase_expr(other, stmt.expr);
+        rebase_stmt_ptr(other, stmt.ws_open_body);
+        rebase_stmt_ptr(other, stmt.ws_close_body);
         rebase_stmt_ptr(other, stmt.then_stmt);
         rebase_stmt_ptr(other, stmt.else_stmt);
         for (u32 i = 0; i < stmt.block_stmts.len; i++) {

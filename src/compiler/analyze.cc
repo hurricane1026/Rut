@@ -4,8 +4,12 @@
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
+#include "rut/common/ws_control_flow.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/ast.h"
+#include "rut/compiler/hir.h"
 #include "rut/compiler/lexer.h"
+#include "rut/compiler/node_pool.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/es256_policy.h"
 #include "rut/runtime/hash.h"
@@ -109,156 +113,8 @@ constexpr Str kReqHeaderMutationOrderDetail = lit_str(
     "req.set/add are currently supported only before guards/waits/for loops, or inside a "
     "selected match arm");
 #if RUT_ENABLE_WEBSOCKET
-constexpr Str kWsPreludeDetail = lit_str(
-    "WebSocket message routes allow only compile-time constant lets and bounded request guards "
-    "before websocket; effects are not executed");
-
-static const AstExpr* ws_prelude_runtime_expr(const AstExpr& expr, u32 depth = 0) {
-    // Keep pathological right-nested expressions from recursing without bound. Flat `+` chains
-    // are left-associated in the AST and are walked iteratively below, so this protects only
-    // genuinely nested syntax without imposing a node budget on ordinary constant expressions.
-    if (depth > 1024) return &expr;
-    const AstExpr* found = nullptr;
-    const AstExpr* current = &expr;
-    while (current != nullptr) {
-        if (current->kind == AstExprKind::Call || current->kind == AstExprKind::MethodCall ||
-            current->kind == AstExprKind::ReqHeader || current->kind == AstExprKind::ReqParam ||
-            current->kind == AstExprKind::ReqCookie || current->kind == AstExprKind::ReqQuery ||
-            current->kind == AstExprKind::ReqQueryString || current->kind == AstExprKind::Wait ||
-            (current->kind == AstExprKind::Ident && current->name.eq(lit_str("req")))) {
-            if (found == nullptr || current->span.start < found->span.start) found = current;
-        }
-        auto consider = [&](const AstExpr* child) {
-            if (child == nullptr) return;
-            const AstExpr* candidate = ws_prelude_runtime_expr(*child, depth + 1);
-            if (candidate != nullptr &&
-                (found == nullptr || candidate->span.start < found->span.start))
-                found = candidate;
-        };
-        consider(current->rhs);
-        for (u32 i = 0; i < current->args.len; i++) consider(current->args[i]);
-        for (u32 i = 0; i < current->field_inits.len; i++) consider(current->field_inits[i].value);
-        current = current->lhs;
-    }
-    return found;
-}
-
-static const AstExpr* ws_guard_disallowed_expr(const AstExpr& expr, u32 depth = 0) {
-    if (depth > 128) return &expr;
-    auto earlier = [](const AstExpr* current, const AstExpr* candidate) {
-        return candidate != nullptr &&
-                       (current == nullptr || candidate->span.start < current->span.start)
-                   ? candidate
-                   : current;
-    };
-    switch (expr.kind) {
-        case AstExprKind::BoolLit:
-        case AstExprKind::IntLit:
-        case AstExprKind::StrLit:
-        case AstExprKind::LitMethod:
-        case AstExprKind::Nil:
-        case AstExprKind::Ident:
-            return nullptr;
-        case AstExprKind::Field:
-            if (expr.lhs != nullptr && expr.lhs->kind == AstExprKind::Field &&
-                expr.lhs->lhs != nullptr && expr.lhs->lhs->kind == AstExprKind::Ident &&
-                expr.lhs->lhs->name.eq(lit_str("req")) && expr.lhs->name.eq(lit_str("params")) &&
-                expr.name.len != 0 && expr.rhs == nullptr && expr.args.len == 0)
-                return nullptr;
-            if (expr.lhs == nullptr || expr.lhs->kind != AstExprKind::Ident ||
-                !expr.lhs->name.eq(lit_str("req")) ||
-                !(expr.name.eq(lit_str("method")) || expr.name.eq(lit_str("path")) ||
-                  expr.name.eq(lit_str("pathOnly")) || expr.name.eq(lit_str("queryString")) ||
-                  expr.name.eq(lit_str("authorization")) || expr.name.eq(lit_str("host")) ||
-                  expr.name.eq(lit_str("userAgent")) || expr.name.eq(lit_str("origin")) ||
-                  expr.name.eq(lit_str("accept")) || expr.name.eq(lit_str("acceptLanguage")) ||
-                  expr.name.eq(lit_str("acceptEncoding")) ||
-                  expr.name.eq(lit_str("cacheControl")) || expr.name.eq(lit_str("contentType")) ||
-                  expr.name.eq(lit_str("ifModifiedSince")) || expr.name.eq(lit_str("referer")) ||
-                  expr.name.eq(lit_str("forwarded")) || expr.name.eq(lit_str("xForwardedFor")) ||
-                  expr.name.eq(lit_str("xForwardedProto")) || expr.name.eq(lit_str("xRealIp")) ||
-                  expr.name.eq(lit_str("xRequestId"))))
-                return &expr;
-            return nullptr;
-        case AstExprKind::MethodCall:
-            if (expr.lhs == nullptr || expr.args.len != 1 || expr.args[0] == nullptr) return &expr;
-            if (expr.name.eq(lit_str("or"))) {
-                const AstExpr& fallback = *expr.args[0];
-                if (fallback.kind != AstExprKind::BoolLit && fallback.kind != AstExprKind::IntLit &&
-                    fallback.kind != AstExprKind::StrLit && fallback.kind != AstExprKind::Nil &&
-                    fallback.kind != AstExprKind::LitMethod)
-                    return expr.args[0];
-                return ws_guard_disallowed_expr(*expr.lhs, depth + 1);
-            }
-            if (expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq(lit_str("req")) &&
-                (expr.name.eq(lit_str("header")) || expr.name.eq(lit_str("uniqueHeader")) ||
-                 expr.name.eq(lit_str("headerCount")) || expr.name.eq(lit_str("param")) ||
-                 expr.name.eq(lit_str("query")) || expr.name.eq(lit_str("cookie"))) &&
-                expr.args[0]->kind == AstExprKind::StrLit)
-                return nullptr;
-            return &expr;
-        case AstExprKind::Eq:
-        case AstExprKind::Lt:
-        case AstExprKind::Gt:
-        case AstExprKind::And:
-        case AstExprKind::Or:
-            break;
-        default:
-            return &expr;
-    }
-    const AstExpr* bad = nullptr;
-    if (expr.lhs != nullptr) bad = earlier(bad, ws_guard_disallowed_expr(*expr.lhs, depth + 1));
-    if (expr.rhs != nullptr) bad = earlier(bad, ws_guard_disallowed_expr(*expr.rhs, depth + 1));
-    for (u32 i = 0; i < expr.args.len; i++)
-        if (expr.args[i] != nullptr)
-            bad = earlier(bad, ws_guard_disallowed_expr(*expr.args[i], depth + 1));
-    for (u32 i = 0; i < expr.field_inits.len; i++)
-        if (expr.field_inits[i].value != nullptr)
-            bad = earlier(bad, ws_guard_disallowed_expr(*expr.field_inits[i].value, depth + 1));
-    return bad;
-}
-
-static bool ws_http_guard_expr_allowed(const HirExpr& expr, u32 depth = 0) {
-    if (depth > 128) return false;
-    switch (expr.kind) {
-        case HirExprKind::BoolLit:
-        case HirExprKind::IntLit:
-        case HirExprKind::StrLit:
-        case HirExprKind::ConstMethod:
-        case HirExprKind::Nil:
-        case HirExprKind::LocalRef:
-        case HirExprKind::ReqHeaderCount:
-        case HirExprKind::ReqUniqueHeader:
-        case HirExprKind::ReqHeader:
-        case HirExprKind::ReqParam:
-        case HirExprKind::ReqCookie:
-        case HirExprKind::ReqQuery:
-        case HirExprKind::ReqQueryString:
-        case HirExprKind::ReqTlsClientCertSha256:
-        case HirExprKind::ReqPath:
-        case HirExprKind::ReqPathOnly:
-        case HirExprKind::ReqMethod:
-            return expr.lhs == nullptr && expr.rhs == nullptr && expr.args.len == 0;
-        case HirExprKind::NoError:
-        case HirExprKind::HasValue:
-            return expr.lhs != nullptr && expr.rhs == nullptr && expr.args.len == 0 &&
-                   ws_http_guard_expr_allowed(*expr.lhs, depth + 1);
-        case HirExprKind::Eq:
-        case HirExprKind::Lt:
-        case HirExprKind::Gt:
-        case HirExprKind::Or:
-            return expr.lhs != nullptr && expr.rhs != nullptr &&
-                   ws_http_guard_expr_allowed(*expr.lhs, depth + 1) &&
-                   ws_http_guard_expr_allowed(*expr.rhs, depth + 1) && expr.args.len == 0;
-        case HirExprKind::IfElse:
-            return expr.lhs != nullptr && expr.rhs != nullptr && expr.args.len == 1 &&
-                   expr.args[0] != nullptr && ws_http_guard_expr_allowed(*expr.lhs, depth + 1) &&
-                   ws_http_guard_expr_allowed(*expr.rhs, depth + 1) &&
-                   ws_http_guard_expr_allowed(*expr.args[0], depth + 1);
-        default:
-            return false;
-    }
-}
+constexpr Str kWsTailDetail =
+    lit_str("a WebSocket message handler must be the route's final top-level statement");
 
 static bool ws_prelude_contains_terminate(const AstStatement* stmt, u32 depth = 0) {
     if (stmt == nullptr) return false;
@@ -409,9 +265,16 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
         case HirTypeKind::Str:
+        case HirTypeKind::Bytes:
+        case HirTypeKind::IP:
         case HirTypeKind::Json:
         case HirTypeKind::Generic:
         case HirTypeKind::Unknown:
+        case HirTypeKind::WebSocketMessage:
+        case HirTypeKind::WebSocketConnection:
+        case HirTypeKind::WebSocketClose:
+        case HirTypeKind::WebSocketMessageKind:
+        case HirTypeKind::WebSocketDirection:
             return true;
         case HirTypeKind::Struct:
             return struct_index != 0xffffffffu;
@@ -504,7 +367,8 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.is_concrete =
         type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::I64 ||
         type == HirTypeKind::Str || type == HirTypeKind::Json || type == HirTypeKind::Method ||
-        type == HirTypeKind::ByteSize || type == HirTypeKind::IP || type == HirTypeKind::Response;
+        type == HirTypeKind::ByteSize || type == HirTypeKind::IP || type == HirTypeKind::Response ||
+        is_ws_borrowed_type(type) || is_ws_enum_type(type) || type == HirTypeKind::Bytes;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -717,7 +581,10 @@ static bool hir_type_shape_satisfies_eq_constraint(const HirModule& mod,
         case HirTypeKind::I32:
         case HirTypeKind::I64:
         case HirTypeKind::Str:
+        case HirTypeKind::Bytes:
         case HirTypeKind::Method:
+        case HirTypeKind::WebSocketMessageKind:
+        case HirTypeKind::WebSocketDirection:
         case HirTypeKind::ByteSize:
         case HirTypeKind::IP:
             return true;
@@ -2133,9 +2000,18 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"bool", 4})) return HirTypeKind::Bool;
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
+    if (name.eq(lit_str("Bytes"))) return HirTypeKind::Bytes;
     if (name.eq({"Method", 6})) return HirTypeKind::Method;
+    if (name.eq(lit_str("IP"))) return HirTypeKind::IP;
     if (name.eq({"Json", 4})) return HirTypeKind::Json;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
+#if RUT_ENABLE_WEBSOCKET
+    if (name.eq(lit_str("WebSocketMessage"))) return HirTypeKind::WebSocketMessage;
+    if (name.eq(lit_str("WebSocketConnection"))) return HirTypeKind::WebSocketConnection;
+    if (name.eq(lit_str("WebSocketClose"))) return HirTypeKind::WebSocketClose;
+    if (name.eq(lit_str("WebSocketMessageKind"))) return HirTypeKind::WebSocketMessageKind;
+    if (name.eq(lit_str("WebSocketDirection"))) return HirTypeKind::WebSocketDirection;
+#endif
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
         variant_index = idx;
@@ -3626,15 +3502,87 @@ static FrontendResult<HirExpr> analyze_array_iter_expr(const AstExpr& expr,
                                                        const HirModule& mod,
                                                        const HirLocal* locals,
                                                        u32 local_count);
-static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
-                                                         HirRoute* route,
-                                                         const HirModule& mod,
-                                                         const HirExpr* args,
-                                                         u32 arg_count,
-                                                         const GenericBinding* generic_bindings,
-                                                         u32 generic_binding_count);
+// Rebind lexical initializer identities while copying a function body into
+// another owning expression pool. Numeric local slots are not unique across
+// nested helper invocations.
+struct ExprValueBinding {
+    const HirExpr* source = nullptr;
+    HirExpr* target = nullptr;
+    const ExprValueBinding* parent = nullptr;
+};
+
+static FrontendResult<HirExpr> instantiate_function_expr(
+    const HirExpr& expr,
+    HirRoute* route,
+    const HirModule& mod,
+    const HirExpr* args,
+    u32 arg_count,
+    const GenericBinding* generic_bindings,
+    u32 generic_binding_count,
+    const ExprValueBinding* bindings = nullptr);
 static FrontendResult<HirExpr> normalize_function_expr(
     const HirExpr& expr, HirFunction* fn, const HirLocal* locals, u32 local_count, u32 param_count);
+#if RUT_ENABLE_WEBSOCKET
+static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
+                                                  u32 depth = 0,
+                                                  bool validate_receivers = true,
+                                                  WsCallbackPhase phase = WsCallbackPhase::Message);
+static bool ws_infallible_binding(const HirExpr& expr, u32 depth);
+#endif
+#if RUT_ENABLE_WEBSOCKET
+struct WsOutputLiteralBounds {
+    u32 minimum = 0;
+    bool valid_utf8 = true;
+    bool complete = true;
+};
+
+// Follow only the produced String/Bytes value, not inputs to JSON/hash work.
+// Dynamic data retains runtime checks; literal Text components and a proven
+// minimum length retain the compile-time guarantees of the recipe path.
+static WsOutputLiteralBounds ws_output_literal_bounds(
+    const HirExpr& value, const HirLocal* locals, u32 count, u32& visits, u32 depth = 0) {
+    if (++visits > 4096 || depth > 128) return {0, true, false};
+    if (value.kind == HirExprKind::StrLit)
+        return {value.str_value.len, ws_valid_text_payload(value.str_value)};
+    if (value.kind == HirExprKind::BytesLit) return {value.str_value.len, true};
+    if (value.kind == HirExprKind::LocalRef) {
+        for (u32 i = 0; i < count; ++i)
+            if (locals[i].ref_index == value.local_index)
+                return ws_output_literal_bounds(locals[i].init, locals, count, visits, depth + 1);
+        return {};
+    }
+    if ((value.kind == HirExprKind::BoundValue || value.kind == HirExprKind::ValueOf) && value.lhs)
+        return ws_output_literal_bounds(*value.lhs, locals, count, visits, depth + 1);
+    if (value.kind == HirExprKind::LetIn && value.rhs)
+        return ws_output_literal_bounds(*value.rhs, locals, count, visits, depth + 1);
+    if (value.kind == HirExprKind::StringConcat && value.lhs && value.rhs) {
+        const auto kLhs = ws_output_literal_bounds(*value.lhs, locals, count, visits, depth + 1);
+        const auto kRhs = ws_output_literal_bounds(*value.rhs, locals, count, visits, depth + 1);
+        const u64 kSize = static_cast<u64>(kLhs.minimum) + kRhs.minimum;
+        return {kSize > 0xffffffffu ? 0xffffffffu : static_cast<u32>(kSize),
+                kLhs.valid_utf8 && kRhs.valid_utf8,
+                kLhs.complete && kRhs.complete};
+    }
+    if (value.kind == HirExprKind::IfElse && value.lhs && value.rhs && value.args.len == 1 &&
+        value.args[0]) {
+        ConstValue condition{};
+        if (const_eval_expr(*value.lhs, locals, count, &condition, 0) &&
+            condition.type == HirTypeKind::Bool)
+            return ws_output_literal_bounds(condition.bool_value ? *value.rhs : *value.args[0],
+                                            locals,
+                                            count,
+                                            visits,
+                                            depth + 1);
+        const auto kYes = ws_output_literal_bounds(*value.rhs, locals, count, visits, depth + 1);
+        const auto kNo = ws_output_literal_bounds(*value.args[0], locals, count, visits, depth + 1);
+        return {kYes.minimum < kNo.minimum ? kYes.minimum : kNo.minimum,
+                kYes.valid_utf8 && kNo.valid_utf8,
+                kYes.complete && kNo.complete};
+    }
+    return {};
+}
+#endif
+
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
                                                           HirRoute* scratch,
                                                           const HirModule& mod,
@@ -4008,6 +3956,37 @@ static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
     if (!lhs) return core::make_unexpected(lhs.error());
     auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
     if (!rhs) return core::make_unexpected(rhs.error());
+    if (expr.kind == AstExprKind::Add && lhs->type == HirTypeKind::Str &&
+        rhs->type == HirTypeKind::Str && !lhs->may_nil && !lhs->may_error && !rhs->may_nil &&
+        !rhs->may_error) {
+        if (lhs->kind == HirExprKind::StrLit && rhs->kind == HirExprKind::StrLit) {
+            if (rhs->str_value.len > 262144 || lhs->str_value.len > 262144 - rhs->str_value.len)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("String concatenation exceeds its byte budget"));
+            std::string text(lhs->str_value.ptr ? lhs->str_value.ptr : "", lhs->str_value.len);
+            if (rhs->str_value.len) text.append(rhs->str_value.ptr, rhs->str_value.len);
+            auto owned = intern_analysis_string(mod, std::move(text));
+            if (!owned) return core::make_unexpected(owned.error());
+            HirExpr literal{};
+            literal.kind = HirExprKind::StrLit;
+            literal.type = HirTypeKind::Str;
+            literal.span = expr.span;
+            literal.str_value = owned.value();
+            return literal;
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::StringConcat;
+        out.type = HirTypeKind::Str;
+        out.span = expr.span;
+        if (!route->exprs.push(lhs.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(rhs.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
     adopt_int_literal_type(&lhs.value(), &rhs.value());
     const bool int_typed = (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&
                            (rhs->type == HirTypeKind::I32 || rhs->type == HirTypeKind::I64);
@@ -5067,6 +5046,28 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (recv.may_nil || recv.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
+    if (recv.type == HirTypeKind::Str && expr.args.len == 1 &&
+        (expr.name.eq(lit_str("hasPrefix")) || expr.name.eq(lit_str("hasSuffix")) ||
+         expr.name.eq(lit_str("contains")))) {
+        auto needle = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!needle) return core::make_unexpected(needle.error());
+        if (needle->type != HirTypeKind::Str || needle->may_nil || needle->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        HirExpr out{};
+        out.kind = HirExprKind::StringPredicate;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        out.int_value = expr.name.eq(lit_str("hasPrefix"))   ? 0
+                        : expr.name.eq(lit_str("hasSuffix")) ? 1
+                                                             : 2;
+        if (!route->exprs.push(recv)) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(needle.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
     if (expr.name.eq({"matches", 7}) && recv.type == HirTypeKind::Str && expr.args.len == 1 &&
         expr.args[0]->kind == AstExprKind::RegexLit) {
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
@@ -5584,12 +5585,47 @@ static bool is_standard_error_field(Str field_name) {
            field_name.eq({"func", 4}) || field_name.eq({"line", 4});
 }
 
+// Bool and the two closed WebSocket domains have exactly two scalar cases.
+// Keep nominal types through analysis; MIR uses their existing scalar carrier.
+static bool is_match_pattern(const HirExpr& pattern) {
+    return pattern.kind == HirExprKind::BoolLit || pattern.kind == HirExprKind::IntLit ||
+           pattern.kind == HirExprKind::StrLit || pattern.kind == HirExprKind::VariantCase ||
+           (pattern.kind == HirExprKind::ConstWsCase && is_ws_enum_type(pattern.type) &&
+            pattern.int_value >= 0 && pattern.int_value <= 1);
+}
+static bool is_binary_match_case(const HirExpr& pattern) {
+    return pattern.kind == HirExprKind::BoolLit || pattern.kind == HirExprKind::ConstWsCase;
+}
+static bool binary_match_case_value(const HirExpr& pattern) {
+    return pattern.kind == HirExprKind::BoolLit ? pattern.bool_value : pattern.int_value != 0;
+}
+
 static FrontendResult<HirExpr> analyze_match_pattern(const AstExpr& pattern_expr,
                                                      const HirExpr& subject,
                                                      HirRoute* route,
                                                      const HirModule& mod,
                                                      const HirLocal* locals,
                                                      u32 local_count) {
+#if RUT_ENABLE_WEBSOCKET
+    if (pattern_expr.kind == AstExprKind::VariantCase && is_ws_enum_type(subject.type)) {
+        const bool kKind = subject.type == HirTypeKind::WebSocketMessageKind;
+        const Str kDomain = kKind ? lit_str("WebSocketMessageKind") : lit_str("WebSocketDirection");
+        if (pattern_expr.lhs || (pattern_expr.name.len && !pattern_expr.name.eq(kDomain)))
+            return frontend_error(FrontendError::UnsupportedSyntax, pattern_expr.span);
+        const bool kFirst =
+            pattern_expr.str_value.eq(kKind ? lit_str("text") : lit_str("clientToUpstream"));
+        const bool kSecond =
+            pattern_expr.str_value.eq(kKind ? lit_str("binary") : lit_str("upstreamToClient"));
+        if (!kFirst && !kSecond)
+            return frontend_error(FrontendError::UnsupportedSyntax, pattern_expr.span);
+        HirExpr result{};
+        result.kind = HirExprKind::ConstWsCase;
+        result.type = subject.type;
+        result.span = pattern_expr.span;
+        result.int_value = kFirst ? 0 : 1;
+        return result;
+    }
+#endif
     if (pattern_expr.kind == AstExprKind::VariantCase) {
         const bool subject_is_error_kind = subject.type != HirTypeKind::Variant &&
                                            subject.may_error &&
@@ -5698,13 +5734,215 @@ static u8 route_method_key_from_token(u8 token_type) {
     }
 }
 
+static constexpr i64 kWsLifecycleContinue = 255;
+
+static FrontendResult<HirExpr> ws_lifecycle_sequence(HirRoute& owner,
+                                                     const HirExpr& head,
+                                                     const HirExpr& tail,
+                                                     Span span) {
+    const auto kKeep = [&](const HirExpr& value) -> HirExpr* {
+        if (!owner.exprs.push(value)) return nullptr;
+        return &owner.exprs[owner.exprs.len - 1];
+    };
+    HirExpr* initializer = kKeep(head);
+    if (!initializer) return frontend_error(FrontendError::OutOfMemory, span);
+    HirExpr reference = head;
+    reference.kind = HirExprKind::BoundValue;
+    reference.lhs = initializer;
+    reference.rhs = nullptr;
+    reference.args.len = 0;
+    reference.field_inits.len = 0;
+    HirExpr code{};
+    code.kind = HirExprKind::IntLit;
+    code.type = HirTypeKind::I32;
+    code.int_value = kWsLifecycleContinue;
+    HirExpr test{};
+    test.kind = HirExprKind::Eq;
+    test.type = HirTypeKind::Bool;
+    test.span = span;
+    test.lhs = kKeep(reference);
+    test.rhs = kKeep(code);
+    if (!test.lhs || !test.rhs) return frontend_error(FrontendError::OutOfMemory, span);
+    HirExpr choice{};
+    choice.kind = HirExprKind::IfElse;
+    choice.type = HirTypeKind::I32;
+    choice.span = span;
+    choice.lhs = kKeep(test);
+    choice.rhs = kKeep(tail);
+    if (!choice.lhs || !choice.rhs || !choice.args.push(kKeep(reference)) || !choice.args[0])
+        return frontend_error(FrontendError::OutOfMemory, span);
+    HirExpr sequence{};
+    sequence.kind = HirExprKind::LetIn;
+    sequence.type = HirTypeKind::I32;
+    sequence.span = span;
+    sequence.lhs = initializer;
+    sequence.rhs = kKeep(choice);
+    if (!sequence.rhs) return frontend_error(FrontendError::OutOfMemory, span);
+    return sequence;
+}
+
+static bool uses_lexical_values(const HirRoute* route) {
+    return route != nullptr && (route->is_ws_callback || route->is_lexical_helper);
+}
+
+static FrontendResult<HirExpr> function_call_body(const HirFunction& fn,
+                                                  const HirRoute* route,
+                                                  Span span) {
+    const bool kLexical = uses_lexical_values(route);
+    const bool kStringBody = hir_has_string_construction(fn.body);
+    if (!kLexical && (!kStringBody || fn.lexical_body_index >= fn.exprs.len)) return fn.body;
+    if (fn.lexical_body_index >= fn.exprs.len)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              span,
+                              lit_str("helper requires lexical error/effect integration"));
+    return fn.exprs[fn.lexical_body_index];
+}
+
+// Only proven immutable computations may be substituted at multiple/zero uses.
+// Unknown operations conservatively retain their evaluation at the call site.
+static bool call_argument_needs_evaluation(const HirExpr& value, u32 depth = 0) {
+    if (depth > 128) return true;
+    if (value.kind == HirExprKind::BoundValue) return false;
+    switch (value.kind) {
+        case HirExprKind::BoolLit:
+        case HirExprKind::IntLit:
+        case HirExprKind::StrLit:
+        case HirExprKind::BytesLit:
+        case HirExprKind::ConstMethod:
+        case HirExprKind::ConstWsCase:
+        case HirExprKind::Nil:
+        case HirExprKind::Error:
+        case HirExprKind::LocalRef:
+        case HirExprKind::WsMessageField:
+        case HirExprKind::BytesCount:
+        case HirExprKind::Eq:
+        case HirExprKind::Lt:
+        case HirExprKind::Gt:
+        case HirExprKind::BitAnd:
+        case HirExprKind::BitOr:
+        case HirExprKind::BitXor:
+        case HirExprKind::BitShl:
+        case HirExprKind::BitShr:
+        case HirExprKind::Add:
+        case HirExprKind::Sub:
+        case HirExprKind::Mul:
+        case HirExprKind::Div:
+        case HirExprKind::Mod:
+        case HirExprKind::WidenI64:
+        case HirExprKind::MaxInt:
+        case HirExprKind::MinInt:
+        case HirExprKind::Or:
+        case HirExprKind::NoError:
+        case HirExprKind::HasValue:
+        case HirExprKind::ValueOf:
+        case HirExprKind::MissingOf:
+        case HirExprKind::Tuple:
+        case HirExprKind::TupleSlot:
+        case HirExprKind::StructInit:
+        case HirExprKind::Field:
+        case HirExprKind::VariantCase:
+        case HirExprKind::VariantTag:
+        case HirExprKind::IfElse:
+            break;
+        default:
+            return true;
+    }
+    if (value.lhs && call_argument_needs_evaluation(*value.lhs, depth + 1)) return true;
+    if (value.rhs && call_argument_needs_evaluation(*value.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && call_argument_needs_evaluation(*value.args[i], depth + 1)) return true;
+    for (u32 i = 0; i < value.field_inits.len; ++i)
+        if (value.field_inits[i].value &&
+            call_argument_needs_evaluation(*value.field_inits[i].value, depth + 1))
+            return true;
+    return false;
+}
+
+struct LexicalCallArguments {
+    HirRoute* route;
+    FixedVec<HirExpr*, AstExpr::kMaxArgs + 1> initializers;
+
+    FrontendResult<void> bind(HirExpr& value) {
+        if (route == nullptr ||
+            (!uses_lexical_values(route) && !hir_has_string_construction(value)))
+            return {};
+        const bool kEvaluated = call_argument_needs_evaluation(value);
+        if (is_ws_borrowed_type(value.type) && kEvaluated)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                value.span,
+                lit_str("a borrowed message alias cannot carry runtime initialization"));
+        if (is_ws_borrowed_type(value.type) || !kEvaluated) return {};
+        if (!route->exprs.push(value))
+            return frontend_error(FrontendError::OutOfMemory, value.span);
+        HirExpr* key = &route->exprs[route->exprs.len - 1];
+        if (!initializers.push(key)) return frontend_error(FrontendError::TooManyItems, value.span);
+        value.kind = HirExprKind::BoundValue;
+        value.lhs = key;
+        value.rhs = nullptr;
+        value.args.len = 0;
+        value.field_inits.len = 0;
+        return {};
+    }
+
+    FrontendResult<HirExpr> finish(HirExpr body) {
+        for (u32 i = initializers.len; i > 0; --i) {
+            if (!route->exprs.push(body))
+                return frontend_error(FrontendError::OutOfMemory, body.span);
+            body.kind = HirExprKind::LetIn;
+            body.lhs = initializers[i - 1];
+            body.rhs = &route->exprs[route->exprs.len - 1];
+            body.args.len = 0;
+            body.field_inits.len = 0;
+        }
+        return body;
+    }
+};
+
+static FrontendResult<HirExpr> inline_function_call(const HirFunction& fn,
+                                                    HirRoute* route,
+                                                    const HirModule& mod,
+                                                    const HirExpr* args,
+                                                    u32 arg_count,
+                                                    const GenericBinding* generic_bindings,
+                                                    u32 generic_binding_count,
+                                                    Span span,
+                                                    const ExprValueBinding* bindings = nullptr) {
+    if (arg_count > AstExpr::kMaxArgs) return frontend_error(FrontendError::TooManyItems, span);
+    HirExpr values[AstExpr::kMaxArgs]{};
+    LexicalCallArguments evaluated{route, {}};
+    for (u32 i = 0; i < arg_count; ++i) {
+        values[i] = args[i];
+        auto bound = evaluated.bind(values[i]);
+        if (!bound) return core::make_unexpected(bound.error());
+    }
+    auto body = function_call_body(fn, route, span);
+    if (!body) return core::make_unexpected(body.error());
+    auto result = instantiate_function_expr(body.value(),
+                                            route,
+                                            mod,
+                                            values,
+                                            arg_count,
+                                            generic_bindings,
+                                            generic_binding_count,
+                                            bindings);
+    if (!result) return core::make_unexpected(result.error());
+    return evaluated.finish(result.value());
+}
+
 static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          HirRoute* route,
                                                          const HirModule& mod,
                                                          const HirExpr* args,
                                                          u32 arg_count,
                                                          const GenericBinding* generic_bindings,
-                                                         u32 generic_binding_count) {
+                                                         u32 generic_binding_count,
+                                                         const ExprValueBinding* bindings) {
+    // Every instantiated tree needs the destination scope's owning node pool.
+    if (!route)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("helper instantiation requires an expression scope"));
     // Helper bodies analyze against a scratch route (empty path), so their
     // req.params / req.param accesses skip capture validation. Instantiation
     // targets the CONCRETE attached route — revalidate here so a helper
@@ -5727,6 +5965,46 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     out.field_inits.len = 0;
     out.args.len = 0;
 
+    if (expr.kind == HirExprKind::BoundValue) {
+        if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        for (const ExprValueBinding* entry = bindings; entry; entry = entry->parent) {
+            if (entry->source != expr.lhs || entry->target == nullptr) continue;
+            out.lhs = entry->target;
+            return out;
+        }
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    }
+    if (expr.kind == HirExprKind::LetIn) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto initializer = instantiate_function_expr(*expr.lhs,
+                                                     route,
+                                                     mod,
+                                                     args,
+                                                     arg_count,
+                                                     generic_bindings,
+                                                     generic_binding_count,
+                                                     bindings);
+        if (!initializer) return core::make_unexpected(initializer.error());
+        if (!route->exprs.push(initializer.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        HirExpr* key = &route->exprs[route->exprs.len - 1];
+        const ExprValueBinding kScoped{expr.lhs, key, bindings};
+        auto body = instantiate_function_expr(*expr.rhs,
+                                              route,
+                                              mod,
+                                              args,
+                                              arg_count,
+                                              generic_bindings,
+                                              generic_binding_count,
+                                              &kScoped);
+        if (!body) return core::make_unexpected(body.error());
+        if (!route->exprs.push(body.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = key;
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
     if (expr.kind == HirExprKind::LocalRef) {
         if (expr.local_index >= arg_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -5740,8 +6018,14 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
 
     if (expr.kind == HirExprKind::ProtocolCall) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto recv = instantiate_function_expr(
-            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto recv = instantiate_function_expr(*expr.lhs,
+                                              route,
+                                              mod,
+                                              args,
+                                              arg_count,
+                                              generic_bindings,
+                                              generic_binding_count,
+                                              bindings);
         if (!recv) return core::make_unexpected(recv.error());
         if (recv->type == HirTypeKind::Generic)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.str_value);
@@ -5763,6 +6047,13 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             function_index = req->function_index;
         }
         const auto& fn = mod.functions[function_index];
+        if (route != nullptr) route->uses_http_values |= fn.uses_http_values;
+        if (route != nullptr && route->is_ws_callback &&
+            (fn.uses_http_values || fn.has_non_response_statement_effect ||
+             fn.respond_guards.len != 0))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("message predicates require pure helpers"));
         for (u32 i = 0; i < fn.params.len; i++) {
             if (fn.params[i].type == HirTypeKind::Response)
                 return frontend_error(
@@ -5780,7 +6071,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                  args,
                                                  arg_count,
                                                  generic_bindings,
-                                                 generic_binding_count);
+                                                 generic_binding_count,
+                                                 bindings);
             if (!arg) return core::make_unexpected(arg.error());
             call_args[call_arg_count++] = arg.value();
         }
@@ -5812,8 +6104,15 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         }
         if (fn.respond_guards.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, fn.name);
-        auto inlined = instantiate_function_expr(
-            fn.body, route, mod, call_args, call_arg_count, impl_bindings, impl_binding_count);
+        auto inlined = inline_function_call(fn,
+                                            route,
+                                            mod,
+                                            call_args,
+                                            call_arg_count,
+                                            impl_bindings,
+                                            impl_binding_count,
+                                            expr.span,
+                                            bindings);
         if (!inlined) return core::make_unexpected(inlined.error());
         if (fn.return_type != HirTypeKind::Unknown &&
             (inlined->kind == HirExprKind::Nil || inlined->kind == HirExprKind::Error)) {
@@ -5880,8 +6179,14 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
 
     if (expr.kind == HirExprKind::TupleSlot) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto lhs = instantiate_function_expr(
-            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto lhs = instantiate_function_expr(*expr.lhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (lhs->type != HirTypeKind::Tuple)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -5904,16 +6209,28 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     if (expr.kind == HirExprKind::Or) {
         if (expr.lhs == nullptr || expr.rhs == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto lhs = instantiate_function_expr(
-            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto lhs = instantiate_function_expr(*expr.lhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!lhs->may_nil && !lhs->may_error) {
             HirExpr out_lhs = lhs.value();
             out_lhs.span = expr.span;
             return out_lhs;
         }
-        auto rhs = instantiate_function_expr(
-            *expr.rhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto rhs = instantiate_function_expr(*expr.rhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!rhs) return core::make_unexpected(rhs.error());
         HirExpr out_or = expr;
         if (!route->exprs.push(lhs.value()))
@@ -5931,16 +6248,28 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     }
 
     if (expr.lhs != nullptr) {
-        auto lhs = instantiate_function_expr(
-            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto lhs = instantiate_function_expr(*expr.lhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!route->exprs.push(lhs.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
-        auto rhs = instantiate_function_expr(
-            *expr.rhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto rhs = instantiate_function_expr(*expr.rhs,
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!route->exprs.push(rhs.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
@@ -5953,7 +6282,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                              args,
                                              arg_count,
                                              generic_bindings,
-                                             generic_binding_count);
+                                             generic_binding_count,
+                                             bindings);
         if (!val) return core::make_unexpected(val.error());
         if (!route->exprs.push(val.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
@@ -5964,8 +6294,14 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     for (u32 i = 0; i < expr.args.len; i++) {
-        auto arg = instantiate_function_expr(
-            *expr.args[i], route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        auto arg = instantiate_function_expr(*expr.args[i],
+                                             route,
+                                             mod,
+                                             args,
+                                             arg_count,
+                                             generic_bindings,
+                                             generic_binding_count,
+                                             bindings);
         if (!arg) return core::make_unexpected(arg.error());
         if (!route->exprs.push(arg.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
@@ -5973,6 +6309,25 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     out.span = expr.span;
+    if (out.kind == HirExprKind::StringConcat && out.lhs && out.rhs) {
+        ConstValue lhs{};
+        ConstValue rhs{};
+        if (const_eval_expr(*out.lhs, nullptr, 0, &lhs, 0) && lhs.type == HirTypeKind::Str &&
+            const_eval_expr(*out.rhs, nullptr, 0, &rhs, 0) && rhs.type == HirTypeKind::Str) {
+            if (rhs.str_value.len > 262144 || lhs.str_value.len > 262144 - rhs.str_value.len)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("String concatenation exceeds its byte budget"));
+            std::string text(lhs.str_value.ptr ? lhs.str_value.ptr : "", lhs.str_value.len);
+            if (rhs.str_value.len) text.append(rhs.str_value.ptr, rhs.str_value.len);
+            auto owned = intern_analysis_string(mod, std::move(text));
+            if (!owned) return core::make_unexpected(owned.error());
+            out.kind = HirExprKind::StrLit;
+            out.str_value = owned.value();
+            out.lhs = nullptr;
+            out.rhs = nullptr;
+        }
+    }
     auto policy = normalize_rs256_policy(out, route, route->locals.data, route->locals.len);
     if (!policy) return core::make_unexpected(policy.error());
     auto ec_policy = normalize_es256_policy(out, route, route->locals.data, route->locals.len);
@@ -6024,28 +6379,55 @@ static FrontendResult<void> instantiate_function_respond_guards(
     return {};
 }
 
-static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
-                                                       HirFunction* fn,
-                                                       const HirLocal* locals,
-                                                       u32 local_count,
-                                                       u32 param_count) {
+static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
+                                              NodePool<HirExpr>& exprs,
+                                              const HirLocal* locals,
+                                              u32 local_count,
+                                              u32 param_count,
+                                              const ExprValueBinding* bindings = nullptr) {
     HirExpr out = expr;
     out.lhs = nullptr;
     out.rhs = nullptr;
     out.field_inits.len = 0;
     out.args.len = 0;
 
+    if (expr.kind == HirExprKind::BoundValue) {
+        if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        for (const ExprValueBinding* entry = bindings; entry; entry = entry->parent) {
+            if (entry->source != expr.lhs || entry->target == nullptr) continue;
+            out.lhs = entry->target;
+            return out;
+        }
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    }
+    if (expr.kind == HirExprKind::LetIn) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto initializer =
+            normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
+        if (!initializer) return core::make_unexpected(initializer.error());
+        if (!exprs.push(initializer.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        HirExpr* key = &exprs[exprs.len - 1];
+        const ExprValueBinding kScoped{expr.lhs, key, bindings};
+        auto body = normalize_expr(*expr.rhs, exprs, locals, local_count, param_count, &kScoped);
+        if (!body) return core::make_unexpected(body.error());
+        if (!exprs.push(body.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = key;
+        out.rhs = &exprs[exprs.len - 1];
+        return out;
+    }
     if (expr.kind == HirExprKind::LocalRef) {
         if (expr.local_index >= local_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.local_index < param_count) return expr;
-        return normalize_function_expr(
-            locals[expr.local_index].init, fn, locals, local_count, param_count);
+        return normalize_expr(
+            locals[expr.local_index].init, exprs, locals, local_count, param_count, bindings);
     }
 
     if (expr.kind == HirExprKind::TupleSlot) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto lhs = normalize_function_expr(*expr.lhs, fn, locals, local_count, param_count);
+        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (lhs->type != HirTypeKind::Tuple)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -6057,49 +6439,54 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
             out_elem.span = expr.span;
             return out_elem;
         }
-        if (!fn->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
-        out.lhs = &fn->exprs[fn->exprs.len - 1];
+        if (!exprs.push(lhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &exprs[exprs.len - 1];
         out.span = expr.span;
         return out;
     }
 
     if (expr.lhs != nullptr) {
-        auto lhs = normalize_function_expr(*expr.lhs, fn, locals, local_count, param_count);
+        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
         if (!lhs) return core::make_unexpected(lhs.error());
-        if (!fn->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
-        out.lhs = &fn->exprs[fn->exprs.len - 1];
+        if (!exprs.push(lhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &exprs[exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
-        auto rhs = normalize_function_expr(*expr.rhs, fn, locals, local_count, param_count);
+        auto rhs = normalize_expr(*expr.rhs, exprs, locals, local_count, param_count, bindings);
         if (!rhs) return core::make_unexpected(rhs.error());
-        if (!fn->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
-        out.rhs = &fn->exprs[fn->exprs.len - 1];
+        if (!exprs.push(rhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.rhs = &exprs[exprs.len - 1];
     }
     for (u32 i = 0; i < expr.field_inits.len; i++) {
-        auto val = normalize_function_expr(
-            *expr.field_inits[i].value, fn, locals, local_count, param_count);
+        auto val = normalize_expr(
+            *expr.field_inits[i].value, exprs, locals, local_count, param_count, bindings);
         if (!val) return core::make_unexpected(val.error());
-        if (!fn->exprs.push(val.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        if (!exprs.push(val.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr::FieldInit init{};
         init.name = expr.field_inits[i].name;
-        init.value = &fn->exprs[fn->exprs.len - 1];
+        init.value = &exprs[exprs.len - 1];
         if (!out.field_inits.push(init))
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     for (u32 i = 0; i < expr.args.len; i++) {
-        auto arg = normalize_function_expr(*expr.args[i], fn, locals, local_count, param_count);
+        auto arg = normalize_expr(*expr.args[i], exprs, locals, local_count, param_count, bindings);
         if (!arg) return core::make_unexpected(arg.error());
-        if (!fn->exprs.push(arg.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
-        if (!out.args.push(&fn->exprs[fn->exprs.len - 1]))
+        if (!exprs.push(arg.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        if (!out.args.push(&exprs[exprs.len - 1]))
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     out.span = expr.span;
     return out;
+}
+
+// Function and protocol callback expressions share normalization; their owning
+// expression pools determine lifetime, without introducing another value engine.
+static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
+                                                       HirFunction* fn,
+                                                       const HirLocal* locals,
+                                                       u32 local_count,
+                                                       u32 param_count) {
+    return normalize_expr(expr, fn->exprs, locals, local_count, param_count);
 }
 
 static FrontendResult<void> collect_function_response_effects(HirFunction* fn,
@@ -6172,13 +6559,15 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         u32 merged_error_variant = lhs.error_variant_index;
         u32 merged_struct_index = lhs.struct_index;
         if (lhs.type == HirTypeKind::Unknown) merged_struct_index = rhs.struct_index;
-        if (lhs.error_struct_index == 0xffffffffu) {
+        // A built-in Error has no custom struct index. That is still a real
+        // error domain: a successful arm must not overwrite its variant with
+        // the success value's absent metadata.
+        if (!lhs.may_error) {
             merged_error_struct = rhs.error_struct_index;
             merged_error_variant = rhs.error_variant_index;
-        } else if (rhs.error_struct_index != 0xffffffffu) {
-            if (lhs.error_struct_index != rhs.error_struct_index ||
-                lhs.error_variant_index != rhs.error_variant_index)
-                return false;
+        } else if (rhs.may_error && (lhs.error_struct_index != rhs.error_struct_index ||
+                                     lhs.error_variant_index != rhs.error_variant_index)) {
+            return false;
         }
 
         out->type = merged_type;
@@ -6353,7 +6742,50 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         scratch->allow_respond_effects = false;
         auto result = analyze_expr(expr, scratch, mod, cur_locals, cur_local_count, cur_binding);
         scratch->allow_respond_effects = saved_allow_respond_effects;
+#if RUT_ENABLE_WEBSOCKET
+        if (result && scratch->is_ws_callback) {
+            // Binding references are still in lexical scope here. Validate
+            // phase before folding; receiver lowering is checked after the
+            // whole scoped value tree has been normalized into its owner.
+            if (const HirExpr* bad = ws_general_disallowed_value(
+                    result.value(), 0, false, scratch->ws_callback_phase))
+                return frontend_error(FrontendError::UnsupportedSyntax, bad->span);
+        }
+#endif
         return result;
+    };
+
+    auto bind_message_initializer = [&](HirExpr& value,
+                                        const HirLocal* scope,
+                                        u32 count,
+                                        Span span) -> FrontendResult<HirExpr*> {
+        // Presence tests and narrowed reads must share a reached producer. Keep
+        // known nil/error handling on its existing dead-branch typing path.
+        if (!uses_lexical_values(scratch) ||
+            (scratch->is_lexical_helper && !call_argument_needs_evaluation(value)) ||
+            known_value_state(value, scope, count, 0) != KnownValueState::Unknown)
+            return static_cast<HirExpr*>(nullptr);
+        if (!scratch->exprs.push(value)) return frontend_error(FrontendError::OutOfMemory, span);
+        HirExpr* initializer = &scratch->exprs[scratch->exprs.len - 1];
+        value.kind = HirExprKind::BoundValue;
+        value.lhs = initializer;
+        value.rhs = nullptr;
+        value.args.len = 0;
+        value.field_inits.len = 0;
+        return initializer;
+    };
+    auto finish_message_initializer =
+        [&](HirExpr* initializer, const HirExpr& body, Span span) -> FrontendResult<HirExpr> {
+        if (!initializer) return body;
+        if (!scratch->exprs.push(body)) return frontend_error(FrontendError::OutOfMemory, span);
+        HirExpr out = body;
+        out.kind = HirExprKind::LetIn;
+        out.span = span;
+        out.lhs = initializer;
+        out.rhs = &scratch->exprs[scratch->exprs.len - 1];
+        out.args.len = 0;
+        out.field_inits.len = 0;
+        return out;
     };
 
     auto analyze_function_match_pattern = [&](const AstExpr& pattern_expr,
@@ -6368,10 +6800,136 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         return result;
     };
 
+#if RUT_ENABLE_WEBSOCKET
+    if (stmt.kind == AstStmtKind::ReturnVoid && scratch->is_ws_callback &&
+        scratch->ws_callback_phase != WsCallbackPhase::Message) {
+        HirExpr value{};
+        value.kind = HirExprKind::IntLit;
+        value.type = HirTypeKind::I32;
+        value.int_value = static_cast<u8>(WsVerdict::Drop);
+        value.span = stmt.span;
+        return value;
+    }
+    if (stmt.kind == AstStmtKind::Expr && scratch->is_ws_callback) {
+        const AstExpr& call = stmt.expr;
+        if (scratch->ws_callback_phase != WsCallbackPhase::Message &&
+            call.kind == AstExprKind::MethodCall && call.name.eq(lit_str("set")) && call.lhs &&
+            call.lhs->kind == AstExprKind::Ident &&
+            !user_bound_ident_name(mod, locals, local_count, binding, call.lhs->name)) {
+            for (u32 i = 0; i < mod.caches.len; ++i) {
+                if (!mod.caches[i].name.eq(call.lhs->name)) continue;
+                AstStatement effect{};
+                effect.kind = AstStmtKind::Block;
+                effect.span = stmt.span;
+                // AST child lists require mutable statement pointers.
+                // NOLINTNEXTLINE(misc-const-correctness)
+                AstStatement atom = stmt;
+                if (!effect.block_stmts.push(&atom))
+                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                return analyze_function_body_stmt(
+                    effect, scratch, mod, locals, local_count, binding, false);
+            }
+        }
+        if (call.kind != AstExprKind::MethodCall || call.lhs == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        auto receiver = analyze_function_expr(*call.lhs, locals, local_count, binding);
+        if (!receiver) return core::make_unexpected(receiver.error());
+        auto current = normalize_expr(receiver.value(), scratch->exprs, locals, local_count, 1);
+        if (!current) return core::make_unexpected(current.error());
+        const bool kMessage = scratch->ws_callback_phase == WsCallbackPhase::Message &&
+                              current->type == HirTypeKind::WebSocketMessage;
+        const bool kOpen = scratch->ws_callback_phase == WsCallbackPhase::Open &&
+                           current->type == HirTypeKind::WebSocketConnection &&
+                           call.name.eq(lit_str("close"));
+        if (current->kind != HirExprKind::LocalRef || current->local_index != 0 ||
+            (!kMessage && !kOpen) || current->may_nil || current->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        HirExpr verdict{};
+        verdict.kind = HirExprKind::IntLit;
+        verdict.type = HirTypeKind::I32;
+        verdict.span = call.span;
+        if (call.args.len != 0) {
+            const bool kForward = call.name.eq(lit_str("forward"));
+            const bool kClose = call.name.eq(lit_str("close"));
+            if ((!kForward && !kClose) || call.args.len > (kForward ? 1u : 2u))
+                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+            HirExpr operands[2]{};
+            for (u32 i = 0; i < call.args.len; ++i) {
+                if (!call.args[i])
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+                auto value = analyze_function_expr(*call.args[i], locals, local_count, binding);
+                if (!value) return core::make_unexpected(value.error());
+                if (value->may_nil || value->may_error ||
+                    (kForward ? value->type != HirTypeKind::Str && value->type != HirTypeKind::Bytes
+                              : value->type != (i == 0 ? HirTypeKind::I32 : HirTypeKind::Str)))
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[i]->span);
+                ConstValue known{};
+                if (const_eval_expr(value.value(), locals, local_count, &known, 0)) {
+                    if ((!kForward && i == 0 &&
+                         (known.int_value < 0 || known.int_value > 65535 ||
+                          !ws_valid_close_code(static_cast<u32>(known.int_value)))) ||
+                        ((!kForward && i == 1) && !ws_valid_close_reason(known.str_value)) ||
+                        (kForward &&
+                         (known.str_value.len > kWsMaxMessageCapacity ||
+                          known.str_value.len > (scratch->ws_handler.max_message_size
+                                                     ? scratch->ws_handler.max_message_size
+                                                     : kWsTerminateMessageCapacity) ||
+                          (value->type == HirTypeKind::Str &&
+                           !ws_valid_text_payload(known.str_value)))))
+                        return frontend_error(FrontendError::UnsupportedSyntax, call.args[i]->span);
+                }
+                if (kForward || i == 1) {
+                    u32 visits = 0;
+                    const auto kBounds =
+                        ws_output_literal_bounds(value.value(), locals, local_count, visits);
+                    if (!kBounds.complete)
+                        return frontend_error(FrontendError::TooManyItems, call.args[i]->span);
+                    const u32 kMaximum = kForward ? (scratch->ws_handler.max_message_size
+                                                         ? scratch->ws_handler.max_message_size
+                                                         : kWsTerminateMessageCapacity)
+                                                  : 123u;
+                    if ((value->type == HirTypeKind::Str && !kBounds.valid_utf8) ||
+                        kBounds.minimum > (kForward ? kWsMaxMessageCapacity : 123u) ||
+                        (kMaximum && kBounds.minimum > kMaximum))
+                        return frontend_error(FrontendError::UnsupportedSyntax, call.args[i]->span);
+                }
+                operands[i] = value.value();
+            }
+            if (kClose && call.args.len == 1) {
+                operands[1].kind = HirExprKind::StrLit;
+                operands[1].type = HirTypeKind::Str;
+                operands[1].str_value = lit_str("");
+            }
+            if (!scratch->exprs.push(operands[0]))
+                return frontend_error(FrontendError::OutOfMemory, call.span);
+            verdict.lhs = &scratch->exprs[scratch->exprs.len - 1];
+            if (kClose) {
+                if (!scratch->exprs.push(operands[1]))
+                    return frontend_error(FrontendError::OutOfMemory, call.span);
+                verdict.rhs = &scratch->exprs[scratch->exprs.len - 1];
+            }
+            verdict.kind = kForward ? HirExprKind::WsForward : HirExprKind::WsClose;
+            verdict.int_value = operands[0].type == HirTypeKind::Bytes ? 2 : 1;
+            scratch->ws_handler.has_forward_payload = true;
+            return verdict;
+        }
+        if (call.name.eq(lit_str("forward")))
+            verdict.int_value = static_cast<u8>(WsVerdict::Forward);
+        else if (call.name.eq(lit_str("drop")))
+            verdict.int_value = static_cast<u8>(WsVerdict::Drop);
+        else if (call.name.eq(lit_str("close")))
+            verdict.int_value = static_cast<u8>(WsVerdict::Close);
+        else
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        return verdict;
+    }
+#endif
     if (stmt.kind == AstStmtKind::Expr)
         return analyze_function_expr(stmt.expr, locals, local_count, binding);
 
     if (stmt.kind == AstStmtKind::If) {
+        if (stmt.then_stmt == nullptr || stmt.else_stmt == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
         // `if let name = expr { then } else { else }`: the condition folds to
         // `HasValue(expr)` (via analyze_guard_cond), and the narrowed binding is
         // injected into the THEN-branch scope only. The else branch and the
@@ -6381,9 +6939,19 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         for (u32 i = 0; i < local_count; i++) then_scoped[i] = locals[i];
         u32 then_count = local_count;
         HirExpr cond_expr{};
+        HirExpr* initializer_key = nullptr;
         if (stmt.bind_value) {
             auto bound = analyze_function_expr(stmt.expr, locals, local_count, binding);
             if (!bound) return core::make_unexpected(bound.error());
+#if RUT_ENABLE_WEBSOCKET
+            if (scratch->is_ws_callback &&
+                ((!bound->may_nil && !bound->may_error) || stmt.name.eq(lit_str("json")) ||
+                 user_bound_ident_name(mod, locals, local_count, binding, stmt.name)))
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+#endif
+            auto cached = bind_message_initializer(bound.value(), locals, local_count, stmt.span);
+            if (!cached) return core::make_unexpected(cached.error());
+            initializer_key = cached.value();
             auto cond = build_guard_cond_from_analyzed(bound.value(),
                                                        stmt.expr.span,
                                                        scratch,
@@ -6496,7 +7064,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             return frontend_error(FrontendError::OutOfMemory, stmt.span);
         if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
             return frontend_error(FrontendError::TooManyItems, stmt.span);
-        return out;
+        return finish_message_initializer(initializer_key, out, stmt.span);
     }
 
     if (stmt.kind == AstStmtKind::Match && stmt.is_const) {
@@ -6530,11 +7098,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             if (!pattern) return core::make_unexpected(pattern.error());
 
             bool matched = false;
-            if (pattern->kind == HirExprKind::BoolLit && subject_value.type == HirTypeKind::Bool) {
-                matched = pattern->bool_value == subject_value.bool_value;
-            } else if (pattern->kind == HirExprKind::IntLit &&
-                       subject_value.type == HirTypeKind::I32) {
+            if ((pattern->kind == HirExprKind::ConstWsCase && pattern->type == subject_value.type &&
+                 is_ws_enum_type(subject_value.type)) ||
+                (pattern->kind == HirExprKind::IntLit && subject_value.type == HirTypeKind::I32)) {
                 matched = pattern->int_value == subject_value.int_value;
+            } else if (pattern->kind == HirExprKind::BoolLit &&
+                       subject_value.type == HirTypeKind::Bool) {
+                matched = binary_match_case_value(pattern.value()) == subject_value.bool_value;
             } else if (pattern->kind == HirExprKind::StrLit &&
                        subject_value.type == HirTypeKind::Str) {
                 matched = pattern->str_value.eq(subject_value.str_value);
@@ -6581,6 +7151,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             return frontend_error(
                 FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
 
+        LexicalCallArguments match_subject{scratch, {}};
+        auto bound_subject = match_subject.bind(subject.value());
+        if (!bound_subject) return core::make_unexpected(bound_subject.error());
         if (!scratch->exprs.push(subject.value()))
             return frontend_error(FrontendError::OutOfMemory, stmt.span);
         const HirExpr* subject_ptr = &scratch->exprs[scratch->exprs.len - 1];
@@ -6694,8 +7267,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             auto pattern =
                 analyze_function_match_pattern(*arm.pattern, subject.value(), locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
-            if (pattern->kind != HirExprKind::BoolLit && pattern->kind != HirExprKind::IntLit &&
-                pattern->kind != HirExprKind::StrLit && pattern->kind != HirExprKind::VariantCase)
+            if (!is_match_pattern(pattern.value()))
                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
             if (pattern->type != subject->type)
                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
@@ -6711,13 +7283,14 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     seen_variant_cases[case_index] = true;
                     seen_variant_case_count++;
                 }
-            } else if (pattern->type == HirTypeKind::Bool) {
-                bool& seen_bool_case = pattern->bool_value ? seen_bool_true : seen_bool_false;
-                if (seen_bool_case && !arm.has_guard)
+            } else if (pattern->type == HirTypeKind::Bool || is_ws_enum_type(pattern->type)) {
+                const bool kSeenBoolCase =
+                    binary_match_case_value(pattern.value()) ? seen_bool_true : seen_bool_false;
+                if (kSeenBoolCase && !arm.has_guard)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                if (pattern->bool_value && !seen_bool_case)
+                if (binary_match_case_value(pattern.value()) && !kSeenBoolCase)
                     seen_bool_true = true;
-                else if (!pattern->bool_value && !seen_bool_case)
+                else if (!binary_match_case_value(pattern.value()) && !kSeenBoolCase)
                     seen_bool_false = true;
             }
 
@@ -6774,15 +7347,16 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         if (!seen_wildcard) {
             if (seen_guarded_arm)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-            if (subject->type == HirTypeKind::Bool && seen_bool_true && seen_bool_false)
-                return result;
+            if ((subject->type == HirTypeKind::Bool || is_ws_enum_type(subject->type)) &&
+                seen_bool_true && seen_bool_false)
+                return match_subject.finish(result);
             if (subject->type != HirTypeKind::Variant)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             const auto& variant = mod.variants[subject->variant_index];
             if (seen_variant_case_count != variant.cases.len)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
         }
-        return result;
+        return match_subject.finish(result);
     }
 
     if (stmt.kind == AstStmtKind::Block) {
@@ -6794,8 +7368,18 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                       const HirLocal* cur_locals,
                                       u32 cur_local_count,
                                       bool cur_allow_respond_guards) -> FrontendResult<HirExpr> {
-            if (si >= stmt.block_stmts.len)
+            if (si >= stmt.block_stmts.len) {
+                if (scratch->is_ws_callback &&
+                    scratch->ws_callback_phase != WsCallbackPhase::Message) {
+                    HirExpr done{};
+                    done.kind = HirExprKind::IntLit;
+                    done.type = HirTypeKind::I32;
+                    done.int_value = kWsLifecycleContinue;
+                    done.span = stmt.span;
+                    return done;
+                }
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            }
             auto analyze_block_expr =
                 [&](const AstExpr& expr,
                     const HirLocal* expr_locals,
@@ -6804,18 +7388,32 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (cur_allow_respond_guards)
                     return analyze_expr(
                         expr, scratch, mod, expr_locals, expr_local_count, expr_binding);
-                const bool saved_allow_respond_effects = scratch->allow_respond_effects;
-                scratch->allow_respond_effects = false;
-                auto result =
-                    analyze_expr(expr, scratch, mod, expr_locals, expr_local_count, expr_binding);
-                scratch->allow_respond_effects = saved_allow_respond_effects;
-                return result;
+                return analyze_function_expr(expr, expr_locals, expr_local_count, expr_binding);
             };
             const auto& inner = *stmt.block_stmts[si];
             const bool is_last = si + 1 == stmt.block_stmts.len;
-            if (inner.kind == AstStmtKind::Let && !is_last) {
+            const bool kLifecycle =
+                scratch->is_ws_callback && scratch->ws_callback_phase != WsCallbackPhase::Message;
+            if (inner.kind == AstStmtKind::Let && (!is_last || kLifecycle)) {
+#if RUT_ENABLE_WEBSOCKET
+                if (scratch->is_ws_callback &&
+                    (inner.name.eq(lit_str("json")) ||
+                     user_bound_ident_name(mod, cur_locals, cur_local_count, nullptr, inner.name)))
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+#endif
+                const bool kSavedUuidInitOk = scratch->uuid_init_ok;
+                if (scratch->is_ws_callback)
+                    scratch->uuid_init_ok =
+                        inner.expr.kind == AstExprKind::Call && inner.expr.name.eq(lit_str("uuid"));
                 auto init = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
+                scratch->uuid_init_ok = kSavedUuidInitOk;
                 if (!init) return core::make_unexpected(init.error());
+                if (uses_lexical_values(scratch) && is_ws_borrowed_type(init->type) &&
+                    call_argument_needs_evaluation(init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.expr.span,
+                        lit_str("a borrowed message alias cannot carry runtime initialization"));
                 // Mirror the route-level let handler's ArrayLit-at-RHS gate
                 // (MIR has no ArrayLit lowering yet).
                 if (init->kind == HirExprKind::ArrayLit)
@@ -6854,12 +7452,67 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 local.error_variant_index = init->error_variant_index;
                 local.shape_index = init->shape_index;
                 local.init = init.value();
+                HirExpr* initializer_key = nullptr;
+                // A message alias has no runtime carrier. Scalar/Bytes values
+                // use a real lexical binding, including unused nullable work.
+                if (uses_lexical_values(scratch) && !is_ws_borrowed_type(init->type) &&
+                    (scratch->is_ws_callback || call_argument_needs_evaluation(init.value()))) {
+                    if (!scratch->exprs.push(init.value()))
+                        return frontend_error(FrontendError::OutOfMemory, inner.span);
+                    initializer_key = &scratch->exprs[scratch->exprs.len - 1];
+                    local.init.kind = HirExprKind::BoundValue;
+                    local.init.lhs = initializer_key;
+                    local.init.rhs = nullptr;
+                    local.init.args.len = 0;
+                    local.init.field_inits.len = 0;
+                }
                 auto inserted = insert_scoped_local(
                     next_locals, next_count, HirRoute::kMaxLocals, local, inner.span);
                 if (!inserted) return core::make_unexpected(inserted.error());
                 if (!scratch->locals.push(local))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
-                return self(self, si + 1, next_locals, next_count, cur_allow_respond_guards);
+                auto body = self(self, si + 1, next_locals, next_count, cur_allow_respond_guards);
+                if (!body || initializer_key == nullptr) return body;
+                if (!scratch->exprs.push(body.value()))
+                    return frontend_error(FrontendError::OutOfMemory, inner.span);
+                HirExpr evaluated = body.value();
+                evaluated.kind = HirExprKind::LetIn;
+                evaluated.span = inner.span;
+                evaluated.lhs = initializer_key;
+                evaluated.rhs = &scratch->exprs[scratch->exprs.len - 1];
+                evaluated.args.len = 0;
+                evaluated.field_inits.len = 0;
+                return evaluated;
+            }
+            if (scratch->is_ws_callback && inner.kind == AstStmtKind::Expr &&
+                (!is_last || kLifecycle) && inner.expr.kind == AstExprKind::MethodCall &&
+                inner.expr.name.eq(lit_str("set")) && inner.expr.lhs &&
+                inner.expr.lhs->kind == AstExprKind::Ident &&
+                !user_bound_ident_name(
+                    mod, cur_locals, cur_local_count, binding, inner.expr.lhs->name)) {
+                bool cache_receiver = false;
+                for (u32 ci = 0; ci < mod.caches.len; ++ci)
+                    cache_receiver |= mod.caches[ci].name.eq(inner.expr.lhs->name);
+                if (cache_receiver) {
+                    // Share the ordinary cache statement permission/type checker.
+                    // Keep the write at its reached lexical position, never in
+                    // an unconditional HTTP entry prelude or an elided helper.
+                    const bool kSavedPermission = scratch->cache_set_stmt_ok;
+                    scratch->cache_set_stmt_ok = true;
+                    auto effect =
+                        analyze_block_expr(inner.expr, cur_locals, cur_local_count, binding);
+                    scratch->cache_set_stmt_ok = kSavedPermission;
+                    if (!effect) return core::make_unexpected(effect.error());
+                    if (effect->kind != HirExprKind::CacheSet)
+                        return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+                    if (!scratch->exprs.push(effect.value()))
+                        return frontend_error(FrontendError::OutOfMemory, inner.span);
+                    HirExpr* initializer = &scratch->exprs[scratch->exprs.len - 1];
+                    auto tail =
+                        self(self, si + 1, cur_locals, cur_local_count, cur_allow_respond_guards);
+                    if (!tail) return core::make_unexpected(tail.error());
+                    return finish_message_initializer(initializer, tail.value(), inner.span);
+                }
             }
             if (inner.kind == AstStmtKind::Expr && !is_last &&
                 inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
@@ -7020,9 +7673,22 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         self, si + 1, next_locals, cur_local_count, cur_allow_respond_guards);
                 }
             }
-            if (inner.kind == AstStmtKind::Guard && !is_last) {
+            if (inner.kind == AstStmtKind::Guard && (!is_last || kLifecycle)) {
                 auto bound = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
+#if RUT_ENABLE_WEBSOCKET
+                if (scratch->is_ws_callback && inner.bind_value &&
+                    ((!bound->may_nil && !bound->may_error) || inner.name.eq(lit_str("json")) ||
+                     user_bound_ident_name(mod, cur_locals, cur_local_count, binding, inner.name)))
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+#endif
+                HirExpr* initializer_key = nullptr;
+                if (inner.bind_value || inner.match_arms.len != 0) {
+                    auto cached = bind_message_initializer(
+                        bound.value(), cur_locals, cur_local_count, inner.span);
+                    if (!cached) return core::make_unexpected(cached.error());
+                    initializer_key = cached.value();
+                }
                 auto cond = build_guard_cond_from_analyzed(bound.value(),
                                                            inner.expr.span,
                                                            scratch,
@@ -7129,7 +7795,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (inner.match_arms.len != 0) {
                     else_expr = analyze_function_guard_match_expr(
                         inner.match_arms, bound.value(), cur_locals, cur_local_count);
-                } else {
+                } else if (inner.else_stmt != nullptr) {
                     else_expr = analyze_function_body_stmt(*inner.else_stmt,
                                                            scratch,
                                                            mod,
@@ -7178,7 +7844,45 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return frontend_error(FrontendError::OutOfMemory, inner.span);
                 if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
-                return out;
+                return finish_message_initializer(initializer_key, out, inner.span);
+            }
+            if (kLifecycle && (inner.kind == AstStmtKind::Match ||
+                               (inner.kind == AstStmtKind::If && inner.then_stmt))) {
+                AstStatement empty{};
+                empty.kind = AstStmtKind::Block;
+                empty.span = inner.span;
+                AstStatement choice = inner;
+                if (choice.kind == AstStmtKind::If && !choice.else_stmt) choice.else_stmt = &empty;
+                auto branch = analyze_function_body_stmt(
+                    choice, scratch, mod, cur_locals, cur_local_count, binding, false);
+                if (!branch) return core::make_unexpected(branch.error());
+                auto tail =
+                    self(self, si + 1, cur_locals, cur_local_count, cur_allow_respond_guards);
+                if (!tail) return core::make_unexpected(tail.error());
+                return ws_lifecycle_sequence(*scratch, branch.value(), tail.value(), inner.span);
+            }
+            if (kLifecycle && inner.kind == AstStmtKind::ReturnVoid)
+                return analyze_function_body_stmt(
+                    inner, scratch, mod, cur_locals, cur_local_count, binding, false);
+            if (kLifecycle && inner.kind == AstStmtKind::Expr &&
+                inner.expr.kind == AstExprKind::MethodCall && inner.expr.name.eq(lit_str("close")))
+                return analyze_function_body_stmt(
+                    inner, scratch, mod, cur_locals, cur_local_count, binding, false);
+            if (scratch->is_ws_callback && !is_last && inner.kind == AstStmtKind::If &&
+                inner.else_stmt == nullptr && inner.then_stmt != nullptr) {
+                // An early terminal branch resumes at the following statements
+                // only when its condition/binding is absent. Analyze the tail in
+                // the outer scope, and reuse the ordinary lazy IfElse lowering.
+                AstStatement tail{};
+                tail.kind = AstStmtKind::Block;
+                tail.span = stmt.span;
+                for (u32 next = si + 1; next < stmt.block_stmts.len; ++next)
+                    if (!tail.block_stmts.push(stmt.block_stmts[next]))
+                        return frontend_error(FrontendError::TooManyItems, inner.span);
+                AstStatement choice = inner;
+                choice.else_stmt = &tail;
+                return analyze_function_body_stmt(
+                    choice, scratch, mod, cur_locals, cur_local_count, binding, false);
             }
             if (!is_last && inner.kind != AstStmtKind::Let && inner.kind != AstStmtKind::Guard)
                 return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
@@ -7261,25 +7965,198 @@ static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
     return false;
 }
 
+// Function declarations retain their existing HTTP control/effect representation.
+// Message calls reuse the same analyzer with real lexical initializers, then
+// normalize the result into the function's owning pool (never retain AST views).
+static FrontendResult<void> build_lexical_function_body(const AstStatement& source,
+                                                        HirFunction& fn,
+                                                        const HirModule& mod,
+                                                        const HirLocal* params,
+                                                        u32 error_variant_index) {
+    fn.lexical_body_index = 0xffffffffu;
+    if (fn.has_non_response_statement_effect || fn.respond_guards.len != 0) return {};
+    auto scratch = std::make_unique<HirRoute>();
+    scratch->is_helper_scratch = true;
+    scratch->is_lexical_helper = true;
+    scratch->error_variant_index = error_variant_index;
+    auto body = analyze_function_body_stmt(
+        source, scratch.get(), mod, params, fn.params.len, nullptr, false);
+    if (!body) {
+        // A valid HTTP helper can still use recovery/effects unavailable in a
+        // synchronous message callback. Reject that call, not the declaration.
+        if (body.error().code == FrontendError::UnsupportedSyntax) return {};
+        return core::make_unexpected(body.error());
+    }
+    // Contextual nil/error results need the declaration's complete type shape
+    // through a lexical continuation, rather than only on its outer LetIn.
+    const auto kAdoptMissing = [&](auto&& self, HirExpr& value) -> void {
+        if (value.type == HirTypeKind::Unknown && (value.may_nil || value.may_error)) {
+            value.type = fn.body.type;
+            value.generic_index = fn.body.generic_index;
+            value.associated_name = fn.body.associated_name;
+            value.generic_has_error_constraint = fn.body.generic_has_error_constraint;
+            value.generic_has_eq_constraint = fn.body.generic_has_eq_constraint;
+            value.generic_has_ord_constraint = fn.body.generic_has_ord_constraint;
+            value.generic_protocol_index = fn.body.generic_protocol_index;
+            value.generic_protocol_count = fn.body.generic_protocol_count;
+            for (u32 i = 0; i < value.generic_protocol_count; ++i)
+                value.generic_protocol_indices[i] = fn.body.generic_protocol_indices[i];
+            value.variant_index = fn.body.variant_index;
+            value.struct_index = fn.body.struct_index;
+            value.shape_index = fn.body.shape_index;
+            value.tuple_len = fn.body.tuple_len;
+            for (u32 i = 0; i < value.tuple_len; ++i) {
+                value.tuple_types[i] = fn.body.tuple_types[i];
+                value.tuple_variant_indices[i] = fn.body.tuple_variant_indices[i];
+                value.tuple_struct_indices[i] = fn.body.tuple_struct_indices[i];
+            }
+            if (value.kind == HirExprKind::LetIn && value.rhs) self(self, *value.rhs);
+            if (value.kind == HirExprKind::IfElse) {
+                if (value.rhs) self(self, *value.rhs);
+                if (value.args.len && value.args[0]) self(self, *value.args[0]);
+            }
+        }
+    };
+    kAdoptMissing(kAdoptMissing, body.value());
+    HirLocal locals[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
+    u32 count = 0;
+    for (u32 i = 0; i < fn.params.len; ++i) locals[count++] = params[i];
+    for (u32 i = 0; i < scratch->locals.len; ++i) locals[count++] = scratch->locals[i];
+    auto normalized = normalize_function_expr(body.value(), &fn, locals, count, fn.params.len);
+    if (!normalized) return core::make_unexpected(normalized.error());
+    if (!fn.exprs.push(normalized.value()))
+        return frontend_error(FrontendError::OutOfMemory, source.span);
+    fn.lexical_body_index = fn.exprs.len - 1;
+    return {};
+}
+
 #if RUT_ENABLE_WEBSOCKET
+// Callback values use ordinary type checking and helper normalization. Only
+// infallible immutable values may be substituted; reached nullable/fallible
+// initializers retain their lexical evaluation and explicit carrier.
+struct WsCallbackScope {
+    std::unique_ptr<HirRoute> route = std::make_unique<HirRoute>();
+    std::unique_ptr<HirFunction> normalized = std::make_unique<HirFunction>();
+    // Keep the existing admission capacity independent of the callback parameter
+    // and locals in both the callback and its current terminal branch.
+    FixedVec<HirLocal,
+             HirRoute::kMaxLocals +
+                 (HirWsHandler::kMaxLenGuards + 1) * AstStatement::kMaxBlockStatements>
+        locals;
+};
+
+static FrontendResult<HirExpr> analyze_ws_value(const AstExpr& expr,
+                                                WsCallbackScope& scope,
+                                                const HirModule& mod) {
+    auto& scratch = *scope.route;
+    const u32 kLocalCount = scope.locals.len;
+    auto value = analyze_expr(expr, &scratch, mod, scope.locals.data, kLocalCount, nullptr);
+    if (!value) return core::make_unexpected(value.error());
+    if (scratch.locals.len != 0 || scratch.guards.len != 0)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    return normalize_function_expr(
+        value.value(), scope.normalized.get(), scope.locals.data, kLocalCount, 1);
+}
+
+static const HirExpr* ws_general_disallowed_value(const HirExpr& expr,
+                                                  u32 depth,
+                                                  bool validate_receivers,
+                                                  WsCallbackPhase phase) {
+    if (depth > 128) return &expr;
+    // The initializer is checked at LetIn, not again for every reference.
+    // Following reference edges here would expand a shared lexical graph.
+    if (expr.kind == HirExprKind::BoundValue) return nullptr;
+    if ((expr.kind >= HirExprKind::ReqHeaderCount && expr.kind <= HirExprKind::ReqMethod &&
+         expr.kind != HirExprKind::ConstMethod) ||
+        expr.kind == HirExprKind::WaitResult || expr.kind == HirExprKind::WaitField)
+        return &expr;
+    if (validate_receivers && expr.kind == HirExprKind::WsMessageField &&
+        !ws_projection_receiver_valid(expr, phase))
+        return &expr;
+    if (expr.lhs != nullptr)
+        if (const HirExpr* bad =
+                ws_general_disallowed_value(*expr.lhs, depth + 1, validate_receivers, phase))
+            return bad;
+    if (expr.rhs != nullptr)
+        if (const HirExpr* bad =
+                ws_general_disallowed_value(*expr.rhs, depth + 1, validate_receivers, phase))
+            return bad;
+    for (u32 i = 0; i < expr.args.len; ++i)
+        if (expr.args[i] != nullptr)
+            if (const HirExpr* bad = ws_general_disallowed_value(
+                    *expr.args[i], depth + 1, validate_receivers, phase))
+                return bad;
+    for (u32 i = 0; i < expr.field_inits.len; ++i)
+        if (expr.field_inits[i].value != nullptr)
+            if (const HirExpr* bad = ws_general_disallowed_value(
+                    *expr.field_inits[i].value, depth + 1, validate_receivers, phase))
+                return bad;
+    return nullptr;
+}
+
+static bool ws_infallible_binding(const HirExpr& expr, u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes || expr.may_nil || expr.may_error) return false;
+    if (expr.kind == HirExprKind::BoolLit || expr.kind == HirExprKind::IntLit ||
+        expr.kind == HirExprKind::StrLit || expr.kind == HirExprKind::BytesLit ||
+        expr.kind == HirExprKind::ConstWsCase)
+        return true;
+    if (expr.kind == HirExprKind::LocalRef)
+        return expr.local_index == 0 && expr.type == HirTypeKind::WebSocketMessage;
+    if (expr.kind == HirExprKind::WsMessageField || expr.kind == HirExprKind::BytesCount)
+        return expr.lhs && ws_infallible_binding(*expr.lhs, depth + 1);
+    if (expr.kind == HirExprKind::IfElse) {
+        // Boolean helpers may choose between any supported infallible predicates.
+        // Fallible work remains excluded from ordinary eager-let substitution.
+        return !is_ws_borrowed_type(expr.type) && expr.lhs && expr.rhs && expr.args.len == 1 &&
+               expr.args[0] && ws_infallible_binding(*expr.lhs, depth + 1) &&
+               ws_infallible_binding(*expr.rhs, depth + 1) &&
+               ws_infallible_binding(*expr.args[0], depth + 1);
+    }
+    if (expr.kind == HirExprKind::WidenI64)
+        return expr.lhs && ws_infallible_binding(*expr.lhs, depth + 1);
+    if (expr.kind == HirExprKind::Add || expr.kind == HirExprKind::Sub ||
+        expr.kind == HirExprKind::Mul || expr.kind == HirExprKind::Div ||
+        expr.kind == HirExprKind::Mod || expr.kind == HirExprKind::BitAnd ||
+        expr.kind == HirExprKind::BitOr || expr.kind == HirExprKind::BitXor ||
+        expr.kind == HirExprKind::BitShl || expr.kind == HirExprKind::BitShr ||
+        expr.kind == HirExprKind::MaxInt || expr.kind == HirExprKind::MinInt)
+        return expr.lhs && expr.rhs && ws_infallible_binding(*expr.lhs, depth + 1) &&
+               ws_infallible_binding(*expr.rhs, depth + 1);
+    return (expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
+            expr.kind == HirExprKind::Gt || expr.kind == HirExprKind::Or) &&
+           expr.lhs && expr.rhs && ws_infallible_binding(*expr.lhs, depth + 1) &&
+           ws_infallible_binding(*expr.rhs, depth + 1);
+}
+
+static FrontendResult<bool> ws_is_message_receiver(const AstExpr& call,
+                                                   WsCallbackScope& scope,
+                                                   const HirModule& mod) {
+    if (call.kind != AstExprKind::MethodCall || !call.lhs) return false;
+    auto receiver = analyze_ws_value(*call.lhs, scope, mod);
+    if (!receiver) return core::make_unexpected(receiver.error());
+    return receiver->kind == HirExprKind::LocalRef && receiver->local_index == 0 &&
+           receiver->type == HirTypeKind::WebSocketMessage;
+}
+
 // A `message.<field>` access (lhs ident `message`).
-static bool ws_is_message_field(const AstExpr& e, Str field) {
+static bool ws_is_message_field(const AstExpr& e, Str field, Str parameter) {
     return e.kind == AstExprKind::Field && e.lhs != nullptr && e.lhs->kind == AstExprKind::Ident &&
-           e.lhs->name.eq({"message", 7}) && e.name.eq(field);
+           e.lhs->name.eq(parameter) && e.name.eq(field);
 }
 // `message.len` — the reassembled message length.
-static bool ws_is_message_len(const AstExpr& e) {
-    return ws_is_message_field(e, {"len", 3});
+static bool ws_is_message_len(const AstExpr& e, Str parameter) {
+    return ws_is_message_field(e, {"len", 3}, parameter);
 }
 
 // A bare message verdict `message.drop()/close()/forward()` (no args) → WsVerdict, for guard
 // else-branches. Argument-bearing closes are handled by analyze_message_guard_verdict;
 // payload-bearing forwards are handled by analyze_message_guard_verdict.
-static FrontendResult<WsVerdict> analyze_bare_message_verdict(const AstExpr& call) {
-    const bool is_message = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
-                            call.lhs->kind == AstExprKind::Ident &&
-                            call.lhs->name.eq({"message", 7});
-    if (!is_message || call.args.len != 0)
+static FrontendResult<WsVerdict> analyze_bare_message_verdict(const AstExpr& call,
+                                                              WsCallbackScope& scope,
+                                                              const HirModule& mod) {
+    auto receiver = ws_is_message_receiver(call, scope, mod);
+    if (!receiver) return core::make_unexpected(receiver.error());
+    if (!receiver.value() || call.args.len != 0)
         return frontend_error(FrontendError::UnsupportedSyntax, call.span);
     if (call.name.eq({"forward", 7})) return WsVerdict::Forward;
     if (call.name.eq({"drop", 4})) return WsVerdict::Drop;
@@ -7290,19 +8167,19 @@ static FrontendResult<WsVerdict> analyze_bare_message_verdict(const AstExpr& cal
 // Share status/reason validation between default and guard-branch closes.
 static FrontendResult<HirWsClosePolicy> analyze_message_close_policy(const AstExpr& call,
                                                                      HirRoute& route,
-                                                                     const HirModule& mod) {
-    if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
-        !call.lhs->name.eq({"message", 7}) || !call.name.eq({"close", 5}) || call.args.len > 2)
+                                                                     const HirModule& mod,
+                                                                     WsCallbackScope& scope) {
+    auto receiver = ws_is_message_receiver(call, scope, mod);
+    if (!receiver) return core::make_unexpected(receiver.error());
+    if (!receiver.value() || !call.name.eq({"close", 5}) || call.args.len > 2)
         return frontend_error(FrontendError::UnsupportedSyntax, call.span);
     HirWsClosePolicy policy{};
     if (call.args.len >= 1) {
         if (!call.args[0]) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-        auto code =
-            analyze_expr(*call.args[0], &route, mod, route.locals.data, route.locals.len, nullptr);
+        auto code = analyze_ws_value(*call.args[0], scope, mod);
         if (!code) return core::make_unexpected(code.error());
         ConstValue cv{};
-        if (code->type != HirTypeKind::I32 ||
-            !const_eval_expr(code.value(), route.locals.data, route.locals.len, &cv, 0) ||
+        if (code->type != HirTypeKind::I32 || !const_eval_expr(code.value(), nullptr, 0, &cv, 0) ||
             cv.type != HirTypeKind::I32)
             return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
         const i32 value = static_cast<i32>(cv.int_value);
@@ -7313,8 +8190,7 @@ static FrontendResult<HirWsClosePolicy> analyze_message_close_policy(const AstEx
     if (call.args.len == 2) {
         if (!call.args[1] || call.args[1]->kind != AstExprKind::StrLit)
             return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-        auto reason =
-            analyze_expr(*call.args[1], &route, mod, route.locals.data, route.locals.len, nullptr);
+        auto reason = analyze_ws_value(*call.args[1], scope, mod);
         if (!reason) return core::make_unexpected(reason.error());
         if (reason->kind != HirExprKind::StrLit || reason->type != HirTypeKind::Str ||
             reason->str_value.len > kWsMaxCloseReasonBytes ||
@@ -7339,14 +8215,37 @@ struct WsJsonBinding {
         Boolean,
         Integer,
         KindName,
-        Count
+        Count,
+        Value
     };
     Str name{};
     Str path{};
     Kind kind = Kind::Document;
+    const HirExpr* value = nullptr;  // private callback normalization pool
 };
 
 using WsJsonBindings = FixedVec<WsJsonBinding, HirWsHandler::kMaxLenGuards>;
+
+static FrontendResult<HirExpr> analyze_ws_proven_value(const AstExpr& expr,
+                                                       const HirModule& mod,
+                                                       const WsJsonBindings& documents,
+                                                       WsCallbackScope& scope);
+
+static FrontendResult<void> ws_publish_value_binding(const WsJsonBinding& binding,
+                                                     WsCallbackScope& scope) {
+    if (binding.kind != WsJsonBinding::Kind::Value) return {};
+    if (!binding.value) return frontend_error(FrontendError::UnsupportedSyntax, {});
+    HirLocal local{};
+    local.name = binding.name;
+    local.span = binding.value->span;
+    local.ref_index = scope.locals.len;
+    local.type = binding.value->type;
+    local.shape_index = binding.value->shape_index;
+    local.init = *binding.value;
+    if (!scope.locals.push(local))
+        return frontend_error(FrontendError::TooManyItems, binding.value->span);
+    return {};
+}
 
 static const WsJsonBinding* ws_json_binding(const WsJsonBindings& bindings, Str name) {
     for (u32 i = 0; i < bindings.len; ++i)
@@ -7371,23 +8270,29 @@ static const WsJsonBinding* ws_json_scalar_source(const AstExpr& call,
 
 // Resolve relative RFC 6901 paths at compile time. Earlier guards prove the
 // source exists; callbacks keep using one root-relative path and retain no nodes.
+static FrontendResult<Str> ws_json_append_path(Str source,
+                                               Str path,
+                                               Span span,
+                                               const HirModule& mod) {
+    if (source.len > json::kMaxBytes || path.len > json::kMaxBytes - source.len)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              span,
+                              lit_str("combined message JSON pointer exceeds 8192 bytes"));
+    if (source.len == 0) return path;
+    if (path.len == 0) return source;
+    // An invalid relative pointer must fail rather than name a sibling.
+    if (path.ptr[0] != '/') return path;
+    std::string combined(source.ptr, source.len);
+    combined.append(path.ptr, path.len);
+    return intern_analysis_string(mod, std::move(combined));
+}
+
 static FrontendResult<Str> ws_json_get_path(const WsJsonBinding& source,
                                             const AstExpr& pointer,
                                             const HirModule& mod) {
     auto path = decoded_expression_string(pointer.str_value, mod, pointer.span);
     if (!path) return core::make_unexpected(path.error());
-    if (source.path.len > json::kMaxBytes || path->len > json::kMaxBytes - source.path.len)
-        return frontend_error(FrontendError::UnsupportedSyntax,
-                              pointer.span,
-                              lit_str("combined message JSON pointer exceeds 8192 bytes"));
-    if (source.path.len == 0) return path.value();
-    if (path->len == 0) return source.path;
-    // An invalid relative pointer must still fail at runtime, rather than
-    // accidentally naming a sibling when appended to a valid source path.
-    if (path->ptr[0] != '/') return path.value();
-    std::string combined(source.path.ptr, source.path.len);
-    combined.append(path->ptr, path->len);
-    return intern_analysis_string(mod, std::move(combined));
+    return ws_json_append_path(source.path, path.value(), pointer.span, mod);
 }
 
 // Flatten bounded String concatenation around at most one message.text reference.
@@ -7400,6 +8305,7 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
                                                        HirWsTextRewrite& rewrite,
                                                        bool& after_source,
                                                        const WsJsonBindings& documents,
+                                                       WsCallbackScope& scope,
                                                        u32& nodes,
                                                        u32 depth = 0) {
     if (depth >= HirWsHandler::kMaxConditionNodes || nodes++ >= HirWsHandler::kMaxConditionNodes)
@@ -7413,6 +8319,7 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
                                                rewrite,
                                                after_source,
                                                documents,
+                                               scope,
                                                nodes,
                                                depth + 1);
         if (!left) return left;
@@ -7424,10 +8331,11 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
                                           rewrite,
                                           after_source,
                                           documents,
+                                          scope,
                                           nodes,
                                           depth + 1);
     }
-    if (ws_is_message_field(expr, {"text", 4})) {
+    if (ws_is_message_field(expr, {"text", 4}, route.ws_handler.parameter_name)) {
         if (rewrite.source != HirWsTextSource::Literal)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         rewrite.source = HirWsTextSource::MessageText;
@@ -7441,7 +8349,7 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
         text = decoded.value();
     } else if (expr.kind == AstExprKind::Ident) {
         const WsJsonBinding* binding = ws_json_binding(documents, expr.name);
-        if (binding) {
+        if (binding && binding->kind != WsJsonBinding::Kind::Value) {
             if ((binding->kind != WsJsonBinding::Kind::String &&
                  binding->kind != WsJsonBinding::Kind::NumberText &&
                  binding->kind != WsJsonBinding::Kind::JsonStringify) ||
@@ -7454,22 +8362,34 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
             rewrite.source_path = binding->path;
             after_source = true;
             return {};
-        } else {
-            auto value =
-                analyze_expr(expr, &route, mod, route.locals.data, route.locals.len, nullptr);
-            if (!value) return core::make_unexpected(value.error());
-            ConstValue known{};
-            if (value->type != HirTypeKind::Str || value->may_nil || value->may_error ||
-                !const_eval_expr(value.value(), route.locals.data, route.locals.len, &known, 0) ||
-                known.type != HirTypeKind::Str)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-            text = known.str_value;
         }
+        auto value = analyze_ws_value(expr, scope, mod);
+        if (!value) return core::make_unexpected(value.error());
+        if (value->kind == HirExprKind::WsMessageField && value->str_value.eq(lit_str("text"))) {
+            if (rewrite.source != HirWsTextSource::Literal)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            rewrite.source = HirWsTextSource::MessageText;
+            after_source = true;
+            return {};
+        }
+        ConstValue known{};
+        if (value->type != HirTypeKind::Str || value->may_nil || value->may_error ||
+            !const_eval_expr(value.value(), nullptr, 0, &known, 0) ||
+            known.type != HirTypeKind::Str)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        text = known.str_value;
     } else {
-        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto value = analyze_ws_value(expr, scope, mod);
+        if (!value) return core::make_unexpected(value.error());
+        if (value->kind != HirExprKind::WsMessageField || !value->str_value.eq(lit_str("text")) ||
+            rewrite.source != HirWsTextSource::Literal)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        rewrite.source = HirWsTextSource::MessageText;
+        after_source = true;
+        return {};
     }
-    if (text.len > kWsTerminateMessageCapacity ||
-        prefix.size() + suffix.size() + text.len > kWsTerminateMessageCapacity)
+    if (text.len > kWsMaxMessageCapacity ||
+        prefix.size() + suffix.size() + text.len > kWsMaxMessageCapacity)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     auto& part = after_source ? suffix : prefix;
     if (text.len != 0) part.append(text.ptr, text.len);
@@ -7477,29 +8397,64 @@ static FrontendResult<void> analyze_message_text_parts(const AstExpr& expr,
 }
 
 static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(
-    const AstExpr& call, HirRoute& route, const HirModule& mod, const WsJsonBindings& documents) {
-    if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
-        !call.lhs->name.eq({"message", 7}) || !call.name.eq({"forward", 7}) || call.args.len != 1 ||
-        !call.args[0])
+    const AstExpr& call,
+    HirRoute& route,
+    const HirModule& mod,
+    const WsJsonBindings& documents,
+    WsCallbackScope& scope) {
+    auto receiver = ws_is_message_receiver(call, scope, mod);
+    if (!receiver) return core::make_unexpected(receiver.error());
+    if (!receiver.value() || !call.name.eq({"forward", 7}) || call.args.len != 1 || !call.args[0])
         return frontend_error(FrontendError::UnsupportedSyntax, call.span);
     std::string prefix, suffix;
     HirWsTextRewrite result;
     u32 nodes = 0;
     bool after_source = false;
-    const bool kBinary = call.args[0]->kind == AstExprKind::BytesLit;
-    if (kBinary) {
-        result.source = HirWsTextSource::LiteralBinary;
-        const Str kBytes = call.args[0]->str_value;
+    bool binary = call.args[0]->kind == AstExprKind::BytesLit;
+    Str bytes = binary ? call.args[0]->str_value : Str{};
+    const auto* alias = call.args[0]->kind == AstExprKind::Ident
+                            ? ws_json_binding(documents, call.args[0]->name)
+                            : nullptr;
+    if (!binary && (!alias || alias->kind == WsJsonBinding::Kind::Value)) {
+        auto value = analyze_ws_value(*call.args[0], scope, mod);
+        if (value && !value->may_nil && !value->may_error) {
+            if (value->kind == HirExprKind::BytesLit) {
+                binary = true;
+                bytes = value->str_value;
+            } else if (value->kind == HirExprKind::WsMessageField &&
+                       value->type == HirTypeKind::Bytes &&
+                       value->str_value.eq(lit_str("payload")) && value->lhs &&
+                       value->lhs->kind == HirExprKind::LocalRef &&
+                       value->lhs->type == HirTypeKind::WebSocketMessage &&
+                       value->lhs->local_index == 0) {
+                binary = true;
+                result.source = HirWsTextSource::MessageBytes;
+            }
+        }
+    }
+    if (binary) {
+        if (result.source != HirWsTextSource::MessageBytes)
+            result.source = HirWsTextSource::LiteralBinary;
+        const Str kBytes = bytes;
         if (kBytes.len != 0) prefix.assign(kBytes.ptr, kBytes.len);
     } else {
-        auto parts = analyze_message_text_parts(
-            *call.args[0], route, mod, prefix, suffix, result, after_source, documents, nodes);
+        auto parts = analyze_message_text_parts(*call.args[0],
+                                                route,
+                                                mod,
+                                                prefix,
+                                                suffix,
+                                                result,
+                                                after_source,
+                                                documents,
+                                                scope,
+                                                nodes);
         if (!parts) return core::make_unexpected(parts.error());
     }
-    if ((route.ws_handler.max_message_size != 0 &&
-         prefix.size() + suffix.size() > route.ws_handler.max_message_size) ||
-        (!kBinary && (!utf8_valid(reinterpret_cast<const u8*>(prefix.data()), prefix.size()) ||
-                      !utf8_valid(reinterpret_cast<const u8*>(suffix.data()), suffix.size()))))
+    if ((prefix.size() + suffix.size() > (route.ws_handler.max_message_size
+                                              ? route.ws_handler.max_message_size
+                                              : kWsTerminateMessageCapacity)) ||
+        (!binary && (!utf8_valid(reinterpret_cast<const u8*>(prefix.data()), prefix.size()) ||
+                     !utf8_valid(reinterpret_cast<const u8*>(suffix.data()), suffix.size()))))
         return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
     auto retain = [&](std::string text) -> FrontendResult<u32> {
         auto owned = intern_analysis_string(mod, std::move(text));
@@ -7524,12 +8479,15 @@ static FrontendResult<HirWsTextRewrite> analyze_message_forward_payload(
 static FrontendResult<WsVerdict> analyze_message_guard_verdict(const AstExpr& call,
                                                                HirRoute& route,
                                                                const HirModule& mod,
-                                                               const WsJsonBindings& documents) {
-    // Bare close retains its existing route-default policy. Explicit arguments
-    // select a distinct policy, including an empty reason for close(code).
-    if (call.args.len == 0) return analyze_bare_message_verdict(call);
+                                                               const WsJsonBindings& documents,
+                                                               WsCallbackScope& scope,
+                                                               bool own_close_policy = false) {
+    // Guard bare closes retain their route-default policy. Conditional arms can
+    // request an independent policy even for close() without explicit arguments.
+    if (call.args.len == 0 && !(own_close_policy && call.name.eq(lit_str("close"))))
+        return analyze_bare_message_verdict(call, scope, mod);
     if (call.name.eq({"forward", 7})) {
-        auto payload = analyze_message_forward_payload(call, route, mod, documents);
+        auto payload = analyze_message_forward_payload(call, route, mod, documents, scope);
         if (!payload) return core::make_unexpected(payload.error());
         auto& texts = route.ws_handler.forward_payloads;
         const u32 index = texts.len;
@@ -7537,7 +8495,7 @@ static FrontendResult<WsVerdict> analyze_message_guard_verdict(const AstExpr& ca
             return frontend_error(FrontendError::TooManyItems, call.span);
         return static_cast<WsVerdict>(static_cast<u8>(WsVerdict::ForwardTextPolicy0) + index);
     }
-    auto policy = analyze_message_close_policy(call, route, mod);
+    auto policy = analyze_message_close_policy(call, route, mod, scope);
     if (!policy) return core::make_unexpected(policy.error());
     auto& policies = route.ws_handler.close_policies;
     const u32 index = policies.len;
@@ -7548,17 +8506,19 @@ static FrontendResult<WsVerdict> analyze_message_guard_verdict(const AstExpr& ca
 
 // Match a guard condition `message.len <cmp> <int-literal>` (or its mirror `N <cmp> message.len`),
 // normalized so cmp reads `len <cmp> bound`. Any other shape → UnsupportedSyntax.
-static FrontendResult<WsLenGuard> analyze_message_len_cond(const AstExpr& cond, WsVerdict verdict) {
+static FrontendResult<WsLenGuard> analyze_message_len_cond(const AstExpr& cond,
+                                                           WsVerdict verdict,
+                                                           Str parameter) {
     if (cond.lhs == nullptr || cond.rhs == nullptr)
         return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
     const AstExpr& lhs = *cond.lhs;
     const AstExpr& rhs = *cond.rhs;
     bool len_left = false;
     const AstExpr* num = nullptr;
-    if (ws_is_message_len(lhs) && rhs.kind == AstExprKind::IntLit) {
+    if (ws_is_message_len(lhs, parameter) && rhs.kind == AstExprKind::IntLit) {
         len_left = true;
         num = &rhs;
-    } else if (ws_is_message_len(rhs) && lhs.kind == AstExprKind::IntLit) {
+    } else if (ws_is_message_len(rhs, parameter) && lhs.kind == AstExprKind::IntLit) {
         len_left = false;
         num = &lhs;
     } else {
@@ -7593,22 +8553,29 @@ static FrontendResult<WsLenGuard> analyze_message_len_cond(const AstExpr& cond, 
 // `message.text.matches(re"…")` — a regex scan over the message payload. Returns the pattern
 // when the shape matches, else an empty Str (len 0 means "not a text-match condition"); a
 // genuinely empty regex isn't expressible (re"" needs at least the delimiters → never 0 here).
-static Str ws_message_text_match_pattern(const AstExpr& cond) {
+static Str ws_message_text_match_pattern(const AstExpr& cond, Str parameter) {
     if (cond.kind != AstExprKind::MethodCall || cond.lhs == nullptr ||
         !cond.name.eq({"matches", 7}) || cond.args.len != 1 || cond.args[0] == nullptr ||
         cond.args[0]->kind != AstExprKind::RegexLit)
         return Str{};
-    if (!ws_is_message_field(*cond.lhs, {"text", 4})) return Str{};
+    if (!ws_is_message_field(*cond.lhs, {"text", 4}, parameter)) return Str{};
     return cond.args[0]->str_value;
 }
 
-static bool ws_is_json_parse(const AstExpr& call, const HirModule& mod, const HirRoute& route) {
-    return call.kind == AstExprKind::MethodCall && call.lhs &&
-           call.lhs->kind == AstExprKind::Ident && call.lhs->name.eq(lit_str("json")) &&
-           call.name.eq(lit_str("parse")) && call.args.len == 1 && call.args[0] &&
-           ws_is_message_field(*call.args[0], lit_str("text")) &&
-           !user_bound_ident_name(
-               mod, route.locals.data, route.locals.len, nullptr, lit_str("json"));
+static bool ws_is_json_parse(const AstExpr& call,
+                             const HirModule& mod,
+                             const HirRoute& route,
+                             WsCallbackScope& scope) {
+    if (call.kind != AstExprKind::MethodCall || !call.lhs || call.lhs->kind != AstExprKind::Ident ||
+        !call.lhs->name.eq(lit_str("json")) || !call.name.eq(lit_str("parse")) ||
+        call.args.len != 1 || !call.args[0] ||
+        user_bound_ident_name(mod, scope.locals.data, scope.locals.len, nullptr, lit_str("json")))
+        return false;
+    if (ws_is_message_field(*call.args[0], lit_str("text"), route.ws_handler.parameter_name))
+        return true;
+    auto value = analyze_ws_value(*call.args[0], scope, mod);
+    return value && value->kind == HirExprKind::WsMessageField &&
+           value->str_value.eq(lit_str("text"));
 }
 
 // Match a leaf condition for the message handler. `negate` is logical !, accepted
@@ -7624,7 +8591,67 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
                                                              bool negate,
                                                              const HirModule& mod,
                                                              const HirRoute& route,
-                                                             const WsJsonBindings& documents) {
+                                                             const WsJsonBindings& documents,
+                                                             WsCallbackScope& scope) {
+    // Ordinary value aliases use their normalized text view or a constant string.
+    if ((cond.kind == AstExprKind::Field || cond.kind == AstExprKind::MethodCall) && cond.lhs &&
+        cond.lhs->kind == AstExprKind::Ident) {
+        const auto* binding = ws_json_binding(documents, cond.lhs->name);
+        if (binding && binding->kind == WsJsonBinding::Kind::Value && binding->value &&
+            binding->value->type == HirTypeKind::Str) {
+            const auto& value = *binding->value;
+            if (value.kind == HirExprKind::WsMessageField && value.str_value.eq(lit_str("text"))) {
+                AstExpr receiver{};
+                receiver.kind = AstExprKind::Ident;
+                receiver.name = route.ws_handler.parameter_name;
+                receiver.span = cond.span;
+                AstExpr text{};
+                text.kind = AstExprKind::Field;
+                text.name = lit_str("text");
+                text.lhs = &receiver;
+                text.span = cond.span;
+                AstExpr rebound = cond;
+                rebound.lhs = &text;
+                return analyze_message_guard_cond(
+                    rebound, verdict, negate, mod, route, documents, scope);
+            }
+            if (value.kind == HirExprKind::StrLit) {
+                bool matched = false;
+                if (cond.kind == AstExprKind::Field && cond.name.eq(lit_str("isEmpty"))) {
+                    matched = value.str_value.len == 0;
+                } else if (cond.kind == AstExprKind::MethodCall && cond.args.len == 1 &&
+                           cond.args[0] && cond.args[0]->kind == AstExprKind::StrLit &&
+                           (cond.name.eq(lit_str("hasPrefix")) ||
+                            cond.name.eq(lit_str("hasSuffix")) ||
+                            cond.name.eq(lit_str("contains")))) {
+                    auto needle =
+                        decoded_expression_string(cond.args[0]->str_value, mod, cond.span);
+                    if (!needle) return core::make_unexpected(needle.error());
+                    const Str kText = value.str_value;
+                    if (needle->len == 0)
+                        matched = true;
+                    else if (needle->len <= kText.len) {
+                        const u32 kLast = kText.len - needle->len;
+                        const u32 kFirst = cond.name.eq(lit_str("hasSuffix")) ? kLast : 0;
+                        const u32 kEnd = cond.name.eq(lit_str("contains")) ? kLast : kFirst;
+                        for (u32 offset = kFirst; offset <= kEnd; ++offset)
+                            if (Str{kText.ptr + offset, needle->len}.eq(needle.value())) {
+                                matched = true;
+                                break;
+                            }
+                    }
+                } else {
+                    return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
+                }
+                WsLenGuard node{};
+                node.accessor = WsLenGuard::Accessor::Constant;
+                node.bound = matched ? 1u : 0u;
+                node.negate = negate;
+                node.verdict = verdict;
+                return node;
+            }
+        }
+    }
     // Optional scalar equality: a failed extraction is nil. Negated equality
     // therefore succeeds for a wrong JSON kind, unlike a prior typed binding.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
@@ -7735,7 +8762,7 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
         const AstExpr* call = cond.rhs->kind == AstExprKind::Nil   ? cond.lhs
                               : cond.lhs->kind == AstExprKind::Nil ? cond.rhs
                                                                    : nullptr;
-        if (call && ws_is_json_parse(*call, mod, route)) {
+        if (call && ws_is_json_parse(*call, mod, route, scope)) {
             WsLenGuard g{};
             g.accessor = WsLenGuard::Accessor::JsonValid;
             g.negate = !negate;  // parse(...) == nil is the inverse of valid JSON.
@@ -7910,13 +8937,37 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
             return g;
         }
     }
+    if (cond.kind == AstExprKind::MethodCall && cond.lhs && cond.lhs->kind == AstExprKind::Ident &&
+        cond.name.eq(lit_str("matches"))) {
+        const WsJsonBinding* binding = ws_json_binding(documents, cond.lhs->name);
+        if (binding && binding->kind == WsJsonBinding::Kind::String) {
+            if (cond.args.len != 1 || !cond.args[0] || cond.args[0]->kind != AstExprKind::RegexLit)
+                return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
+            const Str kPattern = cond.args[0]->str_value;
+#if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
+            std::string regex_error;
+            if (!validate_regex_literal(kPattern, &regex_error))
+                return frontend_error(FrontendError::InvalidRegex,
+                                      cond.args[0]->span,
+                                      intern_generated_name(regex_error));
+#endif
+            WsLenGuard g{};
+            g.accessor = WsLenGuard::Accessor::JsonStringRegex;
+            g.pattern = binding->path;
+            g.value = kPattern;
+            g.negate = negate;
+            g.verdict = verdict;
+            return g;
+        }
+    }
     // Literal comparison is byte-exact, like ordinary string equality. Reuse the
     // expression decoder so escapes and embedded NULs have the same semantics.
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs) {
         const AstExpr* literal = nullptr;
-        if (ws_is_message_field(*cond.lhs, {"text", 4}) && cond.rhs->kind == AstExprKind::StrLit)
+        if (ws_is_message_field(*cond.lhs, {"text", 4}, route.ws_handler.parameter_name) &&
+            cond.rhs->kind == AstExprKind::StrLit)
             literal = cond.rhs;
-        else if (ws_is_message_field(*cond.rhs, {"text", 4}) &&
+        else if (ws_is_message_field(*cond.rhs, {"text", 4}, route.ws_handler.parameter_name) &&
                  cond.lhs->kind == AstExprKind::StrLit)
             literal = cond.lhs;
         if (literal) {
@@ -7931,7 +8982,7 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
         }
     }
     if (cond.kind == AstExprKind::MethodCall && cond.lhs &&
-        ws_is_message_field(*cond.lhs, {"text", 4}) &&
+        ws_is_message_field(*cond.lhs, {"text", 4}, route.ws_handler.parameter_name) &&
         (cond.name.eq({"hasPrefix", 9}) || cond.name.eq({"hasSuffix", 9}) ||
          cond.name.eq({"contains", 8}))) {
         if (cond.args.len != 1 || !cond.args[0] || cond.args[0]->kind != AstExprKind::StrLit)
@@ -7948,7 +8999,7 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
         return g;
     }
     if (cond.kind == AstExprKind::Field && cond.name.eq({"isEmpty", 7}) && cond.lhs &&
-        ws_is_message_field(*cond.lhs, {"text", 4})) {
+        ws_is_message_field(*cond.lhs, {"text", 4}, route.ws_handler.parameter_name)) {
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::Len;
         g.cmp = WsLenGuard::Cmp::Eq;
@@ -7956,13 +9007,13 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
         g.verdict = verdict;
         return g;
     }
-    const Str text_pattern = ws_message_text_match_pattern(cond);
-    if (text_pattern.len != 0) {
+    const Str kTextPattern = ws_message_text_match_pattern(cond, route.ws_handler.parameter_name);
+    if (kTextPattern.len != 0) {
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
         // Same compile-time regex check the HTTP `matches()` path runs, so an invalid pattern
         // is a frontend diagnostic with a source span instead of a late JIT-compile failure.
         std::string regex_error;
-        if (!validate_regex_literal(text_pattern, &regex_error)) {
+        if (!validate_regex_literal(kTextPattern, &regex_error)) {
             return frontend_error(FrontendError::InvalidRegex,
                                   cond.args[0]->span,
                                   intern_generated_name(regex_error));
@@ -7970,12 +9021,12 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
 #endif
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::TextMatch;
-        g.pattern = text_pattern;
+        g.pattern = kTextPattern;
         g.negate = negate;
         g.verdict = verdict;
         return g;
     }
-    if (ws_is_message_field(cond, {"fromClient", 10})) {
+    if (ws_is_message_field(cond, {"fromClient", 10}, route.ws_handler.parameter_name)) {
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::FromClient;
         g.cmp = WsLenGuard::Cmp::Eq;
@@ -7983,21 +9034,298 @@ static FrontendResult<WsLenGuard> analyze_message_guard_cond(const AstExpr& cond
         g.verdict = verdict;
         return g;
     }
-    const bool is_text = ws_is_message_field(cond, {"isText", 6});
-    if (is_text || ws_is_message_field(cond, {"isBinary", 8})) {
+    const bool kIsText = ws_is_message_field(cond, {"isText", 6}, route.ws_handler.parameter_name);
+    if (kIsText || ws_is_message_field(cond, {"isBinary", 8}, route.ws_handler.parameter_name)) {
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::Opcode;
         g.cmp = WsLenGuard::Cmp::Eq;
         // Handlers receive only Text/Binary, so negation selects the other opcode.
-        g.bound = (is_text != negate) ? 0x1u : 0x2u;
+        g.bound = (kIsText != negate) ? 0x1u : 0x2u;
         g.verdict = verdict;
         return g;
     }
-    auto g = analyze_message_len_cond(cond, verdict);
+    auto g = analyze_message_len_cond(cond, verdict, route.ws_handler.parameter_name);
     if (!g) return core::make_unexpected(g.error());
     g->negate = negate;
     return g;
 }
+// The public type checker and helper inliner produce ordinary HIR. Only the
+// protocol reads and the final bounded predicate representation are WS-specific.
+static bool ws_typed_field(const HirExpr& expr, Str name) {
+    return expr.kind == HirExprKind::WsMessageField && expr.str_value.eq(name) && expr.lhs &&
+           expr.lhs->type == HirTypeKind::WebSocketMessage;
+}
+
+static bool ws_payload_count(const HirExpr& expr) {
+    return expr.kind == HirExprKind::BytesCount && expr.lhs &&
+           ws_typed_field(*expr.lhs, lit_str("payload"));
+}
+
+// Reconstructed aliases contain a nonoptional parse and at most one get with
+// the complete proven path. User parse/get calls remain optional and cannot
+// manufacture this form through a predicate helper.
+static bool ws_typed_json_path(const HirExpr& expr, Str& path) {
+    const HirExpr* root = &expr;
+    path = {};
+    if (root->kind == HirExprKind::JsonOp && root->type == HirTypeKind::Json && !root->may_nil &&
+        !root->may_error && root->int_value == static_cast<i64>(json::Op::Get) &&
+        root->args.len == 2 && root->args[0] && root->args[1] &&
+        root->args[1]->kind == HirExprKind::StrLit) {
+        path = root->args[1]->str_value;
+        if (path.len > json::kMaxBytes || (!path.ptr && path.len)) return false;
+        root = root->args[0];
+    }
+    return root->kind == HirExprKind::JsonOp && root->type == HirTypeKind::Json && !root->may_nil &&
+           !root->may_error && root->int_value == static_cast<i64>(json::Op::Parse) &&
+           root->args.len == 1 && root->args[0] &&
+           ws_typed_field(*root->args[0], lit_str("text")) &&
+           root->args[0]->lhs->kind == HirExprKind::LocalRef &&
+           root->args[0]->lhs->local_index == 0;
+}
+
+static bool ws_typed_json_scalar(const HirExpr& expr, json::Op op, Str& path) {
+    return expr.kind == HirExprKind::JsonOp && !expr.may_nil && !expr.may_error &&
+           expr.int_value == static_cast<i64>(op) && expr.args.len == 1 && expr.args[0] &&
+           ws_typed_json_path(*expr.args[0], path);
+}
+
+static FrontendResult<u32> lower_ws_typed_condition(const HirExpr& expr,
+                                                    WsVerdict verdict,
+                                                    HirWsHandler& handler,
+                                                    bool is_operand,
+                                                    bool negate,
+                                                    u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::TooManyItems, expr.span);
+    if (expr.type != HirTypeKind::Bool || expr.may_nil || expr.may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    WsLenGuard node{};
+    node.verdict = verdict;
+    node.negate = negate;
+    node.is_operand = is_operand;
+    const auto kAppend = [&](const WsLenGuard& value) -> FrontendResult<u32> {
+        if (!handler.len_guards.push(value))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return handler.len_guards.len - 1;
+    };
+    const auto kChild = [&](const HirExpr& value, bool invert = false) {
+        return lower_ws_typed_condition(value, verdict, handler, true, invert, depth + 1);
+    };
+    ConstValue known{};
+    if (const_eval_expr(expr, nullptr, 0, &known, 0) && known.type == HirTypeKind::Bool) {
+        node.accessor = WsLenGuard::Accessor::Constant;
+        node.bound = known.bool_value ? 1u : 0u;
+        return kAppend(node);
+    }
+    if (expr.kind == HirExprKind::Eq && expr.lhs && expr.rhs &&
+        ws_typed_field(*expr.lhs, lit_str("payload")) &&
+        ws_typed_field(*expr.rhs, lit_str("payload"))) {
+        // This callback supplies a single immutable message; both views are its payload.
+        node.accessor = WsLenGuard::Accessor::Constant;
+        node.bound = 1;
+        return kAppend(node);
+    }
+    if (expr.kind == HirExprKind::Eq && expr.lhs && expr.rhs && is_ws_enum_type(expr.lhs->type) &&
+        expr.lhs->type == expr.rhs->type) {
+        // Both closed types have two cases. Compare their first-case predicates
+        // without exposing the wire opcode or coercing either type to an integer.
+        const auto kOperand = [&](const HirExpr& value) -> FrontendResult<u32> {
+            WsLenGuard operand{};
+            operand.is_operand = true;
+            operand.cmp = WsLenGuard::Cmp::Eq;
+            if (value.kind == HirExprKind::ConstWsCase && value.int_value >= 0 &&
+                value.int_value <= 1) {
+                operand.accessor = WsLenGuard::Accessor::Constant;
+                operand.bound = value.int_value == 0 ? 1u : 0u;
+            } else if (ws_typed_field(value, lit_str("kind"))) {
+                operand.accessor = WsLenGuard::Accessor::Opcode;
+                operand.bound = 1;
+            } else if (ws_typed_field(value, lit_str("direction"))) {
+                operand.accessor = WsLenGuard::Accessor::FromClient;
+                operand.bound = 1;
+            } else {
+                return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+            }
+            return kAppend(operand);
+        };
+        auto lhs = kOperand(*expr.lhs);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = kOperand(*expr.rhs);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        node.accessor = WsLenGuard::Accessor::BoolEqual;
+        node.lhs = lhs.value();
+        node.rhs = rhs.value();
+        return kAppend(node);
+    }
+    Str proven_path{};
+    if (ws_typed_json_scalar(expr, json::Op::AsBool, proven_path)) {
+        node.accessor = WsLenGuard::Accessor::JsonBoolEqual;
+        node.pattern = proven_path;
+        node.bound = 1;
+        return kAppend(node);
+    }
+    // Ordinary Boolean equality, including mirrored and nested comparisons.
+    if (expr.kind == HirExprKind::Eq && expr.lhs && expr.rhs &&
+        expr.lhs->type == HirTypeKind::Bool && expr.rhs->type == HirTypeKind::Bool) {
+        const HirExpr* value = expr.lhs;
+        const HirExpr* literal = expr.rhs;
+        if (value->kind == HirExprKind::BoolLit) {
+            value = expr.rhs;
+            literal = expr.lhs;
+        }
+        if (literal->kind == HirExprKind::BoolLit)
+            return lower_ws_typed_condition(
+                *value, verdict, handler, is_operand, negate != !literal->bool_value, depth + 1);
+        // Keep equality as one node so each operand is evaluated exactly once.
+        auto a = kChild(*expr.lhs);
+        if (!a) return core::make_unexpected(a.error());
+        auto b = kChild(*expr.rhs);
+        if (!b) return core::make_unexpected(b.error());
+        node.accessor = WsLenGuard::Accessor::BoolEqual;
+        node.lhs = a.value();
+        node.rhs = b.value();
+        return kAppend(node);
+    }
+    if (expr.kind == HirExprKind::IfElse && expr.lhs && expr.rhs && expr.args.len == 1 &&
+        expr.args[0] &&
+        (expr.rhs->kind == HirExprKind::BoolLit || expr.args[0]->kind == HirExprKind::BoolLit)) {
+        // Shared HIR encodes &&/|| as lazy Boolean branches. A helper may
+        // also return if cond { false } else { predicate }, or its dual.
+        const bool kConstantThen = expr.rhs->kind == HirExprKind::BoolLit;
+        const bool kConstant = kConstantThen ? expr.rhs->bool_value : expr.args[0]->bool_value;
+        auto lhs = kChild(*expr.lhs, kConstantThen != kConstant);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = kChild(kConstantThen ? *expr.args[0] : *expr.rhs);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        node.accessor = kConstant ? WsLenGuard::Accessor::Or : WsLenGuard::Accessor::And;
+        node.lhs = lhs.value();
+        node.rhs = rhs.value();
+    } else if (expr.kind == HirExprKind::IfElse && expr.lhs && expr.rhs && expr.args.len == 1 &&
+               expr.args[0]) {
+        auto selector = kChild(*expr.lhs);
+        if (!selector) return core::make_unexpected(selector.error());
+        auto yes = kChild(*expr.rhs);
+        if (!yes) return core::make_unexpected(yes.error());
+        auto no = kChild(*expr.args[0]);
+        if (!no) return core::make_unexpected(no.error());
+        node.accessor = WsLenGuard::Accessor::BoolSelect;
+        node.bound = selector.value();
+        node.lhs = yes.value();
+        node.rhs = no.value();
+    } else if (expr.kind == HirExprKind::BoolLit) {
+        node.accessor = WsLenGuard::Accessor::Constant;
+        node.bound = expr.bool_value ? 1u : 0u;
+    } else if (ws_typed_field(expr, lit_str("fromClient"))) {
+        node.accessor = WsLenGuard::Accessor::FromClient;
+        node.cmp = WsLenGuard::Cmp::Eq;
+        node.bound = 1;
+    } else if (ws_typed_field(expr, lit_str("isText")) ||
+               ws_typed_field(expr, lit_str("isBinary"))) {
+        node.accessor = WsLenGuard::Accessor::Opcode;
+        node.cmp = WsLenGuard::Cmp::Eq;
+        node.bound = ws_typed_field(expr, lit_str("isText")) ? 1u : 2u;
+    } else if (expr.kind == HirExprKind::RegexMatch && expr.lhs &&
+               ws_typed_field(*expr.lhs, lit_str("text"))) {
+        node.accessor = WsLenGuard::Accessor::TextMatch;
+        node.pattern = expr.str_value;
+    } else if (expr.kind == HirExprKind::RegexMatch && expr.lhs &&
+               ws_typed_json_scalar(*expr.lhs, json::Op::AsString, proven_path)) {
+        node.accessor = WsLenGuard::Accessor::JsonStringRegex;
+        node.pattern = proven_path;
+        node.value = expr.str_value;
+    } else if ((expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
+                expr.kind == HirExprKind::Gt) &&
+               expr.lhs && expr.rhs) {
+        const HirExpr* field = expr.lhs;
+        const HirExpr* value = expr.rhs;
+        bool swapped = false;
+        if (field->kind != HirExprKind::JsonOp && value->kind == HirExprKind::JsonOp) {
+            field = expr.rhs;
+            value = expr.lhs;
+            swapped = true;
+        }
+        if (field->kind == HirExprKind::JsonOp) {
+            node.cmp = expr.kind == HirExprKind::Eq                ? WsLenGuard::Cmp::Eq
+                       : (expr.kind == HirExprKind::Lt) != swapped ? WsLenGuard::Cmp::Lt
+                                                                   : WsLenGuard::Cmp::Gt;
+            ConstValue bound{};
+            if ((ws_typed_json_scalar(*field, json::Op::AsInt, proven_path) ||
+                 ws_typed_json_scalar(*field, json::Op::Count, proven_path)) &&
+                const_eval_expr(*value, nullptr, 0, &bound, 0) && bound.type == field->type &&
+                (bound.type == HirTypeKind::I32 || bound.type == HirTypeKind::I64)) {
+                node.accessor = field->type == HirTypeKind::I32
+                                    ? WsLenGuard::Accessor::JsonCountCompare
+                                    : WsLenGuard::Accessor::JsonIntCompare;
+                node.int_bound = bound.int_value;
+            } else if (expr.kind == HirExprKind::Eq && value->kind == HirExprKind::StrLit) {
+                if (ws_typed_json_scalar(*field, json::Op::AsString, proven_path))
+                    node.accessor = WsLenGuard::Accessor::JsonStringEqual;
+                else if (ws_typed_json_scalar(*field, json::Op::AsNumber, proven_path))
+                    node.accessor = WsLenGuard::Accessor::JsonNumberTextEqual;
+                else if (ws_typed_json_scalar(*field, json::Op::Stringify, proven_path))
+                    node.accessor = WsLenGuard::Accessor::JsonStringifyEqual;
+                else if (ws_typed_json_scalar(*field, json::Op::KindName, proven_path))
+                    node.accessor = WsLenGuard::Accessor::JsonKindEqual;
+                else
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+                node.value = value->str_value;
+            } else {
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            }
+            node.pattern = proven_path;
+            return kAppend(node);
+        }
+        field = expr.lhs;
+        value = expr.rhs;
+        const bool kSwapped =
+            field->kind != HirExprKind::WsMessageField && !ws_payload_count(*field);
+        if (kSwapped) {
+            field = expr.rhs;
+            value = expr.lhs;
+        }
+        node.cmp = expr.kind == HirExprKind::Eq                 ? WsLenGuard::Cmp::Eq
+                   : (expr.kind == HirExprKind::Lt) != kSwapped ? WsLenGuard::Cmp::Lt
+                                                                : WsLenGuard::Cmp::Gt;
+        if ((ws_typed_field(*field, lit_str("len")) || ws_payload_count(*field)) &&
+            value->kind == HirExprKind::IntLit) {
+            // The runtime's complete-message length is nonnegative and bounded.
+            if (value->int_value < 0 || value->int_value > 0xffffffffLL) {
+                node.accessor = WsLenGuard::Accessor::Constant;
+                node.bound = node.cmp == WsLenGuard::Cmp::Lt   ? value->int_value > 0
+                             : node.cmp == WsLenGuard::Cmp::Gt ? value->int_value < 0
+                                                               : false;
+            } else {
+                node.accessor = WsLenGuard::Accessor::Len;
+                node.bound = static_cast<u32>(value->int_value);
+            }
+        } else if (expr.kind == HirExprKind::Eq && ((ws_typed_field(*field, lit_str("text")) &&
+                                                     value->kind == HirExprKind::StrLit) ||
+                                                    (ws_typed_field(*field, lit_str("payload")) &&
+                                                     value->kind == HirExprKind::BytesLit))) {
+            node.accessor = WsLenGuard::Accessor::TextEqual;
+            node.pattern = value->str_value;
+        } else {
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+    } else {
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    }
+    return kAppend(node);
+}
+
+static FrontendResult<u32> analyze_ws_typed_condition(const AstExpr& expr,
+                                                      WsVerdict verdict,
+                                                      HirWsHandler& handler,
+                                                      const HirModule& mod,
+                                                      const WsJsonBindings& documents,
+                                                      WsCallbackScope& scope,
+                                                      bool is_operand,
+                                                      bool negate) {
+    auto typed = analyze_ws_proven_value(expr, mod, documents, scope);
+    if (!typed) return core::make_unexpected(typed.error());
+    return lower_ws_typed_condition(typed.value(), verdict, handler, is_operand, negate);
+}
+
 // Store a bounded condition tree in postorder. Only roots are source guards; children
 // are evaluated by short-circuit branches in the message-handler JIT.
 static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
@@ -8005,6 +9333,7 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
                                                      HirRoute& route,
                                                      const HirModule& mod,
                                                      const WsJsonBindings& documents,
+                                                     WsCallbackScope& scope,
                                                      bool is_operand = false,
                                                      bool negate = false,
                                                      u32 depth = 0) {
@@ -8020,17 +9349,17 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
     if (cond.kind == AstExprKind::Eq && cond.lhs && cond.rhs &&
         cond.rhs->kind == AstExprKind::BoolLit && !cond.rhs->bool_value && !kOptionalBoolEquality) {
         return analyze_message_condition(
-            *cond.lhs, verdict, route, mod, documents, is_operand, !negate, depth + 1);
+            *cond.lhs, verdict, route, mod, documents, scope, is_operand, !negate, depth + 1);
     }
     WsLenGuard node{};
     if (cond.kind == AstExprKind::And || cond.kind == AstExprKind::Or) {
         if (!cond.lhs || !cond.rhs)
             return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
         auto lhs = analyze_message_condition(
-            *cond.lhs, verdict, route, mod, documents, true, false, depth + 1);
+            *cond.lhs, verdict, route, mod, documents, scope, true, false, depth + 1);
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = analyze_message_condition(
-            *cond.rhs, verdict, route, mod, documents, true, false, depth + 1);
+            *cond.rhs, verdict, route, mod, documents, scope, true, false, depth + 1);
         if (!rhs) return core::make_unexpected(rhs.error());
         node.accessor =
             cond.kind == AstExprKind::And ? WsLenGuard::Accessor::And : WsLenGuard::Accessor::Or;
@@ -8039,8 +9368,18 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
         node.negate = negate;
         node.verdict = verdict;
     } else {
-        auto leaf = analyze_message_guard_cond(cond, verdict, negate, mod, route, documents);
-        if (!leaf) return core::make_unexpected(leaf.error());
+        auto leaf = analyze_message_guard_cond(cond, verdict, negate, mod, route, documents, scope);
+        if (!leaf) {
+            if (leaf.error().code != FrontendError::UnsupportedSyntax)
+                return core::make_unexpected(leaf.error());
+            const u32 kSavedCount = handler.len_guards.len;
+            auto typed = analyze_ws_typed_condition(
+                cond, verdict, handler, mod, documents, scope, is_operand, negate);
+            if (typed) return typed;
+            handler.len_guards.len = kSavedCount;
+            if (leaf.error().detail.len != 0) return core::make_unexpected(leaf.error());
+            return core::make_unexpected(typed.error());
+        }
         node = leaf.value();
     }
     node.is_operand = is_operand;
@@ -8048,6 +9387,1149 @@ static FrontendResult<u32> analyze_message_condition(const AstExpr& cond,
         return frontend_error(FrontendError::TooManyItems, cond.span);
     return handler.len_guards.len - 1;
 }
+static FrontendResult<void> analyze_ws_binding(const AstStatement& stmt,
+                                               WsCallbackScope& scope,
+                                               const HirModule& mod,
+                                               const WsJsonBindings& documents) {
+    bool collision =
+        stmt.name.eq(lit_str("json")) ||
+        user_bound_ident_name(mod, scope.locals.data, scope.locals.len, nullptr, stmt.name);
+    for (u32 j = 0; j < documents.len; ++j) collision |= documents[j].name.eq(stmt.name);
+    if (collision)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("message bindings require a fresh name"));
+    auto value = analyze_ws_value(stmt.expr, scope, mod);
+    if (!value) return core::make_unexpected(value.error());
+    auto declared = apply_declared_type_to_expr(&value.value(), mod, stmt);
+    if (!declared) return core::make_unexpected(declared.error());
+    if (!ws_infallible_binding(value.value()))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("message lets require infallible scalar or message values"));
+    HirLocal local{};
+    local.name = stmt.name;
+    local.span = stmt.span;
+    local.ref_index = scope.locals.len;
+    local.type = value->type;
+    local.shape_index = value->shape_index;
+    local.init = value.value();
+    if (!scope.locals.push(local)) return frontend_error(FrontendError::TooManyItems, stmt.span);
+    return {};
+}
+
+static FrontendResult<void> analyze_ws_default_verdict(const AstExpr& call,
+                                                       HirRoute& route,
+                                                       const HirModule& mod,
+                                                       const WsJsonBindings& documents,
+                                                       WsCallbackScope& scope) {
+    auto receiver = ws_is_message_receiver(call, scope, mod);
+    if (!receiver) return core::make_unexpected(receiver.error());
+    if (!receiver.value()) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+
+    if (call.name.eq({"forward", 7})) {
+        if (call.args.len > 1)  // forward() or forward(payload, load_balance: .roundRobin)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        route.ws_handler.default_verdict = WsVerdict::Forward;
+        if (call.args.len == 1) {
+            auto payload = analyze_message_forward_payload(call, route, mod, documents, scope);
+            if (!payload) return core::make_unexpected(payload.error());
+            route.ws_handler.has_forward_payload = true;
+            route.ws_handler.forward_payload = payload.value();
+        }
+    } else if (call.name.eq({"drop", 4})) {
+        if (call.args.len != 0) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        route.ws_handler.default_verdict = WsVerdict::Drop;
+    } else if (call.name.eq({"close", 5})) {
+        auto policy = analyze_message_close_policy(call, route, mod, scope);
+        if (!policy) return core::make_unexpected(policy.error());
+        route.ws_handler.default_verdict = WsVerdict::Close;
+        route.ws_handler.close_code = policy->code;
+        route.ws_handler.close_reason_expr = policy->reason_expr;
+    } else {
+        return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+    }
+    return {};
+}
+
+// A terminal branch has immutable bindings followed by exactly one verdict.
+// Restore lexical scope even on failure; retained output bytes belong to the module.
+static FrontendResult<WsVerdict> analyze_ws_verdict_branch(const AstStatement& body,
+                                                           HirRoute& route,
+                                                           const HirModule& mod,
+                                                           const WsJsonBindings& documents,
+                                                           WsCallbackScope& scope,
+                                                           bool is_default) {
+    const u32 kSavedLocals = scope.locals.len;
+    const auto kAnalyze = [&]() -> FrontendResult<WsVerdict> {
+        const AstStatement* last = &body;
+        if (body.kind == AstStmtKind::Block) {
+            if (body.block_stmts.len == 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, body.span);
+            for (u32 i = 0; i + 1 < body.block_stmts.len; ++i) {
+                const auto* statement = body.block_stmts[i];
+                if (!statement || statement->kind != AstStmtKind::Let)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        statement ? statement->span : body.span,
+                        lit_str("message branches require lets followed by one verdict"));
+                auto binding = analyze_ws_binding(*statement, scope, mod, documents);
+                if (!binding) return core::make_unexpected(binding.error());
+            }
+            last = body.block_stmts[body.block_stmts.len - 1];
+        }
+        if (!last || last->kind != AstStmtKind::Expr)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  last ? last->span : body.span,
+                                  lit_str("message branches require a terminal verdict"));
+        if (is_default) {
+            auto verdict = analyze_ws_default_verdict(last->expr, route, mod, documents, scope);
+            if (!verdict) return core::make_unexpected(verdict.error());
+            return route.ws_handler.default_verdict;
+        }
+        // A branch-local close() means 1000, independently of an else close policy.
+        return analyze_message_guard_verdict(last->expr, route, mod, documents, scope, true);
+    };
+    auto result = kAnalyze();
+    scope.locals.len = kSavedLocals;
+    return result;
+}
+
+// The same projection table describes typed proof values and their bounded
+// presence tests. Helpers reach it only after ordinary type checking/inlining.
+struct WsJsonProjection {
+    WsJsonBinding::Kind kind;
+    json::Op op;
+    HirTypeKind type;
+    WsLenGuard::Accessor accessor;
+};
+static constexpr WsJsonProjection kWsJsonProjections[] = {
+    {WsJsonBinding::Kind::Document,
+     json::Op::Parse,
+     HirTypeKind::Json,
+     WsLenGuard::Accessor::JsonValid},
+    {WsJsonBinding::Kind::SelectedValue,
+     json::Op::Get,
+     HirTypeKind::Json,
+     WsLenGuard::Accessor::JsonHasPath},
+    {WsJsonBinding::Kind::String,
+     json::Op::AsString,
+     HirTypeKind::Str,
+     WsLenGuard::Accessor::JsonStringValid},
+    {WsJsonBinding::Kind::NumberText,
+     json::Op::AsNumber,
+     HirTypeKind::Str,
+     WsLenGuard::Accessor::JsonNumberTextValid},
+    {WsJsonBinding::Kind::JsonStringify,
+     json::Op::Stringify,
+     HirTypeKind::Str,
+     WsLenGuard::Accessor::JsonStringifyValid},
+    {WsJsonBinding::Kind::Boolean,
+     json::Op::AsBool,
+     HirTypeKind::Bool,
+     WsLenGuard::Accessor::JsonBoolValid},
+    {WsJsonBinding::Kind::Integer,
+     json::Op::AsInt,
+     HirTypeKind::I64,
+     WsLenGuard::Accessor::JsonIntValid},
+    {WsJsonBinding::Kind::KindName,
+     json::Op::KindName,
+     HirTypeKind::Str,
+     WsLenGuard::Accessor::JsonHasPath},
+    {WsJsonBinding::Kind::Count,
+     json::Op::Count,
+     HirTypeKind::I32,
+     WsLenGuard::Accessor::JsonCountValid},
+};
+
+// Materialize a proof only in analyzer scratch. It remains a borrowed message
+// projection, never an HTTP local or a runtime JSON object. Earlier guards have
+// established presence, so the reconstructed projection is nonoptional.
+static FrontendResult<HirExpr> ws_json_proof_value(const WsJsonBinding& binding,
+                                                   Span span,
+                                                   WsCallbackScope& scope) {
+    if (binding.kind == WsJsonBinding::Kind::Value) {
+        if (!binding.value) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        return *binding.value;
+    }
+    HirExpr receiver{};
+    receiver.kind = HirExprKind::LocalRef;
+    receiver.type = HirTypeKind::WebSocketMessage;
+    receiver.local_index = 0;
+    receiver.span = span;
+    if (!scope.route->exprs.push(receiver)) return frontend_error(FrontendError::OutOfMemory, span);
+    HirExpr text{};
+    text.kind = HirExprKind::WsMessageField;
+    text.type = HirTypeKind::Str;
+    text.str_value = lit_str("text");
+    text.lhs = &scope.route->exprs[scope.route->exprs.len - 1];
+    text.span = span;
+    auto value = make_json_op(json::Op::Parse,
+                              HirTypeKind::Json,
+                              false,
+                              &text,
+                              nullptr,
+                              nullptr,
+                              span,
+                              scope.route.get());
+    if (!value) return value;
+    if (binding.path.len != 0) {
+        HirExpr pointer{};
+        pointer.kind = HirExprKind::StrLit;
+        pointer.type = HirTypeKind::Str;
+        pointer.str_value = binding.path;
+        pointer.span = span;
+        value = make_json_op(json::Op::Get,
+                             HirTypeKind::Json,
+                             false,
+                             &value.value(),
+                             &pointer,
+                             nullptr,
+                             span,
+                             scope.route.get());
+        if (!value) return value;
+    }
+    if (binding.kind == WsJsonBinding::Kind::Document ||
+        binding.kind == WsJsonBinding::Kind::SelectedValue)
+        return value;
+    for (const auto& projection : kWsJsonProjections) {
+        if (projection.kind != binding.kind) continue;
+        return make_json_op(projection.op,
+                            projection.type,
+                            false,
+                            &value.value(),
+                            nullptr,
+                            nullptr,
+                            span,
+                            scope.route.get());
+    }
+    return frontend_error(FrontendError::UnsupportedSyntax, span);
+}
+
+static FrontendResult<HirExpr> analyze_ws_proven_value(const AstExpr& expr,
+                                                       const HirModule& mod,
+                                                       const WsJsonBindings& documents,
+                                                       WsCallbackScope& scope) {
+    const u32 kSavedLocals = scope.locals.len;
+    const auto kAnalyze = [&]() -> FrontendResult<HirExpr> {
+        for (u32 i = 0; i < documents.len; ++i) {
+            const auto& binding = documents[i];
+            if (binding.kind == WsJsonBinding::Kind::Value) continue;
+            auto value = ws_json_proof_value(binding, expr.span, scope);
+            if (!value) return value;
+            HirLocal local{};
+            local.name = binding.name;
+            local.span = expr.span;
+            local.ref_index = scope.locals.len;
+            local.type = value->type;
+            local.shape_index = value->shape_index;
+            local.init = value.value();
+            if (!scope.locals.push(local))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
+        return analyze_ws_value(expr, scope, mod);
+    };
+    auto value = kAnalyze();
+    scope.locals.len = kSavedLocals;
+    return value;
+}
+
+// Helper inlining copies expression trees. Match only the concrete expression
+// forms accepted by the bounded message projection/selector lowerers, never an
+// arbitrary optional computation. No pointer identity or generated local survives.
+static bool ws_same_json_helper_expr(const HirExpr& a, const HirExpr& b, u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes || a.kind != b.kind || a.type != b.type ||
+        a.may_nil != b.may_nil || a.may_error != b.may_error)
+        return false;
+    const auto kKind = a.kind;
+    if (kKind != HirExprKind::BoolLit && kKind != HirExprKind::IntLit &&
+        kKind != HirExprKind::StrLit && kKind != HirExprKind::BytesLit &&
+        kKind != HirExprKind::ConstWsCase && kKind != HirExprKind::LocalRef &&
+        kKind != HirExprKind::WsMessageField && kKind != HirExprKind::BytesCount &&
+        kKind != HirExprKind::Eq && kKind != HirExprKind::Lt && kKind != HirExprKind::Gt &&
+        kKind != HirExprKind::Or && kKind != HirExprKind::IfElse && kKind != HirExprKind::JsonOp &&
+        kKind != HirExprKind::HasValue && kKind != HirExprKind::ValueOf &&
+        kKind != HirExprKind::RegexMatch && kKind != HirExprKind::Nil)
+        return false;
+    if (a.int_value != b.int_value || a.bool_value != b.bool_value ||
+        a.local_index != b.local_index || !a.str_value.eq(b.str_value) || a.args.len != b.args.len)
+        return false;
+    const auto kSame = [&](const HirExpr* lhs, const HirExpr* rhs) {
+        if (!lhs || !rhs) return lhs == rhs;
+        return ws_same_json_helper_expr(*lhs, *rhs, depth + 1);
+    };
+    if (!kSame(a.lhs, b.lhs) || !kSame(a.rhs, b.rhs)) return false;
+    for (u32 i = 0; i < a.args.len; ++i)
+        if (!kSame(a.args[i], b.args[i])) return false;
+    return true;
+}
+
+struct WsJsonHelperProof {
+    const HirExpr* source = nullptr;
+    WsJsonBinding binding{};
+};
+struct WsJsonHelperProofs {
+    FixedVec<WsJsonHelperProof, HirWsHandler::kMaxConditionNodes> entries;
+    NodePool<HirExpr>& retained;
+    explicit WsJsonHelperProofs(NodePool<HirExpr>& values) : retained(values) {}
+};
+
+static const WsJsonBinding* ws_json_helper_proof(const HirExpr& source,
+                                                 const WsJsonHelperProofs& proofs) {
+    for (u32 i = proofs.entries.len; i != 0; --i)
+        if (proofs.entries[i - 1].source &&
+            ws_same_json_helper_expr(source, *proofs.entries[i - 1].source))
+            return &proofs.entries[i - 1].binding;
+    return nullptr;
+}
+
+// Successful ordinary optional bindings can occur in helper selectors and
+// literal pointer arguments. Replace only their scoped ValueOf proofs; JSON
+// proofs keep their dedicated projection representation.
+static FrontendResult<HirExpr> ws_resolve_value_proofs(const HirExpr& value,
+                                                       WsJsonHelperProofs& proofs,
+                                                       u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::TooManyItems, value.span);
+    if (value.kind == HirExprKind::ValueOf && value.lhs) {
+        const auto* proof = ws_json_helper_proof(*value.lhs, proofs);
+        if (proof && proof->kind == WsJsonBinding::Kind::Value && proof->value)
+            return *proof->value;
+    }
+    HirExpr result = value;
+    const auto kChild = [&](const HirExpr* child) -> FrontendResult<HirExpr*> {
+        if (!child) return static_cast<HirExpr*>(nullptr);
+        auto resolved = ws_resolve_value_proofs(*child, proofs, depth + 1);
+        if (!resolved) return core::make_unexpected(resolved.error());
+        if (!proofs.retained.push(resolved.value()))
+            return frontend_error(FrontendError::OutOfMemory, child->span);
+        return &proofs.retained[proofs.retained.len - 1];
+    };
+    auto lhs = kChild(value.lhs);
+    if (!lhs) return core::make_unexpected(lhs.error());
+    result.lhs = lhs.value();
+    auto rhs = kChild(value.rhs);
+    if (!rhs) return core::make_unexpected(rhs.error());
+    result.rhs = rhs.value();
+    for (u32 i = 0; i < value.args.len; ++i) {
+        auto arg = kChild(value.args[i]);
+        if (!arg) return core::make_unexpected(arg.error());
+        result.args[i] = arg.value();
+    }
+    return result;
+}
+
+// Only earlier proven, immutable message projections may supply Json arguments.
+// Mutations, fallback expressions and helper control flow cannot masquerade as
+// a root-relative projection. Bound depth independently of helper nesting.
+static FrontendResult<Str> ws_json_proof_path(const HirExpr& value,
+                                              const HirModule& mod,
+                                              const WsJsonHelperProofs& proofs,
+                                              u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    if (value.kind == HirExprKind::ValueOf && value.lhs && value.type == HirTypeKind::Json &&
+        !value.may_nil && !value.may_error) {
+        const auto* proof = ws_json_helper_proof(*value.lhs, proofs);
+        if (proof && (proof->kind == WsJsonBinding::Kind::Document ||
+                      proof->kind == WsJsonBinding::Kind::SelectedValue))
+            return proof->path;
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              value.span,
+                              lit_str("message JSON input requires a reached binding proof"));
+    }
+    if (value.type != HirTypeKind::Json || value.may_nil || value.may_error ||
+        value.kind != HirExprKind::JsonOp || value.args.len == 0 || !value.args[0])
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    if (value.int_value == static_cast<i64>(json::Op::Parse) && value.args.len == 1 &&
+        ws_typed_field(*value.args[0], lit_str("text")))
+        return Str{};
+    if (value.int_value != static_cast<i64>(json::Op::Get) || value.args.len != 2 ||
+        !value.args[1] || value.args[1]->kind != HirExprKind::StrLit)
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    auto source = ws_json_proof_path(*value.args[0], mod, proofs, depth + 1);
+    if (!source) return core::make_unexpected(source.error());
+    return ws_json_append_path(source.value(), value.args[1]->str_value, value.span, mod);
+}
+
+// One-sided optional helper branches lower to a lazy conjunction. Each reached
+// selector runs once; its rejected path returns absence without extracting JSON.
+// This compact fast path denotes one immutable projection. Different value
+// alternatives use continuation specialization below, without a runtime value slot.
+static FrontendResult<u32> lower_ws_json_optional(const HirExpr& value,
+                                                  WsVerdict verdict,
+                                                  HirRoute& route,
+                                                  const HirModule& mod,
+                                                  WsJsonBinding& binding,
+                                                  WsJsonHelperProofs& proofs,
+                                                  bool is_operand = false,
+                                                  u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::TooManyItems, value.span);
+    if (value.may_error) return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    if (value.kind == HirExprKind::IfElse && value.lhs && value.rhs && value.args.len == 1 &&
+        value.args[0]) {
+        const bool kNilThen = value.rhs->kind == HirExprKind::Nil;
+        const bool kNilElse = value.args[0]->kind == HirExprKind::Nil;
+        if (kNilThen == kNilElse)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  value.span,
+                                  lit_str("message optional helpers require one supported value "
+                                          "and a nil alternative"));
+        const u32 kSavedProofs = proofs.entries.len;
+        FrontendResult<u32> condition =
+            frontend_error(FrontendError::UnsupportedSyntax, value.span);
+        if (value.lhs->kind == HirExprKind::HasValue && value.lhs->lhs) {
+            WsJsonBinding selected{};
+            condition = lower_ws_json_optional(
+                *value.lhs->lhs, verdict, route, mod, selected, proofs, true, depth + 1);
+            if (!condition) return core::make_unexpected(condition.error());
+            if (kNilThen) {
+                route.ws_handler.len_guards[condition.value()].negate ^= true;
+            } else if (!proofs.entries.push({value.lhs->lhs, selected})) {
+                return frontend_error(FrontendError::TooManyItems, value.span);
+            }
+        } else {
+            auto resolved = ws_resolve_value_proofs(*value.lhs, proofs);
+            if (!resolved) return core::make_unexpected(resolved.error());
+            condition = lower_ws_typed_condition(
+                resolved.value(), verdict, route.ws_handler, true, kNilThen, depth + 1);
+            if (!condition) return core::make_unexpected(condition.error());
+        }
+        auto present = lower_ws_json_optional(kNilThen ? *value.args[0] : *value.rhs,
+                                              verdict,
+                                              route,
+                                              mod,
+                                              binding,
+                                              proofs,
+                                              true,
+                                              depth + 1);
+        proofs.entries.len = kSavedProofs;
+        if (!present) return core::make_unexpected(present.error());
+        WsLenGuard node{};
+        node.accessor = WsLenGuard::Accessor::And;
+        node.verdict = verdict;
+        node.is_operand = is_operand;
+        node.lhs = condition.value();
+        node.rhs = present.value();
+        if (!route.ws_handler.len_guards.push(node))
+            return frontend_error(FrontendError::TooManyItems, value.span);
+        return route.ws_handler.len_guards.len - 1;
+    }
+    if (value.kind == HirExprKind::ValueOf && value.lhs && !value.may_nil) {
+        const auto* proof = ws_json_helper_proof(*value.lhs, proofs);
+        if (!proof)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                value.span,
+                lit_str("message optional value requires a reached binding proof"));
+        binding.kind = proof->kind;
+        binding.path = proof->path;
+        binding.value = proof->value;
+        WsLenGuard node{};
+        node.accessor = WsLenGuard::Accessor::Constant;
+        node.bound = 1;
+        node.verdict = verdict;
+        node.is_operand = is_operand;
+        if (!route.ws_handler.len_guards.push(node))
+            return frontend_error(FrontendError::TooManyItems, value.span);
+        return route.ws_handler.len_guards.len - 1;
+    }
+    auto resolved = ws_resolve_value_proofs(value, proofs);
+    if (!resolved) return core::make_unexpected(resolved.error());
+    if (ws_infallible_binding(resolved.value())) {
+        if (!proofs.retained.push(resolved.value()))
+            return frontend_error(FrontendError::OutOfMemory, value.span);
+        binding.kind = WsJsonBinding::Kind::Value;
+        binding.value = &proofs.retained[proofs.retained.len - 1];
+        WsLenGuard node{};
+        node.accessor = WsLenGuard::Accessor::Constant;
+        node.bound = 1;
+        node.verdict = verdict;
+        node.is_operand = is_operand;
+        if (!route.ws_handler.len_guards.push(node))
+            return frontend_error(FrontendError::TooManyItems, value.span);
+        return route.ws_handler.len_guards.len - 1;
+    }
+    if (value.kind != HirExprKind::JsonOp || value.args.len == 0 || !value.args[0])
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            value.span,
+            lit_str("message optional bindings require a supported value or JSON projection"));
+    for (const auto& projection : kWsJsonProjections) {
+        if (value.int_value != static_cast<i64>(projection.op)) continue;
+        binding.kind = projection.kind;
+        WsLenGuard node{};
+        node.verdict = verdict;
+        node.is_operand = is_operand;
+        node.accessor = projection.accessor;
+        if (projection.kind == WsJsonBinding::Kind::Document) {
+            auto text = ws_resolve_value_proofs(*value.args[0], proofs);
+            if (!text) return core::make_unexpected(text.error());
+            if (value.args.len != 1 || !ws_typed_field(text.value(), lit_str("text")))
+                return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+        } else {
+            auto path = ws_json_proof_path(*value.args[0], mod, proofs);
+            if (!path) return core::make_unexpected(path.error());
+            if (projection.kind == WsJsonBinding::Kind::SelectedValue) {
+                if (value.args.len != 2 || !value.args[1])
+                    return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+                auto pointer = ws_resolve_value_proofs(*value.args[1], proofs);
+                if (!pointer) return core::make_unexpected(pointer.error());
+                if (pointer->kind != HirExprKind::StrLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+                path = ws_json_append_path(path.value(), pointer->str_value, value.span, mod);
+                if (!path) return core::make_unexpected(path.error());
+            } else if (value.args.len != 1) {
+                return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+            }
+            binding.path = path.value();
+            node.pattern = path.value();
+        }
+        if (!route.ws_handler.len_guards.push(node))
+            return frontend_error(FrontendError::TooManyItems, value.span);
+        return route.ws_handler.len_guards.len - 1;
+    }
+    return frontend_error(FrontendError::UnsupportedSyntax,
+                          value.span,
+                          lit_str("message optional bindings require parse/get/scalar JSON "
+                                  "projections, directly or through pure helpers"));
+}
+
+// JSON proof aliases share ordinary type checking with pure projection helpers.
+static FrontendResult<HirExpr> analyze_ws_json_initializer(const AstStatement& stmt,
+                                                           HirRoute& route,
+                                                           const HirModule& mod,
+                                                           WsJsonBindings& documents,
+                                                           WsCallbackScope& scope) {
+    bool collision =
+        stmt.name.eq(route.ws_handler.parameter_name) || stmt.name.eq(lit_str("json")) ||
+        user_bound_ident_name(mod, scope.locals.data, scope.locals.len, nullptr, stmt.name);
+    for (const auto& binding : documents) collision |= binding.name.eq(stmt.name);
+    if (collision)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("message guard bindings require a fresh name"));
+    auto value = analyze_ws_proven_value(stmt.expr, mod, documents, scope);
+    if (!value) return core::make_unexpected(value.error());
+    if (!value->may_nil || value->may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    return value.value();
+}
+
+static FrontendResult<u32> analyze_ws_json_binding_value(const AstStatement& stmt,
+                                                         const HirExpr& value,
+                                                         WsVerdict verdict,
+                                                         HirRoute& route,
+                                                         const HirModule& mod,
+                                                         WsJsonBindings& documents,
+                                                         WsCallbackScope& scope) {
+    WsJsonBinding binding{};
+    binding.name = stmt.name;
+    WsJsonHelperProofs proofs{scope.normalized->exprs};
+    auto root = lower_ws_json_optional(value, verdict, route, mod, binding, proofs);
+    if (!root) return core::make_unexpected(root.error());
+    auto published = ws_publish_value_binding(binding, scope);
+    if (!published) return core::make_unexpected(published.error());
+    if (!documents.push(binding)) return frontend_error(FrontendError::TooManyItems, stmt.span);
+    return root.value();
+}
+
+static FrontendResult<u32> analyze_ws_json_binding(const AstStatement& stmt,
+                                                   WsVerdict verdict,
+                                                   HirRoute& route,
+                                                   const HirModule& mod,
+                                                   WsJsonBindings& documents,
+                                                   WsCallbackScope& scope) {
+    auto value = analyze_ws_json_initializer(stmt, route, mod, documents, scope);
+    if (!value) return core::make_unexpected(value.error());
+    return analyze_ws_json_binding_value(
+        stmt, value.value(), verdict, route, mod, documents, scope);
+}
+
+static FrontendResult<u32> analyze_ws_branch_guard(const AstStatement& stmt,
+                                                   HirRoute& route,
+                                                   const HirModule& mod,
+                                                   WsJsonBindings& documents,
+                                                   WsCallbackScope& scope,
+                                                   u32& conditional_count) {
+    if (stmt.kind != AstStmtKind::Guard || !stmt.else_stmt ||
+        stmt.else_stmt->kind != AstStmtKind::Expr)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    if (++conditional_count > HirWsHandler::kMaxLenGuards)
+        return frontend_error(FrontendError::TooManyItems, stmt.span);
+    auto verdict =
+        analyze_message_guard_verdict(stmt.else_stmt->expr, route, mod, documents, scope);
+    if (!verdict) return core::make_unexpected(verdict.error());
+    if (stmt.bind_value)
+        return analyze_ws_json_binding(stmt, verdict.value(), route, mod, documents, scope);
+    return analyze_message_condition(stmt.expr, verdict.value(), route, mod, documents, scope);
+}
+
+// A nested arm still terminates on every path. Targets select a later root or
+// an action, rather than cloning its ancestor's predicates into each leaf.
+static FrontendResult<u32> analyze_ws_tree_branch(const AstStatement& body,
+                                                  HirRoute& route,
+                                                  const HirModule& mod,
+                                                  WsJsonBindings& documents,
+                                                  WsCallbackScope& scope,
+                                                  bool default_tail,
+                                                  u32& conditional_count);
+
+// Alternative values specialize the callback continuation; no value slot crosses
+// the handler ABI. Nil edges are patched only after their shared continuation exists.
+static bool ws_optional_has_choices(const HirExpr& value, u32 depth = 0, bool result = true) {
+    if (depth >= HirWsHandler::kMaxConditionNodes) return true;
+    if (value.kind == HirExprKind::Or) return true;
+    if (value.kind == HirExprKind::ValueOf || value.kind == HirExprKind::HasValue)
+        return value.lhs && ws_optional_has_choices(*value.lhs, depth + 1, true);
+    if (value.kind == HirExprKind::IfElse && value.rhs && value.args.len == 1 && value.args[0]) {
+        if (result && value.rhs->kind != HirExprKind::Nil &&
+            value.args[0]->kind != HirExprKind::Nil)
+            return true;
+        if (value.lhs && ws_optional_has_choices(*value.lhs, depth + 1, false)) return true;
+        return ws_optional_has_choices(*value.rhs, depth + 1, result) ||
+               ws_optional_has_choices(*value.args[0], depth + 1, result);
+    }
+    if (value.lhs && ws_optional_has_choices(*value.lhs, depth + 1, false)) return true;
+    if (value.rhs && ws_optional_has_choices(*value.rhs, depth + 1, false)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && ws_optional_has_choices(*value.args[i], depth + 1, false)) return true;
+    return false;
+}
+
+struct WsOptionalEdge {
+    u32 root = 0;
+    bool pass = false;
+};
+using WsOptionalEdges = FixedVec<WsOptionalEdge, 2 * HirWsHandler::kMaxConditionNodes>;
+struct WsOptionalTarget {
+    u32 entry = kWsControlNext;
+    WsOptionalEdges* pending = nullptr;
+};
+using WsOptionalSuccess = FrontendResult<WsOptionalTarget> (*)(const WsJsonBinding&, void*);
+
+static FrontendResult<void> ws_optional_connect(WsOptionalEdge edge,
+                                                WsOptionalTarget target,
+                                                HirRoute& route,
+                                                Span span) {
+    if (target.entry == kWsControlNext) {
+        if (!target.pending || !target.pending->push(edge))
+            return frontend_error(FrontendError::TooManyItems, span);
+    } else {
+        auto& node = route.ws_handler.len_guards[edge.root];
+        if (edge.pass)
+            node.pass_target = target.entry;
+        else
+            node.fail_target = target.entry;
+    }
+    return {};
+}
+
+static FrontendResult<void> ws_optional_patch(const WsOptionalEdges& edges,
+                                              WsOptionalTarget target,
+                                              HirRoute& route,
+                                              Span span) {
+    for (u32 i = 0; i < edges.len; ++i) {
+        auto linked = ws_optional_connect(edges[i], target, route, span);
+        if (!linked) return linked;
+    }
+    return {};
+}
+
+static FrontendResult<WsOptionalTarget> lower_ws_optional_choices(const HirExpr& value,
+                                                                  HirRoute& route,
+                                                                  const HirModule& mod,
+                                                                  WsJsonHelperProofs& proofs,
+                                                                  WsOptionalEdges& failures,
+                                                                  WsOptionalSuccess success,
+                                                                  void* context,
+                                                                  u32 depth = 0) {
+    if (depth >= HirWsHandler::kMaxConditionNodes)
+        return frontend_error(FrontendError::TooManyItems, value.span);
+    if (value.may_error) return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    if (value.kind == HirExprKind::Nil) return WsOptionalTarget{kWsControlNext, &failures};
+    if (value.kind == HirExprKind::Or && value.lhs && value.rhs) {
+        // any()/or() evaluates its operands eagerly in the ordinary language.
+        // Only an infallible, immutable fallback can be specialized lazily here.
+        auto fallback = ws_resolve_value_proofs(*value.rhs, proofs);
+        if (!fallback) return core::make_unexpected(fallback.error());
+        if (value.lhs->may_error || !ws_infallible_binding(fallback.value()))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                value.span,
+                lit_str("message optional fallback requires an infallible value"));
+        HirExpr present{};
+        present.kind = HirExprKind::HasValue;
+        present.type = HirTypeKind::Bool;
+        present.lhs = value.lhs;
+        present.span = value.span;
+        HirExpr unwrapped{};
+        unwrapped.kind = HirExprKind::ValueOf;
+        unwrapped.type = value.lhs->type;
+        unwrapped.shape_index = value.lhs->shape_index;
+        unwrapped.lhs = value.lhs;
+        unwrapped.span = value.span;
+        HirExpr choice = value;
+        choice.kind = HirExprKind::IfElse;
+        choice.lhs = &present;
+        choice.rhs = &unwrapped;
+        choice.args.len = 0;
+        if (!choice.args.push(&fallback.value()))
+            return frontend_error(FrontendError::TooManyItems, value.span);
+        return lower_ws_optional_choices(
+            choice, route, mod, proofs, failures, success, context, depth + 1);
+    }
+    if (value.kind == HirExprKind::IfElse && value.lhs && value.rhs && value.args.len == 1 &&
+        value.args[0]) {
+        if (value.lhs->kind == HirExprKind::HasValue && value.lhs->lhs) {
+            // The selector itself may choose a value. Each success gets its own
+            // proof; selector absence alone enters the helper's else expression.
+            struct Continuation {
+                const HirExpr& source;
+                const HirExpr& body;
+                HirRoute& route;
+                const HirModule& mod;
+                WsJsonHelperProofs& proofs;
+                WsOptionalEdges& failures;
+                WsOptionalSuccess success;
+                void* context;
+                u32 depth;
+            } continuation{*value.lhs->lhs,
+                           *value.rhs,
+                           route,
+                           mod,
+                           proofs,
+                           failures,
+                           success,
+                           context,
+                           depth + 1};
+            const auto kContinue = [](const WsJsonBinding& binding,
+                                      void* opaque) -> FrontendResult<WsOptionalTarget> {
+                auto& next = *static_cast<Continuation*>(opaque);
+                const u32 kSavedProofs = next.proofs.entries.len;
+                if (!next.proofs.entries.push({&next.source, binding}))
+                    return frontend_error(FrontendError::TooManyItems, next.body.span);
+                auto result = lower_ws_optional_choices(next.body,
+                                                        next.route,
+                                                        next.mod,
+                                                        next.proofs,
+                                                        next.failures,
+                                                        next.success,
+                                                        next.context,
+                                                        next.depth);
+                next.proofs.entries.len = kSavedProofs;
+                return result;
+            };
+            WsOptionalEdges missing{};
+            auto selected = lower_ws_optional_choices(
+                *value.lhs->lhs, route, mod, proofs, missing, kContinue, &continuation, depth + 1);
+            if (!selected) return core::make_unexpected(selected.error());
+            auto other = lower_ws_optional_choices(
+                *value.args[0], route, mod, proofs, failures, success, context, depth + 1);
+            if (!other) return core::make_unexpected(other.error());
+            auto linked = ws_optional_patch(missing, other.value(), route, value.span);
+            if (!linked) return core::make_unexpected(linked.error());
+            return selected->entry == kWsControlNext ? other.value() : selected.value();
+        }
+        auto resolved = ws_resolve_value_proofs(*value.lhs, proofs);
+        if (!resolved) return core::make_unexpected(resolved.error());
+        auto condition = lower_ws_typed_condition(
+            resolved.value(), WsVerdict::Drop, route.ws_handler, false, false, depth + 1);
+        if (!condition) return core::make_unexpected(condition.error());
+        auto yes = lower_ws_optional_choices(
+            *value.rhs, route, mod, proofs, failures, success, context, depth + 1);
+        if (!yes) return core::make_unexpected(yes.error());
+        auto no = lower_ws_optional_choices(
+            *value.args[0], route, mod, proofs, failures, success, context, depth + 1);
+        if (!no) return core::make_unexpected(no.error());
+        auto linked =
+            ws_optional_connect({condition.value(), true}, yes.value(), route, value.span);
+        if (!linked) return core::make_unexpected(linked.error());
+        linked = ws_optional_connect({condition.value(), false}, no.value(), route, value.span);
+        if (!linked) return core::make_unexpected(linked.error());
+        return WsOptionalTarget{condition.value(), nullptr};
+    }
+    WsJsonBinding binding{};
+    auto present = lower_ws_json_optional(value, WsVerdict::Drop, route, mod, binding, proofs);
+    if (!present) return core::make_unexpected(present.error());
+    auto target = success(binding, context);
+    if (!target) return core::make_unexpected(target.error());
+    auto linked = ws_optional_connect({present.value(), true}, target.value(), route, value.span);
+    if (!linked) return core::make_unexpected(linked.error());
+    linked = ws_optional_connect(
+        {present.value(), false}, {kWsControlNext, &failures}, route, value.span);
+    if (!linked) return core::make_unexpected(linked.error());
+    return WsOptionalTarget{present.value(), nullptr};
+}
+
+struct WsChoiceBody {
+    Str name;
+    const AstStatement& body;
+    HirRoute& route;
+    const HirModule& mod;
+    WsJsonBindings& documents;
+    WsCallbackScope& scope;
+    bool default_tail;
+    u32 base_count;
+    u32 max_count;
+    u32 successes = 0;
+};
+
+static FrontendResult<WsOptionalTarget> analyze_ws_choice_body(const WsJsonBinding& binding,
+                                                               void* opaque) {
+    auto& next = *static_cast<WsChoiceBody*>(opaque);
+    const u32 kSavedBindings = next.documents.len;
+    const u32 kSavedLocals = next.scope.locals.len;
+    WsJsonBinding named = binding;
+    named.name = next.name;
+    if (!next.documents.push(named))
+        return frontend_error(FrontendError::TooManyItems, next.body.span);
+    auto published = ws_publish_value_binding(named, next.scope);
+    if (!published) {
+        next.documents.len = kSavedBindings;
+        return core::make_unexpected(published.error());
+    }
+    u32 count = next.base_count;
+    // The first specialization retains the lexical default recipe. Later ones
+    // use branch policies, so they cannot overwrite that default's JSON path.
+    const bool kDefault = next.default_tail && next.successes == 0;
+    ++next.successes;
+    auto entry = analyze_ws_tree_branch(
+        next.body, next.route, next.mod, next.documents, next.scope, kDefault, count);
+    next.documents.len = kSavedBindings;
+    next.scope.locals.len = kSavedLocals;
+    if (!entry) return core::make_unexpected(entry.error());
+    if (count > next.max_count) next.max_count = count;
+    return WsOptionalTarget{entry.value(), nullptr};
+}
+
+struct WsTreeControl {
+    u32 entry = 0;
+    u32 continuation = 0;
+};
+
+static FrontendResult<WsTreeControl> analyze_ws_choice_if(const AstStatement& stmt,
+                                                          const HirExpr& value,
+                                                          HirRoute& route,
+                                                          const HirModule& mod,
+                                                          WsJsonBindings& documents,
+                                                          WsCallbackScope& scope,
+                                                          bool default_tail,
+                                                          bool terminal,
+                                                          u32& conditional_count) {
+    WsChoiceBody next{stmt.name,
+                      *stmt.then_stmt,
+                      route,
+                      mod,
+                      documents,
+                      scope,
+                      false,
+                      conditional_count,
+                      conditional_count};
+    WsOptionalEdges failures{};
+    WsJsonHelperProofs proofs{scope.normalized->exprs};
+    auto entry = lower_ws_optional_choices(
+        value, route, mod, proofs, failures, analyze_ws_choice_body, &next);
+    if (!entry) return core::make_unexpected(entry.error());
+    if (next.successes == 0 || entry->entry == kWsControlNext)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    conditional_count = next.max_count;
+    u32 continuation = entry->entry;
+    u32 no = 0;
+    if (terminal) {
+        auto other = analyze_ws_tree_branch(
+            *stmt.else_stmt, route, mod, documents, scope, default_tail, conditional_count);
+        if (!other) return core::make_unexpected(other.error());
+        no = other.value();
+    } else {
+        // Enclosing sequences must patch the absence join, never the selector's
+        // false edge (which may select a different successful value).
+        WsLenGuard join{};
+        join.accessor = WsLenGuard::Accessor::Constant;
+        join.pass_target = kWsControlDefault;
+        if (!route.ws_handler.len_guards.push(join))
+            return frontend_error(FrontendError::TooManyItems, stmt.span);
+        continuation = route.ws_handler.len_guards.len - 1;
+        no = continuation;
+        route.ws_handler.len_guards[continuation].fail_target =
+            ws_control_after(route.ws_handler.len_guards.len);
+    }
+    auto linked = ws_optional_patch(failures, {no, nullptr}, route, stmt.span);
+    if (!linked) return core::make_unexpected(linked.error());
+    return WsTreeControl{entry->entry, continuation};
+}
+
+static FrontendResult<u32> analyze_ws_choice_guard(const AstStatement& stmt,
+                                                   const HirExpr& value,
+                                                   WsVerdict verdict,
+                                                   const AstStatement& tail,
+                                                   HirRoute& route,
+                                                   const HirModule& mod,
+                                                   WsJsonBindings& documents,
+                                                   WsCallbackScope& scope,
+                                                   bool default_tail,
+                                                   u32& conditional_count) {
+    WsChoiceBody next{stmt.name,
+                      tail,
+                      route,
+                      mod,
+                      documents,
+                      scope,
+                      default_tail,
+                      conditional_count,
+                      conditional_count};
+    WsOptionalEdges failures{};
+    WsJsonHelperProofs proofs{scope.normalized->exprs};
+    auto entry = lower_ws_optional_choices(
+        value, route, mod, proofs, failures, analyze_ws_choice_body, &next);
+    if (!entry) return core::make_unexpected(entry.error());
+    if (next.successes == 0 || entry->entry == kWsControlNext)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    conditional_count = next.max_count;
+    auto linked = ws_optional_patch(
+        failures, {ws_control_return(static_cast<u8>(verdict)), nullptr}, route, stmt.span);
+    if (!linked) return core::make_unexpected(linked.error());
+    return entry->entry;
+}
+
+static AstStatement ws_remaining_body(const AstStatement& body, u32 first) {
+    AstStatement tail{};
+    tail.kind = AstStmtKind::Block;
+    tail.span = body.span;
+    for (u32 i = first; i < body.block_stmts.len; ++i)
+        (void)tail.block_stmts.push(body.block_stmts[i]);
+    return tail;
+}
+
+static FrontendResult<WsTreeControl> analyze_ws_tree_if(const AstStatement& stmt,
+                                                        HirRoute& route,
+                                                        const HirModule& mod,
+                                                        WsJsonBindings& documents,
+                                                        WsCallbackScope& scope,
+                                                        bool default_tail,
+                                                        bool terminal,
+                                                        u32& conditional_count) {
+    if (stmt.kind != AstStmtKind::If || !stmt.then_stmt ||
+        (terminal ? !stmt.else_stmt : stmt.else_stmt != nullptr))
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    if (++conditional_count > HirWsHandler::kMaxLenGuards)
+        return frontend_error(FrontendError::TooManyItems, stmt.span);
+    const u32 kSavedBindings = documents.len;
+    const u32 kSavedLocals = scope.locals.len;
+    FrontendResult<u32> root = frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    if (stmt.bind_value) {
+        auto value = analyze_ws_json_initializer(stmt, route, mod, documents, scope);
+        if (!value) return core::make_unexpected(value.error());
+        if (ws_optional_has_choices(value.value()))
+            return analyze_ws_choice_if(stmt,
+                                        value.value(),
+                                        route,
+                                        mod,
+                                        documents,
+                                        scope,
+                                        default_tail,
+                                        terminal,
+                                        conditional_count);
+        root = analyze_ws_json_binding_value(
+            stmt, value.value(), WsVerdict::Drop, route, mod, documents, scope);
+    } else {
+        root = analyze_message_condition(stmt.expr, WsVerdict::Drop, route, mod, documents, scope);
+    }
+    if (!root) {
+        documents.len = kSavedBindings;
+        scope.locals.len = kSavedLocals;
+        return core::make_unexpected(root.error());
+    }
+    auto yes = analyze_ws_tree_branch(
+        *stmt.then_stmt, route, mod, documents, scope, false, conditional_count);
+    documents.len = kSavedBindings;
+    scope.locals.len = kSavedLocals;
+    if (!yes) return core::make_unexpected(yes.error());
+    u32 no = ws_control_after(route.ws_handler.len_guards.len);
+    if (terminal) {
+        auto other = analyze_ws_tree_branch(
+            *stmt.else_stmt, route, mod, documents, scope, default_tail, conditional_count);
+        if (!other) return core::make_unexpected(other.error());
+        no = other.value();
+    }
+    auto& node = route.ws_handler.len_guards[root.value()];
+    node.pass_target = yes.value();
+    node.fail_target = no;
+    return WsTreeControl{root.value(), root.value()};
+}
+
+static FrontendResult<u32> analyze_ws_tree_branch(const AstStatement& body,
+                                                  HirRoute& route,
+                                                  const HirModule& mod,
+                                                  WsJsonBindings& documents,
+                                                  WsCallbackScope& scope,
+                                                  bool default_tail,
+                                                  u32& conditional_count) {
+    const u32 kSavedLocals = scope.locals.len;
+    const u32 kSavedBindings = documents.len;
+    const auto kAnalyze = [&]() -> FrontendResult<u32> {
+        u32 entry = kWsControlNext;
+        u32 pending = kWsControlNext;
+        bool pending_fail = false;
+        const auto kContinueAt = [&](u32 target) {
+            if (pending == kWsControlNext) return;
+            auto& node = route.ws_handler.len_guards[pending];
+            if (pending_fail)
+                node.fail_target = target;
+            else
+                node.pass_target = target;
+        };
+        const AstStatement* last = &body;
+        if (body.kind == AstStmtKind::Block) {
+            if (body.block_stmts.len == 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, body.span);
+            for (u32 i = 0; i + 1 < body.block_stmts.len; ++i) {
+                const auto* statement = body.block_stmts[i];
+                if (!statement) return frontend_error(FrontendError::UnsupportedSyntax, body.span);
+                if (statement->kind == AstStmtKind::Let) {
+                    auto binding = analyze_ws_binding(*statement, scope, mod, documents);
+                    if (!binding) return core::make_unexpected(binding.error());
+                    continue;
+                }
+                WsTreeControl control{};
+                if (statement->kind == AstStmtKind::Guard && statement->bind_value) {
+                    if (!statement->else_stmt || statement->else_stmt->kind != AstStmtKind::Expr)
+                        return frontend_error(FrontendError::UnsupportedSyntax, statement->span);
+                    if (++conditional_count > HirWsHandler::kMaxLenGuards)
+                        return frontend_error(FrontendError::TooManyItems, statement->span);
+                    auto verdict = analyze_message_guard_verdict(
+                        statement->else_stmt->expr, route, mod, documents, scope);
+                    if (!verdict) return core::make_unexpected(verdict.error());
+                    auto value =
+                        analyze_ws_json_initializer(*statement, route, mod, documents, scope);
+                    if (!value) return core::make_unexpected(value.error());
+                    if (ws_optional_has_choices(value.value())) {
+                        auto tail = ws_remaining_body(body, i + 1);
+                        auto selected = analyze_ws_choice_guard(*statement,
+                                                                value.value(),
+                                                                verdict.value(),
+                                                                tail,
+                                                                route,
+                                                                mod,
+                                                                documents,
+                                                                scope,
+                                                                default_tail,
+                                                                conditional_count);
+                        if (!selected) return core::make_unexpected(selected.error());
+                        kContinueAt(selected.value());
+                        return entry == kWsControlNext ? selected.value() : entry;
+                    }
+                    auto root = analyze_ws_json_binding_value(
+                        *statement, value.value(), verdict.value(), route, mod, documents, scope);
+                    if (!root) return core::make_unexpected(root.error());
+                    control = {root.value(), root.value()};
+                } else if (statement->kind == AstStmtKind::Guard) {
+                    auto root = analyze_ws_branch_guard(
+                        *statement, route, mod, documents, scope, conditional_count);
+                    if (!root) return core::make_unexpected(root.error());
+                    control = {root.value(), root.value()};
+                } else {
+                    auto branch = analyze_ws_tree_if(
+                        *statement, route, mod, documents, scope, false, false, conditional_count);
+                    if (!branch) return core::make_unexpected(branch.error());
+                    control = branch.value();
+                }
+                kContinueAt(control.entry);
+                if (entry == kWsControlNext) entry = control.entry;
+                pending = control.continuation;
+                pending_fail = statement->kind == AstStmtKind::If;
+            }
+            last = body.block_stmts[body.block_stmts.len - 1];
+        }
+        if (!last) return frontend_error(FrontendError::UnsupportedSyntax, body.span);
+        const auto kTail = [&]() -> FrontendResult<u32> {
+            if (last->kind == AstStmtKind::If) {
+                auto branch = analyze_ws_tree_if(
+                    *last, route, mod, documents, scope, default_tail, true, conditional_count);
+                if (!branch) return core::make_unexpected(branch.error());
+                return branch->entry;
+            }
+            if (last->kind != AstStmtKind::Expr)
+                return frontend_error(FrontendError::UnsupportedSyntax, last->span);
+            if (default_tail) {
+                auto verdict = analyze_ws_default_verdict(last->expr, route, mod, documents, scope);
+                if (!verdict) return core::make_unexpected(verdict.error());
+                return kWsControlDefault;
+            }
+            auto verdict =
+                analyze_message_guard_verdict(last->expr, route, mod, documents, scope, true);
+            if (!verdict) return core::make_unexpected(verdict.error());
+            return ws_control_return(static_cast<u8>(verdict.value()));
+        };
+        auto tail = kTail();
+        if (!tail) return core::make_unexpected(tail.error());
+        kContinueAt(tail.value());
+        return entry == kWsControlNext ? tail.value() : entry;
+    };
+    auto result = kAnalyze();
+    scope.locals.len = kSavedLocals;
+    documents.len = kSavedBindings;
+    return result;
+}
+
+static bool ws_if_needs_control_targets(const AstStatement& stmt) {
+    if (stmt.bind_value) return true;
+    const auto kNested = [](const AstStatement* branch) {
+        if (!branch) return false;
+        if (branch->kind == AstStmtKind::If) return true;
+        if (branch->kind != AstStmtKind::Block) return false;
+        for (u32 i = 0; i < branch->block_stmts.len; ++i) {
+            const auto* statement = branch->block_stmts[i];
+            if (statement &&
+                (statement->kind == AstStmtKind::If || statement->kind == AstStmtKind::Guard))
+                return true;
+        }
+        return false;
+    };
+    if (kNested(stmt.then_stmt)) return true;
+    if (stmt.else_stmt && stmt.else_stmt->kind == AstStmtKind::If)
+        return ws_if_needs_control_targets(*stmt.else_stmt);
+    return kNested(stmt.else_stmt);
+}
+
+static FrontendResult<void> analyze_ws_if(const AstStatement& stmt,
+                                          HirRoute& route,
+                                          const HirModule& mod,
+                                          WsJsonBindings& documents,
+                                          WsCallbackScope& scope,
+                                          bool terminal,
+                                          u32& conditional_count) {
+    if (stmt.kind != AstStmtKind::If || !stmt.then_stmt ||
+        (terminal ? !stmt.else_stmt : stmt.else_stmt != nullptr))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("terminal message if requires else; earlier if must omit else"));
+    if (ws_if_needs_control_targets(stmt)) {
+        auto root = analyze_ws_tree_if(
+            stmt, route, mod, documents, scope, terminal, terminal, conditional_count);
+        if (!root) return core::make_unexpected(root.error());
+        return {};
+    }
+    if (++conditional_count > HirWsHandler::kMaxLenGuards)
+        return frontend_error(FrontendError::TooManyItems, stmt.span);
+    auto verdict = analyze_ws_verdict_branch(*stmt.then_stmt, route, mod, documents, scope, false);
+    if (!verdict) return core::make_unexpected(verdict.error());
+    // Existing roots take a verdict when false. Invert the if condition so a
+    // true source condition terminates immediately; subsequent clauses stay lazy.
+    auto condition = analyze_message_condition(
+        stmt.expr, verdict.value(), route, mod, documents, scope, false, true);
+    if (!condition) return core::make_unexpected(condition.error());
+    if (!terminal) return {};
+    if (stmt.else_stmt->kind == AstStmtKind::If)
+        return analyze_ws_if(
+            *stmt.else_stmt, route, mod, documents, scope, true, conditional_count);
+    auto other = analyze_ws_verdict_branch(*stmt.else_stmt, route, mod, documents, scope, true);
+    if (!other) return core::make_unexpected(other.error());
+    return {};
+}
+
 #endif
 
 // Resolve an upstream by name; UnknownUpstream (at `span`) when absent. Shared by the route
@@ -8303,6 +10785,18 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.str_value = decoded.value();
         return out;
     }
+    if (expr.kind == AstExprKind::BytesLit) {
+        // The parser's decoded pool belongs to AstFile, not the source mmap.
+        // Retain it in the module before AST/import storage can disappear.
+        std::string bytes;
+        if (expr.str_value.len != 0) bytes.assign(expr.str_value.ptr, expr.str_value.len);
+        auto retained = intern_analysis_string(mod, std::move(bytes));
+        if (!retained) return core::make_unexpected(retained.error());
+        out.kind = HirExprKind::BytesLit;
+        out.type = HirTypeKind::Bytes;
+        out.str_value = retained.value();
+        return out;
+    }
     if (expr.kind == AstExprKind::ObjectLit) {
         return frontend_error(
             FrontendError::UnsupportedSyntax,
@@ -8526,9 +11020,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.type = HirTypeKind::Str;
                 return out;
             }
-            if (expr.name.eq({"body", 4})) {
+            if (expr.name.eq({"body", 4}) || expr.name.eq(lit_str("bodyBytes"))) {
                 out.kind = HirExprKind::ReqBody;
-                out.type = HirTypeKind::Str;
+                out.type =
+                    expr.name.eq(lit_str("bodyBytes")) ? HirTypeKind::Bytes : HirTypeKind::Str;
                 return out;
             }
             if (expr.name.eq({"keepAlive", 9})) {
@@ -8653,6 +11148,24 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                   lit_str("route has no such capture in req.params"));
         }
         if (expr.lhs->kind == AstExprKind::Ident) {
+#if RUT_ENABLE_WEBSOCKET
+            if (!user_bound_ident_name(mod, locals, local_count, binding, expr.lhs->name) &&
+                (expr.lhs->name.eq(lit_str("WebSocketMessageKind")) ||
+                 expr.lhs->name.eq(lit_str("WebSocketDirection")))) {
+                const bool kKind = expr.lhs->name.eq(lit_str("WebSocketMessageKind"));
+                const bool kFirst =
+                    expr.name.eq(kKind ? lit_str("text") : lit_str("clientToUpstream"));
+                const bool kSecond =
+                    expr.name.eq(kKind ? lit_str("binary") : lit_str("upstreamToClient"));
+                if (!kFirst && !kSecond)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+                out.kind = HirExprKind::ConstWsCase;
+                out.type =
+                    kKind ? HirTypeKind::WebSocketMessageKind : HirTypeKind::WebSocketDirection;
+                out.int_value = kFirst ? 0 : 1;
+                return out;
+            }
+#endif
             const u32 variant_index = [&]() {
                 for (u32 i = 0; i < mod.variants.len; i++) {
                     if (mod.variants[i].name.eq(expr.lhs->name)) return i;
@@ -8680,6 +11193,119 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         auto base = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!base) return core::make_unexpected(base.error());
+#if RUT_ENABLE_WEBSOCKET
+        if (base->type == HirTypeKind::WebSocketClose) {
+            if (base->may_nil || base->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (expr.name.eq(lit_str("code")) || expr.name.eq(lit_str("upstreamCode")))
+                out.type = HirTypeKind::I32;
+            else if (expr.name.eq(lit_str("reason")) || expr.name.eq(lit_str("upstreamReason")))
+                out.type = HirTypeKind::Str;
+            else if (expr.name.eq(lit_str("wasClean")))
+                out.type = HirTypeKind::Bool;
+            else if (expr.name.eq(lit_str("connection")))
+                out.type = HirTypeKind::WebSocketConnection;
+            else
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            out.kind = HirExprKind::WsMessageField;
+            out.str_value = expr.name;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+        if (base->type == HirTypeKind::WebSocketConnection) {
+            if (base->may_nil || base->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (expr.name.eq(lit_str("remoteAddr")))
+                out.type = HirTypeKind::IP;
+            else if (expr.name.eq(lit_str("remotePort")))
+                out.type = HirTypeKind::I32;
+            else if (expr.name.eq(lit_str("isTls")))
+                out.type = HirTypeKind::Bool;
+            else if (expr.name.eq(lit_str("subprotocol")))
+                out.type = HirTypeKind::Str;
+            else
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            out.kind = HirExprKind::WsMessageField;
+            out.str_value = expr.name;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+        if (base->type == HirTypeKind::WebSocketMessage) {
+            if (base->may_nil || base->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (expr.name.eq(lit_str("fromClient")) || expr.name.eq(lit_str("isText")) ||
+                expr.name.eq(lit_str("isBinary")))
+                out.type = HirTypeKind::Bool;
+            else if (expr.name.eq(lit_str("len")))
+                out.type = HirTypeKind::I32;
+            else if (expr.name.eq(lit_str("text")))
+                out.type = HirTypeKind::Str;
+            else if (expr.name.eq(lit_str("payload")))
+                out.type = HirTypeKind::Bytes;
+            else if (expr.name.eq(lit_str("kind")))
+                out.type = HirTypeKind::WebSocketMessageKind;
+            else if (expr.name.eq(lit_str("direction")))
+                out.type = HirTypeKind::WebSocketDirection;
+            else if (expr.name.eq(lit_str("connection")))
+                out.type = HirTypeKind::WebSocketConnection;
+            else
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            out.kind = HirExprKind::WsMessageField;
+            out.str_value = expr.name;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+#endif
+        if (base->type == HirTypeKind::Str && expr.name.eq(lit_str("isEmpty"))) {
+            if (base->may_nil || base->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            out.kind = HirExprKind::StringPredicate;
+            out.type = HirTypeKind::Bool;
+            out.int_value = 3;
+            out.span = expr.span;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            HirExpr empty{};
+            empty.kind = HirExprKind::StrLit;
+            empty.type = HirTypeKind::Str;
+            empty.str_value = lit_str("");
+            if (!route->exprs.push(empty))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.rhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+        if (base->type == HirTypeKind::Bytes) {
+            if (base->may_nil || base->may_error ||
+                (!expr.name.eq(lit_str("count")) && !expr.name.eq(lit_str("isEmpty"))))
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            HirExpr count{};
+            count.kind = HirExprKind::BytesCount;
+            count.type = HirTypeKind::I32;
+            count.span = expr.span;
+            count.lhs = &route->exprs[route->exprs.len - 1];
+            if (expr.name.eq(lit_str("count"))) return count;
+            if (!route->exprs.push(count))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.kind = HirExprKind::Eq;
+            out.type = HirTypeKind::Bool;
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            HirExpr zero{};
+            zero.kind = HirExprKind::IntLit;
+            zero.type = HirTypeKind::I32;
+            if (!route->exprs.push(zero))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+            out.rhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
         if (base->is_wait_result) {
             if (base->kind != HirExprKind::LocalRef)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -9750,6 +12376,17 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         adopt_int_literal_type(&lhs.value(), &rhs.value());
         const bool lhs_maybe_missing = lhs->may_nil || lhs->may_error;
         const bool rhs_maybe_missing = rhs->may_nil || rhs->may_error;
+        // `!value` is synthesized as equality with false, but it is not the
+        // Optional equality operation. Unwrap optional/fallible Bool first.
+        // != and !(a == b) negate an already-plain comparison result.
+        if (expr.is_synthesized_negation && (lhs_maybe_missing || rhs_maybe_missing))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("logical negation requires an unwrapped bool"));
+        if (is_ws_borrowed_type(lhs->type) || is_ws_borrowed_type(rhs->type))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("compare message fields, not borrowed messages"));
         if (expr.kind != AstExprKind::Eq && (lhs_maybe_missing || rhs_maybe_missing))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (lhs->type != rhs->type) {
@@ -10058,7 +12695,22 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
                                             const HirLocal* locals,
                                             u32 local_count,
                                             const MatchPayloadBinding* binding) {
-    return analyze_expr_impl(expr, route, mod, locals, local_count, binding, false);
+    auto result = analyze_expr_impl(expr, route, mod, locals, local_count, binding, false);
+    if (result && route != nullptr) {
+        const auto kKind = result->kind;
+        const bool kHttp = result->type == HirTypeKind::Response ||
+                           (kKind >= HirExprKind::ReqHeaderCount &&
+                            kKind <= HirExprKind::ReqMethod && kKind != HirExprKind::ConstMethod) ||
+                           kKind == HirExprKind::ReqSetHeader ||
+                           kKind == HirExprKind::ReqAddHeader ||
+                           kKind == HirExprKind::ReqRemoveHeader;
+        route->uses_http_values |= kHttp;
+        if (route->is_ws_callback && kHttp)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("HTTP values are unavailable in a message callback"));
+    }
+    return result;
 }
 
 static bool is_static_for_iter_expr(const HirExpr& expr,
@@ -11286,6 +13938,12 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
     if (fn_index == mod.functions.len) return fail_with_name(expr.span, "unknown function");
     const auto& fn = mod.functions[fn_index];
+    if (route != nullptr) route->uses_http_values |= fn.uses_http_values;
+    if (route != nullptr && route->is_ws_callback &&
+        (fn.uses_http_values || fn.has_non_response_statement_effect || fn.respond_guards.len != 0))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("message predicates require pure helpers"));
     for (u32 i = 0; i < fn.params.len; i++) {
         if (fn.params[i].type == HirTypeKind::Response)
             return fail_call(
@@ -11526,6 +14184,15 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
         return {};
     };
+    LexicalCallArguments pipe_input{route, {}};
+    HirExpr pipe_value{};
+    if (pipe_lhs != nullptr &&
+        (uses_lexical_values(route) || hir_has_string_construction(*pipe_lhs))) {
+        pipe_value = *pipe_lhs;
+        auto bound = pipe_input.bind(pipe_value);
+        if (!bound) return core::make_unexpected(bound.error());
+        pipe_lhs = &pipe_value;
+    }
     if (pipe_lhs != nullptr) {
         const auto lhs_state = known_value_state(*pipe_lhs, locals, local_count, 0);
         if (lhs_state == KnownValueState::Nil) {
@@ -11553,7 +14220,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             }
             folded.span = expr.span;
             folded.may_nil = true;
-            return folded;
+            return pipe_input.finish(folded);
         }
         if (lhs_state == KnownValueState::Error) {
             const HirExpr* err_expr = known_error_expr(*pipe_lhs, locals, local_count, 0);
@@ -11582,7 +14249,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             folded.span = expr.span;
             folded.may_nil = false;
             folded.may_error = true;
-            return folded;
+            return pipe_input.finish(folded);
         }
         if (lhs_state == KnownValueState::Unknown && (pipe_lhs->may_nil || pipe_lhs->may_error)) {
             u32 placeholder_count = 0;
@@ -11664,13 +14331,14 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     expr.span,
                     "respond-capable helper calls are not supported in conditional pipe",
                     nullptr);
-            auto then_expr = instantiate_function_expr(fn.body,
-                                                       route,
-                                                       mod,
-                                                       analyzed_args,
-                                                       effective_arg_count,
-                                                       generic_bindings,
-                                                       fn.type_params.len);
+            auto then_expr = inline_function_call(fn,
+                                                  route,
+                                                  mod,
+                                                  analyzed_args,
+                                                  effective_arg_count,
+                                                  generic_bindings,
+                                                  fn.type_params.len,
+                                                  expr.span);
             if (!then_expr) return core::make_unexpected(then_expr.error());
             auto pipe_then_typed = apply_return_type(then_expr.value(), "pipe conditional");
             if (!pipe_then_typed) return core::make_unexpected(pipe_then_typed.error());
@@ -11755,7 +14423,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.rhs = then_ptr;
             if (!out.args.push(else_ptr))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
-            return out;
+            return pipe_input.finish(out);
         }
     }
     HirExpr analyzed_args[AstExpr::kMaxArgs]{};
@@ -11806,13 +14474,14 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                               fn.type_params.len,
                                                               respond_guard_span);
     if (!respond_guards) return core::make_unexpected(respond_guards.error());
-    auto inlined = instantiate_function_expr(fn.body,
-                                             route,
-                                             mod,
-                                             analyzed_args,
-                                             effective_arg_count,
-                                             generic_bindings,
-                                             fn.type_params.len);
+    auto inlined = inline_function_call(fn,
+                                        route,
+                                        mod,
+                                        analyzed_args,
+                                        effective_arg_count,
+                                        generic_bindings,
+                                        fn.type_params.len,
+                                        expr.span);
     if (!inlined) {
         return core::make_unexpected(inlined.error());
     }
@@ -11824,7 +14493,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     // `if ok { 2147483648 } else { error(500) }` infers exactly that.
     if (inlined->type == HirTypeKind::I64 && inlined->may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
-    return inlined.value();
+    return pipe_input.finish(inlined.value());
 }
 
 static bool push_named_error_case(FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases>& cases,
@@ -12530,6 +15199,13 @@ static bool const_eval_expr(
     // tree recursion, so we add a fixed headroom on top of
     // local_count for the Eq/Lt/Gt descent.
     if (depth > local_count + HirRoute::kMaxLocals) return false;
+    if (expr.kind == HirExprKind::BoundValue && expr.lhs != nullptr)
+        return const_eval_expr(*expr.lhs, locals, local_count, out, depth + 1);
+    if (expr.kind == HirExprKind::LetIn && expr.lhs != nullptr && expr.rhs != nullptr) {
+        ConstValue initializer{};
+        return const_eval_expr(*expr.lhs, locals, local_count, &initializer, depth + 1) &&
+               const_eval_expr(*expr.rhs, locals, local_count, out, depth + 1);
+    }
     if (expr.kind == HirExprKind::BoolLit) {
         out->type = HirTypeKind::Bool;
         out->bool_value = expr.bool_value;
@@ -12545,10 +15221,29 @@ static bool const_eval_expr(
         out->str_value = expr.str_value;
         return true;
     }
+    if (expr.kind == HirExprKind::BytesLit) {
+        out->type = HirTypeKind::Bytes;
+        out->str_value = expr.str_value;
+        return true;
+    }
+    if (expr.kind == HirExprKind::BytesCount && expr.lhs) {
+        ConstValue bytes{};
+        if (!const_eval_expr(*expr.lhs, locals, local_count, &bytes, depth + 1) ||
+            bytes.type != HirTypeKind::Bytes)
+            return false;
+        out->type = HirTypeKind::I32;
+        out->int_value = bytes.str_value.len;
+        return true;
+    }
     if (expr.kind == HirExprKind::ConstMethod) {
         // Method literals (POST, GET, …) are compile-time constants;
         // fold them so `if const POST == GET { ... }` works.
         out->type = HirTypeKind::Method;
+        out->int_value = expr.int_value;
+        return true;
+    }
+    if (expr.kind == HirExprKind::ConstWsCase) {
+        out->type = expr.type;
         out->int_value = expr.int_value;
         return true;
     }
@@ -12621,11 +15316,11 @@ static bool const_eval_expr(
                 return true;
             }
             if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::I64 ||
-                lhs.type == HirTypeKind::Method) {
+                lhs.type == HirTypeKind::Method || is_ws_enum_type(lhs.type)) {
                 out->bool_value = lhs.int_value == rhs.int_value;
                 return true;
             }
-            if (lhs.type == HirTypeKind::Str) {
+            if (lhs.type == HirTypeKind::Str || lhs.type == HirTypeKind::Bytes) {
                 out->bool_value = lhs.str_value.eq(rhs.str_value);
                 return true;
             }
@@ -12773,11 +15468,13 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 *inner_arm.pattern, subject.value(), route, mod, locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
             bool matched = false;
-            if (pattern->kind == HirExprKind::BoolLit && subject_value.type == HirTypeKind::Bool) {
-                matched = pattern->bool_value == subject_value.bool_value;
-            } else if (pattern->kind == HirExprKind::IntLit &&
-                       subject_value.type == HirTypeKind::I32) {
+            if ((pattern->kind == HirExprKind::ConstWsCase && pattern->type == subject_value.type &&
+                 is_ws_enum_type(subject_value.type)) ||
+                (pattern->kind == HirExprKind::IntLit && subject_value.type == HirTypeKind::I32)) {
                 matched = pattern->int_value == subject_value.int_value;
+            } else if (pattern->kind == HirExprKind::BoolLit &&
+                       subject_value.type == HirTypeKind::Bool) {
+                matched = binary_match_case_value(pattern.value()) == subject_value.bool_value;
             } else if (pattern->kind == HirExprKind::StrLit &&
                        subject_value.type == HirTypeKind::Str) {
                 matched = pattern->str_value.eq(subject_value.str_value);
@@ -13252,11 +15949,13 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             if (!pattern) return core::make_unexpected(pattern.error());
 
             bool matched = false;
-            if (pattern->kind == HirExprKind::BoolLit && subject_value.type == HirTypeKind::Bool) {
-                matched = pattern->bool_value == subject_value.bool_value;
-            } else if (pattern->kind == HirExprKind::IntLit &&
-                       subject_value.type == HirTypeKind::I32) {
+            if ((pattern->kind == HirExprKind::ConstWsCase && pattern->type == subject_value.type &&
+                 is_ws_enum_type(subject_value.type)) ||
+                (pattern->kind == HirExprKind::IntLit && subject_value.type == HirTypeKind::I32)) {
                 matched = pattern->int_value == subject_value.int_value;
+            } else if (pattern->kind == HirExprKind::BoolLit &&
+                       subject_value.type == HirTypeKind::Bool) {
+                matched = binary_match_case_value(pattern.value()) == subject_value.bool_value;
             } else if (pattern->kind == HirExprKind::StrLit &&
                        subject_value.type == HirTypeKind::Str) {
                 matched = pattern->str_value.eq(subject_value.str_value);
@@ -13653,21 +16352,18 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 auto outer_pattern = analyze_match_pattern(
                     *arm.pattern, subject.value(), route, mod, locals, local_count);
                 if (!outer_pattern) return core::make_unexpected(outer_pattern.error());
-                if (outer_pattern->kind != HirExprKind::BoolLit &&
-                    outer_pattern->kind != HirExprKind::IntLit &&
-                    outer_pattern->kind != HirExprKind::StrLit &&
-                    outer_pattern->kind != HirExprKind::VariantCase)
+                if (!is_match_pattern(outer_pattern.value()))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (outer_pattern->type != subject->type &&
                     !(subject_is_error_kind && outer_pattern->kind == HirExprKind::VariantCase))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                if (outer_pattern->kind == HirExprKind::BoolLit) {
-                    bool& seen_unguarded_bool_case = outer_pattern->bool_value
+                if (is_binary_match_case(outer_pattern.value())) {
+                    bool& seen_unguarded_bool_case = binary_match_case_value(outer_pattern.value())
                                                          ? seen_unguarded_bool_true
                                                          : seen_unguarded_bool_false;
                     if (seen_unguarded_bool_case)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    if (outer_pattern->bool_value)
+                    if (binary_match_case_value(outer_pattern.value()))
                         seen_bool_true = true;
                     else
                         seen_bool_false = true;
@@ -13729,21 +16425,19 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                                    nested_locals,
                                                                    nested_local_count);
                         if (!inner_pattern) return core::make_unexpected(inner_pattern.error());
-                        if (inner_pattern->kind != HirExprKind::BoolLit &&
-                            inner_pattern->kind != HirExprKind::IntLit &&
-                            inner_pattern->kind != HirExprKind::StrLit &&
-                            inner_pattern->kind != HirExprKind::VariantCase)
+                        if (!is_match_pattern(inner_pattern.value()))
                             return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
                         if (inner_pattern->type != inner_subject->type)
                             return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
-                        if (inner_pattern->kind == HirExprKind::BoolLit) {
-                            bool& seen_bool_case = inner_pattern->bool_value
-                                                       ? inner_seen_bool_true
-                                                       : inner_seen_bool_false;
-                            if (seen_bool_case)
+                        if (is_binary_match_case(inner_pattern.value())) {
+                            const bool kSeenBoolCase =
+                                binary_match_case_value(inner_pattern.value())
+                                    ? inner_seen_bool_true
+                                    : inner_seen_bool_false;
+                            if (kSeenBoolCase)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_arm.span);
-                            if (inner_pattern->bool_value)
+                            if (binary_match_case_value(inner_pattern.value()))
                                 inner_seen_bool_true = true;
                             else
                                 inner_seen_bool_false = true;
@@ -13820,8 +16514,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 }
                 if (!inner_seen_wildcard) {
                     bool inner_is_exhaustive = false;
-                    if (inner_subject->type == HirTypeKind::Bool && inner_seen_bool_true &&
-                        inner_seen_bool_false) {
+                    if ((inner_subject->type == HirTypeKind::Bool ||
+                         is_ws_enum_type(inner_subject->type)) &&
+                        inner_seen_bool_true && inner_seen_bool_false) {
                         inner_is_exhaustive = true;
                     } else if (inner_subject->type == HirTypeKind::Variant) {
                         const auto& variant = mod.variants[inner_subject->variant_index];
@@ -13871,8 +16566,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     if (!analyzed_pattern) return core::make_unexpected(analyzed_pattern.error());
                     pattern = analyzed_pattern.value();
                 }
-                if (pattern.kind != HirExprKind::BoolLit && pattern.kind != HirExprKind::IntLit &&
-                    pattern.kind != HirExprKind::StrLit && pattern.kind != HirExprKind::VariantCase)
+                if (!is_match_pattern(pattern))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (pattern.type != subject->type &&
                     !(subject_is_error_kind && pattern.kind == HirExprKind::VariantCase))
@@ -13882,15 +16576,17 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                       pattern.variant_index != subject->error_variant_index) ||
                      (!subject_is_error_kind && pattern.variant_index != subject->variant_index)))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                if (pattern.kind == HirExprKind::BoolLit) {
-                    bool& seen_bool_case = pattern.bool_value ? seen_bool_true : seen_bool_false;
-                    bool& seen_unguarded_bool_case =
-                        pattern.bool_value ? seen_unguarded_bool_true : seen_unguarded_bool_false;
+                if (is_binary_match_case(pattern)) {
+                    const bool kSeenBoolCase =
+                        binary_match_case_value(pattern) ? seen_bool_true : seen_bool_false;
+                    bool& seen_unguarded_bool_case = binary_match_case_value(pattern)
+                                                         ? seen_unguarded_bool_true
+                                                         : seen_unguarded_bool_false;
                     if (seen_unguarded_bool_case)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    if (pattern.bool_value && !seen_bool_case)
+                    if (binary_match_case_value(pattern) && !kSeenBoolCase)
                         seen_bool_true = true;
-                    else if (!pattern.bool_value && !seen_bool_case)
+                    else if (!binary_match_case_value(pattern) && !kSeenBoolCase)
                         seen_bool_false = true;
                     if (!arm.has_guard) seen_unguarded_bool_case = true;
                 }
@@ -14009,7 +16705,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         if (!seen_wildcard) {
             if (seen_guarded_arm)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-            if (subject->type == HirTypeKind::Bool && seen_bool_true && seen_bool_false) return {};
+            if ((subject->type == HirTypeKind::Bool || is_ws_enum_type(subject->type)) &&
+                seen_bool_true && seen_bool_false)
+                return {};
             if (subject->type != HirTypeKind::Variant && !subject_is_error_kind)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             if (subject_is_error_kind && subject->error_variant_index == 0xffffffffu)
@@ -14044,248 +16742,252 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             route->ws_handler.subprotocol = protocol.value();
         }
         route->ws_handler.span = stmt.span;
+        route->ws_handler.parameter_name =
+            stmt.ws_parameter_name.len ? stmt.ws_parameter_name : lit_str("message");
         route->control.kind = HirControlKind::Direct;
         route->control.direct_term.kind = HirTerminatorKind::ForwardUpstream;
         route->control.direct_term.span = stmt.span;
         route->control.direct_term.upstream_index = upstream_index.value();
 
-        WsJsonBindings documents{};
-        const AstStatement* body = stmt.then_stmt;
-        if (body == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-        const AstExpr* default_call = nullptr;
-        if (body->kind == AstStmtKind::Expr) {
-            default_call = &body->expr;
-        } else if (body->kind == AstStmtKind::Block) {
-            const u32 stmt_count = body->block_stmts.len;
-            if (stmt_count == 0)
-                return frontend_error(FrontendError::UnsupportedSyntax, body->span);
-            if (stmt_count - 1 > HirWsHandler::kMaxLenGuards)
+        WsCallbackScope scope{};
+        scope.route->is_ws_callback = true;
+        HirLocal parameter{};
+        parameter.name = route->ws_handler.parameter_name;
+        parameter.type = HirTypeKind::WebSocketMessage;
+        parameter.init.kind = HirExprKind::LocalRef;
+        parameter.init.type = parameter.type;
+        if (!scope.locals.push(parameter))
+            return frontend_error(FrontendError::TooManyItems, stmt.span);
+        // Capture only compile-time admission values, never request-borrowed data.
+        for (u32 i = 0; i < route->locals.len; ++i) {
+            const auto& outer = route->locals[i];
+            if (outer.name.eq(parameter.name)) continue;
+            ConstValue known{};
+            if (!const_eval_expr(outer.init, route->locals.data, route->locals.len, &known, 0))
+                continue;
+            if (known.type != HirTypeKind::Bool && known.type != HirTypeKind::I32 &&
+                known.type != HirTypeKind::I64 && known.type != HirTypeKind::Str &&
+                known.type != HirTypeKind::Bytes && !is_ws_enum_type(known.type))
+                continue;
+            HirLocal captured = outer;
+            captured.ref_index = scope.locals.len;
+            captured.init = outer.init;
+            captured.init.lhs = nullptr;
+            captured.init.rhs = nullptr;
+            captured.init.args.len = 0;
+            captured.init.field_inits.len = 0;
+            captured.init.type = known.type;
+            captured.init.bool_value = known.bool_value;
+            captured.init.int_value = known.int_value;
+            captured.init.str_value = known.str_value;
+            captured.init.kind = known.type == HirTypeKind::Bool    ? HirExprKind::BoolLit
+                                 : known.type == HirTypeKind::Str   ? HirExprKind::StrLit
+                                 : known.type == HirTypeKind::Bytes ? HirExprKind::BytesLit
+                                 : is_ws_enum_type(known.type)      ? HirExprKind::ConstWsCase
+                                                                    : HirExprKind::IntLit;
+            if (!ws_infallible_binding(captured.init)) continue;
+            if (!scope.locals.push(captured))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
+        const auto kAnalyzeHook = [&](const AstStatement* body,
+                                      Str name,
+                                      WsCallbackPhase phase,
+                                      u32& root) -> FrontendResult<void> {
+            if (!body) return {};
+            WsCallbackScope hook{};
+            hook.route->is_ws_callback = true;
+            hook.route->ws_callback_phase = phase;
+            hook.route->ws_handler.max_message_size = route->ws_handler.max_message_size;
+            HirLocal input{};
+            input.name = name;
+            input.type = phase == WsCallbackPhase::Open ? HirTypeKind::WebSocketConnection
+                                                        : HirTypeKind::WebSocketClose;
+            input.init.kind = HirExprKind::LocalRef;
+            input.init.type = input.type;
+            if (!hook.locals.push(input))
                 return frontend_error(FrontendError::TooManyItems, body->span);
-            for (u32 i = 0; i + 1 < stmt_count; i++) {  // all but the last are guards
-                const AstStatement* gs = body->block_stmts[i];
-                if (gs == nullptr || gs->kind != AstStmtKind::Guard || gs->else_stmt == nullptr ||
-                    gs->else_stmt->kind != AstStmtKind::Expr)
-                    return frontend_error(FrontendError::UnsupportedSyntax,
-                                          gs ? gs->span : body->span);
-                auto gv =
-                    analyze_message_guard_verdict(gs->else_stmt->expr, *route, mod, documents);
-                if (!gv) return core::make_unexpected(gv.error());
-                if (gs->bind_value) {
-                    // Document bindings are scoped aliases for this immutable message's JSON.
-                    // Reject collisions rather than resolving later expressions as an outer value.
-                    bool collision =
-                        gs->name.eq(lit_str("message")) || gs->name.eq(lit_str("json")) ||
-                        user_bound_ident_name(
-                            mod, route->locals.data, route->locals.len, nullptr, gs->name);
-                    for (u32 binding_index = 0; binding_index < documents.len; ++binding_index)
-                        collision |= documents[binding_index].name.eq(gs->name);
-                    if (collision)
-                        return frontend_error(
-                            FrontendError::UnsupportedSyntax,
-                            gs->span,
-                            lit_str("message guard bindings require a fresh name"));
-                    WsJsonBinding binding{};
-                    binding.name = gs->name;
-                    WsLenGuard node{};
-                    node.verdict = gv.value();
-                    if (ws_is_json_parse(gs->expr, mod, *route)) {
-                        node.accessor = WsLenGuard::Accessor::JsonValid;
-                        binding.kind = WsJsonBinding::Kind::Document;
-                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
-                               gs->expr.lhs->kind == AstExprKind::Ident &&
-                               gs->expr.lhs->name.eq(lit_str("json")) &&
-                               gs->expr.name.eq(lit_str("get")) && gs->expr.args.len == 2 &&
-                               gs->expr.args[0] && gs->expr.args[1] &&
-                               gs->expr.args[0]->kind == AstExprKind::Ident &&
-                               gs->expr.args[1]->kind == AstExprKind::StrLit) {
-                        const WsJsonBinding* source =
-                            ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                                        source->kind != WsJsonBinding::Kind::SelectedValue))
-                            return frontend_error(FrontendError::UnsupportedSyntax,
-                                                  gs->span,
-                                                  lit_str("json.get message bindings require a "
-                                                          "validated JSON value alias"));
-                        auto path = ws_json_get_path(*source, *gs->expr.args[1], mod);
-                        if (!path) return core::make_unexpected(path.error());
-                        node.accessor = WsLenGuard::Accessor::JsonHasPath;
-                        node.pattern = path.value();
-                        binding.kind = WsJsonBinding::Kind::SelectedValue;
-                        binding.path = path.value();
-                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
-                               gs->expr.lhs->kind == AstExprKind::Ident &&
-                               gs->expr.lhs->name.eq(lit_str("json")) &&
-                               gs->expr.name.eq(lit_str("string")) && gs->expr.args.len == 1 &&
-                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
-                        const WsJsonBinding* source =
-                            ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                                        source->kind != WsJsonBinding::Kind::SelectedValue))
-                            return frontend_error(FrontendError::UnsupportedSyntax,
-                                                  gs->span,
-                                                  lit_str("json.string message bindings require "
-                                                          "a validated JSON value alias"));
-                        node.accessor = WsLenGuard::Accessor::JsonStringValid;
-                        node.pattern = source->path;
-                        binding.kind = WsJsonBinding::Kind::String;
-                        binding.path = source->path;
-                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
-                               gs->expr.lhs->kind == AstExprKind::Ident &&
-                               gs->expr.lhs->name.eq(lit_str("json")) &&
-                               gs->expr.name.eq(lit_str("numberText")) && gs->expr.args.len == 1 &&
-                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
-                        const WsJsonBinding* source =
-                            ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                                        source->kind != WsJsonBinding::Kind::SelectedValue))
-                            return frontend_error(
-                                FrontendError::UnsupportedSyntax,
-                                gs->span,
-                                lit_str("json.numberText message bindings require "
-                                        "a validated JSON value alias"));
-                        node.accessor = WsLenGuard::Accessor::JsonNumberTextValid;
-                        node.pattern = source->path;
-                        binding.kind = WsJsonBinding::Kind::NumberText;
-                        binding.path = source->path;
-                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
-                               gs->expr.lhs->kind == AstExprKind::Ident &&
-                               gs->expr.lhs->name.eq(lit_str("json")) &&
-                               gs->expr.name.eq(lit_str("stringify")) && gs->expr.args.len == 1 &&
-                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
-                        const WsJsonBinding* source =
-                            ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                                        source->kind != WsJsonBinding::Kind::SelectedValue))
-                            return frontend_error(FrontendError::UnsupportedSyntax,
-                                                  gs->span,
-                                                  lit_str("json.stringify message bindings require "
-                                                          "a validated JSON value alias"));
-                        node.accessor = WsLenGuard::Accessor::JsonStringifyValid;
-                        node.pattern = source->path;
-                        binding.kind = WsJsonBinding::Kind::JsonStringify;
-                        binding.path = source->path;
-                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
-                               gs->expr.lhs->kind == AstExprKind::Ident &&
-                               gs->expr.lhs->name.eq(lit_str("json")) &&
-                               gs->expr.name.eq(lit_str("bool")) && gs->expr.args.len == 1 &&
-                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
-                        const WsJsonBinding* source =
-                            ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                                        source->kind != WsJsonBinding::Kind::SelectedValue))
-                            return frontend_error(FrontendError::UnsupportedSyntax,
-                                                  gs->span,
-                                                  lit_str("json.bool message bindings require a "
-                                                          "validated JSON value alias"));
-                        node.accessor = WsLenGuard::Accessor::JsonBoolValid;
-                        node.pattern = source->path;
-                        binding.kind = WsJsonBinding::Kind::Boolean;
-                        binding.path = source->path;
-                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
-                               gs->expr.lhs->kind == AstExprKind::Ident &&
-                               gs->expr.lhs->name.eq(lit_str("json")) &&
-                               gs->expr.name.eq(lit_str("int")) && gs->expr.args.len == 1 &&
-                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
-                        const WsJsonBinding* source =
-                            ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                                        source->kind != WsJsonBinding::Kind::SelectedValue))
-                            return frontend_error(FrontendError::UnsupportedSyntax,
-                                                  gs->span,
-                                                  lit_str("json.int message bindings require a "
-                                                          "validated JSON value alias"));
-                        node.accessor = WsLenGuard::Accessor::JsonIntValid;
-                        node.pattern = source->path;
-                        binding.kind = WsJsonBinding::Kind::Integer;
-                        binding.path = source->path;
-                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
-                               gs->expr.lhs->kind == AstExprKind::Ident &&
-                               gs->expr.lhs->name.eq(lit_str("json")) &&
-                               gs->expr.name.eq(lit_str("kind")) && gs->expr.args.len == 1 &&
-                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
-                        const WsJsonBinding* source =
-                            ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                                        source->kind != WsJsonBinding::Kind::SelectedValue))
-                            return frontend_error(FrontendError::UnsupportedSyntax,
-                                                  gs->span,
-                                                  lit_str("json.kind message bindings require "
-                                                          "a validated JSON value alias"));
-                        node.accessor = WsLenGuard::Accessor::JsonHasPath;
-                        node.pattern = source->path;
-                        binding.kind = WsJsonBinding::Kind::KindName;
-                        binding.path = source->path;
-                    } else if (gs->expr.kind == AstExprKind::MethodCall && gs->expr.lhs &&
-                               gs->expr.lhs->kind == AstExprKind::Ident &&
-                               gs->expr.lhs->name.eq(lit_str("json")) &&
-                               gs->expr.name.eq(lit_str("count")) && gs->expr.args.len == 1 &&
-                               gs->expr.args[0] && gs->expr.args[0]->kind == AstExprKind::Ident) {
-                        const WsJsonBinding* source =
-                            ws_json_binding(documents, gs->expr.args[0]->name);
-                        if (!source || (source->kind != WsJsonBinding::Kind::Document &&
-                                        source->kind != WsJsonBinding::Kind::SelectedValue))
-                            return frontend_error(FrontendError::UnsupportedSyntax,
-                                                  gs->span,
-                                                  lit_str("json.count message bindings require "
-                                                          "a validated JSON value alias"));
-                        node.accessor = WsLenGuard::Accessor::JsonCountValid;
-                        node.pattern = source->path;
-                        binding.kind = WsJsonBinding::Kind::Count;
-                        binding.path = source->path;
-                    } else {
-                        return frontend_error(
-                            FrontendError::UnsupportedSyntax,
-                            gs->span,
-                            lit_str("message guard bindings require json.parse, "
-                                    "json.get, json.string, json.numberText, json.bool, "
-                                    "json.stringify, json.int, json.kind, or json.count aliases"));
+            for (u32 i = 1; i < scope.locals.len; ++i) {
+                if (scope.locals[i].name.eq(name)) continue;
+                HirLocal captured = scope.locals[i];
+                captured.ref_index = hook.locals.len;
+                if (!hook.locals.push(captured))
+                    return frontend_error(FrontendError::TooManyItems, body->span);
+            }
+            if (hook.locals.len > HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, body->span);
+            auto value = analyze_function_body_stmt(
+                *body, hook.route.get(), mod, hook.locals.data, hook.locals.len, nullptr, false);
+            if (!value) return core::make_unexpected(value.error());
+            HirExpr finished{};
+            finished.kind = HirExprKind::IntLit;
+            finished.type = HirTypeKind::I32;
+            finished.int_value = static_cast<u8>(WsVerdict::Drop);
+            auto sequenced =
+                ws_lifecycle_sequence(*hook.route, value.value(), finished, body->span);
+            if (!sequenced) return core::make_unexpected(sequenced.error());
+            value = sequenced;
+            HirLocal all_locals[HirRoute::kMaxLocals * 2]{};
+            u32 count = 0;
+            for (u32 i = 0; i < hook.locals.len; ++i) all_locals[count++] = hook.locals[i];
+            for (u32 i = 0; i < hook.route->locals.len; ++i)
+                all_locals[count++] = hook.route->locals[i];
+            auto normalized = normalize_expr(value.value(), route->exprs, all_locals, count, 1);
+            if (!normalized) return core::make_unexpected(normalized.error());
+            if (normalized->type != HirTypeKind::I32 || normalized->may_nil ||
+                normalized->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, body->span);
+            if (const HirExpr* bad =
+                    ws_general_disallowed_value(normalized.value(), 0, true, phase))
+                return frontend_error(FrontendError::UnsupportedSyntax, bad->span);
+            root = route->exprs.len;
+            if (!route->exprs.push(normalized.value()))
+                return frontend_error(FrontendError::OutOfMemory, body->span);
+            return {};
+        };
+        auto opened = kAnalyzeHook(stmt.ws_open_body,
+                                   stmt.ws_open_parameter,
+                                   WsCallbackPhase::Open,
+                                   route->ws_handler.open_body_expr);
+        if (!opened) return opened;
+        auto closed = kAnalyzeHook(stmt.ws_close_body,
+                                   stmt.ws_close_parameter,
+                                   WsCallbackPhase::Close,
+                                   route->ws_handler.close_body_expr);
+        if (!closed) return closed;
+        const HirWsHandler kHandler = route->ws_handler;
+        const u32 kExprCount = route->exprs.len;
+        const u32 kCaptureCount = scope.locals.len;
+        auto analyze_legacy = [&]() -> FrontendResult<void> {
+            WsJsonBindings documents{};
+            const AstStatement* body = stmt.then_stmt;
+            if (body == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            u32 conditional_count = 0;
+            const AstExpr* default_call = nullptr;
+            if (body->kind == AstStmtKind::Expr) {
+                default_call = &body->expr;
+            } else if (body->kind == AstStmtKind::If) {
+                return analyze_ws_if(*body, *route, mod, documents, scope, true, conditional_count);
+            } else if (body->kind == AstStmtKind::Block) {
+                const u32 kStmtCount = body->block_stmts.len;
+                if (kStmtCount == 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax, body->span);
+                for (u32 i = 0; i + 1 < kStmtCount;
+                     i++) {  // bindings and guards precede the verdict
+                    const AstStatement* gs = body->block_stmts[i];
+                    if (gs && gs->kind == AstStmtKind::Let) {
+                        auto binding = analyze_ws_binding(*gs, scope, mod, documents);
+                        if (!binding) return core::make_unexpected(binding.error());
+                        continue;
                     }
-                    if (!route->ws_handler.len_guards.push(node) || !documents.push(binding))
+                    if (gs && gs->kind == AstStmtKind::If) {
+                        auto branch = analyze_ws_if(
+                            *gs, *route, mod, documents, scope, false, conditional_count);
+                        if (!branch) return core::make_unexpected(branch.error());
+                        continue;
+                    }
+                    if (gs == nullptr || gs->kind != AstStmtKind::Guard ||
+                        gs->else_stmt == nullptr || gs->else_stmt->kind != AstStmtKind::Expr)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              gs ? gs->span : body->span);
+                    if (++conditional_count > HirWsHandler::kMaxLenGuards)
                         return frontend_error(FrontendError::TooManyItems, gs->span);
-                } else {
-                    auto g =
-                        analyze_message_condition(gs->expr, gv.value(), *route, mod, documents);
-                    if (!g) return core::make_unexpected(g.error());
+                    auto gv = analyze_message_guard_verdict(
+                        gs->else_stmt->expr, *route, mod, documents, scope);
+                    if (!gv) return core::make_unexpected(gv.error());
+                    if (gs->bind_value) {
+                        auto value =
+                            analyze_ws_json_initializer(*gs, *route, mod, documents, scope);
+                        if (!value) return core::make_unexpected(value.error());
+                        if (ws_optional_has_choices(value.value())) {
+                            auto tail = ws_remaining_body(*body, i + 1);
+                            auto selected = analyze_ws_choice_guard(*gs,
+                                                                    value.value(),
+                                                                    gv.value(),
+                                                                    tail,
+                                                                    *route,
+                                                                    mod,
+                                                                    documents,
+                                                                    scope,
+                                                                    true,
+                                                                    conditional_count);
+                            if (!selected) return core::make_unexpected(selected.error());
+                            return {};
+                        }
+                        auto binding = analyze_ws_json_binding_value(
+                            *gs, value.value(), gv.value(), *route, mod, documents, scope);
+                        if (!binding) return core::make_unexpected(binding.error());
+                    } else {
+                        auto g = analyze_message_condition(
+                            gs->expr, gv.value(), *route, mod, documents, scope);
+                        if (!g) return core::make_unexpected(g.error());
+                    }
                 }
+                const AstStatement* last = body->block_stmts[kStmtCount - 1];
+                if (last && last->kind == AstStmtKind::If)
+                    return analyze_ws_if(
+                        *last, *route, mod, documents, scope, true, conditional_count);
+                if (last == nullptr || last->kind != AstStmtKind::Expr)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          last ? last->span : body->span);
+                default_call = &last->expr;
+            } else {
+                return frontend_error(FrontendError::UnsupportedSyntax, body->span);
             }
-            const AstStatement* last = body->block_stmts[stmt_count - 1];
-            if (last == nullptr || last->kind != AstStmtKind::Expr)
-                return frontend_error(FrontendError::UnsupportedSyntax,
-                                      last ? last->span : body->span);
-            default_call = &last->expr;
-        } else {
-            return frontend_error(FrontendError::UnsupportedSyntax, body->span);
-        }
-        const AstExpr& call = *default_call;
-        const bool is_message_method =
-            call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
-            call.lhs->kind == AstExprKind::Ident && call.lhs->name.eq({"message", 7});
-        if (!is_message_method) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-
-        if (call.name.eq({"forward", 7})) {
-            if (call.args.len > 1)  // forward() or forward(payload, load_balance: .roundRobin)
-                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-            route->ws_handler.default_verdict = WsVerdict::Forward;
-            if (call.args.len == 1) {
-                auto payload = analyze_message_forward_payload(call, *route, mod, documents);
-                if (!payload) return core::make_unexpected(payload.error());
+            return analyze_ws_default_verdict(*default_call, *route, mod, documents, scope);
+        };
+        auto legacy = analyze_legacy();
+        if (legacy || (legacy.error().code != FrontendError::UnsupportedSyntax &&
+                       legacy.error().code != FrontendError::TooManyItems))
+            return legacy;
+        route->ws_handler = kHandler;
+        route->exprs.len = kExprCount;
+        if (kCaptureCount > HirRoute::kMaxLocals) return legacy;
+        auto generic = std::unique_ptr<WsCallbackScope>(new (std::nothrow) WsCallbackScope{});
+        if (!generic) return frontend_error(FrontendError::OutOfMemory, stmt.span);
+        generic->route->is_ws_callback = true;
+        generic->route->ws_handler.max_message_size = kHandler.max_message_size;
+        for (u32 i = 0; i < kCaptureCount; ++i)
+            if (!generic->locals.push(scope.locals[i]))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        auto result = [&]() -> FrontendResult<void> {
+            if (stmt.then_stmt == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            auto expression = analyze_function_body_stmt(*stmt.then_stmt,
+                                                         generic->route.get(),
+                                                         mod,
+                                                         generic->locals.data,
+                                                         generic->locals.len,
+                                                         nullptr,
+                                                         false);
+            if (!expression) return core::make_unexpected(expression.error());
+            HirLocal all_locals[HirRoute::kMaxLocals * 2]{};
+            u32 count = 0;
+            for (u32 i = 0; i < generic->locals.len; ++i) all_locals[count++] = generic->locals[i];
+            for (u32 i = 0; i < generic->route->locals.len; ++i)
+                all_locals[count++] = generic->route->locals[i];
+            auto normalized =
+                normalize_expr(expression.value(), route->exprs, all_locals, count, 1);
+            if (!normalized) return core::make_unexpected(normalized.error());
+            if (normalized->type != HirTypeKind::I32 || normalized->may_nil ||
+                normalized->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            if (const HirExpr* bad = ws_general_disallowed_value(normalized.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax, bad->span);
+            const u32 kRoot = route->exprs.len;
+            if (!route->exprs.push(normalized.value()))
+                return frontend_error(FrontendError::OutOfMemory, stmt.span);
+            route->ws_handler.general_body_expr = kRoot;
+            if (generic->route->ws_handler.has_forward_payload) {
                 route->ws_handler.has_forward_payload = true;
-                route->ws_handler.forward_payload = payload.value();
+                route->ws_handler.forward_payload = {};
+                route->ws_handler.forward_payload.source = HirWsTextSource::Dynamic;
             }
-        } else if (call.name.eq({"drop", 4})) {
-            if (call.args.len != 0)
-                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-            route->ws_handler.default_verdict = WsVerdict::Drop;
-        } else if (call.name.eq({"close", 5})) {
-            auto policy = analyze_message_close_policy(call, *route, mod);
-            if (!policy) return core::make_unexpected(policy.error());
-            route->ws_handler.default_verdict = WsVerdict::Close;
-            route->ws_handler.close_code = policy->code;
-            route->ws_handler.close_reason_expr = policy->reason_expr;
-        } else {
-            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-        }
-        return {};
+            return {};
+        }();
+        if (result) return result;
+        route->ws_handler = kHandler;
+        route->exprs.len = kExprCount;
+        return result.error().code == FrontendError::OutOfMemory ? result : legacy;
     }
 #endif
 
@@ -16272,16 +18974,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                route->locals.data,
                                                                route->locals.len);
                     if (!outer_pattern) return core::make_unexpected(outer_pattern.error());
-                    if (outer_pattern->kind != HirExprKind::BoolLit &&
-                        outer_pattern->kind != HirExprKind::IntLit &&
-                        outer_pattern->kind != HirExprKind::StrLit &&
-                        outer_pattern->kind != HirExprKind::VariantCase)
+                    if (!is_match_pattern(outer_pattern.value()))
                         return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
                     if (outer_pattern->type != subject->type)
                         return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
-                    if (outer_pattern->kind == HirExprKind::BoolLit) {
-                        bool& seen = outer_pattern->bool_value ? seen_bool_true : seen_bool_false;
-                        bool& seen_unguarded = outer_pattern->bool_value
+                    if (is_binary_match_case(outer_pattern.value())) {
+                        bool& seen = binary_match_case_value(outer_pattern.value())
+                                         ? seen_bool_true
+                                         : seen_bool_false;
+                        bool& seen_unguarded = binary_match_case_value(outer_pattern.value())
                                                    ? seen_unguarded_bool_true
                                                    : seen_unguarded_bool_false;
                         if (seen_unguarded)
@@ -16360,17 +19061,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                        route->locals.data,
                                                                        route->locals.len);
                             if (!inner_pattern) return core::make_unexpected(inner_pattern.error());
-                            if (inner_pattern->kind != HirExprKind::BoolLit &&
-                                inner_pattern->kind != HirExprKind::IntLit &&
-                                inner_pattern->kind != HirExprKind::StrLit &&
-                                inner_pattern->kind != HirExprKind::VariantCase)
+                            if (!is_match_pattern(inner_pattern.value()))
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_arm.span);
                             if (inner_pattern->type != inner_subject->type)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_arm.span);
-                            if (inner_pattern->kind == HirExprKind::BoolLit) {
-                                bool& seen_inner = inner_pattern->bool_value
+                            if (is_binary_match_case(inner_pattern.value())) {
+                                bool& seen_inner = binary_match_case_value(inner_pattern.value())
                                                        ? inner_seen_bool_true
                                                        : inner_seen_bool_false;
                                 if (seen_inner)
@@ -16495,17 +19193,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                          route->locals.data,
                                                          route->locals.len);
                     if (!pattern) return core::make_unexpected(pattern.error());
-                    if (pattern->kind != HirExprKind::BoolLit &&
-                        pattern->kind != HirExprKind::IntLit &&
-                        pattern->kind != HirExprKind::StrLit &&
-                        pattern->kind != HirExprKind::VariantCase)
+                    if (!is_match_pattern(pattern.value()))
                         return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
                     if (pattern->type != subject->type)
                         return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
-                    if (pattern->kind == HirExprKind::BoolLit) {
-                        bool& seen = pattern->bool_value ? seen_bool_true : seen_bool_false;
-                        bool& seen_unguarded = pattern->bool_value ? seen_unguarded_bool_true
-                                                                   : seen_unguarded_bool_false;
+                    if (is_binary_match_case(pattern.value())) {
+                        bool& seen = binary_match_case_value(pattern.value()) ? seen_bool_true
+                                                                              : seen_bool_false;
+                        bool& seen_unguarded = binary_match_case_value(pattern.value())
+                                                   ? seen_unguarded_bool_true
+                                                   : seen_unguarded_bool_false;
                         if (seen_unguarded)
                             return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
                         if (!seen) seen = true;
@@ -16884,17 +19581,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                        arm_locals,
                                                                        arm_local_count);
                             if (!inner_pattern) return core::make_unexpected(inner_pattern.error());
-                            if (inner_pattern->kind != HirExprKind::BoolLit &&
-                                inner_pattern->kind != HirExprKind::IntLit &&
-                                inner_pattern->kind != HirExprKind::StrLit &&
-                                inner_pattern->kind != HirExprKind::VariantCase)
+                            if (!is_match_pattern(inner_pattern.value()))
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_ast_arm.span);
                             if (inner_pattern->type != inner_subject->type)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_ast_arm.span);
-                            if (inner_pattern->kind == HirExprKind::BoolLit) {
-                                bool& seen_inner = inner_pattern->bool_value
+                            if (is_binary_match_case(inner_pattern.value())) {
+                                bool& seen_inner = binary_match_case_value(inner_pattern.value())
                                                        ? inner_seen_bool_true
                                                        : inner_seen_bool_false;
                                 if (seen_inner)
@@ -19341,7 +22035,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             normalize_function_expr(body.value(), &fn, all_locals, all_local_count, fn.params.len);
         if (!normalized) return core::make_unexpected(normalized.error());
         fn.body = normalized.value();
-        return {};
+        fn.uses_http_values = scratch->uses_http_values;
+        return build_lexical_function_body(
+            *ast_func.body, fn, mod, param_locals, scratch->error_variant_index);
     };
 
     auto resolve_impl_target_for_header =
@@ -20923,6 +23619,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
             normalize_function_expr(body.value(), &fn, all_locals, all_local_count, fn.params.len);
         if (!normalized) return core::make_unexpected(normalized.error());
         fn.body = normalized.value();
+        fn.uses_http_values = scratch.uses_http_values;
+        auto lexical = build_lexical_function_body(
+            *item.func.body, fn, mod, param_locals, scratch.error_variant_index);
+        if (!lexical) return core::make_unexpected(lexical.error());
     }
 
     for (u32 i = 0; i < file.items.len; i++) {
@@ -21136,40 +23836,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
 
 #if RUT_ENABLE_WEBSOCKET
-        bool source_has_ws_terminate = false;
-        for (u32 si = 0; si < route_decl.statements.len; si++)
-            source_has_ws_terminate |= ws_prelude_contains_terminate(route_decl.statements[si]);
-        if (source_has_ws_terminate) {
-            bool has_disallowed_prelude = false;
-            Span disallowed_span{};
-            auto consider_disallowed_span = [&](Span span) {
-                if (!has_disallowed_prelude || span.start < disallowed_span.start) {
-                    has_disallowed_prelude = true;
-                    disallowed_span = span;
-                }
-            };
-            for (u32 di = 0; di < route_decl.decorators.len; di++)
-                consider_disallowed_span(route_decl.decorators[di].span);
-            for (u32 ci = 0; ci < route_decl.chains.len; ci++)
-                consider_disallowed_span(route_decl.chains[ci].span);
-            for (u32 si = 0; si < route_decl.statements.len; si++) {
-                const AstStatement* stmt = route_decl.statements[si];
-                if (stmt == nullptr || stmt->kind == AstStmtKind::WsTerminate) continue;
-                if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard) {
-                    consider_disallowed_span(stmt->span);
-                    continue;
-                }
-                if (stmt->kind == AstStmtKind::Let) {
-                    if (const AstExpr* runtime_expr = ws_prelude_runtime_expr(stmt->expr))
-                        consider_disallowed_span(runtime_expr->span);
-                } else if (stmt->kind == AstStmtKind::Guard) {
-                    if (const AstExpr* bad = ws_guard_disallowed_expr(stmt->expr))
-                        consider_disallowed_span(bad->span);
-                }
-            }
-            if (has_disallowed_prelude)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, disallowed_span, kWsPreludeDetail);
+        // HTTP admission uses the ordinary route pipeline, including helpers,
+        // effects and value bindings. Only the callback placement is special:
+        // one route owns one post-upgrade handler, published at its final tail.
+        for (u32 si = 0; si < route_decl.statements.len; si++) {
+            const AstStatement* stmt = route_decl.statements[si];
+            if (!ws_prelude_contains_terminate(stmt)) continue;
+            if (stmt == nullptr || stmt->kind != AstStmtKind::WsTerminate ||
+                si + 1 != route_decl.statements.len)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      stmt ? stmt->span : route_decl.span,
+                                      kWsTailDetail);
         }
 #endif
 
@@ -21924,60 +24601,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
             break;
         }
 
-#if RUT_ENABLE_WEBSOCKET
-        if (route.is_ws_terminate) {
-            bool has_disallowed_prelude = false;
-            Span disallowed_span{};
-            auto consider_disallowed_span = [&](Span span) {
-                if (!has_disallowed_prelude || span.start < disallowed_span.start) {
-                    has_disallowed_prelude = true;
-                    disallowed_span = span;
-                }
-            };
-            // These route-level features currently have no HTTP-route publication path for
-            // terminate mode. Reject the source use even if expansion happens to fold away.
-            for (u32 di = 0; di < route_decl.decorators.len; di++)
-                consider_disallowed_span(route_decl.decorators[di].span);
-            for (u32 ci = 0; ci < route_decl.chains.len; ci++)
-                consider_disallowed_span(route_decl.chains[ci].span);
-
-            for (u32 si = 0; si < route_decl.statements.len; si++) {
-                const AstStatement* stmt = route_decl.statements[si];
-                if (stmt == nullptr || stmt->kind == AstStmtKind::WsTerminate) continue;
-                if (stmt->kind == AstStmtKind::Guard) {
-                    if (const AstExpr* bad = ws_guard_disallowed_expr(stmt->expr))
-                        consider_disallowed_span(bad->span);
-                    continue;
-                }
-                if (stmt->kind != AstStmtKind::Let) {
-                    consider_disallowed_span(stmt->span);
-                    continue;
-                }
-                if (const AstExpr* runtime_expr = ws_prelude_runtime_expr(stmt->expr)) {
-                    consider_disallowed_span(runtime_expr->span);
-                    continue;
-                }
-                const HirLocal* local = nullptr;
-                for (u32 li = 0; li < route.locals.len; li++) {
-                    if (route.locals[li].span.start == stmt->span.start &&
-                        route.locals[li].name.eq(stmt->name)) {
-                        local = &route.locals[li];
-                        break;
-                    }
-                }
-                ConstValue value{};
-                if (local == nullptr || local->init.may_nil || local->init.may_error ||
-                    known_value_state(local->init, route.locals.data, route.locals.len, 0) !=
-                        KnownValueState::Available ||
-                    !const_eval_expr(local->init, route.locals.data, route.locals.len, &value, 0))
-                    consider_disallowed_span(stmt->span);
-            }
-            if (has_disallowed_prelude)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, disallowed_span, kWsPreludeDetail);
-        }
-#endif
-
         bool has_chain_after_response_effects = false;
         for (u32 ci = 0; ci < route_decl.chains.len; ci++) {
             const auto& chain_use = route_decl.chains[ci];
@@ -21995,11 +24618,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
         if (has_chain_after_response_effects) {
-            if (route.is_ws_terminate)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax,
-                    route_decl.span,
-                    lit_str("chain after Response effects are not supported on WebSocket routes"));
             auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
             // Explicit status returns in guard failure bodies are response
             // terminators too. Chain-after values are request-derived and are
@@ -22997,99 +25615,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             auto timer_ok = validate_timer_route(route, mod, route_decl.body_span);
             if (!timer_ok) return core::make_unexpected(timer_ok.error());
         }
-#if RUT_ENABLE_WEBSOCKET
-        if (route.is_ws_terminate) {
-            bool has_disallowed_prelude = false;
-            Span disallowed_span{};
-            auto consider_disallowed_span = [&](Span span) {
-                if (!has_disallowed_prelude || span.start < disallowed_span.start) {
-                    has_disallowed_prelude = true;
-                    disallowed_span = span;
-                }
-            };
-            auto static_http_failure = [](const HirTerminator& term) {
-                return term.kind == HirTerminatorKind::ReturnStatus &&
-                       term.source_kind == HirTerminatorSourceKind::Literal &&
-                       term.response_body_local_index == 0xffffffffu &&
-                       term.forward_set_path.len == 0 && term.forward_set_headers.len == 0 &&
-                       term.forward_request_policy_id == 0 &&
-                       term.forward_response_policy_id == 0 &&
-                       term.forward_failure_policy_id == 0 &&
-                       term.forward_timeout_failure_policy_id == 0;
-            };
-            for (u32 gi = 0; gi < route.guards.len; gi++) {
-                const HirGuard& guard = route.guards[gi];
-                bool fail_ok = guard.fail_kind == HirGuard::FailKind::Term
-                                   ? static_http_failure(guard.fail_term)
-                               : guard.fail_kind == HirGuard::FailKind::Body
-                                   ? guard.fail_body.body_kind == HirGuardBody::BodyKind::Direct &&
-                                         guard.fail_body.locals.len == 0 &&
-                                         static_http_failure(guard.fail_body.direct_term)
-                                   : false;
-                if (!ws_http_guard_expr_allowed(guard.cond) || !fail_ok)
-                    consider_disallowed_span(guard.span);
-            }
-            for (u32 wi = 0; wi < route.waits.len; wi++)
-                consider_disallowed_span(route.waits[wi].span);
-            for (u32 fi = 0; fi < route.for_loops.len; fi++)
-                consider_disallowed_span(route.for_loops[fi].span);
-            if (route.control.kind != HirControlKind::Direct) {
-                consider_disallowed_span(route.control.kind == HirControlKind::If
-                                             ? route.control.cond.span
-                                             : route.control.match_expr.span);
-            }
-            for (u32 di = 0; di < route.decorators.len; di++)
-                consider_disallowed_span(route.decorators[di].span);
-            if (route.rate_limit.count != 0 || route.throttle_down_bps != 0 ||
-                route.http_cache_ttl != 0) {
-                for (u32 di = 0; di < route_decl.decorators.len; di++)
-                    consider_disallowed_span(route_decl.decorators[di].span);
-            }
-            for (u32 li = 0; li < route.locals.len; li++) {
-                const HirLocal& local = route.locals[li];
-                const HirGuard* guard_binding = nullptr;
-                for (u32 gi = 0; gi < route.guards.len; gi++)
-                    if (route.guards[gi].span.start == local.span.start &&
-                        route.guards[gi].span.end == local.span.end)
-                        guard_binding = &route.guards[gi];
-                if (guard_binding != nullptr) {
-                    const HirExpr& init = local.init;
-                    ConstValue value{};
-                    const bool static_binding =
-                        !init.may_nil && !init.may_error &&
-                        const_eval_expr(init, route.locals.data, route.locals.len, &value, 0);
-                    const bool request_binding =
-                        init.kind == HirExprKind::ValueOf && init.lhs != nullptr &&
-                        guard_binding->cond.kind == HirExprKind::HasValue &&
-                        guard_binding->cond.lhs != nullptr &&
-                        guard_binding->cond.lhs->span.start == init.lhs->span.start &&
-                        guard_binding->cond.lhs->span.end == init.lhs->span.end &&
-                        ws_http_guard_expr_allowed(*init.lhs);
-                    if (!static_binding && !request_binding) consider_disallowed_span(local.span);
-                    continue;
-                }
-                ConstValue value{};
-                if (local.init.may_nil || local.init.may_error ||
-                    known_value_state(local.init, route.locals.data, route.locals.len, 0) !=
-                        KnownValueState::Available ||
-                    !const_eval_expr(local.init, route.locals.data, route.locals.len, &value, 0))
-                    consider_disallowed_span(local.span);
-            }
-            const HirTerminator& ws_forward = route.control.direct_term;
-            if (route.control.kind != HirControlKind::Direct ||
-                ws_forward.kind != HirTerminatorKind::ForwardUpstream ||
-                ws_forward.upstream_index != route.ws_handler.upstream_index ||
-                ws_forward.forward_set_path.len != 0 || ws_forward.forward_set_headers.len != 0 ||
-                ws_forward.forward_request_policy_id != 0 ||
-                ws_forward.forward_response_policy_id != 0 ||
-                ws_forward.forward_failure_policy_id != 0 ||
-                ws_forward.forward_timeout_failure_policy_id != 0)
-                consider_disallowed_span(route.ws_handler.span);
-            if (has_disallowed_prelude)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, disallowed_span, kWsPreludeDetail);
-        }
-#endif
+
         // Cap HTTP routes at kMaxRoutes even though the routes vector reserves extra
         // slots for synthesized timers — a timer must never consume HTTP capacity
         // (and mod.routes.len counts both, so track HTTP routes separately).

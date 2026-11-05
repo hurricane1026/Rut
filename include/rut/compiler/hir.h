@@ -13,6 +13,8 @@
 #include "rut/common/types.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/common/wait_limits.h"
+#include "rut/common/ws_control_flow.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/node_pool.h"
@@ -130,6 +132,8 @@ enum class HirExprKind : u8 {
     IntLit,
     StrLit,
     RegexMatch,
+    StringConcat,
+    StringPredicate,
     Tuple,
     // Array literal: elements stored in `args`. analyze rejects heterogeneous
     // arrays and bare empty `[]`; typed empty route locals are currently
@@ -244,6 +248,21 @@ enum class HirExprKind : u8 {
     // the value in rhs and echoes it (type I64).
     CacheGet,
     CacheSet,
+    // A projection from a callback-scoped WebSocketMessage. lhs retains the
+    // typed receiver through ordinary helper inlining; str_value names the field.
+    WsMessageField,
+    // Built-in closed protocol enum. int_value is its language case index,
+    // independent of the WebSocket wire opcode.
+    ConstWsCase,
+    BytesLit,
+    BytesCount,
+    // Lexical evaluation: lhs is evaluated once before rhs. BoundValue refers
+    // to that initializer node identity, so helper inlining cannot capture a
+    // different local with a coincidentally equal slot index.
+    LetIn,
+    BoundValue,
+    WsForward,  // lhs payload, int_value Text/Binary wire opcode; produces an action
+    WsClose,    // lhs code, rhs reason; produces an action
 };
 
 enum class HirTypeKind : u8 {
@@ -275,7 +294,26 @@ enum class HirTypeKind : u8 {
     // A bounded response builder local. It is consumed by `return <local>` and
     // does not have a runtime MIR carrier in the initial literal-only slice.
     Response,
+    // Borrowed complete Text/Binary message; only message callbacks supply values.
+    // It has no HTTP/MIR storage representation and cannot outlive the callback.
+    WebSocketMessage,
+    WebSocketConnection,
+    WebSocketMessageKind,
+    WebSocketDirection,
+    // Raw octets. Runtime views use the existing pointer/length carrier;
+    // source typing keeps these separate from text and JSON.
+    Bytes,
+    WebSocketClose,
 };
+
+constexpr bool is_ws_enum_type(HirTypeKind type) {
+    return type == HirTypeKind::WebSocketMessageKind || type == HirTypeKind::WebSocketDirection;
+}
+
+constexpr bool is_ws_borrowed_type(HirTypeKind type) {
+    return type == HirTypeKind::WebSocketMessage || type == HirTypeKind::WebSocketConnection ||
+           type == HirTypeKind::WebSocketClose;
+}
 
 inline constexpr u32 kMaxTupleSlots = 10;
 
@@ -532,6 +570,23 @@ struct HirExpr {
     FixedVec<HirExpr*, kMaxArgs> args;
 };
 
+// A bounded String construction can allocate/fail; preserve its selected branch
+// and call-site evaluation even when pure scalar trees can still be substituted.
+inline bool hir_has_string_construction(const HirExpr& value, u32 depth = 0) {
+    if (depth > 128) return true;
+    if (value.kind == HirExprKind::StringConcat) return true;
+    if (value.kind == HirExprKind::BoundValue) return false;
+    if (value.lhs && hir_has_string_construction(*value.lhs, depth + 1)) return true;
+    if (value.rhs && hir_has_string_construction(*value.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && hir_has_string_construction(*value.args[i], depth + 1)) return true;
+    for (u32 i = 0; i < value.field_inits.len; ++i)
+        if (value.field_inits[i].value &&
+            hir_has_string_construction(*value.field_inits[i].value, depth + 1))
+            return true;
+    return false;
+}
+
 struct HirFunction {
     static constexpr u32 kMaxTypeParams = 4;
     struct TypeParamDecl {
@@ -598,6 +653,8 @@ struct HirFunction {
     // whether the source helper also contained another statement effect so a
     // call site cannot silently drop it during expansion.
     bool has_non_response_statement_effect = false;
+    // Phase capability retained before normalization can fold away a read.
+    bool uses_http_values = false;
     struct RespondHeader {
         Str key{};
         Str value{};
@@ -613,6 +670,10 @@ struct HirFunction {
     static constexpr u32 kMaxRespondGuards = 4;
     FixedVec<RespondGuard, kMaxRespondGuards> respond_guards;
     HirExpr body{};
+    // The same typed source normalized with reached lexical values for the
+    // synchronous message phase and common String construction; owned by exprs,
+    // including imported helpers.
+    u32 lexical_body_index = 0xffffffffu;
 
     HirFunction() = default;
     HirFunction(const HirFunction& other)
@@ -633,8 +694,10 @@ struct HirFunction {
           params(other.params),
           exprs(other.exprs),
           has_non_response_statement_effect(other.has_non_response_statement_effect),
+          uses_http_values(other.uses_http_values),
           respond_guards(other.respond_guards),
-          body(other.body) {
+          body(other.body),
+          lexical_body_index(other.lexical_body_index) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
@@ -672,8 +735,10 @@ struct HirFunction {
         params = other.params;
         exprs = other.exprs;
         has_non_response_statement_effect = other.has_non_response_statement_effect;
+        uses_http_values = other.uses_http_values;
         respond_guards = other.respond_guards;
         body = other.body;
+        lexical_body_index = other.lexical_body_index;
         rebase_from(other);
         return *this;
     }
@@ -695,8 +760,10 @@ struct HirFunction {
           params(other.params),
           exprs(other.exprs),
           has_non_response_statement_effect(other.has_non_response_statement_effect),
+          uses_http_values(other.uses_http_values),
           respond_guards(other.respond_guards),
-          body(other.body) {
+          body(other.body),
+          lexical_body_index(other.lexical_body_index) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
@@ -734,8 +801,10 @@ struct HirFunction {
         params = other.params;
         exprs = other.exprs;
         has_non_response_statement_effect = other.has_non_response_statement_effect;
+        uses_http_values = other.uses_http_values;
         respond_guards = other.respond_guards;
         body = other.body;
+        lexical_body_index = other.lexical_body_index;
         rebase_from(other);
         return *this;
     }
@@ -1094,7 +1163,8 @@ enum class WsVerdict : u8 {
 
 // Message-handler condition nodes. Leaf nodes inspect message length, opcode,
 // direction or payload predicates; And/Or nodes combine earlier child nodes. Only roots
-// are source guards and yield their else verdict when false.
+// are source conditional clauses. Unset control targets yield their else verdict
+// when false and continue to the next root when true.
 struct WsLenGuard {
     enum class Accessor : u8 {
         Len,
@@ -1130,17 +1200,22 @@ struct WsLenGuard {
         JsonStringifyEqual,
         JsonStringifyPrefix,
         JsonStringifySuffix,
-        JsonStringifyContains
+        JsonStringifyContains,
+        JsonStringRegex,
+        Constant,
+        BoolEqual,
+        BoolSelect
     };
     // <=, >= and != normalize to a negated comparison. Opcode guards use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
     Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
-    u32 bound = 0;  // Len: the byte literal message.len is compared to. Opcode: the WsOpcode value.
+    u32 bound = 0;  // Len: literal bound; Opcode: wire value; BoolSelect: selector child index.
     // TextMatch/TextEqual/TextPrefix/TextSuffix/TextContains: regex or decoded literal, valid
     // through codegen. JsonHasPath/JsonStringValid: decoded JSON Pointer.
     // JsonStringEqual/Prefix/Suffix/Contains: pattern is the pointer and value is the
     // decoded expected string (empty for isEmpty).
+    // JsonStringRegex: pattern is the pointer; value is the regex pattern contents.
     // JsonBoolValid/Equal: pattern is the JSON Pointer; bound is the expected bool for Equal.
     // JsonKindEqual: pattern is the JSON Pointer; value is an expected kind name.
     // JsonCountValid/Compare: pattern is the JSON Pointer; int_bound is a signed i32 literal.
@@ -1148,11 +1223,15 @@ struct WsLenGuard {
     Str value{};
     i64 int_bound = 0;    // JsonIntCompare: i64 bound; JsonCountCompare: validated i32 bound.
     bool negate = false;  // invert this node's condition, including an entire subtree
-    // Compound conditions reference earlier nodes in the handler's postorder array.
+    // Compound conditions reference earlier nodes. BoolSelect uses bound/lhs/rhs
+    // for its selector/true/false operands, each owned exactly once.
     u32 lhs = 0;
     u32 rhs = 0;
     bool is_operand = false;              // only roots execute as source-level guards
     WsVerdict verdict = WsVerdict::Drop;  // yielded when the guard fails
+    // Root-only forward targets; Next preserves legacy sequential guard behavior.
+    u32 pass_target = kWsControlNext;
+    u32 fail_target = kWsControlNext;
 };
 
 struct HirWsClosePolicy {
@@ -1166,7 +1245,9 @@ enum class HirWsTextSource : u8 {
     JsonString,
     JsonNumberText,
     JsonStringify,
-    LiteralBinary
+    LiteralBinary,
+    MessageBytes,
+    Dynamic  // shared-IR callback may publish a runtime payload or close reason
 };
 
 struct HirWsTextRewrite {
@@ -1176,10 +1257,32 @@ struct HirWsTextRewrite {
     HirWsTextSource source = HirWsTextSource::Literal;
 };
 
+inline bool ws_projection_receiver_valid(const HirExpr& expr, WsCallbackPhase phase) {
+    const HirExpr* receiver = expr.lhs;
+    if (receiver && receiver->type == HirTypeKind::WebSocketConnection &&
+        receiver->kind == HirExprKind::WsMessageField) {
+        if (!receiver->str_value.eq(lit_str("connection")) || receiver->may_nil ||
+            receiver->may_error)
+            return false;
+        receiver = receiver->lhs;
+    }
+    const auto kRoot = phase == WsCallbackPhase::Open    ? HirTypeKind::WebSocketConnection
+                       : phase == WsCallbackPhase::Close ? HirTypeKind::WebSocketClose
+                                                         : HirTypeKind::WebSocketMessage;
+    return receiver && receiver->kind == HirExprKind::LocalRef && receiver->local_index == 0 &&
+           receiver->type == kRoot && !receiver->may_nil && !receiver->may_error;
+}
+
 struct HirWsHandler {
+    // A normalized shared-IR entry lives in the owning route's expression pool.
+    // The index preserves ordinary HirRoute copy/move rebasing and ownership.
+    u32 general_body_expr = 0xffffffffu;
+    u32 open_body_expr = 0xffffffffu;
+    u32 close_body_expr = 0xffffffffu;
+    Str parameter_name = lit_str("message");  // analyzer-only lexical binding
     WsVerdict default_verdict = WsVerdict::Forward;
-    // Postorder condition forest. Guard roots execute in source order before the
-    // default verdict; the first failing guard's else verdict wins.
+    // Postorder condition forest with forward-only root control targets. Unset
+    // targets preserve ordered guards before the default verdict.
     static constexpr u32 kMaxLenGuards = 4;
     static constexpr u32 kMaxConditionNodes = 32;
     FixedVec<WsLenGuard, kMaxConditionNodes> len_guards;
@@ -1196,7 +1299,7 @@ struct HirWsHandler {
     u16 close_code = 1000;
     u32 close_reason_expr = 0xffffffffu;  // decoded literal in HirRoute.exprs, or absent
     // `maxMessageSize:` kwarg in bytes (0 = omitted → the loader uses the engine default). The
-    // explicit values are validated against the single-slice payload capacity.
+    // explicit values are validated against the bounded bulk payload capacity.
     u32 max_message_size = 0;
     Str subprotocol{};  // decoded, validated required offer; empty means no policy
     u32 upstream_index = 0;
@@ -1280,6 +1383,13 @@ struct HirRoute {
     // Direct ForwardUpstream to the configured WebSocket backend; `ws_handler`
     // separately carries the post-101 message verdict handler.
     bool is_ws_terminate = false;
+    // Analyzer-only scratch scope for synchronous message expressions. HTTP
+    // admission on a terminate route retains ordinary helper/effect semantics.
+    bool is_ws_callback = false;
+    WsCallbackPhase ws_callback_phase = WsCallbackPhase::Message;
+    bool is_lexical_helper = false;
+    // Analyzer capability summary, including reads in otherwise unused values.
+    bool uses_http_values = false;
     HirWsHandler ws_handler{};
     // Timer route: the body is a `timer name, every: D {...}` background periodic
     // task, not an HTTP route. `path` holds the timer name; `timer_interval_ms`
@@ -1310,6 +1420,10 @@ struct HirRoute {
           throttle_down_bps(other.throttle_down_bps),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
+          is_ws_callback(other.is_ws_callback),
+          ws_callback_phase(other.ws_callback_phase),
+          is_lexical_helper(other.is_lexical_helper),
+          uses_http_values(other.uses_http_values),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
@@ -1336,6 +1450,10 @@ struct HirRoute {
         throttle_down_bps = other.throttle_down_bps;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
+        is_ws_callback = other.is_ws_callback;
+        ws_callback_phase = other.ws_callback_phase;
+        is_lexical_helper = other.is_lexical_helper;
+        uses_http_values = other.uses_http_values;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
@@ -1362,6 +1480,10 @@ struct HirRoute {
           throttle_down_bps(other.throttle_down_bps),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
+          is_ws_callback(other.is_ws_callback),
+          ws_callback_phase(other.ws_callback_phase),
+          is_lexical_helper(other.is_lexical_helper),
+          uses_http_values(other.uses_http_values),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
@@ -1388,6 +1510,10 @@ struct HirRoute {
         throttle_down_bps = other.throttle_down_bps;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
+        is_ws_callback = other.is_ws_callback;
+        ws_callback_phase = other.ws_callback_phase;
+        is_lexical_helper = other.is_lexical_helper;
+        uses_http_values = other.uses_http_values;
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;

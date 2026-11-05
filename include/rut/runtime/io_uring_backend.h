@@ -232,6 +232,10 @@ struct IoUringBackend {
     // No user buffer needed — kernel picks from provided ring.
     // Returns false if SQ is full (no SQE submitted).
     bool add_recv(i32 fd, u32 conn_id);
+    // Bounded downstream one-shot receive. A selected buffer is returned before
+    // rearming; max_len limits the copy to current plaintext/ciphertext space.
+    // Uses the ordinary ring, retaining downstream terminal/cancel validation.
+    bool add_recv_once(i32 fd, u32 conn_id, u32 max_len);
 
     // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
     // can distinguish upstream vs client recv CQEs.

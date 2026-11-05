@@ -43,17 +43,21 @@ struct WsFrameHeader {
     u8 mask_key[4];   // valid iff masked
     u64 payload_len;  // 7-/16-/64-bit decoded length
     u32 header_len;   // octets this header consumed (2..14); payload starts at buf+header_len
+    bool compressed = false;  // RFC 7692 RSV1, only on the first data fragment
 };
 
 // Parse a frame header from `buf` (incremental). Returns:
 //   Complete   — `*out` fully populated; payload follows at buf + out->header_len.
 //   Incomplete — the header is not fully present yet; call again after more bytes.
-//   Error      — protocol violation (any RSV bit set, a reserved/invalid opcode, a
+//   Error      — protocol violation (unnegotiated RSV bits, a reserved/invalid opcode, a
 //                control frame with FIN=0 or payload>125, the 64-bit length's top bit
 //                set, or a mask-direction violation). The caller must fail the tunnel.
 // `require_mask` enforces §5.1: pass true for client->server frames (MUST be masked)
 // and false for server->client frames (MUST NOT be masked).
-ParseStatus ws_parse_header(const u8* buf, u32 len, bool require_mask, WsFrameHeader* out);
+// `allow_compressed` requires a negotiated RFC 7692 decoder. It permits RSV1
+// only on initial Text/Binary frames; RSV2/3 and compressed controls still fail.
+ParseStatus ws_parse_header(
+    const u8* buf, u32 len, bool require_mask, WsFrameHeader* out, bool allow_compressed = false);
 
 // Unmask (or mask — the operation is its own inverse) `len` payload bytes in place with
 // the 4-byte key (§5.3). Safe for len == 0.
@@ -71,8 +75,13 @@ void ws_unmask_chunk(u8* payload, u64 len, const u8 mask_key[4], u64 offset);
 // fragmented (fin=false), carries >125 bytes, or is a Close with a 1-byte body, or any payload
 // length with the reserved 64-bit high bit set — in which case nothing is written.
 // Callers must treat a 0 return as a refusal.
-u32 ws_write_header(
-    u8* out, WsOpcode op, bool fin, bool masked, const u8 mask_key[4], u64 payload_len);
+u32 ws_write_header(u8* out,
+                    WsOpcode op,
+                    bool fin,
+                    bool masked,
+                    const u8 mask_key[4],
+                    u64 payload_len,
+                    bool compressed = false);
 
 // ── Message reassembly (RFC 6455 §5.4) ─────────────────────────────
 // A data *message* is one Text/Binary frame (FIN=0 when fragmented) followed by zero or

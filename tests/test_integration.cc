@@ -118,6 +118,11 @@ void observe_send_pause(void* /*lp*/, Connection& conn, IoEvent ev) {
 }
 
 struct ScriptedTlsState {
+    i32 shutdown_calls = 0;
+    i32 shutdown_first_rc = -1;
+    i32 shutdown_second_rc = 0;
+    i32 shutdown_first_error = SSL_ERROR_WANT_WRITE;
+    i32 shutdown_second_error = SSL_ERROR_NONE;
     i32 accept_calls = 0;
     i32 read_calls = 0;
     i32 write_calls = 0;
@@ -177,6 +182,15 @@ i32 scripted_ssl_write(SSL* /*ssl*/, const void* /*buf*/, i32 /*len*/) {
     return g_scripted_tls->write_second_rc;
 }
 
+i32 scripted_ssl_shutdown(SSL*) {
+    if (!g_scripted_tls) return -1;
+    ++g_scripted_tls->shutdown_calls;
+    const bool first = g_scripted_tls->shutdown_calls == 1;
+    g_scripted_tls->last_error =
+        first ? g_scripted_tls->shutdown_first_error : g_scripted_tls->shutdown_second_error;
+    return first ? g_scripted_tls->shutdown_first_rc : g_scripted_tls->shutdown_second_rc;
+}
+
 i32 scripted_ssl_get_error(SSL* /*ssl*/, i32 /*rc*/) {
     if (!g_scripted_tls) return SSL_ERROR_SSL;
     return g_scripted_tls->last_error;
@@ -201,7 +215,8 @@ struct ScopedTlsHooks {
                   scripted_ssl_write,
                   scripted_ssl_get_error,
                   scripted_alpn_negotiated,
-                  scripted_capture_client_fingerprint};
+                  scripted_capture_client_fingerprint,
+                  scripted_ssl_shutdown};
         set_epoll_tls_hooks_for_test(&hooks_);
     }
 
@@ -4551,6 +4566,55 @@ TEST(partial_send, non_tls_send_completes_with_smaller_conn_table) {
     close(fds[0]);
     close(fds[1]);
     backend.shutdown();
+}
+
+TEST(tls_state_machine, websocket_shutdown_retry_and_preflight_matrix) {
+    const i32 errors[] = {SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE, SSL_ERROR_SSL};
+    for (i32 error : errors) {
+        EpollBackend backend;
+        REQUIRE(backend.init(0, -1, 1).has_value());
+        int sockets[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
+        TestConn owner;
+        owner.init(0, sockets[0]);
+        auto& conn = owner.conn;
+        conn.tls_active = conn.tls_handshake_complete = true;
+        conn.tls = reinterpret_cast<SSL*>(1);
+        conn.ws_tls_shutdown_pending = conn.ws_upstream_send_pending = true;
+        REQUIRE(backend.add_recv(conn.fd, 0));
+        ScriptedTlsState state;
+        state.shutdown_first_error = error;
+        ScopedTlsHooks hooks(state);
+        REQUIRE(backend.add_tls_shutdown(conn));
+        CHECK_EQ(state.shutdown_calls, 1);
+        IoEvent events[8];
+        if (error == SSL_ERROR_WANT_READ) {
+            backend.pause_recv(0, true);  // must retain the shutdown operation's read retry
+            const u8 byte = 'x';
+            REQUIRE_EQ(write(sockets[1], &byte, 1), 1);
+        }
+        u32 count = backend.wait(events, 8, &conn, 1);
+        REQUIRE_GT(count, 0u);
+        bool completion = false;
+        for (u32 n = 0; n < count; ++n) {
+            if (events[n].type != IoEventType::Send) continue;
+            completion = true;
+            CHECK_EQ(events[n].result, error == SSL_ERROR_SSL ? -EPROTO : 1);
+        }
+        CHECK(completion);
+        CHECK_EQ(state.read_calls, 0);  // shutdown never falls into SSL_read/SSL_write
+        CHECK_EQ(state.write_calls, 0);
+        CHECK_EQ(state.shutdown_calls, error == SSL_ERROR_SSL ? 1 : 2);
+        backend.pending_count = EpollBackend::kPendingCap;
+        CHECK_FALSE(backend.add_tls_shutdown(conn));
+        CHECK_EQ(state.shutdown_calls, error == SSL_ERROR_SSL ? 1 : 2);
+        backend.pending_count = 0;
+        conn.tls = nullptr;
+        conn.tls_active = false;
+        backend.shutdown();
+        close(sockets[0]);
+        close(sockets[1]);
+    }
 }
 
 TEST(tls_state_machine, recv_retry_matrix) {

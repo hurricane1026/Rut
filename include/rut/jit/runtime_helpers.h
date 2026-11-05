@@ -312,6 +312,19 @@ rut::u8 rut_helper_str_contains(const char* text,
                                 const char* needle,
                                 rut::u32 needle_len);
 
+// Begin a synchronous post-upgrade message evaluation. The previous message's
+// temporary values have already been copied into owned send storage.
+void rut_helper_ws_begin_message(void* conn);
+rut::u32 rut_helper_ws_forward(void* conn, const char* payload, rut::u32 len, rut::u8 opcode);
+rut::u32 rut_helper_ws_close(void* conn, rut::i32 code, const char* reason, rut::u32 len);
+// Downstream connection metadata, borrowed only during the synchronous message callback.
+rut::u32 rut_helper_ws_connection_scalar(void* conn, rut::u32 field);
+void rut_helper_ws_close_reason(void* conn,
+                                rut::u32 field,
+                                const char** out_ptr,
+                                rut::u32* out_len);
+void rut_helper_ws_connection_subprotocol(void* conn, const char** out_ptr, rut::u32* out_len);
+
 // Validate a bounded complete JSON payload without publishing a document or allocating.
 rut::u8 rut_helper_ws_json_valid(const char* payload, rut::u64 len);
 rut::u8 rut_helper_ws_json_has_path(const char* payload,
@@ -322,6 +335,9 @@ rut::u8 rut_helper_ws_json_string_at_path(const char* payload,
                                           rut::u64 len,
                                           const char* path,
                                           rut::u32 path_len);
+// 0=no match, 1=match, 2=decode/scan error; callers close on error before negation.
+rut::u8 rut_helper_ws_json_string_regex_at_path(
+    const char* payload, rut::u64 len, const char* path, rut::u32 path_len, void* database);
 rut::u8 rut_helper_ws_json_string_equals_at_path(const char* payload,
                                                  rut::u64 len,
                                                  const char* path,
@@ -407,8 +423,26 @@ void* rut_helper_regex_deserialize(const char* bytes, rut::u64 length);
 // Full regular-expression match using a precompiled database.
 rut::u8 rut_helper_str_regex_match(const char* s, rut::u32 s_len, void* db);
 
+// Full-match tri-state result: 0 no match, 1 match, 2 scan/resource failure.
+// Message callbacks must close on failure before applying Boolean operators.
+rut::u8 rut_helper_str_regex_result(const char* s, rut::u32 s_len, void* db);
+
 // Returns 1 when the Vectorscan backend is available.
 rut::u8 rut_helper_regex_backend_available();
+
+// Byte-exact suffix predicate; empty needle matches any valid String.
+rut::u8 rut_helper_str_has_suffix(const char* text,
+                                  rut::u32 size,
+                                  const char* needle,
+                                  rut::u32 needle_size);
+// Bounded String concatenation into the existing invocation arena. Returns 0
+// on invalid carriers or allocation failure, never a fabricated empty result.
+rut::u8 rut_helper_str_concat(void* conn,
+                              void* arena,
+                              const rut::Str* parts,
+                              rut::u32 count,
+                              const char** out_ptr,
+                              rut::u32* out_size);
 
 // Trim prefix from string. If s starts with pfx, out = remainder.
 // Otherwise out = s unchanged.
@@ -469,6 +503,14 @@ void rut_helper_resp_header(void* conn,
 // a no-op (defensive; analyze bounds the index at compile time).
 void rut_helper_cache_get(rut::u32 instance, rut::u32 key_ip, rut::u8* out_has, rut::i64* out_val);
 void rut_helper_cache_set(rut::u32 instance, rut::u32 key_ip, rut::i64 val);
+// Compiled handlers bind the declaration identity as well as its original slot.
+// A reload may move/remove that name; lookup uses one consistent registry snapshot.
+void rut_helper_cache_get_bound(
+    rut::u32 instance, rut::u64 identity, rut::u32 key_ip, rut::u8* out_has, rut::i64* out_val);
+void rut_helper_cache_set_bound(rut::u32 instance,
+                                rut::u64 identity,
+                                rut::u32 key_ip,
+                                rut::i64 val);
 // Harness hook for multiplexing logical shards on one thread. Production shard
 // threads leave the default shard selected. Returns the previously selected shard.
 rut::u32 rut_helper_cache_select_local_shard(rut::u32 shard_id);

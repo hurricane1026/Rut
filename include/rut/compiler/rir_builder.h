@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/hash.h"
@@ -60,6 +61,15 @@ struct Builder {
 
     Module* mod;
 
+    // Frontend lexical values are keyed by their owning initializer identity.
+    // A scoped stack entry lives only during synchronous IR materialization.
+    struct ValueBinding {
+        const void* key = nullptr;
+        ValueId value = kNoValue;
+        const ValueBinding* parent = nullptr;
+    };
+    const ValueBinding* value_bindings = nullptr;
+
     // Current insert point — stored as index to survive grow_blocks().
     Function* cur_func;
     BlockId cur_block_id;
@@ -71,6 +81,7 @@ struct Builder {
 
     void init(Module* m) {
         mod = m;
+        value_bindings = nullptr;
         cur_func = nullptr;
         cur_block_id = kNoBlock;
         cur_block = nullptr;
@@ -509,6 +520,42 @@ struct Builder {
         return TRY(emit(Opcode::ReqPathOnly, ty, loc)).vid;
     }
 
+    Result<ValueId> emit_ws_message_field(WsMessageFieldId field, SourceLoc loc = {}) {
+        if (!ws_message_field_valid(static_cast<u32>(field)))
+            return core::make_unexpected(RirError::InvalidState);
+        const bool kBool = ws_message_field_is_bool(field);
+        const TypeKind kKind = ws_message_field_is_string(field)                 ? TypeKind::Str
+                               : field == WsMessageFieldId::ConnectionRemoteAddr ? TypeKind::IP
+                               : kBool                                           ? TypeKind::Bool
+                                                                                 : TypeKind::I32;
+        auto* ty = TRY(make_type(kKind));
+        auto result = TRY(emit(Opcode::WsMessageField, ty, loc));
+        result.inst->imm.i32_val = static_cast<i32>(field);
+        return result.vid;
+    }
+
+    Result<ValueId> emit_ws_forward(ValueId payload, u8 opcode, SourceLoc loc = {}) {
+        if (!val_has_type(payload, TypeKind::Str) || (opcode != 1 && opcode != 2))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::WsForward, ty, loc));
+        inst->operands[0] = payload;
+        inst->operand_count = 1;
+        inst->imm.i32_val = opcode;
+        return vid;
+    }
+
+    Result<ValueId> emit_ws_close(ValueId code, ValueId reason, SourceLoc loc = {}) {
+        if (!val_has_type(code, TypeKind::I32) || !val_has_type(reason, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::WsClose, ty, loc));
+        inst->operands[0] = code;
+        inst->operands[1] = reason;
+        inst->operand_count = 2;
+        return vid;
+    }
+
     Result<ValueId> emit_req_body(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
         return TRY(emit(Opcode::ReqBody, ty, loc)).vid;
@@ -845,6 +892,15 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_str_length(ValueId str, SourceLoc loc = {}) {
+        if (!val_has_type(str, TypeKind::Str)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::StrLength, ty, loc));
+        inst->operands[0] = str;
+        inst->operand_count = 1;
+        return vid;
+    }
+
     Result<ValueId> emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
             return err(RirError::InvalidState);
@@ -853,6 +909,22 @@ struct Builder {
         inst->operands[0] = str;
         inst->operands[1] = prefix;
         inst->operand_count = 2;
+        return vid;
+    }
+
+    Result<ValueId> emit_str_predicate(ValueId text,
+                                       ValueId needle,
+                                       u32 predicate,
+                                       SourceLoc loc = {}) {
+        if (predicate > 3 || !val_has_type(text, TypeKind::Str) ||
+            !val_has_type(needle, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::StrPredicate, ty, loc));
+        inst->operands[0] = text;
+        inst->operands[1] = needle;
+        inst->operand_count = 2;
+        inst->imm.i32_val = static_cast<i32>(predicate);
         return vid;
     }
 
@@ -878,6 +950,9 @@ struct Builder {
     }
 
     Result<ValueId> emit_str_interpolate(const ValueId* parts, u32 count, SourceLoc loc = {}) {
+        if (!parts || count == 0 || count > 64) return err(RirError::InvalidState);
+        for (u32 i = 0; i < count; ++i)
+            if (!val_has_type(parts[i], TypeKind::Str)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Str));
         auto r = TRY(emit(Opcode::StrInterpolate, ty, loc));
         auto ops = set_operands(r.inst, parts, count);
@@ -1129,6 +1204,30 @@ struct Builder {
         inst->operands[1] = then_val;
         inst->operands[2] = else_val;
         inst->operand_count = 3;
+        return vid;
+    }
+
+    Result<ValueId> emit_phi(ValueId first,
+                             BlockId first_block,
+                             ValueId second,
+                             BlockId second_block,
+                             SourceLoc loc = {}) {
+        if (!valid_val(first) || !valid_val(second) || !cur_block ||
+            first_block.id >= cur_func->block_count || second_block.id >= cur_func->block_count ||
+            first_block == second_block || first_block == cur_block_id ||
+            second_block == cur_block_id)
+            return err(RirError::InvalidState);
+        const Type* type = cur_func->values[first.id].type;
+        if (!type || !types_equal(type, cur_func->values[second.id].type))
+            return err(RirError::InvalidState);
+        for (u32 i = 0; i < cur_block->inst_count; ++i)
+            if (cur_block->insts[i].op != Opcode::Phi) return err(RirError::InvalidState);
+        auto [inst, vid] = TRY(emit(Opcode::Phi, type, loc));
+        inst->operands[0] = first;
+        inst->operands[1] = second;
+        inst->operand_count = 2;
+        inst->imm.block_targets[0] = first_block;
+        inst->imm.block_targets[1] = second_block;
         return vid;
     }
 

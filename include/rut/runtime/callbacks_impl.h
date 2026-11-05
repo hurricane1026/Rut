@@ -1681,7 +1681,8 @@ bool ws_prepare_handshake_before_forward(Loop* loop, Connection& conn) {
                                                                      slice,
                                                                      SlicePool::kSliceSize,
                                                                      &offers_len,
-                                                                     conn.ws_subprotocol);
+                                                                     conn.ws_subprotocol,
+                                                                     &conn.ws_downstream_deflate);
         if (result != WsHandshakeRequestResult::Ready) {
             loop->free_ws_handshake_slice(slice);
             switch (result) {
@@ -1699,6 +1700,7 @@ bool ws_prepare_handshake_before_forward(Loop* loop, Connection& conn) {
             }
             return false;
         }
+        conn.ws_client_header_len = conn.req_header_end;
         if (conn.ws_subprotocol.len != 0) {
             const u32 kOldHeader = conn.req_header_end;
             const u32 kNewHeader = ws_restrict_subprotocol(
@@ -3214,7 +3216,12 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                           (route->action == RouteAction::JitHandler && route->fn != nullptr));
     conn.is_ws_terminate_route = ws_term;
     conn.ws_handler = ws_term ? route->ws_frame_handler : nullptr;
+    conn.ws_open_handler = ws_term ? route->ws_open_handler : nullptr;
+    conn.ws_close_handler = ws_term ? route->ws_close_handler : nullptr;
     conn.ws_subprotocol = ws_term ? route->ws_subprotocol : Str{};
+    conn.ws_negotiated_subprotocol = {};
+    conn.ws_downstream_deflate = {};
+    conn.ws_upstream_deflate = {};
     conn.ws_max_message_size = ws_term ? route->ws_max_message_size : 0;
     conn.ws_close_code = ws_term ? route->ws_close_code : 1000;
     conn.ws_close_reason = ws_term ? route->ws_close_reason : Str{};
@@ -8597,8 +8604,22 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         }
     }
 #if RUT_ENABLE_WEBSOCKET
-    // Terminate routes must not let the backend negotiate a per-message extension.
-    if (conn.is_ws_terminate_route && conn.req_wants_upgrade) strip_ws_extensions(conn);
+    // The gateway negotiates its client role independently of the downstream.
+    // A retry snapshot already contains this canonical offer.
+    if (conn.is_ws_terminate_route && conn.req_wants_upgrade && conn.retry_req_send_len == 0) {
+        const u32 kOldHeader = conn.req_header_end;
+        const u32 kOldTotal = conn.recv_buf.len();
+        const u32 kNewHeader = ws_rewrite_extensions(
+            conn.recv_slice, kOldHeader, kOldTotal, conn.recv_buf.capacity(), kWsDeflateOffer);
+        if (!kNewHeader) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.recv_buf.set_len(kOldTotal - kOldHeader + kNewHeader);
+        conn.req_header_end = kNewHeader;
+        if (conn.req_initial_send_len >= kOldHeader)
+            conn.req_initial_send_len = conn.req_initial_send_len - kOldHeader + kNewHeader;
+    }
 #endif
     // Pick the request source. A retried fresh connect (after a reused socket died
     // post-send) has retry_req_send_len > 0: recv_buf was reset at request-sent, so
@@ -10995,7 +11016,10 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_c2u.reset();
         conn.ws_c2u.masked = true;       // client->upstream is client-role on both ends → masked
         conn.ws_c2u.from_client = true;  // this leg is the client→upstream direction
+        conn.ws_c2u.decoder = conn.ws_downstream_codec;
+        conn.ws_c2u.encoder = conn.ws_upstream_codec;
         conn.ws_c2u.max_message_size = kCap;
+        conn.ws_c2u.dynamic_output = &conn.ws_handler_output;
         conn.ws_c2u.forward_text = conn.ws_forward_text;
         conn.ws_c2u.forward_texts = conn.ws_forward_texts;
         conn.ws_c2u.forward_text_count = conn.ws_forward_text_count;
@@ -11007,7 +11031,10 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_u2c.reset();
         conn.ws_u2c.masked = false;       // upstream->client is server-role on both ends → unmasked
         conn.ws_u2c.from_client = false;  // this leg is the upstream→client direction
+        conn.ws_u2c.decoder = conn.ws_upstream_codec;
+        conn.ws_u2c.encoder = conn.ws_downstream_codec;
         conn.ws_u2c.max_message_size = kCap;
+        conn.ws_u2c.dynamic_output = &conn.ws_handler_output;
         conn.ws_u2c.forward_text = conn.ws_forward_text;
         conn.ws_u2c.forward_texts = conn.ws_forward_texts;
         conn.ws_u2c.forward_text_count = conn.ws_forward_text_count;
@@ -11150,65 +11177,172 @@ bool ws_handle_timer_tick(Loop* loop, Connection& conn) {
     return false;
 }
 
-// Drive the bidirectional Close handshake: submit a Close frame on each peer's send slot
-// when it's idle (deferring on a busy slot), skip a peer that already half-closed, and
-// close once both slots' Close frames have drained. Idempotent — safe to call from the
-// trigger and from both sent callbacks. Returns false on a submit failure (caller closes).
+// Closing controls use the sender's own send slot. Application data is
+// discarded without callbacks; the ordinary fixed shutdown deadline bounds
+// peers that keep sending data or withhold their Close acknowledgement.
+template <bool FromClient, typename Loop>
+bool ws_receive_closing(Loop* loop, Connection& conn) {
+    auto& input = FromClient ? conn.recv_buf : conn.upstream_recv_buf;
+    auto& inspector = FromClient ? conn.ws_c2u : conn.ws_u2c;
+    bool& received = FromClient ? conn.ws_close_client_received : conn.ws_close_upstream_received;
+    const bool kEof = FromClient ? conn.ws_client_eof : conn.ws_upstream_eof;
+    auto consume = [&](u32 count) {
+        if constexpr (FromClient)
+            conn.consume_request_receive_buffer(count);
+        else
+            input.consume(count);
+    };
+    if (!received && input.len() != 0) {
+        u8 ping[kWsMaxControlPayload];
+        u32 ping_len = 0, consumed = 0;
+        const WsClosingRead kStatus =
+            ws_read_closing(inspector, input.data(), input.len(), ping, &ping_len, &consumed);
+        if (kStatus == WsClosingRead::Error) return false;
+        consume(consumed);
+        if (kStatus == WsClosingRead::Close && !conn.ws_record_peer_close(FromClient, inspector))
+            return false;
+        if (kStatus == WsClosingRead::Ping) {
+            u8* frame = FromClient ? conn.ws_close_frame_client : conn.ws_close_frame_upstream;
+            u64& rng = FromClient ? conn.ws_u2c.mask_rng : conn.ws_c2u.mask_rng;
+            const u32 kFrameSize = ws_emit_pong_frame(
+                frame, sizeof(conn.ws_close_frame_client), !FromClient, rng, ping, ping_len);
+            if (kFrameSize == 0) return false;
+            if constexpr (FromClient) {
+                if (!client_send(loop, conn, frame, kFrameSize)) return false;
+                conn.ws_upstream_send_pending = true;
+            } else {
+                if (!loop->submit_send_upstream(conn, frame, kFrameSize)) return false;
+                conn.ws_client_send_pending = true;
+            }
+            return true;
+        }
+    }
+    if (received || kEof) {
+        consume(input.len());  // trailing bytes cannot create more application events
+        if constexpr (FromClient)
+            ws_stop_client_poll(loop, conn);
+        else
+            ws_stop_upstream_poll(loop, conn);
+    }
+    return true;
+}
+
+// Local TLS alert ciphertext has drained before FIN. This operation owns no
+// application plaintext; keep it separate from ordinary TLS logical sends.
+template <typename Loop>
+bool ws_finish_tls_shutdown(Loop* loop, Connection& conn) {
+    conn.ws_tls_shutdown_pending = false;
+    conn.ws_tls_shutdown_need_read = false;
+    conn.ws_upstream_send_pending = false;
+    conn.on_send = nullptr;
+    if (!loop->end_ws_client_stream(conn)) return false;
+    conn.ws_client_write_shutdown = true;
+    return true;
+}
+
+template <typename Loop>
+void on_ws_tls_shutdown_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (!conn.ws_tls_shutdown_pending || ev.result <= 0 || !ws_finish_tls_shutdown(loop, conn) ||
+        !ws_drive_close(loop, conn))
+        close_conn_if_live(loop, conn);
+}
+
+// Submit each Close once its slot is idle, retain both send owners through
+// completion, and then receive peer acknowledgements independently. A completed
+// downstream handshake sends FIN immediately; upstream acknowledgement can still
+// arrive before the ordinary shared retirement path releases either fd/slot.
 template <typename Loop>
 bool ws_drive_close(Loop* loop, Connection& conn) {
-    // A peer that already FIN'd can't receive a Close — treat its slot as satisfied.
-    if (conn.ws_client_eof) conn.ws_close_client_need = false;
-    if (conn.ws_upstream_eof) conn.ws_close_upstream_need = false;
-    // Client slot (upstream->client, unmasked): send the echo Close if idle.
     if (conn.ws_close_client_need && !conn.ws_upstream_send_pending) {
-        const Str reason = conn.ws_echo_close_reason;
-        // The slot is idle: its dedicated output slice is stable until this send completes.
-        u8* frame = reason.empty() ? conn.ws_close_frame_client : conn.ws_u2c_out;
-        const u32 cap = reason.empty() ? sizeof(conn.ws_close_frame_client) : SlicePool::kSliceSize;
-        if (!frame) return false;
-        const u32 n = ws_emit_close_frame(frame,
-                                          cap,
-                                          /*masked=*/false,
-                                          conn.ws_u2c.mask_rng,
-                                          conn.ws_echo_close_code,
-                                          reason);
-        if (n == 0 || !client_send(loop, conn, frame, n)) return false;
+        const u32 kFrameSize = ws_emit_close_payload(conn.ws_close_frame_client,
+                                                     sizeof(conn.ws_close_frame_client),
+                                                     false,
+                                                     conn.ws_u2c.mask_rng,
+                                                     conn.ws_close_payload);
+        if (kFrameSize == 0 || !client_send(loop, conn, conn.ws_close_frame_client, kFrameSize))
+            return false;
         conn.ws_upstream_send_pending = true;
         conn.ws_close_client_need = false;
         conn.ws_close_client_inflight = true;
     }
-    // Upstream slot (client->upstream, masked): send the echo Close if idle.
     if (conn.ws_close_upstream_need && !conn.ws_client_send_pending) {
-        const Str reason = conn.ws_echo_close_reason;
-        u8* frame = reason.empty() ? conn.ws_close_frame_upstream : conn.ws_c2u_out;
-        const u32 cap =
-            reason.empty() ? sizeof(conn.ws_close_frame_upstream) : SlicePool::kSliceSize;
-        if (!frame) return false;
-        const u32 n = ws_emit_close_frame(frame,
-                                          cap,
-                                          /*masked=*/true,
-                                          conn.ws_c2u.mask_rng,
-                                          conn.ws_echo_close_code,
-                                          reason);
-        if (n == 0 || !loop->submit_send_upstream(conn, frame, n)) return false;
+        const u32 kFrameSize = ws_emit_close_payload(conn.ws_close_frame_upstream,
+                                                     sizeof(conn.ws_close_frame_upstream),
+                                                     true,
+                                                     conn.ws_c2u.mask_rng,
+                                                     conn.ws_close_payload);
+        if (kFrameSize == 0 ||
+            !loop->submit_send_upstream(conn, conn.ws_close_frame_upstream, kFrameSize))
+            return false;
         conn.ws_client_send_pending = true;
         conn.ws_close_upstream_need = false;
         conn.ws_close_upstream_inflight = true;
     }
-    // Both slots have finished their Close (none pending, none draining) → tear down.
-    if (!conn.ws_close_client_need && !conn.ws_close_client_inflight &&
-        !conn.ws_close_upstream_need && !conn.ws_close_upstream_inflight) {
+    // Terminate-mode sends own separate output storage. Retire their parsed
+    // receive prefixes now, so one leg's blocked write cannot hold the other
+    // leg's acknowledgement behind already-inspected bytes. No send buffer is
+    // compacted or reused, and later completions see a zero consumed prefix.
+    conn.consume_request_receive_buffer(conn.ws_c2u_consumed);
+    conn.ws_c2u_consumed = 0;
+    conn.upstream_recv_buf.consume(conn.ws_u2c_consumed);
+    conn.ws_u2c_consumed = 0;
+    if (!conn.ws_upstream_send_pending && !ws_receive_closing<true>(loop, conn)) return false;
+    if (!conn.ws_client_send_pending && !ws_receive_closing<false>(loop, conn)) return false;
+    const bool kClientDone = conn.ws_close_client_received || conn.ws_client_eof;
+    const bool kUpstreamDone = conn.ws_close_upstream_received || conn.ws_upstream_eof;
+    if (conn.ws_close_client_sent && kClientDone && !conn.ws_upstream_send_pending &&
+        !conn.ws_client_write_shutdown) {
+        if (conn.tls_active) {
+            conn.ws_tls_shutdown_pending = true;
+            conn.ws_upstream_send_pending = true;
+            conn.on_send = &on_ws_tls_shutdown_sent<Loop>;
+            if (!loop->submit_ws_tls_shutdown(conn)) return false;
+        } else {
+            if (!loop->end_ws_client_stream(conn)) return false;
+            conn.ws_client_write_shutdown = true;
+        }
+    }
+    if (conn.ws_close_client_sent && conn.ws_close_upstream_sent && kClientDone && kUpstreamDone &&
+        !conn.ws_client_send_pending && !conn.ws_upstream_send_pending) {
+        conn.ws_close_handshake_complete =
+            conn.ws_close_client_received && conn.ws_close_upstream_received;
         close_conn_if_live(loop, conn);
+        return true;
+    }
+    // Closing controls reply to their sender, so this phase backpressures the
+    // receive on its own send slot rather than the opposite forwarding slot.
+    if (conn.ws_tls_shutdown_pending && conn.ws_tls_shutdown_need_read) {
+        if (!ws_resume_client_recv(loop, conn)) return false;
+    } else if (kClientDone || conn.ws_upstream_send_pending) {
+        if (!conn.recv_paused_for_send && !ws_pause_client_recv(loop, conn)) return false;
+    } else if (!ws_resume_client_recv(loop, conn)) {
+        return false;
+    }
+    if (kUpstreamDone || conn.ws_client_send_pending) {
+        if (!conn.upstream_recv_paused_for_send && !ws_pause_upstream_recv(loop, conn))
+            return false;
+    } else {
+        conn.upstream_recv_paused_for_send = false;
+        if (!loop->submit_recv_upstream(conn)) return false;
     }
     return true;
 }
 
 template <typename Loop>
 bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
-    // Once a Close handshake is under way, no more data is forwarded — ignore further bytes
-    // (the handshake drives teardown). Prevents relaying frames after the Close.
-    if (conn.ws_closing) return true;
-    if (conn.recv_buf.len() == 0) return true;
+#if RUT_ENABLE_WEBSOCKET
+    if (conn.ws_closing) return ws_drive_close(loop, conn);
+#endif
+    if (conn.recv_buf.len() == 0) {
+        // Another completion in this CQ batch may already have inspected the
+        // bytes copied for this terminal recv. Its callback must still restore
+        // the bounded receive owner even though no application input remains.
+        if (conn.is_ws_terminate && !conn.ws_client_send_pending && !conn.ws_client_eof &&
+            !conn.ws_upstream_eof)
+            return ws_resume_client_recv(loop, conn);
+        return true;
+    }
     if (conn.ws_client_send_pending) return ws_pause_client_recv(loop, conn);
 #if RUT_ENABLE_WEBSOCKET
     if (conn.is_ws_terminate) {
@@ -11219,27 +11353,30 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                                               conn.recv_buf.data(),
                                               conn.recv_buf.len(),
                                               conn.ws_c2u_out,
-                                              SlicePool::kSliceSize,
+                                              conn.ws_buffer_capacity(),
                                               conn.ws_c2u_msg,
                                               conn.ws_max_message_size,
                                               conn.ws_handler,
                                               &conn,
                                               &consumed,
                                               &produced);
+        if (conn.ws_c2u.received_close && !conn.ws_record_peer_close(true, conn.ws_c2u))
+            return false;
         if (st == WsInspectStatus::Error) return false;  // caller closes
         if (produced > 0) {
             conn.ws_c2u_consumed = consumed;
             if (st == WsInspectStatus::Close) {
                 // The produced send carries the Close to the upstream; the client must get a
                 // Close back too (handshake). Start the upstream slot in-flight + queue the
-                // client echo, then close once both drain. The echo carries the code the
-                // inspector resolved (handler message.close(code), or 1000 for a peer close).
+                // client echo, then await both peers. The echo carries the code the
+                // inspector resolved, preserving a peer status/reason or handler policy.
                 conn.ws_closing = true;
                 ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_upstream_inflight = true;
                 conn.ws_close_client_need = true;
-                conn.ws_echo_close_code = conn.ws_c2u.echo_close_code;
-                conn.ws_echo_close_reason = conn.ws_c2u.echo_close_reason;
+                if (!conn.ws_close_payload.assign(conn.ws_c2u.echo_close_code,
+                                                  conn.ws_c2u.echo_close_reason()))
+                    return false;
             }
             if (!loop->submit_send_upstream(conn, conn.ws_c2u_out, produced)) return false;
             conn.ws_client_send_pending = true;
@@ -11282,8 +11419,17 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
-    if (conn.ws_closing) return true;  // close handshake under way — stop forwarding data
-    if (conn.upstream_recv_buf.len() == 0) return true;
+#if RUT_ENABLE_WEBSOCKET
+    if (conn.ws_closing) return ws_drive_close(loop, conn);
+#endif
+    if (conn.upstream_recv_buf.len() == 0) {
+        if (conn.is_ws_terminate && !conn.ws_upstream_send_pending && !conn.ws_client_eof &&
+            !conn.ws_upstream_eof) {
+            conn.upstream_recv_paused_for_send = false;
+            return loop->submit_recv_upstream(conn);
+        }
+        return true;
+    }
     if (conn.ws_upstream_send_pending) {
         return ws_pause_upstream_recv(loop, conn);
     }
@@ -11299,26 +11445,29 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
                                               conn.upstream_recv_buf.data(),
                                               conn.upstream_recv_buf.len(),
                                               conn.ws_u2c_out,
-                                              SlicePool::kSliceSize,
+                                              conn.ws_buffer_capacity(),
                                               conn.ws_u2c_msg,
                                               conn.ws_max_message_size,
                                               conn.ws_handler,
                                               &conn,
                                               &consumed,
                                               &produced);
+        if (conn.ws_u2c.received_close && !conn.ws_record_peer_close(false, conn.ws_u2c))
+            return false;
         if (st == WsInspectStatus::Error) return false;
         if (produced > 0) {
             conn.ws_u2c_consumed = consumed;
             if (st == WsInspectStatus::Close) {
                 // The produced send carries the Close to the client; the upstream must get a
                 // Close back too. Start the client slot in-flight + queue the upstream echo,
-                // carrying the code the inspector resolved (message.close(code), or 1000).
+                // carrying the status/reason the inspector resolved.
                 conn.ws_closing = true;
                 ws_arm_shutdown_deadline(loop, conn);
                 conn.ws_close_client_inflight = true;
                 conn.ws_close_upstream_need = true;
-                conn.ws_echo_close_code = conn.ws_u2c.echo_close_code;
-                conn.ws_echo_close_reason = conn.ws_u2c.echo_close_reason;
+                if (!conn.ws_close_payload.assign(conn.ws_u2c.echo_close_code,
+                                                  conn.ws_u2c.echo_close_reason()))
+                    return false;
             }
             if (!client_send(loop, conn, conn.ws_u2c_out, produced)) return false;
             conn.ws_upstream_send_pending = true;
@@ -11422,6 +11571,12 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         // Client half-closed (clean FIN). Enter drain mode: flush both directions'
         // buffered/in-flight bytes, then tear down once everything has drained.
         conn.ws_client_eof = true;
+#if RUT_ENABLE_WEBSOCKET
+        if (conn.ws_closing) {
+            if (!ws_drive_close(loop, conn)) close_conn_if_live(loop, conn);
+            return;
+        }
+#endif
         if (!ws_drain_pump(loop, conn)) {
             close_conn_if_live(loop, conn);
             return;
@@ -11448,6 +11603,7 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.ws_c2u_consumed = 0;
         conn.ws_client_send_len = 0;
         if (conn.ws_closing) {  // a Close drained on the upstream slot — advance the handshake
+            if (conn.ws_close_upstream_inflight) conn.ws_close_upstream_sent = true;
             conn.ws_close_upstream_inflight = false;
             if (!ws_drive_close(loop, conn)) close_conn_if_live(loop, conn);
             return;
@@ -11469,11 +11625,28 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.recv_paused_for_send = false;
         if (conn.recv_buf.len() > 0) {
             if (!ws_try_send_client_to_upstream(loop, conn)) close_conn_if_live(loop, conn);
+            if constexpr (requires(Loop* candidate, Connection& c) {
+                              candidate->process_buffered_tls_input(c);
+                          }) {
+                // A control send can park a partially decrypted TLS record.
+                // Its ciphertext was already received, so arming the socket
+                // alone cannot resume it. This completion runs outside the
+                // TLS decrypt callback; return immediately after driving it.
+                if (conn.fd >= 0 && !conn.ws_client_send_pending)
+                    (void)loop->process_buffered_tls_input(conn);
+            }
             return;
         }
         // Resume client recv (paused for this send), and pump the opposite direction.
         if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn)) {
             close_conn_if_live(loop, conn);
+            return;
+        }
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->process_buffered_tls_input(c);
+                      }) {
+            if (conn.fd >= 0 && !conn.ws_client_send_pending)
+                (void)loop->process_buffered_tls_input(conn);
         }
         return;
     }
@@ -11520,6 +11693,12 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         // Backend half-closed (clean FIN). Mirror on_ws_client_recv: drain both
         // directions, then tear down once everything has flushed.
         conn.ws_upstream_eof = true;
+#if RUT_ENABLE_WEBSOCKET
+        if (conn.ws_closing) {
+            if (!ws_drive_close(loop, conn)) close_conn_if_live(loop, conn);
+            return;
+        }
+#endif
         if (!ws_drain_pump(loop, conn)) {
             close_conn_if_live(loop, conn);
             return;
@@ -11544,6 +11723,7 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.ws_u2c_consumed = 0;
         conn.ws_upstream_send_len = 0;
         if (conn.ws_closing) {  // a Close drained on the client slot — advance the handshake
+            if (conn.ws_close_client_inflight) conn.ws_close_client_sent = true;
             conn.ws_close_client_inflight = false;
             if (!ws_drive_close(loop, conn)) close_conn_if_live(loop, conn);
             return;
@@ -11676,8 +11856,10 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     // the access-log request size would depend on packet framing. Trim to the
     // parsed header length (an upgrade request has no body).
     if (conn.req_header_end > 0) {
-        conn.downstream_req_size = conn.req_header_end;
-        conn.req_size = conn.req_header_end;
+        const u32 kHeaderLength =
+            conn.ws_client_header_len ? conn.ws_client_header_len : conn.req_header_end;
+        conn.downstream_req_size = kHeaderLength;
+        conn.req_size = kHeaderLength;
     }
     on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_sent_len);
     // The HTTP request is complete at the 101: release the upstream max_inflight
@@ -11697,6 +11879,35 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
                    &on_ws_upstream_recv<Loop>,
                    &on_ws_client_to_upstream_sent<Loop>);
     conn.upstream_recv_paused_for_send = false;
+    if (conn.is_ws_terminate && !conn.ws_session_started) {
+        conn.ws_session_started = true;
+        const WsFrameAction kAction =
+            conn.ws_open_handler ? conn.ws_open_handler(&conn, WsOpcode::Text, nullptr, 0, true)
+                                 : WsFrameAction::Drop;
+        if (kAction == WsFrameAction::Close || kAction == WsFrameAction::CloseDynamic) {
+            const WsHandlerOutput& output = conn.ws_handler_output;
+            const u16 kCode =
+                kAction == WsFrameAction::CloseDynamic ? output.close_code : conn.ws_close_code;
+            const Str kReason =
+                kAction == WsFrameAction::CloseDynamic ? output.payload : conn.ws_close_reason;
+            if ((kAction == WsFrameAction::CloseDynamic &&
+                 (!output.ready || output.opcode != WsOpcode::Close)) ||
+                !conn.ws_close_payload.assign(kCode, kReason)) {
+                close_conn_if_live(loop, conn);
+                return;
+            }
+            conn.ws_closing = true;
+            conn.ws_close_client_need = true;
+            conn.ws_close_upstream_need = true;
+            ws_arm_shutdown_deadline(loop, conn);
+            if (!ws_drive_close(loop, conn)) close_conn_if_live(loop, conn);
+            return;
+        }
+        if (kAction != WsFrameAction::Drop && kAction != WsFrameAction::Forward) {
+            close_conn_if_live(loop, conn);
+            return;
+        }
+    }
     if (conn.ws_pre_tunnel_upstream_closed) {
         // Backend already half-closed during the 101 drain: enter drain mode
         // immediately rather than arming new client reads. Flush any buffered
@@ -15305,18 +15516,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 !ws_handshake_response_matches(resp,
                                                conn.ws_handshake_slice,
                                                conn.ws_handshake_offers_len,
-                                               conn.ws_subprotocol)) {
+                                               conn.ws_subprotocol,
+                                               &conn.ws_upstream_deflate)) {
                 loop->close_conn(conn);
                 return;
             }
             conn.ws_handshake_phase = WsHandshakePhase::Validated;
         }
 #endif
-        // The 101 is authoritative for what was actually negotiated (the request's offer
-        // is only a proposal). Record whether the backend selected WebSocket — terminate
-        // arms on THIS, not the request — and refuse a response extension terminate can't
-        // honor (ws_inspect rejects RSV1 compressed frames), so we never send the client a
-        // 101 advertising an extension that would break the first compressed frame.
+        // Upstream and downstream are independent WebSocket endpoints. The
+        // validated upstream agreement drives only that leg's codecs; the
+        // client receives its own accepted offer in retained header storage.
         conn.resp_upgrade_is_websocket = false;
         bool resp_has_ws_ext = false;
         for (u32 i = 0; i < resp.header_count; i++) {
@@ -15329,7 +15539,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 if (vl.len > 0) resp_has_ws_ext = true;
             }
         }
-        if (conn.is_ws_terminate_route && resp_has_ws_ext) {
+        if (conn.is_ws_terminate_route && resp_has_ws_ext && !conn.ws_upstream_deflate.enabled) {
             loop->close_conn(conn);  // backend negotiated an extension terminate can't process
             return;
         }
@@ -15344,6 +15554,50 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             }
             upgrade_response = conn.response_header_buf.data();
             upgrade_response_len = conn.response_header_buf.len();
+        }
+        if (conn.is_ws_terminate_route) {
+            const bool kResourcesReady = [&]() {
+                if constexpr (requires(Loop* candidate, Connection& c) {
+                                  candidate->alloc_ws_terminate_bufs(c);
+                              }) {
+                    return loop->alloc_response_header_buf(conn) &&
+                           loop->alloc_ws_terminate_bufs(conn);
+                }
+                return false;
+            }();
+            if (!kResourcesReady) {
+                loop->close_conn(conn);
+                return;
+            }
+            if (upgrade_response != conn.response_header_buf.data()) {
+                conn.response_header_buf.reset();
+                if (conn.response_header_buf.write(upgrade_response, upgrade_response_len) !=
+                    upgrade_response_len) {
+                    loop->close_conn(conn);
+                    return;
+                }
+            }
+            char extension[192]{};
+            const u32 kExtensionLength = ws_format_deflate_agreement(
+                conn.ws_downstream_deflate, extension, sizeof(extension));
+            if (conn.ws_downstream_deflate.enabled && !kExtensionLength) {
+                loop->close_conn(conn);
+                return;
+            }
+            const u32 kRewritten = ws_rewrite_extensions(conn.response_header_slice,
+                                                         conn.response_header_buf.len(),
+                                                         conn.response_header_buf.len(),
+                                                         conn.response_header_buf.capacity(),
+                                                         {extension, kExtensionLength});
+            if (!kRewritten) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.response_header_buf.set_len(kRewritten);
+            conn.ws_negotiated_subprotocol =
+                ws_selected_subprotocol(conn.response_header_buf.data(), kRewritten);
+            upgrade_response = conn.response_header_buf.data();
+            upgrade_response_len = kRewritten;
         }
         conn.ws_upgrade_sent_len = upgrade_response_len;
         conn.ws_pre_tunnel_upstream_closed = false;

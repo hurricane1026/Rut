@@ -17,17 +17,28 @@
 // This is the pure decision engine — it touches no sockets. The tunnel pump calls
 // ws_inspect at the forward boundary and sends the produced bytes.
 namespace rut {
+struct WsDeflateCodec;
 
 inline constexpr u32 kWsMaxCloseReasonBytes = kWsMaxControlPayload - 2;
 
+// Default remains the ordinary-slice payload budget. Explicit larger limits
+// use existing bulk storage; reserve the worst-case masked frame header.
 inline constexpr u32 kWsTerminateMessageCapacity = SlicePool::kSliceSize - kWsMaxHeaderSize;
+inline constexpr u32 kWsMaxMessageCapacity = SlicePool::kBulkSliceSize - kWsMaxHeaderSize;
 
 constexpr bool ws_valid_message_capacity(u32 size) {
-    return size != 0 && size <= kWsTerminateMessageCapacity;
+    return size != 0 && size <= kWsMaxMessageCapacity;
 }
 
 enum class WsJsonStringMatch : u8 { Equal, Prefix, Suffix, Contains };
 enum class WsJsonIntComparison : u8 { Lt, Gt, Eq };
+enum class WsJsonStringScanResult : u8 { NoMatch, Match, Error };
+using WsJsonStringScanner = WsJsonStringScanResult (*)(void*, Str);
+
+// Decode in the existing thread-local workspace and scan synchronously. The
+// scanner must not retain the view or reenter JSON helpers using that workspace.
+WsJsonStringScanResult ws_json_scan_string_at_path(
+    const u8* payload, u64 len, Str path, WsJsonStringScanner scanner, void* context);
 
 // Valid UTF-8 for a text message; an empty view is valid.
 bool ws_valid_text_payload(Str text);
@@ -66,6 +77,33 @@ constexpr bool ws_valid_close_code(u32 code) {
            (code >= 3000 && code <= 4999);
 }
 
+// Owned Close metadata. 1005 represents an absent wire status, never a status
+// encoded on the wire. No view points into receive or callback scratch storage;
+// ordinary copies retain the reason independently.
+struct WsClosePayload {
+    u16 code = 1005;
+    u8 reason_len = 0;
+    char reason_storage[kWsMaxCloseReasonBytes]{};
+
+    Str reason() const { return {reason_storage, reason_len}; }
+    bool assign(u16 status, Str text);
+};
+
+// Each WebSocket leg has its own received Close status (RFC 6455 section 7.1.5).
+// 1006 means no valid Close frame was received; 1005 means an empty Close frame.
+// Views borrow connection-owned storage only until connection teardown returns.
+struct WsPeerCloseContext {
+    u16 code = 1006;
+    Str reason{};
+    bool received = false;
+};
+
+struct WsSessionCloseContext {
+    WsPeerCloseContext client{};
+    WsPeerCloseContext upstream{};
+    bool was_clean = false;
+};
+
 // What the gateway should do with a fully-reassembled data message.
 enum class WsFrameAction : u8 {
     Forward,       // re-serialize the message and send it on
@@ -80,6 +118,8 @@ enum class WsFrameAction : u8 {
     ForwardTextPolicy1,
     ForwardTextPolicy2,
     ForwardTextPolicy3,
+    ForwardDynamic,  // synchronous callback publication, copied before the next invocation
+    CloseDynamic,
 };
 
 inline constexpr u32 kWsMaxClosePolicies = 4;
@@ -95,14 +135,17 @@ enum class WsTextSource : u8 {
     JsonString,
     JsonNumberText,
     JsonStringify,
-    LiteralBinary
+    LiteralBinary,
+    MessageBytes,
+    Dynamic  // shared-IR callback may publish a runtime payload or close reason
 };
 
 // Immutable text output recipe. Literal replacement omits the input; affix recipes
 // surround one bounded dynamic source, if present, with route-owned UTF-8 views.
 // JSON paths and fixed strings are pinned with the route config until the send retires.
-// LiteralBinary reuses this recipe and the ForwardText action ABI, but emits Binary
-// and permits arbitrary bytes. Other sources still emit validated UTF-8 Text.
+// LiteralBinary and MessageBytes reuse the ForwardText action ABI, emitting Binary
+// with arbitrary bytes. MessageBytes copies the complete borrowed payload, with no
+// affixes. Other sources emit validated UTF-8 Text.
 struct WsTextRewrite {
     Str prefix{};
     Str suffix{};
@@ -125,6 +168,16 @@ enum class WsInspectStatus : u8 {
     Error,  // protocol violation or a bound exceeded (message/output cap) — fail the tunnel
 };
 
+// Borrowed only during a synchronous callback. Inspection copies data into owned
+// send storage before returning or invoking another callback. Close reasons are
+// copied separately into the closing inspector, so the other leg cannot retire them.
+struct WsHandlerOutput {
+    Str payload{};
+    u16 close_code = 1000;
+    WsOpcode opcode = WsOpcode::Text;
+    bool ready = false;
+};
+
 // Per-direction inspection state. One instance per tunnel direction; persists across
 // recv chunks because frames and messages span reads.
 //
@@ -140,25 +193,37 @@ struct WsInspector {
     // client leg, but masking is a wire-format property and direction is a routing one —
     // conflating them would break the day they diverge. The caller sets it at arm time.
     bool from_client = false;
+    // Independently negotiated receive and destination legs. The session owns
+    // these codecs; reset never discards their negotiated dictionary history.
+    WsDeflateCodec* decoder = nullptr;
+    WsDeflateCodec* encoder = nullptr;
+    bool compressed_message = false;
     // Immutable route-owned default and branch texts. The pinned route
     // configuration must remain alive until this connection retires.
+    WsHandlerOutput* dynamic_output = nullptr;
     WsTextRewrite forward_text{};
     const WsTextRewrite* forward_texts = nullptr;
     u32 forward_text_count = 0;
     u64 mask_rng = 0;          // Reserved for compatibility; masking keys use RAND_bytes.
     u64 max_message_size = 0;  // 0 = unbounded
-    // `message.close(code)` support. close_code (INPUT) is the RFC 6455 status the handler's
-    // Close verdict should put on the wire — set by the caller from the route config (1000 =
-    // Normal Closure default). echo_close_code (OUTPUT) is written by ws_inspect whenever it
-    // returns Close: the code the OPPOSITE leg's echo Close should carry. For a handler Close
-    // it mirrors close_code; for a peer-sent Close it stays 1000 (the echo behavior is
-    // unchanged — the peer's own code is already relayed verbatim on the forward leg).
+    // Handler policy is input; echo metadata is output for the sender's reply.
+    // A peer Close preserves its exact status/reason, with 1005 for no status.
+    // A handler Close uses the selected policy for both legs.
     Str close_reason{};  // immutable route-owned UTF-8, at most 123 bytes
     const WsClosePolicy* close_policies = nullptr;
     u32 close_policy_count = 0;
-    Str echo_close_reason{};  // selected handler reason, empty for a peer-initiated close
+    char echo_close_storage[kWsMaxCloseReasonBytes]{};
+    u32 echo_close_reason_len = 0;
+    Str echo_close_reason() const { return {echo_close_storage, echo_close_reason_len}; }
+    bool set_echo_close_reason(Str reason) {
+        if (reason.len > kWsMaxCloseReasonBytes || (!reason.ptr && reason.len)) return false;
+        for (u32 i = 0; i < reason.len; ++i) echo_close_storage[i] = reason.ptr[i];
+        echo_close_reason_len = reason.len;
+        return true;
+    }
     u16 close_code = 1000;
     u16 echo_close_code = 1000;
+    bool received_close = false;  // distinguishes a peer Close from a handler verdict
     // Reject fragmented messages when a caller cannot provide a separate output buffer.
     // The tunnel supplies one and leaves this disabled.
     bool reject_fragmented = false;
@@ -169,9 +234,12 @@ struct WsInspector {
     u64 partial_payload_len = 0;
 
     void reset() {
-        echo_close_reason = {};
+        echo_close_reason_len = 0;
+        echo_close_code = 1000;
+        received_close = false;
         assembler.reset();
         message_len = 0;
+        compressed_message = false;
         partial_data_frame = false;
         partial_payload_len = 0;
     }
@@ -212,5 +280,22 @@ WsInspectStatus ws_inspect(WsInspector& st,
 // gateway→client. Returns bytes written, 0 on overflow or random generator failure.
 u32 ws_emit_close_frame(
     u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code = 1000, Str reason = {});
+
+// Closing receive mode: ignore data without invoking application code or
+// publishing output, but retain framing/fragment bounds across reads. Controls
+// remain whole; Ping exposes its unmasked body for a same-peer Pong reply.
+// Close stores owned echo metadata and received_close in the inspector. Bytes
+// following the first Close are left unconsumed for the caller to discard.
+enum class WsClosingRead : u8 { NeedMore, Ping, Close, Error };
+WsClosingRead ws_read_closing(
+    WsInspector& st, const u8* in, u32 in_len, u8* ping_payload, u32* ping_len, u32* consumed);
+u32 ws_emit_pong_frame(
+    u8* out, u32 out_cap, bool masked, u64& mask_rng, const u8* payload, u32 len);
+
+// Emit owned metadata, preserving an absent status as an empty Close body.
+// Unlike ws_emit_close_frame, this accepts the local-only 1005 representation
+// only with an empty reason; it never writes that number onto the wire.
+u32 ws_emit_close_payload(
+    u8* out, u32 out_cap, bool masked, u64& mask_rng, const WsClosePayload& payload);
 
 }  // namespace rut

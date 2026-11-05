@@ -5,6 +5,7 @@
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/slice_pool.h"
+#include "rut/runtime/ws_extensions.h"
 
 namespace rut {
 namespace {
@@ -226,7 +227,9 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
                                               u8* storage,
                                               u32 storage_capacity,
                                               u32* out_offers_len,
-                                              Str required_subprotocol) {
+                                              Str required_subprotocol,
+                                              WsDeflateAgreement* downstream_deflate) {
+    if (downstream_deflate) *downstream_deflate = {};
     if (request == nullptr || header_len == 0 || header_len > SlicePool::kSliceSize ||
         out_offers_len == nullptr ||
         (storage != nullptr && storage_capacity < kWsHandshakeAcceptLength + 1))
@@ -307,6 +310,10 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
         }
         if (!offered) return WsHandshakeRequestResult::BadRequest;
     }
+    WsDeflateAgreement selected{};
+    if (!ws_select_deflate_offer(parsed.headers, parsed.header_count, &selected))
+        return WsHandshakeRequestResult::BadRequest;
+    if (downstream_deflate) *downstream_deflate = selected;
     if (storage == nullptr) return WsHandshakeRequestResult::Ready;
     if (!encode_accept(key, storage, storage_capacity))
         return WsHandshakeRequestResult::InternalError;
@@ -318,11 +325,17 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
 bool ws_handshake_response_matches(const ParsedResponse& response,
                                    const u8* storage,
                                    u32 offers_len,
-                                   Str required_subprotocol) {
+                                   Str required_subprotocol,
+                                   WsDeflateAgreement* upstream_deflate) {
+    if (upstream_deflate) *upstream_deflate = {};
     if (storage == nullptr || offers_len > SlicePool::kSliceSize - kWsHandshakeAcceptLength ||
         (required_subprotocol.len != 0 && !ws_valid_subprotocol(required_subprotocol)) ||
         response.header_count > kMaxHeaders || response.version != HttpVersion::Http11 ||
         response.status_code != 101 || response.headers_truncated)
+        return false;
+    WsDeflateAgreement selected{};
+    if (upstream_deflate &&
+        !ws_accept_deflate_response(response.headers, response.header_count, &selected))
         return false;
     u32 upgrade_count = 0;
     u32 accept_count = 0;
@@ -340,7 +353,7 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
             if (!connection_value_is_valid(header.value, &connection_upgrade)) return false;
         } else if (name_is(header.name, "sec-websocket-extensions", 24)) {
             const Str kValue = trim_ows(header.value);
-            if (kValue.len != 0) return false;
+            if (kValue.len != 0 && !upstream_deflate) return false;
         } else if (name_is(header.name, "sec-websocket-accept", 20)) {
             if (++accept_count != 1) return false;
             const Str kValue = trim_ows(header.value);
@@ -356,8 +369,10 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
                           (required_subprotocol.len == 0 || kValue.eq(required_subprotocol));
         }
     }
-    return upgrade_count == 1 && upgrade_ok && connection_upgrade && accept_count == 1 &&
-           protocol_ok;
+    const bool kValid =
+        upgrade_count == 1 && upgrade_ok && connection_upgrade && accept_count == 1 && protocol_ok;
+    if (kValid && upstream_deflate) *upstream_deflate = selected;
+    return kValid;
 }
 
 u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str required_subprotocol) {

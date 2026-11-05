@@ -3039,25 +3039,7 @@ public:
     }
 
     // WebSocket reassembly and output slices for both directions. All-or-nothing.
-    bool alloc_ws_terminate_bufs(ConnectionBase& c) {
-        if (c.ws_c2u_msg) return true;  // already allocated
-        u8* a = pool.alloc();
-        u8* b = pool.alloc();
-        u8* x = pool.alloc();
-        u8* y = pool.alloc();
-        if (!a || !b || !x || !y) {
-            if (a) pool.free(a);
-            if (b) pool.free(b);
-            if (x) pool.free(x);
-            if (y) pool.free(y);
-            return false;
-        }
-        c.ws_c2u_msg = a;
-        c.ws_u2c_msg = b;
-        c.ws_c2u_out = x;
-        c.ws_u2c_out = y;
-        return true;
-    }
+    bool alloc_ws_terminate_bufs(ConnectionBase& c) { return c.alloc_ws_buffers(pool); }
 
     u8* alloc_ws_handshake_slice() { return pool.alloc(); }
     void free_ws_handshake_slice(u8* slice) {
@@ -3353,6 +3335,7 @@ public:
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
         // kernel op), so reclaim them now. Output slices can be owned by a send and
         // are reclaimed only after pending operations drain.
+        c.free_ws_codecs(pool);
         if (c.ws_c2u_msg) {
             pool.free(c.ws_c2u_msg);
             c.ws_c2u_msg = nullptr;
@@ -3549,7 +3532,13 @@ public:
             if (c.recv_pause_cancel_pending) c.recv_pause_rearm_pending = true;
             return true;
         }
-        if (backend.add_recv(c.fd, c.id)) {
+        const bool kBoundedWs = c.is_ws_tunnel && c.is_ws_terminate &&
+                                (c.ws_max_message_size > kWsTerminateMessageCapacity ||
+                                 c.ws_downstream_codec || c.ws_upstream_codec);
+        const u32 kAvailable = c.tls_active ? c.tls_in_buf.write_avail() : c.recv_buf.write_avail();
+        const bool kSubmitted = kBoundedWs ? backend.add_recv_once(c.fd, c.id, kAvailable)
+                                           : backend.add_recv(c.fd, c.id);
+        if (kSubmitted) {
             c.pending_ops++;
             c.recv_armed = true;
             c.recv_pause_rearm_pending = false;
@@ -3963,6 +3952,38 @@ public:
         }
         return false;
     }
+
+#if RUT_ENABLE_WEBSOCKET
+    bool advance_ws_tls_shutdown(Connection& c) {
+        if (!c.ws_tls_shutdown_pending || !c.ws_upstream_send_pending || !c.ws_closing ||
+            !c.tls_active || c.tls_engine.ssl == nullptr || c.tls_send_owner_generation != 0 ||
+            c.tls_send_src != nullptr || c.tls_pending_on_send != nullptr || c.tls_proxy_stream)
+            return false;
+        if (c.tls_out_inflight || c.tls_out_buf.len() != 0)
+            return tls_ensure_draining<Self>(this, c);
+        if (!c.ws_tls_shutdown_generated) {
+            tls_engine_set_input(c.tls_engine, c.tls_in_buf.data(), c.tls_in_buf.len());
+            tls_engine_set_output(
+                c.tls_engine, c.tls_out_buf.write_ptr(), c.tls_out_buf.write_avail());
+            const TlsOp kStatus = tls_engine_shutdown(c.tls_engine);
+            c.tls_in_buf.consume(tls_engine_input_consumed(c.tls_engine));
+            c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));
+            c.ws_tls_shutdown_generated = kStatus == TlsOp::Ok;
+            c.ws_tls_shutdown_need_read = kStatus == TlsOp::WantRead;
+            if (kStatus == TlsOp::Error || kStatus == TlsOp::Closed) return false;
+            if (c.tls_out_buf.len() != 0) return tls_ensure_draining<Self>(this, c);
+            if (kStatus == TlsOp::WantRead) {
+                c.recv_paused_for_send = false;
+                return submit_recv(c);
+            }
+            if (kStatus == TlsOp::WantWrite) return false;  // no output or retry driver
+        }
+        return ws_finish_tls_shutdown(this, c);
+    }
+
+    bool submit_ws_tls_shutdown_impl(Connection& c) { return advance_ws_tls_shutdown(c); }
+
+#endif
 
     // close() cannot end a stream that an armed io_uring recv still references:
     // the FIN would wait until the close-path cancel drains, after the client
@@ -4544,10 +4565,23 @@ public:
     // by pipeline_advance/recover; it does not change the recv primitive.
     [[nodiscard]] bool use_one_shot_upstream_recv(const Connection& c) const {
 #if RUT_ENABLE_WEBSOCKET
+        // A server may coalesce its first full-sized frame with the 101. Bound
+        // the initial response read too: no tunnel callback can drain data
+        // while multishot CQEs are still filling the HTTP header buffer.
+        if (c.is_ws_terminate_route && c.req_wants_upgrade && !c.is_ws_tunnel &&
+            c.protocol == ConnProtocol::Http11 &&
+            c.ws_handshake_phase == WsHandshakePhase::Prepared && c.ws_handshake_slice &&
+            c.fd >= 0 && c.upstream_fd >= 0 && valid_upstream_episode(c.upstream_episode) &&
+            !c.upstream_episode_quarantined && !c.upstream_abandoned &&
+            (c.on_upstream_recv == &on_upstream_response<Self> ||
+             c.on_upstream_recv == &on_early_upstream_recvd_send_inflight<Self>))
+            return true;
         // A fixed rewrite can expand several tiny inputs into multiple full
         // output batches. Bound each upstream read by available receive space:
         // multishot CQEs otherwise append before callbacks can drain that space.
-        if (c.is_ws_tunnel && c.is_ws_terminate && c.ws_has_nonempty_rewrite() && !c.ws_closing &&
+        if (c.is_ws_tunnel && c.is_ws_terminate &&
+            (c.ws_max_message_size > kWsTerminateMessageCapacity || c.ws_downstream_codec ||
+             c.ws_upstream_codec || (c.ws_has_nonempty_rewrite() && !c.ws_closing)) &&
             c.fd >= 0 && c.upstream_fd >= 0 && c.on_upstream_recv == &on_ws_upstream_recv<Self> &&
             valid_upstream_episode(c.upstream_episode) && !c.upstream_episode_quarantined &&
             !c.upstream_abandoned)

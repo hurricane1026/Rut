@@ -241,7 +241,7 @@ def main():
             ]
             assert len(size_offsets) == 1, (path_offset, size_offsets)
             size_offset = config_offset + size_offsets[0]
-            for invalid_size in (0, 16371, 0xFFFFFFFF):
+            for invalid_size in (0, 262131, 0xFFFFFFFF):
                 damaged = bytearray(ws_image)
                 before = bytes(damaged[size_offset : size_offset + 4])
                 damaged[size_offset : size_offset + 4] = struct.pack("<I", invalid_size)

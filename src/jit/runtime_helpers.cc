@@ -5,6 +5,7 @@
 #include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
+#include "rut/common/ws_message.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/auth.h"
@@ -22,6 +23,7 @@
 #include "rut/runtime/signed_request.h"
 #include "rut/runtime/uuid.h"
 #include "rut/runtime/webhook.h"
+#include "rut/runtime/ws_frame.h"
 #include "rut/runtime/ws_terminate.h"
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -30,6 +32,7 @@
 #include <unistd.h>
 #endif
 #include <hs.h>
+#include <hs_common.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -891,7 +894,7 @@ rut::CacheLocalState::ShardTables* shard_cache_tables() {
     return &state->shards[t_active_cache_shard];
 }
 
-rut::CacheTable* cache_table_for(rut::u32 instance) {
+rut::CacheTable* cache_table_for(rut::u32 instance, rut::u64 expected_identity = 0) {
     rut::CacheLocalState::ShardTables* t_state_ptr = shard_cache_tables();
     if (t_state_ptr == nullptr) {
         log_cache_state_error_once();
@@ -963,6 +966,19 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
         }
         t_generation = gen;
     }
+    // A long-lived handler may retain its old declaration index across reload.
+    // Resolve its compiled name identity inside THIS validated snapshot, before
+    // touching a table; a separate registry lookup could race another publish.
+    if (expected_identity != 0 &&
+        (instance >= live_count || snap_idents[instance] != expected_identity)) {
+        instance = live_count;
+        for (rut::u32 i = 0; i < live_count; ++i) {
+            if (snap_idents[i] == expected_identity) {
+                instance = i;
+                break;
+            }
+        }
+    }
     if (instance >= live_count) return nullptr;
     const rut::u32 cap = snap_caps[instance];
     if (cap == 0) return nullptr;
@@ -1006,6 +1022,19 @@ void rut_helper_cache_get(u32 instance, u32 key_ip, u8* out_has, i64* out_val) {
 void rut_helper_cache_set(u32 instance, u32 key_ip, i64 val) {
     rut::CacheTable* t = cache_table_for(instance);
     if (t != nullptr) t->set(key_ip, val);
+}
+
+void rut_helper_cache_get_bound(u32 instance, u64 identity, u32 key_ip, u8* out_has, i64* out_val) {
+    const rut::CacheTable* table = identity != 0 ? cache_table_for(instance, identity) : nullptr;
+    i64 value = 0;
+    const bool kFound = table && table->get(key_ip, &value);
+    *out_has = kFound ? 1u : 0u;
+    *out_val = kFound ? value : 0;
+}
+
+void rut_helper_cache_set_bound(u32 instance, u64 identity, u32 key_ip, i64 value) {
+    rut::CacheTable* table = identity != 0 ? cache_table_for(instance, identity) : nullptr;
+    if (table) table->set(key_ip, value);
 }
 
 u32 rut_helper_cache_select_local_shard(u32 shard_id) {
@@ -2018,16 +2047,16 @@ void rut_helper_regex_free(void* db) {
     free(handle);
 }
 
-u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
-    if (!s || !db) return 0;
+static u8 regex_match_result(const char* s, u32 s_len, void* db) {
+    if (!s || !db) return 2;
     auto* handle = static_cast<RegexHandle*>(db);
     hs_database_t* regex_db = nullptr;
-    if (!begin_regex_scan(handle, &regex_db)) return 0;
+    if (!begin_regex_scan(handle, &regex_db)) return 2;
     RegexScratchCache* cache = get_regex_scratch_cache();
     if (cache == nullptr) {
         end_regex_scan(handle);
         regex_runtime_error("unable to create thread-local scratch cache");
-        return 0;
+        return 2;
     }
     pthread_mutex_lock(&cache->mutex);
     hs_scratch_t* scratch = cache->get(handle);
@@ -2035,7 +2064,7 @@ u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
         pthread_mutex_unlock(&cache->mutex);
         end_regex_scan(handle);
         regex_runtime_error("scratch allocation failed");
-        return 0;
+        return 2;
     }
 
     RegexMatchCtx ctx{};
@@ -2043,7 +2072,54 @@ u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
     hs_error_t rc = hs_scan(regex_db, s, s_len, 0, scratch, on_full_regex_match, &ctx);
     pthread_mutex_unlock(&cache->mutex);
     end_regex_scan(handle);
-    return (rc == HS_SUCCESS || rc == HS_SCAN_TERMINATED) && ctx.matched ? 1 : 0;
+    if (rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED) return 2;
+    return ctx.matched ? 1 : 0;
+}
+
+u8 rut_helper_str_has_suffix(const char* text, u32 size, const char* needle, u32 needle_size) {
+    if ((!text && size) || (!needle && needle_size) || needle_size > size) return 0;
+    if (!needle_size) return 1;
+    return __builtin_memcmp(text + size - needle_size, needle, needle_size) == 0 ? 1u : 0u;
+}
+
+u8 rut_helper_str_concat(
+    void* conn, void* arena, const Str* parts, u32 count, const char** out_ptr, u32* out_size) {
+    *out_ptr = nullptr;
+    *out_size = 0;
+    if (!parts || count == 0 || count > 64) return 0;
+    u32 size = 0;
+    static constexpr u32 kBudget = 262144;
+    for (u32 i = 0; i < count; ++i) {
+        if ((!parts[i].ptr && parts[i].len) || parts[i].len > kBudget - size) return 0;
+        size += parts[i].len;
+    }
+    if (size == 0) {
+        *out_ptr = "";
+        return 1;
+    }
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    if (!storage || !storage->backend.pool || storage->space_used() > kBudget - size ||
+        (!storage->current && !storage->init(storage->backend.pool)))
+        return 0;
+    auto* result = static_cast<char*>(storage->alloc(size));
+    if (!result) return 0;
+    u32 offset = 0;
+    for (u32 i = 0; i < count; ++i) {
+        if (parts[i].len) __builtin_memcpy(result + offset, parts[i].ptr, parts[i].len);
+        offset += parts[i].len;
+    }
+    *out_ptr = result;
+    *out_size = size;
+    return 1;
+}
+
+u8 rut_helper_str_regex_result(const char* s, u32 s_len, void* db) {
+    return regex_match_result(s, s_len, db);
+}
+
+u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
+    return regex_match_result(s, s_len, db) == 1 ? 1u : 0u;
 }
 
 u8 rut_helper_regex_backend_available() {
@@ -2275,6 +2351,104 @@ extern "C" u8 rut_helper_ws_json_has_path(const char* payload,
 
 extern "C" u8 rut_helper_ws_json_valid(const char* payload, u64 len) {
     return ws_valid_json_payload(reinterpret_cast<const u8*>(payload), len) ? 1u : 0u;
+}
+
+extern "C" void rut_helper_ws_begin_message(void* conn) {
+    if (conn == nullptr) return;
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    // Admission is complete before a message callback can run. Keep the shard
+    // pool binding while returning all previous evaluation slices to that pool.
+    connection.ws_handler_output = {};
+    connection.json_arena.destroy();
+    connection.jit_response_body = {};
+    connection.jit_response_body_valid = false;
+}
+
+extern "C" u32 rut_helper_ws_connection_scalar(void* conn, u32 field) {
+    if (!conn) return 0;
+    const auto& connection = *static_cast<const ConnectionBase*>(conn);
+    const auto kField = static_cast<WsMessageFieldId>(field);
+    if (kField == WsMessageFieldId::ConnectionRemoteAddr) return connection.peer_addr;
+    if (kField == WsMessageFieldId::ConnectionRemotePort) return connection.peer_port;
+    if (kField == WsMessageFieldId::ConnectionIsTls) return connection.tls_active ? 1u : 0u;
+    const auto kClose = connection.ws_session_close_context();
+    if (kField == WsMessageFieldId::CloseCode) return kClose.client.code;
+    if (kField == WsMessageFieldId::CloseUpstreamCode) return kClose.upstream.code;
+    if (kField == WsMessageFieldId::CloseWasClean) return kClose.was_clean ? 1u : 0u;
+    return 0;
+}
+
+extern "C" void rut_helper_ws_close_reason(void* conn,
+                                           u32 field,
+                                           const char** out_ptr,
+                                           u32* out_len) {
+    Str reason{};
+    if (conn) {
+        const auto kContext = static_cast<const ConnectionBase*>(conn)->ws_session_close_context();
+        if (field == static_cast<u32>(WsMessageFieldId::CloseReason))
+            reason = kContext.client.reason;
+        if (field == static_cast<u32>(WsMessageFieldId::CloseUpstreamReason))
+            reason = kContext.upstream.reason;
+    }
+    *out_ptr = reason.ptr;
+    *out_len = reason.len;
+}
+
+extern "C" void rut_helper_ws_connection_subprotocol(void* conn,
+                                                     const char** out_ptr,
+                                                     u32* out_len) {
+    const auto* connection = static_cast<const ConnectionBase*>(conn);
+    const Str kProtocol = !connection ? Str{}
+                          : connection->ws_negotiated_subprotocol.len
+                              ? connection->ws_negotiated_subprotocol
+                              : connection->ws_subprotocol;
+    *out_ptr = kProtocol.ptr;
+    *out_len = kProtocol.len;
+}
+
+extern "C" u32 rut_helper_ws_forward(void* conn, const char* payload, u32 len, u8 opcode) {
+    if (!conn) return static_cast<u32>(WsFrameAction::Close);
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    const u32 kCap = connection.ws_max_message_size ? connection.ws_max_message_size
+                                                    : kWsTerminateMessageCapacity;
+    if (len > kCap || len > kWsMaxMessageCapacity) {
+        connection.ws_handler_output = {{}, 1009, WsOpcode::Close, true};
+        return static_cast<u32>(WsFrameAction::CloseDynamic);
+    }
+    if ((opcode != 1 && opcode != 2) || (!payload && len) ||
+        (opcode == 1 && !ws_valid_text_payload({payload, len}))) {
+        connection.ws_handler_output = {{}, 1011, WsOpcode::Close, true};
+        return static_cast<u32>(WsFrameAction::CloseDynamic);
+    }
+    connection.ws_handler_output = {{payload, len}, 1000, static_cast<WsOpcode>(opcode), true};
+    return static_cast<u32>(WsFrameAction::ForwardDynamic);
+}
+
+extern "C" u32 rut_helper_ws_close(void* conn, i32 code, const char* reason, u32 len) {
+    if (!conn) return static_cast<u32>(WsFrameAction::Close);
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    // Check before narrowing: a large integer must never wrap to a valid wire code.
+    if (code < 0 || !ws_valid_close_code(static_cast<u32>(code)) ||
+        !ws_valid_close_reason({reason, len})) {
+        code = 1011;
+        reason = nullptr;
+        len = 0;
+    }
+    connection.ws_handler_output = {{reason, len}, static_cast<u16>(code), WsOpcode::Close, true};
+    return static_cast<u32>(WsFrameAction::CloseDynamic);
+}
+
+extern "C" u8 rut_helper_ws_json_string_regex_at_path(
+    const char* payload, u64 len, const char* path, u32 path_len, void* database) {
+    return static_cast<u8>(ws_json_scan_string_at_path(
+        reinterpret_cast<const u8*>(payload),
+        len,
+        {path, path_len},
+        [](void* context, Str decoded) {
+            return static_cast<WsJsonStringScanResult>(
+                regex_match_result(decoded.ptr, decoded.len, context));
+        },
+        database));
 }
 
 extern "C" u8 rut_helper_ws_json_string_at_path(const char* payload,

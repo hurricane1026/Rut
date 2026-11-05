@@ -2582,7 +2582,7 @@ message bytes. A backend 101 must select that exact token before any response by
 are sent. Without the option, the backend may select a validated offer or omit
 selection. Bare passthrough does not accept the option. The policy is route-owned
 and pinned across I/O, including after native relocation; compiler and serving
-binaries must agree on native format 15. See [terminate mode](docs/websocket-terminate.md).
+binaries must agree on native format 16. See [terminate mode](docs/websocket-terminate.md).
 
 The `message.close(code, "reason")` verdict, final or in a guard else-branch, sends a fixed reason to both
 peers during the handler-initiated close handshake. The code follows the existing
@@ -2598,6 +2598,83 @@ there is no message-time allocation. A peer Close retains its original payload o
 receives the existing normal-closure echo without the configured reason.
 The echo uses its direction's idle output slice, retained until send completion;
 no extra slices or enlarged inline close-frame buffers are needed.
+
+General JSON message expressions use the ordinary optional API and shared
+MIR/RIR path: dynamic RFC 6901 pointers, independent Json values, scalar/collection
+queries, member/set/remove/append edits, JSON construction, stringify and concrete
+struct decoding. `json(value)`/`json.encode(value)` yield optional text;
+`json.value(value)` yields optional Json. Json remains nominally distinct from
+text, and optional arguments require explicit unwrapping. Parse/edit/decoding
+failure and arena exhaustion retain ordinary nil handling. Decoded/edited values
+use the connection's existing message arena and are retired only after output
+has been copied. Scalar queries and validated raw views keep their existing
+allocation behavior. Parser limits (8192 bytes, 2048 nodes, depth64), message
+bounds and the 256KiB intermediate-arena budget remain in force.
+
+The four-clause/32-node JSON predicate forest and fixed policy tables describe
+the specialized recipe lowering below. Their source shapes remain fast paths;
+callbacks outside those shapes use shared IR with ordinary parser/local bounds.
+General error-capable lets and helper-internal evaluation still require
+integration. A synthesized logical
+negation is distinguished from optional equality in the common analyzer:
+`!optionalBool` rejects until unwrapped; `optionalBool == false` remains a plain
+Boolean equality result. HTTP capability evidence is recorded at recursive
+expression analysis before folding and propagated through helper metadata and
+HIR copies, so an unused argument or folded helper read cannot bypass the
+message phase boundary.
+
+General regex expressions lower through the existing `StrRegexMatch` operation
+with the ordinary literal-pattern and unwrapped-String checks. Message codegen
+uses the shared Vectorscan scanner's tri-state helper (match/no-match/failure),
+branches on failure and returns Close before Boolean negation or a continuation
+can consume it. The raw-text specialized recipe uses the same failure contract;
+ordinary HTTP retains its existing Boolean helper. Selected branches and logical
+short circuits skip unreached scans. A reached unused regex let still scans, and
+therefore still closes on failure. Normal JSON decoding may supply independent
+String, numberText, stringify or kind values. Regex globals already have unique
+module identities, so linking multiple callbacks and HTTP entries retains each
+owned database and native artifact metadata. No new regex library or syntax is
+introduced.
+
+General synchronous callbacks also accept `message.forward(value)` with an
+unwrapped `str` or `Bytes` expression, including conditional pure-helper results,
+callback-local values and a guard-unwrapped `uuid()`. `str` selects Text and
+validates UTF-8 even for Binary input; Bytes selects Binary. Bare forward keeps
+the incoming kind. The specialized `message.text` affix recipe applies the same
+UTF-8 rule to valid Binary payloads. No implicit conversion or interpolation is
+introduced. Values borrowed from HTTP admission remain prohibited.
+
+Message callback `guard let` and `if let` initializers with runtime presence
+use the same lexical `LetIn`/`BoundValue` representation as callback locals.
+The producer is evaluated once before its presence check; success-path reads
+reuse that value. Known nil/error branches retain their existing static typing
+and pruning. A surrounding untaken branch performs no initialization.
+The existing digest and HMAC builtins are available on plain message strings,
+including raw Binary `message.text` bytes; optional hex results use the message
+arena and its existing crypto budget. Pool failure remains nil and follows the
+source's declared guard/else branch. No new crypto dependency or conversion is
+introduced. General error integration and helper-internal lexical
+semantics remain separate completion work.
+
+`message.close(code, reason)` also accepts runtime plain `i32` and `str` values.
+Known invalid codes and reasons remain compile errors. Runtime invalid codes
+are checked before narrowing; an invalid code/reason or invalid dynamic Text
+produces a 1011 close, and over-limit dynamic output produces 1009. Reasons
+retain their 123-byte UTF-8 bound, independently of the data-message limit.
+Argumentless closes and fixed route-owned policies retain the behavior above.
+
+Shared HIR/MIR output nodes become verified RIR `ws.forward` / `ws.close`
+operations and use explicit native-allowlisted publication helpers. Only the
+selected branch publishes. A synchronous callback borrows its result until
+inspection copies it into the existing owned output slice; later message-arena
+retirement cannot invalidate an asynchronous send. A closing inspector copies
+its echo reason separately before the other direction can reuse callback
+scratch. Before consuming a subsequent final data frame, a dynamic-output route
+reserves its configured maximum message size and the maximum close payload;
+insufficient space flushes prior output before the next callback. Expanding
+routes retain the existing io_uring receive-pause strategy. There is no extra
+per-message allocation or runtime LLVM dependency. Message/output storage follows the configured bounded capacity described below.
+Open/close lifecycle contexts are supported; RFC 7692 compression remains pending.
 
 Current terminate handlers support `guard` conditions over `message.fromClient`,
 `message.isText`, `message.isBinary`, `message.len` comparisons, and
@@ -2616,22 +2693,30 @@ regex metacharacters or normalize Unicode. Dynamic arguments and interpolation
 remain unsupported.
 The HTTP route prelude before a terminating `websocket(...) { message in ... }`
 runs as the ordinary request JIT handler before its final direct forward to the
-same WebSocket upstream. It permits immutable compile-time `let` bindings and
-up to eight bounded top-level request guards with static local failure
-responses. Guard-let bindings are visible only to subsequent HTTP guards and
-cannot be captured by the separate message handler or its rewrite expressions.
-Only existing request reads, literals, earlier bindings, comparisons, boolean
-operators, and `.or(literal)` are admitted. Helpers, effects, body reads,
-mutation, waits, loops, conditionals, decorators and chains remain compile-time
-errors until there is an execution path that can preserve their semantics. The
-four message guards remain independent. Bare `websocket(upstream)` passthrough
-routes remain ordinary HTTP routes and retain their normal guards and
-decorators. Origin is enforced only when a route adds a corresponding request
-guard; terminate mode does not add implicit Origin validation.
+same WebSocket upstream. It uses ordinary request expressions, locals, helpers,
+JSON/regex, guards, effects, waits and route decorators with their
+existing ordering and limits. `chain before` steps participate in that admission
+path. A rejection returns locally without opening the WebSocket upstream.
+The callback declaration must be the route's final top-level statement; nested
+callback declarations remain unsupported.
+HTTP values cannot be captured by the separate message callback; compile-time
+constants alone may cross the upgrade boundary. Message helper purity is checked
+only in the callback's analyzer scope, not in the enclosing HTTP route. The four
+message conditional clauses remain independent of HTTP guard capacity. Origin is
+enforced only when the route adds a request guard; terminate mode does not add
+implicit Origin validation. Strict opening-handshake validation still runs before
+the resulting WebSocket forward, including when admission mutates request headers.
 The DSL exposes complete Text/Binary messages. Wire opcodes, FIN, masking,
 continuation frames and Ping/Pong/Close frames are runtime-internal details.
 The legacy `frame` binding and `.opcode` access are rejected; message type
 selection uses `message.isText` / `message.isBinary`.
+
+Response-header `chain after` steps share the ordinary HTTP effect/commit path,
+including local admission rejection and the accepted upstream 101. The runtime
+stabilizes request-derived values across rewrites. Existing HTTP wait/for
+restrictions still apply. Mutations cannot rewrite protected 101 Connection,
+Upgrade or Sec-WebSocket handshake fields after negotiation; they fail before
+publishing the handshake. HTTP response effects never become message captures.
 
 ```swift
 upstream chat at "127.0.0.1:9000"
@@ -2662,7 +2747,9 @@ in the final verdict or a guard else-branch. It reuses the existing exact-byte
 literal decoder and its 4096-byte decoded limit; it must also fit `maxMessageSize`.
 The adjacent `b"..."` form accepts raw bytes and the escapes `\n`, `\r`,
 `\t`, `\\`, `\"`, and `\xHH`; NUL is `\x00`. Empty and non-UTF-8 payloads are valid.
-Concatenation, variable references, Unicode escapes and interpolation are rejected.
+Immutable Bytes aliases and pure helpers normalized to these literals are also
+accepted. Concatenation, Unicode escapes and interpolation are rejected. Complete
+borrowed message payloads also support Binary output as described below.
 Text or Binary input becomes Binary output; ordinary string replacements still
 produce Text. Bare `forward()` keeps the original message, and control frames
 bypass the handler. Malformed Text input remains a protocol error before dispatch.
@@ -2673,16 +2760,20 @@ The loader copies decoded bytes into retained route storage; output framing copi
 those bytes into the owned send slice before asynchronous I/O.
 
 A terminate route defaults to a 16370-byte `maxMessageSize`: one 16 KiB slice minus
-the maximum 14-byte WebSocket header. Explicit limits must be from 1 through 16370
-bytes; larger values such as `16kb` are rejected until larger-message buffering is
-implemented. A fixed replacement uses ordinary string escape decoding and must fit both
-`maxMessageSize` and the single-slice terminate cap. Bounded text concatenation is
+the maximum 14-byte WebSocket header. Explicit limits may range from 1 through 262130
+bytes (256 KiB minus the same header allowance), including `16kb` and `64kb`.
+Limits above the default acquire four bulk slices atomically from the existing
+shard-local SlicePool: one complete-message and one owned output buffer per
+direction. Failure returns all acquired slices and closes without silently
+lowering the limit. Ordinary I/O slices stream into message storage; outbound
+frames retain owned storage through send and cancellation retirement. A fixed replacement uses ordinary string escape decoding and must fit both
+`maxMessageSize` and the bounded terminate storage cap. Bounded text concatenation is
 also supported: `message.forward("prefix" + message.text + "suffix")`, including either
 affix alone or an identity `message.text`. Route-local `let` strings whose values
 are known at compile time, including aliases of such strings, may supply fixed
 replacements or affix leaves. Their decoded bytes are copied into the same
 route-owned recipe as literals; request-derived, optional, and non-string values
-are rejected. Calls remain unsupported. Constant strings obey the same UTF-8,
+are rejected. Calls do not participate in this specialized `+` grammar. Constant strings obey the same UTF-8,
 combined fixed-byte limit, and expression-node limits as literal leaves. The
 expression contains at most 32 nodes (literals or constant references, `+`, and
 at most one dynamic source): either `message.text` or one previously guard-unwrapped
@@ -2693,7 +2784,8 @@ visible only after its guard succeeds, including in later guard else branches;
 the binding being declared is unavailable in its own else branch. Constant
 fragments are folded into immutable prefix/suffix views. Other fields, functions,
 two aliases, combining an alias with `message.text`, interpolation, and injection
-remain unsupported. A `message.text` recipe requires Text input; a JSON string
+remain unsupported by the affix grammar. A `message.text` recipe validates UTF-8
+for either input kind; a JSON string
 recipe can select a valid JSON string from Text or Binary input and emits Text.
 Empty values, embedded NUL, and Unicode are preserved without normalization.
 The final payload, including both affixes, must fit both bounds; overflow fails
@@ -2711,6 +2803,19 @@ retained across callbacks. Typed scalar aliases are not Json containers, and the
 new binding remains unavailable in its own failure branch. Native layout and the
 handler ABI are unchanged. See the nested example in
 [terminate mode](docs/websocket-terminate.md).
+
+A guard-unwrapped `json.string` alias additionally supports `.matches(re"pattern")`
+with the ordinary regex literal validation and full-value semantics. The subject
+is decoded UTF-8, including NUL, and follows the same no-normalization rule as
+literal predicates. Logical negation and short-circuit conjunction/disjunction
+use the existing bounded condition forest. The compiled guard retains its JSON
+Pointer and regex pattern separately; the existing JIT/native regex finalization
+owns each database. A synchronous scanner borrows only the current thread's JSON
+decoding workspace, and no view crosses asynchronous I/O. Decode and regex scan
+errors are distinct from a non-match and close before negation. Optional calls,
+Json/numberText/stringify and other scalar aliases remain unsupported as regex
+receivers. This extends guard accessors and the native helper symbol table without
+changing the message handler ABI or native artifact layout.
 
 Direct optional extraction comparisons are also supported in message guards:
 `json.string(value) == "subscribe"`, `json.bool(value) == false`, and
@@ -2741,8 +2846,8 @@ bounds remain fail-closed.
 `json.stringify(documentOrField)` binds the ordinary compact serialization of any
 previously unwrapped JSON value. It follows `Document::write`: strings and object
 keys are escaped, member order and number lexemes are preserved, and the existing
-writer capacity bounds output. The alias supports the same literal string
-comparisons and predicates as a string alias and can be the sole rewrite source
+writer capacity bounds output. The alias supports literal string comparisons and `isEmpty`/`hasPrefix`/
+`hasSuffix`/`contains`, and can be the sole rewrite source
 with fixed affixes. It has its own typed guard/source tag. The selected value is
 serialized and copied synchronously into the owned output slice; workspace views
 do not cross the callback.
@@ -2763,7 +2868,8 @@ upstream receive on io_uring, so multiple CQEs cannot overflow receive storage
 before the inspection callback drains it. Literal bytes and JSON Pointer paths are
 copied into the loaded program's retained arena; native artifacts relocate both
 views, so neither mode retains temporary HIR views. The native artifact format
-version is 14 following the JSON stringify recipe tag extension. Encoding copies
+version is 18, including the JSON recipes, authentication metadata and WebSocket
+lifecycle entries. Encoding copies
 the prefix, dynamic source, and suffix directly into the existing output slice,
 then masks that frame; no concatenation buffer or message-time allocation is
 introduced.
@@ -2805,6 +2911,363 @@ reassembled Text/Binary message. Its length is the complete payload byte count,
 and `fromClient` identifies the sender. Fragmentation and control frames are
 handled by the runtime; application policies do not observe wire frame boundaries.
 
+The callback parameter has the built-in borrowed type `WebSocketMessage`.
+Its `fromClient`, `isText` and `isBinary` fields have type `bool`, `len` has
+type `i32`, and `text` has type `str`. The last remains a raw-byte view of
+either message kind; it does not assert UTF-8 for Binary messages. Ordinary
+pure helpers can accept this type or its scalar projections, using the same
+type checker and function inliner as HTTP expressions. The WS predicate
+lowerer consumes the resulting HIR and emits the existing bounded condition
+forest, with no message object allocation or retained payload pointers.
+Supported helper predicates comprise Boolean literals/equality/composition,
+length comparisons against literals, text equality against literals, and
+whole-value regex matching. Both operand orders work for scalar equality.
+Non-Boolean conditions and mismatched operands are compile errors.
+HTTP reads, request/header mutations and HTTP response effects cannot execute
+in the message phase; helpers with discarded statement effects are rejected
+as well. Message verdicts remain callback statements. This introduces neither
+an HTTP storage representation for messages nor permission to retain a message
+past its synchronous callback. A shared compiler entry now lowers pure scalar
+callback expressions through MIR/RIR and a private synchronous message ABI in
+the same LLVM module as HTTP handlers. It supports integer arithmetic/bitwise
+operations, String comparisons, local aliases, guards and full if/else values,
+without consuming HTTP route/timer slots. Conditional message values use explicit
+RIR branches and verified Phi nodes; nullable/error carrier adaptation happens
+on the selected incoming edge. LLVM merges use each predecessor's final helper
+continuation, including helpers that split a block internally. The existing specialized JSON/rewrite
+path remains available. Internal LetIn/BoundValue nodes retain callback local
+initialization order and single evaluation. Initializer-node identities are
+rebound into each owning expression pool during normalization/inlining and into
+scoped SSA values during RIR materialization, preventing numeric local-slot
+capture. Message aliases keep their zero-carrier representation. Nullable UUID
+locals use the ordinary runtime allocator/failure contract; ordinary helper
+body lets, general error work and close-event context still require
+integration. Dynamic output, digest/HMAC and general JSON use shared IR.
+
+`message.connection` projects a borrowed `WebSocketConnection` with downstream
+client `remoteAddr: IP`, `remotePort: i32`, `isTls: bool` and selected
+`subprotocol: str` (empty when absent). These identify the same downstream
+connection in both directions. The compiler uses ordinary helper signatures
+and lexical aliases; the connection view has no stored MIR carrier and cannot
+outlive the synchronous callback. Scalar projections use typed message inputs
+and runtime helpers reading the live connection, rather than HTTP request
+parsing or expired request views. Subprotocol storage remains pinned by the
+active route configuration and output publication copies it before async sends.
+The IP type is available to ordinary HTTP/helper signatures as well. Open/close
+event contexts and session state remain separate work.
+
+Synchronous message callbacks share `Cache<IP, i64>` reads and reached bare
+writes with the ordinary type checker and shared MIR/RIR. The connection IP
+keeps its IP domain through RIR, rather than degrading to a source integer.
+Read predicates accept `IP` keys; cache counters retain inferred `i64` types,
+without enabling user `i64` annotations. `.get` remains optional and `.set`
+remains a statement. Lexical sequencing keeps writes behind successful guards
+and inside selected branches. Compiled HTTP and message accesses carry the
+cache declaration name identity as well as its original index. The runtime
+resolves identity within the same seqlock snapshot used for table selection,
+so a retained old handler cannot address a different cache after slot reuse.
+Missing declarations degrade to the ordinary miss/no-op API; moved/resized
+slots may lose state, consistent with the lossy cache contract. This provides
+no strict session or cross-shard state. Shared codegen resets the monotonic
+clock latch for each callback that reads time; repeated reads within that
+invocation remain stable.
+
+The message also projects two nominal, closed domains: `kind` is
+`WebSocketMessageKind` (`text`, `binary`), and `direction` is `WebSocketDirection`
+(`clientToUpstream`, `upstreamToClient`). Fully qualified case references,
+`==`/`!=`, and generic `Eq` use the common analyzer. Their identity is preserved
+across imports, helper parameters/returns and ordinary HTTP locals. The types
+are distinct from each other and from Bool/integer/string values, and do not
+conform to `Ord`. Scalar storage after type checking uses the existing i32 MIR
+carrier; source-level integer operations or wire opcodes are not exposed.
+Message-phase lowering compares each domain's first-case predicate using the
+existing single-evaluation Boolean equality node. Complete messages have only
+Text/Binary kinds; Ping/Pong/Close/Continuation remain runtime protocol events.
+The old Boolean properties remain supported. Ordinary `match` accepts both
+fully qualified cases and contextual `.case` patterns for these closed domains,
+in helpers, HTTP routes and message callbacks. An unguarded complete pair or
+wildcard is required where ordinary match requires exhaustiveness. Duplicate
+cases, cross-domain cases, payload patterns and integer/Boolean substitutions
+are rejected. The matched value retains nominal typing; a reached resource
+producer in a lexical helper/callback selector runs once.
+
+General message callbacks retain lexical bindings through ordinary pure helper
+inlining. Reached helper local/guard producers and actual arguments run once,
+including unused resource-producing arguments; argument order is preserved and
+only the selected branch executes. Pure immutable message/scalar projections
+may be substituted. Fallible helper values and aliases retain the ordinary
+error carrier through lexical local storage, `guard let`, `if let` and
+`.or(default)` recovery. Successful false/zero/empty values stay present; nil
+and errors stay distinct. A stored error does not implicitly throw. Named
+error domains survive successful helper branches; incompatible domains are
+rejected. `guard match` uses the same final-wildcard requirement as HTTP.
+Response/effect/yield helper integration remains pending, and unsupported
+bodies are diagnosed instead of silently dropping work.
+
+Unwrapped String concatenation and the byte-exact `hasPrefix`, `hasSuffix`,
+`contains` and `isEmpty` operations share the HTTP compiler path. Concatenation
+owns bytes in the existing bounded arena and stops on allocation failure. Text
+publication still checks UTF-8 and message/frame limits; known invalid literal
+components and a proven minimum output exceeding a limit are compile errors.
+General source interpolation and Bytes concatenation remain unsupported.
+
+`message.payload` projects an immutable `Bytes` view of the complete payload,
+regardless of message kind. It borrows the runtime message buffer for the
+synchronous callback; helpers cannot retain it past that callback. The public
+type is distinct from `str`, supports byte-exact `Eq`, `.count: i32` and
+`.isEmpty: bool`, and uses the existing `b"..."` literals (4096 decoded bytes
+per literal). Text message views contain encoded UTF-8 bytes; Binary message
+views have no text-validity requirement. The existing `message.text` API is
+unchanged. Arbitrary-byte equality has no implicit text conversion or regex
+decoding, and count measures octets, including NUL and multi-byte encodings.
+
+The same Bytes type is usable in ordinary helper signatures, returns, imports
+and HTTP locals. `req.bodyBytes` is the typed byte projection of the existing
+request body read; it emits the same ReqBody operation, so complete-body
+buffering, rejection of unsupported body framing, size limits and request
+lifetimes remain those of `req.body`. HIR retains decoded literal bytes in
+module-owned storage, independent of the AST's response-body pool. After source type checking, MIR
+reuses the pointer/length string carrier and byte equality. RIR `str.length`
+extracts the i32 length without reading payload memory; its builder and verifier
+require a plain string carrier and i32 result. This is separate from the RIR
+`Bytes` kind used internally for fixed-size cryptographic outputs. No new
+runtime helper or allocation is needed. Message predicates lower payload count,
+emptiness and literal byte equality to existing length/raw-comparison nodes.
+Dynamic scalar payload replacement is supported as described below; byte indexing/concatenation remains unsupported.
+
+The callback parameter uses an ordinary source identifier, recorded on the AST
+and analyzer-only handler metadata. Its spelling is not part of the runtime or
+native ABI. Callback-local `let` bindings share ordinary expression analysis,
+declared-type checking and function-expression normalization. A separate scratch
+route and function own their temporary HIR. The sole message parameter is local
+0; normalized immutable aliases refer to it or to infallible scalar computations.
+Supported initializers are scalar literals, message aliases/projections, byte
+counts, supported comparisons and Boolean composition, including helpers whose
+normalized bodies use these forms. Optional values, regex/JSON operations and
+HTTP reads/effects are rejected even when unused. Restricting substitution to
+infallible reads preserves eager-let semantics without introducing deferred
+fallible work or runtime storage. Predicates consume normalized HIR in the
+existing bounded lowerer; aliases never enter the HTTP route's local storage.
+Message aliases can receive verdicts, and text aliases can feed the existing
+text recipe and JSON parse guards. Fixed Binary output accepts Bytes aliases and
+pure helper results that normalize to exact-byte literals, as well as the complete
+borrowed message payload. Close reasons
+keep their literal-only contract; close codes accept constant integer aliases.
+
+Boolean helper results support ordinary `if`/`else` expressions with two
+nonconstant predicate arms, including nesting and generic/helper composition.
+Both branches use the existing message predicate subset. The selector evaluates
+once, followed by exactly one arm; outer negation inverts the chosen result,
+without converting a reached decode/scan error into a Boolean value. Helpers with
+infallible immutable selectors and arms may also initialize callback lets or feed
+nullable-helper conditions. Callback regex/JSON locals use lexical shared IR
+rather than recipe substitution, including reached unused work; guarded predicate
+calls retain their reached evaluation and error behavior.
+
+Lowering reuses normalized HIR IfElse and appends one BoolSelect node with three
+owned postorder operands: bound is the selector index, lhs/rhs are true/false
+indices. The JIT validates all three backward references and single ownership,
+then emits branch control flow rather than an eager LLVM select. It does not
+expand the selector into two Boolean clauses. All children and the selection node
+share the existing 32-node forest budget, with no extra source clause, runtime
+state, helper symbol, handler ABI field or native-layout change. The existing
+constant-arm And/Or lowering remains compact.
+
+Reached JSON scalar aliases also feed ordinary typed predicate helpers. A
+compiler-only scope temporarily reconstructs their nonoptional parse/get/scalar
+expressions, normalizes the helper with the shared type checker, then restores
+locals before returning. The same scope builder handles optional initializers;
+no proof local escapes an arm or enters the HTTP route's runtime local storage.
+
+Typed predicate lowering accepts only the reconstructed nonoptional message-root
+parse, optionally one get carrying the complete validated path, and a supported
+scalar projection. User parse/get/scalar calls remain optional; helper wrapping
+cannot create a proof. Bool helpers use existing BoolEqual/BoolSelect composition.
+String equality preserves string/numberText/stringify/kind sources, and regex
+helpers over decoded JSON String use the existing JsonStringRegex operation.
+I32 count helpers use ordinary Eq/Ord constraints and existing count comparisons.
+Numeric bounds may normalize to compile-time integers, including inferred I64
+helper results, without truncation or new I64 annotations/generic support.
+
+These predicate calls retain the existing literal/constant comparison limits:
+no String ordering, general scalar-to-scalar comparison (except Bool), rendered
+number/stringify regex, dynamic pointers, arithmetic on JSON values or ordinary
+JSON-let substitution is added. Earlier presence and kind guards still dominate
+all uses, including wrong-kind, nil, false, zero and empty values. Existing source
+clauses, condition nodes, handler ABI and native layout are unchanged.
+
+The lexical scope includes compile-time admission constants and is discarded at
+the callback boundary. Locals require fresh names across lets, captures and JSON
+proof aliases; the `json` namespace cannot be a local let. The parameter may
+shadow an outer name or namespace. Reads of a previous fixed spelling such as
+`message` after parameter renaming are ordinary name lookups. The shared AST
+block limit remains eight statements. The 16-local HTTP admission budget stays
+independent of the message parameter and callback lets. Lets do not count toward the four source
+guards, whose combined condition forest remains bounded to 32 nodes. JSON proof
+aliases retain their separate bounded representation. General nested blocks,
+arbitrary computation, loops, and lifecycle entry points remain subsequent work.
+
+Ordinary `if` / `else if` / `else` syntax now selects message verdicts. A
+nonterminal `if` must omit else and end its taken arm with a verdict; false falls
+through to the next statement. A terminal if-chain requires a final else and
+ends the callback on every path. Arms currently contain immutable infallible
+lets, guards and early if statements followed by a verdict or a complete nested
+conditional tree. Every callback path must terminate. JSON optional bindings are
+supported in if-let conditions through the same resolver as guard-let. Branch locals use the same analyzer and helper
+normalization as callback locals, with lexical scope restored after each arm.
+Sibling arms may reuse names, and branch names never resolve a condition or
+leak into later statements. The full HTTP admission-local capacity is preserved
+independently of locals in the callback and its current branch. All arms are
+checked even when a constant condition makes one unreachable.
+
+Each if/else-if condition lowers to one existing condition root with inverted
+polarity: its true source condition takes the root's false verdict. This makes
+ordered guard roots implement the branch chain without repeated condition
+execution, while preserving short-circuit predicates and scan-error exits.
+Each guard, if or else-if shares the four-clause budget, and all roots share the
+32-node forest. The shared eight-statement AST block limit applies per arm;
+the parser also bounds recursive if syntax before analysis. A complete if/else
+chain must end its callback or branch block. Branch verdicts reuse existing close/forward
+policy slots; a no-argument if-branch close receives its own 1000/empty policy
+so a final else's close policy cannot change it. Bare closes in existing guard
+else-statements retain their route-default contract. The default final else uses
+the existing default-verdict path, so neither native format nor runtime/JIT ABI
+changes. Close-event values and general control flow remain subsequent work.
+
+Nested if trees preserve each ancestor's single evaluation using forward control
+edges on condition roots. `WsLenGuard` and the compiler/JIT `WsLenGuardSpec` append
+pass/fail targets. Unset targets retain the previous sequential guard contract.
+Explicit targets select a later root, a known terminal verdict, or the configured
+default. An early nested if uses a forward boundary on its false edge to skip its
+entire taken subtree before resuming later source statements. Branch compilation
+restores lexical locals before analyzing siblings; nested locals and sixteen
+admission constants have independent capacity bounded by the existing clause and
+block limits. Both arms are checked and count toward the four-condition and
+32-node budgets. A complete nested tree never duplicates parent predicates.
+
+The JIT validates forward-only root targets and continuation boundaries before
+emitting one block per root. It rejects operand entry, self/backward control edges,
+out-of-range indices, unknown verdicts/tags, and targets on operand nodes. The
+postorder predicate forest still requires each operand to have exactly one parent.
+Root edges do not change predicate short-circuit behavior or reached decode/scan
+error exits. Encoded targets are compiler/JIT data and never become runtime
+verdicts. Source and native loading share this emission path; the serialized
+native format, message handler function ABI and retained recipe tables are
+unchanged. No runtime allocation or LLVM dependency is added to rut_runtime.
+
+Branch guard and if-let analysis share the existing bounded JSON proof resolver.
+An optional condition appends its presence test and exposes its alias only while
+analyzing the true arm, restoring the proof scope before the failure arm. Guard
+aliases are added after analyzing their failure verdict, so failure cannot read
+its not-yet-bound value. A branch saves/restores both ordinary and JSON binding
+scopes. This supports the existing parse/get/string/numberText/bool/int/stringify/
+kind/count subset, including false/zero/empty successful values and JSON null
+presence where the operation defines it. Optional initializers also accept pure
+helpers that normalize to the same parse/get/scalar projection. The analyzer
+materializes earlier proof aliases as nonoptional typed expressions in temporary
+scratch locals, runs ordinary type checking and helper normalization, then
+restores the local scope. Only projections rooted in this callback's borrowed
+message and compile-time pointer strings lower to the existing presence tests.
+Generic forwarding of unwrapped inputs and imported helper namespaces use their
+ordinary language semantics. No proof value escapes into HTTP/MIR storage.
+One-sided conditional helper returns are lowered as lazy conjunctions of the
+selector and the remaining optional expression. Exactly one arm continues toward
+a JSON projection; the other is nil. A nil then-arm negates the selector, including
+its whole compound predicate. Nested selectors and Boolean helper guards retain
+source order and evaluate each reached selector once. Selector nodes and AND
+nodes are operands; only the final presence root is a source clause. All nodes
+share the existing 32-node budget, with one of four clauses per binding call.
+The alias is published only after the complete optional expression is lowered.
+
+JSON guard-let and if-let inside helpers use the ordinary normalized HasValue /
+ValueOf expressions. Lowering a reached HasValue appends its bounded optional
+predicate and records its source expression with the resulting projection only
+for the success continuation. ValueOf must structurally match a live proof;
+helper inlining copies expression trees, so pointer identity is insufficient.
+Matching is restricted to the concrete projection/selector expression forms and
+bounded nesting. It compares operation, type, missing channels, literal/field
+values, receiver and operands, distinguishing otherwise-similar JSON paths.
+
+A proven Json ValueOf supplies that root-relative path to later get/scalar
+operations. Returning a proven binding emits a constant-present operand instead
+of repeating its extraction. Proof scopes are restored before leaving the
+continuation, including failed lowering. Proofs stay in bounded compiler scratch;
+no value storage, runtime operation or serialization field is introduced. A
+caller binding publishes only a successful projection.
+
+Helpers may select different immutable JSON projections or return a fallback
+projection from an optional-binding failure arm. Such values lower to a forward
+control graph: each selector runs once and each successful leaf specializes the
+callback continuation with its own alias kind/path and proof scope. An absent
+selected value enters the caller's failure continuation, rather than trying a
+sibling alternative; explicit helper fallbacks are taken only on their own
+HasValue absence edge. No choice slot or dynamic path is stored at runtime.
+
+Specialized callback copies count original source clauses once, using the maximum
+continuation count before analyzing a shared failure arm. All generated predicate
+operands, control roots and early-if absence joins share the 32-node limit. The
+four source clauses and existing close/forward policy-table limits remain. The
+first guard continuation retains the lexical default recipe; later specializations
+use branch policies, preserving both their own path and existing bare guard-close
+behavior. An early optional if returns a distinct absence-join handle so later
+statements cannot overwrite the selector edge that chooses another value.
+
+JIT validation retains four legacy sequential roots and permits explicit forward
+control roots within the same 32-node forest. Existing operand ownership, target,
+cycle and action checks remain. Compiler source clauses stay bounded separately.
+These recipe tables do not represent JSON edits, runtime paths or general
+optional computations; those use shared IR. Initializer-less callback shorthand
+bindings remain unsupported. The recipe path adds no runtime storage, native
+format, accessor tag or handler ABI.
+
+Ordinary optional helper results now use the same bounded continuation lowering.
+Successful leaves may be the existing infallible immutable subset: scalar/Bytes
+literals, borrowed message/field aliases, byte counts, supported comparisons and
+Boolean composition. A leaf stores a private descriptor pointing into the callback
+normalization pool; publishing it adds only a compiler-local immutable binding.
+Scoped ValueOf proofs can supply later selectors, message text parsing and literal
+JSON pointers. Each selected alternative retains its own normalized value; false,
+zero and empty text/Bytes remain present. Callback arm exit restores both value
+and JSON alias scopes. No borrowed view escapes the synchronous message callback.
+
+Inside nullable helpers, ordinary eager `.or(fallback)` / `any(value, fallback)`
+may lower to presence alternatives only when the fallback normalizes to that
+infallible immutable subset. Omitting its evaluation on a present path cannot
+change effects or errors. Regex scans, HTTP/state effects and other fallible
+fallback work are rejected, preserving ordinary evaluation/error semantics.
+The general callback path separately supports ordinary nullable scalar locals
+and computations with explicit unwrapping. Compile-time Bytes aliases
+and helper results also feed the existing LiteralBinary recipe.
+
+`message.forward(message.payload)` accepts the complete borrowed Bytes value,
+including immutable aliases, inlined pure helper returns and reached optional
+bindings. It always emits Binary, even for Text input; bare `forward()` preserves
+the original kind. Normalization must resolve to the current callback message's
+payload field in this specialized recipe. General scalar output may select
+another Bytes expression; request bodies, slices and byte concatenation remain
+unsupported. Empty Bytes emits an empty Binary frame; invalid UTF-8 in a Binary
+input remains byte-exact, while malformed Text is rejected before the handler.
+
+An appended MessageBytes rewrite-source tag reuses the existing recipe fields,
+ForwardText action and native layout. It carries no source pointer or affixes;
+metadata validation rejects nonempty prefix/suffix and JSON paths. Older readers
+reject the unknown tag; native artifacts retain the same-build identity contract.
+Output sizing includes the full reassembled payload in both bounds checks and
+pre-dispatch drain estimates. The inspector copies into the separate owned output
+slice before asynchronous I/O; no input pointer, per-message allocation or new
+connection state is added. Fragmentation, partial reads, control relay and both
+I/O backends retain their existing ownership and cancellation paths.
+
+A branch sequence tracks its entry and pending continuation edge. A guard's
+success edge or an early if's false edge is patched to the next source condition,
+or directly to the terminal verdict/default if no further condition follows.
+This prevents a successful final guard or absent early binding from entering a
+sibling arm. Nested failure verdicts terminate normally; reached extraction tests
+are evaluated once, with existing short-circuit and decode/scan error behavior.
+Each guard/if-let still consumes one of the four clauses and shares the 32-node
+budget. The parser reuses If's existing binding metadata and Swift if-let surface;
+no keyword, runtime allocation, JIT control tag, handler ABI or native format is added.
+
 ```swift
 return websocket(eventService, maxMessageSize: 4kb) { message in
     guard message.len <= 2048 else { message.close(1009, "message too large") }
@@ -2841,7 +3304,7 @@ handler. A validated document alias supports `json.get` presence checks, while
 typed string, boolean, and integer bindings and literal comparisons are limited to the
 operations below.
 General document operations, arbitrary value extraction and rewriting remain
-unsupported. Each binding guard counts toward the four-source-guard limit.
+unsupported. Each binding guard counts toward the four-source-clause limit.
 
 JSON aliases may be unwrapped one step further for string routing policies:
 `guard let field = json.get(document, "/type") ...` binds a selected Json value,
@@ -2857,9 +3320,9 @@ type checks still happen first. These path aliases are compile-time metadata:
 every reached check reparses the full bounded message and retains no document
 node or borrowed string. Nested `get` accepts an earlier guard-unwrapped Json
 selection. Direct optional `json.get` values, strings used as Json, documents
-used as strings without `json.string`, dynamic paths,
-dynamic predicate arguments, and general value extraction are rejected. This
-uses the existing four-guard and 32-condition-node limits.
+used as strings without `json.string` remain type errors. Dynamic paths and
+ordinary extraction use shared IR. The specialized predicates retain their
+four-clause and 32-condition-node tables.
 
 JSON booleans can be unwrapped with `json.bool(documentOrField)` after JSON
 parsing and, for a selected field, a `json.get` presence guard. Both JSON `true`
@@ -2890,11 +3353,12 @@ containers; it does not count descendants. Count aliases compare with signed
 32-bit integer literals using the six integer comparisons, and out-of-range
 literals are rejected. Arithmetic and alias-to-alias comparisons are unsupported.
 These checks use the same bounded JSON workspace and per-check reparse behavior.
-The four source-guard limit means a selected-field handler can use a
+Within the specialized recipe, the four source-guard limit allows a
 parse/get/kind/comparison chain or a parse/get/count/comparison chain, but cannot
 combine both complete selected-field chains. A root document can bind both kind
 and count and combine their predicates within four guards because it needs no
-`get` presence guard. The 32-condition-node and JSON parser limits are unchanged.
+`get` presence guard. Richer source uses shared IR; JSON parser limits still
+apply to every path.
 
 The native/JIT helper validates the complete unmasked, reassembled payload with
 the existing JSON parser and a bounded workspace per worker thread. It accepts
@@ -2938,11 +3402,28 @@ re-read), each with its own buffer for natural backpressure.
   combined after validation as unique case-sensitive ASCII tokens. Before
   sending backend 101, the runtime checks one matching Accept and, if selected,
   one protocol token from the offers, alongside the existing complete-header,
-  exact Upgrade/Connection, and no-extension checks. Invalid requests close with
+  exact Upgrade/Connection, and independent RFC 7692 extension checks. Invalid requests close with
   400/426 before upstream connect; an invalid backend 101 closes before any 101
   bytes are sent. Non-101 responses use ordinary HTTP forwarding. Origin stays
   explicit application policy. Bare passthrough routes keep generic Upgrade
   behavior. This supported subset is not full RFC 6455 conformance.
+
+- **Terminate compression.** `permessage-deflate` is negotiated independently on
+  each leg, with windows 8 through 15 and actual-response context semantics.
+  The gateway replaces extension fields rather than relaying the other leg's
+  agreement. Before publishing 101, each enabled leg atomically acquires one
+  existing 256 KiB bulk slice for a private pinned static C zlib codec with a
+  bounded custom allocator. Message inspection sees decoded bytes; its existing
+  maximum bounds both decoded input and final output. Compressed input also has
+  a per-message wire-work budget of `max + max / 8 + 1024`. Received history is
+  retained across dropped messages unless no-context was agreed. Encoding resets
+  per message and falls back to the original uncompressed output when compression
+  is not beneficial or does not fit. RSV1 is legal only on negotiated initial
+  data frames. Controls and ordinary closing ownership are unchanged. The owned
+  rewritten 101 retains selected subprotocol metadata through session teardown;
+  input header consumption preserves any coalesced first frame. Bounded io_uring
+  reads cover the initial 101 and the active compressed/bulk session, including
+  terminal CQEs whose data another callback already consumed.
 
 - **Backpressure.** Each direction pauses its read while its paired send drains,
   so a slow peer applies TCP flow control to the fast one. Buffered bytes are
@@ -2950,6 +3431,46 @@ re-read), each with its own buffer for natural backpressure.
   and re-sends any bytes that raced in. On io_uring (provided-buffer recv), a
   buffer-full `-ENOBUFS` means the overflow was already consumed and discarded,
   so the tunnel fails closed there rather than forwarding a corrupted stream.
+
+- **Terminate-mode Close metadata.** A valid peer Close retains its exact status
+  and UTF-8 reason on both the forwarded frame and the reply to its sender.
+  An absent status is represented internally by 1005 and emitted as an empty
+  body, never as status bytes. The connection owns reply reason storage across
+  inspector reset and deferred sends. Each leg tracks Close send completion
+  separately from the first valid peer Close; both are required for a clean
+  handshake. Once closing starts, application data is discarded, Ping receives
+  a same-peer Pong and Close acknowledgements retain framing/status validation.
+  A downstream handshake sends TCP FIN independently of a blocked upstream send
+  or acknowledgement. Receive prefixes already copied into owned output can be
+  retired without reusing that output, so neither leg can strand the other.
+  EOF without Close is abnormal. The original shutdown deadline also bounds
+  acknowledgement waiting; traffic cannot refresh it. All fd/slot/buffer release
+  still uses normal async retirement. TLS emits local close_notify and drains
+  its owned ciphertext before FIN; epoll retries SSL_shutdown on its required
+  readiness, while io_uring retains the ordinary authenticated raw send owner.
+  Pending WebSocket output and the shutdown operation remain distinct. Peer
+  close_notify and EOF delivered to the WebSocket callback affect only the
+  downstream leg; fatal TLS errors still terminate the connection. A validated
+  WebSocket Close is application EOF and the TCP connection is terminal, so
+  local TLS shutdown does not wait for a second TLS alert. The same shutdown
+  deadline bounds blocked alert output. Received Close metadata is retained
+  independently for each leg, separately from the initiating local policy.
+  Each reports its first received status/reason, 1005 for an empty Close and
+  1006 when no valid Close was received; clean closure requires both handshakes.
+  These connection-owned views remain valid during pre-teardown cleanup, even
+  after an inspector reset. Optional `onOpen: { connection in ... }` and
+  `onClose: { closed in ... }` are synchronous compiled lifecycle entries using
+  Swift multiple trailing closures. Open runs after the accepted 101/resources
+  and before buffered messages; close runs once before config/TLS/slot teardown,
+  including failure/timeout, only for an opened session. The borrowed
+  `WebSocketClose` exposes downstream `code`/`reason`, explicit `upstreamCode` /
+  `upstreamReason`, `wasClean`, and `connection`. Normal helper/optional/guard,
+  Cache and time semantics apply. Bare return ends a hook; implicit fallthrough
+  is void. Shared lexical IR evaluates each branch once before continuation,
+  without duplicating the rest of the body into every branch. Open may call
+  `connection.close(...)` to enter normal bounded closing before messages;
+  close callbacks cannot reopen closing or yield. Native metadata version 18
+  relocates both hook symbols and retains their regex/config ownership.
 
 - **Connection teardown — drain-then-close (nginx model).** WebSocket shutdown
   is an *application-level* event (the RFC 6455 Close-frame handshake), not a TCP

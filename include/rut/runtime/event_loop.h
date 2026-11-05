@@ -79,12 +79,32 @@ public:
     void close_conn(Connection& c) {
         if (password_gateway) password_gateway->cancel(c.id);
         c.release_backend_active();
+        if (c.ws_session_started && !c.ws_session_close_notified) {
+            c.ws_session_close_notified = true;
+            // Synchronous, exactly once while config, TLS facts and owned Close
+            // metadata are still alive. Callback results cannot reopen teardown.
+            if (c.ws_close_handler) (void)c.ws_close_handler(&c, WsOpcode::Text, nullptr, 0, true);
+        }
         if (c.on_close) {
             auto cleanup = c.on_close;
             c.on_close = nullptr;
             cleanup(&self(), c);
         }
         self().close_conn_impl(c);
+    }
+    // Complete the server-role TCP write half once its WebSocket Close is
+    // acknowledged and all client-bound output is drained. Keep fd/slot custody
+    // until the ordinary retirement path cancels outstanding kernel operations.
+    bool end_ws_client_stream(Connection& c) {
+        if constexpr (requires { self().end_ws_client_stream_impl(c); })
+            return self().end_ws_client_stream_impl(c);
+        if (c.fd < 0 || c.ws_upstream_send_pending || c.send_armed) return false;
+        return ::shutdown(c.fd, SHUT_WR) == 0;
+    }
+    bool submit_ws_tls_shutdown(Connection& c) {
+        if constexpr (requires { self().submit_ws_tls_shutdown_impl(c); })
+            return self().submit_ws_tls_shutdown_impl(c);
+        return false;
     }
     Connection* alloc_conn() { return self().alloc_conn_impl(); }
     void free_conn(Connection& c) {
@@ -701,8 +721,10 @@ public:
         timer.init();
         // Reserve six ordinary slices and one complete bounded response chain
         // per admitted connection. Storage remains lazy and shared by the shard.
-        auto pooled =
-            pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
+        auto pooled = pool.init(SlicePool::capacity_for_connections(connection_capacity),
+                                pool_prealloc,
+                                SlicePool::kMaxCachedSlices,
+                                SlicePool::bulk_capacity_for_connections(connection_capacity));
         if (!pooled) {
             destroy_slot_storage();
             return core::make_unexpected(pooled.error());
@@ -959,25 +981,7 @@ public:
     // WebSocket reassembly and output slices for both directions. All-or-nothing;
     // freed in free_conn_impl. Without this the legacy EventLoop's ws_arm_terminate would
     // hit the requires-guard's false branch and close a terminate tunnel at the 101.
-    bool alloc_ws_terminate_bufs(ConnectionBase& c) {
-        if (c.ws_c2u_msg) return true;  // already allocated
-        u8* a = pool.alloc();
-        u8* b = pool.alloc();
-        u8* x = pool.alloc();
-        u8* y = pool.alloc();
-        if (!a || !b || !x || !y) {
-            if (a) pool.free(a);
-            if (b) pool.free(b);
-            if (x) pool.free(x);
-            if (y) pool.free(y);
-            return false;
-        }
-        c.ws_c2u_msg = a;
-        c.ws_u2c_msg = b;
-        c.ws_c2u_out = x;
-        c.ws_u2c_out = y;
-        return true;
-    }
+    bool alloc_ws_terminate_bufs(ConnectionBase& c) { return c.alloc_ws_buffers(pool); }
 
     u8* alloc_ws_handshake_slice() { return pool.alloc(); }
     void free_ws_handshake_slice(u8* slice) {
@@ -1035,6 +1039,7 @@ public:
         c.ws_handshake_phase = WsHandshakePhase::None;
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
         // kernel op), so reclaim them now regardless of the async deferred path below.
+        c.free_ws_codecs(pool);
         if (c.ws_c2u_msg) {
             pool.free(c.ws_c2u_msg);
             c.ws_c2u_msg = nullptr;

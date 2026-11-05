@@ -538,11 +538,26 @@ TEST(websocket_upgrade_admission, validated_101_pending_send_close_retires_owned
         &loop, *conn, make_ev(conn->id, IoEventType::UpstreamRecv, sizeof(kResponse) - 1));
     CHECK_EQ(conn->ws_handshake_phase, WsHandshakePhase::Validated);
     REQUIRE(conn->ws_handshake_slice != nullptr);
+    CHECK(loop.ws_terminate_in_use);
+    CHECK(conn->ws_c2u_msg != nullptr);
+    CHECK(conn->ws_u2c_msg != nullptr);
+    CHECK(conn->ws_c2u_out != nullptr);
+    CHECK(conn->ws_u2c_out != nullptr);
+    Connection* const unrelated = loop.alloc_conn();
+    REQUIRE(unrelated != nullptr);
+    loop.close_conn(*unrelated);
+    CHECK(loop.ws_terminate_in_use);
+    CHECK(conn->ws_c2u_msg != nullptr);
     const MockOp* handshake_send = loop.backend.last_op(MockOp::Send);
     REQUIRE(handshake_send != nullptr);
     REQUIRE(handshake_send->send_len > 1);
 
     loop.close_conn(*conn);
+    CHECK_FALSE(loop.ws_terminate_in_use);
+    CHECK(conn->ws_c2u_msg == nullptr);
+    CHECK(conn->ws_u2c_msg == nullptr);
+    CHECK(conn->ws_c2u_out == nullptr);
+    CHECK(conn->ws_u2c_out == nullptr);
     CHECK_EQ(loop.ws_handshake_free_calls, 1u);
     CHECK_FALSE(loop.ws_handshake_in_use);
     CHECK_EQ(conn->fd, -1);

@@ -2,6 +2,25 @@
 #include "es256_fixture.h"
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/signed_request.h"
+#include "fixtures/ws_bool_select.h"
+#include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_cache_context.h"
+#include "fixtures/ws_connection_context.h"
+#include "fixtures/ws_dynamic_output.h"
+#include "fixtures/ws_eager_bindings.h"
+#include "fixtures/ws_error_guard_match.h"
+#include "fixtures/ws_error_scalars.h"
+#include "fixtures/ws_error_values.h"
+#include "fixtures/ws_general_expressions.h"
+#include "fixtures/ws_general_json.h"
+#include "fixtures/ws_general_regex.h"
+#include "fixtures/ws_hash_output.h"
+#include "fixtures/ws_helper_lexical.h"
+#include "fixtures/ws_helper_observables.h"
+#include "fixtures/ws_nominal_match.h"
+#include "fixtures/ws_nominal_selector.h"
+#include "fixtures/ws_optional_values.h"
+#include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
 #include "rut/jit/native_helper_symbols.h"
@@ -280,7 +299,7 @@ TEST(native_program, websocket_terminate_http_guards_and_dual_handlers_survive_s
     CHECK_EQ(allowed.upstream_id, route.upstream_id);
 }
 
-TEST(native_program, websocket_terminate_rejects_unsupported_http_prelude_before_publish) {
+TEST(native_program, websocket_terminate_http_helper_guard_survives_source_removal) {
     Source source;
     REQUIRE(source.fd >= 0);
     REQUIRE(
@@ -291,9 +310,15 @@ TEST(native_program, websocket_terminate_rejects_unsupported_http_prelude_before
     Program owner;
     REQUIRE(owner.p);
     char error[512]{};
-    CHECK_FALSE(load_native_program(source.path, *owner.p, error, sizeof(error), 2));
-    CHECK_EQ(owner.p->config.route_count, 0u);
-    CHECK_EQ(owner.p->library, nullptr);
+    REQUIRE(load_native_program(source.path, *owner.p, error, sizeof(error), 2));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 1u);
+    const auto& route = owner.p->config.routes[0];
+    CHECK(route.ws_terminate);
+    REQUIRE(route.fn);
+    REQUIRE(route.ws_frame_handler);
+    const auto allowed = invoke(route, "GET /ws HTTP/1.1\r\nHost: test\r\n\r\n");
+    CHECK(allowed.action == jit::HandlerAction::Forward);
 }
 
 TEST(native_program, websocket_dual_handlers_keep_mixed_http_timer_ordinals) {
@@ -1045,6 +1070,66 @@ route GET "/root-number" { return websocket(backend) { message in
     CHECK(memcmp(root_output + 2, root_expected, sizeof(root_expected) - 1) == 0);
 }
 
+TEST(native_program, websocket_json_string_regex_survives_source_removal_and_multiple_routes) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"
+route GET "/root" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let text = json.string(document) else { message.close(1003) }
+ guard text.matches(re"sub[0-9]+") && message.text.matches(re".+") else { message.drop() }
+ message.forward()
+} }
+route GET "/selected" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/a~1b/\0") else { message.close(1008) }
+ guard let text = json.string(field) else { message.close(1003) }
+ guard !text.matches(re"deny[0-9]+") else { message.drop() }
+ message.forward()
+} }
+route GET "/other" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.close(1007) }
+ guard let field = json.get(document, "/other") else { message.close(1008) }
+ guard let text = json.string(field) else { message.close(1003) }
+ guard text.matches(re"other[0-9]+") else { message.drop() }
+ message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 3u);
+    struct Case {
+        u32 route;
+        const char* payload;
+        WsFrameAction action;
+    };
+    const Case cases[] = {
+        {0, R"("sub12")", WsFrameAction::Forward},
+        {0, R"("sub\u0031\u0032")", WsFrameAction::Forward},
+        {0, R"("sub12suffix")", WsFrameAction::Drop},
+        {0, R"("other7")", WsFrameAction::Drop},
+        {1, R"({"a/b":{"\u0000":"deny7"}})", WsFrameAction::Drop},
+        {1, R"({"a/b":{"\u0000":"xdeny7"}})", WsFrameAction::Forward},
+        {1, R"({"a/b":{"\u0000":null}})", WsFrameAction::ClosePolicy2},
+        {1, R"({"a/b":{}})", WsFrameAction::ClosePolicy1},
+        {2, R"({"other":"other9"})", WsFrameAction::Forward},
+        {2, R"({"other":"sub12"})", WsFrameAction::Drop},
+    };
+    for (const auto& c : cases) {
+        const auto handler = owner.p->config.routes[c.route].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(c.payload),
+                              strlen(c.payload),
+                              client) == c.action);
+            }
+        }
+    }
+}
+
 TEST(native_program, websocket_direct_json_scalar_guards_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"
@@ -1650,10 +1735,828 @@ TEST(native_program, websocket_guard_close_policies_survive_source_removal) {
                            &used,
                            &produced) == WsInspectStatus::Close);
         CHECK_EQ(st.echo_close_code, codes[i]);
-        CHECK(st.echo_close_reason.eq(reasons[i]));
+        CHECK(st.echo_close_reason().eq(reasons[i]));
         CHECK_EQ(produced, 4u + reasons[i].len);
         if (!reasons[i].empty()) CHECK(memcmp(out + 4, reasons[i].ptr, reasons[i].len) == 0);
     }
+}
+
+TEST(native_program, websocket_typed_message_helpers_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func accepted(_ text: str) -> bool => text.matches(re"o.k")
+func allowed(_ msg: WebSocketMessage) -> bool =>
+    !msg.fromClient || (msg.isText == true && msg.len <= 3 && accepted(msg.text))
+route GET "/ws" { return websocket(backend) { message in
+    guard true else { message.close() }
+    guard allowed(message) else { message.drop() }
+    guard message.isText != message.isBinary else { message.close() }
+    message.forward()
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const Str payloads[] = {{"o\0k", 3}, {"oak", 3}, {"no", 2}, {"", 0}, {"oaks", 4}};
+    const bool flags[] = {false, true};
+    const WsOpcode opcodes[] = {WsOpcode::Text, WsOpcode::Binary};
+    for (bool client : flags) {
+        for (WsOpcode op : opcodes) {
+            for (u32 i = 0; i < 5; ++i) {
+                const auto payload = payloads[i];
+                const bool pass = !client || (op == WsOpcode::Text && i < 2);
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(payload.ptr),
+                              payload.len,
+                              client) == (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+    }
+}
+
+TEST(native_program, websocket_domain_types_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func isText(_ kind: WebSocketMessageKind) -> bool => same(kind, WebSocketMessageKind.text)
+func fromClient(_ direction: WebSocketDirection) -> bool =>
+    same(direction, WebSocketDirection.clientToUpstream)
+func classify(_ path: str) -> WebSocketMessageKind {
+    if path == "/text" { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+route GET "/http" {
+    let kind = classify(req.path)
+    guard isText(kind) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(backend) { message in
+    guard !fromClient(message.direction) || isText(message.kind) else { message.drop() }
+    message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    const char* requests[] = {"GET /text HTTP/1.1\r\nHost: test\r\n\r\n",
+                              "GET /binary HTTP/1.1\r\nHost: test\r\n\r\n"};
+    const auto http = owner.p->config.routes[0].fn;
+    REQUIRE(http);
+    for (u32 i = 0; i < 2; ++i) {
+        const auto result =
+            jit::HandlerResult::unpack(http(nullptr,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(requests[i]),
+                                            static_cast<u32>(strlen(requests[i])),
+                                            nullptr));
+        CHECK_EQ(result.status_code, i == 0 ? 200u : 403u);
+    }
+    const auto handler = owner.p->config.routes[1].ws_frame_handler;
+    REQUIRE(handler);
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            CHECK(handler(nullptr, op, nullptr, 0, client) ==
+                  (!client || op == WsOpcode::Text ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+    }
+}
+
+TEST(native_program, websocket_scalar_helpers_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_scalar_helpers::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_scalar_helpers::check(_tc, owner.p->config);
+}
+
+TEST(native_program, websocket_bool_select_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_bool_select::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_bool_select::check(_tc, owner.p->config);
+}
+
+TEST(native_program, websocket_borrowed_binary_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_borrowed_binary::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_borrowed_binary::check(_tc, owner.p->config);
+}
+
+TEST(native_program, websocket_optional_values_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_optional_values::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_optional_values::check(_tc, owner.p->config);
+}
+
+TEST(native_program, websocket_value_choices_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"
+func pick(_ msg: WebSocketMessage, _ root: Json) -> Json {
+    if msg.fromClient { json.get(root, "/a") } else { json.get(root, "/b") }
+}
+func readChoice(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = pick(msg, root) else { nil }
+    json.string(field)
+}
+func fallback(_ root: Json) -> Json {
+    if let field = json.get(root, "/a") { field } else { json.get(root, "/b") }
+}
+func readFallback(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = fallback(root) else { nil }
+    json.string(field)
+}
+route GET "/guard" { return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.drop() }
+    guard text.hasPrefix("ok") else { msg.close(1008) }
+    msg.forward("<" + text + ">")
+} }
+route GET "/if" { return websocket(ws) { msg in
+    if let text = readChoice(msg) { msg.forward(text) }
+    else { msg.forward("absent") }
+} }
+route GET "/early" { return websocket(ws) { msg in
+    if msg.fromClient {
+        if let text = readFallback(msg) { msg.forward(text) }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/fallback" { return websocket(ws) { msg in
+    guard let text = readFallback(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/bare" { return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.close() }
+    msg.close(1008, "policy")
+} }
+func textOrNumber(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    if let text = json.string(root) { text } else { json.numberText(root) }
+}
+route GET "/scalar" { return websocket(ws) { msg in
+    guard let text = textOrNumber(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& program = *owner.p;
+    test::ws_helper_observables::choices(_tc, program.config);
+}
+
+TEST(native_program, websocket_helper_bindings_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func readName(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = json.get(identity(root), "/name") else { nil }
+    guard let value = json.string(field) else { nil }
+    value
+}
+func readFlag(_ msg: WebSocketMessage) -> bool {
+    if let root = json.parse(msg.text) {
+        if let field = json.get(root, "/flag") {
+            if let value = json.bool(field) { value } else { nil }
+        } else { nil }
+    } else { nil }
+}
+func readRoot(_ msg: WebSocketMessage) -> Json {
+    guard let root = json.parse(msg.text) else { nil }
+    root
+}
+func readNested(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let child = json.get(root, "/a~1b") else { nil }
+    guard let field = json.get(child, "/~0") else { nil }
+    if let value = json.string(field) { value } else { nil }
+}
+func readSecond(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let first = json.get(root, "/a") else { nil }
+    guard let second = json.get(root, "/b") else { nil }
+    json.string(second)
+}
+route GET "/name" { return websocket(ws) { msg in
+    if let text = readName(msg) { msg.forward("<" + text + ">") }
+    else { msg.forward("absent") }
+} }
+route GET "/flag" { return websocket(ws) { msg in
+    if let value = readFlag(msg) {
+        if value == false { msg.forward("false") } else { msg.forward("true") }
+    } else { msg.forward("absent") }
+} }
+route GET "/root" { return websocket(ws) { msg in
+    guard let root = readRoot(msg) else { msg.close(1007) }
+    guard let text = json.string(root) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/nested" { return websocket(ws) { msg in
+    guard let text = readNested(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/different" { return websocket(ws) { msg in
+    if let text = readSecond(msg) { msg.forward(text) }
+    else { msg.forward("absent") }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& program = *owner.p;
+    test::ws_helper_observables::bindings(_tc, program.config);
+}
+
+TEST(native_program, websocket_optional_conditions_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream ws at "127.0.0.1:9999"
+func readClient(_ msg: WebSocketMessage) -> Json {
+    guard msg.fromClient else { nil }
+    if msg.isText { json.parse(msg.text) } else { nil }
+}
+func readServer(_ msg: WebSocketMessage) -> Json {
+    if msg.fromClient { nil } else { json.parse(msg.text) }
+}
+func selectedString(_ msg: WebSocketMessage, _ root: Json) -> str {
+    if msg.fromClient { json.string(root) } else { nil }
+}
+route GET "/client" { return websocket(ws) { msg in
+    if let root = readClient(msg) {
+        guard let field = json.get(root, "/name") else { msg.close(1008) }
+        guard let text = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + text + ">")
+    } else { msg.forward() }
+} }
+route GET "/server" { return websocket(ws) { msg in
+    if let root = readServer(msg) { msg.forward("json") }
+    else { msg.forward("absent") }
+} }
+route GET "/scalar" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    if let value = selectedString(msg, root) { msg.forward(value) }
+    else { msg.forward("absent") }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 3u);
+    const auto handler = owner.p->config.routes[0].ws_frame_handler;
+    const auto server = owner.p->config.routes[1].ws_frame_handler;
+    const auto scalar = owner.p->config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    REQUIRE(server);
+    REQUIRE(scalar);
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            const char* values[] = {"{\"name\":\"\"}", "{\"name\":null}", "{}", "broken"};
+            for (u32 j = 0; j < 4; ++j) {
+                const auto* data = reinterpret_cast<const u8*>(values[j]);
+                const u32 size = static_cast<u32>(strlen(values[j]));
+                CHECK(handler(nullptr, op, data, size, client) ==
+                      (!client || op == WsOpcode::Binary || j == 3 ? WsFrameAction::Forward
+                       : j == 0 ? WsFrameAction::ForwardTextPolicy0
+                       : j == 1 ? WsFrameAction::ClosePolicy1
+                                : WsFrameAction::ClosePolicy0));
+                CHECK(server(nullptr, op, data, size, client) ==
+                      (!client && j != 3 ? WsFrameAction::ForwardTextPolicy0
+                                         : WsFrameAction::ForwardText));
+            }
+            const char* values2[] = {"\"\"", "\"ok\"", "null", "broken"};
+            for (u32 j = 0; j < 4; ++j)
+                CHECK(scalar(nullptr,
+                             op,
+                             reinterpret_cast<const u8*>(values2[j]),
+                             static_cast<u32>(strlen(values2[j])),
+                             client) == (j == 3            ? WsFrameAction::ClosePolicy0
+                                         : client && j < 2 ? WsFrameAction::ForwardTextPolicy0
+                                                           : WsFrameAction::ForwardText));
+        }
+    }
+}
+
+TEST(native_program, websocket_json_helpers_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func document(_ msg: WebSocketMessage) -> Json => json.parse(msg.text)
+func select(_ value: Json, _ pointer: str) -> Json => json.get(identity(value), pointer)
+func stringValue(_ value: Json) -> str => json.string(value)
+func flag(_ value: Json) -> bool => json.bool(value)
+route GET "/name" { return websocket(backend) { msg in
+    if msg.fromClient {
+        guard let root = document(msg) else { msg.close(1007) }
+        guard let field = select(root, "/a~1b") else { msg.drop() }
+        guard let text = stringValue(field) else { msg.drop() }
+        msg.forward("<" + text + ">")
+    } else { msg.forward() }
+} }
+route GET "/flag" { return websocket(backend) { msg in
+    if let root = document(identity(msg)) {
+        if let field = select(root, "/flag") {
+            if let value = flag(identity(field)) {
+                guard value == false else { msg.forward("true") }
+                msg.forward("false")
+            } else { msg.forward("wrong") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    const auto names = owner.p->config.routes[0].ws_frame_handler;
+    const auto flags = owner.p->config.routes[1].ws_frame_handler;
+    REQUIRE(names);
+    REQUIRE(flags);
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            const char* strings[] = {
+                "{\"a/b\":\"a\\u0000b\"}", "{\"a/b\":\"\"}", "{\"a/b\":false}", "{}", "broken"};
+            for (u32 j = 0; j < 5; ++j)
+                CHECK(names(nullptr,
+                            op,
+                            reinterpret_cast<const u8*>(strings[j]),
+                            static_cast<u32>(strlen(strings[j])),
+                            client) == (!client ? WsFrameAction::Forward
+                                        : j < 2 ? WsFrameAction::ForwardTextPolicy0
+                                        : j < 4 ? WsFrameAction::Drop
+                                                : WsFrameAction::ClosePolicy0));
+            const char* values[] = {
+                "{\"flag\":false}", "{\"flag\":true}", "{\"flag\":null}", "{}", "broken"};
+            const WsFrameAction actions[] = {WsFrameAction::ForwardTextPolicy1,
+                                             WsFrameAction::ForwardTextPolicy0,
+                                             WsFrameAction::ForwardTextPolicy2,
+                                             WsFrameAction::ForwardTextPolicy3,
+                                             WsFrameAction::Close};
+            for (u32 j = 0; j < 5; ++j)
+                CHECK(flags(nullptr,
+                            op,
+                            reinterpret_cast<const u8*>(values[j]),
+                            static_cast<u32>(strlen(values[j])),
+                            client) == actions[j]);
+        }
+    }
+    const auto& route = owner.p->config.routes[0];
+    CHECK(route.ws_forward_texts[0].source == WsTextSource::JsonString);
+}
+
+TEST(native_program, websocket_branch_bindings_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/guard" { return websocket(backend) { msg in
+    if msg.fromClient {
+        guard let document = json.parse(msg.text) else { msg.close(1007) }
+        guard let field = json.get(document, "/name") else { msg.close(1008) }
+        guard let name = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + name + ">")
+    } else { msg.forward() }
+} }
+route GET "/iflet" { return websocket(backend) { msg in
+    if let document = json.parse(msg.text) {
+        if let field = json.get(document, "/flag") {
+            if let value = json.bool(field) {
+                guard value == false else { msg.forward("true") }
+                msg.forward("false")
+            } else { msg.forward("wrong") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+} }
+route GET "/continuation" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if let document = json.parse(msg.text) { msg.forward("json") }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/fallthrough" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isText { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/root-iflet" { return websocket(backend) { msg in
+    if let document = json.parse(msg.text) {
+        if let text = json.string(document) { msg.forward(text) }
+        else { msg.drop() }
+    }
+    msg.forward(b"\xff")
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& program = *owner.p;
+    REQUIRE_EQ(program.config.route_count, 5u);
+    const auto guarded = program.config.routes[0].ws_frame_handler;
+    const auto optional = program.config.routes[1].ws_frame_handler;
+    const auto continuation = program.config.routes[2].ws_frame_handler;
+    const auto fallthrough = program.config.routes[3].ws_frame_handler;
+    const auto root = program.config.routes[4].ws_frame_handler;
+    REQUIRE(guarded);
+    REQUIRE(optional);
+    REQUIRE(continuation);
+    REQUIRE(fallthrough);
+    REQUIRE(root);
+    for (bool client : {false, true}) {
+        const char* documents[] = {
+            "{\"name\":\"ok\"}", "{\"name\":\"\"}", "{}", "{\"name\":false}", "broken"};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(guarded(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(documents[i]),
+                          static_cast<u32>(strlen(documents[i])),
+                          client) == (!client  ? WsFrameAction::Forward
+                                      : i < 2  ? WsFrameAction::ForwardTextPolicy0
+                                      : i == 2 ? WsFrameAction::ClosePolicy1
+                                      : i == 3 ? WsFrameAction::ClosePolicy2
+                                               : WsFrameAction::ClosePolicy0));
+        const char* flags[] = {
+            "{\"flag\":false}", "{\"flag\":true}", "{\"flag\":null}", "{}", "broken"};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(optional(nullptr,
+                           WsOpcode::Text,
+                           reinterpret_cast<const u8*>(flags[i]),
+                           static_cast<u32>(strlen(flags[i])),
+                           client) == (i == 0   ? WsFrameAction::ForwardTextPolicy1
+                                       : i == 1 ? WsFrameAction::ForwardTextPolicy0
+                                       : i == 2 ? WsFrameAction::ForwardTextPolicy2
+                                       : i == 3 ? WsFrameAction::ForwardTextPolicy3
+                                                : WsFrameAction::Close));
+        const u8 bad[] = {0xff, 0};
+        const char* json = "null";
+        const char* broken = "broken";
+        CHECK(continuation(nullptr, WsOpcode::Binary, bad, 2, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::ForwardText));
+        CHECK(continuation(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(json), 4, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        CHECK(
+            continuation(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, client) ==
+            (client ? WsFrameAction::Drop : WsFrameAction::ForwardText));
+        CHECK(fallthrough(nullptr, WsOpcode::Binary, bad, 2, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        CHECK(
+            fallthrough(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, client) ==
+            (client ? WsFrameAction::Drop : WsFrameAction::ForwardText));
+        const char* strings[] = {"\"\"", "null", "broken"};
+        for (u32 i = 0; i < 3; ++i)
+            CHECK(root(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(strings[i]),
+                       static_cast<u32>(strlen(strings[i])),
+                       client) == (i == 0   ? WsFrameAction::ForwardTextPolicy0
+                                   : i == 1 ? WsFrameAction::Drop
+                                            : WsFrameAction::ForwardText));
+    }
+    REQUIRE_EQ(program.config.routes[1].ws_forward_text_count, 4u);
+    CHECK_EQ(program.config.routes[1].ws_close_code, 1007u);
+}
+
+TEST(native_program, websocket_nested_if_preserves_control_targets_after_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+route GET "/nested" { return websocket(backend) { packet in
+    let msg = identity(packet)
+    if msg.fromClient {
+        let payload: Bytes = msg.payload
+        if payload.isEmpty { msg.drop() }
+        else {
+            if msg.kind == WebSocketMessageKind.binary { msg.forward(b"\xff\x00") }
+            else { msg.forward("<" + msg.text + ">") }
+        }
+    } else {
+        let prefix = "["
+        if msg.payload.isEmpty { msg.close() }
+        else { msg.forward(prefix + msg.text + "]") }
+    }
+} }
+route GET "/early" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.forward(b"\x00\xff") }
+        else { msg.drop() }
+    }
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let name = json.string(document) else { msg.close(1003) }
+    msg.forward(name)
+} }
+route GET "/json" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    if msg.fromClient {
+        if json.bool(document) == false { msg.forward("false") }
+        else if json.bool(document) == true { msg.forward("true") }
+        else { msg.drop() }
+    } else { msg.close(1008, "policy") }
+} }
+route GET "/close" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.close() }
+        else { msg.close(1003, "text") }
+    } else { msg.close(1008, "policy") }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& program = *owner.p;
+    REQUIRE_EQ(program.config.route_count, 4u);
+    const auto nested = program.config.routes[0].ws_frame_handler;
+    const auto early = program.config.routes[1].ws_frame_handler;
+    const auto json = program.config.routes[2].ws_frame_handler;
+    const auto close = program.config.routes[3].ws_frame_handler;
+    REQUIRE(nested);
+    REQUIRE(early);
+    REQUIRE(json);
+    REQUIRE(close);
+    const u8 bad[] = {0xff, 0};
+    const char* text = "hello";
+    for (bool client : {false, true}) {
+        CHECK(nested(nullptr, WsOpcode::Binary, bad, 2, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        CHECK(nested(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(text), 5, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::ForwardText));
+        CHECK(nested(nullptr, WsOpcode::Binary, nullptr, 0, client) ==
+              (client ? WsFrameAction::Drop : WsFrameAction::ClosePolicy0));
+        CHECK(close(nullptr, WsOpcode::Binary, nullptr, 0, client) ==
+              (client ? WsFrameAction::ClosePolicy0 : WsFrameAction::Close));
+        CHECK(close(nullptr, WsOpcode::Text, nullptr, 0, client) ==
+              (client ? WsFrameAction::ClosePolicy1 : WsFrameAction::Close));
+        const char* values[] = {"false", "true", "null", "{}", "broken"};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(json(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(values[i]),
+                       static_cast<u32>(strlen(values[i])),
+                       client) == (i == 4    ? WsFrameAction::ClosePolicy0
+                                   : !client ? WsFrameAction::Close
+                                   : i == 0  ? WsFrameAction::ForwardTextPolicy0
+                                   : i == 1  ? WsFrameAction::ForwardTextPolicy1
+                                             : WsFrameAction::Drop));
+    }
+    const char* allowed = "\"allow\"";
+    const char* broken = "broken";
+    CHECK(early(nullptr, WsOpcode::Binary, bad, 2, true) == WsFrameAction::ForwardTextPolicy0);
+    CHECK(early(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, true) ==
+          WsFrameAction::Drop);
+    CHECK(early(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(allowed), 7, false) ==
+          WsFrameAction::ForwardText);
+    CHECK(early(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, false) ==
+          WsFrameAction::ClosePolicy0);
+    REQUIRE_EQ(program.config.routes[3].ws_close_policy_count, 2u);
+    CHECK_EQ(program.config.routes[3].ws_close_policies[0].code, 1000u);
+    CHECK_EQ(program.config.routes[3].ws_close_policies[1].code, 1003u);
+    CHECK_EQ(program.config.routes[3].ws_close_code, 1008u);
+}
+
+TEST(native_program, websocket_if_branches_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func allowed(_ bytes: Bytes) -> bool => bytes.count == 2 && bytes == b"\x00\xff"
+route GET "/branches" { return websocket(backend) { packet in
+    let msg = identity(packet)
+    if msg.fromClient && !allowed(msg.payload) { msg.drop() }
+    if msg.kind == WebSocketMessageKind.text {
+        let copy = msg
+        let text = copy.text
+        copy.forward("[" + text + "]")
+    } else if msg.payload == b"\x00\xff" {
+        let copy = msg
+        copy.forward(b"\xff\x00")
+    } else {
+        let copy = msg
+        copy.close(1008, "policy")
+    }
+} }
+route GET "/json" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let field = json.get(document, "/name") else { msg.close(1008) }
+    guard let name = json.string(field) else { msg.close(1003) }
+    if msg.fromClient && name == "deny" { msg.drop() }
+    else {
+        let prefix = "<"
+        msg.forward(prefix + name + ">")
+    }
+} }
+route GET "/close" { return websocket(backend) { msg in
+    if msg.fromClient { msg.close() }
+    else { msg.close(1008, "policy") }
+} }
+route GET "/optional" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    if json.bool(document) == false { msg.forward("false") }
+    else if json.bool(document) == true { msg.forward("true") }
+    else if json.bool(document) == nil { msg.forward("missing") }
+    else { msg.drop() }
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    auto& program = *owner.p;
+    REQUIRE_EQ(program.config.route_count, 4u);
+    const auto branches = program.config.routes[0].ws_frame_handler;
+    const auto json = program.config.routes[1].ws_frame_handler;
+    const auto close = program.config.routes[2].ws_frame_handler;
+    const auto optional = program.config.routes[3].ws_frame_handler;
+    REQUIRE(branches);
+    REQUIRE(json);
+    REQUIRE(close);
+    REQUIRE(optional);
+    REQUIRE_EQ(program.config.routes[0].ws_forward_text_count, 2u);
+    const Str payloads[] = {{"\0\xff", 2}, {"\xff\0", 2}, {"", 0}, {"ok", 2}};
+    for (bool client : {false, true}) {
+        for (u32 i = 0; i < 4; ++i) {
+            const auto action = branches(nullptr,
+                                         WsOpcode::Binary,
+                                         reinterpret_cast<const u8*>(payloads[i].ptr),
+                                         payloads[i].len,
+                                         client);
+            CHECK(action == (i == 0   ? WsFrameAction::ForwardTextPolicy1
+                             : client ? WsFrameAction::Drop
+                                      : WsFrameAction::Close));
+        }
+        const char* text = "hello";
+        CHECK(branches(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(text), 5, client) ==
+              (client ? WsFrameAction::Drop : WsFrameAction::ForwardTextPolicy0));
+        const char* documents[] = {
+            "{\"name\":\"ok\"}", "{\"name\":\"deny\"}", "{}", "{\"name\":false}", "broken"};
+        for (u32 i = 0; i < 5; ++i) {
+            const auto action = json(nullptr,
+                                     WsOpcode::Text,
+                                     reinterpret_cast<const u8*>(documents[i]),
+                                     static_cast<u32>(strlen(documents[i])),
+                                     client);
+            CHECK(action == (i == 0 || (i == 1 && !client) ? WsFrameAction::ForwardText
+                             : i == 1                      ? WsFrameAction::Drop
+                             : i == 2                      ? WsFrameAction::ClosePolicy1
+                             : i == 3                      ? WsFrameAction::ClosePolicy2
+                                                           : WsFrameAction::ClosePolicy0));
+        }
+        CHECK(close(nullptr, WsOpcode::Binary, nullptr, 0, client) ==
+              (client ? WsFrameAction::ClosePolicy0 : WsFrameAction::Close));
+        const char* values[] = {"false", "true", "null", "0", "{}", "[]"};
+        for (u32 i = 0; i < 6; ++i)
+            CHECK(optional(nullptr,
+                           WsOpcode::Text,
+                           reinterpret_cast<const u8*>(values[i]),
+                           static_cast<u32>(strlen(values[i])),
+                           client) == (i == 0   ? WsFrameAction::ForwardTextPolicy0
+                                       : i == 1 ? WsFrameAction::ForwardTextPolicy1
+                                                : WsFrameAction::ForwardTextPolicy2));
+    }
+    REQUIRE_EQ(program.config.routes[2].ws_close_policy_count, 1u);
+    CHECK_EQ(program.config.routes[2].ws_close_policies[0].code, 1000u);
+    CHECK_EQ(program.config.routes[2].ws_close_code, 1008u);
+}
+
+TEST(native_program, websocket_callback_scope_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func same<T: Eq>(_ left: T, _ right: T) -> bool => left == right
+func payloadSize(_ bytes: Bytes) -> i32 => bytes.count
+route GET "/bytes" {
+    let required = 2
+    return websocket(backend) { msg in
+        let alias: WebSocketMessage = identity(msg)
+        let bytes: Bytes = alias.payload
+        let marker: Bytes = b"\x00\xff"
+        let permitted: bool = payloadSize(bytes) == required && same(bytes, marker)
+        let client = alias.direction == WebSocketDirection.clientToUpstream
+        guard !client || permitted else { alias.drop() }
+        alias.forward()
+    }
+}
+route GET "/json" { return websocket(backend) { event in
+    let copy = identity(event)
+    let text: str = copy.text
+    guard let document = json.parse(text) else { copy.close(1007, "invalid JSON") }
+    let client = copy.fromClient
+    guard let field = json.get(document, "/name") else { copy.drop() }
+    guard let name = json.string(field) else { copy.drop() }
+    guard !client || name == "ok" else { copy.drop() }
+    copy.forward("[" + text + "]")
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    const auto binary = owner.p->config.routes[0].ws_frame_handler;
+    const auto json = owner.p->config.routes[1].ws_frame_handler;
+    REQUIRE(binary);
+    REQUIRE(json);
+    const Str payloads[] = {{"\0\xff", 2}, {"\xff\0", 2}, {"", 0}};
+    for (bool client : {true, false}) {
+        for (u32 i = 0; i < 3; ++i)
+            CHECK(binary(nullptr,
+                         WsOpcode::Binary,
+                         reinterpret_cast<const u8*>(payloads[i].ptr),
+                         payloads[i].len,
+                         client) ==
+                  (!client || i == 0 ? WsFrameAction::Forward : WsFrameAction::Drop));
+        const char* documents[] = {"{\"name\":\"ok\"}", "{\"name\":\"no\"}", "{}", "broken"};
+        for (u32 i = 0; i < 4; ++i)
+            CHECK(json(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(documents[i]),
+                       static_cast<u32>(strlen(documents[i])),
+                       client) == (i == 3                            ? WsFrameAction::ClosePolicy0
+                                   : (i == 0 || (i == 1 && !client)) ? WsFrameAction::ForwardText
+                                                                     : WsFrameAction::Drop));
+    }
+}
+
+TEST(native_program, websocket_payload_bytes_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(upstream backend at "127.0.0.1:9999"
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func allowed(_ bytes: Bytes) -> bool =>
+    !bytes.isEmpty && bytes.count == 2 && same(bytes, b"\x00\xff")
+func choose(_ path: str) -> Bytes {
+    if path == "/yes" { b"\x00\xff" } else { b"" }
+}
+route GET "/http" {
+    let bytes = choose(req.path)
+    guard allowed(bytes) else { return 403 }
+    return 200
+}
+route POST "/body" {
+    guard allowed(req.bodyBytes) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(backend) { message in
+    guard allowed(message.payload) else { message.drop() }
+    message.forward()
+} })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 3u);
+    const auto http = owner.p->config.routes[0].fn;
+    REQUIRE(http);
+    const char* requests[] = {"GET /yes HTTP/1.1\r\nHost: test\r\n\r\n",
+                              "GET /no HTTP/1.1\r\nHost: test\r\n\r\n"};
+    for (u32 i = 0; i < 2; ++i) {
+        const auto result =
+            jit::HandlerResult::unpack(http(nullptr,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(requests[i]),
+                                            static_cast<u32>(strlen(requests[i])),
+                                            nullptr));
+        CHECK_EQ(result.status_code, i == 0 ? 200u : 403u);
+    }
+    REQUIRE(owner.p->config.routes[1].needs_req_body);
+    const auto body = owner.p->config.routes[1].fn;
+    REQUIRE(body);
+    const char body_request[] =
+        "POST /body HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\n\0\xff";
+    auto body_result = jit::HandlerResult::unpack(body(nullptr,
+                                                       nullptr,
+                                                       reinterpret_cast<const u8*>(body_request),
+                                                       sizeof(body_request) - 1,
+                                                       nullptr));
+    CHECK_EQ(body_result.status_code, 200u);
+    const auto handler = owner.p->config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    const Str payloads[] = {{"\0\xff", 2}, {"\xff\0", 2}, {"", 0}};
+    for (u32 i = 0; i < 3; ++i)
+        CHECK(handler(nullptr,
+                      WsOpcode::Binary,
+                      reinterpret_cast<const u8*>(payloads[i].ptr),
+                      payloads[i].len,
+                      true) == (i == 0 ? WsFrameAction::Forward : WsFrameAction::Drop));
 }
 
 TEST(native_program, websocket_message_type_guards_survive_compiler_exit) {
@@ -2318,3 +3221,205 @@ route GET "/" {
     connection->json_arena.destroy();
     pool.destroy();
 }
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_general_expressions_survive_compiler_and_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_general_expressions::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(owner.p->config.route_count, 4u);
+    const auto http = owner.p->config.routes[0];
+    CHECK_EQ(
+        invoke(http, "POST /http HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\n\r\nx").status_code,
+        200u);
+    CHECK_EQ(invoke(http, "POST /http HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\nxx")
+                 .status_code,
+             403u);
+    const auto handler = owner.p->config.routes[1].ws_frame_handler;
+    const auto guards = owner.p->config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    REQUIRE(guards);
+    const auto optional = owner.p->config.routes[3].ws_frame_handler;
+    REQUIRE(optional);
+    const u8 payload[13] = {0, 255};
+    for (bool client : {false, true}) {
+        for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (u32 len : {0u, 1u, 2u, 5u, 9u, 12u}) {
+                const auto expected =
+                    len == 12 ? WsFrameAction::Close
+                    : (client && len % 4 != 1) || (opcode == WsOpcode::Text && len == 5)
+                        ? WsFrameAction::Drop
+                        : WsFrameAction::Forward;
+                CHECK(handler(nullptr, opcode, payload, len, client) == expected);
+                CHECK(optional(nullptr, opcode, payload, len, client) ==
+                      (!client || len == 1 ? WsFrameAction::Forward : WsFrameAction::Drop));
+                CHECK(guards(nullptr, opcode, payload, len, client) ==
+                      (len < 5 ? WsFrameAction::Drop : WsFrameAction::Forward));
+            }
+        }
+    }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_eager_bindings_survive_source_removal_and_pool_exhaustion) {
+    Source source;
+    REQUIRE(source.append(test::ws_eager_bindings::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_eager_bindings::check(owner.p->config, _tc);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_dynamic_outputs_survive_source_removal_and_pool_exhaustion) {
+    Source source;
+    REQUIRE(source.append(test::ws_dynamic_output::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_dynamic_output::check(owner.p->config, _tc);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_hash_bindings_evaluate_once_and_handle_pool_exhaustion) {
+    Source source;
+    REQUIRE(source.append(test::ws_hash_output::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_hash_output::check(owner.p->config, _tc);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_general_json_values_survive_source_removal_and_pool_exhaustion) {
+    Source source;
+    REQUIRE(source.append(test::ws_general_json::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_general_json::check(owner.p->config, _tc);
+}
+
+TEST(native_program, websocket_general_regex_uses_shared_values_after_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_general_regex::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_general_regex::check(owner.p->config, _tc);
+}
+
+TEST(native_program, websocket_helpers_and_arguments_evaluate_reached_producers_once) {
+    Source source;
+    REQUIRE(source.append(test::ws_helper_lexical::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_helper_lexical::check(owner.p->config, _tc);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_nominal_matches_keep_owned_outputs_and_single_subject_evaluation) {
+    Source source;
+    REQUIRE(source.append(test::ws_nominal_match::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_nominal_match::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_nominal_match_selector_is_not_elided_or_repeated) {
+    Source source;
+    REQUIRE(source.append(test::ws_nominal_selector::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_nominal_selector::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_error_values_bind_once_and_recover_after_source_removal) {
+    Source source;
+    REQUIRE(source.append(test::ws_error_values::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_error_values::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_error_guard_match_preserves_named_cases_and_single_evaluation) {
+    Source source;
+    REQUIRE(source.append(test::ws_error_guard_match::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_error_guard_match::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_error_scalar_bindings_keep_false_zero_and_absence_distinct) {
+    Source source;
+    REQUIRE(source.append(test::ws_error_scalars::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_error_scalars::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_connection_context_keeps_owned_metadata_and_helper_types) {
+    Source source;
+    REQUIRE(source.append(test::ws_connection_context::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    test::ws_connection_context::check(_tc, owner.p->config);
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, websocket_cache_effects_keep_identity_and_clock_across_messages) {
+    Source source;
+    REQUIRE(source.append(test::ws_cache_context::kSource));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    activate_native_program(*owner.p);
+    Source changed_source;
+    REQUIRE(changed_source.append(test::ws_cache_context::kReorderedSource));
+    Program changed;
+    REQUIRE(changed.p);
+    REQUIRE(load(changed_source, *changed.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE_EQ(unlink(changed_source.path), 0);
+    test::ws_cache_context::check(
+        _tc, owner.p->config, changed.p->config, [&]() { activate_native_program(*changed.p); });
+}
+#endif

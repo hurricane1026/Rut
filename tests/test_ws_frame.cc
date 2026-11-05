@@ -362,6 +362,67 @@ TEST(ws_message, max_message_size_overflow_safe) {
     CHECK(feed(m, WsOpcode::Text, true, ~0ull, 1024).st == WsMessageStatus::Error);
 }
 
+TEST(ws_frame, rsv1_requires_negotiation_and_only_marks_initial_data_fragments) {
+    constexpr WsOpcode kOpcodes[] = {WsOpcode::Text, WsOpcode::Binary};
+    constexpr bool kFlags[] = {false, true};
+    constexpr u64 kLengths[] = {0, 125, 126, 65536};
+    const u8 kMask[] = {1, 2, 3, 4};
+    for (WsOpcode opcode : kOpcodes) {
+        for (bool fin : kFlags) {
+            for (bool masked : kFlags) {
+                for (u64 length : kLengths) {
+                    u8 wire[kWsMaxHeaderSize]{};
+                    const u32 size =
+                        ws_write_header(wire, opcode, fin, masked, kMask, length, true);
+                    REQUIRE(size != 0);
+                    WsFrameHeader header{};
+                    CHECK(ws_parse_header(wire, size, masked, &header) == ParseStatus::Error);
+                    REQUIRE(ws_parse_header(wire, size, masked, &header, true) ==
+                            ParseStatus::Complete);
+                    CHECK(header.compressed);
+                    CHECK_EQ(header.opcode, opcode);
+                    CHECK_EQ(header.fin, fin);
+                    CHECK_EQ(header.payload_len, length);
+                    const u32 plain = ws_write_header(wire, opcode, fin, masked, kMask, length);
+                    REQUIRE(ws_parse_header(wire, plain, masked, &header, true) ==
+                            ParseStatus::Complete);
+                    CHECK_FALSE(header.compressed);
+                }
+            }
+        }
+    }
+}
+
+TEST(ws_frame, negotiated_compression_never_permits_reserved_bits_or_compressed_controls) {
+    constexpr WsOpcode kOpcodes[] = {
+        WsOpcode::Continuation, WsOpcode::Close, WsOpcode::Ping, WsOpcode::Pong};
+    const u8 kMask[] = {1, 2, 3, 4};
+    for (WsOpcode opcode : kOpcodes) {
+        u8 wire[kWsMaxHeaderSize];
+        memset(wire, 0xa5, sizeof(wire));
+        CHECK_EQ(ws_write_header(wire, opcode, true, false, kMask, 0, true), 0u);
+        CHECK_EQ(wire[0], 0xa5u);
+        wire[0] = static_cast<u8>(0xc0 | static_cast<u8>(opcode));
+        wire[1] = 0;
+        WsFrameHeader header{};
+        CHECK(ws_parse_header(wire, 2, false, &header, true) == ParseStatus::Error);
+    }
+    for (u32 bit = 0x10; bit <= 0x20; bit <<= 1) {
+        const u8 wire[] = {static_cast<u8>(0x81 | bit), 0};
+        WsFrameHeader header{};
+        CHECK(ws_parse_header(wire, sizeof(wire), false, &header, true) == ParseStatus::Error);
+    }
+    WsMessageAssembler message;
+    REQUIRE(feed(message, WsOpcode::Text, false, 1, 64).st == WsMessageStatus::NeedMore);
+    WsFrameHeader continuation{};
+    continuation.fin = true;
+    continuation.opcode = WsOpcode::Continuation;
+    continuation.compressed = true;
+    WsOpcode output{};
+    u64 length = 0;
+    CHECK(ws_message_feed(message, continuation, 64, &output, &length) == WsMessageStatus::Error);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

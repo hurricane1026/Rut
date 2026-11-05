@@ -88,9 +88,16 @@
     X(rut_helper_hmac_sha256_matches)                 \
     X(rut_helper_basic_matches)                       \
     X(rut_helper_str_constant_time_equal)             \
+    X(rut_helper_ws_forward)                          \
+    X(rut_helper_ws_close)                            \
+    X(rut_helper_ws_close_reason)                     \
+    X(rut_helper_ws_connection_scalar)                \
+    X(rut_helper_ws_connection_subprotocol)           \
+    X(rut_helper_ws_begin_message)                    \
     X(rut_helper_ws_json_has_path)                    \
     X(rut_helper_ws_json_valid)                       \
     X(rut_helper_ws_json_string_at_path)              \
+    X(rut_helper_ws_json_string_regex_at_path)        \
     X(rut_helper_ws_json_string_equals_at_path)       \
     X(rut_helper_ws_json_string_matches_at_path)      \
     X(rut_helper_ws_json_number_text_at_path)         \
@@ -108,11 +115,16 @@
     X(rut_helper_str_eq)                              \
     X(rut_helper_str_cmp)                             \
     X(rut_helper_str_regex_match)                     \
+    X(rut_helper_str_regex_result)                    \
+    X(rut_helper_str_has_suffix)                      \
+    X(rut_helper_str_concat)                          \
     X(rut_helper_str_trim_prefix)                     \
     X(rut_helper_resp_body)                           \
     X(rut_helper_json)                                \
     X(rut_helper_cache_get)                           \
     X(rut_helper_cache_set)                           \
+    X(rut_helper_cache_get_bound)                     \
+    X(rut_helper_cache_set_bound)                     \
     X(rut_helper_time_now_micros)                     \
     X(rut_helper_time_unlatch)
 

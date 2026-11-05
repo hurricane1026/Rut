@@ -3,6 +3,7 @@
 #include "fixtures/jwt_secret_rotation.h"
 #include "fixtures/signed_request.h"
 #include "framing_selection_preflight_fixture.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -33,6 +34,7 @@
 #include <fstream>
 #include <memory>
 
+#include <llvm-c/Core.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <pthread.h>
@@ -300,6 +302,219 @@ TEST(jit, helpers_sanity) {
     CHECK(out_ptr != nullptr);
     CHECK(out_len == 7);
     CHECK(__builtin_memcmp(out_ptr, "payload", 7) == 0);
+}
+
+TEST(jit, websocket_message_inputs_reuse_general_expression_codegen) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    auto connection = std::make_unique<ConnectionBase>();
+    connection->peer_addr = 0x01020304u;
+    connection->peer_port = 43210;
+    connection->tls_active = true;
+    connection->ws_subprotocol = lit("chat-v1");
+    for (u32 id = 0; ws_message_field_valid(id); ++id) {
+        const auto field = static_cast<WsMessageFieldId>(id);
+        TestContext tc;
+        REQUIRE(tc.init());
+        Builder b;
+        b.init(&tc.mod);
+        auto* fn = V(b.create_function(lit("message_input"), lit("/"), 'G'));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        b.set_insert_point(fn, entry);
+        auto input = V(b.emit_ws_message_field(field));
+        if (ws_message_field_is_string(field)) input = V(b.emit_str_length(input));
+        if (field == WsMessageFieldId::ConnectionRemoteAddr) {
+            CHECK(fn->values[input.id].type->kind == TypeKind::IP);
+            tc.mod.cache_instance_count = 1;
+            tc.mod.cache_instances[0] = {lit("input_fields"), 64};
+            const u32 caps[] = {64};
+            const u64 names[] = {cache_instance_identity("input_fields", 12)};
+            cache_registry_publish(caps, names, 1);
+            rut_helper_cache_set(0, connection->peer_addr, 42);
+            auto value = V(b.emit_cache_get(0, input));
+            auto missing = V(b.emit_opt_is_nil(value));
+            auto no = V(b.emit_const_bool(false));
+            input = V(b.emit_cmp(Opcode::CmpEq, missing, no));
+        }
+        if (ws_message_field_is_bool(field) || field == WsMessageFieldId::ConnectionRemoteAddr) {
+            auto yes = V(b.emit_const_i32(1));
+            auto no = V(b.emit_const_i32(0));
+            input = V(b.emit_select(input, yes, no));
+        }
+        auto base = V(b.emit_const_i32(200));
+        auto status = V(b.emit_arith(Opcode::Add, base, input));
+        VOK(b.emit_ret_status(status));
+        CHECK_FALSE(codegen(tc.mod).ok);  // An HTTP entry cannot consume message inputs.
+        auto cg = codegen_ws_body(tc.mod);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_message_input"));
+        REQUIRE(handler);
+        const u8 bytes[] = {0, 255, 195, 169};
+        for (u8 opcode : {1u, 2u}) {
+            for (u8 client : {0u, 1u}) {
+                const u32 expected =
+                    field == WsMessageFieldId::Payload || field == WsMessageFieldId::Length
+                        ? sizeof(bytes)
+                    : field == WsMessageFieldId::Kind                  ? opcode - 1u
+                    : field == WsMessageFieldId::Direction             ? 1u - client
+                    : field == WsMessageFieldId::FromClient            ? client
+                    : field == WsMessageFieldId::IsText                ? opcode == 1u
+                    : field == WsMessageFieldId::IsBinary              ? opcode == 2u
+                    : field == WsMessageFieldId::ConnectionRemoteAddr  ? 1u
+                    : field == WsMessageFieldId::ConnectionRemotePort  ? 43210u
+                    : field == WsMessageFieldId::ConnectionSubprotocol ? 7u
+                    : field == WsMessageFieldId::CloseCode ||
+                            field == WsMessageFieldId::CloseUpstreamCode
+                        ? 1006u
+                    : field == WsMessageFieldId::CloseReason ||
+                            field == WsMessageFieldId::CloseUpstreamReason ||
+                            field == WsMessageFieldId::CloseWasClean
+                        ? 0u
+                        : 1u;
+                auto result = HandlerResult::unpack(handler(
+                    connection.get(), nullptr, bytes, sizeof(bytes), nullptr, opcode, client));
+                CHECK_EQ(result.status_code, 200u + expected);
+            }
+        }
+        engine.shutdown();
+        tc.destroy();
+    }
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_shared_body_links_with_http_and_preserves_callback_abi) {
+    TestContext http;
+    TestContext message;
+    REQUIRE(http.init());
+    REQUIRE(message.init());
+    Builder b;
+    b.init(&http.mod);
+    auto* fn = V(b.create_function(lit("http_peer"), lit("/http"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto path = V(b.emit_req_path());
+    auto prefix = V(b.emit_const_str(lit("/http")));
+    auto accepted = V(b.emit_str_has_prefix(path, prefix));
+    auto ok = V(b.emit_const_i32(200));
+    auto bad = V(b.emit_const_i32(404));
+    auto status = V(b.emit_select(accepted, ok, bad));
+    VOK(b.emit_ret_status(status));
+    auto cg = codegen(http.mod);
+    REQUIRE(cg.ok);
+
+    b.init(&message.mod);
+    fn = V(b.create_function(lit("message_peer"), lit("/ws"), 'G'));
+    entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto payload = V(b.emit_ws_message_field(WsMessageFieldId::Payload));
+    prefix = V(b.emit_const_str(lit("allow")));
+    accepted = V(b.emit_str_has_prefix(payload, prefix));
+    ok = V(b.emit_const_i32(static_cast<i32>(WsFrameAction::Forward)));
+    bad = V(b.emit_const_i32(static_cast<i32>(WsFrameAction::Drop)));
+    status = V(b.emit_select(accepted, ok, bad));
+    VOK(b.emit_ret_status(status));
+    REQUIRE(emit_ws_body(cg.mod, cg.ctx, message.mod, 9));
+    CHECK_FALSE(emit_ws_body(cg.mod, cg.ctx, message.mod, 9));
+    // Both modules' IR pools may retire before the combined code is compiled.
+    message.destroy();
+    http.destroy();
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto http_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_http_peer"));
+    auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_9"));
+    REQUIRE(http_handler);
+    REQUIRE(handler);
+    const char request[] = "GET /http HTTP/1.1\r\nHost: test\r\n\r\n";
+    auto result = HandlerResult::unpack(http_handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    const u8 allowed[] = {'a', 'l', 'l', 'o', 'w', 0, 255};
+    CHECK(handler(nullptr, WsOpcode::Text, allowed, 5, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, allowed, sizeof(allowed), false) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, true) == WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Ping, allowed, 5, true) == WsFrameAction::Close);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 1, true) == WsFrameAction::Close);
+    CHECK(handler(nullptr, WsOpcode::Text, allowed, 0x80000000ull, true) == WsFrameAction::Close);
+
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto connection = std::make_unique<ConnectionBase>();
+    u8* pending_send = pool.alloc();
+    REQUIRE(pending_send);
+    REQUIRE(connection->json_arena.init(&pool));
+    REQUIRE(connection->json_arena.alloc(64));
+    connection->jit_response_body = lit("old");
+    connection->jit_response_body_valid = true;
+    CHECK_EQ(pool.in_use(), 2u);
+    CHECK(handler(connection.get(), WsOpcode::Text, allowed, 5, true) == WsFrameAction::Forward);
+    CHECK_EQ(pool.in_use(), 1u);
+    CHECK(connection->json_arena.current == nullptr);
+    CHECK(connection->json_arena.backend.pool == &pool);
+    CHECK_FALSE(connection->jit_response_body_valid);
+    pending_send[0] = 17;
+    CHECK_EQ(pending_send[0], 17u);
+    pool.free(pending_send);
+    connection->json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+}
+#endif
+
+TEST(jit, websocket_body_rejects_http_reads_and_keeps_borrowed_llvm_context_alive) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("bad_message"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    V(b.emit_req_body());
+    VOK(b.emit_ret_status(200));
+    LLVMContextRef context = LLVMContextCreate();
+    CHECK_FALSE(codegen_ws_body(tc.mod, context).ok);
+    CHECK(LLVMInt32TypeInContext(context) != nullptr);
+    LLVMContextDispose(context);
+    tc.destroy();
+}
+
+TEST(jit, bytes_count_reads_the_full_raw_length_without_text_decoding) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("bytes_count"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto body = V(b.emit_req_body());
+    auto count = V(b.emit_str_length(body));
+    auto base = V(b.emit_const_i32(200));
+    auto status = V(b.emit_arith(Opcode::Add, base, count));
+    VOK(b.emit_ret_status(status));
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_bytes_count"));
+    REQUIRE(handler);
+    const char body_request[] =
+        "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n\0\xff\xc3\xa9";
+    auto result = HandlerResult::unpack(handler(nullptr,
+                                                nullptr,
+                                                reinterpret_cast<const u8*>(body_request),
+                                                sizeof(body_request) - 1,
+                                                nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    const char empty[] = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+    result = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(empty), sizeof(empty) - 1, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    engine.shutdown();
+    tc.destroy();
 }
 
 // Test: Simple handler that always returns 200.
@@ -1640,8 +1855,9 @@ route GET "/users" {
     REQUIRE(handler != nullptr);
 
     cache_registry_set_seed(0xB4A4C4u);
+    rut_helper_cache_reset_local_state();
     const u32 caps[1] = {1024};
-    const u64 idents[1] = {cache_instance_identity("branch-buckets", 14)};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
     cache_registry_publish(caps, idents, 1);
 
     Connection conn;
@@ -20694,6 +20910,146 @@ TEST(jit_dispatch, null_handler_returns_error_outcome) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_bool_select_evaluates_selector_and_one_arm_once) {
+    for (u8 negate : {0, 1}) {
+        WsLenGuardSpec nodes[4]{};
+        for (u32 i = 0; i < 3; ++i) {
+            nodes[i].accessor = 10;  // call a replaceable JSON-validity probe
+            nodes[i].is_operand = true;
+        }
+        nodes[3].accessor = 37;
+        nodes[3].bound = 0;
+        nodes[3].lhs = 1;
+        nodes[3].rhs = 2;
+        nodes[3].negate = negate;
+        nodes[3].verdict = 1;
+        auto generated = codegen_ws_handler(0, nodes, 4, 0);
+        REQUIRE(generated.ok);
+        // Replace the declared helper inside this test module with an observable
+        // counter. The selector returns its flag; either arm returns the value.
+        LLVMValueRef probe = LLVMGetNamedFunction(generated.mod, "rut_helper_ws_json_valid");
+        REQUIRE(probe);
+        LLVMSetValueName2(probe, "select_probe", 12);
+        LLVMSetLinkage(probe, LLVMInternalLinkage);
+        auto builder = LLVMCreateBuilderInContext(generated.ctx);
+        REQUIRE(builder);
+        LLVMPositionBuilderAtEnd(builder,
+                                 LLVMAppendBasicBlockInContext(generated.ctx, probe, "entry"));
+        auto i8_ty = LLVMInt8TypeInContext(generated.ctx);
+        auto i32_ty = LLVMInt32TypeInContext(generated.ctx);
+        auto data = LLVMGetParam(probe, 0);
+        auto before = LLVMBuildLoad2(builder, i32_ty, data, "before");
+        auto next = LLVMBuildAdd(builder, before, LLVMConstInt(i32_ty, 1, 0), "next");
+        LLVMBuildStore(builder, next, data);
+        LLVMValueRef selector_offset = LLVMConstInt(i32_ty, sizeof(u32), 0);
+        LLVMValueRef value_offset = LLVMConstInt(i32_ty, sizeof(u32) + sizeof(u8), 0);
+        auto selector_ptr =
+            LLVMBuildGEP2(builder, i8_ty, data, &selector_offset, 1, "selector.ptr");
+        auto value_ptr = LLVMBuildGEP2(builder, i8_ty, data, &value_offset, 1, "value.ptr");
+        auto selector = LLVMBuildLoad2(builder, i8_ty, selector_ptr, "selector");
+        auto value = LLVMBuildLoad2(builder, i8_ty, value_ptr, "value");
+        auto first = LLVMBuildICmp(builder, LLVMIntEQ, before, LLVMConstInt(i32_ty, 0, 0), "first");
+        LLVMBuildRet(builder, LLVMBuildSelect(builder, first, selector, value, "selected"));
+        LLVMDisposeBuilder(builder);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(generated.mod, generated.ctx));
+        const auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+        REQUIRE(handler);
+        struct Probe {
+            u32 calls;
+            u8 selector;
+            u8 value;
+        };
+        static_assert(offsetof(Probe, selector) == sizeof(u32));
+        static_assert(offsetof(Probe, value) == sizeof(u32) + sizeof(u8));
+        for (u8 selected : {0, 1}) {
+            for (u8 result : {0, 1}) {
+                Probe state{0, selected, result};
+                CHECK(handler(nullptr,
+                              WsOpcode::Text,
+                              reinterpret_cast<const u8*>(&state),
+                              sizeof(state),
+                              true) == (static_cast<bool>(result) != static_cast<bool>(negate)
+                                            ? WsFrameAction::Forward
+                                            : WsFrameAction::Drop));
+                CHECK_EQ(state.calls, 2u);
+            }
+        }
+        engine.shutdown();
+    }
+}
+
+TEST(jit, websocket_bool_select_skips_inactive_errors_and_preserves_reached_errors) {
+    for (u8 negate : {0, 1}) {
+        WsLenGuardSpec nodes[4]{};
+        nodes[0].accessor = 2;
+        nodes[0].cmp = 2;
+        nodes[0].bound = 1;
+        nodes[1].accessor = 6;
+        nodes[1].pattern = "allow";
+        nodes[1].pattern_len = 5;
+        nodes[2].accessor = 34;
+        nodes[2].value = "^allow$";
+        nodes[2].value_len = 7;
+        for (u32 i = 0; i < 3; ++i) nodes[i].is_operand = true;
+        nodes[3].accessor = 37;
+        nodes[3].bound = 0;
+        nodes[3].lhs = 1;
+        nodes[3].rhs = 2;
+        nodes[3].negate = negate;
+        nodes[3].verdict = 1;
+        auto generated = codegen_ws_handler(0, nodes, 4, 0);
+        REQUIRE(generated.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(generated.mod, generated.ctx));
+        const auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+        REQUIRE(handler);
+        const auto run = [&](const char* text, bool client) {
+            return handler(
+                nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(text), strlen(text), client);
+        };
+        CHECK(run("allow", true) == (negate ? WsFrameAction::Drop : WsFrameAction::Forward));
+        CHECK(run("deny", true) == (negate ? WsFrameAction::Forward : WsFrameAction::Drop));
+        CHECK(run("allow", false) == WsFrameAction::Close);
+        CHECK(run("\"allow\"", false) == (negate ? WsFrameAction::Drop : WsFrameAction::Forward));
+        CHECK(run("\"deny\"", false) == (negate ? WsFrameAction::Forward : WsFrameAction::Drop));
+        engine.shutdown();
+    }
+}
+
+TEST(jit, websocket_bool_select_rejects_cycles_sharing_orphans_and_control_operands) {
+    for (u32 invalid = 0; invalid < 9; ++invalid) {
+        WsLenGuardSpec nodes[4]{};
+        for (u32 i = 0; i < 3; ++i) {
+            nodes[i].accessor = 35;
+            nodes[i].bound = 1;
+            nodes[i].is_operand = true;
+        }
+        nodes[3].accessor = 37;
+        nodes[3].bound = 0;
+        nodes[3].lhs = 1;
+        nodes[3].rhs = 2;
+        if (invalid == 1) nodes[3].bound = 3;  // selector cycle
+        if (invalid == 2) nodes[3].bound = 4;  // forward selector
+        if (invalid == 3) nodes[3].bound = 1;  // shared selector/then child, orphan zero
+        if (invalid == 4) nodes[3].rhs = 1;    // shared arms, orphan two
+        if (invalid == 5) nodes[0].is_operand = false;
+        if (invalid == 6) nodes[0].pass_target = kWsControlDefault;
+        if (invalid == 7) nodes[3].is_operand = true;  // orphan compound
+        if (invalid == 8) nodes[3].accessor = 38;      // unknown accessor
+        auto generated = codegen_ws_handler(0, nodes, 4, 0);
+        if (invalid == 0) {
+            REQUIRE(generated.ok);
+            dispose_module(generated.mod, generated.ctx);
+        } else {
+            CHECK_FALSE(generated.ok);
+            if (generated.ok) dispose_module(generated.mod, generated.ctx);
+        }
+    }
+}
+
 TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     WsLenGuardSpec nodes[3]{};
     nodes[0].accessor = 2;
@@ -20733,6 +21089,125 @@ TEST(jit, websocket_condition_forest_rejects_invalid_graphs) {
     CHECK_FALSE(codegen_ws_handler(0, &invalid_source, 1, 0).ok);
     CHECK_FALSE(codegen_ws_handler(0, nullptr, 1, 0).ok);
     CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
+}
+
+TEST(jit, websocket_explicit_control_graphs_use_the_condition_node_budget) {
+    WsLenGuardSpec nodes[WsLenGuardSpec::kMaxConditions]{};
+    for (u32 i = 0; i < WsLenGuardSpec::kMaxConditions; ++i) {
+        nodes[i].accessor = i == 0 ? 2 : 35;
+        nodes[i].cmp = 2;
+        nodes[i].bound = 1;
+        nodes[i].pass_target =
+            i + 1 < WsLenGuardSpec::kMaxConditions ? i + 1 : ws_control_return(0);
+        nodes[i].fail_target = ws_control_return(1);
+    }
+    auto generated = codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions, 69);
+    REQUIRE(generated.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(generated.mod, generated.ctx));
+    auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_69"));
+    REQUIRE(handler);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, nullptr, 0, false) == WsFrameAction::Drop);
+    CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions + 1, 0).ok);
+    nodes[12].pass_target = 12;
+    CHECK_FALSE(codegen_ws_handler(0, nodes, WsLenGuardSpec::kMaxConditions, 0).ok);
+    WsLenGuardSpec legacy[5]{};
+    CHECK_FALSE(codegen_ws_handler(0, legacy, 5, 0).ok);
+}
+
+TEST(jit, websocket_forward_control_targets_keep_nested_conditions_lazy) {
+    WsLenGuardSpec guards[4]{};
+    guards[0].accessor = 2;
+    guards[0].cmp = 2;
+    guards[0].bound = 1;
+    guards[0].pass_target = 1;
+    guards[0].fail_target = ws_control_after(3);
+    guards[1].accessor = 1;
+    guards[1].cmp = 2;
+    guards[1].bound = 2;
+    guards[1].pass_target = ws_control_return(0);
+    guards[1].fail_target = 2;
+    guards[2].accessor = 34;
+    guards[2].pattern = "";
+    guards[2].value = "allow";
+    guards[2].value_len = 5;
+    guards[2].pass_target = ws_control_return(1);
+    guards[2].fail_target = ws_control_return(4);
+    guards[3].accessor = 0;
+    guards[3].cmp = 2;
+    guards[3].bound = 2;
+    guards[3].pass_target = kWsControlDefault;
+    guards[3].fail_target = ws_control_return(1);
+    auto generated = codegen_ws_handler(3, guards, 4, 61);
+    REQUIRE(generated.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(generated.mod, generated.ctx));
+    auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_61"));
+    REQUIRE(handler);
+    const u8 bad[] = {0xff, 0};
+    CHECK(handler(nullptr, WsOpcode::Binary, bad, 1, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, bad, 2, false) == WsFrameAction::ForwardText);
+    CHECK(handler(nullptr, WsOpcode::Binary, bad, 1, false) == WsFrameAction::Drop);
+    const char* allowed = "\"allow\"";
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(allowed), 7, true) ==
+          WsFrameAction::Drop);
+    const char* other = "\"other\"";
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(other), 7, true) ==
+          WsFrameAction::ClosePolicy0);
+    const char* invalid = "broken";
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(invalid), 6, true) ==
+          WsFrameAction::Close);  // reached decode errors cannot become a policy branch
+}
+
+TEST(jit, websocket_control_targets_reject_cycles_operands_and_unknown_actions) {
+    WsLenGuardSpec nodes[4]{};
+    nodes[0].accessor = 35;
+    nodes[0].bound = 1;
+    nodes[1].accessor = 35;
+    nodes[1].bound = 1;
+    nodes[1].is_operand = true;
+    nodes[2].accessor = 35;
+    nodes[2].bound = 0;
+    nodes[2].is_operand = true;
+    nodes[3].accessor = 4;
+    nodes[3].lhs = 1;
+    nodes[3].rhs = 2;
+    const auto valid = [&]() {
+        auto generated = codegen_ws_handler(0, nodes, 4, 0);
+        CHECK(generated.ok);
+        if (generated.ok) dispose_module(generated.mod, generated.ctx);
+    };
+    valid();
+    for (u32 target : {0u,
+                       1u,
+                       4u,
+                       0x20000000u,
+                       0x80000100u,
+                       ws_control_return(3),
+                       ws_control_return(12),
+                       ws_control_return(255),
+                       ws_control_after(0),
+                       ws_control_after(5)}) {
+        nodes[0].pass_target = target;
+        CHECK_FALSE(codegen_ws_handler(0, nodes, 4, 0).ok);
+    }
+    nodes[0].pass_target = 3;
+    valid();
+    nodes[0].pass_target = ws_control_after(1);  // boundary may precede operand nodes
+    valid();
+    nodes[0].pass_target = ws_control_after(4);  // no later root means the default verdict
+    valid();
+    nodes[0].pass_target = kWsControlNext;
+    nodes[1].fail_target = kWsControlDefault;
+    CHECK_FALSE(codegen_ws_handler(0, nodes, 4, 0).ok);
+    nodes[1].fail_target = kWsControlNext;
+    nodes[3].fail_target = 0;
+    CHECK_FALSE(codegen_ws_handler(0, nodes, 4, 0).ok);
+    nodes[3].fail_target = kWsControlNext;
+    CHECK_FALSE(codegen_ws_handler(12, nodes, 4, 0).ok);
 }
 
 TEST(jit, websocket_json_number_text_guard_is_exact_and_typed) {
@@ -20978,6 +21453,9 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     node.accessor = 18;
     node.bound = 2;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.accessor = 36;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);  // Missing equality children.
+    node.accessor = 35;
     node.accessor = 19;
     node.bound = 0;
     node.int_bound = (-9223372036854775807LL - 1);
@@ -21014,6 +21492,99 @@ TEST(jit, websocket_text_literal_rejects_missing_storage) {
     dispose_module(max_count.mod, max_count.ctx);
     node.accessor = 34;
     CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+}
+
+TEST(jit, websocket_json_regex_storage_validation) {
+    WsLenGuardSpec node{};
+    node.accessor = 34;
+    node.verdict = 1;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.value_len = 2;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.value = "ok";
+    node.pattern_len = 1;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    node.pattern_len = 0;
+    auto cg = codegen_ws_handler(0, &node, 1, 0);
+    REQUIRE(cg.ok);
+    dispose_module(cg.mod, cg.ctx);
+    node.accessor = 38;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+}
+
+TEST(jit, websocket_constant_predicates_validate_boolean_values) {
+    WsLenGuardSpec node{};
+    node.accessor = 35;
+    node.verdict = 1;
+    node.bound = 2;
+    CHECK_FALSE(codegen_ws_handler(0, &node, 1, 0).ok);
+    for (u32 value : {0u, 1u}) {
+        node.bound = value;
+        auto cg = codegen_ws_handler(0, &node, 1, 0);
+        REQUIRE(cg.ok);
+        dispose_module(cg.mod, cg.ctx);
+    }
+}
+
+TEST(jit, websocket_json_regex_errors_close_before_negation) {
+    for (u8 negate : {0, 1}) {
+        WsLenGuardSpec node{};
+        node.accessor = 34;
+        node.verdict = 1;
+        node.negate = negate;
+        node.value = "ok";
+        node.value_len = 2;
+        auto cg = codegen_ws_handler(0, &node, 1, 0);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        const auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+        REQUIRE(handler);
+        const char* yes = "\"ok\"";
+        const char* no = "\"no\"";
+        CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(yes), 4, true) ==
+              (negate ? WsFrameAction::Drop : WsFrameAction::Forward));
+        CHECK(handler(nullptr, WsOpcode::Binary, reinterpret_cast<const u8*>(no), 4, false) ==
+              (negate ? WsFrameAction::Forward : WsFrameAction::Drop));
+        for (const char* bad : {"{", "null", "false", "\"\\ud800\""}) {
+            CHECK(
+                handler(
+                    nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(bad), strlen(bad), true) ==
+                WsFrameAction::Close);
+        }
+        CHECK(handler(
+                  nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(1), 0x100000001ULL, true) ==
+              WsFrameAction::Close);
+        CHECK_EQ(rut_helper_ws_json_string_regex_at_path(yes, 4, nullptr, 0, nullptr), 2u);
+        engine.shutdown();
+    }
+}
+
+TEST(jit, websocket_json_regex_short_circuit_skips_decode_and_scan) {
+    WsLenGuardSpec nodes[3]{};
+    nodes[0].accessor = 2;  // !fromClient
+    nodes[0].bound = 0;
+    nodes[0].cmp = 2;  // Eq
+    nodes[0].is_operand = true;
+    nodes[1].accessor = 34;
+    nodes[1].value = "ok";
+    nodes[1].value_len = 2;
+    nodes[1].is_operand = true;
+    nodes[2].accessor = 5;  // !fromClient || regex
+    nodes[2].lhs = 0;
+    nodes[2].rhs = 1;
+    nodes[2].verdict = 1;
+    auto cg = codegen_ws_handler(0, nodes, 3, 0);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+    REQUIRE(handler);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(1), 4, false) ==
+          WsFrameAction::Forward);
+    engine.shutdown();
 }
 
 // Compile a `websocket(x){ message in message.<verdict>() }` program end-to-end through the
@@ -28459,4 +29030,829 @@ TEST(jit, password_identity_maps_terminal_results_and_rejects_untrusted_states) 
     }
     engine.shutdown();
     rir.destroy();
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_branch_phi_keeps_selected_effects_and_helper_continuations) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("branch_effect"), lit("/"), 'G'));
+    const auto entry = V(b.create_block(fn, lit("entry")));
+    const auto merge = V(b.create_block(fn, lit("merge")));
+    const auto left = V(b.create_block(fn, lit("left")));
+    const auto right = V(b.create_block(fn, lit("right")));
+    b.set_insert_point(fn, entry);
+    auto client = V(b.emit_ws_message_field(WsMessageFieldId::FromClient));
+    VOK(b.emit_br(client, left, right));
+    b.set_insert_point(fn, left);
+    auto ten = V(b.emit_const_i32(10));
+    VOK(b.emit_ctx_store_slot_i32(0, ten));
+    auto payload = V(b.emit_ws_message_field(WsMessageFieldId::Payload));
+    auto digest = V(b.emit_hash_digest(static_cast<u32>(HashAlgorithm::Sha256), &payload, 1));
+    VOK(b.emit_jmp(merge));
+    b.set_insert_point(fn, right);
+    auto twenty = V(b.emit_const_i32(20));
+    VOK(b.emit_ctx_store_slot_i32(0, twenty));
+    auto text = V(b.emit_const_str(lit("fallback")));
+    auto fallback = V(b.emit_opt_wrap(text));
+    VOK(b.emit_jmp(merge));
+    b.set_insert_point(fn, merge);
+    auto selected = V(b.emit_phi(digest, left, fallback, right));
+    auto absent = V(b.emit_opt_is_nil(selected));
+    auto ok = V(b.emit_const_i32(200));
+    auto bad = V(b.emit_const_i32(403));
+    auto status = V(b.emit_select(absent, bad, ok));
+    VOK(b.emit_ret_status(status));
+    auto cg = codegen_ws_body(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_branch_effect"));
+    REQUIRE(handler);
+    struct Frame {
+        HandlerCtx ctx{};
+        u64 slots[1]{};
+    } frame;
+    frame.ctx.slot_count = 1;
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto connection = std::make_unique<ConnectionBase>();
+    REQUIRE(connection->json_arena.init(&pool));
+    const u8 data[] = {0, 255};
+    for (void* conn : {static_cast<void*>(nullptr), static_cast<void*>(connection.get())}) {
+        for (u8 from_client : {0u, 1u}) {
+            frame.slots[0] = 0;
+            auto result = HandlerResult::unpack(
+                handler(conn, &frame.ctx, data, sizeof(data), nullptr, 2, from_client));
+            CHECK_EQ(result.status_code, conn == nullptr && from_client ? 403u : 200u);
+            CHECK_EQ(frame.slots[0], from_client ? 10u : 20u);
+        }
+    }
+    connection->json_arena.destroy();
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+    engine.shutdown();
+    tc.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_lexical_values_evaluate_once_at_the_reached_declaration) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    for (u32 mode : {0u, 1u, 2u}) {
+        auto module = std::make_unique<HirModule>();
+        auto route = std::make_unique<HirRoute>();
+        route->path = lit("/message");
+        route->is_ws_callback = true;
+        auto store = [&](const HirExpr& value) -> HirExpr* {
+            if (!route->exprs.push(value)) return nullptr;
+            return &route->exprs[route->exprs.len - 1];
+        };
+        HirExpr uuid{};
+        uuid.kind = HirExprKind::Uuid;
+        uuid.type = HirTypeKind::Str;
+        uuid.may_nil = true;
+        auto* initializer = store(uuid);
+        REQUIRE(initializer);
+        HirExpr bound = uuid;
+        bound.kind = HirExprKind::BoundValue;
+        bound.lhs = initializer;
+        auto* reference = store(bound);
+        REQUIRE(reference);
+        HirExpr plain{};
+        plain.kind = HirExprKind::ValueOf;
+        plain.type = HirTypeKind::Str;
+        plain.lhs = reference;
+        auto* unwrapped = store(plain);
+        REQUIRE(unwrapped);
+        HirExpr equal{};
+        equal.kind = HirExprKind::Eq;
+        equal.type = HirTypeKind::Bool;
+        equal.lhs = unwrapped;
+        equal.rhs = unwrapped;
+        auto* equality = store(equal);
+        REQUIRE(equality);
+        HirExpr present{};
+        present.kind = HirExprKind::HasValue;
+        present.type = HirTypeKind::Bool;
+        present.lhs = reference;
+        auto* presence = store(present);
+        REQUIRE(presence);
+        HirExpr forward{};
+        forward.kind = HirExprKind::IntLit;
+        forward.type = HirTypeKind::I32;
+        auto* yes = store(forward);
+        HirExpr drop = forward;
+        drop.int_value = 1;
+        auto* no = store(drop);
+        HirExpr close = forward;
+        close.int_value = 2;
+        auto* failed = store(close);
+        REQUIRE(yes && no && failed);
+        HirExpr compare = forward;
+        compare.kind = HirExprKind::IfElse;
+        compare.lhs = equality;
+        compare.rhs = yes;
+        REQUIRE(compare.args.push(no));
+        auto* compared = store(compare);
+        REQUIRE(compared);
+        HirExpr checked = forward;
+        checked.kind = HirExprKind::IfElse;
+        checked.lhs = presence;
+        checked.rhs = compared;
+        REQUIRE(checked.args.push(failed));
+        auto* body = store(checked);
+        REQUIRE(body);
+        HirExpr binding = forward;
+        binding.kind = HirExprKind::LetIn;
+        binding.lhs = initializer;
+        binding.rhs = mode == 0 ? body : yes;
+        auto* evaluated = store(binding);
+        REQUIRE(evaluated);
+        HirExpr root = binding;
+        if (mode == 2) {
+            HirExpr receiver{};
+            receiver.kind = HirExprKind::LocalRef;
+            receiver.type = HirTypeKind::WebSocketMessage;
+            auto* message = store(receiver);
+            REQUIRE(message);
+            HirExpr direction{};
+            direction.kind = HirExprKind::WsMessageField;
+            direction.type = HirTypeKind::Bool;
+            direction.str_value = lit("fromClient");
+            direction.lhs = message;
+            auto* client = store(direction);
+            REQUIRE(client);
+            root.kind = HirExprKind::IfElse;
+            root.lhs = client;
+            root.rhs = evaluated;
+            REQUIRE(root.args.push(yes));
+        }
+        HirLocal result{};
+        result.type = HirTypeKind::I32;
+        result.is_runtime_synthetic = true;
+        result.init = bound;
+        REQUIRE(route->locals.push(result));
+        route->control.kind = HirControlKind::Direct;
+        route->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+        route->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+        route->control.direct_term.local_ref_index = 0;
+        CHECK_FALSE(build_mir_route(*module, *route));  // Reference outside its binder.
+        route->locals[0].init = root;
+        auto copied = std::make_unique<HirRoute>(*route);
+        route.reset();
+        auto built = build_mir_route(*module, *copied);
+        REQUIRE(built);
+        std::unique_ptr<MirModule> mir(built.value());
+        auto mir_copy = std::make_unique<MirModule>(*mir);
+        mir.reset();
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(*mir_copy, rir));
+        mir_copy.reset();
+        copied.reset();
+        module.reset();
+        auto cg = codegen_ws_body(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        auto connection = std::make_unique<ConnectionBase>();
+        REQUIRE(connection->json_arena.init(&pool));
+        for (bool owner : {false, true}) {
+            for (u8 client : {0u, 1u}) {
+                connection->json_arena.destroy();
+                auto returned = HandlerResult::unpack(handler(
+                    owner ? connection.get() : nullptr, nullptr, nullptr, 0, nullptr, 1, client));
+                CHECK_EQ(returned.status_code, mode == 0 && !owner ? 2u : 0u);
+                CHECK_EQ(pool.in_use(), owner && (mode != 2 || client) ? 1u : 0u);
+            }
+        }
+        connection->json_arena.destroy();
+        CHECK_EQ(pool.in_use(), 0u);
+        pool.destroy();
+        rir.destroy();
+        engine.shutdown();
+    }
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_general_regex_errors_close_before_negation_and_skip_untaken_scans) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    for (bool fault : {false, true}) {
+        for (u32 mode : {0u, 1u, 2u}) {
+            TestContext tc;
+            REQUIRE(tc.init());
+            Builder b;
+            b.init(&tc.mod);
+            auto* fn = V(b.create_function(lit("regex_message"), lit("/"), 'G'));
+            auto entry = V(b.create_block(fn, lit("entry")));
+            auto scan = V(b.create_block(fn, lit("scan")));
+            auto skip = V(b.create_block(fn, lit("skip")));
+            b.set_insert_point(fn, entry);
+            auto client = V(b.emit_ws_message_field(WsMessageFieldId::FromClient));
+            VOK(b.emit_br(client, scan, skip));
+            b.set_insert_point(fn, scan);
+            auto text = V(b.emit_ws_message_field(WsMessageFieldId::Payload));
+            auto match = V(b.emit_str_regex_match(text, lit("a.*")));
+            if (mode == 1) {
+                auto no = V(b.emit_const_bool(false));
+                match = V(b.emit_cmp(Opcode::CmpEq, match, no));
+            }
+            auto yes = V(b.emit_const_i32(0));
+            auto no = V(b.emit_const_i32(1));
+            auto verdict = mode == 2 ? yes : V(b.emit_select(match, yes, no));
+            VOK(b.emit_ret_status(verdict));
+            b.set_insert_point(fn, skip);
+            VOK(b.emit_ret_status(0));
+            auto cg = codegen_ws_body(tc.mod);
+            REQUIRE(cg.ok);
+            if (fault) {
+                // Inject the runtime's documented scan-failure status into this
+                // module only. No production fault switch or global state.
+                auto helper = LLVMGetNamedFunction(cg.mod, "rut_helper_str_regex_result");
+                REQUIRE(helper);
+                LLVMSetLinkage(helper, LLVMInternalLinkage);
+                auto block = LLVMAppendBasicBlockInContext(cg.ctx, helper, "failed");
+                auto builder = LLVMCreateBuilderInContext(cg.ctx);
+                REQUIRE(builder);
+                LLVMPositionBuilderAtEnd(builder, block);
+                LLVMBuildRet(builder, LLVMConstInt(LLVMInt8TypeInContext(cg.ctx), 2, 0));
+                LLVMDisposeBuilder(builder);
+            }
+            JitEngine engine;
+            REQUIRE(engine.init());
+            REQUIRE(engine.compile(cg.mod, cg.ctx));
+            auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_regex_message"));
+            REQUIRE(handler);
+            for (const char* input : {"allow", "bad"}) {
+                for (u8 client : {0u, 1u}) {
+                    auto result = HandlerResult::unpack(handler(nullptr,
+                                                                nullptr,
+                                                                reinterpret_cast<const u8*>(input),
+                                                                strlen(input),
+                                                                nullptr,
+                                                                1,
+                                                                client));
+                    const bool kMatch = input[0] == 'a';
+                    const u16 expected =
+                        !client     ? 0
+                        : fault     ? 2
+                        : mode == 2 ? 0
+                                    : static_cast<u16>((mode == 1 ? !kMatch : kMatch) ? 0 : 1);
+                    CHECK(result.action == HandlerAction::ReturnStatus);
+                    CHECK_EQ(result.status_code, expected);
+                }
+            }
+            engine.shutdown();
+            tc.destroy();
+        }
+    }
+    CHECK_EQ(rut_helper_str_regex_result("x", 1, nullptr), 2u);
+    void* db = rut_helper_regex_compile("x", 1);
+    REQUIRE(db);
+    CHECK_EQ(rut_helper_str_regex_result(nullptr, 0, db), 2u);
+    CHECK_EQ(rut_helper_str_regex_result("x", 1, db), 1u);
+    CHECK_EQ(rut_helper_str_regex_result("y", 1, db), 0u);
+    rut_helper_regex_free(db);
+}
+
+TEST(jit, websocket_recipe_regex_errors_close_before_negation) {
+    for (u8 negate : {0u, 1u}) {
+        WsLenGuardSpec node{};
+        node.accessor = 3;
+        node.verdict = 1;
+        node.negate = negate;
+        node.pattern = "x";
+        node.pattern_len = 1;
+        auto cg = codegen_ws_handler(0, &node, 1, 0);
+        REQUIRE(cg.ok);
+        auto helper = LLVMGetNamedFunction(cg.mod, "rut_helper_str_regex_result");
+        REQUIRE(helper);
+        LLVMSetLinkage(helper, LLVMInternalLinkage);
+        auto block = LLVMAppendBasicBlockInContext(cg.ctx, helper, "failed");
+        auto builder = LLVMCreateBuilderInContext(cg.ctx);
+        REQUIRE(builder);
+        LLVMPositionBuilderAtEnd(builder, block);
+        LLVMBuildRet(builder, LLVMConstInt(LLVMInt8TypeInContext(cg.ctx), 2, 0));
+        LLVMDisposeBuilder(builder);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+        REQUIRE(handler);
+        for (const char* input : {"x", "y"})
+            CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(input), 1, true) ==
+                  WsFrameAction::Close);
+        engine.shutdown();
+    }
+}
+#endif
+
+TEST(helpers, string_concat_retains_bytes_and_never_turns_failure_into_empty_text) {
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto conn = std::make_unique<ConnectionBase>();
+    REQUIRE(conn->json_arena.init(&pool));
+    char first[] = {'a', 0, 'b'};
+    Str parts[] = {{first, sizeof(first)}, lit("!")};
+    const char* output = nullptr;
+    u32 size = 0;
+    REQUIRE(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size));
+    CHECK((Str{output, size}.eq({"a\0b!", 4})));
+    first[0] = 'z';
+    const Str retained{output, size};
+    parts[0] = lit("second");
+    REQUIRE(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size));
+    CHECK((Str{output, size}.eq(lit("second!"))));
+    CHECK(retained.eq({"a\0b!", 4}));
+    CHECK_EQ(rut_helper_str_has_suffix(retained.ptr, retained.len, "b!", 2), 1u);
+    CHECK_EQ(rut_helper_str_has_suffix(retained.ptr, retained.len, "a!", 2), 0u);
+    CHECK_EQ(rut_helper_str_has_suffix(nullptr, 0, nullptr, 0), 1u);
+    CHECK_EQ(rut_helper_str_has_suffix(nullptr, 1, nullptr, 0), 0u);
+    parts[0] = {nullptr, 1};
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size), 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(size, 0u);
+    parts[0] = {reinterpret_cast<const char*>(1), 262145};
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size), 0u);
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 65, &output, &size), 0u);
+    conn->json_arena.destroy();
+    u8* held[8]{};
+    for (auto& slice : held) {
+        slice = pool.alloc();
+        REQUIRE(slice);
+    }
+    parts[0] = lit("x");
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size), 0u);
+    CHECK_EQ(pool.in_use(), 8u);
+    CHECK(output == nullptr);
+    CHECK_EQ(size, 0u);
+    parts[0] = lit("");
+    parts[1] = lit("");
+    CHECK_EQ(rut_helper_str_concat(conn.get(), nullptr, parts, 2, &output, &size), 1u);
+    CHECK(output != nullptr);
+    CHECK_EQ(size, 0u);
+    for (auto* slice : held) pool.free(slice);
+    conn->json_arena.destroy();
+    pool.destroy();
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_string_concat_is_lazy_and_owns_output_before_the_next_message) {
+    using MessageBodyFn = u64 (*)(void*, HandlerCtx*, const u8*, u32, void*, u8, u8);
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("string_message"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto chosen = V(b.create_block(fn, lit("chosen")));
+    auto skipped = V(b.create_block(fn, lit("skipped")));
+    auto merged = V(b.create_block(fn, lit("merged")));
+    b.set_insert_point(fn, entry);
+    auto client = V(b.emit_ws_message_field(WsMessageFieldId::FromClient));
+    VOK(b.emit_br(client, chosen, skipped));
+    b.set_insert_point(fn, chosen);
+    auto text = V(b.emit_ws_message_field(WsMessageFieldId::Payload));
+    auto suffix = V(b.emit_const_str(lit("!")));
+    ValueId parts[] = {text, suffix};
+    auto joined = V(b.emit_str_interpolate(parts, 2));
+    auto matched = V(b.emit_str_predicate(joined, suffix, 1));
+    auto yes = V(b.create_block(fn, lit("yes")));
+    auto no = V(b.create_block(fn, lit("no")));
+    VOK(b.emit_br(matched, yes, no));
+    b.set_insert_point(fn, no);
+    VOK(b.emit_ret_status(1));
+    b.set_insert_point(fn, yes);
+    VOK(b.emit_jmp(merged));
+    b.set_insert_point(fn, skipped);
+    auto literal = V(b.emit_const_str(lit("skip")));
+    VOK(b.emit_jmp(merged));
+    b.set_insert_point(fn, merged);
+    auto selected = V(b.emit_phi(joined, yes, literal, skipped));
+    auto action = V(b.emit_ws_forward(selected, 1));
+    VOK(b.emit_ret_status(action));
+    auto cg = codegen_ws_body(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<MessageBodyFn>(engine.lookup("handler_string_message"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto conn = std::make_unique<ConnectionBase>();
+    REQUIRE(conn->json_arena.init(&pool));
+    const u8 input[] = {'a', 0};
+    for (u8 client : {1u, 0u}) {
+        rut_helper_ws_begin_message(conn.get());
+        auto result = HandlerResult::unpack(
+            handler(conn.get(), nullptr, input, sizeof(input), nullptr, 2, client));
+        CHECK_EQ(result.status_code, static_cast<u16>(WsFrameAction::ForwardDynamic));
+        REQUIRE(conn->ws_handler_output.ready);
+        CHECK(conn->ws_handler_output.payload.eq(client ? Str{"a\0!", 3} : lit("skip")));
+        CHECK_EQ(conn->json_arena.space_used(), client ? 8u : 0u);
+    }
+    conn->json_arena.destroy();
+    u8* held[8]{};
+    for (auto& slice : held) {
+        slice = pool.alloc();
+        REQUIRE(slice);
+    }
+    for (u8 client : {0u, 1u}) {
+        rut_helper_ws_begin_message(conn.get());
+        auto result = HandlerResult::unpack(
+            handler(conn.get(), nullptr, input, sizeof(input), nullptr, 2, client));
+        CHECK_EQ(result.status_code,
+                 static_cast<u16>(client ? WsFrameAction::Close : WsFrameAction::ForwardDynamic));
+        CHECK_EQ(conn->ws_handler_output.ready, client == 0u);
+        CHECK_EQ(pool.in_use(), 8u);
+    }
+    for (auto* slice : held) pool.free(slice);
+    conn->json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    tc.destroy();
+}
+#endif
+
+TEST(jit, frontend_string_helpers_preserve_lazy_branches_and_actual_argument_evaluation) {
+    struct Scenario {
+        const char* helpers;
+        const char* expression;
+        u32 bytes;
+        bool chosen_only;
+    };
+    const Scenario scenarios[] = {
+        {R"rut(func choose(_ yes: bool, _ text: str) -> str {
+            if yes { text + "!" } else { "skip" }
+        })rut",
+         "choose(req.httpVersion == \"HTTP/1.1\", req.path)",
+         8,
+         true},
+        {"func ignore(_ text: str) -> str => \"skip\"", "ignore(req.path + \"!\")", 8, false},
+        {"func same(_ text: str) -> bool => text == text", "same(req.path + \"!\")", 8, false},
+        {R"rut(func repeatText(_ text: str) -> str {
+            let joined = text + "!"
+            joined + joined
+        })rut",
+         "repeatText(req.path)",
+         24,
+         false},
+        {R"rut(func readPath() -> str {
+            let joined = req.path + "!"
+            joined + joined
+        })rut",
+         "readPath()",
+         24,
+         false},
+        {"func second(_ first: str, _ last: str) -> str => last",
+         "second(req.path + \"a\", req.path + \"b\")",
+         16,
+         false},
+    };
+    for (const auto& scenario : scenarios) {
+        std::string source = scenario.helpers;
+        source += "\nroute GET \"/\" { let value = ";
+        source += scenario.expression;
+        source += " return 200 }\n";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        SlicePool pool;
+        REQUIRE(pool.init(8));
+        auto conn = std::make_unique<ConnectionBase>();
+        REQUIRE(conn->json_arena.init(&pool));
+        for (bool chosen : {false, true}) {
+            const Str request = chosen ? lit("GET /one HTTP/1.1\r\nHost: x\r\n\r\n")
+                                       : lit("GET /one HTTP/1.0\r\nHost: x\r\n\r\n");
+            const bool evaluates = chosen || !scenario.chosen_only;
+            auto result = HandlerResult::unpack(handler(
+                nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+            CHECK_EQ(result.status_code, evaluates ? 500u : 200u);
+            conn->json_arena.reset();
+            result = HandlerResult::unpack(handler(conn.get(),
+                                                   nullptr,
+                                                   reinterpret_cast<const u8*>(request.ptr),
+                                                   request.len,
+                                                   nullptr));
+            CHECK_EQ(result.status_code, 200u);
+            CHECK_EQ(conn->json_arena.space_used(), evaluates ? scenario.bytes : 0u);
+        }
+        conn->json_arena.destroy();
+        pool.destroy();
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_nominal_domains_match_in_ordinary_http_helpers_and_routes) {
+    const char* source = R"rut(
+func chooseKind(_ first: bool) -> WebSocketMessageKind {
+    if first { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+func directionStatus(_ value: WebSocketDirection) -> i32 {
+    match value { .clientToUpstream => 210
+ .upstreamToClient => 211 }
+}
+func directionFor(_ kind: WebSocketMessageKind) -> WebSocketDirection {
+    match kind {
+        .text => WebSocketDirection.clientToUpstream
+        .binary => WebSocketDirection.upstreamToClient
+    }
+}
+route GET "/" {
+    let kind = chooseKind(req.httpVersion == "HTTP/1.1")
+    let status = directionStatus(directionFor(kind))
+    guard (status == 210) == req.http11 else { return 500 }
+    match kind {
+        .text => return 210
+        .binary => return 211
+    }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    for (bool first : {false, true}) {
+        const Str request = first ? lit("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                                  : lit("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+        const auto result = HandlerResult::unpack(handler(
+            nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK_EQ(result.status_code, first ? 210u : 211u);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, websocket_chain_after_response_headers_commit_on_admission_and_rejection) {
+    const auto src = R"rut(
+func response_headers(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Path", req.path)
+    resp.add("X-Stage", "after")
+    resp.remove("Server")
+    0
+}
+func require_http11(_ req: i32) -> i32 {
+    guard req.http11 else { respond 505 }
+    0
+}
+chain access { before require_http11(req) after response_headers(req, resp) }
+upstream ws at "127.0.0.1:9999"
+route GET "/api/users" use chain access {
+    return websocket(ws) { msg in msg.forward() }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    static const char kHttp10Request[] = "GET /api/users HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    const auto rejected = HandlerResult::unpack(handler(&conn,
+                                                        nullptr,
+                                                        reinterpret_cast<const u8*>(kHttp10Request),
+                                                        sizeof(kHttp10Request) - 1,
+                                                        nullptr));
+    CHECK(rejected.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(rejected.status_code, 505);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 3u);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("after")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    conn.reset();
+    const auto result = HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                                      sizeof(kGetApiRequest) - 1,
+                                                      nullptr));
+    CHECK(result.action == HandlerAction::Forward);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 3u);
+    CHECK(conn.resp_header_mutations[0].mode == ConnectionBase::RespHeaderMutationMode::Set);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].mode == ConnectionBase::RespHeaderMutationMode::Add);
+    CHECK(conn.resp_header_mutations[1].name.eq(lit("X-Stage")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("after")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK(conn.resp_header_mutations[2].name.eq(lit("Server")));
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+#endif
+
+TEST(jit, http_error_values_can_be_stored_without_implicit_throwing) {
+    const char* source = R"rut(
+func value(_ failed: bool) -> str { if failed { error(7) } else { "ok" } }
+route GET "/" { let result = value(req.http11) return 200 }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    for (bool first : {false, true}) {
+        const Str request = first ? lit("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                                  : lit("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+        const auto result = HandlerResult::unpack(handler(
+            nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK_EQ(result.status_code, 200u);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, http_named_error_domains_survive_successful_helper_arms) {
+    const char* source = R"rut(
+variant MessageError { bad }
+func value(_ failed: bool) -> str { if failed { error(MessageError.bad) } else { "ok" } }
+route GET "/" {
+    let result = value(req.http11)
+    guard match result else { .bad => return 409 _ => return 500 }
+    return 200
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    for (bool first : {false, true}) {
+        const Str request = first ? lit("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                                  : lit("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+        const auto result = HandlerResult::unpack(handler(
+            nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK_EQ(result.status_code, first ? 409u : 200u);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bound_cache_helpers_keep_declaration_identity_across_reload) {
+    rut_helper_cache_reset_local_state();
+    const u64 alpha = cache_instance_identity("alpha", 5);
+    const u64 beta = cache_instance_identity("beta", 4);
+    const u32 caps[] = {64, 64};
+    const u64 initial[] = {alpha, beta};
+    cache_registry_publish(caps, initial, 2);
+    constexpr u32 kKey = 0x01020304u;
+    rut_helper_cache_set_bound(0, alpha, kKey, 11);
+    rut_helper_cache_set_bound(1, beta, kKey, 22);
+    u8 has = 0;
+    i64 value = 0;
+    rut_helper_cache_get_bound(0, alpha, kKey, &has, &value);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(value, 11);
+
+    const u64 reordered[] = {beta, alpha};
+    cache_registry_publish(caps, reordered, 2);
+    // Reordering may evict old slots: this cache is deliberately lossy.
+    rut_helper_cache_set(0, kKey, 22);
+    rut_helper_cache_set(1, kKey, 11);
+    rut_helper_cache_get_bound(0, alpha, kKey, &has, &value);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(value, 11);
+    rut_helper_cache_set_bound(0, alpha, kKey, 33);
+    rut_helper_cache_get(0, kKey, &has, &value);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(value, 22);
+    rut_helper_cache_get(1, kKey, &has, &value);
+    CHECK_EQ(value, 33);
+
+    cache_registry_publish(caps, reordered, 1);  // alpha removed, beta still at slot 0
+    rut_helper_cache_set(0, kKey, 44);
+    rut_helper_cache_get_bound(0, alpha, kKey, &has, &value);
+    CHECK_EQ(has, 0);
+    CHECK_EQ(value, 0);
+    rut_helper_cache_set_bound(0, alpha, kKey, 99);
+    rut_helper_cache_get(0, kKey, &has, &value);
+    CHECK_EQ(value, 44);
+
+    cache_registry_publish(caps, reordered, 2);  // alpha is a fresh incarnation
+    rut_helper_cache_get_bound(0, alpha, kKey, &has, &value);
+    CHECK_EQ(has, 0);
+    rut_helper_cache_set_bound(0, alpha, kKey, 55);
+    rut_helper_cache_get(1, kKey, &has, &value);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(value, 55);
+    rut_helper_cache_get_bound(0, 0, kKey, &has, &value);
+    CHECK_EQ(has, 0);
+    CHECK_EQ(value, 0);
+    rut_helper_cache_reset_local_state();
+}
+
+TEST(jit, cache_codegen_requires_a_valid_declaration_binding) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("cache_binding"), lit("/"), 'G'));
+    auto block = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, block);
+    auto key = V(b.emit_req_remote_addr());
+    V(b.emit_cache_get(0, key));
+    VOK(b.emit_ret_status(200));
+    CHECK_FALSE(codegen(tc.mod).ok);  // no descriptor for the referenced declaration
+    tc.mod.cache_instance_count = 1;
+    tc.mod.cache_instances[0] = {lit("cache"), 64};
+    auto valid = codegen(tc.mod);
+    REQUIRE(valid.ok);
+    dispose_module(valid.mod, valid.ctx);
+    Instruction& access = fn->entry()->insts[1];
+    for (i32 index : {-1, 1, 100}) {
+        access.imm.i32_val = index;
+        CHECK_FALSE(codegen(tc.mod).ok);
+    }
+    access.imm.i32_val = 0;
+    tc.mod.cache_instances[0].name = {};
+    CHECK_FALSE(codegen(tc.mod).ok);
+    tc.mod.cache_instances[0].name = lit("a_name_that_exceeds_thirty_one_bytes");
+    CHECK_FALSE(codegen(tc.mod).ok);
+    tc.destroy();
 }

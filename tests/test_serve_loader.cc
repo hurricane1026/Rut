@@ -1,3 +1,22 @@
+#include "fixtures/ws_bool_select.h"
+#include "fixtures/ws_borrowed_binary.h"
+#include "fixtures/ws_cache_context.h"
+#include "fixtures/ws_connection_context.h"
+#include "fixtures/ws_dynamic_output.h"
+#include "fixtures/ws_eager_bindings.h"
+#include "fixtures/ws_error_guard_match.h"
+#include "fixtures/ws_error_scalars.h"
+#include "fixtures/ws_error_values.h"
+#include "fixtures/ws_general_expressions.h"
+#include "fixtures/ws_general_json.h"
+#include "fixtures/ws_general_regex.h"
+#include "fixtures/ws_hash_output.h"
+#include "fixtures/ws_helper_lexical.h"
+#include "fixtures/ws_helper_observables.h"
+#include "fixtures/ws_nominal_match.h"
+#include "fixtures/ws_nominal_selector.h"
+#include "fixtures/ws_optional_values.h"
+#include "fixtures/ws_scalar_helpers.h"
 // Tests for the .rut program loader (src/serve_loader.cc): the bridge that
 // compiles a source file end to end (lex -> parse -> analyze -> MIR -> RIR ->
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
@@ -46,6 +65,8 @@ std::string write_file(const std::string& dir, const char* name, const char* con
     const std::string path = dir + "/" + name;
     std::ofstream out(path, std::ios::binary);
     out << contents;
+    out.flush();
+    if (!out.good()) return {};
     out.close();
     return path;
 }
@@ -4398,29 +4419,32 @@ TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific
 }
 
 #if RUT_ENABLE_WEBSOCKET
-TEST(serve_loader, websocket_terminate_rejects_effectful_http_guard) {
+TEST(serve_loader, websocket_terminate_admission_accepts_normal_helper_guard) {
     const std::string dir = "/tmp/rut_serve_loader_ws_prelude";
     const std::string path =
         write_file(dir,
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
                    "func allowed() -> bool => true\n"
-                   "route GET \"/ws\" { guard allowed() else { return 403 }\n"
+                   "chain secure { before allowed() else 403 }\n"
+                   "@rateLimit(limit: 10, window: 1m)\n"
+                   "route GET \"/ws\" use chain secure { guard allowed() else { return 403 }\n"
                    "return websocket(backend) { message in message.forward() } }\n");
     LoadedProgram program;
     LoadError err;
-    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
-    CHECK(err.stage == LoadStage::Analyze);
-    CHECK(err.has_diag);
-    CHECK(err.diag.detail.eq(lit_str(
-        "WebSocket message routes allow only compile-time constant lets and bounded request "
-        "guards before websocket; effects are not executed")));
-    CHECK_EQ(program.config.route_count, 0u);
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 1u);
+    CHECK(program.config.routes[0].ws_terminate);
+    CHECK_EQ(program.config.routes[0].rate_limit.count, 1u);
+    CHECK(program.config.routes[0].action == RouteAction::JitHandler);
+    CHECK(program.config.routes[0].fn != nullptr);
+    CHECK(program.config.routes[0].ws_frame_handler != nullptr);
     program.destroy();
 }
 
 TEST(serve_loader, websocket_subprotocol_is_owned_after_compiler_state_is_retired) {
-    const std::string dir = "/tmp/rut_serve_loader_ws_subprotocol";
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / "rut_serve_loader_ws_subprotocol").string();
     const std::string path = write_file(dir,
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
@@ -4738,7 +4762,9 @@ TEST(serve_loader, websocket_terminate_rewrites_fixed_text) {
 }
 
 TEST(serve_loader, websocket_binary_replacements_retain_bytes_and_select_mixed_branch_types) {
-    const auto path = write_file("/tmp/rut_ws_binary_replacement", "app.rut", R"rut(
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / "rut_ws_binary_replacement").string();
+    const auto path = write_file(dir, "app.rut", R"rut(
 upstream backend at "127.0.0.1:9999"
 route GET "/ws" { return websocket(backend, maxMessageSize: 4b) { message in
     guard message.text != "a" else { message.forward(b"\x00\xFF") }
@@ -4753,7 +4779,7 @@ route GET "/ws" { return websocket(backend, maxMessageSize: 4b) { message in
     LoadError err;
     CHECK_FALSE(load_rut_program(path.c_str(), invalid, err));
     invalid.destroy();
-    const auto valid_path = write_file("/tmp/rut_ws_binary_replacement", "valid.rut", R"rut(
+    const auto valid_path = write_file(dir, "valid.rut", R"rut(
 upstream backend at "127.0.0.1:9999"
 route GET "/ws" { return websocket(backend, maxMessageSize: 5b) { message in
     guard message.text != "a" else { message.forward(b"\x00\xFF") }
@@ -4920,7 +4946,7 @@ TEST(serve_loader, attach_ws_terminate_to_jit_is_exact_and_fail_atomic) {
         "/ws", kRouteMethodGet, source_route.fn, false, ForwardPreflightMode::None, 0));
     REQUIRE(config.add_proxy("/proxy", 'G', upstream.value()));
     const auto handler = source_route.ws_frame_handler;
-    const u32 capacity = kWsTerminateMessageCapacity;
+    const u32 capacity = kWsMaxMessageCapacity;
     CHECK_FALSE(
         config.attach_ws_terminate_to_jit(0, "/wrong", 'G', upstream.value(), handler, capacity));
     CHECK_FALSE(
@@ -4940,6 +4966,105 @@ TEST(serve_loader, attach_ws_terminate_to_jit_is_exact_and_fail_atomic) {
     CHECK(config.attach_ws_terminate_to_jit(0, "/ws", 'G', upstream.value(), handler, capacity));
     CHECK(config.routes[0].ws_terminate);
     CHECK(config.routes[0].ws_frame_handler == handler);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_json_string_regex_matches_decoded_whole_values) {
+    const char* conditions[] = {"text.matches(re\"topic[.][0-9]+\")",
+                                "!text.matches(re\"topic[.][0-9]+\")",
+                                "!message.fromClient || text.matches(re\"topic[.][0-9]+\")"};
+    const char* values[] = {R"("topic.12")",
+                            R"("topic\u002e12")",
+                            R"("x topic.12")",
+                            R"("topic.12x")",
+                            R"("")",
+                            "null",
+                            "false",
+                            "12"};
+    for (bool selected : {false, true}) {
+        for (u32 c = 0; c < 3; ++c) {
+            std::string source =
+                "upstream ws at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(ws) { "
+                "message in\n"
+                "guard let document = json.parse(message.text) else { message.close(1007) }\n";
+            if (selected)
+                source +=
+                    "guard let field = json.get(document, \"/a~1b/\\0\") else { "
+                    "message.close(1008) }\n";
+            source += selected
+                          ? "guard let text = json.string(field) else { message.close(1003) }\n"
+                          : "guard let text = json.string(document) else { message.close(1003) }\n";
+            source += "guard ";
+            source += conditions[c];
+            source += " else { message.drop() }\nmessage.forward() } }\n";
+            const auto path =
+                write_file((std::filesystem::temp_directory_path() / "rut_ws_json_regex").string(),
+                           "app.rut",
+                           source.c_str());
+            LoadedProgram program;
+            LoadError err;
+            REQUIRE(load_rut_program(path.c_str(), program, err));
+            REQUIRE_EQ(unlink(path.c_str()), 0);
+            const auto handler = program.config.routes[0].ws_frame_handler;
+            REQUIRE(handler);
+            for (u32 i = 0; i < 8; ++i) {
+                const std::string payload =
+                    selected ? std::string("{\"a/b\":{\"\\u0000\":") + values[i] + "}}"
+                             : std::string(values[i]);
+                for (bool client : {false, true}) {
+                    for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                        const bool matches = i < 2;
+                        const bool accepts = c == 0   ? matches
+                                             : c == 1 ? !matches
+                                                      : !client || matches;
+                        const auto expected = i >= 5    ? (selected ? WsFrameAction::ClosePolicy2
+                                                                    : WsFrameAction::ClosePolicy1)
+                                              : accepts ? WsFrameAction::Forward
+                                                        : WsFrameAction::Drop;
+                        CHECK(handler(nullptr,
+                                      op,
+                                      reinterpret_cast<const u8*>(payload.data()),
+                                      payload.size(),
+                                      client) == expected);
+                    }
+                }
+            }
+            const char* malformed = "{";
+            CHECK(
+                handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(malformed), 1, true) ==
+                WsFrameAction::ClosePolicy0);
+            program.destroy();
+        }
+    }
+}
+
+TEST(serve_loader, websocket_json_string_regex_handles_nul_unicode_and_raw_regex_together) {
+    const auto path = write_file("/tmp/rut_ws_json_regex_binary", "app.rut", R"rut(
+upstream ws at "127.0.0.1:9999"
+route GET "/ws" { return websocket(ws) { message in
+ guard let document = json.parse(message.text) else { message.drop() }
+ guard let text = json.string(document) else { message.drop() }
+ guard message.text.matches(re".+") && text.matches(re"a\x00€b") else { message.drop() }
+ message.forward(text)
+} })rut");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    for (const char* payload : {R"("a\u0000\u20acb")", R"("a\u0000€b")"}) {
+        CHECK(handler(nullptr,
+                      WsOpcode::Binary,
+                      reinterpret_cast<const u8*>(payload),
+                      strlen(payload),
+                      false) == WsFrameAction::ForwardText);
+    }
+    for (const char* payload : {R"("a€b")", R"("a\u0000€bc")", R"("a\u0000")"}) {
+        CHECK(handler(nullptr,
+                      WsOpcode::Text,
+                      reinterpret_cast<const u8*>(payload),
+                      strlen(payload),
+                      true) == WsFrameAction::Drop);
+    }
     program.destroy();
 }
 
@@ -5037,7 +5162,10 @@ TEST(serve_loader, websocket_direct_json_scalar_comparisons_preserve_optional_tr
 }
 
 TEST(serve_loader, websocket_direct_scalar_guards_use_nested_values_without_extra_bindings) {
-    const auto path = write_file("/tmp/rut_ws_nested_scalar", "app.rut", R"rut(
+    const auto path =
+        write_file((std::filesystem::temp_directory_path() / "rut_ws_nested_scalar").string(),
+                   "app.rut",
+                   R"rut(
 upstream ws at "127.0.0.1:9999"
 route GET "/ws" { return websocket(ws) { message in
  guard let document = json.parse(message.text) else { message.close(1007) }
@@ -5113,8 +5241,10 @@ TEST(serve_loader, websocket_nested_json_lookup_preserves_relative_pointer_seman
             source +=
                 bind ? "\") else { message.drop() }\n" : "\") != nil else { message.drop() }\n";
             source += "message.forward() } }\n";
-            const auto path =
-                write_file("/tmp/rut_ws_nested_json_lookup", "app.rut", source.c_str());
+            const auto path = write_file(
+                (std::filesystem::temp_directory_path() / "rut_ws_nested_json_lookup").string(),
+                "app.rut",
+                source.c_str());
             LoadedProgram program;
             LoadError err;
             REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5153,7 +5283,10 @@ route GET "/ws" { return websocket(ws) { message in
         source += accessors[i];
         source +=
             "(child) else { message.close(1003) }\nmessage.forward(\"[\" + text + \"]\") } }\n";
-        const auto path = write_file("/tmp/rut_ws_nested_json_rewrite", "app.rut", source.c_str());
+        const auto path = write_file(
+            (std::filesystem::temp_directory_path() / "rut_ws_nested_json_rewrite").string(),
+            "app.rut",
+            source.c_str());
         LoadedProgram program;
         LoadError err;
         REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5952,6 +6085,1302 @@ route GET "/ws" { return websocket(backend) { message in
     program.destroy();
 }
 
+TEST(serve_loader, websocket_typed_message_helpers_share_scalar_predicates_with_http) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func accepted(_ text: str) -> bool => text.matches(re"o.k")
+func allowed(_ msg: WebSocketMessage) -> bool =>
+    !msg.fromClient || (true == msg.isText && msg.len <= 3 && accepted(msg.text))
+route GET "/http" { guard accepted(req.path) else { return 403 } return 200 }
+route GET "/ws" { return websocket(backend) { message in
+    guard allowed(message) == true else { message.drop() }
+    guard false == (message.isText == message.isBinary) else { message.drop() }
+    message.forward()
+} }
+)rut";
+    auto path = write_file("/tmp/rut_ws_typed_helpers", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 2u);
+    const auto handler = program.config.routes[1].ws_frame_handler;
+    REQUIRE(handler);
+    const Str payloads[] = {{"o\0k", 3}, {"oak", 3}, {"no", 2}, {"", 0}, {"oaks", 4}};
+    const bool flags[] = {false, true};
+    const WsOpcode opcodes[] = {WsOpcode::Text, WsOpcode::Binary};
+    for (bool client : flags) {
+        for (WsOpcode op : opcodes) {
+            for (u32 i = 0; i < 5; ++i) {
+                const auto payload = payloads[i];
+                const bool pass = !client || (op == WsOpcode::Text && i < 2);
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(payload.ptr),
+                              payload.len,
+                              client) == (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+    }
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_typed_boolean_comparisons_and_constants) {
+    const char* conditions[] = {"message.isText == true",
+                                "true == message.isText",
+                                "false == message.isBinary",
+                                "(message.isText == true) != false",
+                                "message.isText == message.fromClient",
+                                "true",
+                                "false",
+                                "message.len > -1",
+                                "message.len < -1",
+                                "(message.fromClient && message.isText) == "
+                                "(message.isBinary || message.fromClient)"};
+    const bool flags[] = {false, true};
+    const WsOpcode opcodes[] = {WsOpcode::Text, WsOpcode::Binary};
+    for (u32 i = 0; i < 10; ++i) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+            "websocket(backend) { message in\nguard ";
+        source += conditions[i];
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_typed_bools", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : flags) {
+            for (WsOpcode op : opcodes) {
+                const bool text = op == WsOpcode::Text;
+                const bool pass = i < 4    ? text
+                                  : i == 4 ? text == client
+                                  : i == 9 ? (client && text) == (!text || client)
+                                           : i == 5 || i == 7;
+                CHECK(handler(nullptr, op, nullptr, 0, client) ==
+                      (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+        program.destroy();
+    }
+}
+
+TEST(serve_loader, websocket_domain_types_share_predicates_with_dynamic_http_values) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func identity<T>(_ value: T) -> T => value
+func isText(_ kind: WebSocketMessageKind) -> bool => same(kind, WebSocketMessageKind.text)
+func fromClient(_ direction: WebSocketDirection) -> bool =>
+    same(direction, WebSocketDirection.clientToUpstream)
+func classify(_ path: str) -> WebSocketMessageKind {
+    if path == "/text" { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+route GET "/http" {
+    let kind = classify(req.path)
+    guard isText(kind) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(backend) { message in
+    guard !fromClient(message.direction) || isText(identity(message).kind) else { message.drop() }
+    guard same(message.kind, message.kind) else { message.close() }
+    message.forward()
+} })rut";
+    auto path = write_file("/tmp/rut_ws_domain_types", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 2u);
+    const auto http = program.config.routes[0].fn;
+    const auto message = program.config.routes[1].ws_frame_handler;
+    REQUIRE(http);
+    REQUIRE(message);
+    const char* requests[] = {"GET /text HTTP/1.1\r\nHost: test\r\n\r\n",
+                              "GET /binary HTTP/1.1\r\nHost: test\r\n\r\n"};
+    for (u32 i = 0; i < 2; ++i) {
+        const auto result =
+            jit::HandlerResult::unpack(http(nullptr,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(requests[i]),
+                                            static_cast<u32>(strlen(requests[i])),
+                                            nullptr));
+        CHECK_EQ(result.status_code, i == 0 ? 200u : 403u);
+    }
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            CHECK(message(nullptr, op, reinterpret_cast<const u8*>("\0"), 1, client) ==
+                  (!client || op == WsOpcode::Text ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+    }
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_domain_types_compare_cases_in_both_operand_orders) {
+    const char* conditions[] = {"message.kind == WebSocketMessageKind.text",
+                                "WebSocketMessageKind.binary != message.kind",
+                                "message.direction == WebSocketDirection.clientToUpstream",
+                                "WebSocketDirection.upstreamToClient == message.direction",
+                                "message.kind == message.kind",
+                                "message.direction != message.direction",
+                                "WebSocketMessageKind.text != WebSocketMessageKind.binary",
+                                "WebSocketDirection.clientToUpstream == "
+                                "WebSocketDirection.upstreamToClient"};
+    for (u32 i = 0; i < 8; ++i) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return "
+            "websocket(backend) { message in guard ";
+        source += conditions[i];
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_domain_cases", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                const bool pass = i < 2    ? op == WsOpcode::Text
+                                  : i == 2 ? client
+                                  : i == 3 ? !client
+                                           : i == 4 || i == 6;
+                CHECK(handler(nullptr, op, nullptr, 0, client) ==
+                      (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+            }
+        }
+        program.destroy();
+    }
+}
+
+TEST(serve_loader, websocket_branch_bindings_preserve_optional_presence_and_continuations) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+route GET "/guard" { return websocket(backend) { msg in
+    if msg.fromClient {
+        guard let document = json.parse(msg.text) else { msg.close(1007) }
+        guard let field = json.get(document, "/name") else { msg.close(1008) }
+        guard let name = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + name + ">")
+    } else { msg.forward() }
+} }
+route GET "/iflet" { return websocket(backend) { msg in
+    if let document = json.parse(msg.text) {
+        if let field = json.get(document, "/flag") {
+            if let value = json.bool(field) {
+                guard value == false else { msg.forward("true") }
+                msg.forward("false")
+            } else { msg.forward("wrong") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+} }
+route GET "/continuation" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if let document = json.parse(msg.text) { msg.forward("json") }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/fallthrough" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isText { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/root-iflet" { return websocket(backend) { msg in
+    if let document = json.parse(msg.text) {
+        if let text = json.string(document) { msg.forward(text) }
+        else { msg.drop() }
+    }
+    msg.forward(b"\xff")
+} }
+)rut";
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_branch_bindings").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove_all(dir);
+    REQUIRE_EQ(program.config.route_count, 5u);
+    const auto guarded = program.config.routes[0].ws_frame_handler;
+    const auto optional = program.config.routes[1].ws_frame_handler;
+    const auto continuation = program.config.routes[2].ws_frame_handler;
+    const auto fallthrough = program.config.routes[3].ws_frame_handler;
+    const auto root = program.config.routes[4].ws_frame_handler;
+    REQUIRE(guarded);
+    REQUIRE(optional);
+    REQUIRE(continuation);
+    REQUIRE(fallthrough);
+    REQUIRE(root);
+    for (bool client : {false, true}) {
+        const char* documents[] = {
+            "{\"name\":\"ok\"}", "{\"name\":\"\"}", "{}", "{\"name\":false}", "broken"};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(guarded(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(documents[i]),
+                          static_cast<u32>(strlen(documents[i])),
+                          client) == (!client  ? WsFrameAction::Forward
+                                      : i < 2  ? WsFrameAction::ForwardTextPolicy0
+                                      : i == 2 ? WsFrameAction::ClosePolicy1
+                                      : i == 3 ? WsFrameAction::ClosePolicy2
+                                               : WsFrameAction::ClosePolicy0));
+        const char* flags[] = {
+            "{\"flag\":false}", "{\"flag\":true}", "{\"flag\":null}", "{}", "broken"};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(optional(nullptr,
+                           WsOpcode::Text,
+                           reinterpret_cast<const u8*>(flags[i]),
+                           static_cast<u32>(strlen(flags[i])),
+                           client) == (i == 0   ? WsFrameAction::ForwardTextPolicy1
+                                       : i == 1 ? WsFrameAction::ForwardTextPolicy0
+                                       : i == 2 ? WsFrameAction::ForwardTextPolicy2
+                                       : i == 3 ? WsFrameAction::ForwardTextPolicy3
+                                                : WsFrameAction::Close));
+        const u8 bad[] = {0xff, 0};
+        const char* json = "null";
+        const char* broken = "broken";
+        CHECK(continuation(nullptr, WsOpcode::Binary, bad, 2, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::ForwardText));
+        CHECK(continuation(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(json), 4, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        CHECK(
+            continuation(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, client) ==
+            (client ? WsFrameAction::Drop : WsFrameAction::ForwardText));
+        CHECK(fallthrough(nullptr, WsOpcode::Binary, bad, 2, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        CHECK(
+            fallthrough(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, client) ==
+            (client ? WsFrameAction::Drop : WsFrameAction::ForwardText));
+        const char* strings[] = {"\"\"", "null", "broken"};
+        for (u32 i = 0; i < 3; ++i)
+            CHECK(root(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(strings[i]),
+                       static_cast<u32>(strlen(strings[i])),
+                       client) == (i == 0   ? WsFrameAction::ForwardTextPolicy0
+                                   : i == 1 ? WsFrameAction::Drop
+                                            : WsFrameAction::ForwardText));
+    }
+    REQUIRE_EQ(program.config.routes[1].ws_forward_text_count, 4u);
+    CHECK_EQ(program.config.routes[1].ws_close_code, 1007u);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_optional_values_import_any_or_and_literal_pointer_proofs) {
+    struct Case {
+        const char* expression;
+        const char* comparison;
+        const char* present;
+        const char* different;
+        const char* absent;
+    };
+    const Case cases[] = {
+        {"json.bool(root).or(false)", "value == false", "false", "true", "null"},
+        {"any(json.bool(root), false)", "value == false", "false", "true", "null"},
+        {"json.int(root).or(0)", "value == 0", "0", "1", "null"},
+        {"json.count(root).or(0)", "value == 0", "[]", "[1]", "null"},
+        {"json.string(root).or(\"\")", "value == \"\"", "\"\"", "\"x\"", "null"},
+        {"json.numberText(root).or(\"0\")", "value == \"0\"", "0", "1", "null"},
+        {"any(json.string(root), input)", "value == \"null\"", "\"null\"", "false", "null"}};
+    test::WsCallbackProbe probe;
+    REQUIRE(probe.init());
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_optional_defaults").string();
+    for (const auto& test : cases) {
+        std::string helper = "func read(_ input: str) {\n";
+        helper += "guard let root = json.parse(input) else { nil }\n";
+        helper += test.expression;
+        helper += "\n}\n";
+        auto helper_path = write_file(dir, "values.rut", helper.c_str());
+        std::string source = R"rut(import "values"
+upstream ws at "127.0.0.1:9999"
+route GET "/ws" { return websocket(ws) { msg in
+    guard let value = values.read(msg.text) else { msg.drop() }
+    guard )rut";
+        source += test.comparison;
+        source += R"rut( else { msg.drop() }
+    msg.forward()
+} }
+route POST "/http" {
+    guard let value = values.read(req.body) else { return 400 }
+    guard )rut";
+        source += test.comparison;
+        source += " else { return 403 }\nreturn 200\n}\n";
+        auto path = write_file(dir, "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        std::filesystem::remove(path);
+        std::filesystem::remove(helper_path);
+        REQUIRE_EQ(program.config.route_count, 2u);
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                const auto run = [&](const char* payload) {
+                    return handler(probe.conn.get(),
+                                   op,
+                                   reinterpret_cast<const u8*>(payload),
+                                   static_cast<u32>(strlen(payload)),
+                                   client);
+                };
+                CHECK(run(test.present) == WsFrameAction::Forward);
+                CHECK(run(test.different) == WsFrameAction::Drop);
+                CHECK(run(test.absent) == WsFrameAction::Forward);
+                CHECK(run("broken") == WsFrameAction::Drop);
+            }
+        }
+    }
+    const char* source = R"rut(upstream ws at "127.0.0.1:9999"
+func pointer(_ msg: WebSocketMessage) -> str {
+    if msg.fromClient { "/a~1b" } else { nil }
+}
+func read(_ msg: WebSocketMessage) -> str {
+    guard let path = pointer(msg) else { nil }
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = json.get(root, path) else { nil }
+    json.string(field)
+}
+route GET "/ws" { return websocket(ws) { msg in
+    guard let text = read(msg) else { msg.drop() }
+    msg.forward(text)
+} })rut";
+    auto path = write_file(dir, "pointer.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    const auto& route = program.config.routes[0];
+    REQUIRE(route.ws_frame_handler);
+    CHECK(route.ws_forward_text.source == WsTextSource::Dynamic);
+    for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+        for (bool client : {false, true}) {
+            const char* payload = "{\"a/b\":\"ok\"}";
+            probe.expect(_tc,
+                         route.ws_frame_handler,
+                         op,
+                         Str{payload, static_cast<u32>(strlen(payload))},
+                         client,
+                         client ? WsFrameAction::ForwardText : WsFrameAction::Drop,
+                         lit_str("ok"));
+        }
+    }
+}
+
+TEST(serve_loader, websocket_scalar_helpers_survive_source_removal) {
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_scalar_helpers").string();
+    auto path = write_file(dir, "app.rut", test::ws_scalar_helpers::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    test::ws_scalar_helpers::check(_tc, program.config);
+}
+
+TEST(serve_loader, websocket_scalar_helpers_import_decoded_values_into_shared_http_predicates) {
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_scalar_import").string();
+    auto helper = write_file(dir, "scalar.rut", R"rut(
+func allowed(_ value: str) -> bool => value.matches(re"^ok$")
+)rut");
+    auto path = write_file(dir, "app.rut", R"rut(import "scalar"
+upstream ws at "127.0.0.1:9999"
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let field = json.get(root, "/a~1b/~0") else { msg.drop() }
+    guard let text = json.string(field) else { msg.drop() }
+    guard scalar.allowed(text) else { msg.drop() }
+    msg.forward()
+} }
+route POST "/http" { guard scalar.allowed(req.body) else { return 403 } return 200 }
+)rut");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    std::filesystem::remove(helper);
+    REQUIRE_EQ(program.config.route_count, 2u);
+    const auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const char* payloads[] = {
+        "{\"a/b\":{\"~\":\"o\\u006b\"}}", "{\"a/b\":{\"~\":\"no\"}}", "{}", "broken"};
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (u32 i = 0; i < 4; ++i)
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(payloads[i]),
+                              static_cast<u32>(strlen(payloads[i])),
+                              client) == (i == 0 ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+    }
+}
+
+TEST(serve_loader, websocket_bool_select_survives_source_removal) {
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_bool_select").string();
+    auto path = write_file(dir, "app.rut", test::ws_bool_select::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    test::ws_bool_select::check(_tc, program.config);
+}
+
+TEST(serve_loader, websocket_borrowed_binary_survives_source_removal) {
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_borrowed_binary").string();
+    auto path = write_file(dir, "app.rut", test::ws_borrowed_binary::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    test::ws_borrowed_binary::check(_tc, program.config);
+}
+
+TEST(serve_loader, websocket_optional_values_survive_source_removal) {
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_optional_values").string();
+    auto path = write_file(dir, "app.rut", test::ws_optional_values::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    test::ws_optional_values::check(_tc, program.config);
+}
+
+TEST(serve_loader, websocket_value_choices_keep_selected_paths_defaults_and_joins) {
+    const char* source = R"rut(upstream ws at "127.0.0.1:9999"
+func pick(_ msg: WebSocketMessage, _ root: Json) -> Json {
+    if msg.fromClient { json.get(root, "/a") } else { json.get(root, "/b") }
+}
+func readChoice(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = pick(msg, root) else { nil }
+    json.string(field)
+}
+func fallback(_ root: Json) -> Json {
+    if let field = json.get(root, "/a") { field } else { json.get(root, "/b") }
+}
+func readFallback(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = fallback(root) else { nil }
+    json.string(field)
+}
+route GET "/guard" { return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.drop() }
+    guard text.hasPrefix("ok") else { msg.close(1008) }
+    msg.forward("<" + text + ">")
+} }
+route GET "/if" { return websocket(ws) { msg in
+    if let text = readChoice(msg) { msg.forward(text) }
+    else { msg.forward("absent") }
+} }
+route GET "/early" { return websocket(ws) { msg in
+    if msg.fromClient {
+        if let text = readFallback(msg) { msg.forward(text) }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\xff")
+    } else { msg.forward("server") }
+} }
+route GET "/fallback" { return websocket(ws) { msg in
+    guard let text = readFallback(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/bare" { return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.close() }
+    msg.close(1008, "policy")
+} }
+func textOrNumber(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    if let text = json.string(root) { text } else { json.numberText(root) }
+}
+route GET "/scalar" { return websocket(ws) { msg in
+    guard let text = textOrNumber(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+)rut";
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_value_choices").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    test::ws_helper_observables::choices(_tc, program.config);
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, websocket_helper_bindings_keep_scopes_presence_and_distinct_paths) {
+    const char* source = R"rut(upstream ws at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func readName(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = json.get(identity(root), "/name") else { nil }
+    guard let value = json.string(field) else { nil }
+    value
+}
+func readFlag(_ msg: WebSocketMessage) -> bool {
+    if let root = json.parse(msg.text) {
+        if let field = json.get(root, "/flag") {
+            if let value = json.bool(field) { value } else { nil }
+        } else { nil }
+    } else { nil }
+}
+func readRoot(_ msg: WebSocketMessage) -> Json {
+    guard let root = json.parse(msg.text) else { nil }
+    root
+}
+func readNested(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let child = json.get(root, "/a~1b") else { nil }
+    guard let field = json.get(child, "/~0") else { nil }
+    if let value = json.string(field) { value } else { nil }
+}
+func readSecond(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let first = json.get(root, "/a") else { nil }
+    guard let second = json.get(root, "/b") else { nil }
+    json.string(second)
+}
+route GET "/name" { return websocket(ws) { msg in
+    if let text = readName(msg) { msg.forward("<" + text + ">") }
+    else { msg.forward("absent") }
+} }
+route GET "/flag" { return websocket(ws) { msg in
+    if let value = readFlag(msg) {
+        if value == false { msg.forward("false") } else { msg.forward("true") }
+    } else { msg.forward("absent") }
+} }
+route GET "/root" { return websocket(ws) { msg in
+    guard let root = readRoot(msg) else { msg.close(1007) }
+    guard let text = json.string(root) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/nested" { return websocket(ws) { msg in
+    guard let text = readNested(msg) else { msg.drop() }
+    msg.forward(text)
+} }
+route GET "/different" { return websocket(ws) { msg in
+    if let text = readSecond(msg) { msg.forward(text) }
+    else { msg.forward("absent") }
+} }
+)rut";
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_helper_bindings").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    test::ws_helper_observables::bindings(_tc, program.config);
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, websocket_optional_conditions_select_reached_projection_only) {
+    const char* source = R"rut(upstream ws at "127.0.0.1:9999"
+func readClient(_ msg: WebSocketMessage) -> Json {
+    guard msg.fromClient else { nil }
+    if msg.isText { json.parse(msg.text) } else { nil }
+}
+func readServer(_ msg: WebSocketMessage) -> Json {
+    if msg.fromClient { nil } else { json.parse(msg.text) }
+}
+func selectedString(_ msg: WebSocketMessage, _ root: Json) -> str {
+    if msg.fromClient { json.string(root) } else { nil }
+}
+route GET "/client" { return websocket(ws) { msg in
+    if let root = readClient(msg) {
+        guard let field = json.get(root, "/name") else { msg.close(1008) }
+        guard let text = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + text + ">")
+    } else { msg.forward() }
+} }
+route GET "/server" { return websocket(ws) { msg in
+    if let root = readServer(msg) { msg.forward("json") }
+    else { msg.forward("absent") }
+} }
+route GET "/scalar" { return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    if let value = selectedString(msg, root) { msg.forward(value) }
+    else { msg.forward("absent") }
+} }
+)rut";
+    const auto dir =
+        (std::filesystem::temp_directory_path() / "rut_ws_optional_conditions").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove(path);
+    REQUIRE_EQ(program.config.route_count, 3u);
+    const auto client_doc = program.config.routes[0].ws_frame_handler;
+    const auto server_doc = program.config.routes[1].ws_frame_handler;
+    const auto scalar = program.config.routes[2].ws_frame_handler;
+    REQUIRE(client_doc);
+    REQUIRE(server_doc);
+    REQUIRE(scalar);
+    const char* names[] = {
+        "{\"name\":\"a\\u0000b\"}", "{\"name\":\"\"}", "{}", "{\"name\":false}", "broken"};
+    for (bool client : {false, true}) {
+        for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (u32 j = 0; j < 5; ++j) {
+                const auto* data = reinterpret_cast<const u8*>(names[j]);
+                const u32 size = static_cast<u32>(strlen(names[j]));
+                CHECK(client_doc(nullptr, op, data, size, client) ==
+                      (!client || op == WsOpcode::Binary || j == 4 ? WsFrameAction::Forward
+                       : j < 2  ? WsFrameAction::ForwardTextPolicy0
+                       : j == 2 ? WsFrameAction::ClosePolicy0
+                                : WsFrameAction::ClosePolicy1));
+                CHECK(server_doc(nullptr, op, data, size, client) ==
+                      (!client && j != 4 ? WsFrameAction::ForwardTextPolicy0
+                                         : WsFrameAction::ForwardText));
+            }
+            const char* values[] = {"\"\"", "\"a\\u0000b\"", "null", "false", "broken"};
+            for (u32 j = 0; j < 5; ++j)
+                CHECK(scalar(nullptr,
+                             op,
+                             reinterpret_cast<const u8*>(values[j]),
+                             static_cast<u32>(strlen(values[j])),
+                             client) == (j == 4            ? WsFrameAction::ClosePolicy0
+                                         : client && j < 2 ? WsFrameAction::ForwardTextPolicy0
+                                                           : WsFrameAction::ForwardText));
+        }
+    }
+    CHECK(program.config.routes[0].ws_forward_texts[0].source_path.eq(lit_str("/name")));
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, websocket_json_helpers_imported_projections_keep_presence_and_paths) {
+    struct Case {
+        const char* operation;
+        const char* type;
+        const char* value;
+        bool present;
+    };
+    const Case cases[] = {{"string", "str", "\"\"", true},
+                          {"string", "str", "null", false},
+                          {"bool", "bool", "false", true},
+                          {"bool", "bool", "0", false},
+                          {"int", "", "0", true},
+                          {"int", "", "1.5", false},
+                          {"numberText", "str", "0", true},
+                          {"numberText", "str", "false", false},
+                          {"stringify", "str", "null", true},
+                          {"kind", "str", "null", true},
+                          {"count", "i32", "[]", true},
+                          {"count", "i32", "0", false}};
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_json_helpers").string();
+    for (const auto& test : cases) {
+        std::string helpers = R"rut(func identity<T>(_ value: T) -> T => value
+func document(_ msg: WebSocketMessage) -> Json => json.parse(identity(msg).text)
+func field(_ root: Json, _ pointer: str) -> Json => json.get(identity(root), pointer)
+func extract(_ value: Json))rut";
+        if (test.type[0] != '\0') {
+            helpers += " -> ";
+            helpers += test.type;
+        }
+        helpers += " => json.";
+        helpers += test.operation;
+        helpers += "(value)\n";
+        write_file(dir, "policy.rut", helpers.c_str());
+        const char* source = R"rut(import "policy.rut"
+upstream ws at "127.0.0.1:9999"
+route GET "/ws" { return websocket(ws) { msg in
+    guard let root = policy.document(msg) else { msg.close(1007) }
+    guard let child = policy.field(root, "/a~1b") else { msg.drop() }
+    guard let nested = policy.field(child, "/~0") else { msg.drop() }
+    if let value = policy.extract(policy.identity(nested)) { msg.forward("present") }
+    else { msg.forward("absent") }
+} })rut";
+        auto path = write_file(dir, "app.rut", source);
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        // Handler code and retained paths outlive both source files.
+        std::filesystem::remove(path);
+        std::filesystem::remove(dir + "/policy.rut");
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        std::string payload = "{\"a/b\":{\"~\":";
+        payload += test.value;
+        payload += "}}";
+        for (bool client : {false, true}) {
+            for (WsOpcode op : {WsOpcode::Text, WsOpcode::Binary}) {
+                CHECK(handler(nullptr,
+                              op,
+                              reinterpret_cast<const u8*>(payload.data()),
+                              static_cast<u32>(payload.size()),
+                              client) == (test.present ? WsFrameAction::ForwardTextPolicy0
+                                                       : WsFrameAction::ForwardText));
+                const char* invalid[] = {"broken", "{}", "{\"a/b\":{}}"};
+                for (u32 j = 0; j < 3; ++j)
+                    CHECK(handler(nullptr,
+                                  op,
+                                  reinterpret_cast<const u8*>(invalid[j]),
+                                  static_cast<u32>(strlen(invalid[j])),
+                                  client) ==
+                          (j == 0 ? WsFrameAction::ClosePolicy0 : WsFrameAction::Drop));
+            }
+        }
+        program.destroy();
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, websocket_optional_conditions_keep_false_zero_empty_and_null_presence) {
+    struct Case {
+        const char* operation;
+        const char* value;
+        bool present;
+    };
+    const Case cases[] = {{"string", "\"\"", true},
+                          {"string", "null", false},
+                          {"bool", "false", true},
+                          {"bool", "0", false},
+                          {"int", "0", true},
+                          {"int", "1.5", false},
+                          {"numberText", "0", true},
+                          {"numberText", "false", false},
+                          {"stringify", "null", true},
+                          {"kind", "null", true},
+                          {"count", "[]", true},
+                          {"count", "0", false},
+                          {"get", "{\"v\":null}", true},
+                          {"get", "{}", false},
+                          {"parse", "null", true},
+                          {"parse", "broken", false}};
+    const auto dir =
+        (std::filesystem::temp_directory_path() / "rut_ws_optional_extractors").string();
+    for (const auto& test : cases) {
+        for (bool guard_binding : {false, true}) {
+            const bool parse = strcmp(test.operation, "parse") == 0;
+            std::string source =
+                "upstream ws at \"127.0.0.1:9999\"\nfunc conditional(_ msg: WebSocketMessage";
+            if (!parse) source += ", _ document: Json";
+            source += ") { if msg.fromClient { json.";
+            source += test.operation;
+            source += parse                                ? "(msg.text)"
+                      : strcmp(test.operation, "get") == 0 ? "(document, \"/v\")"
+                                                           : "(document)";
+            source += " } else { nil } }\nroute GET \"/ws\" { return websocket(ws) { msg in\n";
+            if (!parse)
+                source += "guard let document = json.parse(msg.text) else { msg.close(1007) }\n";
+            source += guard_binding ? "guard let value = " : "if let value = ";
+            source += parse ? "conditional(msg)" : "conditional(msg, document)";
+            source += guard_binding
+                          ? " else { msg.forward(\"missing\") }\nmsg.forward(\"present\") } }\n"
+                          : " { msg.forward(\"present\") } else { msg.forward(\"missing\") } } }\n";
+            auto path = write_file(dir, "app.rut", source.c_str());
+            LoadedProgram program;
+            LoadError err;
+            REQUIRE(load_rut_program(path.c_str(), program, err));
+            const auto handler = program.config.routes[0].ws_frame_handler;
+            REQUIRE(handler);
+            for (bool client : {false, true})
+                CHECK(handler(nullptr,
+                              WsOpcode::Text,
+                              reinterpret_cast<const u8*>(test.value),
+                              static_cast<u32>(strlen(test.value)),
+                              client) == ((client && test.present) != guard_binding
+                                              ? WsFrameAction::ForwardTextPolicy0
+                                              : WsFrameAction::ForwardText));
+            program.destroy();
+        }
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, websocket_helper_bindings_imported_extractors_preserve_optional_values) {
+    struct Case {
+        const char* operation;
+        const char* value;
+        bool present;
+    };
+    const Case cases[] = {{"string", "\"\"", true},
+                          {"string", "null", false},
+                          {"bool", "false", true},
+                          {"bool", "0", false},
+                          {"int", "0", true},
+                          {"int", "1.5", false},
+                          {"numberText", "0", true},
+                          {"numberText", "false", false},
+                          {"stringify", "null", true},
+                          {"kind", "null", true},
+                          {"count", "[]", true},
+                          {"count", "0", false},
+                          {"get", "{\"v\":null}", true},
+                          {"get", "{}", false},
+                          {"parse", "null", true},
+                          {"parse", "broken", false}};
+    test::WsCallbackProbe probe;
+    REQUIRE(probe.init());
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_helper_extractors").string();
+    for (const auto& test : cases) {
+        const bool parse = strcmp(test.operation, "parse") == 0;
+        std::string helpers = "func extract(_ msg: WebSocketMessage) {\n";
+        helpers += "guard let document = json.parse(msg.text) else { nil }\n";
+        if (!parse) {
+            helpers += "guard let selected = json.";
+            helpers += test.operation;
+            helpers += strcmp(test.operation, "get") == 0 ? "(document, \"/v\")" : "(document)";
+            helpers += " else { nil }\nselected\n";
+        } else {
+            helpers += "document\n";
+        }
+        helpers += "}\n";
+        write_file(dir, "policy.rut", helpers.c_str());
+        std::string source =
+            "import \"policy.rut\"\nupstream ws at \"127.0.0.1:9999\"\n"
+            "route GET \"/ws\" { return websocket(ws) { msg in\n"
+            "if let value = policy.extract(msg) { msg.forward(\"present\") } "
+            "else { msg.forward(\"missing\") } } }\n";
+        auto path = write_file(dir, "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        std::filesystem::remove(path);
+        std::filesystem::remove(dir + "/policy.rut");
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : {false, true})
+            probe.expect(
+                _tc,
+                handler,
+                WsOpcode::Text,
+                Str{test.value, static_cast<u32>(strlen(test.value))},
+                client,
+                test.present ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText,
+                test.present ? lit_str("present") : lit_str("missing"));
+        program.destroy();
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, websocket_branch_bindings_optional_extractors_test_presence_not_truthiness) {
+    struct Case {
+        const char* operation;
+        const char* value;
+        bool present;
+    };
+    const Case cases[] = {{"string", "\"\"", true},
+                          {"string", "null", false},
+                          {"bool", "false", true},
+                          {"bool", "0", false},
+                          {"int", "0", true},
+                          {"int", "1.5", false},
+                          {"numberText", "0", true},
+                          {"numberText", "false", false},
+                          {"stringify", "null", true},
+                          {"kind", "null", true},
+                          {"count", "[]", true},
+                          {"count", "0", false},
+                          {"get", "{\"v\":null}", true},
+                          {"get", "{}", false},
+                          {"parse", "null", true},
+                          {"parse", "broken", false}};
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_if_let_extractors").string();
+    for (const auto& test : cases) {
+        const bool parse = strcmp(test.operation, "parse") == 0;
+        std::string source =
+            "upstream ws at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(ws) { msg "
+            "in\n";
+        if (!parse)
+            source += "guard let document = json.parse(msg.text) else { msg.close(1007) }\n";
+        source += "if let value = json.";
+        source += test.operation;
+        source += parse                                ? "(msg.text)"
+                  : strcmp(test.operation, "get") == 0 ? "(document, \"/v\")"
+                                                       : "(document)";
+        source += " { msg.forward(\"present\") } else { msg.forward(\"missing\") } } }\n";
+        auto path = write_file(dir, "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (bool client : {false, true})
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(test.value),
+                          static_cast<u32>(strlen(test.value)),
+                          client) ==
+                  (test.present ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        program.destroy();
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, websocket_nested_if_routes_each_arm_and_skips_unreached_json) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+route GET "/nested" { return websocket(backend) { packet in
+    let msg = identity(packet)
+    if msg.fromClient {
+        let payload: Bytes = msg.payload
+        if payload.isEmpty { msg.drop() }
+        else {
+            if msg.kind == WebSocketMessageKind.binary { msg.forward(b"\xff\x00") }
+            else { msg.forward("<" + msg.text + ">") }
+        }
+    } else {
+        let prefix = "["
+        if msg.payload.isEmpty { msg.close() }
+        else { msg.forward(prefix + msg.text + "]") }
+    }
+} }
+route GET "/early" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.forward(b"\x00\xff") }
+        else { msg.drop() }
+    }
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let name = json.string(document) else { msg.close(1003) }
+    msg.forward(name)
+} }
+route GET "/json" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    if msg.fromClient {
+        if json.bool(document) == false { msg.forward("false") }
+        else if json.bool(document) == true { msg.forward("true") }
+        else { msg.drop() }
+    } else { msg.close(1008, "policy") }
+} }
+route GET "/close" { return websocket(backend) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.close() }
+        else { msg.close(1003, "text") }
+    } else { msg.close(1008, "policy") }
+} }
+)rut";
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_nested_if").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove_all(dir);
+    REQUIRE_EQ(program.config.route_count, 4u);
+    const auto nested = program.config.routes[0].ws_frame_handler;
+    const auto early = program.config.routes[1].ws_frame_handler;
+    const auto json = program.config.routes[2].ws_frame_handler;
+    const auto close = program.config.routes[3].ws_frame_handler;
+    REQUIRE(nested);
+    REQUIRE(early);
+    REQUIRE(json);
+    REQUIRE(close);
+    const u8 bad[] = {0xff, 0};
+    const char* text = "hello";
+    for (bool client : {false, true}) {
+        CHECK(nested(nullptr, WsOpcode::Binary, bad, 2, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy0 : WsFrameAction::ForwardText));
+        CHECK(nested(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(text), 5, client) ==
+              (client ? WsFrameAction::ForwardTextPolicy1 : WsFrameAction::ForwardText));
+        CHECK(nested(nullptr, WsOpcode::Binary, nullptr, 0, client) ==
+              (client ? WsFrameAction::Drop : WsFrameAction::ClosePolicy0));
+        CHECK(close(nullptr, WsOpcode::Binary, nullptr, 0, client) ==
+              (client ? WsFrameAction::ClosePolicy0 : WsFrameAction::Close));
+        CHECK(close(nullptr, WsOpcode::Text, nullptr, 0, client) ==
+              (client ? WsFrameAction::ClosePolicy1 : WsFrameAction::Close));
+        const char* values[] = {"false", "true", "null", "{}", "broken"};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(json(nullptr,
+                       WsOpcode::Text,
+                       reinterpret_cast<const u8*>(values[i]),
+                       static_cast<u32>(strlen(values[i])),
+                       client) == (i == 4    ? WsFrameAction::ClosePolicy0
+                                   : !client ? WsFrameAction::Close
+                                   : i == 0  ? WsFrameAction::ForwardTextPolicy0
+                                   : i == 1  ? WsFrameAction::ForwardTextPolicy1
+                                             : WsFrameAction::Drop));
+    }
+    const char* allowed = "\"allow\"";
+    const char* broken = "broken";
+    CHECK(early(nullptr, WsOpcode::Binary, bad, 2, true) == WsFrameAction::ForwardTextPolicy0);
+    CHECK(early(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, true) ==
+          WsFrameAction::Drop);
+    CHECK(early(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(allowed), 7, false) ==
+          WsFrameAction::ForwardText);
+    CHECK(early(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(broken), 6, false) ==
+          WsFrameAction::ClosePolicy0);
+    REQUIRE_EQ(program.config.routes[3].ws_close_policy_count, 2u);
+    CHECK_EQ(program.config.routes[3].ws_close_policies[0].code, 1000u);
+    CHECK_EQ(program.config.routes[3].ws_close_policies[1].code, 1003u);
+    CHECK_EQ(program.config.routes[3].ws_close_code, 1008u);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_if_branches_preserve_order_scope_and_optional_equality) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func allowed(_ bytes: Bytes) -> bool => bytes.count == 2 && bytes == b"\x00\xff"
+route GET "/branches" { return websocket(backend) { packet in
+    let msg = identity(packet)
+    if msg.fromClient && !allowed(msg.payload) { msg.drop() }
+    if msg.kind == WebSocketMessageKind.text {
+        let copy = msg
+        let text = copy.text
+        copy.forward("[" + text + "]")
+    } else if msg.payload == b"\x00\xff" {
+        let copy = msg
+        copy.forward(b"\xff\x00")
+    } else {
+        let copy = msg
+        copy.close(1008, "policy")
+    }
+} }
+route GET "/json" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let field = json.get(document, "/name") else { msg.close(1008) }
+    guard let name = json.string(field) else { msg.close(1003) }
+    if msg.fromClient && name == "deny" { msg.drop() }
+    else {
+        let prefix = "<"
+        msg.forward(prefix + name + ">")
+    }
+} }
+route GET "/close" { return websocket(backend) { msg in
+    if msg.fromClient { msg.close() }
+    else { msg.close(1008, "policy") }
+} }
+route GET "/optional" { return websocket(backend) { msg in
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    if json.bool(document) == false { msg.forward("false") }
+    else if json.bool(document) == true { msg.forward("true") }
+    else if json.bool(document) == nil { msg.forward("missing") }
+    else { msg.drop() }
+} }
+)rut";
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_if_branches").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    std::filesystem::remove_all(dir);
+    REQUIRE_EQ(program.config.route_count, 4u);
+    const auto branches = program.config.routes[0].ws_frame_handler;
+    const auto json = program.config.routes[1].ws_frame_handler;
+    const auto close = program.config.routes[2].ws_frame_handler;
+    const auto optional = program.config.routes[3].ws_frame_handler;
+    REQUIRE(branches);
+    REQUIRE(json);
+    REQUIRE(close);
+    REQUIRE(optional);
+    REQUIRE_EQ(program.config.routes[0].ws_forward_text_count, 2u);
+    const Str payloads[] = {{"\0\xff", 2}, {"\xff\0", 2}, {"", 0}, {"ok", 2}};
+    for (bool client : {false, true}) {
+        for (u32 i = 0; i < 4; ++i) {
+            const auto action = branches(nullptr,
+                                         WsOpcode::Binary,
+                                         reinterpret_cast<const u8*>(payloads[i].ptr),
+                                         payloads[i].len,
+                                         client);
+            CHECK(action == (i == 0   ? WsFrameAction::ForwardTextPolicy1
+                             : client ? WsFrameAction::Drop
+                                      : WsFrameAction::Close));
+        }
+        const char* text = "hello";
+        CHECK(branches(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(text), 5, client) ==
+              (client ? WsFrameAction::Drop : WsFrameAction::ForwardTextPolicy0));
+        const char* documents[] = {
+            "{\"name\":\"ok\"}", "{\"name\":\"deny\"}", "{}", "{\"name\":false}", "broken"};
+        for (u32 i = 0; i < 5; ++i) {
+            const auto action = json(nullptr,
+                                     WsOpcode::Text,
+                                     reinterpret_cast<const u8*>(documents[i]),
+                                     static_cast<u32>(strlen(documents[i])),
+                                     client);
+            CHECK(action == (i == 0 || (i == 1 && !client) ? WsFrameAction::ForwardText
+                             : i == 1                      ? WsFrameAction::Drop
+                             : i == 2                      ? WsFrameAction::ClosePolicy1
+                             : i == 3                      ? WsFrameAction::ClosePolicy2
+                                                           : WsFrameAction::ClosePolicy0));
+        }
+        CHECK(close(nullptr, WsOpcode::Binary, nullptr, 0, client) ==
+              (client ? WsFrameAction::ClosePolicy0 : WsFrameAction::Close));
+        const char* values[] = {"false", "true", "null", "0", "{}", "[]"};
+        for (u32 i = 0; i < 6; ++i)
+            CHECK(optional(nullptr,
+                           WsOpcode::Text,
+                           reinterpret_cast<const u8*>(values[i]),
+                           static_cast<u32>(strlen(values[i])),
+                           client) == (i == 0   ? WsFrameAction::ForwardTextPolicy0
+                                       : i == 1 ? WsFrameAction::ForwardTextPolicy1
+                                                : WsFrameAction::ForwardTextPolicy2));
+    }
+    REQUIRE_EQ(program.config.routes[2].ws_close_policy_count, 1u);
+    CHECK_EQ(program.config.routes[2].ws_close_policies[0].code, 1000u);
+    CHECK_EQ(program.config.routes[2].ws_close_code, 1008u);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_callback_scope_uses_helpers_and_borrowed_aliases) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func identity<T>(_ value: T) -> T => value
+func same<T: Eq>(_ left: T, _ right: T) -> bool => left == right
+func payloadSize(_ bytes: Bytes) -> i32 => bytes.count
+route GET "/bytes" {
+    let required = 2
+    return websocket(backend) { msg in
+        let alias: WebSocketMessage = identity(msg)
+        let bytes: Bytes = alias.payload
+        let marker: Bytes = b"\x00\xff"
+        let permitted: bool = payloadSize(bytes) == required && same(bytes, marker)
+        let client = alias.direction == WebSocketDirection.clientToUpstream
+        guard !client || permitted else { alias.drop() }
+        alias.forward()
+    }
+}
+route GET "/json" { return websocket(backend) { event in
+    let copy = identity(event)
+    let text: str = copy.text
+    guard let document = json.parse(text) else { copy.close(1007, "invalid JSON") }
+    let client = copy.fromClient
+    guard let field = json.get(document, "/name") else { copy.drop() }
+    guard let name = json.string(field) else { copy.drop() }
+    guard !client || name == "ok" else { copy.drop() }
+    copy.forward("[" + text + "]")
+} }
+)rut";
+    const auto dir = (std::filesystem::temp_directory_path() / "rut_ws_callback_scope").string();
+    auto path = write_file(dir, "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 2u);
+    std::filesystem::remove_all(dir);
+    const auto binary = program.config.routes[0].ws_frame_handler;
+    const auto json = program.config.routes[1].ws_frame_handler;
+    REQUIRE(binary);
+    REQUIRE(json);
+    const Str payloads[] = {{"\0\xff", 2}, {"\xff\0", 2}, {"", 0}, {"\0\xff\0", 3}};
+    for (bool client : {true, false}) {
+        for (u32 i = 0; i < 4; ++i)
+            CHECK(binary(nullptr,
+                         WsOpcode::Binary,
+                         reinterpret_cast<const u8*>(payloads[i].ptr),
+                         payloads[i].len,
+                         client) ==
+                  (!client || i == 0 ? WsFrameAction::Forward : WsFrameAction::Drop));
+        const char* documents[] = {
+            "{\"name\":\"ok\"}", "{\"name\":\"no\"}", "{}", "{\"name\":1}", "broken"};
+        for (u32 i = 0; i < 5; ++i) {
+            const auto verdict = json(nullptr,
+                                      WsOpcode::Text,
+                                      reinterpret_cast<const u8*>(documents[i]),
+                                      static_cast<u32>(strlen(documents[i])),
+                                      client);
+            CHECK(verdict == (i == 4                            ? WsFrameAction::ClosePolicy0
+                              : (i == 0 || (i == 1 && !client)) ? WsFrameAction::ForwardText
+                                                                : WsFrameAction::Drop));
+        }
+    }
+    CHECK_EQ(program.config.routes[0].needs_req_body, false);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_payload_bytes_share_helpers_with_dynamic_http_values) {
+    const char* source = R"rut(upstream backend at "127.0.0.1:9999"
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func allowed(_ bytes: Bytes) -> bool =>
+    !bytes.isEmpty && bytes.count == 2 && (same(bytes, b"\x00\xff") || bytes == b"ok")
+func choose(_ path: str) -> Bytes {
+    if path == "/yes" { b"\x00\xff" } else { b"" }
+}
+route GET "/http" {
+    let bytes = choose(req.path)
+    guard allowed(bytes) else { return 403 }
+    return 200
+}
+route POST "/body" {
+    guard allowed(req.bodyBytes) else { return 403 }
+    return 200
+}
+route GET "/ws" { return websocket(backend) { message in
+    guard !message.fromClient || allowed(message.payload) else { message.drop() }
+    guard same(message.payload, message.payload) else { message.close() }
+    message.forward()
+} })rut";
+    auto path = write_file("/tmp/rut_ws_payload_bytes", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 3u);
+    const auto http = program.config.routes[0].fn;
+    REQUIRE(http);
+    const char* requests[] = {"GET /yes HTTP/1.1\r\nHost: test\r\n\r\n",
+                              "GET /no HTTP/1.1\r\nHost: test\r\n\r\n"};
+    for (u32 i = 0; i < 2; ++i) {
+        const auto result =
+            jit::HandlerResult::unpack(http(nullptr,
+                                            nullptr,
+                                            reinterpret_cast<const u8*>(requests[i]),
+                                            static_cast<u32>(strlen(requests[i])),
+                                            nullptr));
+        CHECK_EQ(result.status_code, i == 0 ? 200u : 403u);
+    }
+    REQUIRE(program.config.routes[1].needs_req_body);
+    const auto body = program.config.routes[1].fn;
+    REQUIRE(body);
+    const char body_request[] =
+        "POST /body HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\n\0\xff";
+    auto body_result = jit::HandlerResult::unpack(body(nullptr,
+                                                       nullptr,
+                                                       reinterpret_cast<const u8*>(body_request),
+                                                       sizeof(body_request) - 1,
+                                                       nullptr));
+    CHECK_EQ(body_result.status_code, 200u);
+    const auto handler = program.config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    struct Case {
+        WsOpcode op;
+        Str payload;
+        bool pass;
+    };
+    const Case cases[] = {{WsOpcode::Text, {"ok", 2}, true},
+                          {WsOpcode::Binary, {"\0\xff", 2}, true},
+                          {WsOpcode::Binary, {"\xff\0", 2}, false},
+                          {WsOpcode::Text, {"\0\0", 2}, false},
+                          {WsOpcode::Binary, {"", 0}, false},
+                          {WsOpcode::Text, {"okay", 4}, false}};
+    for (bool client : {false, true}) {
+        for (const auto& test : cases) {
+            CHECK(handler(nullptr,
+                          test.op,
+                          reinterpret_cast<const u8*>(test.payload.ptr),
+                          test.payload.len,
+                          client) ==
+                  (!client || test.pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+    }
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_payload_bytes_count_and_equality_cover_empty_and_large_values) {
+    const char* conditions[] = {"message.payload.isEmpty",
+                                "message.payload == b\"\"",
+                                "2 < message.payload.count",
+                                "message.payload.count >= 16370",
+                                "b\"\\x00\\xff\" != message.payload"};
+    char large[16370];
+    memset(large, 0xff, sizeof(large));
+    const Str payloads[] = {{"", 0}, {"\0\xff", 2}, {large, sizeof(large)}};
+    for (u32 i = 0; i < 5; ++i) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { return websocket(backend) "
+            "{ message in guard ";
+        source += conditions[i];
+        source += " else { message.drop() }\nmessage.forward() } }\n";
+        auto path = write_file("/tmp/rut_ws_payload_bytes_count", "app.rut", source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        REQUIRE(load_rut_program(path.c_str(), program, err));
+        const auto handler = program.config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        for (u32 j = 0; j < 3; ++j) {
+            const bool pass = i < 2 ? j == 0 : i < 4 ? j == 2 : j != 1;
+            const auto payload = payloads[j];
+            CHECK(handler(nullptr,
+                          WsOpcode::Binary,
+                          reinterpret_cast<const u8*>(payload.ptr),
+                          payload.len,
+                          true) == (pass ? WsFrameAction::Forward : WsFrameAction::Drop));
+        }
+        program.destroy();
+    }
+}
+
 TEST(serve_loader, websocket_json_root_kind_and_count_compose_within_guard_limit) {
     const char* source = R"rut(upstream backend at "127.0.0.1:9999"
 route GET "/ws" { return websocket(backend) { message in
@@ -6129,7 +7558,7 @@ TEST(serve_loader, websocket_compound_opcode_guards_reach_wire_after_reassembly)
                     (rejected ? WsInspectStatus::Close : WsInspectStatus::Ok));
             if (rejected) {
                 CHECK_EQ(st.echo_close_code, 1008u);
-                CHECK(st.echo_close_reason.eq({"text only", 9}));
+                CHECK(st.echo_close_reason().eq({"text only", 9}));
             } else {
                 REQUIRE_EQ(produced, 4u);
                 CHECK_EQ(out[0], text ? 0x81u : 0x82u);
@@ -6427,7 +7856,7 @@ TEST(serve_loader, websocket_guard_close_policies_reach_wire) {
                                &produced) == WsInspectStatus::Close);
             const u32 policy = from_client ? i : 4;
             CHECK_EQ(st.echo_close_code, codes[policy]);
-            CHECK(st.echo_close_reason.eq(reasons[policy]));
+            CHECK(st.echo_close_reason().eq(reasons[policy]));
             CHECK_EQ(produced, 4u + reasons[policy].len);
             CHECK_EQ((static_cast<u16>(out[2]) << 8) | out[3], codes[policy]);
             if (!reasons[policy].empty())
@@ -6514,7 +7943,7 @@ TEST(serve_loader, websocket_guard_close_coexists_with_default_text_rewrite) {
             CHECK(status == WsInspectStatus::Close);
             CHECK_EQ(out[0], 0x88u);
             CHECK_EQ(st.echo_close_code, 1008u);
-            CHECK(st.echo_close_reason.eq({"blocked", 7}));
+            CHECK(st.echo_close_reason().eq({"blocked", 7}));
         } else {
             CHECK(status == WsInspectStatus::Ok);
             CHECK_EQ(out[0], 0x81u);
@@ -6635,7 +8064,7 @@ TEST(serve_loader, add_ws_terminate_rejects_invalid_message_limits_without_route
     WsMessageHandlerFn handler = [](void*, WsOpcode, const u8*, u64, bool) {
         return WsFrameAction::Forward;
     };
-    const u32 invalid[] = {0, kWsTerminateMessageCapacity + 1u, 0xffffffffu};
+    const u32 invalid[] = {0, kWsMaxMessageCapacity + 1u, 0xffffffffu};
     for (u32 size : invalid) {
         CHECK_FALSE(cfg.add_ws_terminate("/ws", 0, uid, handler, size));
         CHECK_EQ(cfg.route_count, 0u);
@@ -8142,6 +9571,9 @@ TEST(serve_loader, websocket_guard_text_policies_reach_wire) {
         {{}, {}, {"x", json::kMaxBytes + 1}, WsTextSource::JsonStringify},
         {{}, {}, {"x", 1}, WsTextSource::Literal},
         {{}, {}, {"x", 1}, WsTextSource::MessageText},
+        {{"x", 1}, {}, {}, WsTextSource::MessageBytes},
+        {{}, {"x", 1}, {}, WsTextSource::MessageBytes},
+        {{}, {}, {"x", 1}, WsTextSource::MessageBytes},
     };
     for (const WsTextRewrite& rewrite : invalid_recipes) {
         CHECK_FALSE(cfg.add_ws_terminate("/bad",
@@ -8194,4 +9626,245 @@ TEST(serve_loader, websocket_mixed_guard_text_and_close_policies) {
     program.destroy();
 }
 
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_general_expressions_share_http_helpers_and_own_code) {
+    auto path = write_file("/tmp/rut_ws_general", "app.rut", test::ws_general_expressions::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    REQUIRE_EQ(program.config.route_count, 4u);
+    const auto http = program.config.routes[0].fn;
+    REQUIRE(http);
+    for (const char* body : {"x", "xx", "xxxxx"}) {
+        std::string request = "POST /http HTTP/1.1\r\nHost: test\r\nContent-Length: ";
+        request += std::to_string(strlen(body));
+        request += "\r\n\r\n";
+        request += body;
+        auto result = jit::HandlerResult::unpack(http(nullptr,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(request.data()),
+                                                      static_cast<u32>(request.size()),
+                                                      nullptr));
+        CHECK_EQ(result.status_code, strlen(body) == 2 ? 403u : 200u);
+    }
+    const auto handler = program.config.routes[1].ws_frame_handler;
+    const auto guards = program.config.routes[2].ws_frame_handler;
+    REQUIRE(handler);
+    REQUIRE(guards);
+    const auto optional = program.config.routes[3].ws_frame_handler;
+    REQUIRE(optional);
+    const u8 payload[13] = {0, 255};
+    for (bool client : {false, true}) {
+        for (WsOpcode opcode : {WsOpcode::Text, WsOpcode::Binary}) {
+            for (u32 len : {0u, 1u, 2u, 5u, 9u, 12u}) {
+                const auto expected =
+                    len == 12 ? WsFrameAction::Close
+                    : (client && len % 4 != 1) || (opcode == WsOpcode::Text && len == 5)
+                        ? WsFrameAction::Drop
+                        : WsFrameAction::Forward;
+                CHECK(handler(nullptr, opcode, payload, len, client) == expected);
+                CHECK(optional(nullptr, opcode, payload, len, client) ==
+                      (!client || len == 1 ? WsFrameAction::Forward : WsFrameAction::Drop));
+                CHECK(guards(nullptr, opcode, payload, len, client) ==
+                      (len < 5 ? WsFrameAction::Drop : WsFrameAction::Forward));
+            }
+        }
+    }
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_general_branches_grow_ir_maps_without_route_slots) {
+    std::string source = "upstream backend at \"127.0.0.1:9999\"\nroute GET \"/ws\" { ";
+    source += "return websocket(backend) { msg in guard msg.len + 0 == 1 && (";
+    for (u32 i = 0; i < 40; ++i) {
+        if (i != 0) source += " || ";
+        source += "msg.fromClient";
+    }
+    source += ") else { msg.drop() } msg.forward() } }";
+    auto path = write_file("/tmp/rut_ws_branch_growth", "app.rut", source.c_str());
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE(program.rir.module.func_count == 1u);
+    auto handler = program.config.routes[0].ws_frame_handler;
+    REQUIRE(handler);
+    const u8 byte = 42;
+    CHECK(handler(nullptr, WsOpcode::Binary, &byte, 1, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, &byte, 1, false) == WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Binary, nullptr, 0, true) == WsFrameAction::Drop);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_eager_bindings_survive_source_removal_and_pool_exhaustion) {
+    auto path =
+        write_file("/tmp/rut_ws_eager_bindings", "app.rut", test::ws_eager_bindings::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_eager_bindings::check(program.config, _tc);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_dynamic_outputs_survive_source_removal_and_pool_exhaustion) {
+    auto path =
+        write_file("/tmp/rut_ws_dynamic_output", "app.rut", test::ws_dynamic_output::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_dynamic_output::check(program.config, _tc);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_hash_bindings_evaluate_once_and_handle_pool_exhaustion) {
+    auto path = write_file("/tmp/rut_ws_hash_output", "app.rut", test::ws_hash_output::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_hash_output::check(program.config, _tc);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_general_json_values_survive_source_removal_and_pool_exhaustion) {
+    auto path = write_file("/tmp/rut_ws_general_json", "app.rut", test::ws_general_json::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_general_json::check(program.config, _tc);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_general_regex_uses_shared_values_after_source_removal) {
+    auto path = write_file("/tmp/rut_ws_general_regex", "app.rut", test::ws_general_regex::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_general_regex::check(program.config, _tc);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_helpers_and_arguments_evaluate_reached_producers_once) {
+    auto path =
+        write_file("/tmp/rut_ws_helper_lexical", "app.rut", test::ws_helper_lexical::kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_helper_lexical::check(program.config, _tc);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_nominal_matches_keep_owned_outputs_and_single_subject_evaluation) {
+    auto path = write_file("/tmp/rut_ws_nominal_match", "app.rut", test::ws_nominal_match::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_nominal_match::check(_tc, program.config);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_nominal_match_selector_is_not_elided_or_repeated) {
+    auto path =
+        write_file("/tmp/rut_ws_nominal_selector", "app.rut", test::ws_nominal_selector::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_nominal_selector::check(_tc, program.config);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_error_values_bind_once_and_recover_after_source_removal) {
+    auto path = write_file("/tmp/rut_ws_error_values", "app.rut", test::ws_error_values::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_error_values::check(_tc, program.config);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_error_guard_match_preserves_named_cases_and_single_evaluation) {
+    auto path =
+        write_file("/tmp/rut_ws_error_guard_match", "app.rut", test::ws_error_guard_match::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_error_guard_match::check(_tc, program.config);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_error_scalar_bindings_keep_false_zero_and_absence_distinct) {
+    auto path = write_file("/tmp/rut_ws_error_scalars", "app.rut", test::ws_error_scalars::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_error_scalars::check(_tc, program.config);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_connection_context_keeps_owned_metadata_and_helper_types) {
+    const auto path = write_file(
+        "/tmp/rut_ws_connection_context", "app.rut", test::ws_connection_context::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    test::ws_connection_context::check(_tc, program.config);
+    program.destroy();
+}
+#endif
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_cache_effects_keep_identity_and_clock_across_messages) {
+    const auto path =
+        write_file("/tmp/rut_ws_cache_context", "app.rut", test::ws_cache_context::kSource);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    activate_rut_program(program);
+    const auto changed_path = write_file(
+        "/tmp/rut_ws_cache_context", "changed.rut", test::ws_cache_context::kReorderedSource);
+    LoadedProgram changed;
+    REQUIRE(load_rut_program(changed_path.c_str(), changed, error));
+    REQUIRE_EQ(unlink(path.c_str()), 0);
+    REQUIRE_EQ(unlink(changed_path.c_str()), 0);
+    test::ws_cache_context::check(
+        _tc, program.config, changed.config, [&]() { activate_rut_program(changed); });
+    changed.destroy();
+    program.destroy();
+}
 #endif

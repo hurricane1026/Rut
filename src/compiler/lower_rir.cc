@@ -1,5 +1,8 @@
 #include "rut/compiler/lower_rir.h"
 
+#include "rut/common/types.h"
+#include "rut/common/ws_message.h"
+#include "rut/compiler/mir.h"
 #include "rut/compiler/rir_builder.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/route_method.h"
@@ -1268,6 +1271,23 @@ static FrontendResult<rir::ValueId> emit_ord_for_flat_shape(
                               less_than);
 }
 
+static FrontendResult<rir::ValueId> materialize_local_init(
+    const MirLocal& local,
+    const MirModule& mir,
+    const VariantLoweringInfo* variant_infos,
+    TupleLoweringInfo* tuple_infos,
+    u32* tuple_info_count,
+    ErrorLoweringInfo* error_scalar_infos,
+    ErrorLoweringInfo* error_variant_infos,
+    ErrorLoweringInfo* error_struct_infos,
+    const rir::StructDef* error_struct_def,
+    const rir::StructDef* const* user_struct_defs,
+    rir::Builder& b,
+    const rir::ValueId* locals,
+    u32 local_count,
+    Str func_name,
+    Str source_name);
+
 static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                                       const MirModule& mir,
                                                       const VariantLoweringInfo* variant_infos,
@@ -1286,6 +1306,79 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             shape, variant_infos, tuple_infos, tuple_info_count, user_struct_defs, b, span);
     };
 
+    if (value.kind == MirValueKind::BoundValue) {
+        if (value.lhs == nullptr || value.type != value.lhs->type ||
+            value.may_nil != value.lhs->may_nil || value.may_error != value.lhs->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        for (auto* binding = b.value_bindings; binding; binding = binding->parent)
+            if (binding->key == value.lhs) return binding->value;
+        return frontend_error(FrontendError::UnsupportedSyntax, span);
+    }
+    if (value.kind == MirValueKind::LetIn) {
+        if (value.lhs == nullptr || value.rhs == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        const auto kInitialize = [&](const MirValue& initializer) -> FrontendResult<rir::ValueId> {
+            MirLocal local{};
+            local.span = span;
+            local.type = initializer.type;
+            local.shape_index = initializer.shape_index;
+            local.may_nil = initializer.may_nil;
+            local.may_error = initializer.may_error;
+            local.variant_index = initializer.variant_index;
+            local.struct_index = initializer.struct_index;
+            local.error_struct_index = initializer.error_struct_index;
+            local.error_variant_index = initializer.error_variant_index;
+            local.tuple_len = initializer.tuple_len;
+            if (local.tuple_len > kMaxMirTupleSlots)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            for (u32 i = 0; i < local.tuple_len; ++i) {
+                local.tuple_types[i] = initializer.tuple_types[i];
+                local.tuple_variant_indices[i] = initializer.tuple_variant_indices[i];
+                local.tuple_struct_indices[i] = initializer.tuple_struct_indices[i];
+            }
+            local.init = initializer;
+            const auto* error_type =
+                error_scalar_infos[static_cast<u32>(MirTypeKind::I32)].error_type;
+            if (error_type == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            return materialize_local_init(local,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          error_type->struct_def,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          b.cur_func->name,
+                                          b.mod->name);
+        };
+        auto evaluated = kInitialize(*value.lhs);
+        if (!evaluated) return core::make_unexpected(evaluated.error());
+        const rir::Builder::ValueBinding kBinding{value.lhs, evaluated.value(), b.value_bindings};
+        b.value_bindings = &kBinding;
+        auto result = value.rhs->kind == MirValueKind::Nil || value.rhs->kind == MirValueKind::Error
+                          ? kInitialize(*value.rhs)
+                          : materialize_value(*value.rhs,
+                                              mir,
+                                              variant_infos,
+                                              tuple_infos,
+                                              tuple_info_count,
+                                              error_scalar_infos,
+                                              error_variant_infos,
+                                              error_struct_infos,
+                                              user_struct_defs,
+                                              b,
+                                              locals,
+                                              local_count,
+                                              span);
+        b.value_bindings = kBinding.parent;
+        return result;
+    }
     if (value.kind == MirValueKind::BoolConst) {
         auto v = b.emit_const_bool(value.bool_value, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
@@ -1302,6 +1395,42 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         auto v = b.emit_const_str(value.str_value, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
+    }
+    if (value.kind == MirValueKind::StringConcat || value.kind == MirValueKind::StringPredicate) {
+        const bool kPredicate = value.kind == MirValueKind::StringPredicate;
+        if (!value.lhs || !value.rhs || value.lhs->type != MirTypeKind::Str ||
+            value.rhs->type != MirTypeKind::Str || value.lhs->may_nil || value.lhs->may_error ||
+            value.rhs->may_nil || value.rhs->may_error || value.may_nil || value.may_error ||
+            value.type != (kPredicate ? MirTypeKind::Bool : MirTypeKind::Str) ||
+            (kPredicate && (value.int_value < 0 || value.int_value > 3)))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        const auto kOperand = [&](const MirValue& input) {
+            return materialize_value(input,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        };
+        auto lhs = kOperand(*value.lhs);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = kOperand(*value.rhs);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        rir::ValueId parts[] = {lhs.value(), rhs.value()};
+        auto result =
+            kPredicate
+                ? b.emit_str_predicate(
+                      parts[0], parts[1], static_cast<u32>(value.int_value), {span.line, span.col})
+                : b.emit_str_interpolate(parts, 2, {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
     }
     if (value.kind == MirValueKind::RegexMatch) {
         auto lhs = materialize_value(*value.lhs,
@@ -1617,6 +1746,94 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         auto v = b.emit_req_path_only({span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
+    }
+    if (value.kind == MirValueKind::WsForward || value.kind == MirValueKind::WsClose) {
+        const bool kForward = value.kind == MirValueKind::WsForward;
+        if (value.type != MirTypeKind::I32 || value.may_nil || value.may_error || !value.lhs ||
+            value.lhs->may_nil || value.lhs->may_error ||
+            (kForward ? value.lhs->type != MirTypeKind::Str || value.rhs ||
+                            (value.int_value != 1 && value.int_value != 2)
+                      : value.lhs->type != MirTypeKind::I32 || !value.rhs ||
+                            value.rhs->type != MirTypeKind::Str || value.rhs->may_nil ||
+                            value.rhs->may_error))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto materialize = [&](const MirValue& child) {
+            return materialize_value(child,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        };
+        auto lhs = materialize(*value.lhs);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        if (kForward) {
+            auto result = b.emit_ws_forward(
+                lhs.value(), static_cast<u8>(value.int_value), {span.line, span.col});
+            if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+            return result.value();
+        }
+        auto rhs = materialize(*value.rhs);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        auto result = b.emit_ws_close(lhs.value(), rhs.value(), {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
+    }
+    if (value.kind == MirValueKind::WsMessageField) {
+        WsMessageFieldId field{};
+        if (value.str_value.eq(lit_str("text")) || value.str_value.eq(lit_str("payload")))
+            field = WsMessageFieldId::Payload;
+        else if (value.str_value.eq(lit_str("len")))
+            field = WsMessageFieldId::Length;
+        else if (value.str_value.eq(lit_str("kind")))
+            field = WsMessageFieldId::Kind;
+        else if (value.str_value.eq(lit_str("direction")))
+            field = WsMessageFieldId::Direction;
+        else if (value.str_value.eq(lit_str("fromClient")))
+            field = WsMessageFieldId::FromClient;
+        else if (value.str_value.eq(lit_str("isText")))
+            field = WsMessageFieldId::IsText;
+        else if (value.str_value.eq(lit_str("isBinary")))
+            field = WsMessageFieldId::IsBinary;
+        else if (value.str_value.eq(lit_str("remoteAddr")))
+            field = WsMessageFieldId::ConnectionRemoteAddr;
+        else if (value.str_value.eq(lit_str("remotePort")))
+            field = WsMessageFieldId::ConnectionRemotePort;
+        else if (value.str_value.eq(lit_str("isTls")))
+            field = WsMessageFieldId::ConnectionIsTls;
+        else if (value.str_value.eq(lit_str("subprotocol")))
+            field = WsMessageFieldId::ConnectionSubprotocol;
+        else if (value.str_value.eq(lit_str("code")))
+            field = WsMessageFieldId::CloseCode;
+        else if (value.str_value.eq(lit_str("reason")))
+            field = WsMessageFieldId::CloseReason;
+        else if (value.str_value.eq(lit_str("upstreamCode")))
+            field = WsMessageFieldId::CloseUpstreamCode;
+        else if (value.str_value.eq(lit_str("upstreamReason")))
+            field = WsMessageFieldId::CloseUpstreamReason;
+        else if (value.str_value.eq(lit_str("wasClean")))
+            field = WsMessageFieldId::CloseWasClean;
+        else
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        const bool kBool = ws_message_field_is_bool(field);
+        const MirTypeKind kExpected = ws_message_field_is_string(field) ? MirTypeKind::Str
+                                      : field == WsMessageFieldId::ConnectionRemoteAddr
+                                          ? MirTypeKind::IP
+                                      : kBool ? MirTypeKind::Bool
+                                              : MirTypeKind::I32;
+        if (value.type != kExpected || value.may_nil || value.may_error || value.lhs != nullptr ||
+            value.rhs != nullptr || value.args.len != 0 || value.field_inits.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto result = b.emit_ws_message_field(field, {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
     }
     if (value.kind == MirValueKind::ReqBody) {
         auto v = b.emit_req_body({span.line, span.col});
@@ -1983,6 +2200,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         return selected.value();
     }
     if (value.kind == MirValueKind::IfElse) {
+        if (value.lhs == nullptr || value.rhs == nullptr || value.args.len != 1 ||
+            value.args[0] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
         auto cond = materialize_value(*value.lhs,
                                       mir,
                                       variant_infos,
@@ -1997,6 +2217,137 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                       local_count,
                                       span);
         if (!cond) return core::make_unexpected(cond.error());
+        const auto kValueShape = resolved_shape(mir, value);
+        auto adapt_branch = [&](const MirValue& branch,
+                                rir::ValueId branch_id) -> FrontendResult<rir::ValueId> {
+            if (!value.may_error) {
+                if (!value.may_nil) return branch_id;
+                auto inner = make_inner_type(kValueShape);
+                if (!inner) return core::make_unexpected(inner.error());
+                if (branch.may_nil) {
+                    if (branch.kind != MirValueKind::Nil) return branch_id;
+                    auto nil = b.emit_opt_nil(inner.value(), {span.line, span.col});
+                    if (!nil) return frontend_error(FrontendError::OutOfMemory, span);
+                    return nil.value();
+                }
+                auto wrapped = b.emit_opt_wrap(branch_id, {span.line, span.col});
+                if (!wrapped) return frontend_error(FrontendError::OutOfMemory, span);
+                return wrapped.value();
+            }
+            auto& err_info = error_info_for(kValueShape,
+                                            value.error_struct_index,
+                                            error_scalar_infos,
+                                            error_variant_infos,
+                                            error_struct_infos);
+            if (branch.may_error) {
+                if (branch.kind != MirValueKind::Error) return branch_id;
+                const i32 kTagValue = branch.error_variant_index != 0xffffffffu
+                                          ? static_cast<i32>(branch.error_case_index)
+                                          : static_cast<i32>(branch.int_value);
+                auto code = b.emit_const_i32(kTagValue, {span.line, span.col});
+                if (!code) return frontend_error(FrontendError::OutOfMemory, span);
+                auto msg = b.emit_const_str(branch.msg, {span.line, span.col});
+                if (!msg) return frontend_error(FrontendError::OutOfMemory, span);
+                auto file = b.emit_const_str(Str{}, {span.line, span.col});
+                if (!file) return frontend_error(FrontendError::OutOfMemory, span);
+                auto func = b.emit_const_str(Str{}, {span.line, span.col});
+                if (!func) return frontend_error(FrontendError::OutOfMemory, span);
+                auto line = b.emit_const_i32(static_cast<i32>(span.line), {span.line, span.col});
+                if (!line) return frontend_error(FrontendError::OutOfMemory, span);
+                rir::ValueId error_fields[] = {
+                    code.value(), msg.value(), file.value(), func.value(), line.value()};
+                auto error_val = b.emit_struct_create(
+                    const_cast<rir::StructDef*>(err_info.error_type->struct_def),
+                    error_fields,
+                    5,
+                    {span.line, span.col});
+                if (!error_val) return frontend_error(FrontendError::OutOfMemory, span);
+                auto wrapped_err = b.emit_opt_wrap(error_val.value(), {span.line, span.col});
+                if (!wrapped_err) return frontend_error(FrontendError::OutOfMemory, span);
+                auto nil_payload =
+                    b.emit_opt_nil(err_info.payload_inner_type, {span.line, span.col});
+                if (!nil_payload) return frontend_error(FrontendError::OutOfMemory, span);
+                rir::ValueId fields[] = {wrapped_err.value(), nil_payload.value()};
+                auto created =
+                    b.emit_struct_create(err_info.struct_def, fields, 2, {span.line, span.col});
+                if (!created) return frontend_error(FrontendError::OutOfMemory, span);
+                return created.value();
+            }
+            rir::ValueId err{};
+            auto nil_err = b.emit_opt_nil(err_info.error_type, {span.line, span.col});
+            if (!nil_err) return frontend_error(FrontendError::OutOfMemory, span);
+            err = nil_err.value();
+            rir::ValueId payload{};
+            if (branch.may_nil) {
+                if (branch.kind == MirValueKind::Nil) {
+                    auto nil_payload =
+                        b.emit_opt_nil(err_info.payload_inner_type, {span.line, span.col});
+                    if (!nil_payload) return frontend_error(FrontendError::OutOfMemory, span);
+                    payload = nil_payload.value();
+                } else {
+                    payload = branch_id;
+                }
+            } else {
+                auto wrapped = b.emit_opt_wrap(branch_id, {span.line, span.col});
+                if (!wrapped) return frontend_error(FrontendError::OutOfMemory, span);
+                payload = wrapped.value();
+            }
+            rir::ValueId fields[] = {err, payload};
+            auto created =
+                b.emit_struct_create(err_info.struct_def, fields, 2, {span.line, span.col});
+            if (!created) return frontend_error(FrontendError::OutOfMemory, span);
+            return created.value();
+        };
+        if (value.is_branch_conditional) {
+            if (value.is_eager_fallback || value.rhs == nullptr || value.args.len != 1 ||
+                value.args[0] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            auto then_block = b.create_block(b.cur_func, {"value.then", 10});
+            auto else_block = b.create_block(b.cur_func, {"value.else", 10});
+            auto merge_block = b.create_block(b.cur_func, {"value.merge", 11});
+            if (!then_block || !else_block || !merge_block)
+                return frontend_error(FrontendError::OutOfMemory, span);
+            if (!b.emit_br(
+                    cond.value(), then_block.value(), else_block.value(), {span.line, span.col}))
+                return frontend_error(FrontendError::OutOfMemory, span);
+            auto arm = [&](const MirValue& branch,
+                           rir::BlockId block) -> FrontendResult<rir::ValueId> {
+                b.set_insert_point(b.cur_func, block);
+                auto raw = materialize_value(branch,
+                                             mir,
+                                             variant_infos,
+                                             tuple_infos,
+                                             tuple_info_count,
+                                             error_scalar_infos,
+                                             error_variant_infos,
+                                             error_struct_infos,
+                                             user_struct_defs,
+                                             b,
+                                             locals,
+                                             local_count,
+                                             span);
+                if (!raw) return core::make_unexpected(raw.error());
+                return adapt_branch(branch, raw.value());
+            };
+            auto selected_then = arm(*value.rhs, then_block.value());
+            if (!selected_then) return core::make_unexpected(selected_then.error());
+            const rir::BlockId kThenEdge = b.cur_block_id;
+            if (!b.emit_jmp(merge_block.value(), {span.line, span.col}))
+                return frontend_error(FrontendError::OutOfMemory, span);
+            auto selected_else = arm(*value.args[0], else_block.value());
+            if (!selected_else) return core::make_unexpected(selected_else.error());
+            const rir::BlockId kElseEdge = b.cur_block_id;
+            if (!b.emit_jmp(merge_block.value(), {span.line, span.col}))
+                return frontend_error(FrontendError::OutOfMemory, span);
+            b.set_insert_point(b.cur_func, merge_block.value());
+            auto selected = b.emit_phi(selected_then.value(),
+                                       kThenEdge,
+                                       selected_else.value(),
+                                       kElseEdge,
+                                       {span.line, span.col});
+            if (!selected) return frontend_error(FrontendError::OutOfMemory, span);
+            return selected.value();
+        }
         auto then_v = materialize_value(*value.rhs,
                                         mir,
                                         variant_infos,
@@ -2025,88 +2376,25 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                         local_count,
                                         span);
         if (!else_v) return core::make_unexpected(else_v.error());
-        const auto value_shape = resolved_shape(mir, value);
         if (value.may_error) {
-            auto& err_info = error_info_for(value_shape,
+            auto& err_info = error_info_for(kValueShape,
                                             value.error_struct_index,
                                             error_scalar_infos,
                                             error_variant_infos,
                                             error_struct_infos);
-            const bool eager_missing_fallback =
+            const bool kEagerMissingFallback =
                 value.lhs != nullptr && !value.is_pipe_conditional &&
                 (value.lhs->kind == MirValueKind::HasValue ||
                  (value.is_eager_fallback && value.lhs->kind == MirValueKind::BoolConst &&
                   value.lhs->bool_value));
-            auto wrap_error_branch = [&](const MirValue& branch,
-                                         rir::ValueId branch_id) -> FrontendResult<rir::ValueId> {
-                if (branch.may_error) {
-                    if (branch.kind != MirValueKind::Error) return branch_id;
-                    const i32 tag_value = branch.error_variant_index != 0xffffffffu
-                                              ? static_cast<i32>(branch.error_case_index)
-                                              : static_cast<i32>(branch.int_value);
-                    auto code = b.emit_const_i32(tag_value, {span.line, span.col});
-                    if (!code) return frontend_error(FrontendError::OutOfMemory, span);
-                    auto msg = b.emit_const_str(branch.msg, {span.line, span.col});
-                    if (!msg) return frontend_error(FrontendError::OutOfMemory, span);
-                    auto file = b.emit_const_str(Str{}, {span.line, span.col});
-                    if (!file) return frontend_error(FrontendError::OutOfMemory, span);
-                    auto func = b.emit_const_str(Str{}, {span.line, span.col});
-                    if (!func) return frontend_error(FrontendError::OutOfMemory, span);
-                    auto line =
-                        b.emit_const_i32(static_cast<i32>(span.line), {span.line, span.col});
-                    if (!line) return frontend_error(FrontendError::OutOfMemory, span);
-                    rir::ValueId error_fields[] = {
-                        code.value(), msg.value(), file.value(), func.value(), line.value()};
-                    auto error_val = b.emit_struct_create(
-                        const_cast<rir::StructDef*>(err_info.error_type->struct_def),
-                        error_fields,
-                        5,
-                        {span.line, span.col});
-                    if (!error_val) return frontend_error(FrontendError::OutOfMemory, span);
-                    auto wrapped_err = b.emit_opt_wrap(error_val.value(), {span.line, span.col});
-                    if (!wrapped_err) return frontend_error(FrontendError::OutOfMemory, span);
-                    auto nil_payload =
-                        b.emit_opt_nil(err_info.payload_inner_type, {span.line, span.col});
-                    if (!nil_payload) return frontend_error(FrontendError::OutOfMemory, span);
-                    rir::ValueId fields[] = {wrapped_err.value(), nil_payload.value()};
-                    auto created =
-                        b.emit_struct_create(err_info.struct_def, fields, 2, {span.line, span.col});
-                    if (!created) return frontend_error(FrontendError::OutOfMemory, span);
-                    return created.value();
-                }
-                rir::ValueId err{};
-                auto nil_err = b.emit_opt_nil(err_info.error_type, {span.line, span.col});
-                if (!nil_err) return frontend_error(FrontendError::OutOfMemory, span);
-                err = nil_err.value();
-                rir::ValueId payload{};
-                if (branch.may_nil) {
-                    if (branch.kind == MirValueKind::Nil) {
-                        auto nil_payload =
-                            b.emit_opt_nil(err_info.payload_inner_type, {span.line, span.col});
-                        if (!nil_payload) return frontend_error(FrontendError::OutOfMemory, span);
-                        payload = nil_payload.value();
-                    } else {
-                        payload = branch_id;
-                    }
-                } else {
-                    auto wrapped = b.emit_opt_wrap(branch_id, {span.line, span.col});
-                    if (!wrapped) return frontend_error(FrontendError::OutOfMemory, span);
-                    payload = wrapped.value();
-                }
-                rir::ValueId fields[] = {err, payload};
-                auto created =
-                    b.emit_struct_create(err_info.struct_def, fields, 2, {span.line, span.col});
-                if (!created) return frontend_error(FrontendError::OutOfMemory, span);
-                return created.value();
-            };
-            auto then_wrapped = wrap_error_branch(*value.rhs, then_v.value());
+            auto then_wrapped = adapt_branch(*value.rhs, then_v.value());
             if (!then_wrapped) return core::make_unexpected(then_wrapped.error());
-            auto else_wrapped = wrap_error_branch(*value.args[0], else_v.value());
+            auto else_wrapped = adapt_branch(*value.args[0], else_v.value());
             if (!else_wrapped) return core::make_unexpected(else_wrapped.error());
             auto selected = b.emit_select(
                 cond.value(), then_wrapped.value(), else_wrapped.value(), {span.line, span.col});
             if (!selected) return frontend_error(FrontendError::OutOfMemory, span);
-            if (!eager_missing_fallback) return selected.value();
+            if (!kEagerMissingFallback) return selected.value();
             auto branch_has_error = [&](rir::ValueId branch_id) -> FrontendResult<rir::ValueId> {
                 auto err = b.emit_struct_field(
                     branch_id, error_field_name(), err_info.error_opt_type, {span.line, span.col});
@@ -2137,26 +2425,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             return selected_or_error.value();
         }
         if (value.may_nil) {
-            auto inner = make_inner_type(value_shape);
-            if (!inner) return core::make_unexpected(inner.error());
-            auto wrap_optional_branch =
-                [&](const MirValue& branch,
-                    rir::ValueId branch_id) -> FrontendResult<rir::ValueId> {
-                if (branch.may_nil) {
-                    if (branch.kind == MirValueKind::Nil) {
-                        auto nil = b.emit_opt_nil(inner.value(), {span.line, span.col});
-                        if (!nil) return frontend_error(FrontendError::OutOfMemory, span);
-                        return nil.value();
-                    }
-                    return branch_id;
-                }
-                auto wrapped = b.emit_opt_wrap(branch_id, {span.line, span.col});
-                if (!wrapped) return frontend_error(FrontendError::OutOfMemory, span);
-                return wrapped.value();
-            };
-            auto then_wrapped = wrap_optional_branch(*value.rhs, then_v.value());
+            auto then_wrapped = adapt_branch(*value.rhs, then_v.value());
             if (!then_wrapped) return core::make_unexpected(then_wrapped.error());
-            auto else_wrapped = wrap_optional_branch(*value.args[0], else_v.value());
+            auto else_wrapped = adapt_branch(*value.args[0], else_v.value());
             if (!else_wrapped) return core::make_unexpected(else_wrapped.error());
             auto selected = b.emit_select(
                 cond.value(), then_wrapped.value(), else_wrapped.value(), {span.line, span.col});
@@ -2621,7 +2892,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!zero) return frontend_error(FrontendError::OutOfMemory, span);
         return zero.value();
     }
-    if (value.kind == MirValueKind::WidenI64) {
+    if (value.kind == MirValueKind::WidenI64 || value.kind == MirValueKind::BytesCount) {
         auto operand = materialize_value(*value.lhs,
                                          mir,
                                          variant_infos,
@@ -2636,7 +2907,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                          local_count,
                                          span);
         if (!operand) return core::make_unexpected(operand.error());
-        auto out = b.emit_sext_i64(operand.value(), {span.line, span.col});
+        auto out = value.kind == MirValueKind::BytesCount
+                       ? b.emit_str_length(operand.value(), {span.line, span.col})
+                       : b.emit_sext_i64(operand.value(), {span.line, span.col});
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
@@ -4460,6 +4733,10 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
     }
 
     for (u32 i = 0; i < mir.functions.len; i++) {
+        if (mir.functions[i].is_ws_callback &&
+            (mir.functions[i].blocks.len != 1 || mir.functions[i].waits.len != 0 ||
+             mir.functions[i].is_timer || mir.functions[i].has_explicit_resume_blocks))
+            return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
         if (!mir_forward_preflight_lowering_shape_valid(mir, mir.functions[i])) {
             out.destroy();
             return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
@@ -5206,6 +5483,8 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
             if (local_needs_error_prelude(mir.functions[i].locals[li])) error_local_count++;
         }
         const bool has_error_prelude = error_local_count != 0;
+        if (mir.functions[i].is_ws_callback && has_error_prelude)
+            return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
         rir::BlockId prelude_block{};
         if (has_error_prelude) {
             auto block = b.create_block(fn.value(), prelude_label());
@@ -5302,6 +5581,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
             local_vals[mir.functions[i].locals[li].ref_index] = val.value();
         }
 
+        const rir::BlockId kLocalContinuation = b.cur_block_id;
         if (has_error_prelude) {
             u32 error_index = 0;
             for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
@@ -5352,7 +5632,11 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         }
 
         for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
-            b.set_insert_point(fn.value(), block_ids[bi]);
+            b.set_insert_point(fn.value(),
+                               bi == 0 && !has_error_prelude && mir.functions[i].waits.len == 0 &&
+                                       !mir.functions[i].has_explicit_resume_blocks
+                                   ? kLocalContinuation
+                                   : block_ids[bi]);
             if (mir.functions[i].has_explicit_resume_blocks) {
                 const Span store_span = mir.functions[i].blocks[bi].term.span;
                 for (u32 wi = 0; wi < mir.functions[i].waits.len; wi++) {

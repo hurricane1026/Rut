@@ -92,6 +92,12 @@ bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 Statements end at newline (no semicolons). Blocks need no commas between items.
 Comments: `// line only`.
 
+Unwrapped `str` values also support `+` concatenation, `.hasPrefix(str)`,
+`.hasSuffix(str)`, `.contains(str)` and `.isEmpty`. These operations compare
+bytes; concatenation owns bounded arena storage and stops on allocation failure.
+They do not implicitly convert Bytes or optional values. Source interpolation
+remains restricted to the separately documented forms.
+
 ## Bindings and control flow
 
 ```swift
@@ -183,6 +189,16 @@ Domain types are first-class: `Duration ByteSize StatusCode Method IP CIDR Port
 MediaType Regex Time`. Numeric: `i8..i64 u8..u64 f32 f64`, `str`, `[T]`,
 tuples `(a, b)` — ⏳ `.0`/`.1` projection and `let (x, y) = pair` destructuring pending.
 
+`Bytes` is an immutable raw-byte view, distinct from `str`. Construct constants
+with the existing `b"\x00\xff"` literal syntax (at most 4096 decoded bytes per
+literal). `.count` is an `i32` byte count; `.isEmpty` is a Bool property.
+Equality, inequality and generic `Eq` compare exact bytes, including NUL and
+non-UTF-8 bytes. Helpers may accept/return Bytes, imports preserve its type,
+and ordinary HTTP locals can hold Bytes values. `req.bodyBytes` borrows the
+request body as Bytes under the same buffering/lifetime rules as `req.body`.
+There is no implicit text conversion, ordering, concatenation, indexing or
+regex API for Bytes.
+
 ```swift
 struct User {                 // fields: name: type — newline-separated, no commas
     id: str
@@ -254,6 +270,7 @@ req.queryAll("tags")         // ⏳ [str]
 req.cookie("session")        // str?
 req.body(User)               // typed parse, error-capable → guard let
 req.body                     // raw body as str
+req.bodyBytes                // raw body as Bytes; same request-body buffering rules
 req.bodyJson()               // dynamic Json, error-capable
 req.ctx.userId               // typed per-request context (user declares struct Ctx)
 
@@ -845,282 +862,171 @@ return forward(users, load_balance: .roundRobin, streaming: true)         // ⏳
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
-// Current terminate handlers: up to 4 guards over direction, text/binary message type,
-// message.len (< > == <= >= != integer literal, either side), text.matches(re),
-// text ==/!= string literal (either side), text.isEmpty, and
-// text.hasPrefix("literal"), text.hasSuffix("literal"), text.contains("literal").
-// Text predicates
-// compare raw payload bytes; use message.isText for text-only filtering.
-// Literal predicates decode ordinary escapes, including embedded NUL.
-// Empty prefixes/suffixes/substrings match every message; arguments must be literals.
-// Conditions support !, &&, ||, parentheses and left-to-right short-circuiting.
-// ! binds tighter than comparisons; && binds tighter than ||.
-// At most 32 condition nodes (leaf predicates + binary operators); nesting is bounded.
-// A terminate route can run up to eight existing top-level HTTP guards before
-// websocket. These request reads and static failure responses run in the
-// ordinary JIT handler before it connects to the WebSocket upstream. A
-// guard-let binding is visible to later HTTP guards only; it cannot be captured
-// by the separate message handler. Only compile-time lets and bounded request
-// guards are supported here; helpers, effects, body reads, mutation, waits,
-// loops, conditionals, decorators, and chains remain rejected. Bare websocket
-// passthrough routes continue through the ordinary HTTP route pipeline.
-guard let origin = req.uniqueHeader("Origin") else { return 403 }
-guard origin == "https://allowed.example" else { return 403 }
-return websocket(chat) { message in
-    guard !message.fromClient || !message.isText || !message.text.matches(re".*spam.*") else {
-        message.drop()
-    }
-    guard !message.fromClient || message.text != "ping" else { message.drop() }
-    guard message.isText else { message.close(1008, "text only") }
-    guard message.len <= 4096 else { message.close() }
-    message.forward()
-}
-
-// After HTTP guards pass, terminate mode validates GET/HTTP/1.1, exactly one
-// non-empty Host, exact Connection token and an Upgrade offer containing bare
-// websocket (other valid protocol/version offers may coexist), one canonical
-// 16-byte Base64 key, and one WebSocket Version before connecting upstream.
-// One Content-Length: 0 is
-// allowed; positive/duplicate Content-Length, Transfer-Encoding, TE and Expect
-// are rejected with 400. A decimal Version from 0 to 255 without leading zeroes
-// but other than 13 gets 426 with Upgrade, Connection: Upgrade, and
-// Sec-WebSocket-Version: 13 (plus close semantics); malformed versions get 400.
-// Protocol offers may use repeated fields or
-// comma lists; nonempty ASCII tokens must be unique case-sensitively. A backend
-// 101 is sent only with one matching Accept, a selected protocol that was offered
-// (if any), exact Upgrade/Connection checks, a complete header, and no extensions.
-// Invalid 101 closes before send. Non-101 remains ordinary HTTP; Origin stays an
-// explicit application guard. Bare websocket(chat) passthrough keeps generic
-// Upgrade behavior. This bounded supported shape is not full RFC 6455 conformance.
-
-// Require one case-sensitive subprotocol on a terminate route. The string literal
-// must decode to one nonempty ASCII HTTP token. Both named arguments may appear
-// in either order, once each. Missing client offers get 400 before upstream
-// connect. The backend receives only this offer and must select it in its 101;
-// omission or mismatch closes before sending 101. The option requires a block.
-return websocket(chat, subprotocol: "graphql-transport-ws", maxMessageSize: 4kb) { message in
-    message.forward()
-}
-// Omitting subprotocol keeps optional, backend-selected negotiation.
-
-// The runtime bounds a graceful Close or clean-EOF drain to about five
-// seconds; a healthy quiet tunnel has no idle timeout.
-
-// Validate a complete message with the existing JSON parser. Only presence
-// comparisons and the document bindings shown below are supported here.
-// JSON null is a valid document, so json.parse("null") succeeds.
-// Parsing uses the ordinary JSON limits: 8 KiB input, 2048 nodes, depth 64.
-// Values exceeding those bounds count as parse failures, even if valid JSON.
-return websocket(chat) { message in
-    guard !message.fromClient || !message.isText || json.parse(message.text) != nil else {
-        message.close(1007, "invalid JSON")
-    }
-    message.forward()
-}
-// == nil, either operand order, !, && and || are supported with short-circuiting.
-// Text payload access retains its raw-byte semantics; use isText to select Text messages.
-
-// Unwrap a complete message's JSON, require a field (JSON null counts as present),
-// then route on an exact JSON string value. Literal RFC 6901 pointers support
-// nested objects, array indices, ~0 and ~1; an empty pointer selects the root.
-return websocket(chat) { message in
-    guard let document = json.parse(message.text) else { message.close(1007) }
-    guard let field = json.get(document, "/type") else { message.close(1008) }
-    guard let kind = json.string(field) else { message.close(1008) }
-    guard kind == "subscribe" else { message.drop() }
-    message.forward()
-}
-// json.string(document) also checks a root JSON string. A get result must be
-// unwrapped before json.string; missing, null, number, bool, array and object fail.
-// String aliases support literal == / != plus isEmpty, hasPrefix, hasSuffix and
-// contains with string literals. The predicates compare decoded bytes exactly.
-// Bindings require fresh names and count toward the four-guard limit. Each reached
-// check reparses within the JSON bounds; no document or borrowed string survives.
-// Empty contains needles match every valid string; a failed/non-string JSON value
-// still fails its binding. json.get accepts a previously guard-unwrapped Json
-// selection too; its literal pointer is relative to that value. Dynamic paths,
-// arbitrary extraction and mutation remain unsupported; no Unicode normalization occurs.
-
-// Select nested JSON values with separate optional guards. Empty pointers retain
-// the source value, including JSON null. Escaped tokens, indices and NUL work as
-// ordinary RFC 6901 pointers. Presence comparisons also accept selected Json aliases.
-return websocket(chat) { message in
-    guard let document = json.parse(message.text) else { message.close(1007) }
-    guard let payload = json.get(document, "/payload") else { message.close(1008) }
-    guard let field = json.get(payload, "/name") else { message.close(1008) }
-    guard let name = json.string(field) else { message.close(1003) }
-    message.forward("hello " + name)
-}
-// The chain folds at compile time into a root-relative path, capped at 8192 bytes.
-// Four guards and 32 condition nodes remain the limit. Typed scalar aliases cannot
-// be containers, and a binding is unavailable in its own failure branch.
-
-// Compare optional JSON scalar extraction directly, avoiding a typed-binding guard.
-// Sources must be validated document/selected Json aliases. Both operand orders,
-// ==/!= with a matching String/Bool/Int literal or nil, and !/&&/|| are supported.
-return websocket(chat) { message in
-    guard let document = json.parse(message.text) else { message.close(1007) }
-    guard let payload = json.get(document, "/payload") else { message.close(1008) }
-    guard let field = json.get(payload, "/enabled") else { message.close(1008) }
-    guard json.bool(field) == false else { message.drop() }
-    message.forward()
-}
-// json.string(field) == "subscribe" and json.int(field) == 42 work the same way.
-// Failed extraction is nil: == false requires actual false; != false also matches
-// nil. A parse/missing-field guard still fails first. json.int accepts only exact
-// signed i64 integer tokens; fraction/exponent/overflow is nil. String escapes and
-// comparisons retain the existing byte semantics. ==/!= nil tests extraction success.
-// Bare optional Bool/!json.bool(field), direct integer ordering, mismatched literal
-// types and call-to-call comparisons reject. Unwrap an alias for ordering, string
-// predicates or forwarding. The four-guard / 32-condition-node limits remain.
-
-// Forward one previously guard-unwrapped JSON string alias, optionally with fixed
-// UTF-8 affixes. The value is decoded again only when this rewrite is selected.
-return websocket(chat) { message in
-    guard let document = json.parse(message.text) else { message.close(1007) }
-    guard let field = json.get(document, "/name") else { message.close(1008) }
-    guard let name = json.string(field) else { message.close(1003) }
-    message.forward("hello " + name + "!")
-}
-// json.string(document) may select a root string. A rewrite can use one previously
-// successful String alias or one message.text source, never both or two aliases.
-// Document/selected-value and other typed aliases, calls, and dynamic paths are
-// rejected. Fixed literals and compile-time route strings may surround the source.
-// Binary input may produce Text from a JSON string; message.text still requires Text.
-// The selected value is parsed and copied synchronously into the existing output
-// slice; no borrowed JSON document/string survives the callback.
-
-// Preserve a JSON number's exact source lexeme as a typed text alias. No float or
-// Int conversion occurs: -0, 1.2300e+999 and values larger than i64 stay unchanged.
-return websocket(chat) { message in
-    guard let document = json.parse(message.text) else { message.close(1007) }
-    guard let field = json.get(document, "/amount") else { message.close(1008) }
-    guard let amount = json.numberText(field) else { message.close(1003) }
-    message.forward("amount=" + amount)
-}
-// numberText aliases support literal string comparisons and existing string
-// predicates, not numeric comparisons, arithmetic or alias-to-alias comparisons.
-// One prior alias may be the dynamic source with fixed UTF-8 affixes; its exact token
-// is copied synchronously to the owned output slice. Binary JSON also emits Text.
-
-// Bind the ordinary compact serialization of any JSON value, then use it for both
-// a literal predicate and a fixed-affix rewrite.
-return websocket(chat) { message in
-    guard let document = json.parse(message.text) else { message.close(1007) }
-    guard let encoded = json.stringify(document) else { message.close(1003) }
-    guard encoded.contains("\"ok\"") else { message.drop() }
-    message.forward("payload=" + encoded)
-}
-// Strings and object keys are escaped as JSON text; member order and number lexemes
-// are preserved. Serialization is bounded, and the result is copied to owned output
-// before asynchronous sending.
-
-// JSON Bool fields are type-checked; false is a successfully unwrapped value.
-return websocket(chat) { message in
-    guard let document = json.parse(message.text) else { message.close(1007) }
-    guard let field = json.get(document, "/enabled") else { message.close(1008) }
-    guard let enabled = json.bool(field) else { message.close(1003) }
-    guard enabled else { message.drop() }
-    message.forward()
-}
-// A Bool alias supports bare truth, !, && / ||, and == / != with a Bool literal
-// on either side. Comparison leaves are limited to the bare alias and one literal.
-// json.bool(document) checks a root Bool. Missing/null/non-Bool values fail binding.
-
-// Signed 64-bit JSON integer range checks use exact integer tokens.
-return websocket(chat) { message in
-    guard let document = json.parse(message.text) else { message.close(1007) }
-    guard let field = json.get(document, "/count") else { message.close(1008) }
-    guard let count = json.int(field) else { message.close(1003) }
-    guard count >= 1 && count <= 1000 else { message.drop() }
-    message.forward()
-}
-// json.int(document) checks a root integer. Integer aliases compare to Int literals
-// with == / != / < / <= / > / >= in either order. No arithmetic or alias comparison;
-// fractions, exponents and values outside signed i64 fail the binding.
-
-// Apply both kind and cardinality checks to a root array within four guards.
-return websocket(chat) { message in
-    guard let document = json.parse(message.text) else { message.close(1007) }
-    guard let tag = json.kind(document) else { message.close(1003) }
-    guard let amount = json.count(document) else { message.close(1003) }
-    guard tag == "array" && amount <= 32 else { message.drop() }
-    message.forward()
-}
-// json.kind(document) also checks the root and binds one of null/boolean/number/
-// string/array/object; JSON null is a successful "null" kind. Compare its alias
-// only to string literals with == / !=. json.count checks direct array elements
-// or object members; empty containers bind zero. Its Int literals must fit i32.
-// Selected-field chains need json.get too, so only one complete selected-field
-// kind/count check fits under the four source-guard limit.
-
-// Fixed text replacement in the final verdict or a guard branch. Empty literals
-// emit empty Text messages; binary input becomes Text. Literals must fit maxMessageSize
-// and the single-slice cap. General expressions/interpolation remain unsupported.
-return websocket(chat, maxMessageSize: 4kb) { message in
-    guard message.fromClient && message.isText else { message.forward() }
-    message.forward("message replaced")
-}
-
-// Fixed Binary replacement reuses exact-byte literals. It accepts arbitrary bytes,
-// including NUL and invalid UTF-8, and emits Binary even for Text input.
-return websocket(chat, maxMessageSize: 4kb) { message in
-    guard message.fromClient else { message.forward() }
-    guard message.len != 0 else { message.forward(b"") }
-    message.forward(b"\x00\xff")
-}
-// A replacement must be one adjacent b"..." literal, at most 4096 decoded bytes,
-// and fit maxMessageSize. Supported escapes: \n, \r, \t, \\, \" and \xHH (NUL is \x00).
-// No byte concatenation, variables, Unicode escapes or interpolation are accepted.
-// Guard branches choose independent Text/Binary replacements; bare forward()
-// preserves the original type and payload. Invalid Text input is still rejected.
-
-// Terminate mode defaults to 16370 bytes (16 KiB slice minus the maximum 14-byte
-// WebSocket header). Explicit `maxMessageSize` values must be 1b through 16370b;
-// values such as 16kb or 64kb are rejected because larger-message buffering is not implemented.
-
-// Add fixed UTF-8 affixes around one complete Text message, using String +.
-// Parentheses, concatenated literals, and compile-time-known route let strings
-// (including aliases) are accepted, with at most 32 expression nodes.
-// Request-derived strings, optional values, and calls are rejected.
-// At most one message.text reference may appear; repeated references/interpolation reject.
-// Binary messages selected for this operation fail the tunnel; guard the opcode first.
-// The complete rewritten output must fit maxMessageSize and the single-slice cap.
-let label = "audit:"
-return websocket(chat, maxMessageSize: 4kb) { message in
-    guard message.isText else { message.forward() }
-    guard !message.text.hasPrefix("audit:") else { message.forward("[" + message.text + "]") }
-    message.forward(label + message.text)
-}
-
-// Each guard may choose its own replacement; the first failing guard wins.
-return websocket(chat) { message in
-    guard message.text != "ping" else { message.forward("pong") }
-    guard message.text != "hello" else { message.forward("welcome") }
-    message.forward()
-}
-
-// Guard branches can choose independent close codes and fixed UTF-8 reasons.
-// close(code) uses an empty reason; a bare close() keeps the route's default policy.
-return websocket(chat) { message in
-    guard message.len <= 4096 else { message.close(1009, "message too large") }
-    guard !message.text.contains("secret") else { message.close(1008, "policy violation") }
-    message.forward()
-}
-
-// Close with a status and fixed UTF-8 reason (also accepted in guard branches).
-// Reason length is at most 123 UTF-8 bytes; empty reasons and NUL are supported.
-// Handler closes send the configured code/reason to both peers. Peer closes
-// retain their original forwarding and normal-closure echo behavior.
-return websocket(chat) { message in
-    guard message.fromClient && message.text.contains("secret") else { message.forward() }
-    message.close(1008, "policy violation")
-}
-
-// Transparent proxy: no application message processing.
+// WebSocket is an HTTP/1.1-upgraded protocol. Bare websocket(chat) is opaque
+// passthrough; a trailing body opts into complete application-message inspection.
+// No frame binding, opcode, FIN, masking, continuation or ping/pong API is exposed.
 return websocket(chat)
-// Message handlers above see complete Text/Binary payloads. No frame binding,
-// wire opcode, FIN, mask, continuation, or ping/pong API is exposed.
+
+// `message` is a borrowed WebSocketMessage (any parameter name is valid).
+// fromClient/isText/isBinary: bool; len: i32; text: str; payload: Bytes.
+// Text is validated UTF-8 before dispatch. Binary can contain arbitrary bytes;
+// text is still its raw byte view, not an assertion that Binary is UTF-8.
+// payload.count / payload.isEmpty measure bytes; no implicit Bytes/String cast.
+// kind: WebSocketMessageKind.text / .binary; direction:
+// WebSocketDirection.clientToUpstream / .upstreamToClient. Closed domains share
+// ordinary Eq, matching, contextual case names and coverage checks with HTTP/helpers.
+func fromDownstream(_ direction: WebSocketDirection) -> bool {
+    match direction {
+        .clientToUpstream => true
+        .upstreamToClient => false
+    }
+}
+func allowedMessage(_ message: WebSocketMessage) -> bool =>
+    !fromDownstream(message.direction) || (message.isText && message.len <= 2048)
+
+// The route runs ordinary HTTP admission before its final top-level websocket:
+// Request lets/guards/helpers, JSON/regex, mutations, decorators and chain-before
+// keep normal typing/evaluation/limits. Rejection opens no WebSocket upstream.
+// chain-after Response headers apply to rejection and accepted 101, with ordinary
+// HTTP wait/for restrictions. Handshake-critical headers cannot be invalidated.
+route GET "/ws" {
+    guard let origin = req.uniqueHeader("Origin") else { return 403 }
+    guard origin == "https://allowed.example" else { return 403 }
+    return websocket(chat, maxMessageSize: 4kb) { message in
+        guard allowedMessage(message) else { message.drop() }
+        message.forward()
+    }
+}
+// Runtime HTTP bindings cannot escape into callbacks. Proven scalar/String/Bytes
+// constants can cross admission. Request/Response reads, mutations and HTTP yields
+// are unavailable after upgrade, including hidden reads through helpers or dead arms.
+// Whole message/connection/close values are invocation-borrowed: project fields;
+// do not compare/publish/store them or retain views for another callback.
+
+// General callbacks use shared MIR/RIR and the ordinary helper analyzer:
+// arithmetic/bitwise/comparison, immutable lets, guards, if/else, if let, closed
+// matches, optional/error carriers, String/Bytes, JSON and digest/HMAC operations.
+// Selected arms are lazy; reached initializers and actual arguments run once,
+// including unused producers. False, zero, empty String and JSON null stay present.
+// guard let / if let / .or(default) keep ordinary recovery. Named-error guard match
+// keeps HTTP's final-wildcard rule. Unwrap before using a plain success value.
+// uuid() retains the ordinary direct-let initializer and optional unwrap contract.
+// Ordinary parser/local bounds apply; recipe tables do not cap general callbacks.
+// String + / hasPrefix / hasSuffix / contains require unwrapped str; isEmpty is a
+// property. Construction uses bounded arena storage. Allocation failure stops work.
+// matches(re"...") uses Vectorscan full-match; reached scan failures close before
+// Boolean negation can turn them into acceptance. No second regex engine is used.
+
+// Ordinary optional JSON APIs include parse/get/at, scalar/kind/count/keys,
+// exact numberText, stringify, member/set/remove/append, value construction and
+// concrete struct decoding. Runtime RFC 6901 pointers and independent Json values
+// are supported. JSON keeps its 8192-byte / 2048-node / depth-64 parser limits.
+// Locals preserve decoded/edited values across later JSON operations in the callback.
+func messageLabel(_ message: WebSocketMessage) -> str {
+    guard let document = json.parse(message.text) else { nil }
+    guard let name = json.string(document) else { nil }
+    "hello:" + name
+}
+return websocket(chat) { message in
+    if let label = messageLabel(message) { message.forward(label) }
+    else { message.drop() }
+}
+// General source interpolation, mutable local syntax and Bytes slicing/concatenation
+// are not introduced here. Non-response statement effects inside ordinary helpers
+// remain unsupported in HTTP and WebSocket alike. No alternate WS-only syntax.
+
+// connection: borrowed WebSocketConnection. remoteAddr: IP, remotePort: i32,
+// isTls: bool and subprotocol: str describe the downstream client in BOTH directions.
+// The port is host order. subprotocol is the actual selected token, including
+// optional peer selection without a required route token; none is empty String.
+// IP can be passed through ordinary helper signatures, just like other scalar fields.
+// Cache<IP,i64> reads and bare writes use the callback shard. Writes run at their
+// reached statement (including after guards/inside selected branches), not as a
+// prelude; set is not an expression. Inferred counter types work; explicit user
+// i64 annotations are absent. Cache is lossy state, not durable session storage.
+let messages = Cache<IP, i64>(capacity: 1024)
+return websocket(chat) { message in
+    let key = message.connection.remoteAddr
+    let count = messages.get(key).or(0)
+    guard count < 100 else { message.drop() }
+    messages.set(key, count + 1)
+    message.forward()
+}
+// Compiled cache access keeps declaration identity across registry reorder/removal.
+// time.nowMicros() latches once per invocation and refreshes for the next message.
+
+// Verdicts terminate each message path. Bare forward preserves kind and payload;
+// a str argument emits Text, a Bytes argument emits Binary. Dynamic values can
+// come from literals, payloads, aliases, optional bindings or ordinary helpers.
+return websocket(chat) { message in
+    if message.fromClient { message.forward("echo:" + message.text) }
+    else { message.forward(message.payload) }
+}
+// message.forward(b"\x00\xff") emits exact Binary octets, including NUL/invalid UTF-8.
+// Byte literals use adjacent b"...", at most 4096 decoded bytes, with \n/\r/\t,
+// \\, \" and \xHH escapes; Unicode escapes/interpolation are unavailable in Bytes.
+// message.drop() discards one complete application message.
+// close(), close(code), close(code, reason) accept plain runtime i32/str values.
+// Status must be valid on wire and reason <=123 UTF-8 bytes. Invalid runtime
+// arguments close with 1002; invalid Text with 1007; oversized output with 1009.
+// Known invalid literals fail compilation. Codes 1005/1006 are observations only.
+// Output is copied before asynchronous I/O; close reasons own separate drain bytes.
+// Backpressure precedes another callback. io_uring output survives target/cancel
+// retirement in either order; callback/JSON/input views never become send owners.
+
+// maxMessageSize: explicit 1b...262130b; default 16370 bytes. This bounds complete
+// decoded input and rewritten output. Large routes atomically acquire four existing
+// 256 KiB bulk message/output buffers; exhaustion cannot silently lower the limit.
+// Both Linux backends stream I/O slices into complete-message storage.
+// Optional subprotocol: "chat" requires that client offer before upstream connect,
+// restricts the backend offer to it and requires selection. Without it, selection
+// may be one offered token or absent. Both named arguments are optional/unique.
+return websocket(chat, subprotocol: "chat", maxMessageSize: 64kb) { message in
+    message.forward()
+}
+// Terminate admission validates GET/HTTP/1.1, one nonempty Host, exact Upgrade/
+// Connection tokens, canonical 16-byte Base64 key and WebSocket Version 13. One
+// Content-Length: 0 is allowed; positive/duplicate length, TE/Transfer-Encoding and
+// Expect fail with 400. A canonical decimal version 0...255 other than 13 gets 426
+// with version 13/Upgrade/Connection headers. Malformed versions fail with 400. Origin
+// remains explicit policy. A backend 101 needs matching Accept, complete headers,
+// valid selected protocol and independent extension agreement before publication.
+// Non-101 stays ordinary HTTP. Coalesced early frames are retained until acceptance.
+
+// RFC 7692 permessage-deflate is independently negotiated with each leg, with no
+// new DSL option. The callback sees decoded bytes. Windows 8...15 and received
+// context takeover (including across dropped messages) are supported. Controls
+// and continuations cannot set RSV1. Output compresses only when smaller and bounded;
+// incompressible output falls back without lowering the message limit. Compressed
+// wire work is limited separately to max+max/8+1024 bytes per message. Before 101,
+// each negotiated leg reserves one 256 KiB codec slice in addition to large-route
+// data buffers. The private pinned static C codec uses existing pools, no heap.
+
+// Swift multiple trailing closures expose optional lifecycle entries.
+return websocket(chat) { message in
+    message.forward()
+} onOpen: { connection in
+    guard connection.remotePort > 0 else { connection.close(1008, "peer port") }
+} onClose: { closed in
+    let peer: IP = closed.connection.remoteAddr
+    let code: i32 = closed.code
+    let reason: str = closed.reason
+    let clean: bool = closed.wasClean
+}
+// Open runs after accepted 101/resources, before buffered messages; it can close
+// but cannot forward data. Close runs exactly once for an opened session before
+// config/TLS/resource teardown, including on failure/timeout, and cannot reopen it.
+// Failed admission/upgrade has neither event. Bare return ends a hook; fallthrough
+// is void. Ordinary helper/guard/if/match/optional/error/Cache/time semantics apply.
+// WebSocketClose.code/reason are the first downstream peer Close; upstreamCode/
+// upstreamReason are the other leg. Empty Close is 1005, absent is 1006; wasClean
+// requires both complete WebSocket handshakes. Local policy remains independent.
+// Closing preserves peer payloads, acknowledges legs independently, handles controls
+// locally and discards bounded application data without decoder/callback dispatch.
+// One fixed approximately 5s deadline bounds closing/EOF drain; progress cannot
+// extend it. Quiet healthy sessions have no idle timeout. TLS drains close_notify
+// before downstream FIN while allowing the other leg to finish independently.
+// HTTP/2 Extended CONNECT is outside this implementation scope.
 
 // HTTP calls — native syntax, async is invisible (no await anywhere)
 let res = post http://orders/create {
@@ -1295,6 +1201,16 @@ route GET "/api" {
   `wait`/`wait any` reject every cache op, including ops textually before the
   wait; branch writes in static-for routes remain unsupported. Per-shard state:
   effective limits ≈ limit × shard count.
+- Synchronous WebSocket callbacks share this Cache API, including pure read
+  predicates accepting `IP`. Counter values keep inferred `i64` types; explicit
+  user `i64` annotations remain unsupported. Bare writes execute at their reached source
+  position, after successful guards and only on selected branches. Cache remains
+  lossy per-shard state; it does not retain connection/session objects.
+- Compiled reads/writes carry their declaration name identity across hot reload.
+  A moved declaration is resolved in the current registry snapshot; a removed
+  declaration reads as a miss and ignores writes. Old handlers cannot address
+  another named cache merely because its slot was reused. Moving/resizing a
+  declaration may discard entries, as with other cache eviction.
 
 ## Constant-time equality
 
@@ -1376,7 +1292,8 @@ not provided. Runnable example: [math.rut](../examples/math.rut).
 ```
 string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
          s.replace/split/slice s.matches(re"") s.match(re"")
-         ⏳ s.hasPrefix/hasSuffix/trimPrefix/trimSuffix
+         s.hasPrefix(str) s.hasSuffix(str)
+         ⏳ s.trimPrefix/trimSuffix
 hash:    md5/sha1/sha224/sha256/sha384/sha512(data) -> str? (lowercase hex)
          hmacMd5/hmacSha1/hmacSha224/hmacSha256/hmacSha384/hmacSha512(key, data) -> str?
          ⏳ fnv32 fnv64
@@ -1394,7 +1311,7 @@ jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
 time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
-         uses in one request see the same value)
+         uses in one request or message callback see the same value)
          — now()/time(s)/Duration arithmetic still ⏳
 math:    max(a, b) min(a, b) (integer builtins; imported lib/math.rut also
          provides generic math.min/max/clamp)

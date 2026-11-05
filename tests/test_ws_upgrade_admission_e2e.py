@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import zlib
 
 
 REQUEST = (
@@ -42,10 +43,610 @@ UNSOLICITED_PROTOCOL_RESPONSE = (
 )
 
 
+def wire_frame(opcode, payload, masked=False, fin=True, compressed=False):
+    key = b"\x12\x34\x56\x78" if masked else b""
+    size = len(payload)
+    length = bytes((size,)) if size < 126 else (b"\x7e" + size.to_bytes(2, "big") if size <= 65535 else b"\x7f" + size.to_bytes(8, "big"))
+    header = bytes(((0x80 if fin else 0) | (0x40 if compressed else 0) | opcode, length[0] | (0x80 if masked else 0))) + length[1:]
+    body = bytes(value ^ key[index & 3] for index, value in enumerate(payload)) if masked else payload
+    return header + key + body
+
+
 def masked_frame(opcode, payload):
-    key = b"\x12\x34\x56\x78"
-    masked = bytes(value ^ key[index & 3] for index, value in enumerate(payload))
-    return bytes((0x80 | opcode, 0x80 | len(payload))) + key + masked
+    return wire_frame(opcode, payload, masked=True)
+
+
+GENERAL_JSON_DECLARATIONS = r"""
+func jsonPath(_ client: bool) -> str { if client { "/name" } else { "/reply" } }
+struct JsonPayload { label: str count: i32 }
+"""
+GENERAL_JSON_HANDLER = r"""
+return websocket(ws) { msg in
+    let path = jsonPath(msg.fromClient)
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    guard let selected = json.get(root, path) else { msg.close(1008) }
+    guard let text = json.string(selected) else { msg.close(1003) }
+    guard let metadata = json.value({ side: msg.fromClient, length: msg.len }) else { msg.close(1011) }
+    guard let edited = json.member(root, "meta", metadata) else { msg.close(1008) }
+    guard let output = json.stringify(edited) else { msg.close(1011) }
+    if msg.isText { msg.forward(text) } else { msg.forward(output) }
+}
+"""
+
+
+def general_json_exchange(client, peer):
+    import json
+
+    first_payload = b'{"name":"a\\u0000b"}'
+    first = bytearray(masked_frame(2, first_payload[:7]))
+    first[0] &= 0x7f
+    client.sendall(first + masked_frame(9, b"p") + masked_frame(0, first_payload[7:]) +
+                   masked_frame(1, b'{"name":"second"}'))
+    if recv_client_frame(peer) != (9, b"p", True):
+        raise AssertionError("general JSON handler consumed a control frame")
+    opcode, payload, masked = recv_client_frame(peer)
+    if opcode != 1 or not masked or json.loads(payload) != {
+            "name": "a\0b", "meta": {"side": True, "length": len(first_payload)}}:
+        raise AssertionError(f"dynamic JSON edit output changed: {payload!r}")
+    if recv_client_frame(peer) != (1, b"second", True):
+        raise AssertionError("dynamic JSON path selected the wrong client field")
+    reply = b'{"reply":"back"}'
+    peer.sendall(bytes((0x81, len(reply))) + reply)
+    if recv_client_frame(client) != (1, b"back", False):
+        raise AssertionError("dynamic JSON path selected the wrong server field")
+    client.sendall(masked_frame(2, b"{"))
+    if recv_client_frame(client) != (8, b"\x03\xef", False) or \
+            recv_client_frame(peer) != (8, b"\x03\xef", True):
+        raise AssertionError("malformed JSON did not run its explicit 1007 close")
+
+
+GENERAL_REGEX_HANDLER = r"""
+guard req.path.matches(re"/.*") else { return 403 }
+return websocket(ws) { msg in
+    let path = jsonPath(msg.fromClient)
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    guard let selected = json.get(root, path) else { msg.drop() }
+    guard let text = json.string(selected) else { msg.drop() }
+    let allowed = text.matches(re"a.*")
+    guard allowed else { msg.drop() }
+    msg.forward(text)
+}
+"""
+
+
+def general_regex_exchange(client, peer):
+    first = b'{"name":"a\\u0000b"}'
+    fragment = bytearray(masked_frame(2, first[:7]))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"p") + masked_frame(0, first[7:]) +
+                   masked_frame(1, b'{"name":"bad"}') + masked_frame(1, b'{"name":"answer"}'))
+    for expected in ((9, b"p", True), (1, b"a\0b", True), (1, b"answer", True)):
+        actual = recv_client_frame(peer)
+        if actual != expected:
+            raise AssertionError(f"general regex output: {actual=!r}, {expected=!r}")
+    bad, good = b'{"reply":"bad"}', b'{"reply":"answer"}'
+    peer.sendall(bytes((0x81, len(bad))) + bad + bytes((0x82, len(good))) + good)
+    if recv_client_frame(client) != (1, b"answer", False):
+        raise AssertionError("general regex selected the wrong upstream JSON text")
+    client.sendall(masked_frame(1, b"{"))
+    if recv_client_frame(client) != (8, b"\x03\xef", False) or \
+            recv_client_frame(peer) != (8, b"\x03\xef", True):
+        raise AssertionError("invalid JSON preceding general regex did not close")
+
+
+TYPED_JSON_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    guard let value = json.decode(JsonPayload, root) else { msg.close(1003) }
+    guard value.count >= 0 else { msg.close(1008) }
+    guard let encoded = json.value(value) else { msg.close(1011) }
+    guard let output = json.stringify(encoded) else { msg.close(1011) }
+    msg.forward(output)
+}
+"""
+
+
+def typed_json_exchange(client, peer):
+    import json
+
+    payloads = (b'{"label":"a\\u0000b","count":3}', b'{"label":"second","count":0}')
+    client.sendall(b"".join(masked_frame(2, payload) for payload in payloads))
+    for expected in ({"label": "a\0b", "count": 3}, {"label": "second", "count": 0}):
+        opcode, payload, masked = recv_client_frame(peer)
+        if opcode != 1 or not masked or json.loads(payload) != expected:
+            raise AssertionError(f"typed JSON round trip changed: {payload!r}")
+    bad = b'{"label":true,"count":0}'
+    peer.sendall(bytes((0x82, len(bad))) + bad)
+    if recv_client_frame(client) != (8, b"\x03\xeb", False) or \
+            recv_client_frame(peer) != (8, b"\x03\xeb", True):
+        raise AssertionError("typed JSON failure did not run its explicit 1003 close")
+
+
+JSON_LIFETIME_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.close(1007) }
+    guard let first = json.string(root) else { msg.close(1003) }
+    guard let other = json.parse("\"other\"") else { msg.close(1011) }
+    guard let second = json.string(other) else { msg.close(1011) }
+    guard first != second else { msg.drop() }
+    msg.forward(first)
+}
+"""
+
+
+def json_lifetime_exchange(client, peer):
+    messages = ((b'"a\\u0000b"', b"a\0b"), (b'"next"', b"next"))
+    client.sendall(b"".join(masked_frame(2, encoded) for encoded, _ in messages))
+    for _, expected in messages:
+        if recv_client_frame(peer) != (1, expected, True):
+            raise AssertionError("another JSON operation overwrote an earlier decoded value")
+    peer.sendall(b'\x82\x07"reply"')
+    if recv_client_frame(client) != (1, b"reply", False):
+        raise AssertionError("server JSON scratch survived with stale data")
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    if recv_client_frame(peer) != (8, b"\x03\xe8", True):
+        raise AssertionError("general JSON callback changed a close control")
+
+
+HASH_OUTPUT_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        guard let digest = sha256(msg.text) else { msg.close() }
+        msg.forward(digest)
+    } else {
+        if let digest = hmacSha256("key", msg.text) { msg.forward(digest) }
+        else { msg.close() }
+    }
+}
+"""
+
+
+def hash_output_exchange(client, peer):
+    import hashlib
+    import hmac
+
+    messages = (b"a\0b", b"\xff", b"")
+    client.sendall(b"".join(masked_frame(2, payload) for payload in messages))
+    for payload in messages:
+        expected = (1, hashlib.sha256(payload).hexdigest().encode(), True)
+        actual = recv_client_frame(peer)
+        if actual != expected:
+            raise AssertionError(f"message hash: {actual=!r}, {expected=!r}")
+    peer.sendall(b"\x82\x03a\0b" + b"\x89\x01p" + b"\x82\x00")
+    for expected in (
+            (1, hmac.new(b"key", b"a\0b", hashlib.sha256).hexdigest().encode(), False),
+            (9, b"p", False),
+            (1, hmac.new(b"key", b"", hashlib.sha256).hexdigest().encode(), False)):
+        actual = recv_client_frame(client)
+        if actual != expected:
+            raise AssertionError(f"message HMAC: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    if recv_client_frame(peer) != (8, b"\x03\xe8", True):
+        raise AssertionError("hash callback altered control close")
+
+
+DYNAMIC_OUTPUT_DECLARATIONS = r"""
+func outputBytes(_ m: WebSocketMessage) -> Bytes {
+    if m.len == 3 { m.payload } else { b"\x00\xff" }
+}
+func outputText(_ m: WebSocketMessage) -> str {
+    if m.isBinary { m.text } else { "answer" }
+}
+"""
+DYNAMIC_OUTPUT_HANDLER = r"""
+return websocket(ws, maxMessageSize: 128b) { msg in
+    let token = uuid()
+    guard let value = token else { msg.close() }
+    if msg.fromClient { msg.forward(outputBytes(msg)) }
+    else {
+        if msg.len == 3 { msg.close(1000 + msg.len, msg.text) }
+        else { msg.forward(outputText(msg)) }
+    }
+}
+"""
+
+
+def dynamic_output_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"dynamic output: {actual=!r}, {expected=!r}")
+
+    # Message outputs share callback scratch but must own separate send bytes.
+    client.sendall(masked_frame(1, b"one") + masked_frame(2, b"four") + masked_frame(1, b"two"))
+    for payload in (b"one", b"\0\xff", b"two"):
+        expect(peer, (2, payload, True))
+    fragment = bytearray(masked_frame(2, b"\xff"))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"PING") + masked_frame(0, b"\0x"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xff\0x", True))
+    peer.sendall(b"\x81\x04text" + b"\x82\x04a\0bc")
+    expect(client, (1, b"answer", False))
+    expect(client, (1, b"a\0bc", False))
+    peer.sendall(b"\x82\x03bye")
+    expect(client, (8, b"\x03\xebbye", False))
+    expect(peer, (8, b"\x03\xebbye", True))
+
+
+DYNAMIC_BOUND_HANDLER = r"""
+return websocket(ws, maxMessageSize: 8b) { msg in
+    let token = uuid()
+    guard let value = token else { msg.close() }
+    msg.forward(value)
+}
+"""
+
+
+def dynamic_bound_exchange(client, peer):
+    client.sendall(masked_frame(1, b"x"))
+    if recv_client_frame(client) != (8, b"\x03\xf1", False):
+        raise AssertionError("oversized dynamic output did not close with 1009")
+    if recv_client_frame(peer) != (8, b"\x03\xf1", True):
+        raise AssertionError("oversized dynamic output did not close upstream")
+
+
+DYNAMIC_UTF8_HANDLER = r"""
+return websocket(ws) { msg in
+    let token = uuid()
+    guard let value = token else { msg.close() }
+    msg.forward(msg.text)
+}
+"""
+
+
+def dynamic_utf8_exchange(client, peer):
+    client.sendall(masked_frame(2, b"\xff"))
+    if recv_client_frame(client) != (8, b"\x03\xf3", False):
+        raise AssertionError("invalid dynamic Text output did not close with 1011")
+    if recv_client_frame(peer) != (8, b"\x03\xf3", True):
+        raise AssertionError("invalid dynamic Text output did not close upstream")
+
+
+STRING_HELPER_DECLARATIONS = r"""
+func decorated(_ text: str) -> str {
+    let value = text + "!"
+    value + value
+}
+func decodedText(_ text: str) -> str {
+    guard let root = json.parse(text) else { nil }
+    json.string(root)
+}
+"""
+STRING_HELPER_HANDLER = r"""
+return websocket(ws, maxMessageSize: 32b) { msg in
+    if !msg.fromClient { msg.forward("skip") }
+    guard let text = decodedText(msg.text) else { msg.close(1007) }
+    guard text.hasPrefix("a") && text.hasSuffix("z") && text.contains("\0") else { msg.drop() }
+    msg.forward(decorated(text))
+}
+"""
+
+
+def string_helper_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"String helper: {actual=!r}, {expected=!r}")
+
+    client.sendall(masked_frame(2, b'"a\\u0000z"') +
+                   masked_frame(1, b'"drop"') + masked_frame(2, b'"ab\\u0000z"'))
+    expect(peer, (1, b"a\0z!a\0z!", True))
+    expect(peer, (1, b"ab\0z!ab\0z!", True))
+    fragment = bytearray(masked_frame(2, b'"a'))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"PING") + masked_frame(0, b'\\u0000z"'))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"a\0z!a\0z!", True))
+    # Early direction return must skip JSON parsing of invalid Binary data.
+    peer.sendall(b"\x82\x01\xff\x81\x00")
+    expect(client, (1, b"skip", False))
+    expect(client, (1, b"skip", False))
+    # Input fits; the repeated dynamic result exceeds the configured output bound.
+    client.sendall(masked_frame(2, b'"a' + b'x' * 15 + b'\\u0000z"'))
+    expect(client, (8, b"\x03\xf1", False))
+    expect(peer, (8, b"\x03\xf1", True))
+
+
+NOMINAL_MATCH_DECLARATIONS = r"""
+func kindName(_ kind: WebSocketMessageKind) -> str {
+    match kind {
+        .text => "T"
+        .binary => "B"
+    }
+}
+func directionName(_ direction: WebSocketDirection) -> str {
+    match direction {
+        .clientToUpstream => "client"
+        .upstreamToClient => "server"
+    }
+}
+func classified(_ text: str) -> WebSocketMessageKind {
+    let unused = sha256(text)
+    if text == "t" { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+"""
+NOMINAL_MATCH_HANDLER = r"""
+return websocket(ws) { msg in
+    match classified(msg.text) {
+        .text => msg.forward(directionName(msg.direction) + kindName(msg.kind) + "T")
+        .binary => msg.forward(directionName(msg.direction) + kindName(msg.kind) + "B")
+    }
+}
+"""
+
+
+def nominal_match_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"nominal match: {actual=!r}, {expected=!r}")
+
+    client.sendall(masked_frame(1, b"t") + masked_frame(2, b"\xff"))
+    expect(peer, (1, b"clientTT", True))
+    expect(peer, (1, b"clientBB", True))
+    fragment = bytearray(masked_frame(2, b""))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"PING") + masked_frame(0, b"t"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"clientBT", True))
+    peer.sendall(b"\x81\x01t\x82\x01t\x81\x00")
+    expect(client, (1, b"serverTT", False))
+    expect(client, (1, b"serverBT", False))
+    expect(client, (1, b"serverTB", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+CACHE_DECLARATIONS = r"""
+let counts = Cache<IP, i64>(capacity: 64)
+func canAcceptMessage(_ key: IP) -> bool => counts.get(key).or(0) < 2
+"""
+CACHE_HANDLER = r"""
+return websocket(ws) { msg in
+    let tick = time.nowMicros()
+    let unused = sha256(msg.text)
+    guard tick == time.nowMicros() else { msg.close(1011) }
+    guard msg.text != "skip" else { msg.drop() }
+    let key = msg.connection.remoteAddr
+    let before = counts.get(key).or(0)
+    if msg.fromClient {
+        guard canAcceptMessage(key) else { msg.drop() }
+        counts.set(key, before + 1)
+        msg.forward()
+    } else {
+        if before == 2 { msg.forward("two") } else { msg.forward("other") }
+    }
+}
+"""
+
+
+def cache_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"cache message: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(1, b"skip") + masked_frame(2, b"\x00\xff")
+                   + masked_frame(1, b"two") + masked_frame(1, b"blocked")
+                   + masked_frame(9, b"PING"))
+    expect(peer, (2, b"\x00\xff", True))
+    expect(peer, (1, b"two", True))
+    expect(peer, (9, b"PING", True))
+    peer.sendall(b"\x81\x03one\x82\x03two")
+    expect(client, (1, b"two", False))
+    expect(client, (1, b"two", False))
+
+
+CONNECTION_DECLARATIONS = r"""
+func clientPeer(_ connection: WebSocketConnection) -> IP => connection.remoteAddr
+func connectionLabel(_ connection: WebSocketConnection) -> str {
+    if connection.isTls { "tls:" + connection.subprotocol }
+    else { "plain:" + connection.subprotocol }
+}
+"""
+CONNECTION_HANDLER = r"""
+return websocket(ws) { msg in
+    let connection = msg.connection
+    guard connection.remotePort > 0 else { msg.close(1011) }
+    guard clientPeer(connection) == clientPeer(msg.connection) else { msg.close(1011) }
+    msg.forward(connectionLabel(connection))
+}
+"""
+
+
+def connection_exchange(client, peer, expected=b"plain:"):
+    for value in (b"one", b"two"):
+        client.sendall(masked_frame(1, value))
+        if recv_client_frame(peer) != (1, expected, True):
+            raise AssertionError("message connection metadata changed after upgrade")
+        peer.sendall(bytes((0x81, len(value))) + value)
+        if recv_client_frame(client) != (1, expected, False):
+            raise AssertionError("message direction changed downstream connection metadata")
+
+
+ERROR_VALUE_DECLARATIONS = r"""
+func resultValue(_ text: str) -> str {
+    let unused = sha256(text)
+    if text == "fail" { error(7) } else { if text == "nil" { nil } else { text } }
+}
+"""
+ERROR_VALUE_HANDLER = r"""
+return websocket(ws) { msg in
+    let result = resultValue(msg.text)
+    if msg.fromClient {
+        guard let plain = result else { msg.forward("absent") }
+        msg.forward(plain + "!")
+    } else { msg.forward(result.or("upstream fallback")) }
+}
+"""
+
+
+def error_value_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"error value: {actual=!r}, {expected=!r}")
+
+    client.sendall(b"".join(masked_frame(2, data) for data in (b"", b"fail", b"nil", b"ok")))
+    for expected in (b"!", b"absent", b"absent", b"ok!"):
+        expect(peer, (1, expected, True))
+    fragment = bytearray(masked_frame(2, b"f"))
+    fragment[0] &= 0x7f
+    client.sendall(fragment + masked_frame(9, b"PING") + masked_frame(0, b"ail"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"absent", True))
+    peer.sendall(b"\x81\x04fail\x81\x03nil\x81\x00\x81\x05again")
+    for expected in (b"upstream fallback", b"upstream fallback", b"", b"again"):
+        expect(client, (1, expected, False))
+    client.sendall(masked_frame(2, b"\xff"))
+    expect(client, (8, b"\x03\xf3", False))
+    expect(peer, (8, b"\x03\xf3", True))
+
+
+ERROR_FIELDS_DECLARATIONS = r"""
+func inspectedFields(_ input: str) -> str {
+    if input == "bad" { error(7, "bad input") }
+    else { if input == "nil" { nil } else { input } }
+}
+"""
+ERROR_FIELDS_HANDLER = r"""
+return websocket(ws) { msg in
+    let result = inspectedFields(msg.text)
+    let code = result.code
+    let reason = result.msg
+    if code == 7 {
+        guard reason == "bad input" else { msg.close(1011) }
+        msg.forward(reason)
+    } else {
+        guard let plain = result else { msg.forward("absent") }
+        msg.forward(plain)
+    }
+}
+"""
+
+
+def error_fields_exchange(client, peer):
+    for opcode, value, expected in ((2, b"bad", b"bad input"),
+                                    (1, b"ok", b"ok"),
+                                    (2, b"nil", b"absent"),
+                                    (1, b"", b"")):
+        client.sendall(masked_frame(opcode, value))
+        if recv_client_frame(peer) != (1, expected, True):
+            raise AssertionError("client error fields lost their carrier")
+        peer.sendall(bytes((0x80 | opcode, len(value))) + value)
+        if recv_client_frame(client) != (1, expected, False):
+            raise AssertionError("upstream error fields lost their carrier")
+
+
+ERROR_MATCH_DECLARATIONS = r"""
+variant MessageError { bad, empty }
+func inspected(_ input: str) -> str {
+    let unused = sha256(input)
+    if input == "bad" { error(MessageError.bad) }
+    else { if input == "" { error(MessageError.empty) } else { input } }
+}
+"""
+ERROR_MATCH_IMPLICIT_DECLARATIONS = ERROR_MATCH_DECLARATIONS.replace(
+    "variant MessageError { bad, empty }", "").replace("MessageError.", ".")
+ERROR_MATCH_HANDLER = r"""
+return websocket(ws) { msg in
+    let result = inspected(msg.text)
+    guard match result else {
+        .bad => msg.forward("bad input")
+        .empty => msg.close(1008, "empty")
+        _ => msg.close(1011)
+    }
+    guard let plain = result else { msg.close(1011) }
+    msg.forward(plain + "!")
+}
+"""
+
+
+def error_match_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"error match: {actual=!r}, {expected=!r}")
+
+    client.sendall(b"".join(masked_frame(2, data) for data in (b"ok", b"bad", b"again")))
+    for expected in (b"ok!", b"bad input", b"again!"):
+        expect(peer, (1, expected, True))
+    peer.sendall(b"\x81\x03bad\x81\x00")
+    expect(client, (1, b"bad input", False))
+    expect(client, (8, b"\x03\xf0empty", False))
+    expect(peer, (8, b"\x03\xf0empty", True))
+
+
+EAGER_BINDING_DECLARATIONS = r"""
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+"""
+EAGER_BINDING_HANDLER = r"""
+return websocket(ws) { msg in
+    let token = uuid()
+    guard let first = token else { msg.close() }
+    guard let second = token else { msg.close() }
+    guard same(first, second) else { msg.drop() }
+    msg.forward()
+}
+"""
+
+
+def eager_binding_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"eager message binding: {actual=!r}, {expected=!r}")
+
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, b"\0"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xff\0", True))
+    client.sendall(masked_frame(1, b"one") + masked_frame(2, b"two"))
+    expect(peer, (1, b"one", True))
+    expect(peer, (2, b"two", True))
+    peer.sendall(b"\x81\x05reply")
+    expect(client, (1, b"reply", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+GENERAL_DECLARATIONS = r"""
+func allowed(_ size: i32, _ client: bool) -> bool =>
+    !client || bitwise.and(size, 3) == 2
+"""
+GENERAL_HANDLER = r"""
+return websocket(ws) { msg in
+    let size = msg.payload.count + 1
+    guard size >= 1 else { msg.close() }
+    guard size <= 12 else { msg.close() }
+    guard allowed(size, msg.fromClient) else { msg.drop() }
+    if msg.isText && msg.len == 5 { msg.drop() } else { msg.forward() }
+}
+"""
+
+
+def general_expression_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"general message expression: {actual=!r}, {expected=!r}")
+
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, b""))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xff", True))
+    client.sendall(masked_frame(1, b"xx") + masked_frame(1, b"xxxxx") +
+                   masked_frame(2, b"\0\xffabc") + masked_frame(9, b"END"))
+    expect(peer, (2, b"\0\xffabc", True))
+    expect(peer, (9, b"END", True))
+    peer.sendall(b"\x82\x02\0\xff\x81\x05xxxxx\x8a\x03END")
+    expect(client, (2, b"\0\xff", False))
+    expect(client, (10, b"END", False))
+    client.sendall(masked_frame(1, b"xxxxxxxxxxxx"))
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
 
 
 BINARY_HANDLER = r'''
@@ -83,6 +684,328 @@ def binary_exchange(client, peer):
     client.sendall(masked_frame(1, b"CLOSE"))
     expect(peer, (8, b"\x03\xe8", True))
     expect(client, (8, b"\x03\xe8", False))
+
+
+
+OPTIONAL_VALUE_DECLARATIONS = r"""
+func safeName(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    json.string(root).or("fallback")
+}
+func bytesIfClient(_ msg: WebSocketMessage) -> Bytes {
+    if msg.fromClient { b"\x00\xff" }
+    else { if msg.isText { b"" } else { nil } }
+}
+"""
+
+OPTIONAL_DEFAULT_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let name = safeName(msg) else { msg.drop() }
+    guard !name.isEmpty else { msg.forward("empty") }
+    msg.forward("[" + name + "]")
+}
+"""
+
+OPTIONAL_BYTES_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let bytes = bytesIfClient(msg) else { msg.drop() }
+    msg.forward(bytes)
+}
+"""
+
+
+def optional_default_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"optional default: {actual=!r}, {expected=!r}")
+
+    payload = b'"a\\u0000b"'
+    first = bytearray(masked_frame(1, payload[:4]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, payload[4:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"[a\0b]", True))
+    client.sendall(masked_frame(1, b'""') + masked_frame(2, b"null") +
+                   masked_frame(1, b"broken") + masked_frame(1, b"false"))
+    expect(peer, (1, b"empty", True))
+    expect(peer, (1, b"[fallback]", True))
+    expect(peer, (1, b"[fallback]", True))
+    peer.sendall(b'\x82\x02""\x81\x040.00\x81\x06broken\x81\x04"ok"')
+    expect(client, (1, b"empty", False))
+    expect(client, (1, b"[fallback]", False))
+    expect(client, (1, b"[ok]", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def optional_bytes_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"optional Bytes: {actual=!r}, {expected=!r}")
+
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, b"\0"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\0\xff", True))
+    client.sendall(masked_frame(1, b"") + masked_frame(1, b"ok"))
+    expect(peer, (2, b"\0\xff", True))
+    expect(peer, (2, b"\0\xff", True))
+    # Absent server Binary is dropped; present empty Bytes emits an empty Binary.
+    peer.sendall(b"\x82\x01\xff\x81\x00\x81\x02ok")
+    expect(client, (2, b"", False))
+    expect(client, (2, b"", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+
+BORROWED_BINARY_DECLARATIONS = r"""
+func identity<T>(_ value: T) -> T => value
+func payload(_ msg: WebSocketMessage) -> Bytes => msg.payload
+func selectedBytes(_ msg: WebSocketMessage) -> Bytes {
+    if msg.text == "DROP" { nil } else { payload(msg) }
+}
+"""
+BORROWED_BINARY_HANDLER = r"""
+return websocket(ws) { msg in
+    guard msg.text != "CLOSE" else { msg.close(1000) }
+    guard msg.text != "PASS" else { msg.forward() }
+    guard let bytes = selectedBytes(msg) else { msg.drop() }
+    msg.forward(identity(bytes))
+}
+"""
+
+
+def borrowed_binary_exchange(client, peer):
+    def expect(sock, expected):
+        first, second = recv_exact(sock, 2)
+        size = second & 0x7f
+        if size == 126:
+            size = int.from_bytes(recv_exact(sock, 2), "big")
+        elif size == 127:
+            size = int.from_bytes(recv_exact(sock, 8), "big")
+        mask = recv_exact(sock, 4) if second & 0x80 else None
+        data = recv_exact(sock, size)
+        if mask:
+            data = bytes(v ^ mask[i & 3] for i, v in enumerate(data))
+        actual = (first & 0x0f, data, mask is not None)
+        if not first & 0x80 or actual != expected:
+            raise AssertionError(f"borrowed Binary: {actual=!r}, {expected=!r}")
+
+    def frame(opcode, data, masked, fin=True):
+        size = len(data)
+        length = bytes((size,)) if size < 126 else b"\x7e" + size.to_bytes(2, "big")
+        mask = b"\x12\x34\x56\x78" if masked else b""
+        if masked:
+            length = bytes((length[0] | 0x80,)) + length[1:]
+            data = bytes(v ^ mask[i & 3] for i, v in enumerate(data))
+        return bytes(((0x80 if fin else 0) | opcode,)) + length + mask + data
+
+    payload = b"A\0\xc3\xa9"
+    client.sendall(frame(1, payload[:2], True, False) + masked_frame(9, b"PING") +
+                   frame(0, payload[2:], True))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, payload, True))
+    client.sendall(masked_frame(1, b"") + masked_frame(2, b"\xff\0") +
+                   masked_frame(1, b"DROP") + masked_frame(1, b"PASS"))
+    expect(peer, (2, b"", True))
+    expect(peer, (2, b"\xff\0", True))
+    expect(peer, (1, b"PASS", True))
+    peer.sendall(frame(2, b"\xff", False, False) + frame(10, b"p", False) +
+                 frame(0, b"\0", False))
+    expect(client, (10, b"p", False))
+    expect(client, (2, b"\xff\0", False))
+    peer.sendall(frame(1, b"\xc3\xa9", False) + frame(1, b"DROP", False) +
+                 frame(2, b"PASS", False))
+    expect(client, (2, b"\xc3\xa9", False))
+    expect(client, (2, b"PASS", False))
+    # Max-size message crosses a receive slice and competes with a control frame
+    # for output space. No borrowed input may survive the asynchronous send.
+    large = b"\0\xff" * 8185
+    client.sendall(frame(2, large[:5000], True, False) + masked_frame(9, b"p") +
+                   frame(0, large[5000:], True))
+    expect(peer, (9, b"p", True))
+    expect(peer, (2, large, True))
+    wire = frame(2, large, False)
+    peer.sendall(wire[:5])
+    peer.sendall(wire[5:8192])
+    peer.sendall(wire[8192:])
+    expect(client, (2, large, False))
+    client.sendall(masked_frame(1, b"CLOSE"))
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
+
+BOOL_SELECT_DECLARATIONS = r"""
+func accepted(_ client: bool, _ text: bool, _ size: i32) -> bool {
+    if client { text && size <= 4 } else { !text || size == 0 }
+}
+func scanned(_ msg: WebSocketMessage) -> bool {
+    if msg.fromClient { msg.text.matches(re"^ok$") }
+    else { msg.text.matches(re"^server$") }
+}
+route POST "/shared" {
+    guard accepted(true, req.bodyBytes.isEmpty, req.bodyBytes.count) else { return 403 }
+    return 200
+}
+"""
+BOOL_SELECT_HANDLER = r"""
+return websocket(ws) { msg in
+    guard msg.text != "CLOSE" else { msg.close(1000) }
+    let allowed: bool = accepted(msg.fromClient, msg.isText, msg.payload.count)
+    guard !allowed == false else { msg.drop() }
+    msg.forward(msg.payload)
+}
+"""
+BOOL_SELECT_REGEX_HANDLER = r"""
+return websocket(ws) { msg in
+    guard msg.text != "CLOSE" else { msg.close(1000) }
+    guard scanned(msg) else { msg.drop() }
+    msg.forward()
+}
+"""
+
+
+def bool_select_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"Boolean selection: {actual=!r}, {expected=!r}")
+
+    for data, status in ((b"", b"200"), (b"ok", b"403"), (b"\0\xff", b"403")):
+        with socket.create_connection(client.getpeername(), timeout=3) as http:
+            http.sendall(b"POST /shared HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Length: " +
+                         str(len(data)).encode() + b"\r\n\r\n" + data)
+            response = recv_http_response(http)
+            if not response.startswith(b"HTTP/1.1 " + status):
+                raise AssertionError(f"shared Boolean helper: {data=!r}, {response=!r}")
+    first = bytearray(masked_frame(1, b"\xc3"))
+    first[0] &= 0x7f
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, b"\xa9"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xc3\xa9", True))
+    client.sendall(masked_frame(1, b"longer") + masked_frame(2, b"\0\xff") +
+                   masked_frame(1, b"") + masked_frame(1, b"ok"))
+    expect(peer, (2, b"", True))
+    expect(peer, (2, b"ok", True))
+    peer.sendall(b"\x81\x06denied\x82\x02\0\xff\x81\x00")
+    expect(client, (2, b"\0\xff", False))
+    expect(client, (2, b"", False))
+    client.sendall(masked_frame(1, b"CLOSE"))
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
+def bool_select_regex_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"Boolean regex selection: {actual=!r}, {expected=!r}")
+
+    client.sendall(masked_frame(1, b"server") + masked_frame(2, b"\xff") + masked_frame(1, b"ok"))
+    expect(peer, (1, b"ok", True))
+    peer.sendall(b"\x82\x02ok\x81\x06server")
+    expect(client, (1, b"server", False))
+    first = bytearray(masked_frame(2, b"o"))
+    first[0] &= 0x7f
+    client.sendall(first + masked_frame(9, b"p") + masked_frame(0, b"k"))
+    expect(peer, (9, b"p", True))
+    expect(peer, (2, b"ok", True))
+    client.sendall(masked_frame(1, b"CLOSE"))
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
+
+SCALAR_PREDICATE_DECLARATIONS = r"""
+func same<T: Eq>(_ lhs: T, _ rhs: T) -> bool => lhs == rhs
+func allowedName(_ value: str) -> bool => value.matches(re"^allow[0-9]+$") || same(value, "")
+func boolPolicy(_ value: bool, _ client: bool) -> bool {
+    if client { same(value, false) } else { value }
+}
+route POST "/scalar-shared" {
+    guard allowedName(req.body) else { return 403 }
+    return 200
+}
+"""
+SCALAR_STRING_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let field = json.get(root, "/a~1b/~0") else { msg.drop() }
+    guard let name = json.string(field) else { msg.drop() }
+    guard allowedName(name) else { msg.drop() }
+    msg.forward("<" + name + ">")
+}
+"""
+SCALAR_BOOL_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let root = json.parse(msg.text) else { msg.drop() }
+    guard let field = json.get(root, "/flag") else { msg.drop() }
+    guard let value = json.bool(field) else { msg.drop() }
+    guard boolPolicy(value, msg.fromClient) else { msg.drop() }
+    msg.forward()
+}
+"""
+
+
+def scalar_string_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"scalar String helper: {actual=!r}, {expected=!r}")
+
+    for data, status in ((b"allow7", b"200"), (b"", b"200"), (b"denied", b"403")):
+        with socket.create_connection(client.getpeername(), timeout=3) as http:
+            http.sendall(b"POST /scalar-shared HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Length: " +
+                         str(len(data)).encode() + b"\r\n\r\n" + data)
+            response = recv_http_response(http)
+            if not response.startswith(b"HTTP/1.1 " + status):
+                raise AssertionError(f"shared scalar predicate: {data=!r}, {response=!r}")
+    payload = b'{"a/b":{"~":"allow\\u0037"}}'
+    first = bytearray(masked_frame(1, payload[:14]))
+    first[0] &= 0x7f
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, payload[14:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<allow7>", True))
+    client.sendall(masked_frame(1, b'{"a/b":{"~":"allow7\\u0000"}}') +
+                   masked_frame(1, b'{"a/b":{"~":null}}') +
+                   masked_frame(2, b'{"a/b":{"~":""}}'))
+    expect(peer, (1, b"<>", True))
+    payload = b'{"a/b":{"~":"allow9"}}'
+    peer.sendall(bytes((0x82, len(payload))) + payload)
+    expect(client, (1, b"<allow9>", False))
+    bad = b'{"a/b":{"~":false}}'
+    good = b'{"a/b":{"~":""}}'
+    peer.sendall(bytes((0x81, len(bad))) + bad + bytes((0x82, len(good))) + good)
+    expect(client, (1, b"<>", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def scalar_bool_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"scalar Bool helper: {actual=!r}, {expected=!r}")
+
+    yes = b'{"flag":false}'
+    client.sendall(masked_frame(1, b'{"flag":true}') + masked_frame(2, b'{"flag":null}') +
+                   masked_frame(1, b"broken") + masked_frame(2, yes))
+    expect(peer, (2, yes, True))
+    yes = b'{"flag":true}'
+    first = bytes((0x01, 7)) + yes[:7]
+    peer.sendall(first + b"\x8a\x01p" + bytes((0x80, len(yes) - 7)) + yes[7:])
+    expect(client, (10, b"p", False))
+    expect(client, (1, yes, False))
+    bad = b'{"flag":false}'
+    peer.sendall(bytes((0x81, len(bad))) + bad + bytes((0x82, len(yes))) + yes)
+    expect(client, (2, yes, False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
 
 
 NESTED_JSON_HANDLER = r"""
@@ -160,7 +1083,579 @@ def direct_json_exchange(client, peer):
     expect(client, (8, b"\x03\xf0", False))
 
 
-def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, exchange=binary_exchange):
+JSON_REGEX_HANDLER = r"""
+return websocket(ws) { message in
+    guard let document = json.parse(message.text) else { message.close(1007) }
+    guard let field = json.get(document, "/name") else { message.close(1008) }
+    guard let name = json.string(field) else { message.close(1003) }
+    guard !name.matches(re"deny[0-9]+") else { message.drop() }
+    message.forward("<" + name + ">")
+}
+"""
+
+
+def json_regex_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"decoded JSON regex: {actual=!r}, {expected=!r}")
+
+    denied = b'{"name":"deny\\u0037"}'
+    first = bytearray(masked_frame(1, denied[:12]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, denied[12:]) +
+                   masked_frame(2, b'{"name":"allow12"}'))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<allow12>", True))
+    client.sendall(masked_frame(1, b'{"name":"xdeny7"}') +
+                   masked_frame(1, b'{"name":"deny\\u0000"}'))
+    expect(peer, (1, b"<xdeny7>", True))
+    expect(peer, (1, b"<deny\0>", True))
+    peer.sendall(bytes((0x02, 12)) + denied[:12] + b"\x8a\x01p" +
+                 bytes((0x80, len(denied) - 12)) + denied[12:] +
+                 b'\x82\x16{"name":"deny7suffix"}')
+    expect(client, (10, b"p", False))
+    expect(client, (1, b"<deny7suffix>", False))
+    client.sendall(masked_frame(2, b'{"name":false}'))
+    expect(peer, (8, b"\x03\xeb", True))
+    expect(client, (8, b"\x03\xeb", False))
+
+
+TYPED_MESSAGE_DECLARATIONS = r"""
+func accepted(_ text: str) -> bool => text.matches(re"o.k")
+func allowed(_ msg: WebSocketMessage) -> bool =>
+    !msg.fromClient || (true == msg.isText && msg.len <= 3 && accepted(msg.text))
+"""
+
+TYPED_MESSAGE_HANDLER = r"""
+return websocket(ws) { message in
+    guard allowed(message) == true else { message.drop() }
+    guard message.isText != message.isBinary else { message.close() }
+    message.forward()
+}
+"""
+
+DOMAIN_MESSAGE_DECLARATIONS = r"""
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func accepted(_ text: str) -> bool => text.matches(re"o.k")
+func isText(_ kind: WebSocketMessageKind) -> bool => same(kind, WebSocketMessageKind.text)
+func fromClient(_ direction: WebSocketDirection) -> bool =>
+    same(direction, WebSocketDirection.clientToUpstream)
+func allowed(_ msg: WebSocketMessage) -> bool =>
+    !fromClient(msg.direction) || (isText(msg.kind) && msg.len <= 3 && accepted(msg.text))
+func classify(_ kind: str) -> WebSocketMessageKind {
+    if kind == "text" { WebSocketMessageKind.text } else { WebSocketMessageKind.binary }
+}
+route GET "/domain" {
+    let kind = classify(req.header("X-Kind").or(""))
+    guard isText(kind) else { return 403 }
+    return 200
+}
+"""
+
+PAYLOAD_BYTES_DECLARATIONS = r"""
+func same<T: Eq>(_ a: T, _ b: T) -> bool => a == b
+func allowed(_ bytes: Bytes) -> bool =>
+    !bytes.isEmpty && bytes.count == 2 &&
+    (same(bytes, b"\x00\xff") || bytes == b"\xc3\xa9")
+func choose(_ marker: str) -> Bytes {
+    if marker == "yes" { b"\x00\xff" } else { b"" }
+}
+route POST "/bytes" {
+    guard allowed(req.bodyBytes) else { return 403 }
+    return 200
+}
+"""
+
+PAYLOAD_BYTES_HANDLER = r"""
+return websocket(ws) { message in
+    guard !message.fromClient || allowed(message.payload) else { message.drop() }
+    message.forward()
+}
+"""
+
+
+CALLBACK_SCOPE_DECLARATIONS = r"""
+func identity<T>(_ value: T) -> T => value
+"""
+
+CALLBACK_BYTES_HANDLER = r"""
+return websocket(ws) { packet in
+    let msg: WebSocketMessage = identity(packet)
+    let payload: Bytes = msg.payload
+    let client = msg.direction == WebSocketDirection.clientToUpstream
+    let count: i32 = payload.count
+    guard !client || count == 2 else { msg.drop() }
+    guard !client || allowed(payload) else { msg.drop() }
+    msg.forward()
+}
+"""
+
+CALLBACK_JSON_HANDLER = r"""
+return websocket(ws) { event in
+    let packet = identity(event)
+    let payloadText: str = packet.text
+    guard let document = json.parse(payloadText) else { packet.close(1007) }
+    guard let parent = json.get(document, "/payload") else { packet.close(1008) }
+    guard let child = json.get(parent, "/name") else { packet.close(1008) }
+    guard let text = json.string(child) else { packet.close(1003) }
+    packet.forward("[" + text + "]")
+}
+"""
+
+
+IF_MESSAGE_HANDLER = r"""
+return websocket(ws) { packet in
+    let msg = identity(packet)
+    if msg.payload.isEmpty { msg.drop() }
+    if msg.fromClient && msg.isBinary { msg.forward(b"\x00\xff") }
+    if msg.text == "CLOSE" { msg.close() }
+    if msg.text.matches(re"allow[0-9]+") && msg.fromClient {
+        let text = msg.text
+        msg.forward("[" + text + "]")
+    } else {
+        msg.close(1008, "policy")
+    }
+}
+"""
+
+
+def if_message_exchange(client, peer, close_default=False):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"if verdict: {actual=!r}, {expected=!r}")
+
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(masked_frame(2, b"") + first + masked_frame(9, b"PING") +
+                   masked_frame(0, b"\x00"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\x00\xff", True))
+    client.sendall(masked_frame(1, b"allow12"))
+    expect(peer, (1, b"[allow12]", True))
+    if close_default:
+        peer.sendall(b"\x81\x04deny")
+        expected = b"\x03\xf0policy"
+    else:
+        client.sendall(masked_frame(1, b"CLOSE"))
+        expected = b"\x03\xe8"
+    expect(peer, (8, expected, True))
+    expect(client, (8, expected, False))
+
+
+def if_default_exchange(client, peer):
+    if_message_exchange(client, peer, close_default=True)
+
+
+NESTED_IF_HANDLER = r"""
+return websocket(ws) { packet in
+    let msg = identity(packet)
+    if msg.fromClient {
+        if msg.payload.isEmpty { msg.drop() }
+        else {
+            if msg.kind == WebSocketMessageKind.binary { msg.forward(b"\xff\x00") }
+            else { msg.forward("<" + msg.text + ">") }
+        }
+    } else {
+        let prefix = "["
+        if msg.payload.isEmpty { msg.close() }
+        else { msg.forward(prefix + msg.text + "]") }
+    }
+}
+"""
+
+NESTED_EARLY_IF_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        if msg.isBinary { msg.forward(b"\x00\xff") }
+        else { msg.drop() }
+    }
+    guard let document = json.parse(msg.text) else { msg.close(1007) }
+    guard let name = json.string(document) else { msg.close(1003) }
+    msg.forward(name)
+}
+"""
+
+
+def nested_if_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"nested if: {actual=!r}, {expected=!r}")
+    first = bytearray(masked_frame(2, b"\xff"))
+    first[0] &= 0x7F
+    client.sendall(masked_frame(2, b"") + first + masked_frame(9, b"PING") +
+                   masked_frame(0, b"\x00"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\xff\x00", True))
+    client.sendall(masked_frame(1, b"hello"))
+    expect(peer, (1, b"<hello>", True))
+    peer.sendall(b"\x81\x05world")
+    expect(client, (1, b"[world]", False))
+    peer.sendall(b"\x81\x00")
+    expect(peer, (8, b"\x03\xe8", True))
+    expect(client, (8, b"\x03\xe8", False))
+
+
+def nested_early_if_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"nested early if: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(1, b"broken") + masked_frame(2, b"\xff\x00"))
+    expect(peer, (2, b"\x00\xff", True))
+    peer.sendall(b'\x81\x07"allow"')
+    expect(client, (1, b"allow", False))
+    peer.sendall(b"\x81\x06broken")
+    expect(peer, (8, b"\x03\xef", True))
+    expect(client, (8, b"\x03\xef", False))
+
+
+BRANCH_GUARD_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        guard let document = json.parse(msg.text) else { msg.close(1007) }
+        guard let field = json.get(document, "/name") else { msg.close(1008) }
+        guard let name = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + name + ">")
+    } else { msg.forward() }
+}
+"""
+
+IF_LET_HANDLER = r"""
+return websocket(ws) { msg in
+    if let document = json.parse(msg.text) {
+        if let field = json.get(document, "/flag") {
+            if let value = json.bool(field) {
+                guard value == false else { msg.forward("true") }
+                msg.forward("false")
+            } else { msg.forward("wrong") }
+        } else { msg.forward("missing") }
+    } else { msg.close(1007) }
+}
+"""
+
+BRANCH_CONTINUATION_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        if let document = json.parse(msg.text) { msg.forward("json") }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\x00\xff")
+    } else { msg.forward("server") }
+}
+"""
+
+
+JSON_HELPER_DECLARATIONS = r"""
+func identity<T>(_ value: T) -> T => value
+func readDocument(_ msg: WebSocketMessage) -> Json => json.parse(identity(msg).text)
+func select(_ root: Json, _ pointer: str) -> Json => json.get(identity(root), pointer)
+func stringValue(_ value: Json) -> str => json.string(value)
+func flag(_ value: Json) -> bool => json.bool(value)
+"""
+
+HELPER_GUARD_HANDLER = (BRANCH_GUARD_HANDLER
+                        .replace("json.parse(msg.text)", "readDocument(msg)")
+                        .replace("json.get(document,", "select(document,")
+                        .replace("json.string(field)", "stringValue(identity(field))"))
+HELPER_IF_LET_HANDLER = (IF_LET_HANDLER
+                         .replace("json.parse(msg.text)", "readDocument(msg)")
+                         .replace("json.get(document,", "select(document,")
+                         .replace("json.bool(field)", "flag(identity(field))"))
+
+
+OPTIONAL_CONDITION_DECLARATIONS = r"""
+func readClient(_ msg: WebSocketMessage) -> Json {
+    guard msg.fromClient else { nil }
+    if msg.isText { json.parse(msg.text) } else { nil }
+}
+"""
+
+OPTIONAL_CONDITION_HANDLER = r"""
+return websocket(ws) { msg in
+    if let root = readClient(msg) {
+        guard let field = json.get(root, "/name") else { msg.close(1008) }
+        guard let text = json.string(field) else { msg.close(1003) }
+        msg.forward("<" + text + ">")
+    } else { msg.forward() }
+}
+"""
+
+
+HELPER_BINDING_DECLARATIONS = r"""
+func readSelected(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = json.get(root, "/name") else { nil }
+    guard let gate = json.get(root, "/gate") else { nil }
+    if let text = json.string(field) { text } else { nil }
+}
+"""
+
+HELPER_BINDING_HANDLER = r"""
+return websocket(ws) { msg in
+    if let text = readSelected(msg) { msg.forward("<" + text + ">") }
+    else { msg.forward("absent") }
+}
+"""
+
+
+CHOICE_DECLARATIONS = r"""
+func pick(_ msg: WebSocketMessage, _ root: Json) -> Json {
+    if msg.fromClient { json.get(root, "/a") } else { json.get(root, "/b") }
+}
+func readChoice(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = pick(msg, root) else { nil }
+    json.string(field)
+}
+func fallback(_ root: Json) -> Json {
+    if let field = json.get(root, "/a") { field } else { json.get(root, "/b") }
+}
+func readFallback(_ msg: WebSocketMessage) -> str {
+    guard let root = json.parse(msg.text) else { nil }
+    guard let field = fallback(root) else { nil }
+    json.string(field)
+}
+"""
+
+CHOICE_GUARD_HANDLER = r"""
+return websocket(ws) { msg in
+    guard let text = readChoice(msg) else { msg.drop() }
+    guard text.hasPrefix("ok") else { msg.close(1008) }
+    msg.forward("<" + text + ">")
+}
+"""
+
+CHOICE_EARLY_HANDLER = r"""
+return websocket(ws) { msg in
+    if msg.fromClient {
+        if let text = readFallback(msg) { msg.forward(text) }
+        guard msg.isBinary else { msg.drop() }
+        msg.forward(b"\xff")
+    } else { msg.forward("server") }
+}
+"""
+
+
+def choice_guard_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"choice guard: {actual=!r}, {expected=!r}")
+    data = b'{"a":"ok\\u0000A","b":false}'
+    first = bytearray(masked_frame(1, data[:8]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, data[8:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<ok\0A>", True))
+    client.sendall(masked_frame(2, b'{"b":"okB"}') +
+                   masked_frame(2, b'{"a":"ok2","b":"ignored"}'))
+    expect(peer, (1, b"<ok2>", True))
+    for payload in (b'{"a":"okA"}', b'{"a":false,"b":"okB"}'):
+        peer.sendall(bytes((0x81, len(payload))) + payload)
+    expect(client, (1, b"<okB>", False))
+    client.sendall(masked_frame(1, b'{"a":"blocked","b":"okB"}'))
+    expect(peer, (8, b"\x03\xf0", True))
+    expect(client, (8, b"\x03\xf0", False))
+
+
+def choice_early_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"choice early: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(1, b'{"b":"B"}'))
+    expect(peer, (1, b"B", True))
+    client.sendall(masked_frame(1, b'{"a":null,"b":"B"}') +
+                   masked_frame(2, b'{"a":false,"b":"B"}'))
+    expect(peer, (2, b"\xff", True))
+    for payload, expected in ((b'{"a":"A","b":"B"}', b"A"),
+                              (b'{"a":"","b":"B"}', b"")):
+        client.sendall(masked_frame(2, payload))
+        expect(peer, (1, expected, True))
+    peer.sendall(b"\x82\x02\xff\x00")
+    expect(client, (1, b"server", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def helper_binding_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"helper binding: {actual=!r}, {expected=!r}")
+    data = b'{"gate":null,"name":"a\\u0000b"}'
+    first = bytearray(masked_frame(1, data[:13]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, data[13:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<a\0b>", True))
+    for payload, expected in ((b'{"gate":false,"name":""}', b"<>"),
+                              (b'{"name":"lost"}', b"absent"),
+                              (b'{"gate":0,"name":false}', b"absent"),
+                              (b"\xff\x00", b"absent")):
+        client.sendall(masked_frame(2, payload))
+        expect(peer, (1, expected, True))
+    payload = b'{"gate":null,"name":"peer"}'
+    peer.sendall(bytes((0x81, len(payload))) + payload)
+    expect(client, (1, b"<peer>", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def optional_condition_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"optional condition: {actual=!r}, {expected=!r}")
+    data = b'{"name":"a\\u0000b"}'
+    first = bytearray(masked_frame(1, data[:9]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, data[9:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<a\0b>", True))
+    client.sendall(masked_frame(1, b'{"name":""}'))
+    expect(peer, (1, b"<>", True))
+    client.sendall(masked_frame(2, b"\xff\x00"))
+    expect(peer, (2, b"\xff\x00", True))
+    client.sendall(masked_frame(1, b"broken"))
+    expect(peer, (1, b"broken", True))
+    peer.sendall(b"\x82\x02\xff\x00")
+    expect(client, (2, b"\xff\x00", False))
+    client.sendall(masked_frame(1, b'{"name":false}'))
+    expect(peer, (8, b"\x03\xeb", True))
+    expect(client, (8, b"\x03\xeb", False))
+
+
+def branch_guard_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"branch guard: {actual=!r}, {expected=!r}")
+    data = b'{"name":"a\\u0000b"}'
+    first = bytearray(masked_frame(1, data[:9]))
+    first[0] &= 0x7F
+    client.sendall(first + masked_frame(9, b"PING") + masked_frame(0, data[9:]))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"<a\0b>", True))
+    client.sendall(masked_frame(1, b'{"name":""}'))
+    expect(peer, (1, b"<>", True))
+    peer.sendall(b"\x82\x02\xff\x00")
+    expect(client, (2, b"\xff\x00", False))
+    client.sendall(masked_frame(1, b"broken"))
+    expect(peer, (8, b"\x03\xef", True))
+    expect(client, (8, b"\x03\xef", False))
+
+
+def if_let_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"if let: {actual=!r}, {expected=!r}")
+    for payload, expected in ((b'{"flag":false}', b"false"),
+                              (b'{"flag":true}', b"true"),
+                              (b'{"flag":null}', b"wrong"), (b"{}", b"missing")):
+        client.sendall(masked_frame(2, payload))
+        expect(peer, (1, expected, True))
+    peer.sendall(b'\x81\x0e{"flag":false}')
+    expect(client, (1, b"false", False))
+    client.sendall(masked_frame(1, b"broken"))
+    expect(peer, (8, b"\x03\xef", True))
+    expect(client, (8, b"\x03\xef", False))
+
+
+def branch_continuation_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"branch continuation: {actual=!r}, {expected=!r}")
+    client.sendall(masked_frame(1, b"broken") + masked_frame(2, b"\xff\x00"))
+    expect(peer, (2, b"\x00\xff", True))
+    client.sendall(masked_frame(1, b"null"))
+    expect(peer, (1, b"json", True))
+    peer.sendall(b"\x82\x02\xff\x00")
+    expect(client, (1, b"server", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def payload_bytes_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"byte payload: {actual=!r}, {expected=!r}")
+
+    for data, status in ((b"\0\xff", b"200"), (b"", b"403"), (b"\xc3\xa9", b"200")):
+        with socket.create_connection(client.getpeername(), timeout=3) as http:
+            headers = (b"POST /bytes HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Length: " +
+                       str(len(data)).encode() + b"\r\n\r\n")
+            http.sendall(headers + data[:1])
+            if len(data) > 1:
+                http.settimeout(0.1)
+                try:
+                    early = http.recv(1)
+                except socket.timeout:
+                    early = None
+                if early is not None:
+                    raise AssertionError(f"bodyBytes policy ran before body completion: {early=!r}")
+                http.settimeout(3)
+                http.sendall(data[1:])
+            response = recv_http_response(http)
+            if not response.startswith(b"HTTP/1.1 " + status):
+                raise AssertionError(f"Bytes in HTTP: {data=!r}, {response=!r}")
+    first = bytearray(masked_frame(2, b"\0"))
+    first[0] &= 0x7F
+    client.sendall(masked_frame(2, b"") + masked_frame(2, b"\xff\0") + first +
+                   masked_frame(9, b"PING") + masked_frame(0, b"\xff"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (2, b"\0\xff", True))
+    client.sendall(masked_frame(1, b"\xc3\xa9"))
+    expect(peer, (1, b"\xc3\xa9", True))
+    peer.sendall(b"\x82\x01\xff\x81\x00")
+    expect(client, (2, b"\xff", False))
+    expect(client, (1, b"", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def domain_message_exchange(client, peer):
+    for kind, status in ((b"text", b"200"), (b"binary", b"403")):
+        with socket.create_connection(client.getpeername(), timeout=3) as http:
+            http.sendall(b"GET /domain HTTP/1.1\r\nHost: test\r\nConnection: close\r\nX-Kind: " +
+                         kind + b"\r\n\r\n")
+            response = recv_http_response(http)
+            if not response.startswith(b"HTTP/1.1 " + status):
+                raise AssertionError(f"domain enum in HTTP: {kind=!r}, {response=!r}")
+    typed_message_exchange(client, peer)
+
+
+def typed_message_exchange(client, peer):
+    def expect(sock, expected):
+        actual = recv_client_frame(sock)
+        if actual != expected:
+            raise AssertionError(f"typed message predicate: {actual=!r}, {expected=!r}")
+
+    # Predicate sees the complete message, while Ping bypasses application inspection.
+    first = bytearray(masked_frame(1, b"o"))
+    first[0] &= 0x7F
+    client.sendall(masked_frame(1, b"bad") + masked_frame(2, b"oak") + first +
+                   masked_frame(9, b"PING") + masked_frame(0, b"ak"))
+    expect(peer, (9, b"PING", True))
+    expect(peer, (1, b"oak", True))
+    client.sendall(masked_frame(1, b"o\0k"))
+    expect(peer, (1, b"o\0k", True))
+    # The same typed helper deliberately permits the upstream direction.
+    peer.sendall(b"\x82\x03bad\x81\x00")
+    expect(client, (2, b"bad", False))
+    expect(client, (1, b"", False))
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    expect(peer, (8, b"\x03\xe8", True))
+
+
+def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER,
+                                exchange=binary_exchange, declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS,
+                                tls=False, validate_request=None, validate_response=None):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-binary-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -168,10 +1663,20 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, ex
         path = os.path.join(temp, "route.rut")
         with open(path, "w", encoding="utf-8") as route_file:
             route_file.write(
-                f'listen 127.0.0.1:0\n'
-                f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
-                'route GET "/ws" {\n' + handler + '}\n')
-        process, port, diagnostic = launch(server, path, backend_kind)
+                ('' if tls else 'listen 127.0.0.1:0\n')
+                + f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+                + declarations + '\nroute GET "/ws" {\n' + handler + '}\n')
+        context = None
+        extra_args = ()
+        if tls:
+            fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+            extra_args = ("0", "--tls-cert", os.path.join(fixtures, "localhost_cert.pem"),
+                          "--tls-key", os.path.join(fixtures, "localhost_key.pem"))
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.set_alpn_protocols(["http/1.1"])
+        process, port, diagnostic = launch(server, path, backend_kind, extra_args)
         if process is None:
             text = diagnostic.decode(errors="replace")
             if backend_kind == "io_uring" and \
@@ -179,14 +1684,21 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, ex
                 return "skip", text
             raise AssertionError(f"{backend_kind} binary replacement server failed:\n{text}")
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
-                client.sendall(REQUEST)
+            raw = socket.create_connection(("127.0.0.1", port), timeout=3)
+            client_socket = context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=False) if context else raw
+            with client_socket as client:
+                client.sendall(request)
                 with upstream.accept()[0] as peer:
                     peer.settimeout(3)
-                    recv_until(peer, b"\r\n\r\n")
-                    peer.sendall(WS_RESPONSE_HEADERS)
-                    if not recv_until(client, b"\r\n\r\n").startswith(b"HTTP/1.1 101"):
+                    received = recv_until(peer, b"\r\n\r\n")
+                    if validate_request:
+                        validate_request(received)
+                    peer.sendall(response)
+                    received = recv_http_response(client)
+                    if not received.startswith(b"HTTP/1.1 101"):
                         raise AssertionError("binary replacement handshake failed")
+                    if validate_response:
+                        validate_response(received)
                     exchange(client, peer)
         finally:
             process.terminate()
@@ -199,7 +1711,9 @@ def binary_replacement_scenario(server, backend_kind, handler=BINARY_HANDLER, ex
 
 
 def native_binary_source_removal_scenario(server, compiler, backend_kind,
-                                         handler=BINARY_HANDLER, exchange=binary_exchange):
+                                         handler=BINARY_HANDLER, exchange=binary_exchange,
+                                         declarations="", request=REQUEST, response=WS_RESPONSE_HEADERS, tls=False,
+                                         validate_request=None, validate_response=None):
     with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-native-") as temp:
         upstream.bind(("127.0.0.1", 0))
         upstream.listen(1)
@@ -208,8 +1722,9 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind,
         artifact = os.path.join(temp, "route.native")
         with open(source, "w", encoding="utf-8") as route_file:
             route_file.write(
-                f'listen 127.0.0.1:0\nupstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
-                'route GET "/ws" { ' + handler + '}\n')
+                ('' if tls else 'listen 127.0.0.1:0\n')
+                + f'upstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+                + declarations + '\nroute GET "/ws" { ' + handler + '}\n')
         emitted = subprocess.run([compiler, source, "2"], capture_output=True, check=True, timeout=30)
         with open(artifact, "wb") as artifact_file:
             artifact_file.write(emitted.stdout)
@@ -232,26 +1747,45 @@ def native_binary_source_removal_scenario(server, compiler, backend_kind,
                 "finally:\n"
                 "    os.close(fd)\n")
         os.chmod(wrapper, 0o700)
-        process, port, diagnostic = launch(native_server, os.path.join(temp, "deleted.rut"), backend_kind)
+        extra_args = ()
+        context = None
+        if tls:
+            fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+            extra_args = ("0", "--tls-cert", os.path.join(fixtures, "localhost_cert.pem"),
+                          "--tls-key", os.path.join(fixtures, "localhost_key.pem"))
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.set_alpn_protocols(["http/1.1"])
+        def connect():
+            raw = socket.create_connection(("127.0.0.1", port), timeout=3)
+            return context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=False) if context else raw
+        process, port, diagnostic = launch(native_server, os.path.join(temp, "deleted.rut"), backend_kind, extra_args)
         if process is None:
             text = diagnostic.decode(errors="replace")
             if backend_kind == "io_uring" and "--backend io_uring requested, but io_uring is unavailable" in text:
                 return "skip", text
             raise AssertionError(f"{backend_kind} native binary artifact failed:\n{text}")
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+            with connect() as client:
                 client.sendall(REQUEST.replace(b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", b"") + masked_frame(1, b"TAIL"))
                 if not recv_http_response(client).startswith(b"HTTP/1.1 400"):
                     raise AssertionError("native source-removed artifact accepted malformed handshake")
-            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
-                client.sendall(REQUEST)
+            with connect() as client:
+                client.sendall(request)
                 with upstream.accept()[0] as peer:
                     peer.settimeout(3)
-                    if not recv_until(peer, b"\r\n\r\n").startswith(b"GET /ws "):
+                    received = recv_until(peer, b"\r\n\r\n")
+                    if not received.startswith(b"GET /ws "):
                         raise AssertionError("native artifact did not forward valid handshake")
-                    peer.sendall(WS_RESPONSE_HEADERS)
-                    if not recv_until(client, b"\r\n\r\n").startswith(b"HTTP/1.1 101"):
+                    if validate_request:
+                        validate_request(received)
+                    peer.sendall(response)
+                    received = recv_http_response(client)
+                    if not received.startswith(b"HTTP/1.1 101"):
                         raise AssertionError("native artifact did not relay valid 101")
+                    if validate_response:
+                        validate_response(received)
                     exchange(client, peer)
         finally:
             process.terminate()
@@ -273,16 +1807,30 @@ def recv_exact(sock, length):
     return bytes(data)
 
 
-def recv_client_frame(sock):
+def recv_client_frame(sock, metadata=False):
     first, second = recv_exact(sock, 2)
-    if second & 0x7F >= 126:
-        raise AssertionError("short test frame unexpectedly used an extended length")
     length = second & 0x7F
+    if length == 126:
+        length = int.from_bytes(recv_exact(sock, 2), "big")
+        if length < 126:
+            raise AssertionError("noncanonical 16-bit frame length")
+    elif length == 127:
+        length = int.from_bytes(recv_exact(sock, 8), "big")
+        if length <= 65535:
+            raise AssertionError("noncanonical 64-bit frame length")
+    if length > 1024 * 1024:
+        raise AssertionError("test peer advertised an unbounded frame")
     mask_key = recv_exact(sock, 4) if second & 0x80 else b""
     payload = bytearray(recv_exact(sock, length))
     if mask_key:
         for index in range(length):
             payload[index] ^= mask_key[index & 3]
+    if first & 0x30:
+        raise AssertionError("unexpected reserved frame bits")
+    if metadata:
+        return first & 0x0F, bytes(payload), bool(mask_key), bool(first & 0x80), bool(first & 0x40)
+    if first & 0x40:
+        raise AssertionError("compressed frame without a negotiated test decoder")
     return first & 0x0F, bytes(payload), bool(mask_key)
 
 
@@ -453,7 +2001,108 @@ def scenario(server, backend_kind, terminate, response, expected):
     return "pass", ""
 
 
-def admission_scenario(server, backend_kind):
+def chain_after_scenario(server, compiler, backend_kind, native, protected_header=None):
+    with socket.socket() as upstream, tempfile.TemporaryDirectory(prefix="rut-ws-after-") as temp:
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(2)
+        source = os.path.join(temp, "route.rut")
+        effects = ('resp.set("X-After-Value", req.header("X-Value").or("missing"))\n'
+                   'resp.add("X-Stage", "after")\n')
+        if protected_header:
+            effects += f'resp.set("{protected_header}", "broken")\n'
+        with open(source, "w", encoding="utf-8") as route_file:
+            route_file.write(
+                f'listen 127.0.0.1:0\nupstream ws at "127.0.0.1:{upstream.getsockname()[1]}"\n'
+                'func decorate(_ req: i32, _ resp: Response) -> i32 {\n' + effects + '0\n}\n'
+                'chain headers { after decorate(req, resp) }\n'
+                'route GET "/ws" use chain headers {\n'
+                'req.set("X-Admission", "changed")\n'
+                'guard req.header("X-Deny").or("") != "yes" else { return 403 }\n'
+                'return websocket(ws) { msg in msg.forward(msg.text + "!") }\n}\n')
+        selected_server = server
+        selected_source = source
+        if native:
+            artifact = os.path.join(temp, "route.native")
+            emitted = subprocess.run([compiler, source, "2"], capture_output=True,
+                                     check=True, timeout=30)
+            with open(artifact, "wb") as target:
+                target.write(emitted.stdout)
+            os.unlink(source)
+            selected_server = os.path.join(temp, "rut")
+            shutil.copy2(server, selected_server)
+            wrapper = os.path.join(temp, "rut-compile")
+            with open(wrapper, "w", encoding="utf-8") as target:
+                target.write('#!/usr/bin/env python3\nimport sys\n'
+                             f'with open({artifact!r}, "rb") as source:\n'
+                             '    sys.stdout.buffer.write(source.read())\n')
+            os.chmod(wrapper, 0o700)
+            selected_source = os.path.join(temp, "deleted.rut")
+        process, port, diagnostic = launch(selected_server, selected_source, backend_kind)
+        if process is None:
+            text = diagnostic.decode(errors="replace")
+            if backend_kind == "io_uring" and "--backend io_uring requested, but io_uring is unavailable" in text:
+                return "skip", text
+            raise AssertionError(f"chain after server failed:\n{text}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                denied_request = REQUEST.replace(
+                    b"Connection: Upgrade\r\n", b"Connection: keep-alive\r\n").replace(
+                    b"\r\n\r\n", b"\r\nX-Deny: yes\r\nX-Value: denied-value\r\n\r\n")
+                client.sendall(denied_request)
+                denied = recv_http_response(client)
+                if not denied.startswith(b"HTTP/1.1 403") or \
+                        b"x-after-value: denied-value\r\n" not in denied.lower() or \
+                        denied.lower().count(b"x-stage: after\r\n") != 1:
+                    raise AssertionError(f"chain after denial effects lost: {denied!r}")
+                upstream.settimeout(0.2)
+                try:
+                    unexpected, _ = upstream.accept()
+                except TimeoutError:
+                    pass
+                else:
+                    unexpected.close()
+                    raise AssertionError("chain after denial opened an upstream")
+                upstream.settimeout(3)
+                # Reuse the denied keepalive connection; response values must be fresh.
+                accepted = REQUEST.replace(b"\r\n\r\n", b"\r\nX-Value: allowed-value\r\n\r\n")
+                client.sendall(accepted + masked_frame(1, b"first"))
+                with upstream.accept()[0] as peer:
+                    peer.settimeout(3)
+                    forwarded = recv_until(peer, b"\r\n\r\n")
+                    if b"x-admission: changed\r\n" not in forwarded.lower():
+                        raise AssertionError(f"request rewrite was lost: {forwarded!r}")
+                    peer.sendall(WS_RESPONSE_HEADERS + b"\x81\x06server")
+                    if protected_header:
+                        rejected = recv_until(client, b"\r\n\r\n")
+                        if rejected:
+                            raise AssertionError(f"modified handshake was published: {rejected!r}")
+                        if peer.recv(4096):
+                            raise AssertionError("protected handshake mutation leaked application data")
+                    else:
+                        response = recv_http_response(client)
+                        if not response.startswith(b"HTTP/1.1 101") or \
+                                b"x-after-value: allowed-value\r\n" not in response.lower() or \
+                                response.lower().count(b"x-stage: after\r\n") != 1:
+                            raise AssertionError(f"chain after 101 effects lost/stale: {response!r}")
+                        if recv_client_frame(peer) != (1, b"first!", True):
+                            raise AssertionError("client early message was lost after response rewrite")
+                        if recv_client_frame(client) != (1, b"server!", False):
+                            raise AssertionError("upstream early message was lost after response rewrite")
+                        client.sendall(masked_frame(8, b"\x03\xe8"))
+                        if recv_client_frame(peer) != (8, b"\x03\xe8", True):
+                            raise AssertionError("chain after changed Close forwarding")
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return "pass", ""
+
+
+def admission_scenario(server, backend_kind, prelude=""):
+    """Admission may suspend before reaching the upgrade."""
     ws_backend = socket.socket()
     ws_backend.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ws_backend.bind(("127.0.0.1", 0))
@@ -468,9 +2117,17 @@ def admission_scenario(server, backend_kind):
         f'listen 127.0.0.1:0\n'
         f'upstream ws at "127.0.0.1:{ws_backend.getsockname()[1]}"\n'
         f'upstream normal at "127.0.0.1:{normal_backend.getsockname()[1]}"\n'
+        'func allowed(_ origin: str) -> bool => origin.matches(re"^https://allowed[.]example$")\n'
         'route GET "/ws" {\n'
-        '  guard let origin = req.uniqueHeader("Origin") else { return 403 }\n'
-        '  guard origin == "https://allowed.example" else { return 403 }\n'
+        '  req.set("X-Admission", "checked")\n'
+        '  let candidate = req.uniqueHeader("Origin")\n'
+        '  guard let origin = candidate else { return response(403, body: "missing") }\n'
+        '  let accepted = allowed(origin)\n'
+        '  guard accepted else { return response(403, body: "denied") }\n'
+        '  guard req.bodyBytes.isEmpty else { return 400 }\n'
+        '  guard let doc = json.parse(req.query("policy").or("true")) else { return 400 }\n'
+        '  guard json.bool(doc).or(false) else { return 403 }\n'
+        + prelude +
         '  return websocket(ws) { message in\n'
         '    guard message.text != "DROP" else { message.drop() }\n'
         '    message.forward("REWRITTEN")\n'
@@ -509,6 +2166,8 @@ def admission_scenario(server, backend_kind):
                 denied = recv_http_response(client)
                 if not denied.startswith(b"HTTP/1.1 403"):
                     raise AssertionError(f"{label} did not get local 403: {denied!r}")
+                if label == "wrong Origin" and not denied.endswith(b"denied"):
+                    raise AssertionError(f"denial body was lost: {denied!r}")
                 try:
                     peer, _ = ws_backend.accept()
                     peers.append(peer)
@@ -581,6 +2240,8 @@ def admission_scenario(server, backend_kind):
             forwarded = recv_until(peer, b"\r\n\r\n")
             if b"Origin: https://allowed.example" not in forwarded:
                 raise AssertionError("allowed Origin was not preserved to upstream")
+            if b"X-Admission: checked\r\n".lower() not in forwarded.lower():
+                raise AssertionError(f"HTTP admission request mutation was lost: {forwarded!r}")
             peer.sendall(WS_RESPONSE_HEADERS)
             headers = recv_until(client, b"\r\n\r\n")
             if not headers.startswith(b"HTTP/1.1 101"):
@@ -757,7 +2418,7 @@ def tls_passthrough_scenario(server, backend_kind):
     return "pass", ""
 
 
-def tls_terminate_handshake_scenario(server, backend_kind):
+def tls_terminate_handshake_scenario(server, backend_kind, connection_context=False, closing=False, client_notify=False, lifecycle=False, bulk=False, dynamic=False):
     cert = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_cert.pem")
     key = os.path.join(os.path.dirname(__file__), "fixtures", "localhost_key.pem")
     backend = socket.socket()
@@ -769,6 +2430,20 @@ def tls_terminate_handshake_scenario(server, backend_kind):
         f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
         'route GET "/ws" { return websocket(ws) { message in message.drop() } }\n'
     )
+    if connection_context:
+        source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+                  + CONNECTION_DECLARATIONS + '\nroute GET "/ws" { ' + CONNECTION_HANDLER + '}\n')
+    if closing:
+        source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+                  + '\nroute GET "/ws" { ' + CLOSING_HANDLER + '}\n')
+    if lifecycle:
+        source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+                  + LIFECYCLE_DECLARATIONS + '\nroute GET "/ws" { ' + LIFECYCLE_HANDLER + '}\n')
+    if bulk:
+        source = (f'upstream ws at "127.0.0.1:{backend.getsockname()[1]}"\n'
+                  + (BULK_DYNAMIC_DECLARATIONS if dynamic else '')
+                  + '\nroute GET "/ws" { '
+                  + (BULK_DYNAMIC_HANDLER if dynamic else BULK_HANDLER) + '}\n')
     with tempfile.TemporaryDirectory(prefix="rut-ws-tls-terminate-") as temp:
         path = os.path.join(temp, "route.rut")
         with open(path, "w", encoding="utf-8") as route_file:
@@ -792,7 +2467,7 @@ def tls_terminate_handshake_scenario(server, backend_kind):
             context.set_alpn_protocols(["http/1.1"])
 
             raw = socket.create_connection(("127.0.0.1", port), timeout=3)
-            invalid_client = context.wrap_socket(raw, server_hostname="localhost")
+            invalid_client = context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=not closing)
             clients.append(invalid_client)
             invalid_client.sendall(
                 b"GET /ws HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
@@ -811,7 +2486,7 @@ def tls_terminate_handshake_scenario(server, backend_kind):
             clients.remove(invalid_client)
 
             raw = socket.create_connection(("127.0.0.1", port), timeout=3)
-            valid_client = context.wrap_socket(raw, server_hostname="localhost")
+            valid_client = context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=not (closing or lifecycle or bulk))
             clients.append(valid_client)
             valid_client.sendall(REQUEST)
             peer, _ = backend.accept()
@@ -819,17 +2494,27 @@ def tls_terminate_handshake_scenario(server, backend_kind):
             if not recv_until(peer, b"\r\n\r\n").startswith(b"GET /ws "):
                 raise AssertionError("TLS valid handshake request was not forwarded")
             peer.sendall(WS_RESPONSE_HEADERS)
-            response = recv_until(valid_client, b"\r\n\r\n")
+            response = recv_http_response(valid_client)
             if not response.startswith(b"HTTP/1.1 101"):
                 raise AssertionError(f"TLS valid terminate handshake failed: {response!r}")
-            valid_client.sendall(masked_frame(1, b"DROP"))
-            peer.settimeout(0.25)
-            try:
-                leaked = peer.recv(4096)
-            except TimeoutError:
-                leaked = b""
-            if leaked:
-                raise AssertionError(f"TLS terminate DROP reached backend: {leaked!r}")
+            if bulk:
+                bulk_exchange(dynamic)(valid_client, peer)
+            elif lifecycle:
+                lifecycle_exchange(valid_client, peer)
+            elif connection_context:
+                connection_exchange(valid_client, peer, b"tls:")
+            elif closing:
+                exchange = closing_client_notify_exchange if client_notify else closing_handshake_exchange
+                exchange(valid_client, peer)
+            else:
+                valid_client.sendall(masked_frame(1, b"DROP"))
+                peer.settimeout(0.25)
+                try:
+                    leaked = peer.recv(4096)
+                except TimeoutError:
+                    leaked = b""
+                if leaked:
+                    raise AssertionError(f"TLS terminate DROP reached backend: {leaked!r}")
         finally:
             if peer is not None:
                 peer.close()
@@ -1081,12 +2766,613 @@ def subprotocol_scenario(server, backend_kind):
     return "pass", ""
 
 
+class CompressionPeer:
+    def __init__(self, enabled, masked, window=15, send_no_context=False, receive_no_context=False):
+        self.enabled = enabled
+        self.masked = masked
+        self.window = window
+        self.send_no_context = send_no_context
+        self.receive_no_context = receive_no_context
+        self.encoder = self.new_encoder()
+        self.decoder = zlib.decompressobj(wbits=-window)
+
+    def new_encoder(self):
+        return zlib.compressobj(wbits=-max(self.window, 9),
+                                strategy=zlib.Z_HUFFMAN_ONLY if self.window == 8 else zlib.Z_DEFAULT_STRATEGY)
+
+    def frame(self, opcode, payload, compress=True, fragmented=False):
+        encoded = self.enabled and compress and opcode in (1, 2)
+        if encoded:
+            if self.send_no_context:
+                self.encoder = self.new_encoder()
+            payload = self.encoder.compress(payload) + self.encoder.flush(zlib.Z_SYNC_FLUSH)
+            if not payload.endswith(b"\0\0\xff\xff"):
+                raise AssertionError("reference compressor did not sync flush")
+            payload = payload[:-4]
+        if fragmented:
+            half = max(1, len(payload) // 2)
+            return (wire_frame(opcode, payload[:half], masked=self.masked, fin=False, compressed=encoded)
+                    + wire_frame(9, b"inside", masked=self.masked)
+                    + wire_frame(0, payload[half:], masked=self.masked))
+        return wire_frame(opcode, payload, masked=self.masked, compressed=encoded)
+
+    def receive(self, sock, opcode, payload, compressed=None):
+        kind, body, masked, fin, encoded = recv_client_frame(sock, metadata=True)
+        if kind != opcode or masked == self.masked or not fin:
+            raise AssertionError(f"compression endpoint framing: {kind=} {masked=} {fin=}")
+        if encoded:
+            if not self.enabled or opcode not in (1, 2):
+                raise AssertionError("unnegotiated or compressed control frame")
+            if self.receive_no_context:
+                self.decoder = zlib.decompressobj(wbits=-self.window)
+            body = self.decoder.decompress(body + b"\0\0\xff\xff", 262131)
+            if self.decoder.unconsumed_tail or self.decoder.unused_data:
+                raise AssertionError("invalid or unbounded gateway compression output")
+        if compressed is not None and encoded != compressed:
+            raise AssertionError(f"unexpected compression choice: {encoded=} expected={compressed}")
+        if body != payload:
+            raise AssertionError(f"compression changed message: received={len(body)} expected={len(payload)}")
+
+
+def compression_scenario(server, compiler, backend, downstream, upstream, native=False, tls=False,
+                         window=15, no_context=False, dynamic=False, coalesced=False, maximum=False,
+                         coalesced_maximum=False):
+    client_peer = CompressionPeer(downstream, True, window, no_context, True)
+    upstream_peer = CompressionPeer(upstream, False, window, no_context, no_context)
+    parameters = (f"; server_max_window_bits={window}; client_max_window_bits={window}".encode())
+    client_offer = b"permessage-deflate" + parameters
+    server_choice = b"permessage-deflate" + parameters
+    if no_context:
+        client_offer += b"; client_no_context_takeover"
+        server_choice += b"; client_no_context_takeover; server_no_context_takeover"
+    request = REQUEST[:-2] + (b"Sec-WebSocket-Extensions: " + client_offer + b"\r\n" if downstream else b"") + b"\r\n"
+    response = WS_RESPONSE_HEADERS[:-2] + (b"Sec-WebSocket-Extensions: " + server_choice + b"\r\n" if upstream else b"") + b"\r\n"
+    early_client, early_upstream = b"keep:" + b"Hello" * 1000, b"keep:" + b"World" * 2000
+    early_upstream_kind = 1
+    if coalesced_maximum:
+        early_upstream = os.urandom(262130)
+        early_upstream_kind = 2
+    if coalesced:
+        request += client_peer.frame(1, early_client)
+        response += upstream_peer.frame(early_upstream_kind, early_upstream)
+    action = "msg.forward(chosen(msg.payload, msg.text))" if dynamic else "msg.forward()"
+    handler = ("return websocket(ws, maxMessageSize: 262130b) { msg in\n"
+               "if msg.isText && msg.text.hasPrefix(\"drop:\") { msg.drop() }\n"
+               + action + "\n}")
+
+    def validate_request(header):
+        values = [line.split(b":", 1)[1].strip() for line in header.split(b"\r\n")
+                  if line.lower().startswith(b"sec-websocket-extensions:")]
+        if values != [b"permessage-deflate; client_no_context_takeover; client_max_window_bits"]:
+            raise AssertionError(f"upstream offer did not belong to the gateway: {values!r}")
+
+    def validate_response(header):
+        values = [line.split(b":", 1)[1].strip() for line in header.split(b"\r\n")
+                  if line.lower().startswith(b"sec-websocket-extensions:")]
+        if len(values) != int(downstream):
+            raise AssertionError(f"downstream agreement copied the upstream: {values!r}")
+        if downstream:
+            if b"server_no_context_takeover" not in values[0] or \
+                    f"server_max_window_bits={window}".encode() not in values[0] or \
+                    f"client_max_window_bits={window}".encode() not in values[0]:
+                raise AssertionError(f"downstream window/no-context agreement changed: {values!r}")
+            if (b"client_no_context_takeover" in values[0]) != no_context:
+                raise AssertionError("client no-context hint did not match its agreement")
+
+    def exchange(client, peer):
+        def output_kind(kind):
+            return 2 if dynamic and kind in (1, 2) else kind
+        if coalesced:
+            upstream_peer.receive(peer, output_kind(1), early_client)
+            client_peer.receive(client, output_kind(early_upstream_kind), early_upstream)
+        for source, target, sender, receiver in ((client, peer, client_peer, upstream_peer),
+                                                 (peer, client, upstream_peer, client_peer)):
+            repeated = b"dictionary:" + b"Hello" * 1000
+            source.sendall(sender.frame(1, b"drop:" + repeated))
+            source.sendall(sender.frame(9, b"after-drop"))
+            receiver.receive(target, 9, b"after-drop", compressed=False)
+            # The next compressed message can reference bytes from the dropped one.
+            source.sendall(sender.frame(1, b"keep:" + repeated))
+            receiver.receive(target, output_kind(1), b"keep:" + repeated)
+            source.sendall(sender.frame(1, b"raw:" + repeated, compress=False))
+            receiver.receive(target, output_kind(1), b"raw:" + repeated)
+            text = b"keep:" + b"x" * 16378 + "€".encode() + b"y" * 20000
+            source.sendall(sender.frame(1, text, fragmented=True))
+            receiver.receive(target, 9, b"inside", compressed=False)
+            receiver.receive(target, output_kind(1), text)
+            target.sendall(receiver.frame(10, b"inside"))
+            sender.receive(source, 10, b"inside", compressed=False)
+            if maximum:
+                arbitrary = os.urandom(262130)
+                source.sendall(sender.frame(2, arbitrary))
+                receiver.receive(target, 2, arbitrary, compressed=False)
+            else:
+                arbitrary = b"\xff\0binary" * 1024
+                source.sendall(sender.frame(2, arbitrary))
+                receiver.receive(target, 2, arbitrary)
+        client.sendall(client_peer.frame(8, b"\x03\xe8"))
+        upstream_peer.receive(peer, 8, b"\x03\xe8", compressed=False)
+        client_peer.receive(client, 8, b"\x03\xe8", compressed=False)
+        peer.sendall(upstream_peer.frame(8, b"\x03\xe8"))
+        if client.recv(1) != b"":
+            raise AssertionError("compressed session did not complete its close handshake")
+
+    declarations = BULK_DYNAMIC_DECLARATIONS if dynamic else ""
+    if native:
+        return native_binary_source_removal_scenario(server, compiler, backend, handler, exchange,
+                                                     declarations, request, response, tls=tls,
+                                                     validate_request=validate_request,
+                                                     validate_response=validate_response)
+    return binary_replacement_scenario(server, backend, handler, exchange, declarations, request,
+                                       response, tls=tls, validate_request=validate_request,
+                                       validate_response=validate_response)
+
+
+def compression_rejection_scenario(server, compiler, backend, failure, from_client, native=False,
+                                   tls=False):
+    extension = b"Sec-WebSocket-Extensions: permessage-deflate\r\n"
+    request = REQUEST[:-2] + (b"" if failure == "unnegotiated" else extension) + b"\r\n"
+    response = WS_RESPONSE_HEADERS[:-2] + (b"" if failure == "unnegotiated" else extension) + b"\r\n"
+
+    def exchange(client, peer):
+        source, target = (client, peer) if from_client else (peer, client)
+        sender = CompressionPeer(True, from_client)
+        if failure == "malformed":
+            wire = wire_frame(1, b"\xff", masked=from_client, compressed=True)
+        elif failure == "control":
+            wire = wire_frame(9, b"bad", masked=from_client, compressed=True)
+        elif failure == "utf8":
+            wire = sender.frame(1, b"\xff")
+        elif failure == "limit":
+            wire = sender.frame(2, b"x" * 33)
+        elif failure == "unnegotiated":
+            wire = sender.frame(1, b"not negotiated")
+        else:
+            raise AssertionError(f"unknown compression failure {failure}")
+        source.sendall(wire)
+        for endpoint in (target, source):
+            try:
+                leaked = endpoint.recv(4096)
+            except (ConnectionResetError, ssl.SSLEOFError):
+                leaked = b""
+            if leaked:
+                raise AssertionError(f"invalid compressed message reached application/output: {leaked!r}")
+
+    handler = 'return websocket(ws, maxMessageSize: 32b) { msg in msg.forward("handler ran") }'
+    runner = native_binary_source_removal_scenario if native else binary_replacement_scenario
+    prefix = (server, compiler, backend) if native else (server, backend)
+    return runner(*prefix, handler, exchange, request=request, response=response, tls=tls)
+
+
+def negotiated_connection_scenario(server, compiler, backend, native=False, tls=False):
+    request = REQUEST[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n"
+    response = WS_RESPONSE_HEADERS[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n"
+
+    def exchange(client, peer):
+        connection_exchange(client, peer, b"tls:chat" if tls else b"plain:chat")
+
+    runner = native_binary_source_removal_scenario if native else binary_replacement_scenario
+    prefix = (server, compiler, backend) if native else (server, backend)
+    return runner(*prefix, CONNECTION_HANDLER, exchange, CONNECTION_DECLARATIONS,
+                  request=request, response=response, tls=tls)
+
+
+BULK_HANDLER = "return websocket(ws, maxMessageSize: 262130b) { msg in msg.forward() }"
+BULK_DYNAMIC_DECLARATIONS = r'''func chosen(_ bytes: Bytes, _ text: str) -> Bytes {
+ let unused = sha256(text)
+ bytes
+}
+'''
+BULK_DYNAMIC_HANDLER = "return websocket(ws, maxMessageSize: 262130b) { msg in msg.forward(chosen(msg.payload, msg.text)) }"
+
+
+def bulk_exchange(dynamic=False, stress=False):
+    def exchange(client, peer):
+        def expect(sock, opcode, body, masked):
+            actual = recv_client_frame(sock)
+            if actual != (opcode, body, masked):
+                raise AssertionError(f"bulk frame changed: opcode={actual[0]} bytes={len(actual[1])} expected={len(body)}")
+        text = b"a" * 16383 + "€".encode() + b"b" * (262130 - 16386)
+        binary = bytes(range(256)) * 256
+        # The 81907-byte payload also leaves a one-byte TLS plaintext tail
+        # after five full records when the frame header is split below.
+        for opcode, payload in ((2, binary), (2, b"x" * 81907), (1, text)):
+            frame = masked_frame(opcode, payload)
+            client.sendall(frame[:5])
+            time.sleep(0.01)
+            client.sendall(frame[5:])
+            expect(peer, 2 if dynamic else opcode, payload, True)
+            peer.sendall(wire_frame(opcode, payload))
+            expect(client, 2 if dynamic else opcode, payload, False)
+        client.sendall(wire_frame(1, text[:16384], masked=True, fin=False)
+                       + masked_frame(9, b"inside")
+                       + wire_frame(0, text[16384:65537], masked=True, fin=False)
+                       + wire_frame(0, text[65537:], masked=True))
+        expect(peer, 9, b"inside", True)
+        peer.sendall(wire_frame(10, b"inside"))
+        expect(peer, 2 if dynamic else 1, text, True)
+        expect(client, 10, b"inside", False)
+        if stress:
+            # Leave the destination unread while enough data is queued to make
+            # nonblocking send/receive progress independent of application reads.
+            for sender, receiver, masked in ((client, peer, True), (peer, client, False)):
+                receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)
+                frames = [bytes((index,)) + b"z" * (262130 - 1) for index in range(12)]
+                sender.sendall(b"".join(wire_frame(2, body, masked=masked) for body in frames))
+                time.sleep(0.05)
+                for body in frames:
+                    expect(receiver, 2, body, masked)
+        client.sendall(masked_frame(8, b"\x03\xe8"))
+        expect(peer, 8, b"\x03\xe8", True)
+        expect(client, 8, b"\x03\xe8", False)
+        peer.sendall(wire_frame(8, b"\x03\xe8"))
+        if client.recv(1) != b"":
+            raise AssertionError("bulk session did not finish closing")
+    exchange.__name__ = f"bulk_dynamic={dynamic}_stress={stress}"
+    return exchange
+
+
+CLOSING_HANDLER = 'return websocket(ws) { msg in msg.close(1008, "policy") }'
+
+LIFECYCLE_DECLARATIONS = r'''let sessions = Cache<IP, i64>(capacity: 64)
+route GET "/lifecycle" {
+ let value = sessions.get(req.remoteAddr).or(0)
+ if value == 102 || value == 112 { return 204 } else { return 409 }
+}
+'''
+LIFECYCLE_HANDLER = r'''return websocket(ws) { message in
+ let value = sessions.get(message.connection.remoteAddr).or(0)
+ guard (!message.connection.isTls && value == 2) || (message.connection.isTls && value == 12)
+ else { message.close(1011, "open order") }
+ message.close(1008, "policy")
+} onOpen: { connection in
+ let key = connection.remoteAddr
+ sessions.set(key, sessions.get(key).or(0) + 1)
+ if connection.isTls { sessions.set(key, sessions.get(key).or(0) + 10) }
+ sessions.set(key, sessions.get(key).or(0) + 1)
+} onClose: { closed in
+ guard closed.wasClean && closed.code == 3001 && closed.reason == "ack" &&
+       closed.upstreamCode == 3002 && closed.upstreamReason.isEmpty else { return }
+ let key = closed.connection.remoteAddr
+ sessions.set(key, sessions.get(key).or(0) + 100)
+}'''
+OPEN_CLOSE_HANDLER = r'''return websocket(ws) { message in message.forward("unexpected") }
+onOpen: { connection in connection.close(1008, "policy") }
+onClose: { closed in let unused = closed.code }
+'''
+
+
+
+def assert_socket_quiet(sock):
+    sock.settimeout(0.08)
+    try:
+        data = sock.recv(1)
+    except TimeoutError:
+        return
+    finally:
+        sock.settimeout(3)
+    raise AssertionError(f"expected an open quiet socket, received {data!r}")
+
+
+def closing_handshake_exchange(client, peer):
+    client.sendall(masked_frame(1, b"begin"))
+    expected = b"\x03\xf0policy"
+    if recv_client_frame(client) != (8, expected, False) or \
+            recv_client_frame(peer) != (8, expected, True):
+        raise AssertionError("handler close policy changed")
+    assert_socket_quiet(client)
+    assert_socket_quiet(peer)
+    # App messages stop, while closing controls are answered on the sender's
+    # own leg. A Ping must not be forwarded to the other peer during closing.
+    client.sendall(masked_frame(2, b"late") + masked_frame(9, b"client-ping"))
+    if recv_client_frame(client) != (10, b"client-ping", False):
+        raise AssertionError("closing client Ping did not get its local Pong")
+    assert_socket_quiet(peer)
+    acknowledgement = masked_frame(8, b"\x0b\xb9ack")  # 3001 differs from local cause
+    client.sendall(acknowledgement[:1])
+    assert_socket_quiet(client)
+    client.sendall(acknowledgement[1:])
+    if client.recv(1) != b"":
+        raise AssertionError("downstream handshake did not end its TCP stream")
+    # The gateway must retain the upstream fd and continue closing controls
+    # even though the downstream server-role write half has already sent FIN.
+    peer.sendall(b"\x81\x04late\x89\x0dupstream-ping")
+    if recv_client_frame(peer) != (10, b"upstream-ping", True):
+        raise AssertionError("upstream closing receive was lost after downstream FIN")
+    peer.sendall(b"\x88\x02\x0b\xba")
+    if peer.recv(1) != b"":
+        raise AssertionError("both acknowledgements did not retire the tunnel")
+
+
+def lifecycle_exchange(client, peer):
+    address = client.getpeername()
+    closing_handshake_exchange(client, peer)
+    # Both peers have acknowledged. A new HTTP request observes the callback's
+    # ordinary shard-local Cache effect after the WebSocket connection retired.
+    for _ in range(2):
+        with socket.create_connection(address, timeout=3) as raw:
+            observer = client.context.wrap_socket(raw, server_hostname="localhost") if isinstance(client, ssl.SSLSocket) else raw
+            with observer:
+                observer.sendall(b"GET /lifecycle HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+                if not recv_http_response(observer).startswith(b"HTTP/1.1 204"):
+                    raise AssertionError("lifecycle order, close context or exactly-once effect changed")
+
+
+def closing_client_notify_exchange(client, peer):
+    client.sendall(masked_frame(1, b"begin"))
+    expected = b"\x03\xf0policy"
+    if recv_client_frame(client) != (8, expected, False) or \
+            recv_client_frame(peer) != (8, expected, True):
+        raise AssertionError("handler Close changed before TLS shutdown")
+    client.sendall(masked_frame(8, b"\x03\xe8"))
+    # unwrap sends the client's close_notify and requires the authenticated
+    # server alert; a raw FIN without close_notify cannot satisfy this call.
+    raw = client.unwrap()
+    try:
+        if raw.recv(1) != b"":
+            raise AssertionError("TLS shutdown did not end the downstream TCP write half")
+        assert_socket_quiet(peer)
+        peer.sendall(b"\x89\x04live")
+        if recv_client_frame(peer) != (10, b"live", True):
+            raise AssertionError("client TLS shutdown prematurely retired the upstream")
+        peer.sendall(b"\x88\x00")
+        if peer.recv(1) != b"":
+            raise AssertionError("upstream acknowledgement did not finish TLS-backed tunnel")
+    finally:
+        raw.close()
+
+
+def closing_timeout_exchange(client, peer):
+    started = time.monotonic()
+    client.sendall(masked_frame(1, b"begin"))
+    expected = b"\x03\xf0policy"
+    if recv_client_frame(client) != (8, expected, False) or \
+            recv_client_frame(peer) != (8, expected, True):
+        raise AssertionError("handler Close was not sent before acknowledgement wait")
+    while time.monotonic() - started < 8:
+        time.sleep(0.2)
+        try:
+            client.sendall(masked_frame(9, b"still-here"))
+            if recv_client_frame(client) != (10, b"still-here", False):
+                raise AssertionError("closing timeout changed its Pong body")
+        except (ConnectionResetError, BrokenPipeError):
+            break
+        except AssertionError as error:
+            if "unexpected EOF while reading WebSocket frame" not in str(error):
+                raise
+            break
+    else:
+        raise AssertionError("closing traffic refreshed the fixed acknowledgement deadline")
+    elapsed = time.monotonic() - started
+    if not 4 <= elapsed <= 8:
+        raise AssertionError(f"unexpected acknowledgement timeout duration: {elapsed}")
+
+
+def peer_closing_handshake_exchange(from_client):
+    def exchange(client, peer):
+        body = b"\x03\xf1peer reason"
+        sender, other = (client, peer) if from_client else (peer, client)
+        sender.sendall(masked_frame(8, body) if from_client else b"\x88" + bytes((len(body),)) + body)
+        if recv_client_frame(sender) != (8, body, not from_client) or \
+                recv_client_frame(other) != (8, body, from_client):
+            raise AssertionError("peer initiation did not preserve its Close body")
+        if from_client:
+            if client.recv(1) != b"":
+                raise AssertionError("initiating client did not receive FIN after its reply")
+            assert_socket_quiet(peer)
+            peer.sendall(b"\x88\x00")  # acknowledgement may have no status
+            if peer.recv(1) != b"":
+                raise AssertionError("upstream acknowledgement did not retire the tunnel")
+        else:
+            peer.shutdown(socket.SHUT_WR)  # server can close TCP after its handshake
+            assert_socket_quiet(client)
+            client.sendall(masked_frame(8, b""))
+            if client.recv(1) != b"":
+                raise AssertionError("client acknowledgement was lost after upstream EOF")
+    exchange.__name__ = f"peer_closing_handshake_client={from_client}"
+    return exchange
+
+
+def peer_close_exchange(from_client, payload):
+    def exchange(client, peer):
+        sender, other = (client, peer) if from_client else (peer, client)
+        frame = masked_frame(8, payload) if from_client else bytes((0x88, len(payload))) + payload
+        # Deliver the complete control header separately from its reason body.
+        sender.sendall(frame[:2])
+        time.sleep(0.01)
+        sender.sendall(frame[2:])
+        expected_reply = (8, payload, not from_client)
+        actual = recv_client_frame(sender)
+        if actual != expected_reply:
+            raise AssertionError(f"peer Close reply changed status/reason: {actual!r}")
+        actual = recv_client_frame(other)
+        if actual != (8, payload, from_client):
+            raise AssertionError(f"forwarded peer Close changed status/reason: {actual!r}")
+    exchange.__name__ = f"peer_close_client={from_client}_payload={len(payload)}"
+    return exchange
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True)
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
     for backend in ("epoll", "io_uring"):
+        for native in (False, True):
+            for tls in (False, True):
+                for downstream in (False, True):
+                    for upstream in (False, True):
+                        status, details = compression_scenario(
+                            args.server, args.compiler, backend, downstream, upstream,
+                            native=native, tls=tls, dynamic=True, coalesced=True)
+                        print(f"{status.upper()} {backend} compression native={native} TLS={tls} "
+                              f"downstream={downstream} upstream={upstream}: {details}")
+                status, details = negotiated_connection_scenario(
+                    args.server, args.compiler, backend, native=native, tls=tls)
+                print(f"{status.upper()} {backend} peer-selected protocol native={native} TLS={tls}: {details}")
+                for upstream in (False, True):
+                    status, details = compression_scenario(
+                        args.server, args.compiler, backend, True, upstream,
+                        native=native, tls=tls, coalesced=True, coalesced_maximum=True)
+                    print(f"{status.upper()} {backend} coalesced maximum native={native} TLS={tls} "
+                          f"upstream={upstream}: {details}")
+                for window in (8, 15):
+                    status, details = compression_scenario(
+                        args.server, args.compiler, backend, True, True, native=native, tls=tls,
+                        window=window, no_context=True, maximum=True)
+                    print(f"{status.upper()} {backend} compression boundaries native={native} "
+                          f"TLS={tls} window={window}: {details}")
+                for failure in ("malformed", "control", "utf8", "limit", "unnegotiated"):
+                    for from_client in (False, True):
+                        status, details = compression_rejection_scenario(
+                            args.server, args.compiler, backend, failure, from_client,
+                            native=native, tls=tls)
+                        print(f"{status.upper()} {backend} compression reject={failure} "
+                              f"client={from_client} native={native} TLS={tls}: {details}")
+        for handler, exchange, declarations in (
+                ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
+                 peer_close_exchange(True, b""), ""),
+                ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
+                 peer_close_exchange(False, b""), ""),
+                ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
+                 peer_close_exchange(True, b"\x03\xf1\0" + b"r" * 119 + "€".encode()), ""),
+                ('return websocket(ws) { msg in msg.close(1008, "handler must not run") }',
+                 peer_close_exchange(False, b"\x03\xf1\0" + b"r" * 119 + "€".encode()), ""),
+                (CLOSING_HANDLER, closing_handshake_exchange, ""),
+                (LIFECYCLE_HANDLER, lifecycle_exchange, LIFECYCLE_DECLARATIONS),
+                (OPEN_CLOSE_HANDLER, closing_handshake_exchange, ""),
+                (CLOSING_HANDLER, closing_timeout_exchange, ""),
+                (CLOSING_HANDLER, peer_closing_handshake_exchange(True), ""),
+                (CLOSING_HANDLER, peer_closing_handshake_exchange(False), ""),
+                (GENERAL_JSON_HANDLER, general_json_exchange, GENERAL_JSON_DECLARATIONS),
+                (GENERAL_REGEX_HANDLER, general_regex_exchange, GENERAL_JSON_DECLARATIONS),
+                (TYPED_JSON_HANDLER, typed_json_exchange, GENERAL_JSON_DECLARATIONS),
+                (JSON_LIFETIME_HANDLER, json_lifetime_exchange, ""),
+                (HASH_OUTPUT_HANDLER, hash_output_exchange, ""),
+                (STRING_HELPER_HANDLER, string_helper_exchange, STRING_HELPER_DECLARATIONS),
+                (NOMINAL_MATCH_HANDLER, nominal_match_exchange, NOMINAL_MATCH_DECLARATIONS),
+                (ERROR_VALUE_HANDLER, error_value_exchange, ERROR_VALUE_DECLARATIONS),
+                (CONNECTION_HANDLER, connection_exchange, CONNECTION_DECLARATIONS),
+                (CACHE_HANDLER, cache_exchange, CACHE_DECLARATIONS),
+                (ERROR_MATCH_HANDLER, error_match_exchange, ERROR_MATCH_DECLARATIONS),
+                (ERROR_MATCH_HANDLER, error_match_exchange, ERROR_MATCH_IMPLICIT_DECLARATIONS),
+                (ERROR_FIELDS_HANDLER, error_fields_exchange, ERROR_FIELDS_DECLARATIONS),
+                (DYNAMIC_OUTPUT_HANDLER, dynamic_output_exchange, DYNAMIC_OUTPUT_DECLARATIONS),
+                (DYNAMIC_BOUND_HANDLER, dynamic_bound_exchange, ""),
+                (DYNAMIC_UTF8_HANDLER, dynamic_utf8_exchange, ""),
+                (EAGER_BINDING_HANDLER, eager_binding_exchange, EAGER_BINDING_DECLARATIONS),
+                (GENERAL_HANDLER, general_expression_exchange, GENERAL_DECLARATIONS),
+                (SCALAR_STRING_HANDLER, scalar_string_exchange, SCALAR_PREDICATE_DECLARATIONS),
+                (SCALAR_BOOL_HANDLER, scalar_bool_exchange, SCALAR_PREDICATE_DECLARATIONS),
+                (BOOL_SELECT_HANDLER, bool_select_exchange, BOOL_SELECT_DECLARATIONS),
+                (BOOL_SELECT_REGEX_HANDLER, bool_select_regex_exchange, BOOL_SELECT_DECLARATIONS),
+                (BORROWED_BINARY_HANDLER, borrowed_binary_exchange, BORROWED_BINARY_DECLARATIONS),
+                (OPTIONAL_DEFAULT_HANDLER, optional_default_exchange, OPTIONAL_VALUE_DECLARATIONS),
+                (OPTIONAL_BYTES_HANDLER, optional_bytes_exchange, OPTIONAL_VALUE_DECLARATIONS),
+                (CHOICE_GUARD_HANDLER, choice_guard_exchange, CHOICE_DECLARATIONS),
+                (CHOICE_EARLY_HANDLER, choice_early_exchange, CHOICE_DECLARATIONS),
+                (HELPER_BINDING_HANDLER, helper_binding_exchange, HELPER_BINDING_DECLARATIONS),
+                (OPTIONAL_CONDITION_HANDLER, optional_condition_exchange,
+                 OPTIONAL_CONDITION_DECLARATIONS),
+                (HELPER_GUARD_HANDLER, branch_guard_exchange, JSON_HELPER_DECLARATIONS),
+                (HELPER_IF_LET_HANDLER, if_let_exchange, JSON_HELPER_DECLARATIONS),
+                (BRANCH_GUARD_HANDLER, branch_guard_exchange, ""),
+                (IF_LET_HANDLER, if_let_exchange, ""),
+                (BRANCH_CONTINUATION_HANDLER, branch_continuation_exchange, ""),
+                (NESTED_IF_HANDLER, nested_if_exchange, CALLBACK_SCOPE_DECLARATIONS),
+                (NESTED_EARLY_IF_HANDLER, nested_early_if_exchange, ""),
+                (IF_MESSAGE_HANDLER, if_message_exchange, CALLBACK_SCOPE_DECLARATIONS),
+                (IF_MESSAGE_HANDLER, if_default_exchange, CALLBACK_SCOPE_DECLARATIONS),
+                (CALLBACK_BYTES_HANDLER, payload_bytes_exchange,
+                 PAYLOAD_BYTES_DECLARATIONS + CALLBACK_SCOPE_DECLARATIONS),
+                (CALLBACK_JSON_HANDLER, nested_json_exchange, CALLBACK_SCOPE_DECLARATIONS)):
+            for native in (False, True):
+                if native:
+                    status, details = native_binary_source_removal_scenario(
+                        args.server, args.compiler, backend, handler, exchange, declarations)
+                else:
+                    status, details = binary_replacement_scenario(
+                        args.server, backend, handler, exchange, declarations)
+                if status == "skip":
+                    print(f"SKIP {backend}: {details.strip()}")
+                else:
+                    if status != "pass":
+                        raise AssertionError(f"callback scope: {details}")
+                    print(f"PASS {backend} {exchange.__name__} native={native}")
+        for dynamic in (False, True):
+            handler = BULK_DYNAMIC_HANDLER if dynamic else BULK_HANDLER
+            declarations = BULK_DYNAMIC_DECLARATIONS if dynamic else ''
+            for native in (False, True):
+                for tls in (False, True):
+                    if native:
+                        status, details = native_binary_source_removal_scenario(
+                            args.server, args.compiler, backend, handler,
+                            bulk_exchange(dynamic), declarations, tls=tls)
+                    elif tls:
+                        status, details = tls_terminate_handshake_scenario(
+                            args.server, backend, bulk=True, dynamic=dynamic)
+                    else:
+                        status, details = binary_replacement_scenario(
+                            args.server, backend, handler, bulk_exchange(dynamic), declarations)
+                    print(f"{status.upper()} {backend} bulk native={native} TLS={tls} dynamic={dynamic}: {details}")
+        for tls in (False, True):
+            status, details = native_binary_source_removal_scenario(
+                args.server, args.compiler, backend, BULK_HANDLER,
+                bulk_exchange(stress=True), tls=tls)
+            print(f"{status.upper()} {backend} bulk backpressure TLS={tls}: {details}")
+        for native in (False, True):
+            handler = CONNECTION_HANDLER.replace("websocket(ws)", 'websocket(ws, subprotocol: "chat")')
+            request = REQUEST[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n"
+            response = WS_RESPONSE_HEADERS[:-2] + b"Sec-WebSocket-Protocol: chat\r\n\r\n"
+            exchange = lambda client, peer: connection_exchange(client, peer, b"plain:chat")
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, handler, exchange, CONNECTION_DECLARATIONS,
+                    request=request, response=response)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, handler, exchange, CONNECTION_DECLARATIONS,
+                    request=request, response=response)
+            print(f"{status.upper()} {backend} connection negotiated subprotocol native={native}: {details}")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, PAYLOAD_BYTES_HANDLER,
+                    payload_bytes_exchange, PAYLOAD_BYTES_DECLARATIONS)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, PAYLOAD_BYTES_HANDLER,
+                    payload_bytes_exchange, PAYLOAD_BYTES_DECLARATIONS)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} Bytes payload shared with HTTP native={native}")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, TYPED_MESSAGE_HANDLER,
+                    domain_message_exchange, DOMAIN_MESSAGE_DECLARATIONS)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, TYPED_MESSAGE_HANDLER,
+                    domain_message_exchange, DOMAIN_MESSAGE_DECLARATIONS)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} domain enum predicates shared with HTTP native={native}")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, TYPED_MESSAGE_HANDLER,
+                    typed_message_exchange, TYPED_MESSAGE_DECLARATIONS)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, TYPED_MESSAGE_HANDLER,
+                    typed_message_exchange, TYPED_MESSAGE_DECLARATIONS)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} typed message predicates native={native}")
         status, details = binary_replacement_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")
@@ -1119,6 +3405,17 @@ def main():
                 print(f"SKIP {backend}: {details.strip()}")
             else:
                 print(f"PASS {backend} direct JSON scalar guards native={native}")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, JSON_REGEX_HANDLER, json_regex_exchange)
+            else:
+                status, details = binary_replacement_scenario(
+                    args.server, backend, JSON_REGEX_HANDLER, json_regex_exchange)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} decoded JSON regex native={native}")
         status, details = subprotocol_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")
@@ -1139,16 +3436,45 @@ def main():
             print(f"SKIP {backend}: {details.strip()}")
         else:
             print(f"PASS {backend} strict request shape / 400 / 426 / zero-connect")
-        status, details = admission_scenario(args.server, backend)
-        if status == "skip":
-            print(f"SKIP {backend}: {details.strip()}")
-        else:
-            print(f"PASS {backend} HTTP admission / zero-connect / keepalive / message rewrite")
+        for prelude in ("", "wait(1)\n"):
+            status, details = admission_scenario(args.server, backend, prelude)
+            if status == "skip":
+                print(f"SKIP {backend}: {details.strip()}")
+            else:
+                print(f"PASS {backend} HTTP admission / zero-connect / keepalive / "
+                      f"message rewrite prelude={prelude.strip()!r}")
+        for native in (False, True):
+            for protected_header in (None, "Sec-WebSocket-Accept", "Sec-WebSocket-Protocol",
+                                     "Sec-WebSocket-Extensions"):
+                status, details = chain_after_scenario(args.server, args.compiler, backend,
+                                                      native, protected_header)
+                if status == "skip":
+                    print(f"SKIP {backend}: {details.strip()}")
+                else:
+                    print(f"PASS {backend} HTTP chain after native={native} protected={protected_header}")
         status, details = tls_passthrough_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")
         else:
             print(f"PASS {backend} TLS passthrough")
+        status, details = tls_terminate_handshake_scenario(args.server, backend, closing=True)
+        print(f"{status.upper()} {backend} TLS closing handshake: {details}")
+        status, details = tls_terminate_handshake_scenario(args.server, backend, closing=True, client_notify=True)
+        print(f"{status.upper()} {backend} TLS client close_notify: {details}")
+        for exchange in (closing_handshake_exchange, closing_client_notify_exchange):
+            status, details = native_binary_source_removal_scenario(
+                args.server, args.compiler, backend, CLOSING_HANDLER, exchange, tls=True)
+            print(f"{status.upper()} {backend} native TLS {exchange.__name__}: {details}")
+        for native in (False, True):
+            if native:
+                status, details = native_binary_source_removal_scenario(
+                    args.server, args.compiler, backend, LIFECYCLE_HANDLER,
+                    lifecycle_exchange, LIFECYCLE_DECLARATIONS, tls=True)
+            else:
+                status, details = tls_terminate_handshake_scenario(args.server, backend, lifecycle=True)
+            print(f"{status.upper()} {backend} TLS lifecycle native={native}: {details}")
+        status, details = tls_terminate_handshake_scenario(args.server, backend, connection_context=True)
+        print(f"{status.upper()} {backend} TLS connection context: {details}")
         status, details = tls_terminate_handshake_scenario(args.server, backend)
         if status == "skip":
             print(f"SKIP {backend}: {details.strip()}")

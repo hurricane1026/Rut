@@ -1284,6 +1284,7 @@ template void grpc_deadline_fired<IoUringEventLoop>(IoUringEventLoop*, Connectio
 template void throttle_resume<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 #if RUT_ENABLE_WEBSOCKET
 template bool ws_handle_timer_tick<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+template bool ws_finish_tls_shutdown<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 #endif
 
 #endif

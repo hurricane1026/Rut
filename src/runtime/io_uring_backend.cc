@@ -612,6 +612,24 @@ bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
     return true;
 }
 
+bool IoUringBackend::add_recv_once(i32 fd, u32 conn_id, u32 max_len) {
+    if (fd < 0 || conn_id >= connection_capacity || max_len == 0) return false;
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_RECV;
+    sqe->fd = fd;
+    // Downstream token validation owns only the ordinary provided ring.
+    // Keep bounded reads in that ring across terminal/cancel barriers.
+    sqe->len = max_len < kProvidedBufSize ? max_len : kProvidedBufSize;
+    sqe->buf_group = kBufGroupId;
+    sqe->flags = IOSQE_BUFFER_SELECT;
+    sqe->user_data = encode_user_data(conn_id, IoEventType::Recv);
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
     io_uring_sqe* sqe = get_sqe_flushing();

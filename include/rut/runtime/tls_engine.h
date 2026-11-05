@@ -89,4 +89,9 @@ i32 tls_engine_read(TlsEngine& eng, u8* dst, u32 cap, TlsOp& st);
 // (WantWrite = output region filled before all plaintext was encrypted).
 i32 tls_engine_write(TlsEngine& eng, const u8* src, u32 n, TlsOp& st);
 
+// Generate the local close_notify into the current output region. Ok means
+// SSL_shutdown returned 0 or 1: local alert generation is complete, but the
+// caller still owns/drains ciphertext. WantRead/WantWrite require a retry.
+TlsOp tls_engine_shutdown(TlsEngine& eng);
+
 }  // namespace rut

@@ -3,6 +3,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
+#include "rut/compiler/ast.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_method.h"
 #if RUT_ENABLE_WEBSOCKET
@@ -19,8 +20,8 @@ constexpr Str kEmptyBlockDetail = lit_str("empty block is not supported");
 constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `pattern => ...`");
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
 constexpr Str kWsTrailingBlockDetail =
-    lit_str("websocket trailing blocks require `{ message in ... }`");
-constexpr Str kWsMaxMessageSizeDetail = lit_str("single-slice maximum is 16370 bytes");
+    lit_str("websocket trailing blocks require `{ name in ... }`");
+constexpr Str kWsMaxMessageSizeDetail = lit_str("maximum WebSocket message size is 262130 bytes");
 constexpr Str kObjectCallArgDetail = lit_str("object literals are only allowed as call arguments");
 // The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
 // member names work); the parser rejects them in operator/operand positions.
@@ -45,6 +46,7 @@ constexpr Str kRateLimitArgsDetail =
     lit_str("rate-limit named arguments are `by`, `scope`, or `burst`");
 
 struct Parser {
+    bool ws_lifecycle_body = false;
     const LexedTokens* toks = nullptr;
     AstFile* file = nullptr;
     u32 pos = 0;
@@ -600,22 +602,34 @@ struct Parser {
     // parse_braced_stmt_body because message verdicts are **bare method-call statements**
     // (`message.forward()`), which the general statement parser (parse_stmt) deliberately
     // rejects — its only statements are keyword-led (let/guard/return/if/match/...). Slice B
-    // accepts only bare expression statements; guards/match over `message` are follow-up slices.
+    // accepts immutable lets, message guards and terminal if/else verdict branches.
     // Mirrors parse_braced_stmt_body's empty-block rejection and one-statement unwrap so analyze
     // sees the same body shape.
-    FrontendResult<AstStatement> parse_ws_message_body(const Token& lbrace_tok) {
+    FrontendResult<AstStatement> parse_ws_message_body(const Token& lbrace_tok, u32 depth = 0) {
         AstStatement block{};
         block.kind = AstStmtKind::Block;
         block.span = span_from(lbrace_tok);
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
             AstStatement st{};
-            if (cur().type == TokenType::KwGuard) {
+            if (cur().type == TokenType::KwLet || cur().type == TokenType::KwMatch ||
+                (ws_lifecycle_body && cur().type == TokenType::KwReturn)) {
+                auto binding = parse_stmt();
+                if (!binding) return core::make_unexpected(binding.error());
+                st = binding.value();
+            } else if (cur().type == TokenType::KwGuard) {
                 // `guard <cond> else { <verdict> }` — a conditional verdict.
-                const Token gt = cur();
+                const Token kGuardToken = cur();
                 pos++;
-                auto g = parse_ws_message_guard(gt);
+                auto g = cur().type == TokenType::KwMatch ? parse_func_guard_stmt(kGuardToken)
+                                                          : parse_ws_message_guard(kGuardToken);
                 if (!g) return core::make_unexpected(g.error());
                 st = g.value();
+            } else if (cur().type == TokenType::KwIf) {
+                const Token kIf = cur();
+                pos++;
+                auto branch = parse_ws_message_if(kIf, depth);
+                if (!branch) return core::make_unexpected(branch.error());
+                st = branch.value();
             } else {
                 auto expr = parse_expr();
                 if (!expr) return core::make_unexpected(expr.error());
@@ -630,12 +644,57 @@ struct Parser {
         }
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
-        if (block.block_stmts.len == 0)
+        if (block.block_stmts.len == 0 && !ws_lifecycle_body)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(*rbrace.value()), kEmptyBlockDetail);
         block.span.end = rbrace.value()->end;
-        if (block.block_stmts.len == 1) return *block.block_stmts[0];
+        if (block.block_stmts.len == 1 && !ws_lifecycle_body) return *block.block_stmts[0];
         return block;
+    }
+
+    FrontendResult<AstStatement> parse_ws_message_if(const Token& if_tok, u32 depth) {
+        if (depth >= AstStatement::kMaxBlockStatements)
+            return frontend_error(FrontendError::TooManyItems, span_from(if_tok));
+        AstStatement stmt{};
+        stmt.kind = AstStmtKind::If;
+        if (take(TokenType::KwLet)) {
+            auto name = expect(TokenType::Ident);
+            if (!name) return core::make_unexpected(name.error());
+            stmt.name = name.value()->text;
+            stmt.bind_value = true;
+            auto eq = expect(TokenType::Eq);
+            if (!eq) return core::make_unexpected(eq.error());
+        }
+        auto condition = parse_expr();
+        if (!condition) return core::make_unexpected(condition.error());
+        stmt.expr = condition.value();
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+        auto body = parse_ws_message_body(*lbrace.value(), depth + 1);
+        if (!body) return core::make_unexpected(body.error());
+        auto then_ptr = alloc_stmt(body.value());
+        if (!then_ptr) return core::make_unexpected(then_ptr.error());
+        stmt.then_stmt = then_ptr.value();
+        stmt.span = Span{if_tok.start, body->span.end, if_tok.line, if_tok.col};
+        if (take(TokenType::KwElse)) {
+            AstStatement other{};
+            if (const Token* next_if = take(TokenType::KwIf)) {
+                auto branch = parse_ws_message_if(*next_if, depth + 1);
+                if (!branch) return core::make_unexpected(branch.error());
+                other = branch.value();
+            } else {
+                auto else_brace = expect(TokenType::LBrace);
+                if (!else_brace) return core::make_unexpected(else_brace.error());
+                auto branch = parse_ws_message_body(*else_brace.value(), depth + 1);
+                if (!branch) return core::make_unexpected(branch.error());
+                other = branch.value();
+            }
+            auto else_ptr = alloc_stmt(other);
+            if (!else_ptr) return core::make_unexpected(else_ptr.error());
+            stmt.else_stmt = else_ptr.value();
+            stmt.span.end = other.span.end;
+        }
+        return stmt;
     }
 
     // Parse a message-handler guard, including `guard let name = json.parse(message.text)`.
@@ -643,6 +702,29 @@ struct Parser {
     // ordinary boolean expression over message properties; the else body is a single
     // bare message verdict (message.drop()/forward()/close()). Reuses AstStmtKind::Guard with
     // expr=cond and else_stmt=the verdict Expr — the WsTerminate analyze path interprets it.
+    static bool ws_lifecycle_exits(const AstStatement& stmt, u32 depth = 0) {
+        if (depth > AstStatement::kMaxBlockStatements) return false;
+        if (stmt.kind == AstStmtKind::ReturnVoid) return true;
+        if (stmt.kind == AstStmtKind::Expr)
+            return stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.name.eq(lit_str("close"));
+        if (stmt.kind == AstStmtKind::Block)
+            return stmt.block_stmts.len &&
+                   ws_lifecycle_exits(*stmt.block_stmts[stmt.block_stmts.len - 1], depth + 1);
+        if (stmt.kind == AstStmtKind::If)
+            return stmt.then_stmt && stmt.else_stmt &&
+                   ws_lifecycle_exits(*stmt.then_stmt, depth + 1) &&
+                   ws_lifecycle_exits(*stmt.else_stmt, depth + 1);
+        if (stmt.kind == AstStmtKind::Match) {
+            if (!stmt.match_arms.len) return false;
+            for (u32 i = 0; i < stmt.match_arms.len; ++i)
+                if (!stmt.match_arms[i].stmt ||
+                    !ws_lifecycle_exits(*stmt.match_arms[i].stmt, depth + 1))
+                    return false;
+            return true;
+        }
+        return false;
+    }
+
     FrontendResult<AstStatement> parse_ws_message_guard(const Token& guard_tok) {
         AstStatement stmt{};
         stmt.kind = AstStmtKind::Guard;
@@ -661,6 +743,20 @@ struct Parser {
         if (!kw_else) return core::make_unexpected(kw_else.error());
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
+        if (ws_lifecycle_body) {
+            auto body = parse_ws_message_body(*lbrace.value());
+            if (!body) return core::make_unexpected(body.error());
+            if (!ws_lifecycle_exits(body.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      body->span,
+                                      lit_str("guard else must exit the lifecycle callback"));
+            auto ptr = alloc_stmt(body.value());
+            if (!ptr) return core::make_unexpected(ptr.error());
+            stmt.expr = cond.value();
+            stmt.else_stmt = ptr.value();
+            stmt.span = Span{guard_tok.start, body->span.end, guard_tok.line, guard_tok.col};
+            return stmt;
+        }
         auto verdict = parse_expr();
         if (!verdict) return core::make_unexpected(verdict.error());
         AstStatement vstmt{};
@@ -807,6 +903,10 @@ struct Parser {
 
     FrontendResult<AstExpr> parse_call_arg() {
         if (cur().type == TokenType::LBrace) return parse_object_call_arg();
+        return parse_expr();
+    }
+
+    FrontendResult<AstExpr> parse_primary_atom() {
         if (cur().type == TokenType::Ident && cur().text.eq({"b", 1}) &&
             peek().type == TokenType::StringLit) {
             const Token kStart = cur();
@@ -818,10 +918,6 @@ struct Parser {
             literal.span = Span{kStart.start, prev().end, kStart.line, kStart.col};
             return literal;
         }
-        return parse_expr();
-    }
-
-    FrontendResult<AstExpr> parse_primary_atom() {
         const Token start = cur();
         AstExpr expr{};
         if (cur().type == TokenType::LBrace)
@@ -1870,6 +1966,14 @@ struct Parser {
                 }
                 stmt.has_response_body = true;
             }
+            return stmt;
+        }
+        if (ws_lifecycle_body && cur().type == TokenType::KwReturn &&
+            (peek().type == TokenType::RBrace || peek().line > cur().line)) {
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::ReturnVoid;
+            stmt.span = span_from(cur());
+            ++pos;
             return stmt;
         }
         if (take(TokenType::KwReturn)) {
@@ -2969,7 +3073,7 @@ struct Parser {
                     const u64 bytes = amount * mult;
                     if (bytes == 0 || bytes > 0xffffffffull)
                         return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
-                    if (bytes > kWsTerminateMessageCapacity) {
+                    if (bytes > kWsMaxMessageCapacity) {
                         const Span kValueSpan{num.value()->start,
                                               unit.value()->end,
                                               num.value()->line,
@@ -2983,19 +3087,20 @@ struct Parser {
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.name = name.value()->text;
                 stmt.ws_max_message_size = ws_max_size;
-                // A trailing `{ message in ... }` block makes this TERMINATE mode (the gateway
+                // A trailing `{ name in ... }` block makes this TERMINATE mode (the gateway
                 // parses/inspects each message); a bare `websocket(x)` stays the passthrough
                 // ForwardUpstream tunnel. The block is the per-message handler; its
-                // body is stored on then_stmt (reused like For), parsed by the general
-                // statement parser (per-message verdicts are a follow-up slice).
+                // body is stored on then_stmt (reused like For) and parsed with message
+                // verdict statements in addition to ordinary let bindings.
                 if (cur().type == TokenType::LBrace) {
                     auto lbrace = expect(TokenType::LBrace);
                     if (!lbrace) return core::make_unexpected(lbrace.error());
-                    if (cur().type != TokenType::Ident || !cur().text.eq({"message", 7}))
+                    if (cur().type != TokenType::Ident)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(cur()),
                                               kWsTrailingBlockDetail);
-                    pos++;  // consume the fixed message-handler binding
+                    stmt.ws_parameter_name = cur().text;
+                    pos++;  // consume the callback parameter
                     if (cur().type != TokenType::KwIn)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(cur()),
@@ -3008,6 +3113,35 @@ struct Parser {
                     stmt.kind = AstStmtKind::WsTerminate;
                     stmt.then_stmt = body_ptr.value();
                     stmt.span = Span{start.start, body.value().span.end, start.line, start.col};
+                    while (cur().type == TokenType::Ident && peek().type == TokenType::Colon) {
+                        const bool kOpen = cur().text.eq(lit_str("onOpen"));
+                        const bool kClose = cur().text.eq(lit_str("onClose"));
+                        if ((!kOpen && !kClose) || (kOpen ? stmt.ws_open_body : stmt.ws_close_body))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(cur()));
+                        pos += 2;
+                        auto brace = expect(TokenType::LBrace);
+                        if (!brace) return core::make_unexpected(brace.error());
+                        auto parameter = expect(TokenType::Ident);
+                        if (!parameter) return core::make_unexpected(parameter.error());
+                        auto in = expect(TokenType::KwIn);
+                        if (!in) return core::make_unexpected(in.error());
+                        const bool kSaved = ws_lifecycle_body;
+                        ws_lifecycle_body = true;
+                        auto hook = parse_ws_message_body(*brace.value());
+                        ws_lifecycle_body = kSaved;
+                        if (!hook) return core::make_unexpected(hook.error());
+                        auto hook_ptr = alloc_stmt(hook.value());
+                        if (!hook_ptr) return core::make_unexpected(hook_ptr.error());
+                        if (kOpen) {
+                            stmt.ws_open_body = hook_ptr.value();
+                            stmt.ws_open_parameter = parameter.value()->text;
+                        } else {
+                            stmt.ws_close_body = hook_ptr.value();
+                            stmt.ws_close_parameter = parameter.value()->text;
+                        }
+                        stmt.span.end = hook->span.end;
+                    }
                     return stmt;
                 }
                 // Passthrough form (no block): maxMessageSize only governs terminate-mode
@@ -4002,6 +4136,7 @@ struct Parser {
     }
 
     FrontendResult<AstStatement> parse_func_body_stmt() {
+        if (ws_lifecycle_body && cur().type == TokenType::KwReturn) return parse_stmt();
         if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   span_from(cur()),

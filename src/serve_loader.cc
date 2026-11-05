@@ -1,6 +1,7 @@
 #include "rut/serve_loader.h"
 
 #include "rut/common/types.h"
+#include "rut/common/ws_message.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -20,6 +21,9 @@
 #include "rut/runtime/ws_handshake.h"
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn
 #endif
+
+#include <memory>
+#include <new>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -248,23 +252,16 @@ bool load_rut_program(const char* path,
     }
     ir.hir = hir.value();
 #if RUT_ENABLE_WEBSOCKET
-    constexpr Str kWsPreludeDetail = lit_str(
-        "WebSocket message routes allow only compile-time constant lets and bounded request guards "
-        "before websocket; effects are not executed");
-    // Keep a cheap publication boundary in the loader too: route effects and control flow that
-    // cannot be executed by the ordinary HTTP handler must not be silently omitted.
+    // Admission is already lowered through the ordinary HTTP handler. Keep
+    // the ownership invariant at publication, without excluding its effects,
+    // guard values, scheduling or registered route metadata.
     for (u32 i = 0; i < ir.hir->routes.len; i++) {
         const HirRoute& route = ir.hir->routes[i];
         if (!route.is_ws_terminate) continue;
-        if (route.waits.len != 0 || route.for_loops.len != 0 ||
-            route.control.kind != HirControlKind::Direct || route.decorators.len != 0 ||
-            route.rate_limit.count != 0 || route.throttle_down_bps != 0 ||
-            route.http_cache_ttl != 0) {
-            err.stage = LoadStage::Analyze;
-            set_load_diag(
-                err, Diagnostic{FrontendError::UnsupportedSyntax, route.span, kWsPreludeDetail});
+        if (route.is_ws_callback || route.control.kind != HirControlKind::Direct ||
+            route.control.direct_term.kind != HirTerminatorKind::ForwardUpstream ||
+            route.control.direct_term.upstream_index != route.ws_handler.upstream_index)
             return false;
-        }
     }
 #endif
     AccessLogSinkSpec loaded_access_log{};
@@ -310,6 +307,75 @@ bool load_rut_program(const char* path,
         for (u32 i = 0; i < ir.hir->routes.len; i++) {
             const HirWsHandler& h = ir.hir->routes[i].ws_handler;
             if (!ir.hir->routes[i].is_ws_terminate) continue;
+            const auto kEmitCallback = [&](u32 root, WsCallbackPhase phase) -> bool {
+                const HirRoute& source_route = ir.hir->routes[i];
+                if (root >= source_route.exprs.len) {
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                auto callback = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
+                if (!callback) {
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                callback->path = source_route.path;
+                callback->method = source_route.method;
+                callback->is_ws_callback = true;
+                callback->ws_callback_phase = phase;
+                callback->span = h.span;
+                HirLocal result{};
+                result.type = HirTypeKind::I32;
+                result.ref_index = 0;
+                result.is_runtime_synthetic = true;
+                result.span = h.span;
+                result.init = source_route.exprs[root];
+                if (!callback->locals.push(result)) {
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                callback->control.kind = HirControlKind::Direct;
+                callback->control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+                callback->control.direct_term.source_kind = HirTerminatorSourceKind::LocalRef;
+                callback->control.direct_term.local_ref_index = 0;
+                callback->control.direct_term.span = h.span;
+                err.stage = LoadStage::BuildMir;
+                auto built = build_mir_route(*ir.hir, *callback);
+                if (!built) {
+                    set_load_diag(err, built.error());
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                const std::unique_ptr<MirModule> kCallbackMir(built.value());
+                FrontendRirModule callback_rir{};
+                err.stage = LoadStage::Lower;
+                auto lowered_callback = lower_to_rir(*kCallbackMir, callback_rir);
+                if (!lowered_callback) {
+                    set_load_diag(err, lowered_callback.error());
+                    callback_rir.destroy();
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                err.stage = LoadStage::Codegen;
+                const bool kEmitted =
+                    jit::emit_ws_body(cg.mod, cg.ctx, callback_rir.module, ws_n, phase);
+                callback_rir.destroy();
+                if (!kEmitted) {
+                    jit::dispose_module(cg.mod, cg.ctx);
+                    return false;
+                }
+                return true;
+            };
+            if (h.open_body_expr != 0xffffffffu &&
+                !kEmitCallback(h.open_body_expr, WsCallbackPhase::Open))
+                return false;
+            if (h.close_body_expr != 0xffffffffu &&
+                !kEmitCallback(h.close_body_expr, WsCallbackPhase::Close))
+                return false;
+            if (h.general_body_expr != 0xffffffffu) {
+                if (!kEmitCallback(h.general_body_expr, WsCallbackPhase::Message)) return false;
+                ++ws_n;
+                continue;
+            }
             static_assert(HirWsHandler::kMaxConditionNodes == jit::WsLenGuardSpec::kMaxConditions);
             static_assert(HirWsHandler::kMaxLenGuards == jit::WsLenGuardSpec::kMaxGuards);
             jit::WsLenGuardSpec guards[HirWsHandler::kMaxConditionNodes];
@@ -327,6 +393,8 @@ bool load_rut_program(const char* path,
                 guards[g].lhs = h.len_guards[g].lhs;
                 guards[g].rhs = h.len_guards[g].rhs;
                 guards[g].is_operand = h.len_guards[g].is_operand;
+                guards[g].pass_target = h.len_guards[g].pass_target;
+                guards[g].fail_target = h.len_guards[g].fail_target;
             }
             if (!jit::emit_ws_handler(cg.mod,
                                       cg.ctx,
@@ -410,7 +478,7 @@ bool load_rut_program(const char* path,
                 if (index >= route.exprs.len) return false;
                 const auto& expr = route.exprs[index];
                 if (expr.kind != HirExprKind::StrLit || expr.str_value.len > max_msg ||
-                    expr.str_value.len > kWsTerminateMessageCapacity ||
+                    expr.str_value.len > kWsMaxMessageCapacity ||
                     (binary ? (!expr.str_value.ptr && expr.str_value.len != 0)
                             : !ws_valid_text_payload(expr.str_value)))
                     return false;
@@ -423,12 +491,21 @@ bool load_rut_program(const char* path,
             };
             auto retain_rewrite = [&](const HirWsTextRewrite& source, WsTextRewrite& result) {
                 switch (source.source) {
+                    case HirWsTextSource::Dynamic:
+                        result.source = WsTextSource::Dynamic;
+                        return source.prefix_expr == 0xffffffffu &&
+                               source.suffix_expr == 0xffffffffu && !source.source_path.ptr &&
+                               !source.source_path.len && ws_valid_text_rewrite(result, max_msg);
                     case HirWsTextSource::Literal:
                         result.source = WsTextSource::Literal;
                         if (source.source_path.ptr || source.source_path.len != 0) return false;
                         break;
                     case HirWsTextSource::LiteralBinary:
                         result.source = WsTextSource::LiteralBinary;
+                        if (source.source_path.ptr || source.source_path.len != 0) return false;
+                        break;
+                    case HirWsTextSource::MessageBytes:
+                        result.source = WsTextSource::MessageBytes;
                         if (source.source_path.ptr || source.source_path.len != 0) return false;
                         break;
                     case HirWsTextSource::MessageText:
@@ -543,6 +620,19 @@ bool load_rut_program(const char* path,
                     forward_text_count,
                     subprotocol))
                 return false;
+            auto& attached = out.config.routes[http_route_ordinal];
+            if (route.ws_handler.open_body_expr != 0xffffffffu) {
+                jit::format_ws_callback_symbol(ws_n, WsCallbackPhase::Open, sym, sizeof(sym));
+                attached.ws_open_handler =
+                    reinterpret_cast<WsMessageHandlerFn>(out.engine.lookup(sym));
+                if (!attached.ws_open_handler) return false;
+            }
+            if (route.ws_handler.close_body_expr != 0xffffffffu) {
+                jit::format_ws_callback_symbol(ws_n, WsCallbackPhase::Close, sym, sizeof(sym));
+                attached.ws_close_handler =
+                    reinterpret_cast<WsMessageHandlerFn>(out.engine.lookup(sym));
+                if (!attached.ws_close_handler) return false;
+            }
             ws_n++;
             http_route_ordinal++;
         }

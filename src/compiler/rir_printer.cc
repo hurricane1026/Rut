@@ -171,6 +171,15 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqPathOnly:
             buf.put_cstr("req.pathOnly");
             break;
+        case Opcode::WsForward:
+            buf.put_cstr("ws.forward");
+            break;
+        case Opcode::WsClose:
+            buf.put_cstr("ws.close");
+            break;
+        case Opcode::WsMessageField:
+            buf.put_cstr("ws.message.field");
+            break;
         case Opcode::ReqBody:
             buf.put_cstr("req.body");
             break;
@@ -273,8 +282,14 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::StrConstantTimeEqual:
             buf.put_cstr("str.constant_time_equal");
             break;
+        case Opcode::StrPredicate:
+            buf.put_cstr("str.predicate");
+            break;
         case Opcode::StrHasPrefix:
             buf.put_cstr("str.has_prefix");
+            break;
+        case Opcode::StrLength:
+            buf.put_cstr("str.length");
             break;
         case Opcode::StrTrimPrefix:
             buf.put_cstr("str.trim_prefix");
@@ -398,6 +413,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
             break;
         case Opcode::OptUnwrap:
             buf.put_cstr("opt.unwrap");
+            break;
+        case Opcode::Phi:
+            buf.put_cstr("phi");
             break;
         case Opcode::Select:
             buf.put_cstr("select");
@@ -731,6 +749,22 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             print_quoted_str(buf, inst.imm.str_val);
             break;
+        case Opcode::WsForward:
+            buf.put(' ');
+            buf.put_i32(inst.imm.i32_val);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::WsClose:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
+            break;
+        case Opcode::WsMessageField:
+            buf.put(' ');
+            buf.put_i32(inst.imm.i32_val);
+            break;
         case Opcode::ReqMethod:
         case Opcode::ReqPath:
         case Opcode::ReqPathOnly:
@@ -795,6 +829,14 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_i64(static_cast<i64>(inst.imm.i32_val));
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::StrPredicate:
+            buf.put(' ');
+            buf.put_i32(inst.imm.i32_val);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
             break;
         case Opcode::HttpOriginListAllows:
         case Opcode::HttpTokenListAllows:
@@ -882,6 +924,17 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::BytesHex:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::Phi:
+            buf.put(' ');
+            for (u32 i = 0; i < 2; ++i) {
+                if (i != 0) buf.put_cstr(", ");
+                buf.put('[');
+                print_value_ref(buf, inst.operands[i]);
+                buf.put_cstr(", bb");
+                buf.put_u32(inst.imm.block_targets[i].id);
+                buf.put(']');
+            }
             break;
         case Opcode::Select:
             buf.put(' ');
