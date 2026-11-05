@@ -1,0 +1,13 @@
+// Start with --tls-cert SERVER_CERT --tls-key SERVER_KEY --tls-client-ca CA_BUNDLE.
+// Pins are trusted lowercase SHA-256 fingerprints of client certificate DER.
+// Empty MTLS_PREVIOUS_PIN disables that slot; both credential IDs remain required.
+// Deploy both pins during renewal, then remove the old pin in a new config.
+import "middleware/auth.rut"
+
+route GET "/private" {
+    let identity = auth.rotatingPinnedMtlsIdentity(
+        env("MTLS_CURRENT_PIN"), env("MTLS_PREVIOUS_PIN"), env("MTLS_CONSUMER_ID"),
+        env("MTLS_CURRENT_ID"), env("MTLS_PREVIOUS_ID"))
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
