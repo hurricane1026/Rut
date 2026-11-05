@@ -16,7 +16,7 @@ whether a competing open-source edition includes them.
 | --- | --- | --- |
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
-| Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived scoped HS256 token and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
+| Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
@@ -459,9 +459,10 @@ failures, tampering, zero allocations, and JIT request-arena ownership.
 Arbitrary claims and other signing algorithms are not supported.
 
 The native and Rut/JIT `jwtIssueHs256WithIdAndScope` APIs add exactly one
-trusted single-token `scope` claim to the `jti` profile. The value shares the
-ASCII OAuth scope-token grammar used by `jwtHasScope`; invalid or non-ASCII
-values fail issuance. Identity helpers require callers to authenticate first.
+trusted `scope` string claim to the `jti` profile. The value is a nonempty
+list of ASCII OAuth scope tokens separated by single spaces, sharing the
+strict grammar used by `jwtHasScope`; malformed or non-ASCII lists fail issuance.
+Identity helpers require callers to authenticate first.
 Consumers verify signature and issuer/audience/lifetime, apply the static jti
 snapshot check, then authorize scope. There is no live revocation or replay
 protection.
@@ -1186,3 +1187,27 @@ Rotation is an immutable route policy update. Existing RCU readers finish with
 the old snapshot, and all nodes must adopt the replacement policy for retirement
 to take effect. This neither changes the startup CA bundle nor implements CA
 reload, CRL/OCSP, automatic certificate renewal or durable distributed revocation.
+
+## HS256 issuance with multiple permissions
+
+The existing native `jwt_hs256_issue_with_id_and_scope`, Rut
+`jwtIssueHs256WithIdAndScope`, `Crypto.issueJwtHs256WithIdAndScope`, and
+`auth.jwtForIdentityHs256WithIdAndScope` accept one or more OAuth scope tokens
+separated by single ASCII spaces. The shared issuer/receiver parser follows
+[RFC 6749 section 3.3](https://www.rfc-editor.org/rfc/rfc6749#section-3.3).
+It rejects empty lists, leading/trailing/repeated spaces and all other whitespace,
+quotes, backslashes, controls and non-ASCII bytes. It preserves exact ordering
+and duplicate values; a list never becomes a valid single required token.
+The seven-claim HS256 profile, 8192-byte escaped payload limit, alias rejection,
+request-owned output and failure cleanup are unchanged. Signing does not decide
+which permissions a caller may grant: keep the list in trusted issuer policy.
+
+Native tests check a Python-generated HMAC vector, allocation-free multi-scope
+issuance and the full payload boundary; single-scope vectors remain covered.
+JIT and relocated artifacts exercise both direct and qualified APIs and reject
+malformed lists. Two-shard TLS password-login tests independently verify the
+issued signature and exact list, then require either permission and their
+intersection on epoll/io_uring after source removal. Signed narrower claims
+cannot acquire the other permission through spoofed headers; invalid issuer
+configuration emits no token. This does not add OAuth grants, requested-scope
+negotiation, arbitrary claims or persistent sessions.

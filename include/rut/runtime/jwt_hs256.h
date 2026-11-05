@@ -41,9 +41,11 @@ inline constexpr u32 kMaxJwtHs256KeyBytes = 4096;
                                            u32 capacity,
                                            u32& output_len);
 
-// Same bounded profile with caller-provided jti and one OAuth scope-token.
-// The scope uses jwt_scope_token_valid's ASCII grammar; ID uniqueness remains
-// the caller's responsibility. Output is caller-owned and aliasing is rejected.
+// Same bounded profile with caller-provided jti and an OAuth scope list.
+// One or more nonempty ASCII scope-tokens separated by single spaces; order
+// and duplicates are preserved. Leading/trailing/repeated spaces are rejected.
+// The full escaped payload still fits 8192 bytes; ID uniqueness remains the
+// caller's responsibility. Output is caller-owned and aliasing is rejected.
 [[nodiscard]] bool jwt_hs256_issue_with_id_and_scope(Str key,
                                                      Str subject,
                                                      Str issuer,

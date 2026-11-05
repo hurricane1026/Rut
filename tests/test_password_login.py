@@ -37,14 +37,14 @@ def sign(claims, algorithm="HS256"):
     return payload + b"." + b64(hmac.digest(KEY, payload, "sha256"))
 
 
-def verify(token):
+def verify(token, expected_scope="orders.read"):
     header, payload, signature = token.split(b".")
     assert hmac.compare_digest(decode(signature), hmac.digest(KEY, header + b"." + payload, "sha256"))
     assert json.loads(decode(header)) == {"alg": "HS256", "typ": "JWT"}
     claims = json.loads(decode(payload))
     assert set(claims) == {"sub", "iss", "aud", "iat", "exp", "jti", "scope"}
     assert (claims["sub"], claims["iss"], claims["aud"], claims["scope"]) == (
-        "alice", "rut-password-login", "orders", "orders.read")
+        "alice", "rut-password-login", "orders", expected_scope)
     assert claims["exp"] - claims["iat"] == 300
     assert abs(claims["iat"] - time.time()) < 30
     assert uuid.UUID(claims["jti"]).version == 4
@@ -52,9 +52,30 @@ def verify(token):
 
 
 @contextmanager
-def gateway(args, *, subject="alice", key=KEY.decode(), timeout=5000):
+def gateway(args, *, subject="alice", key=KEY.decode(), timeout=5000, scope="orders.read"):
     source = Path(args.source)
     program = source.read_text()
+    if scope != "orders.read":
+        needle = '"orders.read", env("JWT_ISSUE_KEY"), 300)'
+        assert program.count(needle) == 1
+        program = program.replace(needle, f'{json.dumps(scope)}, env("JWT_ISSUE_KEY"), 300)')
+    # Exercise another permission and their intersection with the same token.
+    program += '''
+route GET "/audit" {
+    let claims = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_ISSUE_KEY"))
+    let identity = auth.jwtIdentityWithLifetime(claims, "rut-password-login", "orders", "login-jwt", 300, 300)
+    guard jwtHasScope(claims, "orders.audit") else { return 403 }
+    let subject = identity.consumerId
+    return response(200, body: subject)
+}
+route GET "/both" {
+    let claims = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_ISSUE_KEY"))
+    let identity = auth.jwtIdentityWithLifetime(claims, "rut-password-login", "orders", "login-jwt", 300, 300)
+    guard jwtHasScope(claims, "orders.read") && jwtHasScope(claims, "orders.audit") else { return 403 }
+    let subject = identity.consumerId
+    return response(200, body: subject)
+}
+'''
     if timeout != 5000:
         needle = 'env("PASSWORD_HASH"), 5000)'
         assert program.count(needle) == 1
@@ -169,6 +190,36 @@ def exercise(args):
         assert request("GET", "/private", [("Authorization", "Bearer " + candidate)])[0] == 401
         duplicate = [("Authorization", "Bearer " + token.decode())] * 2
         assert request("GET", "/private", duplicate)[0] == 401
+
+    # Signatures, exact list bytes, and both permissions survive native loading
+    # after source removal on each backend. Client scope headers confer nothing.
+    with gateway(args, scope="orders.read orders.audit") as request:
+        status, _, token = request("POST", "/login", password + [("X-Scope", "admin")])
+        assert status == 200, (status, token)
+        claims = verify(token, "orders.read orders.audit")
+        authorization = [("Authorization", "Bearer " + token.decode())]
+        for path in ("/private", "/audit", "/both"):
+            status, _, body = request("GET", path, authorization)
+            assert (status, body) == (200, b"alice"), (path, status, body)
+        for scope, path, expected in [("orders.read", "/audit", 403),
+                                      ("orders.audit", "/private", 403),
+                                      ("orders.read", "/both", 403),
+                                      ("orders.audit orders.read", "/both", 200),
+                                      ("orders.read  orders.audit", "/both", 403),
+                                      ("orders.read orders.audit\t", "/private", 403)]:
+            candidate = sign(dict(claims, scope=scope)).decode()
+            status = request("GET", path, [("Authorization", "Bearer " + candidate),
+                                           ("X-Scope", "orders.read orders.audit")])[0]
+            assert status == expected, (scope, path, status)
+        assert request("GET", "/both", authorization * 2)[0] == 401
+
+    # Issuer policy is never trimmed, split on arbitrary whitespace or normalized.
+    for scope in ("orders.read  orders.audit", " orders.read", "orders.read ",
+                  "orders.read orders.audit\t"):
+        with gateway(args, scope=scope) as request:
+            status, fields, body = request("POST", "/login", password)
+            assert status == 503, (scope, status, body)
+            assert fields.get("Content-Type") != "application/jwt"
 
     for options, expected in [({"subject": ""}, 503), ({"key": "short"}, 503), ({"timeout": 1}, 504)]:
         with gateway(args, **options) as request:

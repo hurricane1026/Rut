@@ -2022,12 +2022,26 @@ provided token ID as `jti`; call it only after successful authentication,
 because Identity has no authentication provenance.
 
 `jwtIssueHs256WithIdAndScope` emits exactly `sub`, `iss`, `aud`, `jti`, `scope`,
-`iat` and `exp`. Scope must be one nonempty ASCII OAuth scope-token using the
-same character grammar as `jwtHasScope`; it comes from trusted issuer
-configuration, not request input. Invalid scopes fail issuance. The identity
+`iat` and `exp`. Scope is a nonempty OAuth scope list, for example
+`"orders:read orders:write"`, using the same list grammar as `jwtHasScope`:
+ASCII tokens separated by exactly one ASCII space. Leading/trailing/repeated
+spaces, tabs, controls, quotes, backslashes and non-ASCII bytes fail issuance,
+including malformed suffixes after a valid token. Order and duplicate token
+values are preserved exactly. Single-scope inputs retain their previous bytes
+and signature; the combined escaped payload remains capped at 8192 bytes.
+The list comes from trusted issuer configuration, not request input. The identity
 helper `auth.jwtForIdentityHs256WithIdAndScope` uses `identity.consumerId` as
 `sub` and should be called only after authentication. Validate signature,
 issuer/audience/lifetime and configured jti revocation before scope policy.
+
+Set `JWT_ISSUE_SCOPE="orders:read orders:write"` for the shipped
+[jwt-issue-auth.rut](../examples/jwt-issue-auth.rut) issuer to grant both
+permissions. Resource routes can require either exact token, or require both
+with `jwtHasScope(claims, "orders:read") && jwtHasScope(claims, "orders:write")`.
+This broadens the existing issuance argument, adding no keyword, builtin,
+claim, algorithm, or OAuth endpoint. Missing or invalid authentication remains
+401; authenticated callers lacking a permission receive 403. The password/JWT
+example keeps its existing single read permission by default.
 
 ### Static HS JWT secret rotation
 

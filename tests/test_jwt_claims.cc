@@ -226,6 +226,43 @@ TEST(jwt_claims, group_membership_is_exact_and_validates_the_entire_array) {
     CHECK(has(valid));
 }
 
+TEST(jwt_claims, scope_list_grammar_and_membership_share_strict_boundaries) {
+    const Str valid[] = {lit_str("read"),
+                         lit_str("read write"),
+                         lit_str("write read read"),
+                         lit_str("! # [ ] ~"),
+                         lit_str("Read read")};
+    for (Str value : valid) CHECK(jwt_scope_list_valid(value));
+    const char nul[] = {'r', ' ', 'w', '\0'};
+    const char non_ascii[] = {'r', ' ', static_cast<char>(0x80)};
+    const Str invalid[] = {{nullptr, 1},
+                           {},
+                           lit_str(" "),
+                           lit_str(" read"),
+                           lit_str("read "),
+                           lit_str("read  write"),
+                           lit_str("read\twrite"),
+                           lit_str("read write\r"),
+                           lit_str("read write\n"),
+                           lit_str("read write\""),
+                           lit_str("read write\\"),
+                           {nul, sizeof(nul)},
+                           {non_ascii, sizeof(non_ascii)}};
+    for (Str value : invalid) CHECK(!jwt_scope_list_valid(value));
+    // A valid first scope must not mask malformed permission text later on.
+    json::Document document;
+    const Str malformed[] = {lit_str(R"({"scope":"read write "})"),
+                             lit_str(R"({"scope":"read  write"})"),
+                             lit_str(R"({"scope":"read write\t"})"),
+                             lit_str(R"({"scope":"read write\u0000"})")};
+    for (Str claims : malformed) CHECK(!jwt_has_scope(document, claims, lit_str("read")));
+    char bounded[json::kMaxBytes + 1];
+    for (char& byte : bounded) byte = 'a';
+    CHECK(jwt_scope_list_valid({bounded, json::kMaxBytes}));
+    CHECK(!jwt_scope_list_valid({bounded, sizeof(bounded)}));
+    CHECK(!jwt_scope_token_valid(lit_str("read write")));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
