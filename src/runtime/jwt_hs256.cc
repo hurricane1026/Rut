@@ -94,7 +94,7 @@ bool issue(Str key,
     if (!key.ptr || key.len < 32 || key.len > kMaxJwtHs256KeyBytes ||
         !valid_claim_string(subject) || !valid_claim_string(issuer) ||
         !valid_claim_string(audience) || (include_id && !valid_claim_string(token_id)) ||
-        (include_scope && !jwt_scope_token_valid(scope)) || unix_seconds <= 0 || ttl_seconds <= 0 ||
+        (include_scope && !jwt_scope_list_valid(scope)) || unix_seconds <= 0 || ttl_seconds <= 0 ||
         ttl_seconds > 86400 || unix_seconds > 0x7fffffffffffffffLL - ttl_seconds || !output)
         return false;
 

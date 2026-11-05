@@ -543,7 +543,10 @@ TEST(jwt_hs256_issue, issues_jti_and_one_scope_with_verified_signature_without_a
     const char invalid_non_ascii[] = {'r', static_cast<char>(0xc3), static_cast<char>(0xa9)};
     const char control[] = {'r', '\n'};
     const Str invalid_scopes[] = {lit_str(""),
-                                  lit_str("two words"),
+                                  lit_str("two  words"),
+                                  lit_str(" leading"),
+                                  lit_str("trailing "),
+                                  lit_str("read write\tbad"),
                                   lit_str("quote\""),
                                   lit_str("slash\\"),
                                   {control, sizeof(control)},
@@ -615,6 +618,90 @@ TEST(jwt_hs256_issue, issues_jti_and_one_scope_with_verified_signature_without_a
                                              900,
                                              overlap,
                                              sizeof(overlap),
+                                             length));
+    CHECK_EQ(length, 0u);
+}
+
+TEST(jwt_hs256_issue, scope_list_preserves_bytes_and_matches_independent_signature_vector) {
+    char key[32];
+    for (char& byte : key) byte = 's';
+    const Str scope = lit_str("orders:write orders:read orders:write");
+    char token[kMaxJwtHs256TokenBytes];
+    u32 length = 99;
+    allocations = 0;
+    tracking = true;
+    const bool issued = jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                                          lit_str("alice"),
+                                                          lit_str("issuer"),
+                                                          lit_str("orders"),
+                                                          lit_str("request-18"),
+                                                          scope,
+                                                          1700000000,
+                                                          900,
+                                                          token,
+                                                          sizeof(token),
+                                                          length);
+    tracking = false;
+    REQUIRE(issued);
+    CHECK_EQ(allocations, 0u);
+    // Independently encoded/signed with Python's base64, JSON and HMAC modules.
+    CHECK((Str{token, length}.eq(
+        lit_str("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                "eyJzdWIiOiJhbGljZSIsImlzcyI6Imlzc3VlciIsImF1ZCI6Im9yZGVycyIsImp0aSI6InJlcXVlc3QtMT"
+                "giLCJzY29wZSI6Im9yZGVyczp3cml0ZSBvcmRlcnM6cmVhZCBvcmRlcnM6d3JpdGUiLCJpYXQiOjE3MDAw"
+                "MDAwMDAsImV4cCI6MTcwMDAwMDkwMH0.rvfYZbMiNO9qtpMUH4ciHc6H85C6a-BSELrZkirixwY"))));
+    char payload[kMaxJwtHs256PayloadBytes];
+    u32 payload_len = 0;
+    REQUIRE(
+        authenticate({token, length}, {key, sizeof(key)}, payload, sizeof(payload), payload_len));
+    json::Document document;
+    CHECK(jwt_claims_valid_with_lifetime(document,
+                                         {payload, payload_len},
+                                         lit_str("issuer"),
+                                         lit_str("orders"),
+                                         1700000000,
+                                         900,
+                                         900));
+    CHECK(jwt_has_scope(document, {payload, payload_len}, lit_str("orders:read")));
+    CHECK(jwt_has_scope(document, {payload, payload_len}, lit_str("orders:write")));
+    CHECK(!jwt_has_scope(document, {payload, payload_len}, lit_str("orders:admin")));
+    CHECK(!jwt_has_scope(document, {payload, payload_len}, lit_str("Orders:read")));
+    CHECK(!jwt_has_scope(document, {payload, payload_len}, lit_str("orders")));
+    CHECK(!jwt_has_scope(document, {payload, payload_len}, scope));
+
+    // A whole-list limit does not relax the existing combined payload bound.
+    const u32 overhead = payload_len - scope.len;
+    char large_scopes[json::kMaxBytes + 1];
+    for (u32 i = 0; i < sizeof(large_scopes); ++i) large_scopes[i] = i % 2 == 0 ? 'a' : ' ';
+    const u32 exact_scope_bytes = kMaxJwtHs256PayloadBytes - overhead;
+    // End on a nonempty token without changing the requested boundary length.
+    large_scopes[exact_scope_bytes - 1] = 'a';
+    REQUIRE(jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                              lit_str("alice"),
+                                              lit_str("issuer"),
+                                              lit_str("orders"),
+                                              lit_str("request-18"),
+                                              {large_scopes, exact_scope_bytes},
+                                              1700000000,
+                                              900,
+                                              token,
+                                              sizeof(token),
+                                              length));
+    REQUIRE(
+        authenticate({token, length}, {key, sizeof(key)}, payload, sizeof(payload), payload_len));
+    CHECK_EQ(payload_len, kMaxJwtHs256PayloadBytes);
+    CHECK_EQ(length, kMaxJwtHs256TokenBytes);
+    large_scopes[exact_scope_bytes] = 'a';
+    CHECK(!jwt_hs256_issue_with_id_and_scope({key, sizeof(key)},
+                                             lit_str("alice"),
+                                             lit_str("issuer"),
+                                             lit_str("orders"),
+                                             lit_str("request-18"),
+                                             {large_scopes, exact_scope_bytes + 1},
+                                             1700000000,
+                                             900,
+                                             token,
+                                             sizeof(token),
                                              length));
     CHECK_EQ(length, 0u);
 }

@@ -534,13 +534,15 @@ TEST(native_program, jwt_issue_with_id_and_scope_helper_survives_source_removal)
     Source source;
     const char rut_source[] =
         "route GET \"/token\" { let issued = jwtIssueHs256WithIdAndScope(\"alice\", \"issuer\", "
-        "\"orders\", \"request-88\", \"orders:read\", \"01234567890123456789012345678901\", 60) "
+        "\"orders\", \"request-88\", \"orders:read orders:write\", "
+        "\"01234567890123456789012345678901\", 60) "
         "guard let token = issued else { return 503 } "
         "guard let claims = jwtDecode(token, \"01234567890123456789012345678901\", \"HS256\") "
         "else { return 501 } "
         "guard jwtClaimsValid(claims, \"issuer\", \"orders\") else { return 502 } "
         "guard jwtHasScope(claims, \"orders:read\") else { return 504 } "
-        "guard !jwtHasScope(claims, \"orders:write\") else { return 505 } return 204 }\n";
+        "guard jwtHasScope(claims, \"orders:write\") else { return 505 } "
+        "guard !jwtHasScope(claims, \"orders:admin\") else { return 506 } return 204 }\n";
     REQUIRE(source.append(rut_source, sizeof(rut_source) - 1));
     Program owner;
     REQUIRE(owner.p);

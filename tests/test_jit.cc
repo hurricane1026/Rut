@@ -26784,11 +26784,12 @@ route GET "/direct" {
     return 204
 }
 route GET "/qualified" {
-    let issued = Crypto.issueJwtHs256WithIdAndScope("alice", "issuer", "orders", "request-74", "orders:read", "01234567890123456789012345678901", 90)
+    let issued = Crypto.issueJwtHs256WithIdAndScope("alice", "issuer", "orders", "request-74", "orders:read orders:write", "01234567890123456789012345678901", 90)
     guard let token = issued else { return 511 }
     guard let claims = jwtDecode(token, "01234567890123456789012345678901", "HS256") else { return 512 }
     guard jwtClaimsValidWithLifetime(claims, "issuer", "orders", i64(3600), i64(3600)) else { return 513 }
-    guard jwtHasScope(claims, "orders:read") else { return 514 }
+    guard jwtHasScope(claims, "orders:read") && jwtHasScope(claims, "orders:write") &&
+        !jwtHasScope(claims, "orders:admin") else { return 514 }
     return 204
 }
 route GET "/wrong-scope" {
@@ -26803,6 +26804,16 @@ route GET "/missing-scope" {
     guard let claims = jwtDecode(token, "01234567890123456789012345678901", "HS256") else { return 532 }
     guard jwtClaimsValid(claims, "issuer", "orders") else { return 533 }
     guard jwtHasScope(claims, "orders:read") else { return 403 }
+    return 204
+}
+route GET "/bad-spacing" {
+    let issued = Crypto.issueJwtHs256WithIdAndScope("alice", "issuer", "orders", "request-77", "orders:read  orders:write", "01234567890123456789012345678901", 90)
+    guard let token = issued else { return 503 }
+    return 204
+}
+route GET "/bad-suffix" {
+    let issued = jwtIssueHs256WithIdAndScope("alice", "issuer", "orders", "request-78", "orders:read orders:write\t", "01234567890123456789012345678901", 90)
+    guard let token = issued else { return 503 }
     return 204
 }
 )rut";
@@ -26825,9 +26836,10 @@ route GET "/missing-scope" {
     REQUIRE(pool.init(8));
     SliceArena arena;
     REQUIRE(arena.init(&pool));
-    const char* paths[] = {"/direct", "/qualified", "/wrong-scope", "/missing-scope"};
-    const u16 statuses[] = {204, 204, 403, 403};
-    for (u32 i = 0; i < 4; ++i) {
+    const char* paths[] = {
+        "/direct", "/qualified", "/wrong-scope", "/missing-scope", "/bad-spacing", "/bad-suffix"};
+    const u16 statuses[] = {204, 204, 403, 403, 503, 503};
+    for (u32 i = 0; i < 6; ++i) {
         char handler_name[] = "handler_route_0";
         handler_name[14] = static_cast<char>('0' + i);
         auto handler = reinterpret_cast<HandlerFn>(engine.lookup(handler_name));

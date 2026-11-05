@@ -430,7 +430,7 @@ func jwtForIdentityHs256WithId(_ identity: Identity, _ issuer: str, _ audience: 
     _ tokenId: str, _ key: str, _ ttl: i32) =>
     Crypto.issueJwtHs256WithId(identity.consumerId, issuer, audience, tokenId, key, ttl)
 
-// Scope comes from trusted issuer configuration. Identity carries no
+// The scope list comes from trusted issuer configuration. Identity carries no
 // authentication provenance; call this helper only after authentication.
 func jwtForIdentityHs256WithIdAndScope(_ identity: Identity, _ issuer: str, _ audience: str,
     _ tokenId: str, _ scope: str, _ key: str, _ ttl: i32) =>

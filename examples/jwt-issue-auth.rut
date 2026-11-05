@@ -1,5 +1,7 @@
 // Set API_KEY, CONSUMER_ID, JWT_ISSUER, JWT_AUDIENCE, JWT_ISSUE_SCOPE and
 // JWT_ISSUE_KEY at load time. Scope is trusted configuration. Serve behind TLS.
+// For multiple permissions set JWT_ISSUE_SCOPE="orders:read orders:write";
+// only single spaces may separate tokens. Never copy requested scopes blindly.
 import Crypto
 import "middleware/auth.rut"
 listen :8080

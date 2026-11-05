@@ -9595,9 +9595,15 @@ snapshot and do not provide live revocation or replay protection.
 `jwt_hs256_issue_with_id_and_scope` and the Rut/JIT
 `jwtIssueHs256WithIdAndScope(subject, issuer, audience, tokenId, scope, key, ttl)`
 operation emit exactly seven claims: `sub`, `iss`, `aud`, `jti`, `scope`, `iat`
-and `exp`. Scope is one nonempty ASCII OAuth scope-token using the same grammar
-as `jwtHasScope`; spaces, quotes, backslashes, controls and non-ASCII bytes are
-rejected. The scope is issuer-provided trusted configuration, not request input.
+and `exp`. Scope follows the OAuth list grammar `scope-token *( SP scope-token )`:
+one or more nonempty ASCII tokens separated by exactly one ASCII space. The
+shared bounded parser also serves `jwtHasScope`; leading/trailing/repeated
+spaces, quotes, backslashes, controls and non-ASCII bytes are rejected. Order
+and repeated token values are preserved exactly, without trimming or sorting;
+permission checks still compare one complete, case-sensitive token. A single
+scope retains its previous token bytes and signature. The full escaped payload
+remains bounded to 8192 bytes. The scope list is issuer-provided trusted
+configuration, not request input.
 The identity helper is available only as a convenience after authentication;
 `Identity` itself carries no authentication provenance. Consumers should
 verify signature and issuer/audience/lifetime, check static ID revocation, then

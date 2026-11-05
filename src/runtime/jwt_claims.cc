@@ -31,6 +31,24 @@ bool scope_token_byte(unsigned char c) {
     return c == 0x21 || (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x7e);
 }
 
+// Validate the entire list even after a match, so a malformed suffix cannot
+// authorize a permission or be emitted by the issuer. Views are never retained.
+bool scope_list_matches(Str scopes, Str required, bool& found) {
+    found = false;
+    if (scopes.ptr == nullptr || scopes.len == 0 || scopes.len > json::kMaxBytes) return false;
+    u32 start = 0;
+    for (u32 i = 0; i <= scopes.len; ++i) {
+        if (i == scopes.len || scopes.ptr[i] == ' ') {
+            if (i == start) return false;
+            found |= Str{scopes.ptr + start, i - start}.eq(required);
+            start = i + 1;
+        } else if (!scope_token_byte(static_cast<unsigned char>(scopes.ptr[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 bool jwt_claims_valid(
@@ -110,6 +128,11 @@ bool jwt_scope_token_valid(Str token) {
     return true;
 }
 
+bool jwt_scope_list_valid(Str scopes) {
+    bool ignored = false;
+    return scope_list_matches(scopes, {}, ignored);
+}
+
 bool jwt_has_scope(json::Document& document, Str claims, Str required) {
     if (required.ptr == nullptr || required.len == 0 || required.len > json::kMaxBytes)
         return false;
@@ -121,20 +144,8 @@ bool jwt_has_scope(json::Document& document, Str claims, Str required) {
     if (kScope == json::kNone) return false;
     json::Writer decoded{document.scratch};
     if (!document.string(kScope, decoded) || decoded.len == 0) return false;
-    // Validate the whole list even after a match: a malformed suffix cannot
-    // turn a malformed permission document into an authorization success.
     bool found = false;
-    u32 start = 0;
-    for (u32 i = 0; i <= decoded.len; ++i) {
-        if (i == decoded.len || document.scratch[i] == ' ') {
-            if (i == start) return false;
-            found |= Str{document.scratch + start, i - start}.eq(required);
-            start = i + 1;
-        } else if (!scope_token_byte(static_cast<unsigned char>(document.scratch[i]))) {
-            return false;
-        }
-    }
-    return found;
+    return scope_list_matches({document.scratch, decoded.len}, required, found) && found;
 }
 
 bool jwt_has_group(json::Document& document, Str claims, Str required) {
