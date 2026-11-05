@@ -10053,3 +10053,56 @@ changes keys, never the configured token type. No new keyword, builtin, dependen
 request-path allocation or mutable cross-shard state is introduced. This implements
 a bounded application type policy, not OAuth/OIDC profile conformance or nested
 JWT handling. See the language card for exact behavior and the ES256 example.
+
+### JWT client-bound identity policy
+
+The imported `auth.jwtClientIdentity(verifiedClaims, issuer, audience,
+allowedClientId, credentialId)` helper adds a fixed client allow policy over
+signature-verified claims, using existing typed JSON decoding and claims checks.
+It requires the standard nonempty subject/issuer/audience and valid expiry profile,
+plus one nonempty string `client_id`, matched exactly after JSON decoding against
+the trusted configured client. No client header, `azp`, subject or protected-header
+field can stand in for this payload claim. Duplicate decoded JSON names reject.
+
+Success preserves the verified subject in consumerId and configured credentialId
+with method `jwt`. Empty configured strings produce 503 when the helper runs;
+missing/malformed/empty client claims or invalid standard claims produce challenged
+401 `invalid_token`. A valid signed token for another client produces 403. Scope,
+group, lifetime and revocation policy remain explicit composable steps. Signature
+verification must happen first; `Json` and `Identity` do not carry authentication
+provenance enforced by the type system.
+
+The implementation uses an ordinary two-field struct and the existing compiler,
+JSON runtime and request arena. It adds no keyword, builtin, C++ runtime primitive,
+crypto dependency, mutable state or network call. Configuration remains an immutable
+snapshot adopted through the existing lifecycle. This is a static client access
+policy using the RFC 9068 `client_id` claim, not complete OAuth/OIDC, sender binding,
+a dynamic client registry or replay protection. See the language card and
+`examples/jwt-client-auth.rut` for the executable contract.
+
+
+### Static mTLS credential rotation
+
+The ordinary `auth.rotatingPinnedMtlsIdentity` policy takes current/previous
+certificate SHA-256 pins, one Consumer ID and two credential IDs. It reuses the
+verified connection fingerprint, canonical pin validator and constant-time
+comparison. Empty pin strings disable slots; all metadata remains mandatory and
+at least one slot must be enabled. Every nonempty slot must validate before
+matching either certificate, so a bad secondary pin cannot downgrade to a valid
+primary slot. Configuration errors produce 503; missing or unmatched verified
+identity produces 403 at the HTTP layer. Mandatory mTLS may reject missing or
+untrusted certificates earlier during its handshake.
+
+Success returns the configured Consumer ID, the matching configured credential
+ID and method `mtls`; equal pins prefer current. The policy accepts current-only
+or previous-only snapshots. It reads no identity from request headers. Remove a
+slot and adopt replacement configuration to retire a credential. Existing RCU
+readers retain their snapshot; no mutable state or cross-shard coordination is
+added. Verified connection fingerprints continue to be checked on each request,
+while CA trust remains listener-startup configuration.
+
+The implementation introduces no keyword, builtin, runtime primitive, dependency
+or allocation mechanism. TLS verification, fingerprint ownership/reset, HTTP/2
+propagation and RCU lifetimes remain the existing runtime contracts. Pin rotation
+is separate from certificate issuance, CA reload, CRL/OCSP, timer-based rotation
+and distributed revocation. See the language card and rotation example.

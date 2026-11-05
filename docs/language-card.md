@@ -554,6 +554,29 @@ tickets and renegotiation are disabled for this profile. CRL/OCSP, SAN mapping
 and durable revocation are not provided. See
 [`mtls-pinned-auth.rut`](../examples/mtls-pinned-auth.rut).
 
+`auth.rotatingPinnedMtlsIdentity(currentPin, previousPin, consumerId, currentId,
+previousId)` provides a static two-pin renewal window for one Consumer. Empty
+pin strings disable individual slots; at least one pin and all three metadata
+strings must be nonempty. Every nonempty pin must be exactly 64 lowercase hex
+characters, even when the other pin matches. Invalid configuration returns 503
+before certificate matching. A missing/unverified or unmatched certificate returns
+403 when HTTP routing is reached; a listener requiring client certificates may
+reject it during the TLS handshake instead.
+
+The helper reads only `req.tlsClientCertSha256`, never client-supplied headers.
+Success returns method `mtls`, the configured Consumer ID, and the credential ID
+for the matched slot. Both pins may be equal; current wins that tie. Current-only
+and previous-only configurations are supported. Disabled slots still require
+stable nonempty credential IDs. See [the rotation example](../examples/mtls-rotating-auth.rut).
+
+Deploy both approved pins during renewal, then clear the old slot and adopt a
+replacement configuration to end the window. In-flight requests retain their
+original RCU generation; each node must adopt the new configuration. Existing
+connections keep their verified fingerprint, but subsequent requests use the
+adopted route policy. This rotates the route's pin allowlist, not the listener CA
+bundle, which still requires restart to change. It provides no automatic rotation
+timer, certificate issuance, CRL/OCSP service or cross-node revocation protocol.
+
 Upstream connections are shared per shard/config/upstream/backend and multiplex
 RPCs from different downstream clients. Incomplete HTTP/2 input promotes the
 connection's receive slice to 256 KiB when less than 16 KiB of tail space remains;
@@ -2446,3 +2469,39 @@ without request-time key parsing, allocation or I/O. This is explicit applicatio
 type binding as described in [RFC 8725 section 3.11](https://www.rfc-editor.org/rfc/rfc8725.html#section-3.11),
 not full OAuth access-token profile conformance, nested JWT support or replay
 protection. See [the example](../examples/jwt-es256-auth.rut).
+
+### Client-bound JWT identity
+
+`auth.jwtClientIdentity(verifiedClaims, issuer, audience, allowedClientId,
+credentialId) -> auth.Identity` is ordinary imported Rut policy. Verify the
+signature first with a pinned `Crypto.jwtHs*`, `Crypto.jwtRs256` or
+`Crypto.jwtEs256` policy (or the corresponding auth document wrapper). The
+helper validates the existing issuer/audience/subject/expiry profile and requires
+a nonempty string `client_id` in the signed payload. It compares exact decoded,
+case-sensitive bytes against the trusted configured `allowedClientId`.
+
+Success returns consumerId from verified `sub`, configured credentialId and
+method `jwt`. `client_id` never replaces the user identity, and neither subject,
+`azp`, a protected-header `client_id`, nor HTTP fields substitute for it. Escaped
+names/values compare after JSON decoding; duplicate decoded names reject under
+the shared strict JSON parser. Empty configuration returns 503 when the helper
+runs; invalid claims and missing/empty/non-string client IDs return 401 with
+Bearer `invalid_token`. A valid token naming a different client returns 403.
+Apply scope/group authorization separately; the example challenges insufficient
+scope with 403. Existing lifetime/revocation policies may also be applied before
+publishing identity.
+
+```rut
+let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+let identity = auth.jwtClientIdentity(document, "https://issuer.example", "orders",
+                                      "orders-web", "issuer-key")
+```
+
+The signed client identifier follows the `client_id` claim in
+[RFC 9068 section 2.2](https://www.rfc-editor.org/rfc/rfc9068.html#section-2.2).
+This is a fixed resource authorization policy, not an OAuth/OIDC login flow,
+full access-token profile validator, `azp` inference, or sender proof of possession.
+A bearer token remains replayable by anyone holding it until other policy rejects
+it. `Json` has no compiler-enforced verification provenance: never pass arbitrary
+parsed request JSON. All policy arguments must come from trusted configuration,
+not request fields. See [the runnable example](../examples/jwt-client-auth.rut).

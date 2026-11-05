@@ -3942,6 +3942,24 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_es256_auth_${es256_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(jwt_client_backend epoll io_uring)
+                add_test(NAME test_jwt_client_auth_${jwt_client_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_client_auth.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/jwt-client-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${jwt_client_backend})
+                set_tests_properties(test_jwt_client_auth_${jwt_client_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
+            endforeach()
+            foreach(mtls_rotation_backend epoll io_uring)
+                add_test(NAME test_mtls_rotation_${mtls_rotation_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_rotation.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/mtls-rotating-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${mtls_rotation_backend})
+                set_tests_properties(test_mtls_rotation_${mtls_rotation_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
+            endforeach()
         endif()
         add_test(NAME test_native_protocol
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test_native_protocol.py

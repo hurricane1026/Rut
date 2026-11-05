@@ -1,5 +1,6 @@
 #include "es256_fixture.h"
 #include "fault_injection.h"
+#include "fixtures/jwt_lifetime.h"
 #include "fixtures/signed_request.h"
 #include "rs256_fixture.h"
 #include "rut/compiler/analyze.h"
@@ -2885,6 +2886,227 @@ route GET "/" {
             CHECK(!conn->jit_response_body_valid);
         }
     }
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, jwt_client_binding_requires_signed_client_claim_and_preserves_subject) {
+    const std::string key = test::jwt_lifetime::kSecret;
+    std::string source = "import \"middleware/auth.rut\"\n";
+    const char* configurations[][4] = {
+        {"issuer", "gateway", "orders-web", "issuer-key"},
+        {"", "gateway", "orders-web", "issuer-key"},
+        {"issuer", "", "orders-web", "issuer-key"},
+        {"issuer", "gateway", "", "issuer-key"},
+        {"issuer", "gateway", "orders-web", ""},
+    };
+    for (u32 i = 0; i < 5; ++i) {
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        source += "let doc = auth.jwtDocumentHs256(req.authorization.or(\"\"), \"" + key + "\")\n";
+        source += "let identity = auth.jwtClientIdentity(doc";
+        for (const char* field : configurations[i]) source += std::string(", \"") + field + "\"";
+        source +=
+            ")\nguard identity.credentialId == \"issuer-key\" && identity.method == \"jwt\" else { "
+            "return 500 }\n";
+        source += "let user = identity.consumerId\nreturn response(200, body: user)\n}\n";
+    }
+    JsonProgram program;
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/jwt-client-auth.rut";
+    REQUIRE(program.init(source.c_str(), source_path.c_str()));
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    conn->json_arena.backend.pool = &pool;
+    const struct {
+        const char* claims;
+        u32 status;
+    } cases[] = {
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":"orders-web"})",
+         200},
+        {R"({"sub":"bob","iss":"issuer","aud":["other","gateway"],"exp":200,"client\u005fid":"orders\u002dweb"})",
+         200},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":"mobile"})", 403},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":"Orders-web"})",
+         403},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":"orders-web-extra"})",
+         403},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":"orders-web\u0000"})",
+         403},
+        {R"({"sub":"orders-web","iss":"issuer","aud":"gateway","exp":200,"azp":"orders-web"})",
+         401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":""})", 401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":null})", 401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":42})", 401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":["orders-web"]})",
+         401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":{}})", 401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"client_id":"orders-web","client\u005fid":"orders-web"})",
+         401},
+        {R"({"sub":"alice","iss":"wrong","aud":"gateway","exp":200,"client_id":"orders-web"})",
+         401},
+        {R"({"sub":"alice","iss":"issuer","aud":"wrong","exp":200,"client_id":"orders-web"})", 401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":100,"client_id":"orders-web"})",
+         401},
+        {R"({"sub":"","iss":"issuer","aud":"gateway","exp":200,"client_id":"orders-web"})", 401},
+        {R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"iat":101,"client_id":"orders-web"})",
+         401},
+    };
+    auto run = [&](u32 route, const std::string& token, u32 expected, const char* user = "alice") {
+        const std::string request =
+            "GET / HTTP/1.1\r\nHost: test\r\nX-Client-ID: orders-web\r\nX-Consumer-ID: attacker\r\n"
+            "Authorization: Bearer " +
+            token + "\r\n\r\n";
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        test_fault::ScopedSyscallFault clock(
+            test_fault::fixed_clock_gettime(CLOCK_REALTIME, 100, 0));
+        const auto outcome = invoke_jit_handler(program.handler(route),
+                                                conn,
+                                                *ctx,
+                                                conn->recv_buf.data(),
+                                                conn->recv_buf.len(),
+                                                nullptr);
+        CHECK_EQ(outcome.status_code, expected);
+        handle_jit_outcome(loop.get(), *conn, outcome, program.handler(route), true);
+        const std::string response(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                   conn->send_buf.len());
+        if (expected == 200) {
+            CHECK(response.ends_with(user));
+        } else {
+            CHECK(response.find("alice") == std::string::npos);
+            CHECK(!conn->jit_response_body_valid);
+        }
+        if (expected == 401) CHECK(response.find("WWW-Authenticate: Bearer") != std::string::npos);
+    };
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const std::string token = test::jwt_lifetime::make_token(cases[i].claims);
+        REQUIRE(!token.empty());
+        run(0, token, cases[i].status, i == 1 ? "bob" : "alice");
+    }
+    const std::string good = test::jwt_lifetime::make_token(cases[0].claims);
+    for (u32 route = 1; route < 5; ++route) run(route, good, 503);
+    std::string tampered = good;
+    tampered[tampered.size() - 5] = tampered[tampered.size() - 5] == 'A' ? 'B' : 'A';
+    run(0, tampered, 401);
+    run(0, "malformed", 401);
+    run(0, good + "\r\nauthorization: Bearer " + good, 401);
+    run(0, good, 200);
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
+TEST(json_network, rotating_mtls_pins_validate_configuration_and_map_only_verified_certificates) {
+    const std::string first(64, 'a'), second(64, 'b'), invalid(64, 'A');
+    const std::string configurations[][5] = {
+        {first, second, "customer", "current", "previous"},
+        {first, "", "customer", "current", "previous"},
+        {"", second, "customer", "current", "previous"},
+        {first, first, "customer", "current", "previous"},
+        {"", "", "customer", "current", "previous"},
+        {first, invalid, "customer", "current", "previous"},
+        {"short", second, "customer", "current", "previous"},
+        {first, second, "", "current", "previous"},
+        {first, second, "customer", "", "previous"},
+        {first, second, "customer", "current", ""},
+    };
+    std::string source = "import \"middleware/auth.rut\"\n";
+    for (u32 i = 0; i < 10; ++i) {
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        source += "let identity = auth.rotatingPinnedMtlsIdentity(";
+        for (u32 j = 0; j < 5; ++j) {
+            if (j) source += ", ";
+            source += "\"" + configurations[i][j] + "\"";
+        }
+        source +=
+            ")\nguard identity.consumerId == \"customer\" && identity.method == \"mtls\" else { "
+            "return 500 }\n";
+        source +=
+            "let credential = identity.credentialId\nreturn response(200, body: credential)\n}\n";
+    }
+    const std::string file = __FILE__;
+    const std::string source_path =
+        file.substr(0, file.rfind("/tests/")) + "/examples/mtls-rotating-auth.rut";
+    JsonProgram program;
+    REQUIRE(program.init(source.c_str(), source_path.c_str()));
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    conn->json_arena.backend.pool = &pool;
+    auto run = [&](u32 route,
+                   char fingerprint,
+                   bool tls,
+                   bool handshake,
+                   bool verified,
+                   u32 expected,
+                   const char* credential = "") {
+        conn->tls_active = tls;
+        conn->tls_handshake_complete = handshake;
+        conn->tls_client_cert_sha256_valid = verified;
+        __builtin_memset(
+            conn->tls_client_cert_sha256, fingerprint, sizeof(conn->tls_client_cert_sha256));
+        const std::string request =
+            "GET / HTTP/1.1\r\nHost: test\r\nX-Client-Cert-Sha256: " + first +
+            "\r\nX-Consumer-ID: customer\r\nX-Credential-ID: current\r\n\r\n";
+        release_completed_jit_json(*conn);
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+            request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        const auto outcome = invoke_jit_handler(program.handler(route),
+                                                conn,
+                                                *ctx,
+                                                conn->recv_buf.data(),
+                                                conn->recv_buf.len(),
+                                                nullptr);
+        CHECK_EQ(outcome.status_code, expected);
+        if (expected == 200) {
+            CHECK(conn->jit_response_body_valid);
+            CHECK(conn->jit_response_body.eq(cstr(credential)));
+        } else {
+            CHECK(!conn->jit_response_body_valid);
+        }
+    };
+    run(0, 'a', true, true, true, 200, "current");
+    run(0, 'b', true, true, true, 200, "previous");
+    run(0, 'c', true, true, true, 403);
+    run(1, 'a', true, true, true, 200, "current");
+    run(1, 'b', true, true, true, 403);
+    run(2, 'a', true, true, true, 403);
+    run(2, 'b', true, true, true, 200, "previous");
+    run(3, 'a', true, true, true, 200, "current");
+    run(3, 'b', true, true, true, 403);
+    for (u32 route = 4; route < 10; ++route) {
+        run(route, 'a', true, true, true, 503);
+        run(route, 'b', true, true, true, 503);
+        run(route, 'a', false, false, false, 503);
+    }
+    run(0, 'a', false, false, false, 403);
+    run(0, 'a', true, false, true, 403);
+    run(0, 'a', true, true, false, 403);
+    run(0, 'a', false, true, true, 403);
+    run(0, 'a', true, true, true, 200, "current");
+    conn->tls_active = false;
+    conn->tls_handshake_complete = false;
+    conn->tls_client_cert_sha256_valid = false;
     loop->free_conn(*conn);
     pool.destroy();
 }

@@ -28,7 +28,7 @@ whether a competing open-source edition includes them.
 | OIDC login / session | Pending | Discovery validation, authorization-code + PKCE, state/nonce, redirect validation, ID-token verification, secure cookies, logout and refresh |
 | Gateway OAuth2 endpoints | Pending | Authorization/token grants, client authentication, consent/redirect binding, code single use, token expiry/revocation and persistent state |
 | Upstream OAuth token | Pending | Client credentials/token exchange, audience/scope, per-shard cache with bounded refresh coordination, cancellation and secret-safe logs |
-| mTLS identity | Inbound mandatory client certificate verification with startup CA bundle; verified SHA-256 fingerprint exposed to Rut/JIT/native requests; static pinned identity helper; epoll and io_uring HTTP/1 and HTTP/2 loopback tests; TLS 1.2/1.3 valid, absent, wrong-CA and expired certificate cases; ordinary TLS and cleartext spoof-header rejection; keepalive/reset, pin RCU update, bounded HTTP/2 refusal/retry, and source-unlinked native artifact evidence | Dynamic identity mapping, CRL/OCSP and durable revocation |
+| mTLS identity | Inbound mandatory client certificate verification with startup CA bundle; verified SHA-256 fingerprint exposed to Rut/JIT/native requests; static pinned identity and two-pin credential rotation helpers; epoll and io_uring HTTP/1 and HTTP/2 loopback tests; TLS 1.2/1.3 valid, absent, wrong-CA and expired certificate cases; ordinary TLS and cleartext spoof-header rejection; keepalive/reset, pin RCU update, bounded HTTP/2 refusal/retry, and source-unlinked native artifact evidence | Dynamic identity mapping, CRL/OCSP and durable revocation |
 | LDAP | Pending | Direct LDAP protocol, TLS, bind/search escaping, limits/timeouts, credential hygiene; an HTTP bridge does not satisfy this row |
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
 | Keycloak / Casdoor | Pending | Explicit supported OIDC/OAuth2 or provider protocols and conformance fixtures, role mapping and outage behavior |
@@ -1138,3 +1138,51 @@ epoll and io_uring; unavailable backends are reported as skips.
 The configured type stays with the policy during remote key replacement.
 Signature, approved keys, issuer/audience/time, snapshot revocation and scope/group
 checks continue to compose. Persistent replay state remains outstanding.
+
+## Fixed JWT client authorization
+
+`auth.jwtClientIdentity` applies the existing standard claims policy to verified
+JWT JSON and requires an exact nonempty signed payload `client_id` matching
+trusted configuration. It preserves the verified subject as consumerId and the
+configured credentialId; client identity never substitutes for the user subject.
+Other client IDs receive 403, missing/malformed client claims receive challenged
+401, and empty configured policy fields produce 503. Header/`azp`/subject fallback
+is unavailable. This uses existing Rut/JSON primitives with no new dependency.
+
+HTTP/JIT tests cover correct and escaped client values, distinct subjects, audience
+arrays, absent/wrong/empty/non-string IDs, duplicates, case/prefix/NUL mismatches,
+issuer/audience/expiry/future-issuance failures, configuration errors, tampered
+signatures, duplicate Authorization and spoofed identity headers. Two-shard native
+TLS gateway tests on epoll/io_uring use an independent Python HMAC oracle, remove
+the source/module after loading, verify scope/client denial and Bearer challenges,
+and reject protected-header client IDs and `azp` fallback. Unavailable backends are
+reported as skips by the existing test convention.
+
+The client allow policy is static until configuration adoption. It neither proves
+the presenter's possession of a client secret/key nor implements full RFC 9068,
+OAuth/OIDC login, token exchange, durable revocation or replay tracking.
+
+
+## Static mTLS pin rotation
+
+`auth.rotatingPinnedMtlsIdentity` accepts current and previous canonical SHA-256
+pins for one configured Consumer. Empty pins disable slots; at least one pin and
+both credential IDs remain required. Invalid nonempty slots return 503 before
+any credential match, even when the other slot verifies. Only the verified TLS
+connection fingerprint is accepted. Missing/unmatched identity returns 403 at
+HTTP routing, while mandatory mTLS can reject earlier during handshake. Equal
+pins select current, and successful metadata comes only from configuration.
+
+HTTP/JIT tests cover both distinct fingerprints and credential IDs, disabled
+slots, current preference on ties, old-pin removal, malformed active slots,
+metadata errors and forged headers/connection-state rejection. Real two-shard
+TLS/native gateway tests exercise the fixture certificate in each slot, source
+and module removal after loading, current-only/previous-only/tied/revoked
+snapshots, bad-config refusal, missing client certificates and shutdown on epoll
+and io_uring. The two-backend tests are registered in CMake; unavailable backends
+are explicitly skipped.
+
+Rotation is an immutable route policy update. Existing RCU readers finish with
+the old snapshot, and all nodes must adopt the replacement policy for retirement
+to take effect. This neither changes the startup CA bundle nor implements CA
+reload, CRL/OCSP, automatic certificate renewal or durable distributed revocation.

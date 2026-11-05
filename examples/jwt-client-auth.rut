@@ -1,0 +1,14 @@
+import "middleware/auth.rut"
+
+// All JWT_* values are trusted configuration snapshots. The signed client_id
+// names the client the issuer issued this token to; sub remains the user ID.
+route GET "/orders" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtClientIdentity(document, env("JWT_ISSUER"), env("JWT_AUDIENCE"),
+                                          env("JWT_CLIENT_ID"), "orders-issuer")
+    guard jwtHasScope(document, "orders:read") else {
+        return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})
+    }
+    let userId = identity.consumerId
+    return response(200, body: userId)
+}
