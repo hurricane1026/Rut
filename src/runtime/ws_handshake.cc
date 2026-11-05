@@ -222,6 +222,61 @@ bool request_upgrade_value_is_valid(Str value, bool* offers_websocket) {
 
 }  // namespace
 
+WsHandshakeRequestResult ws_prepare_h2_handshake(const ParsedRequest& request,
+                                                 u8* storage,
+                                                 u32 capacity,
+                                                 u32* offers_len) {
+    if (!offers_len || (storage && capacity < kWsHandshakeAcceptLength + 1))
+        return WsHandshakeRequestResult::BadRequest;
+    *offers_len = 0;
+    u32 versions = 0;
+    u32 hosts = 0;
+    Str version{};
+    for (u32 i = 0; i < request.header_count; ++i) {
+        const auto& h = request.headers[i];
+        if (name_is(h.name, "sec-websocket-version", 21)) {
+            versions++;
+            version = trim_ows(h.value);
+        }
+        if (name_is(h.name, "host", 4)) {
+            hosts++;
+            if (!trim_ows(h.value).len) return WsHandshakeRequestResult::BadRequest;
+        }
+    }
+    if (hosts != 1 || versions != 1 || !request_protocols_valid(request, offers_len) ||
+        version.len == 0 || version.len > 3 || (version.len > 1 && version.ptr[0] == '0'))
+        return WsHandshakeRequestResult::BadRequest;
+    u32 number = 0;
+    for (u32 i = 0; i < version.len; ++i) {
+        if (version.ptr[i] < '0' || version.ptr[i] > '9')
+            return WsHandshakeRequestResult::BadRequest;
+        number = number * 10 + static_cast<u32>(version.ptr[i] - '0');
+    }
+    if (number > 255) return WsHandshakeRequestResult::BadRequest;
+    if (number != 13) return WsHandshakeRequestResult::VersionRequired;
+    if (storage && !append_request_protocols(request, storage, capacity, offers_len))
+        return WsHandshakeRequestResult::InternalError;
+    return WsHandshakeRequestResult::Ready;
+}
+
+bool ws_h2_response_matches(const Header* headers, u32 count, const u8* storage, u32 offers_len) {
+    if (!storage) return false;
+    bool selected = false;
+    for (u32 i = 0; i < count; ++i) {
+        const auto& h = headers[i];
+        if (name_is(h.name, "sec-websocket-accept", 20) ||
+            name_is(h.name, "sec-websocket-key", 17) || name_is(h.name, "content-length", 14))
+            return false;
+        if (!name_is(h.name, "sec-websocket-protocol", 22)) continue;
+        const Str kToken = trim_ows(h.value);
+        if (selected || !ws_valid_subprotocol(kToken) ||
+            !offered_protocol_exists(storage, offers_len, kToken))
+            return false;
+        selected = true;
+    }
+    return true;
+}
+
 WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
                                               u32 header_len,
                                               u8* storage,

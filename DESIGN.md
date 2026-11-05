@@ -2572,6 +2572,23 @@ post /api/orders {
 
 #### 3.4.8 WebSocket Proxying
 
+HTTP/2 opaque forwarding uses RFC 8441 Extended CONNECT on an existing
+methodless `route "/ws"` with the bare `websocket(upstream)` operation and
+`protocol: .http2` upstream. Runtime serving sessions advertise
+SETTINGS_ENABLE_CONNECT_PROTOCOL only in WebSocket-enabled builds. The upstream
+pool waits for the peer's opt-in before emitting `:method = CONNECT` and
+`:protocol = websocket`; `:scheme`, `:authority`, `:path` and version 13 remain
+required. Key/Accept and connection-specific headers are excluded. Accepted
+2xx HEADERS keep the stream open for DATA, with bounded per-stream queues,
+independent request/response flow control, END_STREAM and CANCEL resets. Ordinary
+HTTP and other tunnels may coexist on the same connection. The transport reuses
+the existing pooled HTTP/2 exchange machinery without gRPC metadata or metrics.
+HTTP rejection stays HTTP; post-acceptance errors reset that stream only.
+H2-to-H1 translation and per-stream message/lifecycle callback contexts remain
+pending: inspection and ordinary request-body consumers explicitly get 503 before
+handler/upstream work. The HTTP/1.1 callback semantics below remain unchanged.
+See [the transport guide](docs/websocket-terminate.md#http2-opaque-transport).
+
 Terminate routes support a required subprotocol using
 `return websocket(chat, subprotocol: "graphql-transport-ws") { message in message.forward() }`.
 The string literal must decode to one nonempty, case-sensitive ASCII HTTP token.

@@ -3,8 +3,37 @@
 WebSocket is an HTTP/1.1-upgraded protocol with borrowed message, connection and
 close concepts. Its callbacks use the ordinary expression/helper type checker
 and shared MIR/RIR backend. Frames, masking keys and fragmentation boundaries
-are runtime details, not DSL properties. HTTP/2 Extended CONNECT is outside this
-implementation scope.
+are runtime details, not DSL properties. HTTP/2 Extended CONNECT currently supports
+opaque H2-to-H2 forwarding; the message/lifecycle callbacks described in this guide
+remain HTTP/1.1-only. An H2 inspection route fails with 503 before opening an
+upstream, preserving its policy instead of silently forwarding opaque bytes.
+
+## HTTP/2 opaque transport
+
+```swift
+upstream chatH2 { host: "127.0.0.1", port: 9001, protocol: .http2 }
+route "/ws" {
+    guard req.header("Origin").or("") == "https://allowed.example" else { return 403 }
+    return websocket(chatH2)
+}
+```
+
+This reuses ordinary routing, admission, request mutations and bounded HTTP/2
+transport. The downstream sees CONNECT, not GET. Both hops use RFC 8441:
+SETTINGS_ENABLE_CONNECT_PROTOCOL=1 must precede an upstream Extended CONNECT;
+acceptance is a 2xx HEADERS block followed by duplex DATA, without Connection,
+Upgrade, Sec-WebSocket-Key or Sec-WebSocket-Accept. Version 13 and offered
+subprotocol selection are validated. A rejected opening remains an HTTP response;
+an accepted tunnel failure resets only its stream. END_STREAM half-closes that
+direction while the opposite upload can drain. WebSocket Close and compression
+bytes stay opaque. Ordinary HTTP streams and other tunnels share the connection.
+TLS/ALPN and upstream certificate validation use the existing HTTP/2 path.
+
+An upstream that does not advertise the setting is rejected with 503 without an
+Extended CONNECT request. HTTP/2-to-HTTP/1 translation and H2 message/lifecycle
+callbacks are pending. Request-body-dependent handlers are rejected before DATA
+can be mistaken for an HTTP request body. Builds disabling WebSocket do not
+advertise the setting. No new DSL keyword, codec or dependency is introduced.
 
 ## Surface and HTTP admission
 

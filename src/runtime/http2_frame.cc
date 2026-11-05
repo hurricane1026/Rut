@@ -89,6 +89,11 @@ Http2Error parse_settings(const u8* payload, u32 len, Http2Settings* s) {
                 if (kVal > 1u) return Http2Error::ProtocolError;
                 s->enable_push = kVal;
                 break;
+            case Http2SettingId::EnableConnectProtocol:
+                if (kVal > 1u || (s->enable_connect_protocol == 1u && kVal == 0u))
+                    return Http2Error::ProtocolError;
+                s->enable_connect_protocol = kVal;
+                break;
             case Http2SettingId::MaxConcurrentStreams:
                 s->max_concurrent_streams = kVal;
                 s->has_max_concurrent_streams = true;
@@ -116,6 +121,11 @@ Http2Error parse_settings(const u8* payload, u32 len, Http2Settings* s) {
 
 u32 write_settings_frame(u8* out, const Http2Settings& s) {
     u8* p = out + kFrameHeaderSize;
+    if (s.enable_connect_protocol) {
+        write_u16(p, static_cast<u16>(Http2SettingId::EnableConnectProtocol));
+        write_u32(p + 2, s.enable_connect_protocol);
+        p += 6;
+    }
     // Advertise the settings that differ from protocol defaults.
     if (s.header_table_size != kDefaultHeaderTableSize) {
         write_u16(p, static_cast<u16>(Http2SettingId::HeaderTableSize));

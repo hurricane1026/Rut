@@ -21,6 +21,84 @@ void h2_proxy_begin(Loop*, Connection&) {}
 
 namespace {
 
+TEST(http2_websocket, extended_connect_pseudo_headers_are_explicit_and_strict) {
+    const hpack::Header valid[] = {{{":method", 7}, {"CONNECT", 7}},
+                                   {{":protocol", 9}, {"websocket", 9}},
+                                   {{":scheme", 7}, {"https", 5}},
+                                   {{":authority", 10}, {"ws.test", 7}},
+                                   {{":path", 5}, {"/chat?q=1", 9}},
+                                   {{"sec-websocket-version", 21}, {"13", 2}}};
+    ParsedRequest request;
+    Str protocol;
+    CHECK(!h2_headers_to_request(valid, 6, &request));
+    REQUIRE(h2_headers_to_request(valid, 6, &request, &protocol));
+    CHECK(protocol.eq(lit_str("websocket")));
+    CHECK(request.method == HttpMethod::CONNECT);
+    CHECK(request.path.eq(lit_str("/chat?q=1")));
+    const hpack::Header bad[] = {{{":method", 7}, {"GET", 3}},
+                                 {{":protocol", 9}, {"other", 5}},
+                                 {{":scheme", 7}, {"wss", 3}},
+                                 {{":authority", 10}, {"", 0}},
+                                 {{":path", 5}, {"/chat#fragment", 14}},
+                                 {{"connection", 10}, {"upgrade", 7}}};
+    for (u32 field = 0; field < 6; ++field) {
+        hpack::Header test[7];
+        for (u32 i = 0; i < 6; ++i) test[i] = valid[i];
+        test[field] = bad[field];
+        CHECK(!h2_headers_to_request(test, 6, &request, &protocol));
+    }
+    const hpack::Header forbidden[] = {{{"content-length", 14}, {"0", 1}},
+                                       {{"te", 2}, {"trailers", 8}},
+                                       {{"expect", 6}, {"100-continue", 12}},
+                                       {{"sec-websocket-key", 17}, {"key", 3}},
+                                       {{"sec-websocket-accept", 20}, {"accept", 6}}};
+    for (const auto& field : forbidden) {
+        hpack::Header test[7];
+        for (u32 i = 0; i < 6; ++i) test[i] = valid[i];
+        test[6] = field;
+        CHECK(!h2_headers_to_request(test, 7, &request, &protocol));
+    }
+    for (u32 removed = 0; removed < 5; ++removed) {
+        if (removed == 1) continue;  // without :protocol this is a legacy request
+        hpack::Header test[5];
+        u32 n = 0;
+        for (u32 i = 0; i < 6; ++i)
+            if (i != removed) test[n++] = valid[i];
+        CHECK(!h2_headers_to_request(test, n, &request, &protocol));
+    }
+}
+
+TEST(http2_websocket, version_and_owned_subprotocol_selection) {
+    const hpack::Header hs[] = {{{":method", 7}, {"CONNECT", 7}},
+                                {{":protocol", 9}, {"websocket", 9}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":authority", 10}, {"ws.test", 7}},
+                                {{":path", 5}, {"/chat", 5}},
+                                {{"sec-websocket-version", 21}, {"13", 2}},
+                                {{"sec-websocket-protocol", 22}, {"chat, superchat", 15}}};
+    ParsedRequest request;
+    Str protocol;
+    REQUIRE(h2_headers_to_request(hs, 7, &request, &protocol));
+    u8 storage[128];
+    u32 offers = 0;
+    REQUIRE(ws_prepare_h2_handshake(request, storage, sizeof(storage), &offers) ==
+            WsHandshakeRequestResult::Ready);
+    const Header selected{{"sec-websocket-protocol", 22}, {"chat", 4}, {}};
+    CHECK(ws_h2_response_matches(&selected, 1, storage, offers));
+    CHECK(ws_h2_response_matches(nullptr, 0, storage, offers));
+    Header invalid = selected;
+    invalid.value = {"Chat", 4};
+    CHECK(!ws_h2_response_matches(&invalid, 1, storage, offers));
+    const Header duplicate[] = {selected, selected};
+    CHECK(!ws_h2_response_matches(duplicate, 2, storage, offers));
+    request.headers[1].value = {"12", 2};
+    CHECK(ws_prepare_h2_handshake(request, nullptr, 0, &offers) ==
+          WsHandshakeRequestResult::VersionRequired);
+    request.headers[1].value = {"013", 3};
+    CHECK(ws_prepare_h2_handshake(request, nullptr, 0, &offers) ==
+          WsHandshakeRequestResult::BadRequest);
+}
+
 struct Capture {
     u32 headers_calls;
     u32 last_stream;
@@ -1974,6 +2052,7 @@ TEST(h2_serving, lazy_receive_promotion_happens_after_process_releases_input) {
     small.recv_buf.write(kClientPreface, kClientPrefaceLen);
     small.recv_buf.write(settings, settings_len);
     enter_h2(&loop, small, {small.id, 1, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(loop.owned_h2.our_settings.enable_connect_protocol, RUT_ENABLE_WEBSOCKET ? 1u : 0u);
     CHECK_FALSE(loop.closed);
     CHECK_FALSE(loop.pool.is_bulk(small.recv_slice));
     loop.pool.free(small.recv_slice);

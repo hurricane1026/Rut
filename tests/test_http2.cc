@@ -97,10 +97,33 @@ TEST(http2_preface, mismatch_is_error) {
 TEST(http2_settings, defaults) {
     Http2Settings s;
     s.set_defaults();
+    CHECK_EQ(s.enable_connect_protocol, 0u);
     CHECK_EQ(s.header_table_size, kDefaultHeaderTableSize);
     CHECK_EQ(s.enable_push, 1u);
     CHECK_EQ(s.initial_window_size, kDefaultInitialWindowSize);
     CHECK_EQ(s.max_frame_size, kDefaultMaxFrameSize);
+}
+
+TEST(http2_settings, extended_connect_is_opt_in_and_sticky) {
+    Http2Settings s;
+    s.set_defaults();
+    const u8 enabled[] = {0, 8, 0, 0, 0, 1};
+    const u8 disabled[] = {0, 8, 0, 0, 0, 0};
+    const u8 invalid[] = {0, 8, 0, 0, 0, 2};
+    CHECK(parse_settings(disabled, sizeof(disabled), &s) == Http2Error::NoError);
+    CHECK(parse_settings(invalid, sizeof(invalid), &s) == Http2Error::ProtocolError);
+    CHECK_EQ(s.enable_connect_protocol, 0u);
+    CHECK(parse_settings(enabled, sizeof(enabled), &s) == Http2Error::NoError);
+    CHECK(parse_settings(enabled, sizeof(enabled), &s) == Http2Error::NoError);
+    CHECK(parse_settings(disabled, sizeof(disabled), &s) == Http2Error::ProtocolError);
+    CHECK_EQ(s.enable_connect_protocol, 1u);
+    u8 bytes[128];
+    const u32 n = write_settings_frame(bytes, s);
+    Http2Settings peer;
+    peer.set_defaults();
+    CHECK(parse_settings(bytes + kFrameHeaderSize, n - kFrameHeaderSize, &peer) ==
+          Http2Error::NoError);
+    CHECK_EQ(peer.enable_connect_protocol, 1u);
 }
 
 TEST(http2_settings, parse_applies_values) {

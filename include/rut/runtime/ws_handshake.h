@@ -36,6 +36,14 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
                                    Str required_subprotocol = {},
                                    WsDeflateAgreement* upstream_deflate = nullptr);
 
+// RFC 8441 uses :protocol rather than Key/Accept. Storage has the same owned
+// canonical protocol-list layout as the HTTP/1 handshake (Accept bytes unused).
+WsHandshakeRequestResult ws_prepare_h2_handshake(const ParsedRequest& request,
+                                                 u8* storage,
+                                                 u32 capacity,
+                                                 u32* offers_len);
+bool ws_h2_response_matches(const Header* headers, u32 count, const u8* storage, u32 offers_len);
+
 // Restrict validated request protocol fields to one required offer, without growing
 // the header or touching the coalesced WebSocket bytes. Returns the new header length.
 // The input must already have passed ws_prepare_handshake with this policy.

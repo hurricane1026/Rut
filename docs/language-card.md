@@ -885,8 +885,19 @@ return forward(users, load_balance: .roundRobin, streaming: true)         // ⏳
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
-// WebSocket is an HTTP/1.1-upgraded protocol. Bare websocket(chat) is opaque
-// passthrough; a trailing body opts into complete application-message inspection.
+// WebSocket uses HTTP/1.1 Upgrade or HTTP/2 Extended CONNECT. Bare websocket(chat)
+// is opaque passthrough; HTTP/1.1 also supports complete-message inspection below.
+// HTTP/2 currently requires an HTTP/2 upstream and a methodless route (wire CONNECT):
+upstream chatH2 { host: "127.0.0.1", port: 9001, protocol: .http2 }
+route "/ws" { return websocket(chatH2) }
+// Ordinary header/path admission and local rejection run before the tunnel opens.
+// Both peers negotiate SETTINGS_ENABLE_CONNECT_PROTOCOL. Acceptance is HTTP 2xx,
+// without Key/Accept or Connection/Upgrade headers; DATA carries opaque WS bytes.
+// Each stream has independent flow control, END_STREAM and RST_STREAM; ordinary
+// HTTP requests and other tunnels can share the same downstream connection.
+// H2-to-H1 bridging and H2 message/lifecycle callbacks are not wired yet. Routes
+// requesting inspection or an ordinary request body get 503 before upstream work.
+// There is no implicit downgrade from message inspection to opaque forwarding.
 // No frame binding, opcode, FIN, masking, continuation or ping/pong API is exposed.
 return websocket(chat)
 
@@ -1049,7 +1060,7 @@ return websocket(chat) { message in
 // One fixed approximately 5s deadline bounds closing/EOF drain; progress cannot
 // extend it. Quiet healthy sessions have no idle timeout. TLS drains close_notify
 // before downstream FIN while allowing the other leg to finish independently.
-// HTTP/2 Extended CONNECT is outside this implementation scope.
+// The message/lifecycle callback surface above currently applies to HTTP/1.1.
 
 // HTTP calls — native syntax, async is invisible (no await anywhere)
 let res = post http://orders/create {

@@ -72,6 +72,7 @@ enum class Http2SettingId : u16 {
     InitialWindowSize = 0x4,
     MaxFrameSize = 0x5,
     MaxHeaderListSize = 0x6,
+    EnableConnectProtocol = 0x8,  // RFC 8441; opt in to Extended CONNECT
 };
 
 struct Http2FrameHeader {
@@ -104,7 +105,8 @@ ParseStatus match_client_preface(const u8* buf, u32 len);
 // protocol defaults; parse_settings applies a peer's SETTINGS payload.
 struct Http2Settings {
     u32 header_table_size;
-    u32 enable_push;  // 0 or 1
+    u32 enable_push;              // 0 or 1
+    u32 enable_connect_protocol;  // 0 or 1; once enabled it cannot be disabled
     u32 max_concurrent_streams;
     u32 initial_window_size;
     u32 max_frame_size;
@@ -115,6 +117,7 @@ struct Http2Settings {
     void set_defaults() {
         header_table_size = kDefaultHeaderTableSize;
         enable_push = 1;
+        enable_connect_protocol = 0;
         max_concurrent_streams = 0;
         initial_window_size = kDefaultInitialWindowSize;
         max_frame_size = kDefaultMaxFrameSize;

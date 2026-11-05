@@ -25,6 +25,7 @@
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/ws_handshake.h"
 
 #include <string.h>  // memmove
 
@@ -1637,7 +1638,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // never inherit a completed JIT stream's mutations.
     if (d.conn->h2->async_stream == 0) h2_reset_request_mutations(*d.conn);
     ParsedRequest req;
-    if (!h2_headers_to_request(headers, nheaders, &req)) {
+    Str protocol{};
+    if (!h2_headers_to_request(headers, nheaders, &req, &protocol)) {
         if (has_exact_inventory && req.target_has_fragment) {
             d.close_after_process = true;
             d.resp_len = 0;
@@ -1647,19 +1649,39 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 400);
         return;
     }
+    const bool kWebsocket = protocol.len != 0;
+    if (kWebsocket) {
+        auto& h2 = *d.conn->h2;
+        if (!RUT_ENABLE_WEBSOCKET || !h2.our_settings.enable_connect_protocol || end_stream) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        u32 offers = 0;
+        const auto kResult = ws_prepare_h2_handshake(req, nullptr, 0, &offers);
+        if (kResult != WsHandshakeRequestResult::Ready) {
+            if (kResult == WsHandshakeRequestResult::VersionRequired) {
+                const hpack::Header kVersion{{"sec-websocket-version", 21}, {"13", 2}};
+                h2_emit_response(d, stream_id, 426, &kVersion, 1, nullptr, 0);
+            } else {
+                h2_emit_status(d, stream_id, 400);
+            }
+            return;
+        }
+        if (auto* stream = h2.find_stream(stream_id)) stream->websocket = true;
+    }
     const bool kIsHead = req.method == HttpMethod::HEAD;
     const u8 kMethodKey = route_method_key(req.method);
     const u16 pre_route_policy_id = config != nullptr ? config->pre_route_policy_id(kMethodKey) : 0;
-    const bool origin_form_connect =
-        req.method == HttpMethod::CONNECT && req.path.len != 0 && req.path.ptr[0] == '/';
+    const bool kOriginFormConnect = !kWebsocket && req.method == HttpMethod::CONNECT &&
+                                    req.path.len != 0 && req.path.ptr[0] == '/';
     if ((has_exact_inventory || pre_route_policy_id != 0) &&
-        (req.target_has_fragment || origin_form_connect)) {
+        (req.target_has_fragment || kOriginFormConnect)) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
         return;
     }
-    if (req.target_has_fragment || origin_form_connect) {
+    if (req.target_has_fragment || kOriginFormConnect) {
         h2_emit_status(d, stream_id, 400);
         return;
     }
@@ -1798,6 +1820,14 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         }
     }
 
+    // An Extended CONNECT has no ordinary request body: subsequent DATA belongs
+    // to the tunnel. Reject unsupported inspection/body consumers before any
+    // handler can yield, so a resumed forward cannot bypass the capability gate.
+    if (kWebsocket && (route->ws_terminate || route->needs_req_body)) {
+        h2_emit_status(d, stream_id, 503);
+        return;
+    }
+
     switch (route->action) {
         case RouteAction::Static:
             if (!end_stream && req.has_content_length) {
@@ -1885,6 +1915,11 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                                 req,
                                 end_stream))
                     h2_emit_status(d, stream_id, 503);
+                return;
+            }
+            if (kWebsocket) {
+                h2_emit_status(
+                    d, stream_id, 503);  // H2-to-H1 translation is a separate capability.
                 return;
             }
             // Any request body (DATA frames follow) blocks proxying: we'd forward
@@ -2381,6 +2416,7 @@ void enter_h2(Loop* loop, Connection& conn, IoEvent ev) {
         conn.h2->on_data = nullptr;
         conn.h2->on_reset = nullptr;
         conn.h2->init();
+        conn.h2->our_settings.enable_connect_protocol = RUT_ENABLE_WEBSOCKET ? 1 : 0;
     }
     conn.transition_to_reading_header(&on_h2_data<Loop>);
     on_h2_data<Loop>(static_cast<void*>(loop), conn, ev);

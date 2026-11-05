@@ -1,8 +1,8 @@
 # HTTP/1.1 WebSocket completion criteria
 
 This is the implementation checklist for completing WebSocket as a peer of the
-existing Rut concepts. HTTP/2 Extended CONNECT is outside this iteration, as
-confirmed by the user. Checked entries require executable evidence; this list
+existing Rut concepts. HTTP/2 Extended CONNECT was outside that iteration; the
+subsequent HTTP/2 increment is tracked below. Checked entries require executable evidence; this list
 does not turn target syntax into supported syntax. The language card and
 [terminate guide](websocket-terminate.md) describe the current surface.
 
@@ -52,8 +52,19 @@ views, yield into HTTP I/O or retain borrowed concepts outside their synchronous
 invocation. These are phase/lifetime rules. Source interpolation and
 non-response statement effects in helpers currently fail in both ordinary HTTP
 and WebSocket; they remain shared language limitations. No WebSocket-only
-workaround or alternate syntax is advertised. HTTP/2 Extended CONNECT remains
-outside the user-confirmed scope.
+workaround or alternate syntax is advertised.
+
+## HTTP/2 follow-up
+
+- [x] RFC 8441 settings, pseudo-headers, version and subprotocol validation.
+- [x] Opaque H2-to-H2 duplex forwarding, pooled upstreams and ordinary admission.
+- [x] Independent flow control, cancellation and half-close on multiplexed streams.
+- [ ] H2-to-H1 WebSocket handshake and transport translation.
+- [ ] Per-stream message/connection/close callbacks, owned outputs and compression.
+
+The unfinished capabilities return 503 before upstream work. The completed
+HTTP/1.1 checklist does not imply HTTP/2 callback parity. See the
+[HTTP/2 transport guide](websocket-terminate.md#http2-opaque-transport).
 
 ## Evidence and remaining delivery checks
 

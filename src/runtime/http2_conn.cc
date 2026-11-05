@@ -1,5 +1,6 @@
 #include "rut/runtime/http2_conn.h"
 
+#include "rut/runtime/http_parser.h"
 #include "rut/runtime/slice_pool.h"
 
 namespace rut {
@@ -496,8 +497,9 @@ bool h2_is_connection_header(Str n) {
 
 }  // namespace
 
-bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
+bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req, Str* protocol) {
     req->reset();
+    if (protocol) *protocol = {};
     req->version = HttpVersion::Http11;  // h2 maps to HTTP/1.1 semantics
     req->keep_alive = true;              // h2 connections persist
     req->transfer_encoding = RequestTransferEncoding::None;
@@ -506,6 +508,9 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
     bool have_path = false;
     bool have_authority = false;
     bool have_scheme = false;
+    bool have_protocol = false;
+    Str scheme{};
+    Str authority{};
     bool have_content_length = false;
     bool seen_regular = false;
     // Publish the safety witness independently of semantic header order. Even
@@ -542,6 +547,11 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
                 if (req->header_count >= kMaxHeaders) return false;
                 req->headers[req->header_count++] = {Str{"host", 4}, kValue};
                 have_authority = true;
+                authority = kValue;
+            } else if (h2_str_eq(kName, ":protocol")) {
+                if (!protocol || have_protocol || !h2_name_ok(kValue)) return false;
+                have_protocol = true;
+                *protocol = kValue;
             } else if (!h2_str_eq(kName, ":scheme")) {
                 // :scheme is recognized and dropped; any other pseudo-header
                 // (incl. response pseudo-headers like :status) is malformed.
@@ -549,6 +559,7 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
             } else {
                 if (have_scheme) return false;
                 have_scheme = true;
+                scheme = kValue;
             }
             continue;
         }
@@ -567,6 +578,22 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
             req->content_length = cl;
             req->has_content_length = true;
             req->content_length_count = 1;
+        }
+    }
+    if (have_protocol) {
+        // RFC 8441 requires all four request pseudo-headers. This is a
+        // WebSocket gateway, not an arbitrary authority CONNECT proxy.
+        if (req->method != HttpMethod::CONNECT || !protocol->eq({"websocket", 9}) ||
+            !have_authority || !have_scheme || authority.len == 0 ||
+            (!scheme.eq({"http", 4}) && !scheme.eq({"https", 5})) || req->path.len == 0 ||
+            req->path.ptr[0] != '/' || req->target_has_fragment)
+            return false;
+        for (u32 i = 0; i < req->header_count; i++) {
+            const Str kName = req->headers[i].name;
+            if (h2_str_eq(kName, "content-length") || h2_str_eq(kName, "te") ||
+                h2_str_eq(kName, "expect") || h2_str_eq(kName, "sec-websocket-key") ||
+                h2_str_eq(kName, "sec-websocket-accept"))
+                return false;
         }
     }
     return have_method && have_path;

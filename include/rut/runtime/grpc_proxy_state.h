@@ -31,6 +31,9 @@ struct GrpcExchange {
     AccessLogEntry log_entry;  // owned path/upstream; never borrow decoded HPACK storage
     u8 response_status;
     bool observed;
+    bool websocket;  // opaque Extended CONNECT exchange, with HTTP (not gRPC) errors
+    bool ws_accepted;
+    u32 ws_offers_len;
     u64 deadline_us;
     u64 request_bytes;
     u32 expected_request_bytes;
@@ -65,6 +68,7 @@ struct GrpcExchange {
     u8 response_headers[kHeaders];
     u8 response_trailers[kHeaders];
     u8 response_mutation_storage[kHeaders];
+    u8 ws_offers[kHeaders];
 
     void init() {
         downstream = upstream = nullptr;
@@ -73,6 +77,9 @@ struct GrpcExchange {
         log_entry = {};
         response_status = 2;
         observed = false;
+        websocket = false;
+        ws_accepted = false;
+        ws_offers_len = 0;
         deadline_us = request_bytes = 0;
         expected_request_bytes = 0;
         has_request_length = request_end = request_headers_sent = request_end_sent = false;
