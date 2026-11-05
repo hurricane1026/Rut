@@ -211,7 +211,14 @@ void h1ws_h2_received(void* lp, Connection& c, IoEvent ev) {
     if (length > c.recv_buf.len()) length = c.recv_buf.len();
     if (length) {
         const bool kEnd = g.websocket_http1_eof && length == c.recv_buf.len();
+        Http2Conn* const h2 = c.h2;
+        const u32 handler_gen = c.handler_gen;
         grpc_request_data(loop, c, *x, c.recv_buf.data(), length, kEnd);
+        // A timer-arm failure may synchronously close an H1 WebSocket bridge
+        // with a response send pending. Its close callback releases the
+        // exchange and clears c.h2, so do not touch either afterward.
+        if (c.h2 != h2 || c.handler_gen != handler_gen) return;
+        if (grpc_find(*h2, 1) != x) return;
         c.consume_request_receive_buffer(length);
     } else if (g.websocket_http1_eof && !c.recv_buf.len()) {
         if (x->ws)

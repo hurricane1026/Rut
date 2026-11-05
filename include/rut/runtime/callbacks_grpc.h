@@ -1536,10 +1536,18 @@ void grpc_request_data(
     if (x.ws) {
         if (!ws_h2_process(x, true)) x.failure = 13;
         if (end) ws_h2_eof(x, true);
+        Http2Conn* const downstream_h2 = down.h2;
+        const u32 handler_gen = down.handler_gen;
         grpc_refresh_timer(loop, down);
+        // The H1 bridge closes synchronously when a response send is pending
+        // and timer arming fails. Its close callback may release this exchange.
+        if (down.h2 != downstream_h2 || down.handler_gen != handler_gen) return;
     } else
         x.request_end = end;
-    grpc_drive_upstream(loop, *x.upstream);
+    // A failed exchange is skipped by the driver, which still flushes controls
+    // and pumps siblings. Timer-arm failure may have detached this exchange.
+    Connection* const upstream = x.upstream;
+    if (upstream) grpc_drive_upstream(loop, *upstream);
 }
 
 template <typename Loop>

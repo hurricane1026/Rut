@@ -4863,6 +4863,106 @@ TEST(grpc_proxy, late_failed_upload_data_is_included_in_access_log) {
     CHECK_EQ(transport->backend.pending_count, 0u);
 }
 
+TEST(grpc_proxy, timer_arm_failure_during_websocket_upload_detaches_safely) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection down;
+    down.reset();
+    Http2Conn down_h2;
+    down_h2.init_client();
+    down.h2 = &down_h2;
+    Connection upstream;
+    upstream.reset();
+    u8 upstream_send[512]{};
+    u8 upstream_recv[512]{};
+    upstream.send_slice = upstream_send;
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    upstream.recv_slice = upstream_recv;
+    upstream.recv_buf.bind(upstream_recv, sizeof(upstream_recv));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    REQUIRE(down_h2.open_stream(1) != nullptr);
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    auto* exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(exchange != nullptr);
+    exchange->init();
+    WsH2Session ws{};
+    exchange->ws = &ws;
+    exchange->downstream = &down;
+    exchange->upstream = &upstream;
+    exchange->downstream_stream = 1;
+    exchange->upstream_stream = 1;
+    exchange->deadline_us = monotonic_us() + 1000000;
+    REQUIRE(grpc_attach(down_h2, exchange));
+    REQUIRE(grpc_attach(upstream_h2, exchange));
+
+    // The parser callback runs while the downstream grpc state is busy, as it
+    // does for an H2 DATA frame. Failed timer arming detaches the upstream.
+    down_h2.grpc.busy = true;
+    grpc_request_data(&loop, down, *exchange, nullptr, 0, false);
+
+    CHECK_EQ(exchange->failure, 8u);
+    CHECK(exchange->upstream == nullptr);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+}
+
+TEST(http2_websocket, h1_receive_returns_after_pending_send_timer_close) {
+    SyncCloseGrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection down;
+    down.reset();
+    Http2Conn down_h2;
+    down_h2.init_client();
+    down_h2.grpc.websocket_http1_downstream = true;
+    down.h2 = &down_h2;
+    down.on_close = &grpc_connection_closed<SyncCloseGrpcDriveFixture>;
+    down.on_send = &pending_send;
+    u8 recv[8]{};
+    down.bind_request_receive_buffer(recv, sizeof(recv));
+    const u8 input[] = {0x82};
+    down.recv_buf.write(input, sizeof(input));
+    REQUIRE(down_h2.open_stream(1) != nullptr);
+
+    Connection upstream;
+    upstream.reset();
+    u8 upstream_send[512]{};
+    u8 upstream_recv[512]{};
+    upstream.send_slice = upstream_send;
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    upstream.recv_slice = upstream_recv;
+    upstream.recv_buf.bind(upstream_recv, sizeof(upstream_recv));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+
+    auto* exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    auto* ws = reinterpret_cast<WsH2Session*>(loop.pool.alloc());
+    REQUIRE(exchange != nullptr);
+    REQUIRE(ws != nullptr);
+    new (ws) WsH2Session{};
+    exchange->init();
+    exchange->websocket = true;
+    exchange->ws = ws;
+    exchange->downstream = &down;
+    exchange->upstream = &upstream;
+    exchange->downstream_stream = 1;
+    exchange->upstream_stream = 1;
+    exchange->deadline_us = monotonic_us() + 1000000;
+    REQUIRE(grpc_attach(down_h2, exchange));
+    REQUIRE(grpc_attach(upstream_h2, exchange));
+
+    h1ws_h2_received<SyncCloseGrpcDriveFixture>(
+        &loop, down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
+
+    CHECK(loop.closed);
+    CHECK(down.h2 == nullptr);
+    CHECK_NE(down.handler_gen, 0u);
+}
+
 TEST(grpc_proxy, live_log_keeps_bytes_only_output) {
     auto ring = std::make_unique<LiveAccessLogRing>();
     ring->init();
