@@ -11235,7 +11235,12 @@ bool ws_receive_closing(Loop* loop, Connection& conn) {
 // application plaintext; keep it separate from ordinary TLS logical sends.
 template <typename Loop>
 bool ws_finish_tls_shutdown(Loop* loop, Connection& conn) {
-    if (conn.h2 && conn.h2->grpc.websocket_http1) return h2ws_h1_tls_finished(loop, conn);
+    if constexpr (requires {
+                      loop->grpc_upstreams;
+                      loop->upstream_release(u16{});
+                  }) {
+        if (conn.h2 && conn.h2->grpc.websocket_http1) return h2ws_h1_tls_finished(loop, conn);
+    }
     conn.ws_tls_shutdown_pending = false;
     conn.ws_tls_shutdown_need_read = false;
     conn.ws_upstream_send_pending = false;
@@ -11259,9 +11264,14 @@ void on_ws_tls_shutdown_sent(void* lp, Connection& conn, IoEvent ev) {
 // arrive before the ordinary shared retirement path releases either fd/slot.
 template <typename Loop>
 bool ws_drive_close(Loop* loop, Connection& conn) {
-    if (conn.h2 && conn.h2->grpc.websocket_http1) {
-        h2ws_h1_drive(loop, conn);
-        return true;
+    if constexpr (requires {
+                      loop->grpc_upstreams;
+                      loop->upstream_release(u16{});
+                  }) {
+        if (conn.h2 && conn.h2->grpc.websocket_http1) {
+            h2ws_h1_drive(loop, conn);
+            return true;
+        }
     }
     if (conn.ws_close_client_need && !conn.ws_upstream_send_pending) {
         const u32 kFrameSize = ws_emit_close_payload(conn.ws_close_frame_client,

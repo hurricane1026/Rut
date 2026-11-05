@@ -423,7 +423,10 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         }
         c.on_send = nullptr;  // handshake/control flight; no upper-layer continuation
     }
-    if constexpr (requires { loop->grpc_upstreams; }) {
+    if constexpr (requires {
+                      loop->grpc_upstreams;
+                      loop->upstream_release(u16{});
+                  }) {
         if (c.h2 && c.h2->grpc.websocket_http1 && c.h2->grpc.tls_verified) {
             // HTTP/1 peers wait for GET before writing anything. If the final
             // handshake flight owned on_send at grpc_tls_ready, its drain is
