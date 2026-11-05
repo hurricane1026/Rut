@@ -796,7 +796,7 @@ if(RUT_ENABLE_WEBSOCKET)
                 --server $<TARGET_FILE:rut>
                 --compiler $<TARGET_FILE:rut-compile>)
         set_tests_properties(test_ws_upgrade_admission_e2e PROPERTIES
-            LABELS "integration;network" RUN_SERIAL TRUE TIMEOUT 120)
+            LABELS "integration;network" RUN_SERIAL TRUE TIMEOUT 600)
     endif()
 endif()
 

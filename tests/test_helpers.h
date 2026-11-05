@@ -78,6 +78,9 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     bool fail_ws_handshake_alloc = false;
     bool ws_handshake_in_use = false;
     u32 ws_handshake_free_calls = 0;
+    alignas(64) u8 ws_terminate_storage[4][SlicePool::kSliceSize];
+    bool ws_terminate_in_use = false;
+    u32 ws_terminate_owner_id = 0;
     u8 capture_storage[kMaxConns][CaptureEntry::kMaxHeaderLen];
 
     bool set_capture(CaptureRing* ring) {
@@ -143,6 +146,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         fail_ws_handshake_alloc = false;
         ws_handshake_in_use = false;
         ws_handshake_free_calls = 0;
+        ws_terminate_in_use = false;
         fail_next_recv_submit = false;
         fail_next_upstream_recv_submit = false;
         draining = false;
@@ -199,6 +203,31 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         ws_handshake_free_calls++;
     }
 
+    bool alloc_ws_terminate_bufs(ConnectionBase& c) {
+        if (ws_terminate_in_use || c.ws_buffer_capacity() != SlicePool::kSliceSize) return false;
+        if (c.ws_downstream_deflate.enabled || c.ws_upstream_deflate.enabled) return false;
+        if (c.ws_c2u_msg || c.ws_u2c_msg || c.ws_c2u_out || c.ws_u2c_out) return false;
+        c.ws_c2u_msg = ws_terminate_storage[0];
+        c.ws_u2c_msg = ws_terminate_storage[1];
+        c.ws_c2u_out = ws_terminate_storage[2];
+        c.ws_u2c_out = ws_terminate_storage[3];
+        ws_terminate_owner_id = c.id;
+        ws_terminate_in_use = true;
+        return true;
+    }
+
+    void free_ws_terminate_bufs(ConnectionBase& c) {
+        if (!ws_terminate_in_use || c.id != ws_terminate_owner_id) return;
+        if (c.ws_c2u_msg != ws_terminate_storage[0] || c.ws_u2c_msg != ws_terminate_storage[1] ||
+            c.ws_c2u_out != ws_terminate_storage[2] || c.ws_u2c_out != ws_terminate_storage[3])
+            __builtin_trap();
+        c.ws_c2u_msg = nullptr;
+        c.ws_u2c_msg = nullptr;
+        c.ws_c2u_out = nullptr;
+        c.ws_u2c_out = nullptr;
+        ws_terminate_in_use = false;
+    }
+
     Connection* alloc_conn_impl() {
         if (free_top == 0) return nullptr;
         u32 id = free_stack[--free_top];
@@ -217,6 +246,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         u32 cid = c.id;
         timer.remove(&c);
         // MockBackend::kAsyncIo == false: sync backend, free immediately.
+        free_ws_terminate_bufs(c);
         free_ws_handshake_slice(c.ws_handshake_slice);
         c.ws_handshake_slice = nullptr;
         c.ws_handshake_offers_len = 0;
