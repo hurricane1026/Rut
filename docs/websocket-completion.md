@@ -59,14 +59,23 @@ workaround or alternate syntax is advertised.
 - [x] RFC 8441 settings, pseudo-headers, version and subprotocol validation.
 - [x] Opaque H2-to-H2 duplex forwarding, pooled upstreams and ordinary admission.
 - [x] Independent flow control, cancellation and half-close on multiplexed streams.
-- [ ] H2-to-H1 WebSocket handshake and transport translation.
-- [ ] Per-stream message/connection/close callbacks, owned outputs and compression.
+- [x] H2-to-H1 WebSocket handshake and transport translation, including verified TLS.
+- [x] Per-stream message/connection/close callbacks, owned outputs and compression.
 
-The unfinished capabilities return 503 before upstream work. The completed
-HTTP/1.1 checklist does not imply HTTP/2 callback parity. See the
-[HTTP/2 transport guide](websocket-terminate.md#http2-opaque-transport).
+Ordinary request-body consumers remain outside CONNECT tunnel semantics and get
+503. Reverse H1-downstream to H2-upstream WebSocket bridging remains pending.
+See the [HTTP/2 transport guide](websocket-terminate.md#http2-transport).
 
 ## Evidence and remaining delivery checks
+
+The HTTP/2 follow-up adds real-socket H2-to-H1/H2 sessions on epoll and io_uring,
+with plaintext and verified TLS upstreams. Tests exercise source/JIT message
+payload output and connection/onOpen helpers, required subprotocols, rejection
+body framing, sibling-stream admission and cancellation. Stream-engine tests
+cover messages larger than a flow-control window, input-credit return,
+independent compression legs, owned dynamic output, acceptance/send completion,
+Close metadata, truncated-frame EOF and allocation rollback. The native callback
+baseline remains unchanged; H2 native wire execution has not been separately tested.
 
 After synchronization with current main, the wire suite passed 462 cases with
 no skips. Full frontend (1259 tests), JIT (603), native artifact (81), loader

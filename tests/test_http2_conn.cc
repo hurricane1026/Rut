@@ -21,6 +21,289 @@ void h2_proxy_begin(Loop*, Connection&) {}
 
 namespace {
 
+#if RUT_ENABLE_WEBSOCKET
+struct WsH2Observations {
+    u32 opened = 0, messages = 0, closed = 0;
+    Connection* context = nullptr;
+    WsSessionCloseContext close{};
+    WsFrameAction action = WsFrameAction::Forward;
+} ws_h2_seen;
+WsFrameAction h2_ws_open(void* ctx, WsOpcode, const u8*, u64, bool) {
+    ++ws_h2_seen.opened;
+    ws_h2_seen.context = static_cast<Connection*>(ctx);
+    return WsFrameAction::Drop;
+}
+WsFrameAction h2_ws_message(void* ctx, WsOpcode, const u8*, u64, bool) {
+    ++ws_h2_seen.messages;
+    auto* c = static_cast<Connection*>(ctx);
+    if (ws_h2_seen.action == WsFrameAction::ForwardDynamic)
+        c->ws_handler_output = {lit_str("rewritten"), 1000, WsOpcode::Text, true};
+    return ws_h2_seen.action;
+}
+WsFrameAction h2_ws_close(void* ctx, WsOpcode, const u8*, u64, bool) {
+    ++ws_h2_seen.closed;
+    ws_h2_seen.close = static_cast<Connection*>(ctx)->ws_session_close_context();
+    return WsFrameAction::Drop;
+}
+struct WsH2Fixture {
+    SlicePool pool;
+    RouteEntry route{};
+    std::unique_ptr<Connection> down = std::make_unique<Connection>();
+    std::unique_ptr<GrpcExchange> x = std::make_unique<GrpcExchange>();
+    WsH2Fixture(u32 ordinary = 32, u32 bulk = 12) {
+        if (!pool.init(ordinary, 0, SlicePool::kMaxCachedSlices, bulk).has_value())
+            __builtin_trap();
+        down->reset();
+        down->peer_addr = 0x7f000001;
+        down->peer_port = 3456;
+        down->shard_id = 2;
+        down->tls_active = true;
+        route.ws_terminate = true;
+        route.ws_frame_handler = &h2_ws_message;
+        route.ws_open_handler = &h2_ws_open;
+        route.ws_close_handler = &h2_ws_close;
+        route.ws_max_message_size = 100000;
+        route.ws_close_code = 1000;
+        x->init();
+        ws_h2_seen = {};
+    }
+    bool start(bool compress = false) {
+        x->ws = ws_h2_create(pool, route, *down);
+        if (!x->ws) return false;
+        ParsedRequest req{}, normalized{};
+        req.headers[req.header_count++] = {lit_str("sec-websocket-protocol"), lit_str("chat"), {}};
+        if (compress)
+            req.headers[req.header_count++] = {
+                lit_str("sec-websocket-extensions"), kWsDeflateOffer, {}};
+        const Header selected[] = {{lit_str("sec-websocket-protocol"), lit_str("chat"), {}}};
+        return ws_h2_prepare_request(*x->ws, req, &normalized) &&
+               ws_h2_accept(*x->ws, pool, selected, 1);
+    }
+    void destroy() {
+        ws_h2_destroy(pool, x->ws);
+        x->ws = nullptr;
+    }
+    ~WsH2Fixture() {
+        destroy();
+        pool.destroy();
+    }
+};
+
+TEST(http2_websocket, stream_context_waits_for_acceptance_and_owns_peer_facts) {
+    WsH2Fixture f;
+    REQUIRE(f.start());
+    CHECK_EQ(ws_h2_seen.opened, 0u);
+    REQUIRE(ws_h2_open(*f.x));
+    REQUIRE(ws_h2_open(*f.x));
+    CHECK_EQ(ws_h2_seen.opened, 1u);
+    CHECK(ws_h2_seen.context != f.down.get());
+    CHECK_EQ(ws_h2_seen.context->peer_port, 3456u);
+    CHECK_EQ(ws_h2_seen.context->shard_id, 2u);
+    CHECK(ws_h2_seen.context->tls_active);
+    CHECK(ws_h2_seen.context->ws_negotiated_subprotocol.eq(lit_str("chat")));
+    f.destroy();
+    CHECK_EQ(ws_h2_seen.closed, 1u);
+    CHECK_EQ(ws_h2_seen.close.client.code, 1006u);
+    CHECK(!ws_h2_seen.close.was_clean);
+    CHECK_EQ(f.pool.free_top, f.pool.max_count);
+    CHECK_EQ(f.pool.bulk_free_top, f.pool.bulk_max_count);
+}
+
+TEST(http2_websocket, large_messages_release_input_before_output_and_copy_dynamic_result) {
+    WsH2Fixture f;
+    f.route.ws_forward_text.source = WsTextSource::Dynamic;
+    REQUIRE(f.start());
+    REQUIRE(ws_h2_open(*f.x));
+    const u8 mask[] = {1, 2, 3, 4};
+    const u32 header = ws_write_header(f.x->upload, WsOpcode::Binary, true, true, mask, 90000);
+    for (u32 i = 0; i < 60000; ++i) f.x->upload[header + i] = 'x' ^ mask[i % 4];
+    f.x->upload_len = header + 60000;
+    REQUIRE(ws_h2_process(*f.x, true));
+    CHECK_EQ(f.x->upload_len, 0u);
+    CHECK_EQ(ws_h2_seen.messages, 0u);
+    for (u32 i = 0; i < 30000; ++i) f.x->upload[i] = 'x' ^ mask[(60000 + i) % 4];
+    f.x->upload_len = 30000;
+    ws_h2_seen.action = WsFrameAction::ForwardDynamic;
+    REQUIRE(ws_h2_process(*f.x, true));
+    CHECK_EQ(ws_h2_seen.messages, 1u);
+    CHECK_EQ(f.x->upload_len, 0u);
+    u32 length = 0;
+    const u8* output = ws_h2_output(*f.x, true, &length);
+    WsFrameHeader frame{};
+    REQUIRE(ws_parse_header(output, length, true, &frame) == ParseStatus::Complete);
+    CHECK(frame.opcode == WsOpcode::Text);
+    CHECK_EQ(frame.payload_len, 9u);
+    u8 decoded[9];
+    __builtin_memcpy(decoded, output + frame.header_len, 9);
+    ws_unmask(decoded, 9, frame.mask_key);
+    CHECK(__builtin_memcmp(decoded, "rewritten", 9) == 0);
+    REQUIRE(ws_h2_consume_output(*f.x, true, length));
+    CHECK_EQ(f.x->ws->output_length[0], 0u);
+}
+
+TEST(http2_websocket, inspected_flow_credit_survives_messages_larger_than_a_stream_window) {
+    WsH2Fixture f;
+    REQUIRE(f.start());
+    REQUIRE(ws_h2_open(*f.x));
+    auto h2 = std::make_unique<Http2Conn>();
+    h2->init_client();
+    auto* stream = h2->open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->manual_window = true;
+    f.down->h2 = h2.get();
+    f.x->downstream = f.down.get();
+    f.x->downstream_stream = 1;
+    const u8 mask[] = {1, 2, 3, 4};
+    const u32 header = ws_write_header(f.x->upload, WsOpcode::Binary, true, true, mask, 90000);
+    for (u32 i = 0; i < 60000; ++i) f.x->upload[header + i] = 'x' ^ mask[i % 4];
+    f.x->upload_len = stream->recv_unconsumed = header + 60000;
+    REQUIRE(ws_h2_process(*f.x, true));
+    CHECK_EQ(stream->recv_unconsumed, 0u);
+    for (u32 i = 0; i < 30000; ++i) f.x->upload[i] = 'x' ^ mask[(60000 + i) % 4];
+    f.x->upload_len = stream->recv_unconsumed = 30000;
+    REQUIRE(ws_h2_process(*f.x, true));
+    CHECK_EQ(stream->recv_unconsumed, 0u);
+    CHECK_EQ(stream->recv_credit, header + 90000);
+    CHECK_EQ(h2->conn_recv_credit, header + 90000);
+    u32 length = 0;
+    const u8* output = ws_h2_output(*f.x, true, &length);
+    WsFrameHeader frame{};
+    REQUIRE(ws_parse_header(output, length, true, &frame) == ParseStatus::Complete);
+    CHECK_EQ(frame.payload_len, 90000u);
+    CHECK_EQ(length, frame.header_len + 90000);
+    const u32 total = length;
+    while (length) {
+        const u32 amount = length < 4000 ? length : 4000;
+        REQUIRE(ws_h2_consume_output(*f.x, true, amount));
+        output = ws_h2_output(*f.x, true, &length);
+        if (length) CHECK_EQ(output, f.x->ws->callback.ws_c2u_out + total - length);
+    }
+    CHECK_EQ(ws_h2_seen.messages, 1u);
+    f.down->h2 = nullptr;
+}
+
+TEST(http2_websocket, close_acknowledgements_wait_for_send_completions_and_close_once) {
+    WsH2Fixture f;
+    REQUIRE(f.start());
+    REQUIRE(ws_h2_open(*f.x));
+    u64 rng = 1;
+    f.x->upload_len =
+        ws_emit_close_frame(f.x->upload, sizeof(f.x->upload), true, rng, 1000, lit_str("done"));
+    REQUIRE(ws_h2_process(*f.x, true));
+    CHECK(f.x->ws->callback.ws_close_client_received);
+    CHECK(f.x->deadline_us != 0);
+    const u64 deadline = f.x->deadline_us;
+    u32 length = 0;
+    (void)ws_h2_output(*f.x, true, &length);
+    REQUIRE(ws_h2_consume_output(*f.x, true, length));
+    CHECK(!f.x->request_end);
+    CHECK(!f.x->ws->callback.ws_close_upstream_sent);
+    ws_h2_sent(*f.x, true);
+    (void)ws_h2_output(*f.x, false, &length);
+    REQUIRE(ws_h2_consume_output(*f.x, false, length));
+    ws_h2_sent(*f.x, false);
+    CHECK(f.x->response_end);
+    f.x->download_len =
+        ws_emit_close_frame(f.x->download, sizeof(f.x->download), false, rng, 1001, lit_str("bye"));
+    REQUIRE(ws_h2_process(*f.x, false));
+    CHECK(f.x->request_end);
+    CHECK_EQ(f.x->deadline_us, deadline);
+    f.destroy();
+    CHECK_EQ(ws_h2_seen.messages, 0u);
+    CHECK_EQ(ws_h2_seen.closed, 1u);
+    CHECK(ws_h2_seen.close.was_clean);
+    CHECK_EQ(ws_h2_seen.close.client.code, 1000u);
+    CHECK_EQ(ws_h2_seen.close.upstream.code, 1001u);
+}
+
+TEST(http2_websocket, compression_is_negotiated_per_leg_and_resources_roll_back) {
+    WsH2Fixture f;
+    REQUIRE(f.start(true));
+    CHECK(f.x->ws->callback.ws_downstream_codec != nullptr);
+    CHECK(f.x->ws->callback.ws_upstream_codec == nullptr);
+    CHECK_EQ(ws_h2_seen.opened, 0u);
+    f.destroy();
+    CHECK_EQ(ws_h2_seen.closed, 0u);
+    CHECK_EQ(f.pool.free_top, f.pool.max_count);
+    CHECK_EQ(f.pool.bulk_free_top, f.pool.bulk_max_count);
+    WsH2Fixture limited(2, 2);
+    CHECK(!limited.start());
+    limited.destroy();
+    CHECK_EQ(ws_h2_seen.opened, 0u);
+    CHECK_EQ(limited.pool.free_top, limited.pool.max_count);
+    CHECK_EQ(limited.pool.bulk_free_top, limited.pool.bulk_max_count);
+}
+
+TEST(http2_websocket, compressed_input_is_decoded_before_callback_and_reencoded_for_destination) {
+    WsH2Fixture f;
+    REQUIRE(f.start(true));
+    REQUIRE(ws_h2_open(*f.x));
+    auto* encoder = ws_deflate_create(f.pool, {});
+    REQUIRE(encoder != nullptr);
+    u8 compressed[128];
+    u32 bytes = 0;
+    REQUIRE(ws_deflate_payload(*encoder,
+                               reinterpret_cast<const u8*>("hello"),
+                               5,
+                               compressed,
+                               sizeof(compressed),
+                               &bytes) == WsDeflateStatus::Ok);
+    const u8 mask[] = {4, 3, 2, 1};
+    const u32 header = ws_write_header(f.x->upload, WsOpcode::Text, true, true, mask, bytes, true);
+    __builtin_memcpy(f.x->upload + header, compressed, bytes);
+    ws_unmask(f.x->upload + header, bytes, mask);
+    f.x->upload_len = header + bytes;
+    REQUIRE(ws_h2_process(*f.x, true));
+    CHECK_EQ(ws_h2_seen.messages, 1u);
+    u32 length = 0;
+    const u8* output = ws_h2_output(*f.x, true, &length);
+    WsFrameHeader frame{};
+    REQUIRE(ws_parse_header(output, length, true, &frame) == ParseStatus::Complete);
+    CHECK(!frame.compressed);
+    CHECK_EQ(frame.payload_len, 5u);
+    u8 plain[5];
+    __builtin_memcpy(plain, output + frame.header_len, 5);
+    ws_unmask(plain, 5, frame.mask_key);
+    CHECK(__builtin_memcmp(plain, "hello", 5) == 0);
+    REQUIRE(ws_h2_consume_output(*f.x, true, length));
+    const u32 response_header =
+        ws_write_header(f.x->download, WsOpcode::Text, true, false, nullptr, 100);
+    __builtin_memset(f.x->download + response_header, 'a', 100);
+    f.x->download_len = response_header + 100;
+    REQUIRE(ws_h2_process(*f.x, false));
+    output = ws_h2_output(*f.x, false, &length);
+    REQUIRE(ws_parse_header(output, length, false, &frame, true) == ParseStatus::Complete);
+    CHECK(frame.compressed);
+    CHECK_EQ(ws_h2_seen.messages, 2u);
+    ws_deflate_destroy(f.pool, encoder);
+}
+
+TEST(http2_websocket, eof_rejects_incomplete_headers_payloads_and_fragmented_messages) {
+    for (u32 mode = 0; mode < 3; ++mode) {
+        WsH2Fixture f;
+        REQUIRE(f.start());
+        REQUIRE(ws_h2_open(*f.x));
+        const u8 mask[] = {1, 2, 3, 4};
+        const u32 header = ws_write_header(f.x->upload, WsOpcode::Binary, mode != 2, true, mask, 5);
+        for (u32 i = 0; i < 5; ++i) f.x->upload[header + i] = 'a' ^ mask[i % 4];
+        f.x->upload_len = mode == 0 ? 1 : mode == 1 ? header + 2 : header + 5;
+        REQUIRE(ws_h2_process(*f.x, true));
+        CHECK_EQ(ws_h2_seen.messages, 0u);
+        ws_h2_eof(*f.x, true);
+        CHECK_EQ(f.x->failure, 13u);
+    }
+}
+
+TEST(http2_websocket, required_subprotocol_rejects_before_accepting_and_at_upstream_selection) {
+    WsH2Fixture f;
+    f.route.ws_subprotocol = lit_str("required");
+    CHECK(!f.start());
+    CHECK_EQ(ws_h2_seen.opened, 0u);
+    f.destroy();
+    CHECK_EQ(f.pool.free_top, f.pool.max_count);
+}
+#endif
+
 TEST(http2_websocket, extended_connect_pseudo_headers_are_explicit_and_strict) {
     const hpack::Header valid[] = {{{":method", 7}, {"CONNECT", 7}},
                                    {{":protocol", 9}, {"websocket", 9}},

@@ -1,14 +1,12 @@
 # WebSocket terminate mode — application messages
 
-WebSocket is an HTTP/1.1-upgraded protocol with borrowed message, connection and
-close concepts. Its callbacks use the ordinary expression/helper type checker
-and shared MIR/RIR backend. Frames, masking keys and fragmentation boundaries
-are runtime details, not DSL properties. HTTP/2 Extended CONNECT currently supports
-opaque H2-to-H2 forwarding; the message/lifecycle callbacks described in this guide
-remain HTTP/1.1-only. An H2 inspection route fails with 503 before opening an
-upstream, preserving its policy instead of silently forwarding opaque bytes.
+WebSocket uses HTTP/1.1 Upgrade or HTTP/2 Extended CONNECT, with borrowed message,
+connection and close concepts. Callbacks use the ordinary expression/helper type
+checker and shared MIR/RIR backend. Frames, masking keys and fragmentation
+boundaries are runtime details. HTTP/2 streams have independent callback, output
+and compression state; the callback surface below applies to both transports.
 
-## HTTP/2 opaque transport
+## HTTP/2 transport
 
 ```swift
 upstream chatH2 { host: "127.0.0.1", port: 9001, protocol: .http2 }
@@ -19,21 +17,32 @@ route "/ws" {
 ```
 
 This reuses ordinary routing, admission, request mutations and bounded HTTP/2
-transport. The downstream sees CONNECT, not GET. Both hops use RFC 8441:
-SETTINGS_ENABLE_CONNECT_PROTOCOL=1 must precede an upstream Extended CONNECT;
-acceptance is a 2xx HEADERS block followed by duplex DATA, without Connection,
-Upgrade, Sec-WebSocket-Key or Sec-WebSocket-Accept. Version 13 and offered
+transport. The downstream sees CONNECT. An H2 upstream must advertise
+SETTINGS_ENABLE_CONNECT_PROTOCOL=1 before receiving Extended CONNECT; an H1
+upstream instead receives GET Upgrade with a fresh Key. The gateway validates
+its 101 and Accept before publishing H2 status 200. H2 acceptance contains no
+Connection, Upgrade, Sec-WebSocket-Key or Sec-WebSocket-Accept. Version 13 and
 subprotocol selection are validated. A rejected opening remains an HTTP response;
-an accepted tunnel failure resets only its stream. END_STREAM half-closes that
-direction while the opposite upload can drain. WebSocket Close and compression
-bytes stay opaque. Ordinary HTTP streams and other tunnels share the connection.
-TLS/ALPN and upstream certificate validation use the existing HTTP/2 path.
+an accepted tunnel failure resets only its stream. Ordinary HTTP and other
+tunnels share the downstream connection. TLS upstreams verify configured
+certificates/identity: H2 requires h2 ALPN, H1 accepts http/1.1 or absent ALPN.
 
-An upstream that does not advertise the setting is rejected with 503 without an
-Extended CONNECT request. HTTP/2-to-HTTP/1 translation and H2 message/lifecycle
-callbacks are pending. Request-body-dependent handlers are rejected before DATA
-can be mistaken for an HTTP request body. Builds disabling WebSocket do not
-advertise the setting. No new DSL keyword, codec or dependency is introduced.
+Bare forwarding preserves opaque frame bytes and independent END_STREAM half-close.
+Trailing callbacks opt into the same message/lifecycle handling described below.
+Each stream owns its selected subprotocol, peer facts, message assembly and output,
+and independent compression agreements. Buffers/codecs are acquired before the
+acceptance response. `onOpen` runs after acceptance send completion. Complete
+messages larger than an H2 flow-control window progress through bounded assembly;
+credit returns after input becomes owned. Close acknowledgements track actual send
+completion, with a fixed five-second deadline. Cancellation invokes `onClose` once
+for an opened session and releases stream-owned resources without resetting siblings.
+
+An H2 upstream without the setting gets 503 without an Extended CONNECT request.
+Ordinary request-body-dependent handlers get 503 before DATA can be mistaken for
+an HTTP body. H1 downstream to H2 upstream WebSocket translation is still pending.
+H1 TLS upstream support here belongs to the H2 WebSocket bridge; ordinary H1
+forwarding to TLS still returns 503. Builds disabling WebSocket do not advertise
+the setting. This adds no keyword, codec or dependency.
 
 ## Surface and HTTP admission
 
@@ -224,7 +233,7 @@ keeps its uncompressed frame and full message limit. Partial/invalid decoded
 messages cannot reach the application.
 
 Each negotiated leg atomically reserves one existing 256 KiB bulk slice for its
-encoder/decoder before sending 101. Large routes additionally require their four
+encoder/decoder before sending acceptance (H1 101 or H2 2xx). Large routes additionally require their four
 data/output buffers. Pool exhaustion fails admission without smaller-limit
 fallback. CPU codecs retire at teardown; asynchronous output retains its normal
 send/cancel ownership. The codec is a private pinned static C zlib build with a

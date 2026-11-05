@@ -30,6 +30,12 @@
 #include <string.h>  // memmove
 
 namespace rut {
+inline u16 h2_forward_failure_status(Http2Conn& h2, u32 sid) {
+    const auto* stream = h2.find_stream(sid);
+    return stream && stream->websocket_open_error ? stream->websocket_open_error : 503;
+}
+template <typename Loop>
+void h2ws_open_sessions(Loop*, Connection&);
 
 // Implemented in callbacks.cc using the HTTP/1 override helpers. The h2
 // forwarding path temporarily presents its synthesized HTTP/1 request through
@@ -1364,7 +1370,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             h2_emit_status(d, stream_id, 503);
             return;
         }
-        if (cfg->upstreams[kOutcome.upstream_id].http2) {
+        if (cfg->upstreams[kOutcome.upstream_id].http2 ||
+            (d.conn->h2->find_stream(stream_id) && d.conn->h2->find_stream(stream_id)->websocket)) {
             if (!grpc_start_synth(d,
                                   stream_id,
                                   cfg,
@@ -1372,7 +1379,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                                   forward_synth,
                                   forward_len,
                                   !request_body_followed))
-                h2_emit_status(d, stream_id, 503);
+                h2_emit_status(d, stream_id, h2_forward_failure_status(*d.conn->h2, stream_id));
             return;
         }
         const bool parked = open_request != nullptr
@@ -1823,11 +1830,12 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // An Extended CONNECT has no ordinary request body: subsequent DATA belongs
     // to the tunnel. Reject unsupported inspection/body consumers before any
     // handler can yield, so a resumed forward cannot bypass the capability gate.
-    if (kWebsocket && (route->ws_terminate || route->needs_req_body)) {
+    if (kWebsocket && route->needs_req_body) {
         h2_emit_status(d, stream_id, 503);
         return;
     }
 
+    if (kWebsocket) d.conn->h2->find_stream(stream_id)->websocket_route = route;
     switch (route->action) {
         case RouteAction::Static:
             if (!end_stream && req.has_content_length) {
@@ -1900,7 +1908,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         default:
             d.conn->forward_load_balance = {};
             if (route->upstream_id < config->upstream_count &&
-                config->upstreams[route->upstream_id].http2) {
+                (config->upstreams[route->upstream_id].http2 || kWebsocket)) {
                 if (!h2_proxy_request_forwardable(headers, nheaders)) {
                     h2_emit_status(d, stream_id, 400);
                     return;
@@ -1914,7 +1922,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                                 nheaders,
                                 req,
                                 end_stream))
-                    h2_emit_status(d, stream_id, 503);
+                    h2_emit_status(d, stream_id, h2_forward_failure_status(*d.conn->h2, stream_id));
                 return;
             }
             if (kWebsocket) {
@@ -2156,6 +2164,7 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
 
     conn.send_progress = 0;
     conn.send_buf.reset();
+    if (conn.h2) h2ws_open_sessions(loop, conn);
     if (conn.h2 && conn.h2->outbound_stream != 0) {
         if (conn.h2->outbound_final_staged) {
             const u32 stream_id = conn.h2->outbound_stream;
@@ -2587,6 +2596,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
 
         if (failure_status == 0 && h2->async_request_stream_open &&
+            !(h2->find_stream(kStreamId) && h2->find_stream(kStreamId)->websocket) &&
             (h2->async_cfg == nullptr || kOutcome.upstream_id >= h2->async_cfg->upstream_count ||
              !h2->async_cfg->upstreams[kOutcome.upstream_id].http2)) {
             ParsedRequest open_request;
@@ -2622,7 +2632,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 
         if (failure_status == 0) {
             if (h2->async_cfg != nullptr && kOutcome.upstream_id < h2->async_cfg->upstream_count &&
-                h2->async_cfg->upstreams[kOutcome.upstream_id].http2) {
+                (h2->async_cfg->upstreams[kOutcome.upstream_id].http2 ||
+                 (h2->find_stream(kStreamId) && h2->find_stream(kStreamId)->websocket))) {
                 u8 resp[8192];
                 H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
                 if (!grpc_start_synth(d,
@@ -2632,7 +2643,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                       forward_synth,
                                       forward_len,
                                       !h2->async_request_stream_open)) {
-                    failure_status = 503;
+                    failure_status = h2_forward_failure_status(*h2, kStreamId);
                 } else {
                     conn.pending_handler_fn = nullptr;
                     h2_clear_async(*h2);

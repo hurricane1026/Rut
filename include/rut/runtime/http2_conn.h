@@ -38,6 +38,8 @@ struct Http2Stream {
     i32 recv_window;  // how much DATA the peer may send us on this stream
     bool got_headers;
     bool websocket;  // validated RFC 8441 request; DATA is a duplex tunnel
+    const RouteEntry* websocket_route;
+    u16 websocket_open_error;
     // Streaming consumers return credit only after releasing buffered DATA.
     bool manual_window;
     u32 recv_credit;

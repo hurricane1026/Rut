@@ -41,15 +41,17 @@ struct TlsClientContext {
     SSL_CTX* ssl_ctx;
     BIO_METHOD* socket_bio_method;
     BIO_METHOD* bridge_bio_method;
+    bool http2;
 };
 core::Expected<void, Error> init_tls_client_context(TlsClientContext& ctx,
-                                                    const UpstreamTlsSpec& spec);
+                                                    const UpstreamTlsSpec& spec,
+                                                    bool http2 = true);
 void destroy_tls_client_context(TlsClientContext& ctx);
 core::Expected<SSL*, Error> create_tls_client_ssl(TlsClientContext& ctx,
                                                   i32 fd,
                                                   const char* server_name);
-bool configure_tls_client_ssl(SSL* ssl, const char* server_name);
-bool tls_client_peer_valid(SSL* ssl);
+bool configure_tls_client_ssl(SSL* ssl, const char* server_name, bool http2 = true);
+bool tls_client_peer_valid(SSL* ssl, bool http2 = true);
 bool tls_handshake_finished(SSL* ssl);
 
 // offer_h2: advertise HTTP/2 over ALPN. Leave false until the HTTP/2 data

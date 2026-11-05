@@ -20564,13 +20564,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         // Active health-check config (parser already validated path/interval
         // presence + ranges). Carried verbatim; no probing in this slice.
-        if (item.upstream.http2 && item.upstream.hc_enabled)
+        if ((item.upstream.http2 || item.upstream.tls.enabled) && item.upstream.hc_enabled)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.upstream.addr_span,
-                                  {"HTTP/2 health checks are not supported", 37});
+                                  lit_str("HTTP/2 and TLS health checks are not supported"));
         up.tls = item.upstream.tls;
-        if (up.tls.enabled && !item.upstream.http2)
-            return frontend_error(FrontendError::UnsupportedSyntax, item.upstream.addr_span);
         up.http2 = item.upstream.http2;
         up.hc_enabled = item.upstream.hc_enabled;
         up.hc_path = item.upstream.hc_path_lit;

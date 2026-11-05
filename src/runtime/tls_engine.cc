@@ -1,5 +1,6 @@
 #include "rut/runtime/tls_engine.h"
 
+#include "rut/runtime/tls.h"
 #include "tls_internal.h"
 
 #include <errno.h>
@@ -155,7 +156,7 @@ core::Expected<void, Error> tls_engine_init_client(TlsEngine& eng,
     }
     BIO_set_data(bio, &eng);
     SSL_set_bio(ssl, bio, bio);
-    if (!configure_tls_client_ssl(ssl, server_name)) {
+    if (!configure_tls_client_ssl(ssl, server_name, ctx.http2)) {
         SSL_free(ssl);
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     }

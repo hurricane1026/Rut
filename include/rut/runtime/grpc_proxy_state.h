@@ -7,6 +7,7 @@
 
 namespace rut {
 struct ConnectionBase;
+struct WsH2Session;
 
 // One RPC, allocated from the shard's existing bulk SlicePool. Payloads stay
 // opaque (including compressed protobuf messages and binary metadata). Queue
@@ -33,6 +34,7 @@ struct GrpcExchange {
     bool observed;
     bool websocket;  // opaque Extended CONNECT exchange, with HTTP (not gRPC) errors
     bool ws_accepted;
+    WsH2Session* ws;
     u32 ws_offers_len;
     u64 deadline_us;
     u64 request_bytes;
@@ -79,6 +81,7 @@ struct GrpcExchange {
         observed = false;
         websocket = false;
         ws_accepted = false;
+        ws = nullptr;
         ws_offers_len = 0;
         deadline_us = request_bytes = 0;
         expected_request_bytes = 0;
@@ -116,6 +119,9 @@ struct GrpcProxyState {
     u64 idle_since_us;
     u64 timer_deadline_us;
     bool upstream;
+    bool websocket_http1;  // one dedicated TCP/TLS upstream, using the same bounded mapping
+    bool websocket_http1_eof;
+    bool websocket_http1_headers;
     bool connecting;
     bool busy;
     bool preface_sent;
@@ -130,6 +136,8 @@ struct GrpcProxyState {
         active = cursor = control_len = pending_cancel_count = 0;
         connected_at_us = idle_since_us = timer_deadline_us = 0;
         upstream = connecting = busy = preface_sent = session_failure_recorded = false;
+        websocket_http1 = false;
+        websocket_http1_eof = websocket_http1_headers = false;
     }
 };
 }  // namespace rut

@@ -158,7 +158,15 @@ bool flush_session(nghttp2_session* session, int fd, SSL* ssl = nullptr) {
 }
 struct EchoServer {
     bool websocket = false;
+    bool http1 = false;
     bool connect_protocol = true;
+    struct H1Peer {
+        EchoServer* server = nullptr;
+        int fd = -1;
+        pthread_t thread{};
+        bool started = false;
+    } h1_peers[64];
+    u32 h1_count = 0;
     struct Stream {
         int id;
         u32 len;
@@ -188,6 +196,138 @@ struct EchoServer {
     std::atomic<bool> pause_handshake{false};
     std::atomic<bool> handshake_waiting{false};
     int handshake_gate[2] = {-1, -1};
+    static void* run_http1(void* raw) {
+        auto& peer = *static_cast<H1Peer*>(raw);
+        auto* server = peer.server;
+        SSL* ssl = nullptr;
+        if (server->tls_context) {
+            auto created = create_tls_server_ssl(server->tls_context, peer.fd);
+            if (created) ssl = created.value();
+            if (!ssl || SSL_accept(ssl) != 1) {
+                if (ssl) SSL_free(ssl);
+                close(peer.fd);
+                return nullptr;
+            }
+        }
+        auto send_bytes = [&](const u8* p, u32 n) {
+            while (n) {
+                const int sent = ssl ? SSL_write(ssl, p, n) : send(peer.fd, p, n, MSG_NOSIGNAL);
+                if (sent <= 0) return false;
+                p += sent;
+                n -= sent;
+            }
+            return true;
+        };
+        u8 bytes[16384];
+        u32 used = 0;
+        HttpParser parser{};
+        ParsedRequest request{};
+        bool ready = false;
+        bool reset_peer = false;
+        while (!server->stop.load() && used < sizeof(bytes)) {
+            const int n = ssl ? SSL_read(ssl, bytes + used, sizeof(bytes) - used)
+                              : recv(peer.fd, bytes + used, sizeof(bytes) - used, 0);
+            if (n <= 0) break;
+            used += n;
+            if (parser.parse(bytes, used, &request) == ParseStatus::Complete) {
+                ready = true;
+                break;
+            }
+        }
+        u8 accept[16384];
+        u32 offers = 0;
+        if (ready &&
+            ws_prepare_handshake(bytes, parser.header_end, accept, sizeof(accept), &offers) ==
+                WsHandshakeRequestResult::Ready) {
+            server->requests++;
+            const u32 mode = server->reply_mode.exchange(0);
+            char response[512];
+            const int size =
+                mode == 12 ? snprintf(response,
+                                      sizeof(response),
+                                      "HTTP/1.1 101 Switching Protocols\r\nConnection: "
+                                      "Upgrade\r\nUpgrade: websocket\r\n"
+                                      "Sec-WebSocket-Accept: %.*s\r\n\r\n",
+                                      28,
+                                      reinterpret_cast<char*>(accept))
+                : mode >= 9
+                    ? snprintf(
+                          response,
+                          sizeof(response),
+                          mode == 10
+                              ? "HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n"
+                                "%c%c%c\r\n0\r\nx-finished: yes\r\n\r\n"
+                          : mode == 11
+                              ? "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n%c%c%c"
+                              : "HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n\r\n%c%c%c",
+                          0,
+                          17,
+                          34)
+                : mode == 3 ? snprintf(response,
+                                       sizeof(response),
+                                       "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: "
+                                       "close\r\n\r\n")
+                            : snprintf(response,
+                                       sizeof(response),
+                                       "HTTP/1.1 101 Switching Protocols\r\nConnection: "
+                                       "Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: "
+                                       "%.*s\r\nSec-WebSocket-Protocol: %s\r\n\r\n",
+                                       28,
+                                       reinterpret_cast<char*>(accept),
+                                       mode == 1 ? "unoffered" : "chat");
+            bool okay = mode != 6;
+            if (mode == 7) {
+                static constexpr char hints[] = "HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n";
+                okay = send_bytes(reinterpret_cast<const u8*>(hints), sizeof(hints) - 1);
+            }
+            if (okay) okay = send_bytes(reinterpret_cast<const u8*>(response), size);
+            if (mode == 4) {
+                if (ssl) SSL_shutdown(ssl);
+                shutdown(peer.fd, SHUT_WR);
+            }
+            u32 held = used - parser.header_end;
+            memmove(bytes, bytes + parser.header_end, held);
+            while (!server->stop.load() && mode != 3 && mode < 9) {
+                if (!held) {
+                    pollfd poller{peer.fd, POLLIN, 0};
+                    if ((!ssl || !SSL_pending(ssl)) && poll(&poller, 1, 20) <= 0) continue;
+                    const int n = ssl ? SSL_read(ssl, bytes, sizeof(bytes))
+                                      : recv(peer.fd, bytes, sizeof(bytes), 0);
+                    if (n <= 0) break;
+                    held = n;
+                }
+                if (mode == 6 || mode == 4) {
+                    held = 0;
+                    continue;
+                }
+                if (mode == 8) {
+                    reset_peer = true;
+                    linger reset{1, 0};
+                    setsockopt(peer.fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+                    break;
+                }
+                if (mode == 5) {
+                    static constexpr u8 wire[] = {0x82, 5, 'h', 'e', 'l', 'l', 'o'};
+                    if (held < 11) {
+                        const int n = ssl ? SSL_read(ssl, bytes + held, sizeof(bytes) - held)
+                                          : recv(peer.fd, bytes + held, sizeof(bytes) - held, 0);
+                        if (n <= 0) break;
+                        held += n;
+                        continue;
+                    }
+                    if (!send_bytes(wire, sizeof(wire))) break;
+                } else if (!send_bytes(bytes, held))
+                    break;
+                held = 0;
+            }
+        }
+        if (ssl) {
+            if (!reset_peer) SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
+        close(peer.fd);
+        return nullptr;
+    }
     Stream* get(int id) {
         for (auto& s : streams)
             if (s.id == id) return &s;
@@ -210,8 +350,13 @@ struct EchoServer {
             static constexpr u8 request[] = {0x82, 0x85, 1, 2, 3, 4, 0x69, 0x67, 0x6f, 0x68, 0x6e};
             static constexpr u8 response[] = {0x82, 5, 'h', 'e', 'l', 'l', 'o'};
             if (s->len < sizeof(request)) return NGHTTP2_ERR_DEFERRED;
-            if (s->len != sizeof(request) || memcmp(s->data, request, sizeof(request)) != 0 ||
-                len < sizeof(response))
+            WsFrameHeader frame{};
+            if (ws_parse_header(s->data, s->len, true, &frame) != ParseStatus::Complete ||
+                frame.opcode != WsOpcode::Binary || frame.payload_len != 5 ||
+                s->len != frame.header_len + 5 || len < sizeof(response))
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            ws_unmask(s->data + frame.header_len, 5, frame.mask_key);
+            if (memcmp(s->data + frame.header_len, "hello", 5) != 0)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             memcpy(buf, response, sizeof(response));
             s->len = 0;
@@ -413,6 +558,20 @@ struct EchoServer {
             self->fd = accept(self->listen_fd, nullptr, nullptr);
             if (self->fd < 0) continue;
             self->accepts++;
+            if (self->http1) {
+                if (self->h1_count == 64) {
+                    close(self->fd);
+                    continue;
+                }
+                auto& peer = self->h1_peers[self->h1_count++];
+                peer.server = self;
+                peer.fd = self->fd;
+                set_socket_timeouts(peer.fd, 3);
+                peer.started = pthread_create(&peer.thread, nullptr, &run_http1, &peer) == 0;
+                if (!peer.started) close(peer.fd);
+                self->fd = -1;
+                continue;
+            }
             for (auto& stream : self->streams) stream = {};
             set_socket_timeouts(self->fd, 2);
             SSL* ssl = nullptr;
@@ -495,6 +654,8 @@ struct EchoServer {
             (void)write(handshake_gate[1], &release, 1);
         }
         if (started) pthread_join(thread, nullptr);
+        for (auto& peer : h1_peers)
+            if (peer.started) pthread_join(peer.thread, nullptr);
         if (handshake_gate[0] >= 0) close(handshake_gate[0]);
         if (handshake_gate[1] >= 0) close(handshake_gate[1]);
         if (listen_fd >= 0) close(listen_fd);
@@ -690,7 +851,10 @@ struct Client {
         provider.read_callback = &data;
         return nghttp2_submit_request(session, nullptr, headers, 7, &provider, nullptr);
     }
-    int websocket_request(u32 index, u32 bytes, const char* path = "/ws") {
+    int websocket_request(u32 index,
+                          u32 bytes,
+                          const char* path = "/ws",
+                          const char* protocol = "chat") {
         rpcs[index].size = bytes;
         rpcs[index].end = false;
         const nghttp2_nv headers[] = {nv(":method", "CONNECT"),
@@ -699,7 +863,7 @@ struct Client {
                                       nv(":authority", "ws.test"),
                                       nv(":path", path),
                                       nv("sec-websocket-version", "13"),
-                                      nv("sec-websocket-protocol", "chat")};
+                                      nv("sec-websocket-protocol", protocol)};
         nghttp2_data_provider provider{};
         provider.source.ptr = &rpcs[index];
         provider.read_callback = &data;
@@ -765,8 +929,8 @@ struct Client {
 [[maybe_unused]] u64 websocket_denied(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_status(403).pack();
 }
-[[maybe_unused]] WsFrameAction websocket_must_not_run(void*, WsOpcode, const u8*, u64, bool) {
-    return WsFrameAction::Close;
+[[maybe_unused]] WsFrameAction websocket_forward_message(void*, WsOpcode, const u8*, u64, bool) {
+    return WsFrameAction::Forward;
 }
 
 // Test the opaque transport with byte-exact DATA spanning several flow-control
@@ -775,13 +939,15 @@ template <typename Loop>
 void websocket_h2_case(rut::test::TestCase* _tc,
                        bool tls,
                        bool upstream_support = true,
-                       bool opening_timeout = false) {
+                       bool opening_timeout = false,
+                       bool http1 = false) {
 #if RUT_ENABLE_WEBSOCKET
     auto server = std::make_unique<EchoServer>();
     server->websocket = true;
+    server->http1 = http1;
     server->connect_protocol = upstream_support;
     if (opening_timeout) server->reply_mode = 6;
-    REQUIRE(server->start(tls));
+    REQUIRE(server->start(tls, false, !http1));
     auto shard = std::make_unique<Shard<Loop>>();
     const int lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
@@ -791,16 +957,19 @@ void websocket_h2_case(rut::test::TestCase* _tc,
     }
     auto cfg = std::make_unique<RouteConfig>();
     REQUIRE(cfg->add_upstream("chat", 0x7f000001, get_port(server->listen_fd)).has_value());
-    cfg->upstreams[0].http2 = true;
+    cfg->upstreams[0].http2 = !http1;
     if (tls) {
         cfg->upstreams[0].tls.enabled = true;
         strcpy(cfg->upstreams[0].tls.ca, RUT_GRPC_FIXTURES "/localhost_cert.pem");
         strcpy(cfg->upstreams[0].tls.server_name, "localhost");
     }
     REQUIRE(cfg->add_proxy("/ws", 'C', 0));
+    REQUIRE(cfg->add_proxy("/ordinary", 'G', 0));
     REQUIRE(cfg->add_jit_handler("/jit", 'C', &grpc_jit_forward, false));
     REQUIRE(cfg->add_jit_handler("/deny", 'C', &websocket_denied, false));
-    REQUIRE(cfg->add_ws_terminate("/inspect", 'C', 0, &websocket_must_not_run, 1024));
+    REQUIRE(cfg->add_ws_terminate("/inspect", 'C', 0, &websocket_forward_message, 1024));
+    REQUIRE(cfg->add_ws_terminate("/required", 'C', 0, &websocket_forward_message, 1024));
+    cfg->routes[cfg->route_count - 1].ws_subprotocol = lit_str("chat");
     REQUIRE(cfg->add_static("/health", 'G', 204));
     shard->route_config = cfg.get();
     if (opening_timeout) shard->loop->upstream_timeout = 1;
@@ -816,18 +985,23 @@ void websocket_h2_case(rut::test::TestCase* _tc,
         const int file = mkstemp(path);
         REQUIRE(file >= 0);
         char source[1536];
-        const int len =
-            snprintf(source,
-                     sizeof(source),
-                     "upstream chat { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
-                     "route \"/ws\" { return websocket(chat) }\n"
-                     "route \"/jit\" { guard req.header(\"x-deny\").or(\"no\") == \"no\" "
-                     "else { return 403 } return websocket(chat) }\n"
-                     "route \"/deny\" { return 403 }\n"
-                     "route \"/inspect\" { return websocket(chat) { message in "
-                     "message.forward() } }\n"
-                     "route GET \"/health\" { return 204 }\n",
-                     get_port(server->listen_fd));
+        const int len = snprintf(
+            source,
+            sizeof(source),
+            "upstream chat { host: \"127.0.0.1\", port: %u%s }\n"
+            "route \"/ws\" { return websocket(chat) }\n"
+            "route \"/jit\" { guard req.header(\"x-deny\").or(\"no\") == \"no\" "
+            "else { return 403 } return websocket(chat) }\n"
+            "route \"/deny\" { return 403 }\n"
+            "route \"/inspect\" { return websocket(chat) { message in "
+            "guard message.connection.subprotocol == \"chat\" else { message.close(1008) } "
+            "message.forward(message.payload) } onOpen: { connection in "
+            "guard connection.remotePort > 0 else { connection.close(1008) } } }\n"
+            "route \"/required\" { return websocket(chat, subprotocol: \"chat\") "
+            "{ message in message.forward() } }\n"
+            "route GET \"/health\" { return 204 }\n",
+            get_port(server->listen_fd),
+            http1 ? "" : ", protocol: .http2");
         const bool written = write(file, source, len) == len;
         close(file);
         LoadError error;
@@ -894,7 +1068,7 @@ void websocket_h2_case(rut::test::TestCase* _tc,
                     CHECK_EQ(client.websocket_request(2, 80000, "/jit"), 5);
                     CHECK(client.until(2, false));
                     CHECK_EQ(client.rpcs[2].http_status, 200u);
-                    CHECK_EQ(server->accepts.load(), 1u);
+                    CHECK_EQ(server->accepts.load(), http1 ? 2u : 1u);
                     CHECK_EQ(nghttp2_submit_rst_stream(client.session, 0, 1, NGHTTP2_CANCEL), 0);
                     CHECK(flush_session(client.session, client.fd, client.ssl));
                     client.rpcs[2].size = 160000;
@@ -915,10 +1089,14 @@ void websocket_h2_case(rut::test::TestCase* _tc,
                     CHECK_EQ(client.websocket_request(5, 0, "/deny"), 11);
                     CHECK(client.until(5, true));
                     CHECK_EQ(client.rpcs[5].http_status, 403u);
-                    CHECK_EQ(client.websocket_request(6, 0, "/inspect"), 13);
-                    CHECK(client.until(6, true));
-                    CHECK_EQ(client.rpcs[6].http_status, 503u);
-                    CHECK_EQ(server->requests.load(), requests);
+                    server->reply_mode = 5;
+                    client.rpcs[6].wire_message = true;
+                    CHECK_EQ(client.websocket_request(6, 11, "/inspect"), 13);
+                    CHECK(client.until(6, false));
+                    CHECK_EQ(client.rpcs[6].http_status, 200u);
+                    CHECK_EQ(server->requests.load(), requests + 1);
+                    CHECK_EQ(nghttp2_submit_rst_stream(client.session, 0, 13, NGHTTP2_CANCEL), 0);
+                    CHECK(flush_session(client.session, client.fd, client.ssl));
                     // Server half-closes first; the client can still finish its
                     // upload. Only this stream gets END_STREAM, not TCP FIN.
                     server->reply_mode = 4;
@@ -956,6 +1134,40 @@ void websocket_h2_case(rut::test::TestCase* _tc,
                     CHECK(client.rpcs[10].closed);
                     CHECK_EQ(client.rpcs[10].http_status, 200u);
                     CHECK_EQ(client.rpcs[10].reset_error, static_cast<u32>(NGHTTP2_CANCEL));
+                    const u32 before_missing_offer = server->requests.load();
+                    CHECK_EQ(client.websocket_request(11, 0, "/required", "other"), 23);
+                    CHECK(client.until(11, true));
+                    CHECK_EQ(client.rpcs[11].http_status, 400u);
+                    CHECK_EQ(server->requests.load(), before_missing_offer);
+                    if (http1) {
+                        for (u32 mode = 9; mode <= 11; ++mode) {
+                            const u32 index = mode + 3;
+                            server->reply_mode = mode;
+                            CHECK_EQ(client.websocket_request(index, 3),
+                                     static_cast<i32>(2 * index + 1));
+                            CHECK(client.until(index, true));
+                            CHECK_EQ(client.rpcs[index].http_status, 403u);
+                            CHECK_EQ(client.rpcs[index].received, 3u);
+                            CHECK_EQ(client.rpcs[index].reset_error, 0u);
+                        }
+                        server->reply_mode = 12;  // required selection omitted by upstream
+                        CHECK_EQ(client.websocket_request(15, 0, "/required"), 31);
+                        CHECK(client.until(15, true));
+                        CHECK_EQ(client.rpcs[15].http_status, 502u);
+                        if (tls) {
+                            const u32 accepted = server->accepts.load();
+                            const nghttp2_nv ordinary[] = {nv(":method", "GET"),
+                                                           nv(":scheme", "https"),
+                                                           nv(":authority", "ws.test"),
+                                                           nv(":path", "/ordinary")};
+                            CHECK_EQ(nghttp2_submit_request(
+                                         client.session, nullptr, ordinary, 4, nullptr, nullptr),
+                                     33);
+                            CHECK(client.until(16, true));
+                            CHECK_EQ(client.rpcs[16].http_status, 503u);
+                            CHECK_EQ(server->accepts.load(), accepted);
+                        }
+                    }
                     CHECK(!client.goaway);
                 }
             }
@@ -974,6 +1186,7 @@ void websocket_h2_case(rut::test::TestCase* _tc,
     (void)tls;
     (void)upstream_support;
     (void)opening_timeout;
+    (void)http1;
     SKIP("WebSocket disabled");
 #endif
 }
@@ -1001,6 +1214,18 @@ TEST(http2_websocket, opening_timeout_preserves_siblings_epoll) {
 }
 TEST(http2_websocket, opening_timeout_preserves_siblings_iouring) {
     websocket_h2_case<IoUringEventLoop>(_tc, false, true, true);
+}
+TEST(http2_websocket, http1_bridge_epoll) {
+    websocket_h2_case<EpollEventLoop>(_tc, false, true, false, true);
+}
+TEST(http2_websocket, http1_bridge_iouring) {
+    websocket_h2_case<IoUringEventLoop>(_tc, false, true, false, true);
+}
+TEST(http2_websocket, http1_tls_bridge_epoll) {
+    websocket_h2_case<EpollEventLoop>(_tc, true, true, false, true);
+}
+TEST(http2_websocket, http1_tls_bridge_iouring) {
+    websocket_h2_case<IoUringEventLoop>(_tc, true, true, false, true);
 }
 
 template <typename Loop>

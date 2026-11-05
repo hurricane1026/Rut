@@ -166,6 +166,7 @@ add_library(rut_runtime STATIC
     runtime/ws_extensions.cc
     runtime/ws_deflate.cc
     runtime/ws_handshake.cc
+    runtime/ws_h2.cc
     runtime/ws_terminate.cc
     runtime/access_log.cc
     runtime/access_log_live.cc

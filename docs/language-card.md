@@ -525,13 +525,14 @@ upstream secureGreeter {
 
 `ca` and `server_name` are required. Omit both `cert` and `key` for ordinary
 server-authenticated TLS; supply both for mTLS. Keys must be unencrypted PEM;
-encrypted keys are rejected without an interactive password prompt. Certificate-chain validation,
-DNS/IPv4 identity verification and h2 ALPN are mandatory. DNS identities also
+encrypted keys are rejected without an interactive password prompt. Certificate-chain validation and
+DNS/IPv4 identity verification are mandatory. HTTP/2 additionally requires h2 ALPN. DNS identities also
 send SNI. There is no insecure verification mode, system-CA fallback or protocol
 downgrade. Paths are literal strings (maximum 255 bytes), relative to the
 process working directory when not absolute. `server_name` is at most 253 ASCII
 letters/digits/dots/hyphens; embedded controls and escaped literals are rejected.
-TLS is currently supported only with `.http2`. Files are loaded when a new
+TLS supports `.http2` forwarding and H1 upstreams of the H2 WebSocket bridge.
+Ordinary H1 forwarding to TLS remains unsupported (503). Files are loaded when a new
 pooled upstream session is established, and its TLS context remains alive until
 session teardown. TLS/configuration-file failures return UNAVAILABLE.
 
@@ -886,18 +887,20 @@ return read(root: "/var/www")                  // zero-copy (uses *catch-all cap
 guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 
 // WebSocket uses HTTP/1.1 Upgrade or HTTP/2 Extended CONNECT. Bare websocket(chat)
-// is opaque passthrough; HTTP/1.1 also supports complete-message inspection below.
-// HTTP/2 currently requires an HTTP/2 upstream and a methodless route (wire CONNECT):
+// is opaque passthrough; the same trailing message/lifecycle callbacks inspect H2 streams.
+// HTTP/2 downstream routes are methodless (wire CONNECT), with an H2 or H1 upstream:
 upstream chatH2 { host: "127.0.0.1", port: 9001, protocol: .http2 }
 route "/ws" { return websocket(chatH2) }
 // Ordinary header/path admission and local rejection run before the tunnel opens.
-// Both peers negotiate SETTINGS_ENABLE_CONNECT_PROTOCOL. Acceptance is HTTP 2xx,
-// without Key/Accept or Connection/Upgrade headers; DATA carries opaque WS bytes.
-// Each stream has independent flow control, END_STREAM and RST_STREAM; ordinary
-// HTTP requests and other tunnels can share the same downstream connection.
-// H2-to-H1 bridging and H2 message/lifecycle callbacks are not wired yet. Routes
-// requesting inspection or an ordinary request body get 503 before upstream work.
-// There is no implicit downgrade from message inspection to opaque forwarding.
+// H2 peers negotiate SETTINGS_ENABLE_CONNECT_PROTOCOL. Acceptance is HTTP 2xx,
+// without Key/Accept or Connection/Upgrade headers; DATA carries WebSocket frames.
+// H1 upstreams receive a fresh GET Upgrade; a validated 101 becomes H2 status 200.
+// Each H2 stream owns its callbacks, buffers, negotiated subprotocol and per-leg codecs.
+// Dynamic output, connection/close facts and message limits match HTTP/1.1 behavior.
+// Independent flow control, END_STREAM and RST_STREAM preserve sibling requests.
+// TLS H1 upstreams validate identity and negotiate http/1.1 (or no ALPN); H2 requires h2.
+// Ordinary request-body consumers still get 503: CONNECT DATA belongs to the tunnel.
+// HTTP/1.1 downstream to H2 upstream WebSocket bridging remains unsupported.
 // No frame binding, opcode, FIN, masking, continuation or ping/pong API is exposed.
 return websocket(chat)
 

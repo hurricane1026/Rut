@@ -7,6 +7,8 @@
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/ws_extensions.h"
 
+#include <openssl/rand.h>
+
 namespace rut {
 namespace {
 
@@ -381,7 +383,8 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
                                    const u8* storage,
                                    u32 offers_len,
                                    Str required_subprotocol,
-                                   WsDeflateAgreement* upstream_deflate) {
+                                   WsDeflateAgreement* upstream_deflate,
+                                   bool opaque_extensions) {
     if (upstream_deflate) *upstream_deflate = {};
     if (storage == nullptr || offers_len > SlicePool::kSliceSize - kWsHandshakeAcceptLength ||
         (required_subprotocol.len != 0 && !ws_valid_subprotocol(required_subprotocol)) ||
@@ -408,7 +411,7 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
             if (!connection_value_is_valid(header.value, &connection_upgrade)) return false;
         } else if (name_is(header.name, "sec-websocket-extensions", 24)) {
             const Str kValue = trim_ows(header.value);
-            if (kValue.len != 0 && !upstream_deflate) return false;
+            if (kValue.len != 0 && !upstream_deflate && !opaque_extensions) return false;
         } else if (name_is(header.name, "sec-websocket-accept", 20)) {
             if (++accept_count != 1) return false;
             const Str kValue = trim_ows(header.value);
@@ -428,6 +431,48 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
         upgrade_count == 1 && upgrade_ok && connection_upgrade && accept_count == 1 && protocol_ok;
     if (kValid && upstream_deflate) *upstream_deflate = selected;
     return kValid;
+}
+
+u32 ws_build_h1_handshake(const ParsedRequest& request,
+                          u8* output,
+                          u32 capacity,
+                          u8* storage,
+                          u32 storage_capacity,
+                          u32* offers_len) {
+    if (!output || !storage || !offers_len || request.method != HttpMethod::CONNECT ||
+        !request.path.len || request.path.ptr[0] != '/')
+        return 0;
+    u8 nonce[16];
+    u8 key[32];
+    u32 key_len = 0;
+    if (RAND_bytes(nonce, sizeof(nonce)) != 1 ||
+        !rut_crypto_base64_encode_v1(nonce, sizeof(nonce), key, sizeof(key), &key_len) ||
+        key_len != 24)
+        return 0;
+    u32 used = 0;
+    auto put = [&](Str text) {
+        if (text.len > capacity - used) return false;
+        __builtin_memcpy(output + used, text.ptr, text.len);
+        used += text.len;
+        return true;
+    };
+    if (!put(lit_str("GET ")) || !put(request.path) ||
+        !put(lit_str(
+            " HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: ")) ||
+        !put({reinterpret_cast<const char*>(key), key_len}) || !put(lit_str("\r\n")))
+        return 0;
+    for (u32 i = 0; i < request.header_count; ++i) {
+        const auto& h = request.headers[i];
+        if (name_is(h.name, "connection", 10) || name_is(h.name, "upgrade", 7) ||
+            name_is(h.name, "sec-websocket-key", 17) || name_is(h.name, "sec-websocket-accept", 20))
+            continue;
+        if (!put(h.name) || !put(lit_str(": ")) || !put(h.value) || !put(lit_str("\r\n"))) return 0;
+    }
+    if (!put(lit_str("\r\n")) ||
+        ws_prepare_handshake(output, used, storage, storage_capacity, offers_len) !=
+            WsHandshakeRequestResult::Ready)
+        return 0;
+    return used;
 }
 
 u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str required_subprotocol) {
