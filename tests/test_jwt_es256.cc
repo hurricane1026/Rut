@@ -5,9 +5,26 @@
 #include "rut/runtime/jwt_es256.h"
 #include "test.h"
 
+#include <openssl/crypto.h>
+#include <stdlib.h>
 #include <string.h>
 
 using namespace rut;
+namespace {
+bool tracking = false;
+u32 allocations = 0;
+void* crypto_alloc(size_t size, const char*, int) {
+    if (tracking) ++allocations;
+    return malloc(size);
+}
+void* crypto_realloc(void* pointer, size_t size, const char*, int) {
+    if (tracking) ++allocations;
+    return realloc(pointer, size);
+}
+void crypto_free(void* pointer, const char*, int) {
+    free(pointer);
+}
+}  // namespace
 
 TEST(jwt_es256, published_rfc_decode_and_failure_publication) {
     EcP256PublicKey key;
@@ -165,13 +182,15 @@ TEST(jwt_es256, shard_activation_configuration_ownership_and_revocation) {
 }
 
 int main(int argc, char** argv) {
+    if (!CRYPTO_set_mem_functions(crypto_alloc, crypto_realloc, crypto_free)) return 1;
     if (argc == 2 && strcmp(argv[1], "--emit-fixture") == 0) {
         test::Es256Fixture fixture;
         if (!fixture.init()) return 1;
         char output[16384], policy[4096], token[4096];
         json::Writer trust{policy, sizeof(policy)};
         trust.text({fixture.policy.ptr, fixture.policy.len - 1});
-        trust.text(lit_str(R"(,"revokedJtis":["revoked"],"issuedAfter":100})"));
+        trust.text(
+            lit_str(R"(,"revokedJtis":["revoked"],"issuedAfter":100,"requiredType":"at+jwt"})"));
         json::Writer result{output, sizeof(output)};
         result.text(lit_str(R"({"policy":)"));
         result.text({policy, trust.len});
@@ -181,7 +200,10 @@ int main(int argc, char** argv) {
                              lit_str("expired"),
                              lit_str("revoked"),
                              lit_str("algorithm"),
-                             lit_str("unknown_kid")};
+                             lit_str("unknown_kid"),
+                             lit_str("missing_type"),
+                             lit_str("wrong_type"),
+                             lit_str("duplicate_type")};
         for (u32 i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
             char claims_bytes[1024];
             json::Writer claims{claims_bytes, sizeof(claims_bytes)};
@@ -194,9 +216,15 @@ int main(int argc, char** argv) {
             claims.text(lit_str(R"(,"jti":)"));
             if (!json::quote(i == 4 ? lit_str("revoked") : lit_str("live"), claims)) return 1;
             claims.put('}');
-            const Str header = i == 5   ? lit_str(R"({"alg":"RS256","kid":"current"})")
-                               : i == 6 ? lit_str(R"({"alg":"ES256","kid":"unknown"})")
-                                        : test::Es256Fixture::header;
+            const Str header =
+                i == 5   ? lit_str(R"({"alg":"RS256","kid":"current","typ":"at+jwt"})")
+                : i == 6 ? lit_str(R"({"alg":"ES256","kid":"unknown","typ":"at+jwt"})")
+                : i == 7 ? test::Es256Fixture::header
+                : i == 8 ? lit_str(R"({"alg":"ES256","kid":"current","typ":"JWT"})")
+                : i == 9
+                    ? lit_str(
+                          R"({"alg":"ES256","kid":"current","typ":"at+jwt","t\u0079p":"at+jwt"})")
+                    : lit_str(R"({"alg":"ES256","kid":"current","typ":"at+jwt"})");
             const Str signed_token = fixture.sign(header, {claims_bytes, claims.len}, token);
             if (!claims.ok || signed_token.empty()) return 1;
             result.put(',');
@@ -210,4 +238,226 @@ int main(int argc, char** argv) {
         return fflush(stdout) == 0 ? 0 : 1;
     }
     return rut::test::run_all(argc, argv);
+}
+
+static Str policy_with_type_options(test::Es256Fixture& fixture, Str options, char* bytes) {
+    json::Writer writer{bytes, Es256Policy::kMaxText};
+    writer.text({fixture.policy.ptr, fixture.policy.len - 1});
+    writer.text(options);
+    writer.put('}');
+    return writer.ok ? Str{bytes, writer.len} : Str{};
+}
+
+TEST(jwt_es256, explicit_type_binds_protected_header_before_identity_publication) {
+    test::Es256Fixture fixture;
+    REQUIRE(fixture.init());
+    char plain_bytes[8192], typed_bytes[8192];
+    const Str plain = policy_with_type_options(fixture, {}, plain_bytes);
+    const Str typed =
+        policy_with_type_options(fixture, lit_str(R"(,"requiredType":"at+jwt")"), typed_bytes);
+    const Str configurations[] = {plain, typed};
+    Es256Policies policies;
+    REQUIRE(policies.load(configurations, 2));
+    REQUIRE(policies.activate(0));
+    REQUIRE(policies.activate(1));
+    const struct {
+        Str header;
+        bool typed;
+        bool plain;
+    } cases[] = {
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":"at+jwt"})"), true, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","t\u0079p":"at\u002bjwt"})"), true, true},
+        {lit_str(R"({"alg":"ES256","kid":"current"})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":"JWT"})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":"AT+JWT"})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":"application/at+jwt"})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":"at+jwt-other"})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":" at+jwt"})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":"at+jwt\u0000"})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":""})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":null})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":123})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":["at+jwt"]})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":"at+jwt","t\u0079p":"at+jwt"})"),
+         false,
+         false},
+        {lit_str(R"({"alg":"HS256","kid":"current","typ":"at+jwt"})"), false, false},
+        {lit_str(R"({"alg":"ES256","kid":"unknown","typ":"at+jwt"})"), false, false},
+        {lit_str(R"({"alg":"ES256","kid":"current","cty":"at+jwt"})"), false, true},
+        {lit_str(R"({"alg":"ES256","kid":"current","typ":"at+jwt"})"), true, true},
+    };
+    for (u32 index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        const auto& item = cases[index];
+        char token[4096], payload[8192];
+        const Str value = fixture.sign(
+            item.header,
+            lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"typ":"at+jwt"})"),
+            token);
+        REQUIRE(value.len);
+        for (u32 shard = 0; shard < 2; ++shard) {
+            for (u32 policy = 0; policy < 2; ++policy) {
+                json::Document document;
+                REQUIRE(document.parse(lit_str("{}")));
+                u32 length = 99;
+                allocations = 0;
+                tracking = true;
+                const bool accepted = policies.verify(shard,
+                                                      configurations[policy],
+                                                      document,
+                                                      value,
+                                                      100,
+                                                      payload,
+                                                      sizeof(payload),
+                                                      length);
+                tracking = false;
+                CHECK_EQ(allocations, 0u);
+                CHECK_EQ(accepted, policy ? item.typed : item.plain);
+                CHECK_EQ(document.valid, accepted);
+                if (!accepted) {
+                    CHECK_EQ(length, 0u);
+                    CHECK_EQ(document.count, 0u);
+                    CHECK_EQ(document.source.len, 0u);
+                }
+            }
+        }
+    }
+    char token[4096], payload[8192];
+    test::Es256Fixture other;
+    REQUIRE(other.init());
+    Str value = other.sign(lit_str(R"({"alg":"ES256","kid":"current","typ":"at+jwt"})"),
+                           lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200})"),
+                           token);
+    REQUIRE(value.len);
+    json::Document document;
+    u32 length = 99;
+    CHECK(!policies.verify(0, typed, document, value, 100, payload, sizeof(payload), length));
+    CHECK_EQ(length, 0u);
+    CHECK(!document.valid);
+}
+
+TEST(jwt_es256, explicit_type_configuration_is_bounded_owned_and_strict) {
+    test::Es256Fixture fixture;
+    REQUIRE(fixture.init());
+    const Str invalid[] = {
+        lit_str(R"(,"requiredType":"")"),
+        lit_str(R"(,"requiredType":null)"),
+        lit_str(R"(,"requiredType":true)"),
+        lit_str(R"(,"requiredType":123)"),
+        lit_str(R"(,"requiredType":{})"),
+        lit_str(R"(,"requiredType":["at+jwt"])"),
+        lit_str(R"(,"requiredType":"at jwt")"),
+        lit_str(R"(,"requiredType":"at+jwt\t")"),
+        lit_str(R"(,"requiredType":"at+jwt\u0000")"),
+        lit_str(R"(,"requiredType":"\u007f")"),
+        lit_str(R"(,"requiredType":"\u00e9")"),
+        lit_str(R"(,"requiredType":"JWT","required\u0054ype":"at+jwt")"),
+    };
+    char bytes[8192];
+    for (Str options : invalid) {
+        const Str text = policy_with_type_options(fixture, options, bytes);
+        Es256Policy policy;
+        CHECK(!policy.load(text));
+        CHECK(!policy.keys().valid());
+    }
+    for (u32 size = 128; size <= 129; ++size) {
+        char options[256];
+        json::Writer writer{options};
+        writer.text(lit_str(R"(,"requiredType":")"));
+        for (u32 i = 0; i < size; ++i) writer.put('a');
+        writer.put('"');
+        REQUIRE(writer.ok);
+        const Str text = policy_with_type_options(fixture, {options, writer.len}, bytes);
+        Es256Policy policy;
+        CHECK_EQ(policy.load(text), size == 128);
+        if (size != 128) continue;
+        __builtin_memset(bytes, '!', text.len);
+        CHECK_EQ(policy.required_type().len, 128u);
+        for (u32 i = 0; i < 128; ++i) CHECK_EQ(policy.required_type().ptr[i], 'a');
+        // The bound applies to decoded bytes; actual token verification must agree.
+        char header[512], token[4096], payload[8192];
+        json::Writer head{header};
+        head.text(lit_str(R"({"alg":"ES256","kid":"current","typ":)"));
+        REQUIRE(json::quote(policy.required_type(), head));
+        head.put('}');
+        REQUIRE(head.ok);
+        const Str value =
+            fixture.sign({header, head.len},
+                         lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200})"),
+                         token);
+        REQUIRE(value.len);
+        Es256VerifierSet keys;
+        REQUIRE(keys.init(policy.keys()));
+        json::Document document;
+        u32 length = 0;
+        Str selected;
+        CHECK(jwt_es256_validate_set(keys,
+                                     document,
+                                     value,
+                                     policy.issuer(),
+                                     policy.audience(),
+                                     100,
+                                     payload,
+                                     sizeof(payload),
+                                     length,
+                                     selected,
+                                     policy.required_type()));
+        CHECK(selected.eq(lit_str("current")));
+        // Invalid native policy input also fails without publishing a selected key.
+        CHECK(!jwt_es256_validate_set(keys,
+                                      document,
+                                      value,
+                                      policy.issuer(),
+                                      policy.audience(),
+                                      100,
+                                      payload,
+                                      sizeof(payload),
+                                      length,
+                                      selected,
+                                      {nullptr, 1}));
+        CHECK_EQ(selected.len, 0u);
+        CHECK_EQ(length, 0u);
+        CHECK(!document.valid);
+    }
+}
+
+TEST(jwt_es256, failed_type_policy_does_not_leak_into_separately_trusted_jwks_import) {
+    test::Es256Fixture fixture;
+    REQUIRE(fixture.init());
+    char bytes[8192];
+    const Str bad = policy_with_type_options(
+        fixture, lit_str(R"(,"requiredType":"at+jwt","unsupported":true)"), bytes);
+    Es256Policy policy;
+    REQUIRE(!policy.load(bad));
+    REQUIRE(!policy.keys().valid());
+    json::Document document;
+    REQUIRE(document.parse(fixture.policy));
+    Str jwks;
+    for (u32 node = document.nodes[0].child; node != json::kNone;
+         node = document.nodes[node].next) {
+        json::Writer name{document.scratch};
+        REQUIRE(document.string(document.nodes[node].key, name));
+        if (Str{document.scratch, name.len}.eq(lit_str("jwks"))) jwks = document.raw(node);
+    }
+    REQUIRE(jwks.len);
+    const Str ids[] = {lit_str("current")};
+    REQUIRE(policy.load_jwks(jwks, lit_str("issuer"), lit_str("gateway"), ids, 1));
+    CHECK_EQ(policy.required_type().len, 0u);
+    Es256VerifierSet keys;
+    REQUIRE(keys.init(policy.keys()));
+    char token[4096], payload[8192];
+    const Str value = fixture.sign(test::Es256Fixture::header, test::Es256Fixture::claims, token);
+    REQUIRE(value.len);
+    Str selected;
+    u32 length = 0;
+    CHECK(jwt_es256_validate_set(keys,
+                                 document,
+                                 value,
+                                 policy.issuer(),
+                                 policy.audience(),
+                                 1700000000,
+                                 payload,
+                                 sizeof(payload),
+                                 length,
+                                 selected,
+                                 policy.required_type()));
 }

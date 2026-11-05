@@ -2481,6 +2481,7 @@ exit; mutable crypto workspaces and pointers are never serialized. This adds ver
 not ES256 signing, OIDC, online revocation, persistent sessions or replay state.
 
 
+
 ### RS256 protected token type policy
 
 The `Crypto.jwtRs256(token, policy)` configuration accepts an explicit type:
@@ -2503,3 +2504,28 @@ handling. Configuration owns the type bytes under the same RCU lifecycle as its
 keys. This implements explicit application type binding following
 [RFC 8725 section 3.11](https://www.rfc-editor.org/rfc/rfc8725.html#section-3.11),
 not the complete OAuth JWT access-token profile or nested JWT handling.
+
+### ES256 protected token type policy
+
+`Crypto.jwtEs256(token, policy)` optionally accepts `"requiredType":"at+jwt"`
+in its trusted configuration. This requires the signed protected header `typ`
+to match that exact decoded string. Types are 1–128 decoded visible ASCII bytes
+(0x21–0x7e). Invalid configuration, including empty/non-string values, whitespace,
+controls, non-ASCII, excessive length or duplicate decoded field names, fails
+compilation/loading. The policy owns the bytes until its configuration generation
+retires; native handlers reconstruct the policy from the serialized snapshot.
+
+Enabled policies reject missing, non-string or mismatching `typ` before claims
+publication. Escaped JSON names and values compare after decoding; duplicate
+header names reject. Payload `typ`, HTTP headers and JOSE `cty` cannot satisfy the
+policy. Matching is case-sensitive and performs no media-type normalization or
+alias expansion: `JWT`, `AT+JWT` and `application/at+jwt` do not match `at+jwt`.
+Configure the precise type your issuer emits. Omitting the field preserves
+existing ES256 behavior. Signature, approved kid, issuer/audience/time, revocation
+and scope/group authorization remain required at their existing layers.
+
+The type policy applies to static keys and refreshed remote JWKS on each shard,
+without request-time key parsing, allocation or I/O. This is explicit application
+type binding as described in [RFC 8725 section 3.11](https://www.rfc-editor.org/rfc/rfc8725.html#section-3.11),
+not full OAuth access-token profile conformance, nested JWT support or replay
+protection. See [the example](../examples/jwt-es256-auth.rut).
