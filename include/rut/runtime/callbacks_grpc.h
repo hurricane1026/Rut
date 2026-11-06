@@ -7,6 +7,8 @@
 #include "rut/runtime/receive_headroom.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/upstream_pool.h"
+#include "rut/runtime/ws_h2.h"
+#include "rut/runtime/ws_handshake.h"
 
 namespace rut {
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us);
@@ -32,6 +34,16 @@ template <typename Loop>
 void grpc_on_upstream_data(void*, Connection&, IoEvent);
 template <typename Loop>
 void grpc_on_upstream_sent(void*, Connection&, IoEvent);
+template <typename Loop>
+void h2ws_h1_drive(Loop*, Connection&);
+template <typename Loop>
+void h2ws_h1_received(void*, Connection&, IoEvent);
+template <typename Loop>
+bool h2ws_h1_tls_finished(Loop*, Connection&);
+
+template <typename Loop>
+void h1ws_h2_received(void*, Connection&, IoEvent);
+inline u32 h1ws_h2_response(Connection&, const hpack::Header*, u32, bool, u8*, u32);
 
 inline GrpcExchange* grpc_find(Http2Conn& h, u32 id) {
     for (auto* x : h.grpc.streams)
@@ -48,6 +60,7 @@ inline bool grpc_attach(Http2Conn& h, GrpcExchange* x) {
     return false;
 }
 inline void grpc_queue_cancel(Http2Conn& h, u32 stream_id) {
+    if (h.grpc.websocket_http1) return;  // the dedicated HTTP/1 socket closes on detach
     auto& g = h.grpc;
     if (g.control_len + 13 <= sizeof(g.control)) {
         g.control_len += write_rst_stream(g.control + g.control_len, stream_id, Http2Error::Cancel);
@@ -115,6 +128,17 @@ inline u32 grpc_error_headers(u8* out, u32 cap, u32 sid, u8 code, bool started) 
                                 {{"content-type", 12}, {"application/grpc", 16}},
                                 {{"grpc-status", 11}, value}};
     return http2_write_headers(out, cap, sid, hs + (started ? 2 : 0), started ? 1 : 3, true);
+}
+
+// Extended CONNECT failures are ordinary HTTP before acceptance and a stream
+// reset afterward. They must never acquire gRPC trailers or reset sibling streams.
+inline u32 h2_websocket_error(u8* out, u32 cap, u32 sid, u8 failure, bool started) {
+    if (started) return cap >= 13 ? write_rst_stream(out, sid, Http2Error::Cancel) : 0;
+    const Str kStatus = failure == 14  ? Str{"503", 3}
+                        : failure == 4 ? Str{"504", 3}
+                                       : Str{"502", 3};
+    const hpack::Header kHeader{{":status", 7}, kStatus};
+    return http2_write_headers(out, cap, sid, &kHeader, 1, true);
 }
 
 inline void grpc_log_target(AccessLogEntry& entry, Str path) {
@@ -189,6 +213,7 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
     }
     if (x->slot_held) loop->upstream_release(x->upstream_id);
     grpc_release_backend_active(*x);
+    ws_h2_destroy(loop->pool, x->ws);
     loop->pool.free(reinterpret_cast<u8*>(x));
     if (up && up->h2 && !up->h2->grpc.busy) grpc_drive_upstream(loop, *up);
 }
@@ -221,7 +246,8 @@ void grpc_connection_closed(void* lp, Connection& conn) {
         for (auto*& x : g.streams) {
             if (!x) continue;
             x->upstream = nullptr;
-            if (!x->response_end) x->failure = 14;
+            if (!x->failure && (!x->response_end || (x->websocket && !x->request_end_sent)))
+                x->failure = 14;
             x->response_end = true;
             Connection* down = x->downstream;
             grpc_release_backend_active(*x);
@@ -445,6 +471,99 @@ void grpc_response_headers(
     auto* dispatch = static_cast<GrpcClientDispatch<Loop>*>(ctx);
     auto* x = grpc_find(h, sid);
     if (!x) return;
+    if (x->websocket) {
+        char extension[256];
+        Header regular[Http2Conn::kMaxHeadersPerReq];
+        u32 count = 0;
+        bool accepted = false;
+        bool status_seen = false;
+        for (u32 i = 0; i < n; ++i) {
+            if (hs[i].name.eq({":status", 7})) {
+                if (hs[i].value.len == 3 && hs[i].value.ptr[0] == '1') return;
+                status_seen = true;
+                accepted = hs[i].value.len == 3 && hs[i].value.ptr[0] == '2';
+            } else {
+                regular[count++] = {hs[i].name, hs[i].value, {}};
+            }
+        }
+        if (!status_seen ||
+            (accepted &&
+             (end || !ws_h2_response_matches(regular, count, x->ws_offers, x->ws_offers_len)))) {
+            x->failure = 13;
+            x->response_end = true;
+            grpc_detach_upstream_exchange(dispatch->loop, h, *x);
+            return;
+        }
+        hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
+        u32 filtered_n = 0;
+        for (u32 i = 0; i < n; ++i)
+            if (grpc_response_header_allowed(hs[i])) filtered[filtered_n++] = hs[i];
+        // Preserve handshake-critical selection; user response mutations may
+        // add ordinary fields but must not forge a subprotocol agreement.
+        if (!grpc_apply_response_mutations(
+                *x, filtered, &filtered_n, Http2Conn::kMaxHeadersPerReq)) {
+            x->failure = 8;
+        } else {
+            count = 0;
+            for (u32 i = 0; i < filtered_n; ++i)
+                if (filtered[i].name.ptr[0] != ':')
+                    regular[count++] = {filtered[i].name, filtered[i].value, {}};
+            if (accepted && !ws_h2_response_matches(regular, count, x->ws_offers, x->ws_offers_len))
+                x->failure = 13;
+        }
+        if (!x->failure && accepted && x->ws) {
+            if constexpr (requires { dispatch->loop->pool; }) {
+                if (!ws_h2_accept(*x->ws, dispatch->loop->pool, regular, count)) x->failure = 13;
+            } else
+                x->failure = 13;
+            for (u32 i = 0; i < filtered_n;) {
+                if (!http_header_name_eq_ci(filtered[i].name.ptr,
+                                            filtered[i].name.len,
+                                            "sec-websocket-extensions",
+                                            24)) {
+                    ++i;
+                    continue;
+                }
+                for (u32 j = i + 1; j < filtered_n; ++j) filtered[j - 1] = filtered[j];
+                --filtered_n;
+            }
+            if (x->ws->callback.ws_downstream_deflate.enabled) {
+                if (filtered_n == Http2Conn::kMaxHeadersPerReq)
+                    x->failure = 13;
+                else {
+                    const u32 kLength = ws_format_deflate_agreement(
+                        x->ws->callback.ws_downstream_deflate, extension, sizeof(extension));
+                    if (!kLength)
+                        x->failure = 13;
+                    else
+                        filtered[filtered_n++] = {{"sec-websocket-extensions", 24},
+                                                  {extension, kLength}};
+                }
+            }
+        }
+        if (!x->failure)
+            x->response_headers_len =
+                x->downstream && x->downstream->h2->grpc.websocket_http1_downstream
+                    ? h1ws_h2_response(*x->downstream,
+                                       filtered,
+                                       filtered_n,
+                                       accepted,
+                                       x->response_headers,
+                                       sizeof(x->response_headers))
+                    : http2_write_headers(x->response_headers,
+                                          sizeof(x->response_headers),
+                                          x->downstream_stream,
+                                          filtered,
+                                          filtered_n,
+                                          end);
+        if (!x->response_headers_len) x->failure = 13;
+        x->ws_accepted = accepted && !x->failure;
+        if (x->ws_accepted && !x->ws)
+            x->deadline_us = 0;  // healthy quiet tunnels have no idle deadline
+        x->response_end = end || x->failure;
+        if (x->failure) grpc_detach_upstream_exchange(dispatch->loop, h, *x);
+        return;
+    }
     bool status = false;
     u32 http_status = 0;
     bool content_type = false;
@@ -541,6 +660,12 @@ void grpc_response_trailers(
     auto* dispatch = static_cast<GrpcClientDispatch<Loop>*>(ctx);
     auto* x = grpc_find(h, sid);
     if (!x) return;
+    if (x->websocket) {
+        x->failure = 13;  // WebSocket streams close with DATA/END_STREAM, never trailers.
+        x->response_end = true;
+        grpc_detach_upstream_exchange(dispatch->loop, h, *x);
+        return;
+    }
     hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
     u32 filtered_n = 0;
     for (u32 i = 0; i < n; i++) {
@@ -593,18 +718,25 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
+    if (x->ws && x->ws_accepted) {
+        if (!ws_h2_process(*x, false)) x->failure = 13;
+        if (end) ws_h2_eof(*x, false);
+        if (x->downstream) grpc_refresh_timer(dispatch->loop, *x->downstream);
+        return;
+    }
     if (end) {
         if (x->has_response_length && x->expected_response_bytes != x->response_bytes)
             x->failure = 13;
-        else if (!x->failure)
+        else if (!x->failure && !x->websocket)
             x->failure = 2;
         x->response_end = true;
-        grpc_release_slot(dispatch->loop, *x);
+        if (!x->websocket || x->request_end_sent) grpc_release_slot(dispatch->loop, *x);
     }  // gRPC requires status trailers.
 }
 template <typename Loop>
 void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
-    if (auto* x = grpc_find(h, sid); x && !x->response_end) {
+    if (auto* x = grpc_find(h, sid);
+        x && (!x->response_end || (x->websocket && !x->request_end_sent))) {
         switch (static_cast<u32>(error)) {
             case static_cast<u32>(Http2Error::Cancel):
                 x->failure = 1;
@@ -635,6 +767,28 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
     }
 }
 
+inline const u8* grpc_output(GrpcExchange& x, bool from_client, u32* length) {
+    if (x.ws && x.ws_accepted) {
+        if (!ws_h2_process(x, from_client)) x.failure = 13;
+        return ws_h2_output(x, from_client, length);
+    }
+    *length = from_client ? x.upload_len : x.download_len;
+    return from_client ? x.upload : x.download;
+}
+inline void grpc_consume_output(GrpcExchange& x, bool from_client, u32 length) {
+    if (x.ws && x.ws_accepted) {
+        if (!ws_h2_consume_output(x, from_client, length) || !ws_h2_process(x, from_client))
+            x.failure = 13;
+    } else {
+        grpc_pop(from_client ? x.upload : x.download,
+                 from_client ? x.upload_len : x.download_len,
+                 length);
+        Connection* owner = from_client ? x.downstream : x.upstream;
+        if (owner && owner->h2 && !owner->h2->grpc.websocket_http1)
+            owner->h2->consume_data(from_client ? x.downstream_stream : x.upstream_stream, length);
+    }
+}
+
 template <typename Loop>
 void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -645,7 +799,7 @@ void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     if (conn.h2->grpc.client_tls.ssl_ctx && !conn.h2->grpc.tls_verified) {
         SSL* ssl = conn.tls_engine.ssl ? conn.tls_engine.ssl : conn.tls;
-        if (!tls_client_peer_valid(ssl)) {
+        if (!tls_client_peer_valid(ssl, !conn.h2->grpc.websocket_http1)) {
             grpc_record_handshake_result(loop, conn, false, monotonic_us());
             loop->close_conn(conn);
             return;
@@ -662,12 +816,18 @@ void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.send_progress = 0;
     conn.send_buf.reset();
+    for (auto* x : conn.h2->grpc.streams)
+        if (x && x->ws && x->ws_accepted) ws_h2_sent(*x, true);
     conn.on_send = nullptr;
     grpc_on_upstream_data<Loop>(lp, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0});
 }
 
 template <typename Loop>
 void grpc_drive_upstream(Loop* loop, Connection& conn) {
+    if (conn.h2->grpc.websocket_http1) {
+        h2ws_h1_drive(loop, conn);
+        return;
+    }
     auto& h = *conn.h2;
     auto& g = h.grpc;
     if (g.connecting || conn.on_send || g.busy) return;
@@ -702,38 +862,47 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 if (stream && stream->state != Http2StreamState::Closed) opened++;
                 continue;
             }
-            if (x->failure || x->response_end) continue;
+            if (x->failure || (x->response_end && !x->ws_accepted)) continue;
             if (x->upstream_stream < next_header) next_header = x->upstream_stream;
         }
         for (u32 step = 0; step < 64; step++) {
             const u32 i = (g.cursor + step) % 64;
             auto* x = g.streams[i];
-            if (!x || x->failure || x->response_end) continue;
+            if (!x || x->failure || (x->response_end && !x->ws_accepted)) continue;
             auto* stream = h.find_stream(x->upstream_stream);
             if (!stream) continue;
+            u32 output_len = 0;
+            const u8* output = grpc_output(*x, true, &output_len);
+            if (x->failure) continue;
             if (!x->request_headers_sent) {
                 // Stream creation is ordered even when DATA is round-robin.
                 if (x->upstream_stream != next_header) continue;
                 if (!h.peer_settings_seen || (h.peer_settings.has_max_concurrent_streams &&
                                               opened >= h.peer_settings.max_concurrent_streams))
                     continue;
+                if (x->websocket && !h.peer_settings.enable_connect_protocol) {
+                    x->failure = 14;
+                    x->response_end = true;
+                    continue;  // no Extended CONNECT bytes sent without the peer's opt-in
+                }
                 n = x->request_headers_len;
                 __builtin_memcpy(out, x->request_headers, n);
                 x->request_headers_sent = true;
-            } else if (x->upload_len && stream->send_window > 0 && h.conn_send_window > 0) {
-                u32 amount = x->upload_len;
+            } else if ((!x->websocket || x->ws_accepted) && output_len && stream->send_window > 0 &&
+                       h.conn_send_window > 0) {
+                u32 amount = output_len;
                 const u32 cap = conn.send_buf.write_avail() - kFrameHeaderSize;
                 if (amount > cap) amount = cap;
                 if (amount > h.peer_settings.max_frame_size)
                     amount = h.peer_settings.max_frame_size;
                 if (amount > static_cast<u32>(stream->send_window)) amount = stream->send_window;
                 if (amount > static_cast<u64>(h.conn_send_window)) amount = h.conn_send_window;
-                n = http2_write_data(out, x->upstream_stream, x->upload, amount, false);
-                grpc_pop(x->upload, x->upload_len, amount);
+                n = http2_write_data(out, x->upstream_stream, output, amount, false);
+                grpc_consume_output(*x, true, amount);
                 stream->send_window -= static_cast<i32>(amount);
                 h.conn_send_window -= amount;
-                x->downstream->h2->consume_data(x->downstream_stream, amount);
-            } else if (!x->upload_len && x->request_end && !x->request_end_sent) {
+            } else if ((!x->websocket || x->ws_accepted) && !output_len && !x->upload_len &&
+                       x->request_end && !x->request_end_sent) {
                 if (x->request_trailers_len) {
                     n = x->request_trailers_len;
                     __builtin_memcpy(out, x->request_trailers, n);
@@ -773,6 +942,10 @@ void grpc_tls_ready(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
+    if (conn.h2 && conn.h2->grpc.websocket_http1) {
+        h2ws_h1_received<Loop>(lp, conn, ev);
+        return;
+    }
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result <= 0 || !conn.h2) {
         if (conn.h2) {
@@ -891,7 +1064,7 @@ void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
     const auto& target = conn.request_config->upstreams[conn.upstream_idx];
     if (target.tls.enabled) {
         auto& context = conn.h2->grpc.client_tls;
-        if (!init_tls_client_context(context, target.tls)) {
+        if (!init_tls_client_context(context, target.tls, !conn.h2->grpc.websocket_http1)) {
             grpc_record_handshake_result(loop, conn, false, monotonic_us());
             loop->close_conn(conn);
             return;
@@ -943,10 +1116,15 @@ bool grpc_start_impl(Loop* loop,
                      u32 nh,
                      const ParsedRequest& req,
                      bool end) {
-    if (!cfg || uid >= cfg->upstream_count || !cfg->upstreams[uid].http2 ||
-        req.method != HttpMethod::POST || !grpc_request(req) || down.h2->grpc.active >= 64)
+    auto* downstream_stream = down.h2->find_stream(sid);
+    const bool kWebsocket =
+        RUT_ENABLE_WEBSOCKET && downstream_stream && downstream_stream->websocket;
+    if (!cfg || uid >= cfg->upstream_count || (!cfg->upstreams[uid].http2 && !kWebsocket) ||
+        (!kWebsocket && (req.method != HttpMethod::POST || !grpc_request(req))) ||
+        (kWebsocket && (req.method != HttpMethod::CONNECT || end)) || down.h2->grpc.active >= 64)
         return false;
     const auto& target = cfg->upstreams[uid];
+    const bool kHttp1 = kWebsocket && !target.http2;
     if (!target.addr_count || down.shard_id >= kMaxShards ||
         !forward_load_balance_valid(down.forward_load_balance))
         return false;
@@ -957,8 +1135,13 @@ bool grpc_start_impl(Loop* loop,
     else if (auto* stream = down.h2->find_stream(sid); stream && stream->headers_received_us)
         deadline_base = stream->headers_received_us;
     u64 deadline = 0;
+    if (kWebsocket) {
+        u64 seconds = 30;
+        if constexpr (requires { loop->upstream_timeout; }) seconds = loop->upstream_timeout;
+        deadline = deadline_base + seconds * 1000000;
+    }
     for (u32 i = 0; i < nh; i++) {
-        if (!hs[i].name.eq({"grpc-timeout", 12})) continue;
+        if (kWebsocket || !hs[i].name.eq({"grpc-timeout", 12})) continue;
         u64 timeout = 0;
         if (deadline || !grpc_timeout(hs[i].value, &timeout)) return false;
         deadline = deadline_base + timeout;
@@ -967,6 +1150,7 @@ bool grpc_start_impl(Loop* loop,
         cfg, down.shard_id, down.forward_load_balance, uid, target.addr_count, now);
     Connection* up = nullptr;
     for (auto* c = loop->grpc_upstreams; c; c = c->h2->grpc.pool_next) {
+        if (kHttp1) break;
         if (grpc_upstream_reusable(*c, cfg, uid, backend)) {
             up = c;
             break;
@@ -976,10 +1160,47 @@ bool grpc_start_impl(Loop* loop,
     if (!x) return false;
     static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize);
     x->init();
-    if (!grpc_snapshot_response_mutations(down, *x)) {
-        grpc_release_backend_active(*x);
+    x->websocket = kWebsocket;
+    ParsedRequest inspected_request;
+    const ParsedRequest* opening_request = &req;
+    if (kWebsocket && downstream_stream->websocket_route &&
+        downstream_stream->websocket_route->ws_terminate) {
+        x->ws = ws_h2_create(loop->pool, *downstream_stream->websocket_route, down);
+        if (!x->ws || !ws_h2_prepare_request(*x->ws, req, &inspected_request)) {
+            if (x->ws) downstream_stream->websocket_open_error = 400;
+            ws_h2_destroy(loop->pool, x->ws);
+            loop->pool.free(reinterpret_cast<u8*>(x));
+            return false;
+        }
+        x->ws->callback.request_config = cfg;
+        opening_request = &inspected_request;
+    }
+    if (kWebsocket &&
+        ws_prepare_h2_handshake(
+            *opening_request, x->ws_offers, sizeof(x->ws_offers), &x->ws_offers_len) !=
+            WsHandshakeRequestResult::Ready) {
+        ws_h2_destroy(loop->pool, x->ws);
         loop->pool.free(reinterpret_cast<u8*>(x));
         return false;
+    }
+    if (!grpc_snapshot_response_mutations(down, *x)) {
+        grpc_release_backend_active(*x);
+        ws_h2_destroy(loop->pool, x->ws);
+        loop->pool.free(reinterpret_cast<u8*>(x));
+        return false;
+    }
+    if (kWebsocket) {
+        for (u32 i = 0; i < down.resp_header_mutation_count; ++i) {
+            const Str kName = down.resp_header_mutations[i].name;
+            if (http_header_name_eq_ci(kName.ptr, kName.len, "sec-websocket-protocol", 22) ||
+                http_header_name_eq_ci(kName.ptr, kName.len, "sec-websocket-extensions", 24) ||
+                http_header_name_eq_ci(kName.ptr, kName.len, "sec-websocket-accept", 20) ||
+                http_header_name_eq_ci(kName.ptr, kName.len, "sec-websocket-key", 17)) {
+                ws_h2_destroy(loop->pool, x->ws);
+                loop->pool.free(reinterpret_cast<u8*>(x));
+                return false;
+            }
+        }
     }
     if (end && req.has_content_length && req.content_length != 0) x->failure = 13;
     bool fresh = false;
@@ -987,6 +1208,7 @@ bool grpc_start_impl(Loop* loop,
         up = loop->alloc_conn();
         if (!up) {
             grpc_release_backend_active(*x);
+            ws_h2_destroy(loop->pool, x->ws);
             loop->pool.free(reinterpret_cast<u8*>(x));
             return false;
         }
@@ -994,11 +1216,14 @@ bool grpc_start_impl(Loop* loop,
         if (!loop->alloc_h2(*up) || !grpc_grow_recv(loop, *up)) {
             loop->close_conn(*up);
             grpc_release_backend_active(*x);
+            ws_h2_destroy(loop->pool, x->ws);
             loop->pool.free(reinterpret_cast<u8*>(x));
             return false;
         }
         up->h2->init_client();
-        up->protocol = ConnProtocol::Http2;
+        up->h2->grpc.websocket_http1 = kHttp1;
+        if (kHttp1) up->h2->peer_settings_seen = true;
+        up->protocol = kHttp1 ? ConnProtocol::Http11 : ConnProtocol::Http2;
         up->state = ConnState::ReadingBody;
         up->keep_alive = true;
         up->request_config = cfg;
@@ -1007,8 +1232,10 @@ bool grpc_start_impl(Loop* loop,
         up->h2->grpc.upstream = true;
         up->h2->grpc.connecting = true;
         grpc_begin_handshake(up->h2->grpc, now);
-        up->h2->grpc.pool_next = loop->grpc_upstreams;
-        loop->grpc_upstreams = up;
+        if (!kHttp1) {
+            up->h2->grpc.pool_next = loop->grpc_upstreams;
+            loop->grpc_upstreams = up;
+        }
         up->on_close = &grpc_connection_closed<Loop>;
         h2_async_epoch_enter(loop, *up);
         fresh = true;
@@ -1018,6 +1245,7 @@ bool grpc_start_impl(Loop* loop,
     auto* down_stream = down.h2->find_stream(sid);
     if (!stream || !down_stream) {
         grpc_release_backend_active(*x);
+        ws_h2_destroy(loop->pool, x->ws);
         loop->pool.free(reinterpret_cast<u8*>(x));
         if (fresh) loop->close_conn(*up);
         return false;
@@ -1027,16 +1255,50 @@ bool grpc_start_impl(Loop* loop,
     for (u32 i = 0; i < nh; i++) {
         if (!grpc_request_header_allowed(hs[i]) || filtered_n >= Http2Conn::kMaxHeadersPerReq)
             continue;
+        if (x->ws && hs[i].name.ptr[0] != ':') continue;
         filtered[filtered_n] = hs[i];
         if (hs[i].name.eq({":scheme", 7}))
             filtered[filtered_n].value = target.tls.enabled ? Str{"https", 5} : Str{"http", 4};
         filtered_n++;
     }
-    x->request_headers_len = http2_write_headers(
-        x->request_headers, sizeof(x->request_headers), usid, filtered, filtered_n, false);
+    char inspected_names[Http2Conn::kHeaderScratchCap];
+    u32 inspected_name_bytes = 0;
+    if (x->ws && !kHttp1) {
+        for (u32 i = 0; i < opening_request->header_count; ++i) {
+            const auto& header = opening_request->headers[i];
+            if (http_header_name_eq_ci(header.name.ptr, header.name.len, "host", 4)) continue;
+            if (filtered_n >= Http2Conn::kMaxHeadersPerReq ||
+                header.name.len > sizeof(inspected_names) - inspected_name_bytes) {
+                filtered_n = 0;
+                break;
+            }
+            char* name = inspected_names + inspected_name_bytes;
+            for (u32 j = 0; j < header.name.len; ++j) {
+                const char kCh = header.name.ptr[j];
+                name[j] = kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
+            }
+            inspected_name_bytes += header.name.len;
+            const hpack::Header kNormalized{{name, header.name.len}, header.value};
+            if (grpc_request_header_allowed(kNormalized)) filtered[filtered_n++] = kNormalized;
+        }
+    }
+    x->request_headers_len = kHttp1 ? ws_build_h1_handshake(*opening_request,
+                                                            x->request_headers,
+                                                            sizeof(x->request_headers),
+                                                            x->ws_offers,
+                                                            sizeof(x->ws_offers),
+                                                            &x->ws_offers_len)
+                                    : (filtered_n ? http2_write_headers(x->request_headers,
+                                                                        sizeof(x->request_headers),
+                                                                        usid,
+                                                                        filtered,
+                                                                        filtered_n,
+                                                                        false)
+                                                  : 0);
     if (!x->request_headers_len) {
         stream->state = Http2StreamState::Closed;
         grpc_release_backend_active(*x);
+        ws_h2_destroy(loop->pool, x->ws);
         loop->pool.free(reinterpret_cast<u8*>(x));
         if (fresh) loop->close_conn(*up);
         return false;
@@ -1054,6 +1316,7 @@ bool grpc_start_impl(Loop* loop,
         if (!loop->upstream_acquire(uid, target.max_inflight)) {
             stream->state = Http2StreamState::Closed;
             grpc_release_backend_active(*x);
+            ws_h2_destroy(loop->pool, x->ws);
             loop->pool.free(reinterpret_cast<u8*>(x));
             if (fresh) loop->close_conn(*up);
             return false;
@@ -1063,8 +1326,8 @@ bool grpc_start_impl(Loop* loop,
     x->backend_active = &cfg->backend_selection[down.shard_id].active[uid][backend];
     ++*x->backend_active;
     x->started_us = now;
-    x->observed = true;
-    if (loop->metrics) loop->metrics->on_grpc_start();
+    x->observed = !kWebsocket;
+    if (!kWebsocket && loop->metrics) loop->metrics->on_grpc_start();
     auto& entry = x->log_entry;
     entry.status = 200;
     entry.method = static_cast<u8>(LogHttpMethod::Post);
@@ -1151,40 +1414,61 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             const u32 i = (h.grpc.cursor + step) % 64;
             auto* x = h.grpc.streams[i];
             if (!x) continue;
+            if (x->websocket && x->response_end_sent && !x->failure) {
+                if (x->request_end_sent) grpc_release(loop, x, false);
+                continue;
+            }
             auto* stream = h.find_stream(x->downstream_stream);
             if (!stream) {
                 grpc_release(loop, x, true);
                 continue;
             }
+            u32 output_len = 0;
+            const u8* output = grpc_output(*x, false, &output_len);
             u32 n = 0;
             bool done = false;
             if (x->failure) {
-                n = grpc_error_headers(out + total,
-                                       cap - total,
-                                       x->downstream_stream,
-                                       x->failure,
-                                       x->response_headers_sent);
+                n = x->websocket ? h2_websocket_error(out + total,
+                                                      cap - total,
+                                                      x->downstream_stream,
+                                                      x->failure,
+                                                      x->response_headers_sent)
+                                 : grpc_error_headers(out + total,
+                                                      cap - total,
+                                                      x->downstream_stream,
+                                                      x->failure,
+                                                      x->response_headers_sent);
                 done = n != 0;
             } else if (!x->response_headers_sent && x->response_headers_len) {
                 if (x->response_headers_len > cap - total) continue;
                 n = x->response_headers_len;
                 __builtin_memcpy(out + total, x->response_headers, n);
                 x->response_headers_sent = true;
-                done = x->response_end && !x->download_len && !x->response_trailers_len;
-            } else if (x->response_headers_sent && x->download_len && stream->send_window > 0 &&
+                done = x->response_end && !x->download_len && !x->response_trailers_len &&
+                       (!x->websocket || (x->response_headers[4] & http2_flag::kEndStream));
+            } else if (x->response_headers_sent && output_len && stream->send_window > 0 &&
                        h.conn_send_window > 0 && cap - total > 9) {
-                u32 amount = x->download_len;
+                u32 amount = output_len;
                 if (amount > cap - total - 9) amount = cap - total - 9;
                 if (amount > h.peer_settings.max_frame_size)
                     amount = h.peer_settings.max_frame_size;
                 if (amount > static_cast<u32>(stream->send_window)) amount = stream->send_window;
                 if (amount > static_cast<u64>(h.conn_send_window)) amount = h.conn_send_window;
-                n = http2_write_data(out + total, x->downstream_stream, x->download, amount, false);
+                n = http2_write_data(out + total, x->downstream_stream, output, amount, false);
                 x->staged_response_bytes += amount;
-                grpc_pop(x->download, x->download_len, amount);
+                grpc_consume_output(*x, false, amount);
                 stream->send_window -= static_cast<i32>(amount);
                 h.conn_send_window -= amount;
-                if (x->upstream) x->upstream->h2->consume_data(x->upstream_stream, amount);
+            } else if (x->websocket && x->response_headers_sent && !output_len &&
+                       !x->download_len && x->response_end && !x->response_end_sent &&
+                       cap - total >= kFrameHeaderSize) {
+                n = http2_write_data(out + total, x->downstream_stream, nullptr, 0, true);
+                done = x->request_end_sent || !x->ws_accepted;
+                // Keep the mapping for a peer that has not half-closed yet.
+                if (!done) {
+                    h2_close_stream(&h, x->downstream_stream);
+                    x->response_end_sent = true;
+                }
             } else if (x->response_headers_sent && !x->download_len && x->response_trailers_len) {
                 if (x->response_trailers_len > cap - total) continue;
                 n = x->response_trailers_len;
@@ -1195,7 +1479,10 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             Connection* up = x->upstream;
             if (done) {
                 x->response_end_sent = true;
-                h2_close_stream(&h, x->downstream_stream);
+                if (x->websocket && x->failure && x->response_headers_sent)
+                    stream->state = Http2StreamState::Closed;  // RST has no END_STREAM ack
+                else
+                    h2_close_stream(&h, x->downstream_stream);
                 grpc_release(loop, x, x->failure || !x->request_end_sent);
             }
             if (up && up->h2 && !up->h2->grpc.busy && !up->h2->grpc.connecting) {
@@ -1215,6 +1502,16 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
 template <typename Loop>
 void grpc_kick_downstream(Loop* loop, Connection& down) {
     if (!down.h2 || down.h2->grpc.busy || down.on_send || down.h2->async_stream) return;
+    if constexpr (requires {
+                      loop->pool.alloc_bulk();
+                      loop->upstream_release(u16{});
+                  }) {
+        if (down.h2->grpc.websocket_http1_downstream) {
+            h1ws_h2_received<Loop>(
+                static_cast<void*>(loop), down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
+            return;
+        }
+    }
     on_h2_data<Loop>(static_cast<void*>(loop), down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
 }
 
@@ -1236,8 +1533,21 @@ void grpc_request_data(
     }
     if (len) __builtin_memcpy(x.upload + x.upload_len, data, len);
     x.upload_len += len;
-    x.request_end = end;
-    grpc_drive_upstream(loop, *x.upstream);
+    if (x.ws) {
+        if (!ws_h2_process(x, true)) x.failure = 13;
+        if (end) ws_h2_eof(x, true);
+        Http2Conn* const downstream_h2 = down.h2;
+        const u32 handler_gen = down.handler_gen;
+        grpc_refresh_timer(loop, down);
+        // The H1 bridge closes synchronously when a response send is pending
+        // and timer arming fails. Its close callback may release this exchange.
+        if (down.h2 != downstream_h2 || down.handler_gen != handler_gen) return;
+    } else
+        x.request_end = end;
+    // A failed exchange is skipped by the driver, which still flushes controls
+    // and pumps siblings. Timer-arm failure may have detached this exchange.
+    Connection* const upstream = x.upstream;
+    if (upstream) grpc_drive_upstream(loop, *upstream);
 }
 
 template <typename Loop>
@@ -1249,6 +1559,11 @@ void grpc_request_trailers(void* ctx, Http2Conn& h, u32 sid, const hpack::Header
                   }) {
         auto* x = grpc_find(h, sid);
         if (!x || !x->upstream) return;
+        if (x->websocket) {
+            x->failure = 13;
+            grpc_detach_upstream_exchange(d->loop, *x->upstream->h2, *x);
+            return;
+        }
         x->request_trailers_len = http2_write_headers(
             x->request_trailers, sizeof(x->request_trailers), x->upstream_stream, hs, n, true);
         if (!x->request_trailers_len) {
@@ -1258,6 +1573,15 @@ void grpc_request_trailers(void* ctx, Http2Conn& h, u32 sid, const hpack::Header
         }
         grpc_request_data(d->loop, *d->conn, *x, nullptr, 0, true);
     }
+}
+
+inline bool grpc_h1_ws_expired(const GrpcProxyState& state, u64 now) {
+    if (!state.websocket_http1_downstream) return false;
+    for (auto* x : state.streams)
+        if (x && x->deadline_us && now >= x->deadline_us &&
+            (x->ws_accepted || x->response_headers_sent))
+            return true;
+    return false;
 }
 
 template <typename Loop>
@@ -1282,6 +1606,10 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
         return;
     } else if (!loop->arm_throttle_timer(conn, delay * 1000)) {
         g.timer_deadline_us = 0;
+        if (g.websocket_http1_downstream && conn.on_send) {
+            loop->close_conn(conn);
+            return;
+        }
         struct UpstreamSnapshot {
             Connection* conn;
             Http2Conn* h2;
@@ -1350,6 +1678,10 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
     conn.yield_armed = false;
     conn.h2->grpc.timer_deadline_us = 0;
     const u64 now = monotonic_us();
+    if (grpc_h1_ws_expired(conn.h2->grpc, now)) {
+        loop->close_conn(conn);
+        return;
+    }
     Http2Conn* downstream_h2 = conn.h2;
     const u32 downstream_handler_gen = conn.handler_gen;
     struct UpstreamSnapshot {
@@ -1398,6 +1730,10 @@ template <typename Loop>
 void grpc_tick(Loop* loop, Connection& conn) {
     auto& h = *conn.h2;
     const u64 now = monotonic_us();
+    if (grpc_h1_ws_expired(h.grpc, now)) {
+        loop->close_conn(conn);
+        return;
+    }
     if (h.grpc.upstream) {
         const bool stale_config =
             h.grpc.active == 0 && loop->config_ptr && *loop->config_ptr != conn.request_config;
@@ -1438,11 +1774,14 @@ bool grpc_start_synth(H2Dispatch<Loop>& d,
     for (u32 i = 0; i < req.header_count; i++)
         if (grpc_header_name(req.headers[i].name, {"host", 4})) host = req.headers[i].value;
     if (!host.len) return false;
-    hs[0] = {{":method", 7}, {"POST", 4}};
+    const auto* stream = d.conn->h2->find_stream(sid);
+    const bool kWebsocket = stream && stream->websocket;
+    hs[0] = {{":method", 7}, kWebsocket ? Str{"CONNECT", 7} : Str{"POST", 4}};
     hs[1] = {{":path", 5}, req.path};
     hs[2] = {{":scheme", 7}, {"http", 4}};
     hs[3] = {{":authority", 10}, host};
-    hs[4] = {{"te", 2}, {"trailers", 8}};
+    hs[4] = kWebsocket ? hpack::Header{{":protocol", 9}, {"websocket", 9}}
+                       : hpack::Header{{"te", 2}, {"trailers", 8}};
     u32 n = 5;
     for (u32 i = 0; i < req.header_count; i++) {
         const auto& header = req.headers[i];
@@ -1463,3 +1802,6 @@ bool grpc_start_synth(H2Dispatch<Loop>& d,
 }
 
 }  // namespace rut
+
+#include "rut/runtime/callbacks_h1_ws_h2.h"
+#include "rut/runtime/callbacks_h2_ws.h"

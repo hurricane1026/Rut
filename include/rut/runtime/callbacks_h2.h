@@ -25,10 +25,17 @@
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/ws_handshake.h"
 
 #include <string.h>  // memmove
 
 namespace rut {
+inline u16 h2_forward_failure_status(Http2Conn& h2, u32 sid) {
+    const auto* stream = h2.find_stream(sid);
+    return stream && stream->websocket_open_error ? stream->websocket_open_error : 503;
+}
+template <typename Loop>
+void h2ws_open_sessions(Loop*, Connection&);
 
 // Implemented in callbacks.cc using the HTTP/1 override helpers. The h2
 // forwarding path temporarily presents its synthesized HTTP/1 request through
@@ -1363,7 +1370,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             h2_emit_status(d, stream_id, 503);
             return;
         }
-        if (cfg->upstreams[kOutcome.upstream_id].http2) {
+        if (cfg->upstreams[kOutcome.upstream_id].http2 ||
+            (d.conn->h2->find_stream(stream_id) && d.conn->h2->find_stream(stream_id)->websocket)) {
             if (!grpc_start_synth(d,
                                   stream_id,
                                   cfg,
@@ -1371,7 +1379,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                                   forward_synth,
                                   forward_len,
                                   !request_body_followed))
-                h2_emit_status(d, stream_id, 503);
+                h2_emit_status(d, stream_id, h2_forward_failure_status(*d.conn->h2, stream_id));
             return;
         }
         const bool parked = open_request != nullptr
@@ -1637,7 +1645,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // never inherit a completed JIT stream's mutations.
     if (d.conn->h2->async_stream == 0) h2_reset_request_mutations(*d.conn);
     ParsedRequest req;
-    if (!h2_headers_to_request(headers, nheaders, &req)) {
+    Str protocol{};
+    if (!h2_headers_to_request(headers, nheaders, &req, &protocol)) {
         if (has_exact_inventory && req.target_has_fragment) {
             d.close_after_process = true;
             d.resp_len = 0;
@@ -1647,19 +1656,39 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 400);
         return;
     }
+    const bool kWebsocket = protocol.len != 0;
+    if (kWebsocket) {
+        auto& h2 = *d.conn->h2;
+        if (!RUT_ENABLE_WEBSOCKET || !h2.our_settings.enable_connect_protocol || end_stream) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        u32 offers = 0;
+        const auto kResult = ws_prepare_h2_handshake(req, nullptr, 0, &offers);
+        if (kResult != WsHandshakeRequestResult::Ready) {
+            if (kResult == WsHandshakeRequestResult::VersionRequired) {
+                const hpack::Header kVersion{{"sec-websocket-version", 21}, {"13", 2}};
+                h2_emit_response(d, stream_id, 426, &kVersion, 1, nullptr, 0);
+            } else {
+                h2_emit_status(d, stream_id, 400);
+            }
+            return;
+        }
+        if (auto* stream = h2.find_stream(stream_id)) stream->websocket = true;
+    }
     const bool kIsHead = req.method == HttpMethod::HEAD;
     const u8 kMethodKey = route_method_key(req.method);
     const u16 pre_route_policy_id = config != nullptr ? config->pre_route_policy_id(kMethodKey) : 0;
-    const bool origin_form_connect =
-        req.method == HttpMethod::CONNECT && req.path.len != 0 && req.path.ptr[0] == '/';
+    const bool kOriginFormConnect = !kWebsocket && req.method == HttpMethod::CONNECT &&
+                                    req.path.len != 0 && req.path.ptr[0] == '/';
     if ((has_exact_inventory || pre_route_policy_id != 0) &&
-        (req.target_has_fragment || origin_form_connect)) {
+        (req.target_has_fragment || kOriginFormConnect)) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
         return;
     }
-    if (req.target_has_fragment || origin_form_connect) {
+    if (req.target_has_fragment || kOriginFormConnect) {
         h2_emit_status(d, stream_id, 400);
         return;
     }
@@ -1798,6 +1827,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         }
     }
 
+    // An Extended CONNECT has no ordinary request body: subsequent DATA belongs
+    // to the tunnel. Reject unsupported inspection/body consumers before any
+    // handler can yield, so a resumed forward cannot bypass the capability gate.
+    if (kWebsocket && route->needs_req_body) {
+        h2_emit_status(d, stream_id, 503);
+        return;
+    }
+
+    if (kWebsocket) d.conn->h2->find_stream(stream_id)->websocket_route = route;
     switch (route->action) {
         case RouteAction::Static:
             if (!end_stream && req.has_content_length) {
@@ -1870,7 +1908,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         default:
             d.conn->forward_load_balance = {};
             if (route->upstream_id < config->upstream_count &&
-                config->upstreams[route->upstream_id].http2) {
+                (config->upstreams[route->upstream_id].http2 || kWebsocket)) {
                 if (!h2_proxy_request_forwardable(headers, nheaders)) {
                     h2_emit_status(d, stream_id, 400);
                     return;
@@ -1884,7 +1922,12 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                                 nheaders,
                                 req,
                                 end_stream))
-                    h2_emit_status(d, stream_id, 503);
+                    h2_emit_status(d, stream_id, h2_forward_failure_status(*d.conn->h2, stream_id));
+                return;
+            }
+            if (kWebsocket) {
+                h2_emit_status(
+                    d, stream_id, 503);  // H2-to-H1 translation is a separate capability.
                 return;
             }
             // Any request body (DATA frames follow) blocks proxying: we'd forward
@@ -2121,6 +2164,7 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
 
     conn.send_progress = 0;
     conn.send_buf.reset();
+    if (conn.h2) h2ws_open_sessions(loop, conn);
     if (conn.h2 && conn.h2->outbound_stream != 0) {
         if (conn.h2->outbound_final_staged) {
             const u32 stream_id = conn.h2->outbound_stream;
@@ -2381,6 +2425,7 @@ void enter_h2(Loop* loop, Connection& conn, IoEvent ev) {
         conn.h2->on_data = nullptr;
         conn.h2->on_reset = nullptr;
         conn.h2->init();
+        conn.h2->our_settings.enable_connect_protocol = RUT_ENABLE_WEBSOCKET ? 1 : 0;
     }
     conn.transition_to_reading_header(&on_h2_data<Loop>);
     on_h2_data<Loop>(static_cast<void*>(loop), conn, ev);
@@ -2551,6 +2596,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
 
         if (failure_status == 0 && h2->async_request_stream_open &&
+            !(h2->find_stream(kStreamId) && h2->find_stream(kStreamId)->websocket) &&
             (h2->async_cfg == nullptr || kOutcome.upstream_id >= h2->async_cfg->upstream_count ||
              !h2->async_cfg->upstreams[kOutcome.upstream_id].http2)) {
             ParsedRequest open_request;
@@ -2586,7 +2632,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 
         if (failure_status == 0) {
             if (h2->async_cfg != nullptr && kOutcome.upstream_id < h2->async_cfg->upstream_count &&
-                h2->async_cfg->upstreams[kOutcome.upstream_id].http2) {
+                (h2->async_cfg->upstreams[kOutcome.upstream_id].http2 ||
+                 (h2->find_stream(kStreamId) && h2->find_stream(kStreamId)->websocket))) {
                 u8 resp[8192];
                 H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
                 if (!grpc_start_synth(d,
@@ -2596,7 +2643,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                       forward_synth,
                                       forward_len,
                                       !h2->async_request_stream_open)) {
-                    failure_status = 503;
+                    failure_status = h2_forward_failure_status(*h2, kStreamId);
                 } else {
                     conn.pending_handler_fn = nullptr;
                     h2_clear_async(*h2);

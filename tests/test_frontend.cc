@@ -45334,7 +45334,17 @@ TEST(frontend, upstream_tls_rejects_incomplete_duplicate_or_unsafe_options) {
     REQUIRE(tokens);
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
-    CHECK(!analyze_file_heap(ast.value()));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK(cfg.upstreams[0].tls.enabled);
+    CHECK(!cfg.upstreams[0].http2);
+    rir.destroy();
 }
 
 TEST(frontend, forward_load_balance_required_and_closed_vocabulary) {

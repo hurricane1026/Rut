@@ -77,6 +77,8 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
 void on_request_complete(Loop* lp, Connection& conn, u16 status, u32 resp_size);
+template <typename Loop>
+bool client_send(Loop*, Connection&, const u8*, u32);
 
 template <typename Loop>
 void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev);

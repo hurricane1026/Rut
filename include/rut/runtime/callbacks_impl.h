@@ -322,7 +322,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     if (config == nullptr || upstream_idx >= config->upstream_count) return false;
     const UpstreamTarget& target = config->upstreams[upstream_idx];
-    if (backend_idx >= target.addr_count) return false;
+    if (backend_idx >= target.addr_count || target.tls.enabled) return false;
 
     // Reserve a margin of Connection slots for real client traffic. Near
     // kMaxConns a due sweep can launch up to kMaxProbesPerSweep (32) probes,
@@ -1551,9 +1551,6 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
 
 template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev);
-
-template <typename Loop>
-bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len);
 
 #if RUT_ENABLE_WEBSOCKET
 template <typename Loop>
@@ -3242,7 +3239,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             return;
         conn.state = ConnState::Proxying;
         auto& target = config->upstreams[route->upstream_id];
-        if (target.http2) {
+        if (target.http2 && h1ws_h2_start(loop, conn, route, route->upstream_id)) return;
+        if (target.http2 || target.tls.enabled) {
             conn.pending_handler_fn = nullptr;
             conn.resp_status = 503;
             format_static_response(conn,
@@ -4449,7 +4447,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 auto& target = config->upstreams[upstream_id];
-                if (target.http2) {
+                if (target.http2 || target.tls.enabled) {
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;
                     format_static_response(conn,
@@ -4976,7 +4974,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 const auto& target = config->upstreams[outcome.upstream_id];
-                if (target.http2) {
+                if (target.http2 || target.tls.enabled) {
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;
                     format_static_response(conn,
@@ -5117,7 +5115,9 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             auto& target = config->upstreams[outcome.upstream_id];
-            if (target.http2) {
+            if (target.http2 && h1ws_h2_start(loop, conn, selected_route, outcome.upstream_id))
+                return;
+            if (target.http2 || target.tls.enabled) {
                 conn.pending_handler_fn = nullptr;
                 conn.resp_status = 503;
                 format_static_response(conn,
@@ -9653,6 +9653,10 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }
+    if (cfg->upstreams[upstream_id].tls.enabled) {
+        h2_proxy_fail(loop, conn, 503);
+        return;
+    }
     http_cache_prepare(conn,
                        cfg,
                        (h2->async_http_cache_route << 16) | upstream_id,
@@ -11160,6 +11164,7 @@ void ws_arm_shutdown_deadline(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 bool ws_handle_timer_tick(Loop* loop, Connection& conn) {
+    if (conn.h2 && conn.h2->grpc.websocket_http1_downstream) return false;
     if (conn.ws_shutdown_deadline_armed) {
         const u32 kRemaining = ws_shutdown_deadline_remaining(conn, loop->timer.cursor);
         if (kRemaining == 0) {
@@ -11231,6 +11236,14 @@ bool ws_receive_closing(Loop* loop, Connection& conn) {
 // application plaintext; keep it separate from ordinary TLS logical sends.
 template <typename Loop>
 bool ws_finish_tls_shutdown(Loop* loop, Connection& conn) {
+    if constexpr (requires {
+                      loop->grpc_upstreams;
+                      loop->pool.alloc_bulk();
+                      loop->upstream_release(u16{});
+                  }) {
+        if (conn.h2 && (conn.h2->grpc.websocket_http1 || conn.h2->grpc.websocket_http1_downstream))
+            return h2ws_h1_tls_finished(loop, conn);
+    }
     conn.ws_tls_shutdown_pending = false;
     conn.ws_tls_shutdown_need_read = false;
     conn.ws_upstream_send_pending = false;
@@ -11254,6 +11267,20 @@ void on_ws_tls_shutdown_sent(void* lp, Connection& conn, IoEvent ev) {
 // arrive before the ordinary shared retirement path releases either fd/slot.
 template <typename Loop>
 bool ws_drive_close(Loop* loop, Connection& conn) {
+    if constexpr (requires {
+                      loop->grpc_upstreams;
+                      loop->pool.alloc_bulk();
+                      loop->upstream_release(u16{});
+                  }) {
+        if (conn.h2 && conn.h2->grpc.websocket_http1_downstream) {
+            h1ws_h2_received<Loop>(loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0});
+            return true;
+        }
+        if (conn.h2 && conn.h2->grpc.websocket_http1) {
+            h2ws_h1_drive(loop, conn);
+            return true;
+        }
+    }
     if (conn.ws_close_client_need && !conn.ws_upstream_send_pending) {
         const u32 kFrameSize = ws_emit_close_payload(conn.ws_close_frame_client,
                                                      sizeof(conn.ws_close_frame_client),

@@ -8,6 +8,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1887,7 +1888,9 @@ def launch(server, source, backend, extra_args=()):
             if not part:
                 break
             log.extend(part)
-            for line in log.splitlines():
+            for line in log.splitlines(keepends=True):
+                if not line.endswith(b"\n"):
+                    continue
                 if line.startswith(b"Listening on port "):
                     try:
                         return process, int(line.split()[3]), bytes(log)
@@ -1902,6 +1905,33 @@ def launch(server, source, backend, extra_args=()):
         process.kill()
         process.wait()
     return None, None, bytes(log)
+
+
+def test_launch_waits_for_complete_readiness_line():
+    with tempfile.TemporaryDirectory(prefix="rut-ws-launch-") as temp:
+        server = os.path.join(temp, "staged-server")
+        with open(server, "w", encoding="utf-8") as script:
+            script.write(
+                f"#!{sys.executable}\n"
+                "import os, time\n"
+                "os.write(2, b'Listening on port 4')\n"
+                "time.sleep(0.3)\n"
+                "os.write(2, b'123\\n')\n"
+                "time.sleep(5)\n")
+        os.chmod(server, 0o700)
+        process, port, diagnostic = launch(server, "unused.rut", "epoll")
+        if process is None:
+            raise AssertionError(f"staged readiness server failed: {diagnostic!r}")
+        try:
+            if port != 4123 or b"Listening on port 4123\n" not in diagnostic:
+                raise AssertionError(f"launch accepted incomplete readiness: {port=}, {diagnostic=!r}")
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 def scenario(server, backend_kind, terminate, response, expected):
@@ -3197,6 +3227,8 @@ def main():
     parser.add_argument("--server", required=True)
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
+    test_launch_waits_for_complete_readiness_line()
+    print("PASS launch waits for complete readiness line")
     for backend in ("epoll", "io_uring"):
         for native in (False, True):
             for tls in (False, True):

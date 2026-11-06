@@ -1,8 +1,8 @@
 # HTTP/1.1 WebSocket completion criteria
 
 This is the implementation checklist for completing WebSocket as a peer of the
-existing Rut concepts. HTTP/2 Extended CONNECT is outside this iteration, as
-confirmed by the user. Checked entries require executable evidence; this list
+existing Rut concepts. HTTP/2 Extended CONNECT was outside that iteration; the
+subsequent HTTP/2 increment is tracked below. Checked entries require executable evidence; this list
 does not turn target syntax into supported syntax. The language card and
 [terminate guide](websocket-terminate.md) describe the current surface.
 
@@ -52,10 +52,49 @@ views, yield into HTTP I/O or retain borrowed concepts outside their synchronous
 invocation. These are phase/lifetime rules. Source interpolation and
 non-response statement effects in helpers currently fail in both ordinary HTTP
 and WebSocket; they remain shared language limitations. No WebSocket-only
-workaround or alternate syntax is advertised. HTTP/2 Extended CONNECT remains
-outside the user-confirmed scope.
+workaround or alternate syntax is advertised.
+
+## HTTP/2 follow-up
+
+- [x] RFC 8441 settings, pseudo-headers, version and subprotocol validation.
+- [x] Opaque H2-to-H2 duplex forwarding, pooled upstreams and ordinary admission.
+- [x] Independent flow control, cancellation and half-close on multiplexed streams.
+- [x] H2-to-H1 WebSocket handshake and transport translation, including verified TLS.
+- [x] Per-stream message/connection/close callbacks, owned outputs and compression.
+- [x] H1 GET Upgrade to H2 upstream translation, opaque/inspected and plaintext/TLS.
+
+Ordinary request-body consumers remain outside CONNECT tunnel semantics and get
+503. H1-downstream to H2-upstream bridging uses the same callbacks and pooled
+stream transport, including TLS, handshake validation and independent cancellation.
+See the [HTTP/2 transport guide](websocket-terminate.md#http2-transport).
 
 ## Evidence and remaining delivery checks
+
+The HTTP/2 follow-up adds real-socket H2-to-H1/H2 sessions on epoll and io_uring,
+with plaintext and verified TLS upstreams. Tests exercise source/JIT message
+payload output and connection/onOpen helpers, required subprotocols, rejection
+body framing, sibling-stream admission and cancellation. Stream-engine tests
+cover messages larger than a flow-control window, input-credit return,
+independent compression legs, owned dynamic output, acceptance/send completion,
+Close metadata, truncated-frame EOF and allocation rollback. A dedicated native
+wire harness links the production native loader without LLVM. It compiles through
+rut-compile, removes the source before opening sockets, and runs the same 27 H2
+WebSocket checks, including both backends, plaintext/TLS and both bridge directions.
+The serving process checks that no LLVM image is loaded. Follow-up HTTP requests
+observe Cache writes from onClose, verifying exactly-once execution and the close
+code/wasClean facts after stream cancellation and clean Close handshakes.
+Reverse-bridge real-socket tests cover coalesced pre-101 messages, actual FIN/TLS
+close_notify after Close, two H1 clients sharing one H2 session, and malformed
+Key/version, local admission denial, upstream subprotocol failure, absent settings
+and opening deadlines. Capacity rejection checks that no CONNECT reaches the
+upstream, existing tunnels continue, and shutdown releases concurrency slots and
+configuration epochs. The full network test target also compiles the reduced
+Loop fixtures, guarding against accidental bridge-template instantiation.
+
+The latest HTTP/2 frame, connection and gRPC/WebSocket transport run passed
+19 + 111 + 102 cases, plus the 27 native harness checks. The original three
+runtime suites passed under ASan/UBSan with leak detection, and with JIT/WebSocket
+disabled (feature cases skipped).
 
 After synchronization with current main, the wire suite passed 462 cases with
 no skips. Full frontend (1259 tests), JIT (603), native artifact (81), loader

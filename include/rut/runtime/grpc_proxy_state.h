@@ -7,6 +7,7 @@
 
 namespace rut {
 struct ConnectionBase;
+struct WsH2Session;
 
 // One RPC, allocated from the shard's existing bulk SlicePool. Payloads stay
 // opaque (including compressed protobuf messages and binary metadata). Queue
@@ -31,6 +32,10 @@ struct GrpcExchange {
     AccessLogEntry log_entry;  // owned path/upstream; never borrow decoded HPACK storage
     u8 response_status;
     bool observed;
+    bool websocket;  // opaque Extended CONNECT exchange, with HTTP (not gRPC) errors
+    bool ws_accepted;
+    WsH2Session* ws;
+    u32 ws_offers_len;
     u64 deadline_us;
     u64 request_bytes;
     u32 expected_request_bytes;
@@ -65,6 +70,7 @@ struct GrpcExchange {
     u8 response_headers[kHeaders];
     u8 response_trailers[kHeaders];
     u8 response_mutation_storage[kHeaders];
+    u8 ws_offers[kHeaders];
 
     void init() {
         downstream = upstream = nullptr;
@@ -73,6 +79,10 @@ struct GrpcExchange {
         log_entry = {};
         response_status = 2;
         observed = false;
+        websocket = false;
+        ws_accepted = false;
+        ws = nullptr;
+        ws_offers_len = 0;
         deadline_us = request_bytes = 0;
         expected_request_bytes = 0;
         has_request_length = request_end = request_headers_sent = request_end_sent = false;
@@ -109,6 +119,10 @@ struct GrpcProxyState {
     u64 idle_since_us;
     u64 timer_deadline_us;
     bool upstream;
+    bool websocket_http1;  // one dedicated TCP/TLS upstream, using the same bounded mapping
+    bool websocket_http1_downstream;  // one H1 upgraded client mapped to an H2 stream
+    bool websocket_http1_eof;
+    bool websocket_http1_headers;
     bool connecting;
     bool busy;
     bool preface_sent;
@@ -123,6 +137,8 @@ struct GrpcProxyState {
         active = cursor = control_len = pending_cancel_count = 0;
         connected_at_us = idle_since_us = timer_deadline_us = 0;
         upstream = connecting = busy = preface_sent = session_failure_recorded = false;
+        websocket_http1 = websocket_http1_downstream = false;
+        websocket_http1_eof = websocket_http1_headers = false;
     }
 };
 }  // namespace rut

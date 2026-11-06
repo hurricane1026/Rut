@@ -1,4 +1,5 @@
 #include "posix.h"
+#include "rut/common/types.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
@@ -10,17 +11,27 @@
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
-#if RUT_GRPC_JIT
+#if RUT_GRPC_NATIVE
+#include "rut/native_program.h"
+
+#include <link.h>
+#elif RUT_GRPC_JIT
 #include "rut/serve_loader.h"
 #endif
 #include <atomic>
 #include <cstdlib>
 #include <memory>
 
+#include <errno.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 using namespace rut;
 
@@ -31,6 +42,69 @@ bool grpc_temp_template(char* path, size_t capacity, const char* name) {
     const int length = snprintf(path, capacity, "%s/%s", directory, name);
     return length >= 0 && static_cast<size_t>(length) < capacity;
 }
+
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+struct WebSocketWireProgram {
+#if RUT_GRPC_NATIVE
+    using Program = NativeProgram;
+    static constexpr bool kNative = true;
+#else
+    using Program = LoadedProgram;
+    static constexpr bool kNative = false;
+#endif
+    std::unique_ptr<Program> program = std::make_unique<Program>();
+    ~WebSocketWireProgram() { program->destroy(); }
+    bool load(const char* source, u32 length) {
+        char path[256];
+        if (!grpc_temp_template(path, sizeof(path), "rut-websocket-wire-XXXXXX")) return false;
+        const int kFile = mkstemp(path);
+        if (kFile < 0) return false;
+        u32 written = 0;
+        while (written < length) {
+            const ssize_t kAmount = write(kFile, source + written, length - written);
+            if (kAmount < 0 && errno == EINTR) continue;
+            if (kAmount <= 0) break;
+            written += static_cast<u32>(kAmount);
+        }
+        close(kFile);
+#if RUT_GRPC_NATIVE
+        char error[512]{};
+        const bool kLoaded =
+            written == length && load_native_program(path, *program, error, sizeof(error));
+        if (!kLoaded) fprintf(stderr, "Native WebSocket config failed: %s\n", error);
+#else
+        LoadError error{};
+        const bool kLoaded = written == length && load_rut_program(path, *program, error);
+        if (!kLoaded)
+            fprintf(stderr,
+                    "WebSocket config failed: stage=%u detail=%s\n",
+                    static_cast<u32>(error.stage),
+                    error.detail_buf);
+#endif
+        // load_native_program reaps the compiler before returning. Every socket
+        // and callback below must work using the artifact after source removal.
+        const bool kRemoved = unlink(path) == 0 && access(path, F_OK) < 0 && errno == ENOENT;
+        if (!kLoaded || !kRemoved) return false;
+#if RUT_GRPC_NATIVE
+        bool llvm_loaded = false;
+        dl_iterate_phdr(
+            [](dl_phdr_info* image, size_t, void* raw) {
+                if (strstr(image->dlpi_name, "libLLVM")) *static_cast<bool*>(raw) = true;
+                return 0;
+            },
+            &llvm_loaded);
+        if (llvm_loaded || !program->library || program->artifact_fd < 0) {
+            fprintf(stderr, "Native wire harness must own an artifact without loading LLVM\n");
+            return false;
+        }
+        activate_native_program(*program);
+#else
+        activate_rut_program(*program);
+#endif
+        return true;
+    }
+};
+#endif
 
 template <typename Call>
 inline bool grpc_test_ssl_call(SSL* ssl,
@@ -157,12 +231,26 @@ bool flush_session(nghttp2_session* session, int fd, SSL* ssl = nullptr) {
     return n >= 0;
 }
 struct EchoServer {
+    bool websocket = false;
+    bool http1 = false;
+    bool connect_protocol = true;
+    struct H1Peer {
+        EchoServer* server = nullptr;
+        int fd = -1;
+        pthread_t thread{};
+        bool started = false;
+    } h1_peers[64];
+    u32 h1_count = 0;
     struct Stream {
         int id;
         u32 len;
         bool end;
         bool trailer;
         bool discard;
+        bool websocket;
+        bool wire_message;
+        bool reset_on_data;
+        bool websocket_controls;
         u8 data[65535];
     } streams[64]{};
     int listen_fd = -1;
@@ -173,6 +261,7 @@ struct EchoServer {
     std::atomic<u32> resets{0};
     std::atomic<u32> accepts{0};
     std::atomic<u32> reply_mode{0};
+    std::atomic<u32> bad_websocket_headers{0};
     std::atomic<u32> request_trailers{0};
     bool started = false;
     TlsServerContext* tls_context = nullptr;
@@ -183,6 +272,138 @@ struct EchoServer {
     std::atomic<bool> pause_handshake{false};
     std::atomic<bool> handshake_waiting{false};
     int handshake_gate[2] = {-1, -1};
+    static void* run_http1(void* raw) {
+        auto& peer = *static_cast<H1Peer*>(raw);
+        auto* server = peer.server;
+        SSL* ssl = nullptr;
+        if (server->tls_context) {
+            auto created = create_tls_server_ssl(server->tls_context, peer.fd);
+            if (created) ssl = created.value();
+            if (!ssl || SSL_accept(ssl) != 1) {
+                if (ssl) SSL_free(ssl);
+                close(peer.fd);
+                return nullptr;
+            }
+        }
+        auto send_bytes = [&](const u8* p, u32 n) {
+            while (n) {
+                const int sent = ssl ? SSL_write(ssl, p, n) : send(peer.fd, p, n, MSG_NOSIGNAL);
+                if (sent <= 0) return false;
+                p += sent;
+                n -= sent;
+            }
+            return true;
+        };
+        u8 bytes[16384];
+        u32 used = 0;
+        HttpParser parser{};
+        ParsedRequest request{};
+        bool ready = false;
+        bool reset_peer = false;
+        while (!server->stop.load() && used < sizeof(bytes)) {
+            const int n = ssl ? SSL_read(ssl, bytes + used, sizeof(bytes) - used)
+                              : recv(peer.fd, bytes + used, sizeof(bytes) - used, 0);
+            if (n <= 0) break;
+            used += n;
+            if (parser.parse(bytes, used, &request) == ParseStatus::Complete) {
+                ready = true;
+                break;
+            }
+        }
+        u8 accept[16384];
+        u32 offers = 0;
+        if (ready &&
+            ws_prepare_handshake(bytes, parser.header_end, accept, sizeof(accept), &offers) ==
+                WsHandshakeRequestResult::Ready) {
+            server->requests++;
+            const u32 mode = server->reply_mode.exchange(0);
+            char response[512];
+            const int size =
+                mode == 12 ? snprintf(response,
+                                      sizeof(response),
+                                      "HTTP/1.1 101 Switching Protocols\r\nConnection: "
+                                      "Upgrade\r\nUpgrade: websocket\r\n"
+                                      "Sec-WebSocket-Accept: %.*s\r\n\r\n",
+                                      28,
+                                      reinterpret_cast<char*>(accept))
+                : mode >= 9
+                    ? snprintf(
+                          response,
+                          sizeof(response),
+                          mode == 10
+                              ? "HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n"
+                                "%c%c%c\r\n0\r\nx-finished: yes\r\n\r\n"
+                          : mode == 11
+                              ? "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n%c%c%c"
+                              : "HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n\r\n%c%c%c",
+                          0,
+                          17,
+                          34)
+                : mode == 3 ? snprintf(response,
+                                       sizeof(response),
+                                       "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: "
+                                       "close\r\n\r\n")
+                            : snprintf(response,
+                                       sizeof(response),
+                                       "HTTP/1.1 101 Switching Protocols\r\nConnection: "
+                                       "Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: "
+                                       "%.*s\r\nSec-WebSocket-Protocol: %s\r\n\r\n",
+                                       28,
+                                       reinterpret_cast<char*>(accept),
+                                       mode == 1 ? "unoffered" : "chat");
+            bool okay = mode != 6;
+            if (mode == 7) {
+                static constexpr char hints[] = "HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n";
+                okay = send_bytes(reinterpret_cast<const u8*>(hints), sizeof(hints) - 1);
+            }
+            if (okay) okay = send_bytes(reinterpret_cast<const u8*>(response), size);
+            if (mode == 4) {
+                if (ssl) SSL_shutdown(ssl);
+                shutdown(peer.fd, SHUT_WR);
+            }
+            u32 held = used - parser.header_end;
+            memmove(bytes, bytes + parser.header_end, held);
+            while (!server->stop.load() && mode != 3 && mode < 9) {
+                if (!held) {
+                    pollfd poller{peer.fd, POLLIN, 0};
+                    if ((!ssl || !SSL_pending(ssl)) && poll(&poller, 1, 20) <= 0) continue;
+                    const int n = ssl ? SSL_read(ssl, bytes, sizeof(bytes))
+                                      : recv(peer.fd, bytes, sizeof(bytes), 0);
+                    if (n <= 0) break;
+                    held = n;
+                }
+                if (mode == 6 || mode == 4) {
+                    held = 0;
+                    continue;
+                }
+                if (mode == 8) {
+                    reset_peer = true;
+                    linger reset{1, 0};
+                    setsockopt(peer.fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+                    break;
+                }
+                if (mode == 5) {
+                    static constexpr u8 wire[] = {0x82, 5, 'h', 'e', 'l', 'l', 'o'};
+                    if (held < 11) {
+                        const int n = ssl ? SSL_read(ssl, bytes + held, sizeof(bytes) - held)
+                                          : recv(peer.fd, bytes + held, sizeof(bytes) - held, 0);
+                        if (n <= 0) break;
+                        held += n;
+                        continue;
+                    }
+                    if (!send_bytes(wire, sizeof(wire))) break;
+                } else if (!send_bytes(bytes, held))
+                    break;
+                held = 0;
+            }
+        }
+        if (ssl) {
+            if (!reset_peer) SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
+        close(peer.fd);
+        return nullptr;
+    }
     Stream* get(int id) {
         for (auto& s : streams)
             if (s.id == id) return &s;
@@ -201,6 +422,46 @@ struct EchoServer {
                              nghttp2_data_source* source,
                              void*) {
         auto* s = static_cast<Stream*>(source->ptr);
+        if (s->websocket_controls && s->len && (s->data[0] & 15u) == 8u) {
+            WsFrameHeader header{};
+            const auto parsed = ws_parse_header(s->data, s->len, true, &header);
+            if (parsed == ParseStatus::Incomplete ||
+                (parsed == ParseStatus::Complete &&
+                 s->len < header.header_len + header.payload_len))
+                return NGHTTP2_ERR_DEFERRED;
+            if (parsed != ParseStatus::Complete || header.opcode != WsOpcode::Close || len < 127)
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            const u32 amount = header.header_len + static_cast<u32>(header.payload_len);
+            const u32 out_header =
+                ws_write_header(buf, WsOpcode::Close, true, false, nullptr, header.payload_len);
+            memcpy(buf + out_header, s->data + header.header_len, header.payload_len);
+            ws_unmask(buf + out_header, header.payload_len, header.mask_key);
+            s->len = 0;
+            s->end = true;
+            if (nghttp2_session_consume(session, id, amount) != 0)
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            *flags |= NGHTTP2_DATA_FLAG_EOF;
+            return out_header + static_cast<ssize_t>(header.payload_len);
+        }
+        if (s->wire_message) {
+            static constexpr u8 request[] = {0x82, 0x85, 1, 2, 3, 4, 0x69, 0x67, 0x6f, 0x68, 0x6e};
+            static constexpr u8 response[] = {0x82, 5, 'h', 'e', 'l', 'l', 'o'};
+            if (s->len < sizeof(request)) return NGHTTP2_ERR_DEFERRED;
+            WsFrameHeader frame{};
+            if (ws_parse_header(s->data, s->len, true, &frame) != ParseStatus::Complete ||
+                frame.opcode != WsOpcode::Binary || frame.payload_len != 5 ||
+                s->len != frame.header_len + 5 || len < sizeof(response))
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            ws_unmask(s->data + frame.header_len, 5, frame.mask_key);
+            if (memcmp(s->data + frame.header_len, "hello", 5) != 0)
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            memcpy(buf, response, sizeof(response));
+            s->len = 0;
+            s->wire_message = false;
+            if (nghttp2_session_consume(session, id, sizeof(request)) != 0)
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            return sizeof(response);
+        }
         const u32 n = s->len < len ? s->len : static_cast<u32>(len);
         if (!n && !s->end) return NGHTTP2_ERR_DEFERRED;
         memcpy(buf, s->data, n);
@@ -209,6 +470,10 @@ struct EchoServer {
         // Release upload credit only after response flow control lets us echo.
         if (n && nghttp2_session_consume(session, id, n) != 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
         if (!s->len && s->end) {
+            if (s->websocket) {
+                *flags |= NGHTTP2_DATA_FLAG_EOF;
+                return n;
+            }
             *flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
             nghttp2_nv trailers[] = {nv("grpc-status", "0"), nv("x-trailer", "present")};
             if (nghttp2_submit_trailer(session, id, trailers, 2) != 0)
@@ -225,6 +490,30 @@ struct EchoServer {
         if (f->hd.type == NGHTTP2_HEADERS && f->headers.cat == NGHTTP2_HCAT_REQUEST) {
             self->requests++;
             const u32 mode = self->reply_mode.exchange(0);
+            if (self->websocket) {
+                s->websocket = true;
+                s->wire_message = mode == 5 || mode == 13;
+                s->websocket_controls = mode == 13;
+                s->reset_on_data = mode == 8;
+                if (mode == 6) return 0;  // opening response never arrives
+                if (mode == 7) {
+                    const nghttp2_nv hints[] = {nv(":status", "103"), nv("x-hint", "present")};
+                    if (nghttp2_submit_headers(session, 0, s->id, nullptr, hints, 2, nullptr) != 0)
+                        return NGHTTP2_ERR_CALLBACK_FAILURE;
+                }
+                if (mode == 4) {
+                    s->end = true;
+                    s->discard = true;  // peer keeps sending after our END_STREAM
+                }
+                nghttp2_nv headers[] = {
+                    nv(":status", mode == 3 ? "403" : "200"),
+                    nv("sec-websocket-protocol", mode == 1 ? "unoffered" : "chat")};
+                nghttp2_data_provider provider{};
+                provider.source.ptr = s;
+                provider.read_callback = &read_data;
+                return nghttp2_submit_response(
+                    session, s->id, headers, 2, mode == 3 ? nullptr : &provider);
+            }
             if (mode == 2) return NGHTTP2_ERR_CALLBACK_FAILURE;
             if (mode == 1) {
                 s->discard = true;
@@ -281,8 +570,15 @@ struct EchoServer {
                       size_t value_len,
                       uint8_t,
                       void* user) {
-        if (name_len != 7 || memcmp(name, ":scheme", 7) != 0) return 0;
         auto* server = static_cast<EchoServer*>(user);
+        if (server->websocket) {
+            const Str field{reinterpret_cast<const char*>(name), static_cast<u32>(name_len)};
+            if (field.eq(lit_str("connection")) || field.eq(lit_str("upgrade")) ||
+                field.eq(lit_str("host")) || field.eq(lit_str("sec-websocket-key")) ||
+                field.eq(lit_str("sec-websocket-accept")) || field.eq(lit_str("x-hop")))
+                server->bad_websocket_headers++;
+        }
+        if (name_len != 7 || memcmp(name, ":scheme", 7) != 0) return 0;
         const char* expected = server->tls_context ? "https" : "http";
         if (value_len != strlen(expected) || memcmp(value, expected, value_len) != 0)
             server->bad_schemes++;
@@ -295,6 +591,11 @@ struct EchoServer {
                     size_t len,
                     void* user) {
         auto* s = static_cast<EchoServer*>(user)->get(id);
+        if (s && s->reset_on_data) {
+            s->reset_on_data = false;
+            if (nghttp2_session_consume(session, id, len) != 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
+            return nghttp2_submit_rst_stream(session, 0, id, NGHTTP2_CANCEL);
+        }
         if (s && s->discard)
             return nghttp2_session_consume(session, id, len) == 0 ? 0
                                                                   : NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -344,7 +645,11 @@ struct EchoServer {
         nghttp2_option_del(option);
         nghttp2_session_callbacks_del(cb);
         if (rc != 0) return nullptr;
-        if (nghttp2_submit_settings(session, 0, nullptr, 0) != 0) {
+        const nghttp2_settings_entry connect{NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1};
+        if (nghttp2_submit_settings(session,
+                                    0,
+                                    websocket && connect_protocol ? &connect : nullptr,
+                                    websocket && connect_protocol ? 1 : 0) != 0) {
             nghttp2_session_del(session);
             return nullptr;
         }
@@ -358,6 +663,20 @@ struct EchoServer {
             self->fd = accept(self->listen_fd, nullptr, nullptr);
             if (self->fd < 0) continue;
             self->accepts++;
+            if (self->http1) {
+                if (self->h1_count == 64) {
+                    close(self->fd);
+                    continue;
+                }
+                auto& peer = self->h1_peers[self->h1_count++];
+                peer.server = self;
+                peer.fd = self->fd;
+                set_socket_timeouts(peer.fd, 3);
+                peer.started = pthread_create(&peer.thread, nullptr, &run_http1, &peer) == 0;
+                if (!peer.started) close(peer.fd);
+                self->fd = -1;
+                continue;
+            }
             for (auto& stream : self->streams) stream = {};
             set_socket_timeouts(self->fd, 2);
             SSL* ssl = nullptr;
@@ -440,6 +759,8 @@ struct EchoServer {
             (void)write(handshake_gate[1], &release, 1);
         }
         if (started) pthread_join(thread, nullptr);
+        for (auto& peer : h1_peers)
+            if (peer.started) pthread_join(peer.thread, nullptr);
         if (handshake_gate[0] >= 0) close(handshake_gate[0]);
         if (handshake_gate[1] >= 0) close(handshake_gate[1]);
         if (listen_fd >= 0) close(listen_fd);
@@ -454,9 +775,12 @@ struct Client {
     struct Rpc {
         u32 sent = 0, received = 0, size = 0;
         u32 status = 99;
+        u32 http_status = 0;
+        u32 reset_error = 0;
+        bool wire_message = false;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
              meta = false, trailer = false;
-    } rpcs[17];
+    } rpcs[18];
     nghttp2_session* session = nullptr;
     bool goaway = false;
     int fd = -1;
@@ -472,7 +796,9 @@ struct Client {
         u32 n = rpc->size - rpc->sent;
         if (n > cap) n = static_cast<u32>(cap);
         if (!n && !rpc->end) return NGHTTP2_ERR_DEFERRED;
-        for (u32 i = 0; i < n; i++) out[i] = byte_at(rpc->sent + i);
+        static constexpr u8 wire[] = {0x82, 0x85, 1, 2, 3, 4, 0x69, 0x67, 0x6f, 0x68, 0x6e};
+        for (u32 i = 0; i < n; i++)
+            out[i] = rpc->wire_message ? wire[rpc->sent + i] : byte_at(rpc->sent + i);
         rpc->sent += n;
         if (rpc->sent == rpc->size && rpc->end) {
             *flags |= NGHTTP2_DATA_FLAG_EOF;
@@ -488,8 +814,13 @@ struct Client {
     static int receive(
         nghttp2_session*, uint8_t, int32_t sid, const uint8_t* data, size_t len, void* ctx) {
         auto& rpc = static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2];
-        for (u32 i = 0; i < len; i++)
-            if (data[i] != byte_at(rpc.received + i)) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        static constexpr u8 wire[] = {0x82, 5, 'h', 'e', 'l', 'l', 'o'};
+        for (u32 i = 0; i < len; i++) {
+            const u32 at = rpc.received + i;
+            if (rpc.wire_message && at >= sizeof(wire)) return NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (data[i] != (rpc.wire_message ? wire[at] : byte_at(at)))
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
         rpc.received += static_cast<u32>(len);
         return 0;
     }
@@ -502,6 +833,10 @@ struct Client {
                       uint8_t,
                       void* ctx) {
         auto& rpc = static_cast<Client*>(ctx)->rpcs[(f->hd.stream_id - 1) / 2];
+        if (n == 7 && memcmp(name, ":status", n) == 0) {
+            rpc.http_status = 0;
+            for (size_t i = 0; i < v; ++i) rpc.http_status = rpc.http_status * 10 + value[i] - '0';
+        }
         if (n == 11 && memcmp(name, "grpc-status", n) == 0) {
             rpc.ok = v == 1 && *value == '0';
             rpc.status = 0;
@@ -520,8 +855,9 @@ struct Client {
             static_cast<Client*>(ctx)->rpcs[(f->hd.stream_id - 1) / 2].response_end = true;
         return 0;
     }
-    static int closed(nghttp2_session*, int32_t sid, uint32_t, void* ctx) {
+    static int closed(nghttp2_session*, int32_t sid, uint32_t error, void* ctx) {
         static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].closed = true;
+        static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].reset_error = error;
         return 0;
     }
     bool init(u16 port, bool tls = false, const char* client_name = "client") {
@@ -620,6 +956,34 @@ struct Client {
         provider.read_callback = &data;
         return nghttp2_submit_request(session, nullptr, headers, 7, &provider, nullptr);
     }
+    int websocket_request(u32 index,
+                          u32 bytes,
+                          const char* path = "/ws",
+                          const char* protocol = "chat") {
+        rpcs[index].size = bytes;
+        rpcs[index].end = false;
+        const nghttp2_nv headers[] = {nv(":method", "CONNECT"),
+                                      nv(":protocol", "websocket"),
+                                      nv(":scheme", ssl ? "https" : "http"),
+                                      nv(":authority", "ws.test"),
+                                      nv(":path", path),
+                                      nv("sec-websocket-version", "13"),
+                                      nv("sec-websocket-protocol", protocol)};
+        nghttp2_data_provider provider{};
+        provider.source.ptr = &rpcs[index];
+        provider.read_callback = &data;
+        return nghttp2_submit_request(session, nullptr, headers, 7, &provider, nullptr);
+    }
+    bool connect_settings() {
+        const u64 deadline = monotonic_us() + 2000000;
+        while (monotonic_us() < deadline) {
+            if (nghttp2_session_get_remote_settings(session,
+                                                    NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL))
+                return true;
+            if (!step()) return false;
+        }
+        return false;
+    }
     bool step() {
         if (!flush_session(session, fd, ssl)) return false;
         pollfd p{fd, POLLIN, 0};
@@ -643,7 +1007,8 @@ struct Client {
         const u64 deadline = monotonic_us() + 5000000;
         while (monotonic_us() < deadline) {
             const auto& rpc = rpcs[index];
-            if (complete ? rpc.response_end : rpc.received == rpc.size) return true;
+            if (complete ? rpc.response_end : rpc.received == (rpc.wire_message ? 7 : rpc.size))
+                return true;
             if (!step()) {
                 fprintf(stderr,
                         "rpc %u failed: received=%u status=%u end=%d goaway=%d\n",
@@ -665,6 +1030,680 @@ struct Client {
         if (fd >= 0) close(fd);
     }
 };
+
+[[maybe_unused]] u64 websocket_denied(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_status(403).pack();
+}
+[[maybe_unused]] WsFrameAction websocket_forward_message(void*, WsOpcode, const u8*, u64, bool) {
+    return WsFrameAction::Forward;
+}
+
+// Test the opaque transport with byte-exact DATA spanning several flow-control
+// windows. Codec/inspection tests separately validate the WebSocket frames.
+template <typename Loop>
+void websocket_h2_case(rut::test::TestCase* _tc,
+                       bool tls,
+                       bool upstream_support = true,
+                       bool opening_timeout = false,
+                       bool http1 = false) {
+#if RUT_ENABLE_WEBSOCKET
+    auto server = std::make_unique<EchoServer>();
+    server->websocket = true;
+    server->http1 = http1;
+    server->connect_protocol = upstream_support;
+    if (opening_timeout) server->reply_mode = 6;
+    REQUIRE(server->start(tls, false, !http1));
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    auto cfg = std::make_unique<RouteConfig>();
+    REQUIRE(cfg->add_upstream("chat", 0x7f000001, get_port(server->listen_fd)).has_value());
+    cfg->upstreams[0].http2 = !http1;
+    if (tls) {
+        cfg->upstreams[0].tls.enabled = true;
+        strcpy(cfg->upstreams[0].tls.ca, RUT_GRPC_FIXTURES "/localhost_cert.pem");
+        strcpy(cfg->upstreams[0].tls.server_name, "localhost");
+    }
+    REQUIRE(cfg->add_proxy("/ws", 'C', 0));
+    REQUIRE(cfg->add_proxy("/ordinary", 'G', 0));
+    REQUIRE(cfg->add_jit_handler("/jit", 'C', &grpc_jit_forward, false));
+    REQUIRE(cfg->add_jit_handler("/deny", 'C', &websocket_denied, false));
+    REQUIRE(cfg->add_ws_terminate("/inspect", 'C', 0, &websocket_forward_message, 1024));
+    REQUIRE(cfg->add_ws_terminate("/required", 'C', 0, &websocket_forward_message, 1024));
+    cfg->routes[cfg->route_count - 1].ws_subprotocol = lit_str("chat");
+    REQUIRE(cfg->add_static("/health", 'G', 204));
+    shard->route_config = cfg.get();
+    if (opening_timeout) shard->loop->upstream_timeout = 1;
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+    WebSocketWireProgram compiled;
+    if (!tls || WebSocketWireProgram::kNative) {
+        char source[4096];
+        const int len = snprintf(
+            source,
+            sizeof(source),
+            "let closedCounts = Cache<IP, i64>(capacity: 64)\n"
+            "upstream chat { host: \"127.0.0.1\", port: %u%s%s }\n"
+            "route \"/ws\" { return websocket(chat) }\n"
+            "route \"/jit\" { guard req.header(\"x-deny\").or(\"no\") == \"no\" "
+            "else { return 403 } return websocket(chat) }\n"
+            "route \"/deny\" { return 403 }\n"
+            "route \"/inspect\" { return websocket(chat) { message in "
+            "guard message.connection.subprotocol == \"chat\" else { message.close(1008) } "
+            "message.forward(message.payload) } onOpen: { connection in "
+            "guard connection.remotePort > 0 else { connection.close(1008) } } "
+            "onClose: { closed in "
+            "guard closed.code == 1006 && !closed.wasClean else { return } "
+            "let key = closed.connection.remoteAddr "
+            "closedCounts.set(key, closedCounts.get(key).or(0) + 1) } }\n"
+            "route \"/required\" { return websocket(chat, subprotocol: \"chat\") "
+            "{ message in message.forward() } }\n"
+            "route GET \"/health\" { return 204 }\n"
+            "route GET \"/ordinary\" { return forward(chat, load_balance: .roundRobin) }\n"
+            "route GET \"/closed\" { if closedCounts.get(req.remoteAddr).or(0) == 1 "
+            "{ return 204 } else { return 500 } }\n",
+            get_port(server->listen_fd),
+            http1 ? "" : ", protocol: .http2",
+            tls ? ", tls: { ca: \"" RUT_GRPC_FIXTURES
+                  "/localhost_cert.pem\", "
+                  "server_name: \"localhost\" }"
+                : "");
+        REQUIRE(len > 0 && static_cast<u32>(len) < sizeof(source));
+        REQUIRE(compiled.load(source, static_cast<u32>(len)));
+        shard->route_config = &compiled.program->config;
+    }
+#endif
+    TlsServerContext* tls_server = nullptr;
+    if (tls) {
+        auto context = create_tls_server_context(
+            RUT_GRPC_FIXTURES "/localhost_cert.pem", RUT_GRPC_FIXTURES "/localhost_key.pem", true);
+        REQUIRE(context);
+        tls_server = context.value();
+        shard->loop->tls_server = tls_server;
+    }
+    REQUIRE(shard->spawn(-1).has_value());
+    {
+        Client client;
+        const bool connected = client.init(get_port(lfd), tls) && client.connect_settings();
+        CHECK(connected);
+        if (connected) {
+            CHECK_EQ(client.websocket_request(0, 200000), 1);
+            if (opening_timeout) {
+                CHECK(client.until(0, true));
+                CHECK_EQ(client.rpcs[0].http_status, 504u);
+                CHECK_EQ(server->requests.load(), 1u);
+                const nghttp2_nv health[] = {nv(":method", "GET"),
+                                             nv(":scheme", "http"),
+                                             nv(":authority", "ws.test"),
+                                             nv(":path", "/health")};
+                CHECK_EQ(
+                    nghttp2_submit_request(client.session, nullptr, health, 4, nullptr, nullptr),
+                    3);
+                CHECK(client.until(1, true));
+                CHECK_EQ(client.rpcs[1].http_status, 204u);
+                CHECK(!client.goaway);
+            } else if (!upstream_support) {
+                CHECK(client.until(0, true));
+                CHECK_EQ(client.rpcs[0].http_status, 503u);
+                CHECK_EQ(server->requests.load(), 0u);
+            } else {
+                const bool echo = client.until(0, false);
+                CHECK(echo);
+                CHECK_EQ(client.rpcs[0].http_status, 200u);
+                CHECK(!client.rpcs[0].response_end);
+                if (echo) {
+                    // A local HTTP response must not wait for the live tunnel.
+                    const nghttp2_nv health[] = {nv(":method", "GET"),
+                                                 nv(":scheme", "http"),
+                                                 nv(":authority", "ws.test"),
+                                                 nv(":path", "/health")};
+                    CHECK_EQ(nghttp2_submit_request(
+                                 client.session, nullptr, health, 4, nullptr, nullptr),
+                             3);
+                    CHECK(client.until(1, true));
+                    CHECK_EQ(client.rpcs[1].http_status, 204u);
+                    CHECK_EQ(client.websocket_request(2, 80000, "/jit"), 5);
+                    CHECK(client.until(2, false));
+                    CHECK_EQ(client.rpcs[2].http_status, 200u);
+                    CHECK_EQ(server->accepts.load(), http1 ? 2u : 1u);
+                    CHECK_EQ(nghttp2_submit_rst_stream(client.session, 0, 1, NGHTTP2_CANCEL), 0);
+                    CHECK(flush_session(client.session, client.fd, client.ssl));
+                    client.rpcs[2].size = 160000;
+                    client.rpcs[2].end = true;
+                    CHECK_EQ(nghttp2_session_resume_data(client.session, 5), 0);
+                    CHECK(client.until(2, true));
+                    CHECK_EQ(client.rpcs[2].received, 160000u);
+                    CHECK_EQ(client.rpcs[2].reset_error, 0u);
+                    server->reply_mode = 1;  // unoffered selected subprotocol
+                    CHECK_EQ(client.websocket_request(3, 0), 7);
+                    CHECK(client.until(3, true));
+                    CHECK_EQ(client.rpcs[3].http_status, 502u);
+                    server->reply_mode = 3;
+                    CHECK_EQ(client.websocket_request(4, 0), 9);
+                    CHECK(client.until(4, true));
+                    CHECK_EQ(client.rpcs[4].http_status, 403u);
+                    const u32 requests = server->requests.load();
+                    CHECK_EQ(client.websocket_request(5, 0, "/deny"), 11);
+                    CHECK(client.until(5, true));
+                    CHECK_EQ(client.rpcs[5].http_status, 403u);
+                    server->reply_mode = 5;
+                    client.rpcs[6].wire_message = true;
+                    CHECK_EQ(client.websocket_request(6, 11, "/inspect"), 13);
+                    CHECK(client.until(6, false));
+                    CHECK_EQ(client.rpcs[6].http_status, 200u);
+                    CHECK_EQ(server->requests.load(), requests + 1);
+                    CHECK_EQ(nghttp2_submit_rst_stream(client.session, 0, 13, NGHTTP2_CANCEL), 0);
+                    CHECK(flush_session(client.session, client.fd, client.ssl));
+                    // Server half-closes first; the client can still finish its
+                    // upload. Only this stream gets END_STREAM, not TCP FIN.
+                    server->reply_mode = 4;
+                    CHECK_EQ(client.websocket_request(7, 0), 15);
+                    CHECK(client.until(7, true));
+                    CHECK_EQ(client.rpcs[7].http_status, 200u);
+                    CHECK(!client.rpcs[7].closed);
+                    client.rpcs[7].size = 32;
+                    client.rpcs[7].end = true;
+                    CHECK_EQ(nghttp2_session_resume_data(client.session, 15), 0);
+                    const u64 until_closed = monotonic_us() + 2000000;
+                    while (!client.rpcs[7].closed && monotonic_us() < until_closed)
+                        if (!client.step()) break;
+                    CHECK(client.rpcs[7].closed);
+                    CHECK_EQ(client.rpcs[7].reset_error, 0u);
+                    server->reply_mode = 5;
+                    client.rpcs[8].wire_message = true;
+                    CHECK_EQ(client.websocket_request(8, 11), 17);
+                    CHECK(client.until(8, false));
+                    CHECK_EQ(client.rpcs[8].http_status, 200u);
+                    CHECK_EQ(client.rpcs[8].received, 7u);
+                    CHECK_EQ(nghttp2_submit_rst_stream(client.session, 0, 17, NGHTTP2_CANCEL), 0);
+                    CHECK(flush_session(client.session, client.fd, client.ssl));
+                    server->reply_mode = 7;
+                    CHECK_EQ(client.websocket_request(9, 32), 19);
+                    CHECK(client.until(9, false));
+                    CHECK_EQ(client.rpcs[9].http_status, 200u);
+                    CHECK_EQ(nghttp2_submit_rst_stream(client.session, 0, 19, NGHTTP2_CANCEL), 0);
+                    CHECK(flush_session(client.session, client.fd, client.ssl));
+                    server->reply_mode = 8;
+                    CHECK_EQ(client.websocket_request(10, 32), 21);
+                    const u64 reset_until = monotonic_us() + 2000000;
+                    while (!client.rpcs[10].closed && monotonic_us() < reset_until)
+                        if (!client.step()) break;
+                    CHECK(client.rpcs[10].closed);
+                    CHECK_EQ(client.rpcs[10].http_status, 200u);
+                    CHECK_EQ(client.rpcs[10].reset_error, static_cast<u32>(NGHTTP2_CANCEL));
+                    const u32 before_missing_offer = server->requests.load();
+                    CHECK_EQ(client.websocket_request(11, 0, "/required", "other"), 23);
+                    CHECK(client.until(11, true));
+                    CHECK_EQ(client.rpcs[11].http_status, 400u);
+                    CHECK_EQ(server->requests.load(), before_missing_offer);
+                    if (http1) {
+                        for (u32 mode = 9; mode <= 11; ++mode) {
+                            const u32 index = mode + 3;
+                            server->reply_mode = mode;
+                            CHECK_EQ(client.websocket_request(index, 3),
+                                     static_cast<i32>(2 * index + 1));
+                            CHECK(client.until(index, true));
+                            CHECK_EQ(client.rpcs[index].http_status, 403u);
+                            CHECK_EQ(client.rpcs[index].received, 3u);
+                            CHECK_EQ(client.rpcs[index].reset_error, 0u);
+                        }
+                        server->reply_mode = 12;  // required selection omitted by upstream
+                        CHECK_EQ(client.websocket_request(15, 0, "/required"), 31);
+                        CHECK(client.until(15, true));
+                        CHECK_EQ(client.rpcs[15].http_status, 502u);
+                        if (tls) {
+                            const u32 accepted = server->accepts.load();
+                            const nghttp2_nv ordinary[] = {nv(":method", "GET"),
+                                                           nv(":scheme", "https"),
+                                                           nv(":authority", "ws.test"),
+                                                           nv(":path", "/ordinary")};
+                            CHECK_EQ(nghttp2_submit_request(
+                                         client.session, nullptr, ordinary, 4, nullptr, nullptr),
+                                     33);
+                            CHECK(client.until(16, true));
+                            CHECK_EQ(client.rpcs[16].http_status, 503u);
+                            CHECK_EQ(server->accepts.load(), accepted);
+                        }
+                    }
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+                    if (!tls || WebSocketWireProgram::kNative) {
+                        const nghttp2_nv kClosed[] = {nv(":method", "GET"),
+                                                      nv(":scheme", tls ? "https" : "http"),
+                                                      nv(":authority", "ws.test"),
+                                                      nv(":path", "/closed")};
+                        const u32 kObserver = http1 ? (tls ? 17u : 16u) : 12u;
+                        CHECK_EQ(nghttp2_submit_request(
+                                     client.session, nullptr, kClosed, 4, nullptr, nullptr),
+                                 static_cast<i32>(kObserver * 2 + 1));
+                        CHECK(client.until(kObserver, true));
+                        CHECK_EQ(client.rpcs[kObserver].http_status, 204u);
+                    }
+#endif
+                    CHECK(!client.goaway);
+                }
+            }
+        }
+    }
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+    if (tls_server) destroy_tls_server_context(tls_server);
+#else
+    (void)tls;
+    (void)upstream_support;
+    (void)opening_timeout;
+    (void)http1;
+    SKIP("WebSocket disabled");
+#endif
+}
+
+TEST(http2_websocket, opaque_duplex_epoll) {
+    websocket_h2_case<EpollEventLoop>(_tc, false);
+}
+TEST(http2_websocket, opaque_duplex_iouring) {
+    websocket_h2_case<IoUringEventLoop>(_tc, false);
+}
+TEST(http2_websocket, tls_duplex_epoll) {
+    websocket_h2_case<EpollEventLoop>(_tc, true);
+}
+TEST(http2_websocket, tls_duplex_iouring) {
+    websocket_h2_case<IoUringEventLoop>(_tc, true);
+}
+TEST(http2_websocket, missing_upstream_setting_epoll) {
+    websocket_h2_case<EpollEventLoop>(_tc, false, false);
+}
+TEST(http2_websocket, missing_upstream_setting_iouring) {
+    websocket_h2_case<IoUringEventLoop>(_tc, false, false);
+}
+TEST(http2_websocket, opening_timeout_preserves_siblings_epoll) {
+    websocket_h2_case<EpollEventLoop>(_tc, false, true, true);
+}
+TEST(http2_websocket, opening_timeout_preserves_siblings_iouring) {
+    websocket_h2_case<IoUringEventLoop>(_tc, false, true, true);
+}
+TEST(http2_websocket, http1_bridge_epoll) {
+    websocket_h2_case<EpollEventLoop>(_tc, false, true, false, true);
+}
+TEST(http2_websocket, http1_bridge_iouring) {
+    websocket_h2_case<IoUringEventLoop>(_tc, false, true, false, true);
+}
+TEST(http2_websocket, http1_tls_bridge_epoll) {
+    websocket_h2_case<EpollEventLoop>(_tc, true, true, false, true);
+}
+TEST(http2_websocket, http1_tls_bridge_iouring) {
+    websocket_h2_case<IoUringEventLoop>(_tc, true, true, false, true);
+}
+
+struct H1WebSocketClient {
+    int fd = -1;
+    bool eof = false;
+    int last_ssl_error = SSL_ERROR_NONE;
+    template <typename Call>
+    int tls_io(Call&& call) {
+        int result = -1, error_number = 0;
+        unsigned long openssl_error = 0;
+        (void)grpc_test_ssl_call(ssl,
+                                 fd,
+                                 monotonic_us() + 3000000,
+                                 &result,
+                                 &error_number,
+                                 &last_ssl_error,
+                                 &openssl_error,
+                                 nullptr,
+                                 call);
+        errno = error_number;
+        return result;
+    }
+    SSL_CTX* context = nullptr;
+    SSL* ssl = nullptr;
+    u8 bytes[16384]{};
+    u32 used = 0, offset = 0;
+    bool init(u16 port, bool tls) {
+        fd = connect_to(port);
+        if (fd < 0) return false;
+        set_socket_timeouts(fd, 3);
+        if (tls) {
+            context = SSL_CTX_new(TLS_client_method());
+            if (!context) return false;
+            SSL_CTX_set_verify(context, SSL_VERIFY_NONE, nullptr);
+            ssl = SSL_new(context);
+            if (!ssl || SSL_set_fd(ssl, fd) != 1 || tls_io([&] { return SSL_connect(ssl); }) != 1)
+                return false;
+        }
+        return true;
+    }
+    bool send_bytes(const u8* data, u32 length) {
+        if (!ssl) return write_all_fd(fd, data, length);
+        while (length) {
+            const int n = tls_io([&] { return SSL_write(ssl, data, length); });
+            if (n <= 0) return false;
+            data += n;
+            length -= n;
+        }
+        return true;
+    }
+    bool read_more() {
+        if (used == sizeof(bytes)) return false;
+        int n;
+        if (ssl)
+            n = tls_io([&] { return SSL_read(ssl, bytes + used, sizeof(bytes) - used); });
+        else {
+            do {
+                n = recv(fd, bytes + used, sizeof(bytes) - used, 0);
+            } while (n < 0 && errno == EINTR);
+        }
+        if (n <= 0) {
+            eof = n == 0 && (!ssl || last_ssl_error == SSL_ERROR_ZERO_RETURN);
+            return false;
+        }
+        used += n;
+        return true;
+    }
+    bool header(ParsedResponse* out) {
+        HttpResponseParser parser{};
+        for (;;) {
+            const auto parsed = parser.parse(bytes, used, out);
+            if (parsed == ParseStatus::Complete) {
+                offset = parser.header_end;
+                return true;
+            }
+            if (parsed != ParseStatus::Incomplete || !read_more()) return false;
+        }
+    }
+    bool body(const u8* expected, u32 length) {
+        while (used - offset < length)
+            if (!read_more()) return false;
+        const bool matches = memcmp(bytes + offset, expected, length) == 0;
+        offset += length;
+        return matches;
+    }
+    ~H1WebSocketClient() {
+        if (ssl) SSL_free(ssl);
+        if (context) SSL_CTX_free(context);
+        if (fd >= 0) close(fd);
+    }
+};
+
+template <typename Loop>
+void h1_websocket_h2_case(rut::test::TestCase* _tc,
+                          bool tls,
+                          bool inspect,
+                          bool upstream_support = true,
+                          bool opening_timeout = false) {
+#if RUT_ENABLE_WEBSOCKET
+    auto server = std::make_unique<EchoServer>();
+    server->websocket = true;
+    server->connect_protocol = upstream_support;
+    REQUIRE(server->start(tls));
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    UpstreamConcurrency concurrency{};
+    concurrency.reset();
+    shard->loop->upstream_cc = &concurrency;
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(config->add_upstream("chat", 0x7f000001, get_port(server->listen_fd)).has_value());
+    config->upstreams[0].http2 = true;
+    config->upstreams[0].max_inflight = 2;
+    if (tls) {
+        config->upstreams[0].tls.enabled = true;
+        strcpy(config->upstreams[0].tls.ca, RUT_GRPC_FIXTURES "/localhost_cert.pem");
+        strcpy(config->upstreams[0].tls.server_name, "localhost");
+    }
+    REQUIRE(config->add_proxy("/ws", 'G', 0));
+    REQUIRE(config->add_ws_terminate("/inspect", 'G', 0, &websocket_forward_message, 100000));
+    REQUIRE(config->add_static("/deny", 'G', 403));
+    shard->route_config = config.get();
+    if (opening_timeout) shard->loop->upstream_timeout = 1;
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+    WebSocketWireProgram compiled;
+    if (!tls || WebSocketWireProgram::kNative) {
+        char source[4096];
+        const int length = snprintf(
+            source,
+            sizeof(source),
+            "let closedCounts = Cache<IP, i64>(capacity: 64)\n"
+            "upstream chat { host: \"127.0.0.1\", port: %u, protocol: .http2%s }\n"
+            "route GET \"/ws\" { return websocket(chat) }\n"
+            "route GET \"/inspect\" { return websocket(chat) { message in "
+            "guard message.connection.subprotocol == \"chat\" else { message.close(1008) } "
+            "message.forward(message.payload) } onOpen: { connection in "
+            "guard connection.remotePort > 0 else { connection.close(1008) } } "
+            "onClose: { closed in "
+            "guard closed.code == 1000 && closed.upstreamCode == 1000 && closed.wasClean "
+            "else { return } let key = closed.connection.remoteAddr "
+            "closedCounts.set(key, closedCounts.get(key).or(0) + 1) } }\n"
+            "route GET \"/deny\" { return 403 }\n"
+            "route GET \"/closed\" { if closedCounts.get(req.remoteAddr).or(0) == 1 "
+            "{ return 204 } else { return 500 } }\n",
+            get_port(server->listen_fd),
+            tls ? ", tls: { ca: \"" RUT_GRPC_FIXTURES
+                  "/localhost_cert.pem\", "
+                  "server_name: \"localhost\" }"
+                : "");
+        REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(source));
+        REQUIRE(compiled.load(source, static_cast<u32>(length)));
+        compiled.program->config.upstreams[0].max_inflight = 2;
+        shard->route_config = &compiled.program->config;
+    }
+#endif
+    TlsServerContext* tls_server = nullptr;
+    if (tls) {
+        auto result = create_tls_server_context(
+            RUT_GRPC_FIXTURES "/localhost_cert.pem", RUT_GRPC_FIXTURES "/localhost_key.pem", false);
+        REQUIRE(result);
+        tls_server = result.value();
+        shard->loop->tls_server = tls_server;
+    }
+    REQUIRE(shard->spawn(-1).has_value());
+    auto shutdown_shard = [&] {
+        shard->stop();
+        shard->join();
+        shard->loop->force_close_all();
+        CHECK(shard->loop->grpc_upstreams == nullptr);
+        CHECK_EQ(concurrency.inflight[0].load(std::memory_order_acquire), 0u);
+        CHECK_EQ(shard->epoch.epoch.load(std::memory_order_acquire) % 2, 0u);
+        if (shard->loop->listen_fd >= 0) {
+            close(shard->loop->listen_fd);
+            shard->loop->listen_fd = -1;
+        }
+        shard->shutdown();
+        destroy_tls_server_context(tls_server);
+    };
+    {
+        H1WebSocketClient client;
+        const bool connected = client.init(get_port(lfd), tls);
+        CHECK(connected);
+        if (!connected) {
+            shutdown_shard();
+            return;
+        }
+        char request[512];
+        const int length =
+            snprintf(request,
+                     sizeof(request),
+                     "GET %s HTTP/1.1\r\nHost: ws.test\r\nConnection: Upgrade, X-Hop\r\nX-Hop: "
+                     "secret\r\nUpgrade: websocket\r\n"
+                     "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                     "Sec-WebSocket-Protocol: chat\r\n\r\n",
+                     inspect ? "/inspect" : "/ws");
+        server->reply_mode = opening_timeout ? 6 : 13;
+        CHECK(client.send_bytes(reinterpret_cast<const u8*>(request), length));
+        // Data arriving before 101 must survive translation and opening backpressure.
+        static constexpr u8 message[] = {0x82, 0x85, 1, 2, 3, 4, 0x69, 0x67, 0x6f, 0x68, 0x6e};
+        CHECK(client.send_bytes(message, sizeof(message)));
+        ParsedResponse response{};
+        const bool opened = client.header(&response);
+        if (!opened)
+            fprintf(stderr,
+                    "reverse opening failed: tls=%d inspect=%d bytes=%u eof=%d errno=%d "
+                    "accepts=%u requests=%u handshake_failures=%u\n",
+                    tls,
+                    inspect,
+                    client.used,
+                    client.eof,
+                    errno,
+                    server->accepts.load(),
+                    server->requests.load(),
+                    server->handshake_failures.load());
+        CHECK(opened);
+        if (opened) {
+            if (!upstream_support || opening_timeout) {
+                CHECK_EQ(response.status_code, opening_timeout ? 504u : 503u);
+                CHECK_EQ(server->requests.load(), opening_timeout ? 1u : 0u);
+            } else {
+                CHECK_EQ(response.status_code, 101u);
+                u8 expected[16384];
+                u32 offers = 0;
+                CHECK(ws_prepare_handshake(reinterpret_cast<const u8*>(request),
+                                           length,
+                                           expected,
+                                           sizeof(expected),
+                                           &offers) == WsHandshakeRequestResult::Ready);
+                CHECK(ws_handshake_response_matches(response, expected, offers));
+                static constexpr u8 echoed[] = {0x82, 5, 'h', 'e', 'l', 'l', 'o'};
+                CHECK(client.body(echoed, sizeof(echoed)));
+                CHECK_EQ(server->requests.load(), 1u);
+                H1WebSocketClient sibling;
+                const bool sibling_connected = sibling.init(get_port(lfd), tls);
+                CHECK(sibling_connected);
+                server->reply_mode = 13;
+                CHECK(sibling.send_bytes(reinterpret_cast<const u8*>(request), length));
+                ParsedResponse sibling_response{};
+                CHECK(sibling.header(&sibling_response));
+                CHECK_EQ(sibling_response.status_code, 101u);
+                CHECK_EQ(server->accepts.load(), 1u);
+                // A rejected third stream must release the original HTTP epoch
+                // once, without opening CONNECT or disturbing either live stream.
+                {
+                    H1WebSocketClient saturated;
+                    CHECK(saturated.init(get_port(lfd), tls));
+                    CHECK(saturated.send_bytes(reinterpret_cast<const u8*>(request), length));
+                    ParsedResponse unavailable{};
+                    CHECK(saturated.header(&unavailable));
+                    CHECK_EQ(unavailable.status_code, 503u);
+                    CHECK_EQ(server->requests.load(), 2u);
+                }
+                if (inspect) {
+                    const u8 close[] = {0x88, 0x82, 1, 2, 3, 4, 2, 0xea};
+                    CHECK(client.send_bytes(close, sizeof(close)));
+                    const u8 acknowledged[] = {0x88, 2, 3, 0xe8};
+                    CHECK(client.body(acknowledged, sizeof(acknowledged)));
+                } else {
+                    if (client.ssl)
+                        CHECK(SSL_shutdown(client.ssl) >= 0);
+                    else
+                        CHECK_EQ(shutdown(client.fd, SHUT_WR), 0);
+                }
+                CHECK(!client.read_more());
+                CHECK(client.eof);
+#if RUT_GRPC_JIT || RUT_GRPC_NATIVE
+                if (inspect && (!tls || WebSocketWireProgram::kNative)) {
+                    H1WebSocketClient observer;
+                    CHECK(observer.init(get_port(lfd), tls));
+                    static constexpr char kClosed[] =
+                        "GET /closed HTTP/1.1\r\nHost: ws.test\r\nConnection: close\r\n\r\n";
+                    CHECK(observer.send_bytes(reinterpret_cast<const u8*>(kClosed),
+                                              sizeof(kClosed) - 1));
+                    ParsedResponse observed{};
+                    CHECK(observer.header(&observed));
+                    CHECK_EQ(observed.status_code, 204u);
+                }
+#endif
+                // The first stream's FIN/Close must not cancel its sibling.
+                CHECK(sibling.send_bytes(message, sizeof(message)));
+                CHECK(sibling.body(echoed, sizeof(echoed)));
+                CHECK_EQ(server->requests.load(), 2u);
+                CHECK_EQ(server->bad_websocket_headers.load(), 0u);
+                for (u32 mode = 0; mode < 3; ++mode) {
+                    H1WebSocketClient rejected;
+                    CHECK(rejected.init(get_port(lfd), tls));
+                    char denied[512];
+                    const int size =
+                        snprintf(denied,
+                                 sizeof(denied),
+                                 "GET %s HTTP/1.1\r\nHost: ws.test\r\nConnection: "
+                                 "Upgrade\r\nUpgrade: websocket\r\n"
+                                 "Sec-WebSocket-Version: %s\r\nSec-WebSocket-Key: %s\r\n\r\n",
+                                 mode == 0 ? "/deny" : "/ws",
+                                 mode == 2 ? "12" : "13",
+                                 mode == 1 ? "invalid" : "dGhlIHNhbXBsZSBub25jZQ==");
+                    CHECK(rejected.send_bytes(reinterpret_cast<const u8*>(denied), size));
+                    ParsedResponse rejected_response{};
+                    CHECK(rejected.header(&rejected_response));
+                    CHECK_EQ(rejected_response.status_code,
+                             mode == 0   ? 403u
+                             : mode == 1 ? 400u
+                                         : 426u);
+                    CHECK_EQ(server->requests.load(), 2u);
+                }
+                server->reply_mode = 1;
+                H1WebSocketClient bad_selection;
+                CHECK(bad_selection.init(get_port(lfd), tls));
+                CHECK(bad_selection.send_bytes(reinterpret_cast<const u8*>(request), length));
+                ParsedResponse invalid_response{};
+                CHECK(bad_selection.header(&invalid_response));
+                CHECK_EQ(invalid_response.status_code, 502u);
+            }
+        }
+    }
+    shutdown_shard();
+#else
+    (void)tls;
+    (void)inspect;
+    (void)upstream_support;
+    (void)opening_timeout;
+    SKIP("WebSocket disabled");
+#endif
+}
+TEST(http2_websocket, reverse_opaque_epoll) {
+    h1_websocket_h2_case<EpollEventLoop>(_tc, false, false);
+}
+TEST(http2_websocket, reverse_opaque_iouring) {
+    h1_websocket_h2_case<IoUringEventLoop>(_tc, false, false);
+}
+TEST(http2_websocket, reverse_inspected_epoll) {
+    h1_websocket_h2_case<EpollEventLoop>(_tc, false, true);
+}
+TEST(http2_websocket, reverse_inspected_iouring) {
+    h1_websocket_h2_case<IoUringEventLoop>(_tc, false, true);
+}
+TEST(http2_websocket, reverse_tls_opaque_epoll) {
+    h1_websocket_h2_case<EpollEventLoop>(_tc, true, false);
+}
+TEST(http2_websocket, reverse_tls_opaque_iouring) {
+    h1_websocket_h2_case<IoUringEventLoop>(_tc, true, false);
+}
+TEST(http2_websocket, reverse_tls_inspected_epoll) {
+    h1_websocket_h2_case<EpollEventLoop>(_tc, true, true);
+}
+TEST(http2_websocket, reverse_tls_inspected_iouring) {
+    h1_websocket_h2_case<IoUringEventLoop>(_tc, true, true);
+}
+TEST(http2_websocket, reverse_missing_setting_epoll) {
+    h1_websocket_h2_case<EpollEventLoop>(_tc, false, false, false);
+}
+TEST(http2_websocket, reverse_missing_setting_iouring) {
+    h1_websocket_h2_case<IoUringEventLoop>(_tc, false, false, false);
+}
+TEST(http2_websocket, reverse_opening_timeout_epoll) {
+    h1_websocket_h2_case<EpollEventLoop>(_tc, false, false, true, true);
+}
+TEST(http2_websocket, reverse_opening_timeout_iouring) {
+    h1_websocket_h2_case<IoUringEventLoop>(_tc, false, false, true, true);
+}
 
 template <typename Loop>
 void streaming_case(rut::test::TestCase* _tc,
@@ -1093,6 +2132,70 @@ struct SyncCloseGrpcDriveFixture : GrpcDriveFixture {
 };
 void pending_send(void*, Connection&, IoEvent) {}
 }  // namespace
+
+TEST(http2_websocket, h1_closing_deadline_cancels_blocked_send_and_reclaims_session) {
+    SyncCloseGrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    auto down = std::make_unique<Connection>();
+    down->reset();
+    auto h2 = std::make_unique<Http2Conn>();
+    h2->init_client();
+    h2->grpc.websocket_http1_downstream = true;
+    REQUIRE(h2->open_stream(1) != nullptr);
+    down->h2 = h2.get();
+    down->on_send = &pending_send;
+    down->on_close = &grpc_connection_closed<SyncCloseGrpcDriveFixture>;
+    auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(x != nullptr);
+    x->init();
+    x->websocket = x->ws_accepted = x->response_headers_sent = true;
+    x->downstream = down.get();
+    x->downstream_stream = 1;
+    x->deadline_us = monotonic_us() - 1;
+    REQUIRE(grpc_attach(*h2, x));
+    grpc_deadline_fired(&loop, *down);
+    CHECK(loop.closed);
+    CHECK(down->h2 == nullptr);
+    CHECK_EQ(h2->grpc.active, 0u);
+    CHECK_EQ(loop.pool.bulk_free_top, loop.pool.bulk_max_count);
+}
+
+TEST(http2_websocket, reset_releases_stream_slot_and_all_buffered_credit) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    auto h2 = std::make_unique<Http2Conn>();
+    h2->init_client();
+    h2->grpc.busy = true;
+    Connection down;
+    down.reset();
+    down.h2 = h2.get();
+    for (u32 round = 0; round < Http2Conn::kMaxStreams * 3; ++round) {
+        const u32 sid = round * 2 + 1;
+        auto* stream = h2->open_stream(sid);
+        REQUIRE(stream != nullptr);
+        stream->manual_window = true;
+        stream->recv_unconsumed = 23;
+        auto* exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+        REQUIRE(exchange != nullptr);
+        exchange->init();
+        exchange->downstream = &down;
+        exchange->downstream_stream = sid;
+        exchange->websocket = exchange->ws_accepted = exchange->response_headers_sent = true;
+        exchange->failure = 13;
+        exchange->upload_len = 23;
+        REQUIRE(grpc_attach(*h2, exchange));
+        u8 output[64];
+        REQUIRE_EQ(grpc_pump_downstream(&loop, down, output, sizeof(output)), 13u);
+        Http2FrameHeader frame;
+        REQUIRE(parse_frame_header(output, sizeof(output), &frame) == ParseStatus::Complete);
+        CHECK_EQ(frame.stream_id, sid);
+        CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::RstStream));
+        CHECK(stream->state == Http2StreamState::Closed);
+        CHECK_EQ(h2->grpc.active, 0u);
+        CHECK_EQ(h2->conn_recv_credit, (round + 1) * 23u);
+        CHECK_EQ(h2->nstreams, 1u);
+    }
+}
 
 TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
     GrpcDriveFixture loop;
@@ -1693,6 +2796,39 @@ TEST(grpc_proxy, resumed_jit_forward_snapshots_response_mutations) {
     CHECK(first_value_str.eq({"first", 5}));
     loop.force_close_all();
     loop.shutdown();
+}
+
+TEST(http2_websocket, upstream_failure_after_response_half_close_releases_live_upload) {
+    for (u32 mode = 0; mode < 3; ++mode) {
+        GrpcDriveFixture loop;
+        REQUIRE(loop.pool_ready);
+        auto upstream = std::make_unique<Connection>();
+        upstream->reset();
+        auto h2 = std::make_unique<Http2Conn>();
+        h2->init_client();
+        h2->grpc.upstream = true;
+        upstream->h2 = h2.get();
+        loop.grpc_upstreams = upstream.get();
+        REQUIRE(h2->open_stream(1) != nullptr);
+        auto x = std::make_unique<GrpcExchange>();
+        x->init();
+        x->websocket = x->ws_accepted = x->response_end = true;
+        x->upstream = upstream.get();
+        x->upstream_stream = 1;
+        x->slot_held = true;
+        x->request_end_sent = mode == 2;
+        REQUIRE(grpc_attach(*h2, x.get()));
+        if (mode == 0) {
+            GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, upstream.get()};
+            grpc_response_reset<GrpcDriveFixture>(&dispatch, *h2, 1, Http2Error::Cancel);
+        } else
+            grpc_connection_closed<GrpcDriveFixture>(&loop, *upstream);
+        CHECK_EQ(x->failure, mode == 0 ? 1u : mode == 1 ? 14u : 0u);
+        CHECK(x->upstream == nullptr);
+        CHECK(!x->slot_held);
+        CHECK_EQ(h2->grpc.active, 0u);
+        CHECK_EQ(loop.released, 1u);
+    }
 }
 
 TEST(grpc_proxy, upstream_session_close_releases_slots_with_blocked_downstream) {
@@ -3725,6 +4861,106 @@ TEST(grpc_proxy, late_failed_upload_data_is_included_in_access_log) {
     CHECK_EQ(entry.req_size, 200u);
     CHECK_EQ(entry.grpc_status_plus_one, 15u);
     CHECK_EQ(transport->backend.pending_count, 0u);
+}
+
+TEST(grpc_proxy, timer_arm_failure_during_websocket_upload_detaches_safely) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection down;
+    down.reset();
+    Http2Conn down_h2;
+    down_h2.init_client();
+    down.h2 = &down_h2;
+    Connection upstream;
+    upstream.reset();
+    u8 upstream_send[512]{};
+    u8 upstream_recv[512]{};
+    upstream.send_slice = upstream_send;
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    upstream.recv_slice = upstream_recv;
+    upstream.recv_buf.bind(upstream_recv, sizeof(upstream_recv));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    REQUIRE(down_h2.open_stream(1) != nullptr);
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    auto* exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(exchange != nullptr);
+    exchange->init();
+    WsH2Session ws{};
+    exchange->ws = &ws;
+    exchange->downstream = &down;
+    exchange->upstream = &upstream;
+    exchange->downstream_stream = 1;
+    exchange->upstream_stream = 1;
+    exchange->deadline_us = monotonic_us() + 1000000;
+    REQUIRE(grpc_attach(down_h2, exchange));
+    REQUIRE(grpc_attach(upstream_h2, exchange));
+
+    // The parser callback runs while the downstream grpc state is busy, as it
+    // does for an H2 DATA frame. Failed timer arming detaches the upstream.
+    down_h2.grpc.busy = true;
+    grpc_request_data(&loop, down, *exchange, nullptr, 0, false);
+
+    CHECK_EQ(exchange->failure, 8u);
+    CHECK(exchange->upstream == nullptr);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+}
+
+TEST(http2_websocket, h1_receive_returns_after_pending_send_timer_close) {
+    SyncCloseGrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection down;
+    down.reset();
+    Http2Conn down_h2;
+    down_h2.init_client();
+    down_h2.grpc.websocket_http1_downstream = true;
+    down.h2 = &down_h2;
+    down.on_close = &grpc_connection_closed<SyncCloseGrpcDriveFixture>;
+    down.on_send = &pending_send;
+    u8 recv[8]{};
+    down.bind_request_receive_buffer(recv, sizeof(recv));
+    const u8 input[] = {0x82};
+    down.recv_buf.write(input, sizeof(input));
+    REQUIRE(down_h2.open_stream(1) != nullptr);
+
+    Connection upstream;
+    upstream.reset();
+    u8 upstream_send[512]{};
+    u8 upstream_recv[512]{};
+    upstream.send_slice = upstream_send;
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    upstream.recv_slice = upstream_recv;
+    upstream.recv_buf.bind(upstream_recv, sizeof(upstream_recv));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+
+    auto* exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    auto* ws = reinterpret_cast<WsH2Session*>(loop.pool.alloc());
+    REQUIRE(exchange != nullptr);
+    REQUIRE(ws != nullptr);
+    new (ws) WsH2Session{};
+    exchange->init();
+    exchange->websocket = true;
+    exchange->ws = ws;
+    exchange->downstream = &down;
+    exchange->upstream = &upstream;
+    exchange->downstream_stream = 1;
+    exchange->upstream_stream = 1;
+    exchange->deadline_us = monotonic_us() + 1000000;
+    REQUIRE(grpc_attach(down_h2, exchange));
+    REQUIRE(grpc_attach(upstream_h2, exchange));
+
+    h1ws_h2_received<SyncCloseGrpcDriveFixture>(
+        &loop, down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
+
+    CHECK(loop.closed);
+    CHECK(down.h2 == nullptr);
+    CHECK_NE(down.handler_gen, 0u);
 }
 
 TEST(grpc_proxy, live_log_keeps_bytes_only_output) {

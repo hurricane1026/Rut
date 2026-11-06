@@ -7,6 +7,8 @@
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/ws_extensions.h"
 
+#include <openssl/rand.h>
+
 namespace rut {
 namespace {
 
@@ -222,6 +224,61 @@ bool request_upgrade_value_is_valid(Str value, bool* offers_websocket) {
 
 }  // namespace
 
+WsHandshakeRequestResult ws_prepare_h2_handshake(const ParsedRequest& request,
+                                                 u8* storage,
+                                                 u32 capacity,
+                                                 u32* offers_len) {
+    if (!offers_len || (storage && capacity < kWsHandshakeAcceptLength + 1))
+        return WsHandshakeRequestResult::BadRequest;
+    *offers_len = 0;
+    u32 versions = 0;
+    u32 hosts = 0;
+    Str version{};
+    for (u32 i = 0; i < request.header_count; ++i) {
+        const auto& h = request.headers[i];
+        if (name_is(h.name, "sec-websocket-version", 21)) {
+            versions++;
+            version = trim_ows(h.value);
+        }
+        if (name_is(h.name, "host", 4)) {
+            hosts++;
+            if (!trim_ows(h.value).len) return WsHandshakeRequestResult::BadRequest;
+        }
+    }
+    if (hosts != 1 || versions != 1 || !request_protocols_valid(request, offers_len) ||
+        version.len == 0 || version.len > 3 || (version.len > 1 && version.ptr[0] == '0'))
+        return WsHandshakeRequestResult::BadRequest;
+    u32 number = 0;
+    for (u32 i = 0; i < version.len; ++i) {
+        if (version.ptr[i] < '0' || version.ptr[i] > '9')
+            return WsHandshakeRequestResult::BadRequest;
+        number = number * 10 + static_cast<u32>(version.ptr[i] - '0');
+    }
+    if (number > 255) return WsHandshakeRequestResult::BadRequest;
+    if (number != 13) return WsHandshakeRequestResult::VersionRequired;
+    if (storage && !append_request_protocols(request, storage, capacity, offers_len))
+        return WsHandshakeRequestResult::InternalError;
+    return WsHandshakeRequestResult::Ready;
+}
+
+bool ws_h2_response_matches(const Header* headers, u32 count, const u8* storage, u32 offers_len) {
+    if (!storage) return false;
+    bool selected = false;
+    for (u32 i = 0; i < count; ++i) {
+        const auto& h = headers[i];
+        if (name_is(h.name, "sec-websocket-accept", 20) ||
+            name_is(h.name, "sec-websocket-key", 17) || name_is(h.name, "content-length", 14))
+            return false;
+        if (!name_is(h.name, "sec-websocket-protocol", 22)) continue;
+        const Str kToken = trim_ows(h.value);
+        if (selected || !ws_valid_subprotocol(kToken) ||
+            !offered_protocol_exists(storage, offers_len, kToken))
+            return false;
+        selected = true;
+    }
+    return true;
+}
+
 WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
                                               u32 header_len,
                                               u8* storage,
@@ -326,7 +383,8 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
                                    const u8* storage,
                                    u32 offers_len,
                                    Str required_subprotocol,
-                                   WsDeflateAgreement* upstream_deflate) {
+                                   WsDeflateAgreement* upstream_deflate,
+                                   bool opaque_extensions) {
     if (upstream_deflate) *upstream_deflate = {};
     if (storage == nullptr || offers_len > SlicePool::kSliceSize - kWsHandshakeAcceptLength ||
         (required_subprotocol.len != 0 && !ws_valid_subprotocol(required_subprotocol)) ||
@@ -353,7 +411,7 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
             if (!connection_value_is_valid(header.value, &connection_upgrade)) return false;
         } else if (name_is(header.name, "sec-websocket-extensions", 24)) {
             const Str kValue = trim_ows(header.value);
-            if (kValue.len != 0 && !upstream_deflate) return false;
+            if (kValue.len != 0 && !upstream_deflate && !opaque_extensions) return false;
         } else if (name_is(header.name, "sec-websocket-accept", 20)) {
             if (++accept_count != 1) return false;
             const Str kValue = trim_ows(header.value);
@@ -373,6 +431,48 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
         upgrade_count == 1 && upgrade_ok && connection_upgrade && accept_count == 1 && protocol_ok;
     if (kValid && upstream_deflate) *upstream_deflate = selected;
     return kValid;
+}
+
+u32 ws_build_h1_handshake(const ParsedRequest& request,
+                          u8* output,
+                          u32 capacity,
+                          u8* storage,
+                          u32 storage_capacity,
+                          u32* offers_len) {
+    if (!output || !storage || !offers_len || request.method != HttpMethod::CONNECT ||
+        !request.path.len || request.path.ptr[0] != '/')
+        return 0;
+    u8 nonce[16];
+    u8 key[32];
+    u32 key_len = 0;
+    if (RAND_bytes(nonce, sizeof(nonce)) != 1 ||
+        !rut_crypto_base64_encode_v1(nonce, sizeof(nonce), key, sizeof(key), &key_len) ||
+        key_len != 24)
+        return 0;
+    u32 used = 0;
+    auto put = [&](Str text) {
+        if (text.len > capacity - used) return false;
+        __builtin_memcpy(output + used, text.ptr, text.len);
+        used += text.len;
+        return true;
+    };
+    if (!put(lit_str("GET ")) || !put(request.path) ||
+        !put(lit_str(
+            " HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: ")) ||
+        !put({reinterpret_cast<const char*>(key), key_len}) || !put(lit_str("\r\n")))
+        return 0;
+    for (u32 i = 0; i < request.header_count; ++i) {
+        const auto& h = request.headers[i];
+        if (name_is(h.name, "connection", 10) || name_is(h.name, "upgrade", 7) ||
+            name_is(h.name, "sec-websocket-key", 17) || name_is(h.name, "sec-websocket-accept", 20))
+            continue;
+        if (!put(h.name) || !put(lit_str(": ")) || !put(h.value) || !put(lit_str("\r\n"))) return 0;
+    }
+    if (!put(lit_str("\r\n")) ||
+        ws_prepare_handshake(output, used, storage, storage_capacity, offers_len) !=
+            WsHandshakeRequestResult::Ready)
+        return 0;
+    return used;
 }
 
 u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str required_subprotocol) {

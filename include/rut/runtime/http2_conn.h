@@ -37,6 +37,9 @@ struct Http2Stream {
     i32 send_window;  // how much DATA we may send to the peer on this stream
     i32 recv_window;  // how much DATA the peer may send us on this stream
     bool got_headers;
+    bool websocket;  // validated RFC 8441 request; DATA is a duplex tunnel
+    const RouteEntry* websocket_route;
+    u16 websocket_open_error;
     // Streaming consumers return credit only after releasing buffered DATA.
     bool manual_window;
     u32 recv_credit;
@@ -329,6 +332,11 @@ u32 http2_write_head_response_headers(u8* out,
 // except the synthesized host name which points at static storage. Returns false
 // on a malformed request (missing/duplicate :method or :path, unknown method,
 // or more headers than ParsedRequest holds).
-bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req);
+// Extended CONNECT is accepted only when an explicit protocol output is supplied.
+// Callers must additionally check local SETTINGS negotiation and END_STREAM.
+bool h2_headers_to_request(const hpack::Header* hs,
+                           u32 n,
+                           ParsedRequest* req,
+                           Str* protocol = nullptr);
 
 }  // namespace rut

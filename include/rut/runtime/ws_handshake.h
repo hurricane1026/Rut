@@ -34,7 +34,25 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
                                    const u8* storage,
                                    u32 offers_len,
                                    Str required_subprotocol = {},
-                                   WsDeflateAgreement* upstream_deflate = nullptr);
+                                   WsDeflateAgreement* upstream_deflate = nullptr,
+                                   bool opaque_extensions = false);
+
+// Translate a validated Extended CONNECT request to a fresh HTTP/1.1 Upgrade.
+// The generated Key and expected Accept are owned by the gateway, not the client.
+u32 ws_build_h1_handshake(const ParsedRequest& request,
+                          u8* output,
+                          u32 capacity,
+                          u8* storage,
+                          u32 storage_capacity,
+                          u32* offers_len);
+
+// RFC 8441 uses :protocol rather than Key/Accept. Storage has the same owned
+// canonical protocol-list layout as the HTTP/1 handshake (Accept bytes unused).
+WsHandshakeRequestResult ws_prepare_h2_handshake(const ParsedRequest& request,
+                                                 u8* storage,
+                                                 u32 capacity,
+                                                 u32* offers_len);
+bool ws_h2_response_matches(const Header* headers, u32 count, const u8* storage, u32 offers_len);
 
 // Restrict validated request protocol fields to one required offer, without growing
 // the header or touching the coalesced WebSocket bytes. Returns the new header length.

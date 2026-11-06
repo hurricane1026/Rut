@@ -1,10 +1,52 @@
 # WebSocket terminate mode — application messages
 
-WebSocket is an HTTP/1.1-upgraded protocol with borrowed message, connection and
-close concepts. Its callbacks use the ordinary expression/helper type checker
-and shared MIR/RIR backend. Frames, masking keys and fragmentation boundaries
-are runtime details, not DSL properties. HTTP/2 Extended CONNECT is outside this
-implementation scope.
+WebSocket uses HTTP/1.1 Upgrade or HTTP/2 Extended CONNECT, with borrowed message,
+connection and close concepts. Callbacks use the ordinary expression/helper type
+checker and shared MIR/RIR backend. Frames, masking keys and fragmentation
+boundaries are runtime details. HTTP/2 streams have independent callback, output
+and compression state; the callback surface below applies to both transports.
+
+## HTTP/2 transport
+
+```swift
+upstream chatH2 { host: "127.0.0.1", port: 9001, protocol: .http2 }
+route "/ws" {
+    guard req.header("Origin").or("") == "https://allowed.example" else { return 403 }
+    return websocket(chatH2)
+}
+```
+
+This reuses ordinary routing, admission, request mutations and bounded HTTP/2
+transport. The downstream sees CONNECT. An H2 upstream must advertise
+SETTINGS_ENABLE_CONNECT_PROTOCOL=1 before receiving Extended CONNECT; an H1
+upstream instead receives GET Upgrade with a fresh Key. The gateway validates
+its 101 and Accept before publishing H2 status 200. H2 acceptance contains no
+Connection, Upgrade, Sec-WebSocket-Key or Sec-WebSocket-Accept. Version 13 and
+subprotocol selection are validated. A rejected opening remains an HTTP response;
+an accepted tunnel failure resets only its stream. Ordinary HTTP and other
+tunnels share the downstream connection. TLS upstreams verify configured
+certificates/identity: H2 requires h2 ALPN, H1 accepts http/1.1 or absent ALPN.
+
+Bare forwarding preserves opaque frame bytes and independent END_STREAM half-close.
+Trailing callbacks opt into the same message/lifecycle handling described below.
+Each stream owns its selected subprotocol, peer facts, message assembly and output,
+and independent compression agreements. Buffers/codecs are acquired before the
+acceptance response. `onOpen` runs after acceptance send completion. Complete
+messages larger than an H2 flow-control window progress through bounded assembly;
+credit returns after input becomes owned. Close acknowledgements track actual send
+completion, with a fixed five-second deadline. Cancellation invokes `onClose` once
+for an opened session and releases stream-owned resources without resetting siblings.
+
+An H2 upstream without the setting gets 503 without an Extended CONNECT request.
+Ordinary request-body-dependent handlers get 503 before DATA can be mistaken for
+an HTTP body. H1 GET Upgrade also bridges to H2 upstreams: the client handshake
+is validated before opening an upstream stream, H2 2xx becomes H1 101 with the
+client's Accept, and client FIN/Close or cancellation affects only that H2 stream.
+Callbacks and compression use the same bounded stream context. Multiple H1
+clients can share the pooled H2 upstream without sharing message state.
+H1 TLS upstream support here belongs to the H2-downstream WebSocket bridge;
+ordinary HTTP forwarding to an H1 TLS upstream still returns 503. Builds disabling
+WebSocket do not advertise the setting. This adds no keyword, codec or dependency.
 
 ## Surface and HTTP admission
 
@@ -195,7 +237,7 @@ keeps its uncompressed frame and full message limit. Partial/invalid decoded
 messages cannot reach the application.
 
 Each negotiated leg atomically reserves one existing 256 KiB bulk slice for its
-encoder/decoder before sending 101. Large routes additionally require their four
+encoder/decoder before sending acceptance (H1 101 or H2 2xx). Large routes additionally require their four
 data/output buffers. Pool exhaustion fails admission without smaller-limit
 fallback. CPU codecs retire at teardown; asynchronous output retains its normal
 send/cancel ownership. The codec is a private pinned static C zlib build with a

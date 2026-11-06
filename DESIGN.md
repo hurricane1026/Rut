@@ -2572,6 +2572,44 @@ post /api/orders {
 
 #### 3.4.8 WebSocket Proxying
 
+HTTP/2 WebSocket forwarding uses RFC 8441 Extended CONNECT on an existing
+methodless `route "/ws"` with `websocket(upstream)`, including the ordinary
+message/lifecycle callback forms. Serving sessions advertise
+SETTINGS_ENABLE_CONNECT_PROTOCOL only in WebSocket-enabled builds. HTTP/2
+upstreams use the existing pooled exchange transport and wait for peer opt-in
+before CONNECT. HTTP/1.1 upstreams use one dedicated TCP/TLS connection per stream:
+the gateway sends a fresh GET Upgrade, validates its Key/Accept and selected
+subprotocol, and maps 101 to downstream status 200. Connection-specific headers
+are removed; rejection bodies retain their bounded HTTP framing. TLS verifies the
+configured identity, requires h2 for H2, and accepts http/1.1 or absent ALPN for H1.
+Ordinary forwarding to an H1 TLS upstream remains an explicit 503; that capability
+is wired through the H2-downstream WebSocket adapter. H1 WebSocket clients may
+use H2 upstreams with verified TLS as well.
+
+Accepted HEADERS keep the stream open for duplex DATA, bounded queues and
+independent flow control. Opaque forwarding preserves frame bytes. Inspection
+allocates a stream-owned callback context and four existing message/output slices,
+plus independently negotiated per-leg compression storage, before accepting.
+The context implements the existing Connection helper ABI without owning sockets;
+HTTP request views are never captured. Message, dynamic output, connection and
+close semantics reuse the existing handlers/codecs. Input credit returns once the
+assembler/output owns the bytes, allowing messages larger than an H2 window.
+`onOpen` follows acceptance send completion; Close acknowledgements follow the
+corresponding send completions. Closing has a fixed five-second deadline and
+`onClose` runs once on retirement. Cancellation and failures release only that
+stream's state and credit; post-acceptance failure uses CANCEL. Ordinary HTTP and
+other tunnels may share the downstream connection. The existing exchange machinery
+adds no gRPC metadata or metrics for WebSocket. Ordinary request-body consumers
+still return 503. H1 GET Upgrade can also use an H2 upstream: validate the client
+handshake before upstream work, omit connection-specific and Key/Accept fields
+from Extended CONNECT, and generate H1 101/Accept only after validated H2 acceptance.
+Each H1 client maps to one independently cancelled H2 stream; pooled H2 sessions
+can be shared by H1 and H2 clients. After stream creation succeeds, the H1 request
+epoch transfers to the tunnel while its opening request completes, preserving
+callback/configuration ownership. Failed creation uses ordinary HTTP completion
+and releases the original request epoch once.
+See [the transport guide](docs/websocket-terminate.md#http2-transport).
+
 Terminate routes support a required subprotocol using
 `return websocket(chat, subprotocol: "graphql-transport-ws") { message in message.forward() }`.
 The string literal must decode to one nonempty, case-sensitive ASCII HTTP token.
