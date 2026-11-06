@@ -4,6 +4,7 @@
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
+#include "rut/runtime/callbacks_h1_tls.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
@@ -2262,7 +2263,7 @@ template <typename Loop>
 bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
     // The upstream must have signalled keep-alive + a self-framed body, and the
     // episode must not have been abandoned on timeout.
-    if (!conn.upstream_keep_alive || conn.upstream_abandoned) return false;
+    if (conn.h1_tls_upstream || !conn.upstream_keep_alive || conn.upstream_abandoned) return false;
     // The client→upstream upload must have been fully DELIVERED. A failed body
     // write (initial forward or a streamed chunk) leaves the backend mid-read of a
     // truncated request even though the body counters below may read "complete"
@@ -2296,6 +2297,10 @@ bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
 template <typename Loop>
 bool detach_upstream_close(Loop* loop, Connection& conn) {
     conn.release_backend_active();
+    if (conn.h1_tls_upstream) {
+        h1_tls_detach(loop, conn);
+        return true;
+    }
     if constexpr (requires { loop->detach_upstream_close(conn); }) {
         return loop->detach_upstream_close(conn);
     } else {
@@ -2317,6 +2322,10 @@ bool detach_upstream_close(Loop* loop, Connection& conn) {
 template <typename Loop>
 bool detach_upstream_close_only(Loop* loop, Connection& conn) {
     conn.release_backend_active();
+    if (conn.h1_tls_upstream) {
+        h1_tls_detach(loop, conn);
+        return true;
+    }
     if constexpr (requires { loop->detach_upstream_close(conn); }) {
         return loop->detach_upstream_close(conn);
     } else {
@@ -2330,6 +2339,10 @@ bool detach_upstream_close_only(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 void release_upstream_conn(Loop* loop, Connection& conn) {
+    if (conn.h1_tls_upstream) {
+        h1_tls_detach(loop, conn);
+        return;
+    }
     if (conn.upstream_fd >= 0 && proxy_upstream_reusable(loop, conn)) {
         if constexpr (requires {
                           loop->return_idle_upstream(
@@ -3240,7 +3253,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.state = ConnState::Proxying;
         auto& target = config->upstreams[route->upstream_id];
         if (target.http2 && h1ws_h2_start(loop, conn, route, route->upstream_id)) return;
-        if (target.http2 || target.tls.enabled) {
+        if (target.http2 || (target.tls.enabled && conn.req_wants_upgrade)) {
             conn.pending_handler_fn = nullptr;
             conn.resp_status = 503;
             format_static_response(conn,
@@ -4447,7 +4460,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 auto& target = config->upstreams[upstream_id];
-                if (target.http2 || target.tls.enabled) {
+                if (target.http2 || (target.tls.enabled && conn.req_wants_upgrade)) {
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;
                     format_static_response(conn,
@@ -4974,7 +4987,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 const auto& target = config->upstreams[outcome.upstream_id];
-                if (target.http2 || target.tls.enabled) {
+                if (target.http2 || (target.tls.enabled && conn.req_wants_upgrade)) {
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;
                     format_static_response(conn,
@@ -5117,7 +5130,7 @@ void handle_jit_outcome(Loop* loop,
             auto& target = config->upstreams[outcome.upstream_id];
             if (target.http2 && h1ws_h2_start(loop, conn, selected_route, outcome.upstream_id))
                 return;
-            if (target.http2 || target.tls.enabled) {
+            if (target.http2 || (target.tls.enabled && conn.req_wants_upgrade)) {
                 conn.pending_handler_fn = nullptr;
                 conn.resp_status = 503;
                 format_static_response(conn,
@@ -8917,7 +8930,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             loop->submit_recv_upstream(conn);
             return;
         }
-        if (conn.upstream_fd >= 0) {
+        if (conn.upstream_fd >= 0 && !conn.h1_tls_upstream) {
             const u32 kAvail = conn.upstream_recv_buf.write_avail();
             if (kAvail > 0) {
                 ssize_t nr;
@@ -9651,10 +9664,6 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     if (cfg == nullptr || upstream_id >= cfg->upstream_count ||
         !forward_load_balance_valid(h2->async_load_balance)) {
         h2_proxy_fail(loop, conn, 502);
-        return;
-    }
-    if (cfg->upstreams[upstream_id].tls.enabled) {
-        h2_proxy_fail(loop, conn, 503);
         return;
     }
     http_cache_prepare(conn,
@@ -10823,7 +10832,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             loop->submit_recv_upstream(conn);
             return;
         }
-        if (conn.upstream_fd >= 0) {
+        if (conn.upstream_fd >= 0 && !conn.h1_tls_upstream) {
             const u32 kAvail = conn.upstream_recv_buf.write_avail();
             if (kAvail > 0) {
                 ssize_t nr;

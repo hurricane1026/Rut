@@ -1388,6 +1388,31 @@ let internalService = upstream {
 let orders = upstream { "10.0.1.1:8080" }
 ```
 
+**Implemented HTTP/1.1 HTTPS upstreams:** an upstream's existing `tls` block
+also applies with omitted `protocol` or `.http11`. It requires explicit `ca`
+and `server_name`; optional `cert`/`key` must be provided together for mTLS.
+No insecure verification, system-CA fallback or protocol downgrade is provided.
+HTTP/1 and HTTP/2 clients may forward ordinary requests to this origin.
+
+A shard-local SlicePool sidecar links the logical request to a dedicated
+Connection slot. The transport owns its socket, TLS context/SSL and all I/O
+buffers; the existing backend close ledger retains kernel-visible storage until
+cancellation completions drain. Outbound plaintext is copied into the transport's
+send slice before submission so request/config retirement cannot invalidate an
+in-flight TLS write. Handshake completion is published only after chain,
+hostname/IP and H1 ALPN verification, before forwarding any request bytes.
+Epoll uses the existing socket BIO; io_uring uses TlsEngine with bounded
+single-shot ciphertext receives and its existing ciphertext-send ownership.
+Raw splice/relay paths and plaintext idle-socket reuse exclude this transport.
+TLS contexts live through SSL destruction; all state remains shard-owned.
+
+This first HTTPS transport closes its origin session at request retirement;
+idle TLS pooling is a separate follow-up. Existing HTTP framing, streaming,
+request-buffer limits and ordinary upstream timeout behavior remain in effect.
+Explicit `response_read_timeout` profiles require parent-owned kernel receive
+identity and therefore fail closed before origin contact on this transport.
+H1-to-H1 WebSocket TLS is not enabled by this ordinary-forwarding path.
+
 **Implemented native gRPC gateway path:** the current frontend accepts
 `upstream greeter { host: "127.0.0.1", port: 50051, protocol: .http2 }` and
 `route POST "/package.Service/Method" { return forward(greeter, load_balance: .roundRobin) }`.
@@ -2582,9 +2607,10 @@ the gateway sends a fresh GET Upgrade, validates its Key/Accept and selected
 subprotocol, and maps 101 to downstream status 200. Connection-specific headers
 are removed; rejection bodies retain their bounded HTTP framing. TLS verifies the
 configured identity, requires h2 for H2, and accepts http/1.1 or absent ALPN for H1.
-Ordinary forwarding to an H1 TLS upstream remains an explicit 503; that capability
-is wired through the H2-downstream WebSocket adapter. H1 WebSocket clients may
-use H2 upstreams with verified TLS as well.
+Ordinary HTTP forwarding also supports H1 TLS upstreams through a dedicated
+transport Connection (see §3.4.1); the H2-downstream WebSocket adapter retains its
+separate stream-owned transport. H1 WebSocket clients may use H2 upstreams with
+verified TLS as well.
 
 Accepted HEADERS keep the stream open for duplex DATA, bounded queues and
 independent flow control. Opaque forwarding preserves frame bytes. Inspection

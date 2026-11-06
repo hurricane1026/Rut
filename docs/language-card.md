@@ -531,10 +531,23 @@ send SNI. There is no insecure verification mode, system-CA fallback or protocol
 downgrade. Paths are literal strings (maximum 255 bytes), relative to the
 process working directory when not absolute. `server_name` is at most 253 ASCII
 letters/digits/dots/hyphens; embedded controls and escaped literals are rejected.
-TLS supports `.http2` forwarding and H1 upstreams of the H2 WebSocket bridge.
-Ordinary H1 forwarding to TLS remains unsupported (503). Files are loaded when a new
-pooled upstream session is established, and its TLS context remains alive until
-session teardown. TLS/configuration-file failures return UNAVAILABLE.
+TLS supports `.http2`, ordinary `.http11` forwarding, and H1 upstreams of the
+H2 WebSocket bridge. For HTTPS origins using HTTP/1.1, omit `protocol` or select
+`.http11`; the same `tls` block applies. Both HTTP/1.1 and HTTP/2 downstream
+clients can reach an H1 HTTPS origin. Ordinary H1 HTTPS uses a dedicated pooled
+Connection slot per request; idle TLS sessions are not returned to the plaintext
+upstream socket pool. Request and response streaming retain the existing bounded
+HTTP framing and request admission rules. Epoll and io_uring share the HTTP
+callbacks; io_uring bounds each ciphertext receive by available TLS input space.
+
+An H1 request is sent only after TLS handshake, certificate-chain, hostname/IP,
+and ALPN checks succeed (`http/1.1` or no ALPN). A failed connect/handshake produces
+the existing HTTP proxy failure (normally 502); the ordinary upstream timeout
+still applies. Explicit `response_read_timeout` profiles are not yet supported
+by this transport and fail before contacting the origin. H1-to-H1 WebSocket TLS
+is unchanged; the existing H2 WebSocket bridge keeps its separate transport.
+Files are loaded for each new TLS session, and its context outlives its SSL
+object. HTTP/2 TLS/configuration-file failures retain gRPC UNAVAILABLE.
 
 ### Inbound mTLS pinned identity
 

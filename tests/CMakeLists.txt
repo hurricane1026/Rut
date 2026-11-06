@@ -4099,6 +4099,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_ws_deflate>
         COMMAND $<TARGET_FILE:test_ws_extensions>
         COMMAND $<TARGET_FILE:test_integration>
+        COMMAND $<TARGET_FILE:test_h1_tls_upstream>
         COMMAND $<TARGET_FILE:test_arena>
         COMMAND $<TARGET_FILE:test_expected>
         COMMAND $<TARGET_FILE:test_http_parser>
@@ -4158,7 +4159,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions
+        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions
         COMMENT "Running all tests..."
     )
 else()
@@ -4178,6 +4179,7 @@ else()
         COMMAND $<TARGET_FILE:test_ws_deflate>
         COMMAND $<TARGET_FILE:test_ws_extensions>
         COMMAND $<TARGET_FILE:test_integration>
+        COMMAND $<TARGET_FILE:test_h1_tls_upstream>
         COMMAND $<TARGET_FILE:test_arena>
         COMMAND $<TARGET_FILE:test_expected>
         COMMAND $<TARGET_FILE:test_http_parser>
@@ -4233,7 +4235,7 @@ else()
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_ws_bulk test_ws_deflate test_ws_extensions
+        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_ws_bulk test_ws_deflate test_ws_extensions
         COMMENT "Running non-JIT tests..."
     )
 endif()
@@ -4357,12 +4359,31 @@ if(TARGET check)
     add_dependencies(check check_password_cli)
 endif()
 
-if(RUT_ENABLE_JIT AND Python3_Interpreter_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_h1_tls_upstream test_h1_tls_upstream.cc)
+    target_include_directories(test_h1_tls_upstream PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+    target_link_libraries(test_h1_tls_upstream PRIVATE rut_runtime Threads::Threads)
+    target_compile_definitions(test_h1_tls_upstream PRIVATE
+        RUT_TLS_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+    add_test(NAME test_h1_tls_upstream COMMAND test_h1_tls_upstream)
+    set_tests_properties(test_h1_tls_upstream PROPERTIES LABELS "network" TIMEOUT 60)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
     foreach(backend epoll io_uring)
         add_test(NAME test_forward_auth_${backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_forward_auth.py
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
         set_tests_properties(test_forward_auth_${backend} PROPERTIES
             LABELS "integration" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+
+    foreach(h1_tls_backend epoll io_uring)
+        add_test(NAME test_h1_tls_source_${h1_tls_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_h1_tls_source.py
+                --server $<TARGET_FILE:rut> --fixtures ${CMAKE_CURRENT_SOURCE_DIR}/fixtures
+                --backend ${h1_tls_backend})
+        set_tests_properties(test_h1_tls_source_${h1_tls_backend} PROPERTIES
+            LABELS "network;cli" TIMEOUT 60)
     endforeach()
 endif()

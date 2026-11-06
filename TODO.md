@@ -604,6 +604,10 @@ canonical spelling for common gateway tasks.
 
 ### M2：基础入口与日常流量策略（清单 1、2、4、6）
 
+- [x] 普通 H1 HTTPS 上游：复用 `tls` 配置，HTTP/1 与 HTTP/2 下游可转发；
+  epoll/io_uring 验证证书与身份后发送，支持 mTLS、流式体及取消回收。
+  TLS 空闲池与显式 response-read-deadline profile 尚未覆盖，边界见语言卡。
+
 - [ ] 将已有 HTTP/HTTPS、HTTP/2、WebSocket 能力接入统一 Rut 场景入口并补齐差距。
 - [ ] Rut 模块实现 Host/路径/方法/header/query 条件路由、版本路由、重写、重定向、
   固定响应、维护页、CORS、IP/CIDR/URI/UA/Referer 规则及请求 ID。

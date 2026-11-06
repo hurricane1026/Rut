@@ -9,6 +9,8 @@
 #include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/drain.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/h1_tls_upstream.h"
+#include "rut/runtime/http2_conn.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"  // jit::HandlerCtx for fire_due_timers
@@ -74,10 +76,27 @@ public:
         return self().submit_send_impl(c, buf, len);
     }
     bool submit_connect(Connection& c, const void* addr, u32 addr_len) {
+        if constexpr (
+            requires {
+                self().pool.alloc();
+                self().tls_setup(c);
+            } ||
+            requires {
+                self().pool.alloc();
+                self().backend.add_send_tls(c, c.send_buf.data(), 1u);
+            }) {
+            if (c.request_config && c.upstream_idx < c.request_config->upstream_count) {
+                const auto& target = c.request_config->upstreams[c.upstream_idx];
+                if (target.tls.enabled && !target.http2 && !c.h1_tls_transport &&
+                    !(c.h2 && c.h2->grpc.upstream))
+                    return h1_tls_connect(&self(), c, addr, addr_len);
+            }
+        }
         return self().submit_connect_impl(c, addr, addr_len);
     }
     void close_conn(Connection& c) {
         if (password_gateway) password_gateway->cancel(c.id);
+        if (c.h1_tls_upstream) h1_tls_detach(&self(), c);
         c.release_backend_active();
         if (c.ws_session_started && !c.ws_session_close_notified) {
             c.ws_session_close_notified = true;
@@ -122,9 +141,13 @@ public:
 
     // Upstream I/O: send/recv on upstream_fd instead of fd.
     bool submit_send_upstream(Connection& c, const u8* buf, u32 len) {
+        if (c.h1_tls_upstream) return h1_tls_send(&self(), c, buf, len);
         return self().submit_send_upstream_impl(c, buf, len);
     }
-    bool submit_recv_upstream(Connection& c) { return self().submit_recv_upstream_impl(c); }
+    bool submit_recv_upstream(Connection& c) {
+        if (c.h1_tls_upstream) return h1_tls_recv(&self(), c);
+        return self().submit_recv_upstream_impl(c);
+    }
 
     // Stop watching the upstream fd for readability (used by @throttle to park the
     // proxy body pump between byte-rate windows). On backends with a persistent
@@ -140,6 +163,7 @@ public:
     // caller that ignores the result into a compile error. (epoll's pause can't
     // fail and returns true, so fail-closed checks are no-ops there.)
     [[nodiscard]] bool pause_upstream_recv(Connection& c) {
+        if (c.h1_tls_upstream) return h1_tls_pause(&self(), c);
         if constexpr (requires { static_cast<bool>(self().pause_upstream_recv_impl(c)); }) {
             return static_cast<bool>(self().pause_upstream_recv_impl(c));
         } else if constexpr (requires { self().pause_upstream_recv_impl(c); }) {

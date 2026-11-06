@@ -312,9 +312,13 @@ struct EchoServer {
         }
         u8 accept[16384];
         u32 offers = 0;
-        if (ready &&
-            ws_prepare_handshake(bytes, parser.header_end, accept, sizeof(accept), &offers) ==
-                WsHandshakeRequestResult::Ready) {
+        if (ready && request.path.eq(lit_str("/ordinary"))) {
+            static constexpr char reply[] =
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            (void)send_bytes(reinterpret_cast<const u8*>(reply), sizeof(reply) - 1);
+        } else if (ready && ws_prepare_handshake(
+                                bytes, parser.header_end, accept, sizeof(accept), &offers) ==
+                                WsHandshakeRequestResult::Ready) {
             server->requests++;
             const u32 mode = server->reply_mode.exchange(0);
             char response[512];
@@ -1264,8 +1268,8 @@ void websocket_h2_case(rut::test::TestCase* _tc,
                                          client.session, nullptr, ordinary, 4, nullptr, nullptr),
                                      33);
                             CHECK(client.until(16, true));
-                            CHECK_EQ(client.rpcs[16].http_status, 503u);
-                            CHECK_EQ(server->accepts.load(), accepted);
+                            CHECK_EQ(client.rpcs[16].http_status, 200u);
+                            CHECK_EQ(server->accepts.load(), accepted + 1);
                         }
                     }
 #if RUT_GRPC_JIT || RUT_GRPC_NATIVE

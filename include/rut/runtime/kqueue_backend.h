@@ -53,6 +53,7 @@ struct KqueueBackend {
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 episode);
     bool add_send_tls(Connection& conn, const u8* buf, u32 len);
+    bool add_recv_tls(Connection& conn);
     bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 episode);
     u32 cancel(
         i32 fd, u32 conn_id, bool = false, bool = false, bool = false, bool = false, bool = false);
