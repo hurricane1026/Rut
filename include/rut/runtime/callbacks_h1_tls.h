@@ -84,9 +84,8 @@ void h1_tls_closed(void* lp, Connection& transport) {
     const bool send_inflight = transport.on_send == &h1_tls_sent<Loop>;
     bool buffered_response_preserved = true;
     if (owner && ready && send_inflight && transport.recv_buf.len()) {
-        if (!owner->upstream_recv_buf.write_avail() && !loop->alloc_upstream_buf(*owner)) {
-            buffered_response_preserved = false;
-        } else if (transport.recv_buf.len() > owner->upstream_recv_buf.write_avail()) {
+        if ((!owner->upstream_recv_buf.write_avail() && !loop->alloc_upstream_buf(*owner)) ||
+            transport.recv_buf.len() > owner->upstream_recv_buf.write_avail()) {
             buffered_response_preserved = false;
         } else {
             const u32 buffered_len = transport.recv_buf.len();
