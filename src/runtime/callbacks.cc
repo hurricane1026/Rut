@@ -1257,7 +1257,9 @@ template void record_probe_if_current<NativeReactorEventLoop>(NativeReactorEvent
 
 #ifdef __linux__
 template void h1_tls_detach<IoUringEventLoop>(IoUringEventLoop*, Connection&);
-template bool h1_tls_dispatch_owner_event<IoUringEventLoop>(IoUringEventLoop*, Connection&, IoEvent);
+template bool h1_tls_dispatch_owner_event<IoUringEventLoop>(IoUringEventLoop*,
+                                                            Connection&,
+                                                            IoEvent);
 template void on_request_complete<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16, u32);
 template void pipeline_dispatch<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void on_header_received<IoUringEventLoop>(void*, Connection&, IoEvent);

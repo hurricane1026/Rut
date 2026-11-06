@@ -90,18 +90,17 @@ void h1_tls_closed(void* lp, Connection& transport) {
     owner->upstream_fd = -1;
     IoEvent failure{};
     failure.conn_id = owner->id;
-    failure.type = !ready ? IoEventType::UpstreamConnect
-                   : send_inflight ||
-                             (owner->pending_handler_fn &&
-                              yield_kind_matches_event(owner->pending_yield_kind,
-                                                       IoEventType::UpstreamSend))
-                       ? IoEventType::UpstreamSend
-                   : owner->on_upstream_recv ||
-                             (owner->pending_handler_fn &&
-                              yield_kind_matches_event(owner->pending_yield_kind,
-                                                       IoEventType::UpstreamRecv))
-                       ? IoEventType::UpstreamRecv
-                       : IoEventType::UpstreamSend;
+    failure.type =
+        !ready ? IoEventType::UpstreamConnect
+        : send_inflight ||
+                (owner->pending_handler_fn &&
+                 yield_kind_matches_event(owner->pending_yield_kind, IoEventType::UpstreamSend))
+            ? IoEventType::UpstreamSend
+        : owner->on_upstream_recv ||
+                (owner->pending_handler_fn &&
+                 yield_kind_matches_event(owner->pending_yield_kind, IoEventType::UpstreamRecv))
+            ? IoEventType::UpstreamRecv
+            : IoEventType::UpstreamSend;
     failure.result = clean && failure.type == IoEventType::UpstreamRecv ? 0 : -ECONNRESET;
     // A failed handshake belongs to the connect continuation. After handshake,
     // a pending upload owns send failure; otherwise the response owns EOF.
