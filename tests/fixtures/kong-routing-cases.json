@@ -1,0 +1,450 @@
+[
+  {
+    "id": "get-query",
+    "method": "GET",
+    "path": "/api/users?x=1&x=2",
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/users?x=1&x=2",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/users?x=1&x=2",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "post-body",
+    "method": "POST",
+    "path": "/api/users",
+    "body": "hello",
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "hello",
+      "origin": "api",
+      "path": "/api/users",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "hello",
+      "origin": "api",
+      "path": "/api/users",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "head",
+    "method": "HEAD",
+    "path": "/api/users",
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "",
+      "origin": "api",
+      "path": "/api/users",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "",
+      "origin": "api",
+      "path": "/api/users",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "delete",
+    "method": "DELETE",
+    "path": "/api/item",
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/item",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/item",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "fallback-root",
+    "method": "GET",
+    "path": "/",
+    "headers": {
+      "X-Policy": "spoofed"
+    },
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/",
+      "policy": "global"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/",
+      "policy": "global"
+    }
+  },
+  {
+    "id": "slash-prefix-boundary",
+    "method": "GET",
+    "path": "/apifoo",
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/apifoo",
+      "policy": "global"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/apifoo",
+      "policy": "global"
+    }
+  },
+  {
+    "id": "slash-prefix-no-slash",
+    "method": "GET",
+    "path": "/api",
+    "classification": "known-difference",
+    "reason": "Rut canonicalizes a trailing slash in the route declaration; Kong requires that slash to match this prefix.",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/api",
+      "policy": "global"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "case-sensitive",
+    "method": "GET",
+    "path": "/API/users",
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/API/users",
+      "policy": "global"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/API/users",
+      "policy": "global"
+    }
+  },
+  {
+    "id": "route-denial",
+    "method": "GET",
+    "path": "/api/admin",
+    "classification": "equivalent",
+    "kong": {
+      "status": 403,
+      "body": "blocked",
+      "origin": null,
+      "path": null,
+      "policy": null
+    },
+    "rut": {
+      "status": 403,
+      "body": "blocked",
+      "origin": null,
+      "path": null,
+      "policy": null
+    }
+  },
+  {
+    "id": "route-policy",
+    "method": "GET",
+    "path": "/api/override",
+    "headers": {
+      "X-Policy": "spoofed"
+    },
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/override",
+      "policy": "route"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/override",
+      "policy": "route"
+    }
+  },
+  {
+    "id": "service-policy",
+    "method": "GET",
+    "path": "/catalog/items",
+    "headers": {
+      "X-Policy": "spoofed"
+    },
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/catalog/items",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/catalog/items",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "prefix-boundary-gap",
+    "method": "GET",
+    "path": "/catalogue",
+    "classification": "known-difference",
+    "reason": "Kong matches a byte prefix; the existing Rut route contract matches segment prefixes.",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/catalogue",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/catalogue",
+      "policy": "global"
+    }
+  },
+  {
+    "id": "double-slash-gap",
+    "method": "GET",
+    "path": "/api//users",
+    "classification": "known-difference",
+    "reason": "Kong collapses duplicate path separators before forwarding; Rut preserves the raw target.",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/users",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api//users",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "unreserved-gap",
+    "method": "GET",
+    "path": "/api/%75sers",
+    "classification": "known-difference",
+    "reason": "Kong decodes percent-encoded unreserved bytes before forwarding; Rut preserves the raw target.",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/users",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/%75sers",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "dot-segment-gap",
+    "method": "GET",
+    "path": "/api/../else",
+    "classification": "known-difference",
+    "reason": "Kong removes dot segments before route selection and forwarding; Rut selects and forwards the raw path.",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/else",
+      "policy": "global"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/api/../else",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "host-match",
+    "method": "GET",
+    "path": "/hosted",
+    "headers": {
+      "Host": "special.example.test"
+    },
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/hosted",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/hosted",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "host-fallback",
+    "method": "GET",
+    "path": "/hosted",
+    "headers": {
+      "Host": "other.example.test"
+    },
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/hosted",
+      "policy": "global"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/hosted",
+      "policy": "global"
+    }
+  },
+  {
+    "id": "header-match",
+    "method": "GET",
+    "path": "/header",
+    "headers": {
+      "X-Variant": "blue"
+    },
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/header",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "api",
+      "path": "/header",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "header-fallback",
+    "method": "GET",
+    "path": "/header",
+    "headers": {
+      "X-Variant": "red"
+    },
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/header",
+      "policy": "global"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/header",
+      "policy": "global"
+    }
+  },
+  {
+    "id": "method-match",
+    "method": "POST",
+    "path": "/method",
+    "body": "method-body",
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "method-body",
+      "origin": "api",
+      "path": "/method",
+      "policy": "service"
+    },
+    "rut": {
+      "status": 200,
+      "body": "method-body",
+      "origin": "api",
+      "path": "/method",
+      "policy": "service"
+    }
+  },
+  {
+    "id": "method-fallback",
+    "method": "GET",
+    "path": "/method",
+    "classification": "equivalent",
+    "kong": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/method",
+      "policy": "global"
+    },
+    "rut": {
+      "status": 200,
+      "body": "ok",
+      "origin": "fallback",
+      "path": "/method",
+      "policy": "global"
+    }
+  }
+]
