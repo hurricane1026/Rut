@@ -182,6 +182,10 @@ Text policy_source(const Text& module, const Text& groups) {
         "\"auditors\")",
         "requireAll(claims, \"readers\", "
         "\"\")",
+        "requireExcept(claims, \"readers\", \"suspended\")",
+        "requireExcept(claims, \"readers\", \"readers\")",
+        "requireExcept(claims, \"\", \"suspended\")",
+        "requireExcept(claims, \"readers\", \"\")",
     };
     for (u32 i = 0; i < sizeof(kPolicies) / sizeof(kPolicies[0]); ++i) {
         source += "route GET \"/" + num(i) +
@@ -284,6 +288,56 @@ void matrix(test::TestCase* _tc, Invoke invoke) {
     for (u32 i = 4; i < 8; ++i) {
         check_headers(i, kHeaders, 503);
         check_headers(i, "", 401);
+    }
+    auto check_except = [&](const Text& document, u16 expected) {
+        const Text kSigned = token(document);
+        REQUIRE(kSigned.good());
+        REQUIRE(!kSigned.empty());
+        check_headers(8,
+                      "Authorization: Bearer " + kSigned +
+                          "\r\nX-Consumer-Groups: readers\r\nX-Consumer-ID: alice\r\n",
+                      expected);
+    };
+    check_except(claims(",\"groups\":[\"readers\"]"), 204);
+    check_except(claims(",\"groups\":[\"readers\",\"auditors\"]"), 204);
+    check_except(claims(",\"groups\":[\"readers\",\"suspended\"]"), 403);
+    check_except(claims(",\"groups\":[\"suspended\",\"readers\"]"), 403);
+    check_except(claims(",\"groups\":[\"suspended\"]"), 403);
+    check_except(claims(",\"groups\":[\"other\"]"), 403);
+    check_except(claims(",\"groups\":[\"readers\",\"Suspended\",\"suspended:extra\"]"), 204);
+    check_except(claims(",\"groups\":[\"readers\",\"susp\\u0065nded\"]"), 403);
+    check_except(claims(",\"groups\":[\"r\\u0065aders\"]"), 204);
+    check_except(claims(",\"gr\\u006fups\":[\"readers\",\"suspended\"]"), 403);
+    check_except(claims(",\"groups\":[\"readers\",\"readers\"]"), 204);
+    check_except(claims(""), 403);
+    check_except(claims(",\"scope\":\"readers\""), 403);
+    for (const char* value : malformed) check_except(claims(Text(",\"groups\":") + value), 403);
+    check_except(claims(",\"groups\":[\"readers\",null,\"suspended\"]"), 403);
+    check_except(claims(",\"groups\":[\"readers\"],\"groups\":[\"other\"]"), 401);
+    check_except(
+        "{\"sub\":\"alice\",\"iss\":\"wrong\",\"aud\":\"gateway\",\"exp\":4102444800,"
+        "\"groups\":[\"readers\"]}",
+        401);
+    check_except(
+        "{\"sub\":\"alice\",\"iss\":\"issuer\",\"aud\":\"other\",\"exp\":4102444800,"
+        "\"groups\":[\"readers\"]}",
+        401);
+    check_except(
+        "{\"sub\":\"alice\",\"iss\":\"issuer\",\"aud\":\"gateway\",\"exp\":1,"
+        "\"groups\":[\"readers\"]}",
+        401);
+    const Text kReader = token(claims(",\"groups\":[\"readers\"]"));
+    REQUIRE(kReader.good());
+    Text forged_reader = kReader;
+    const u32 kSignature = forged_reader.find_last_of('.') + 1;
+    forged_reader.value[kSignature] = kReader.value[kSignature] == 'A' ? 'B' : 'A';
+    for (u32 route = 8; route < 12; ++route) {
+        check_headers(route, "", 401);
+        check_headers(route, "X-Consumer-Groups: readers\r\n", 401);
+        check_headers(route, "Authorization: Bearer " + forged_reader + "\r\n", 401);
+        const Text kReaderHeaders = "Authorization: Bearer " + kReader + "\r\n";
+        check_headers(route, kReaderHeaders + kReaderHeaders, 401);
+        check_headers(route, kReaderHeaders, route == 8 ? 204 : route == 9 ? 403 : 503);
     }
 }
 
@@ -464,7 +518,7 @@ TEST(jwt_group_policies, native_policies_survive_source_and_module_removal) {
     bool const kLoaded = load_native_program(source.path, *program, error, sizeof(error));
     if (!kLoaded) fprintf(stderr, "%s\n", error);
     REQUIRE(kLoaded);
-    REQUIRE_EQ(program->config.route_count, 8u);
+    REQUIRE_EQ(program->config.route_count, 12u);
     REQUIRE_EQ(unlink(source.path), 0);
     REQUIRE_EQ(unlink(imported.path), 0);
     REQUIRE_EQ(unlink(groups.path), 0);

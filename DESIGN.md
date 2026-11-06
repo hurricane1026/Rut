@@ -10262,3 +10262,13 @@ monotonic deadline includes queueing and all network phases; terminal results
 are copied into request-owned storage before a slot can be reused. Cancellation
 and worker shutdown precede storage release. No response field changes identity,
 request routing or downstream output without explicit Rut code.
+
+### JWT group exclusion composition
+
+`jwt_groups.requireExcept` composes positive membership with an explicit excluded
+group over the same authenticated JSON document. Positive membership validates
+the full groups array before a negative membership result can allow access;
+exclusion wins for overlap and identical names. Signature and claims verification
+remain mandatory caller responsibilities. The
+[language card](docs/language-card.md#jwt-group-exclusion-policy) defines the
+fail-closed behavior. No keyword, runtime ABI or dependency changes are needed.

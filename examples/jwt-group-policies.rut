@@ -19,3 +19,12 @@ route GET "/sensitive-reports" {
     let subject = identity.consumerId
     return response(200, body: subject)
 }
+
+// Exclusion wins even when the authenticated subject is also an analyst.
+route GET "/active-reports" {
+    let claims = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(claims, env("JWT_ISSUER"), env("JWT_AUDIENCE"), "active-report-policy")
+    let allowed = jwt_groups.requireExcept(claims, "analysts", "suspended")
+    let subject = identity.consumerId
+    return response(200, body: subject)
+}

@@ -2764,3 +2764,15 @@ fan-out, streaming callout bodies, explicit `wait` mixed with calls, timer or
 WebSocket callbacks, or the specialized password/forward-auth prefix in the same
 handler. Direct `guard let x = httpCall(...)` and equivalent unbound calls in
 conditions are rejected: use `let result = ...` then `guard let x = result`.
+
+## JWT group exclusion policy
+
+`jwt_groups.requireExcept(document, required, excluded)` requires a nonempty
+valid signed `groups` array containing `required` and not containing `excluded`.
+Both configured names must be nonempty (503 otherwise). Exact case-sensitive
+exclusion wins on overlap or identical names; malformed or absent groups fail
+closed with 403 and the Bearer insufficient-scope challenge. It returns the same
+JSON document; authenticate signature and claims first, and publish identity
+after success. This ordinary library helper adds no language syntax or runtime
+ABI. See [auth coverage](auth-coverage.md#jwt-required-group-with-exclusion) and
+[jwt-group-policies.rut](../examples/jwt-group-policies.rut).

@@ -1262,3 +1262,26 @@ See [jwt-group-policies.rut](../examples/jwt-group-policies.rut). The focused
 including deletion of the importing source and helper modules before execution.
 The policy is configuration-owned; no dynamic group registry, OIDC session or
 persistent membership lifecycle is added.
+
+## JWT required group with exclusion
+
+`jwt_groups.requireExcept(document, required, excluded)` requires the exact
+signed `required` group and rejects the exact `excluded` group. Exclusion wins
+when both occur, including when the configured names are identical. The helper
+returns the original verified document unchanged. Authenticate and validate claims
+before calling it, then publish identity only after authorization succeeds.
+
+The positive membership check validates the whole nonempty string array first:
+missing, empty, malformed or mixed-type `groups` return 403 rather than becoming
+an allow through a negated membership check. Rejection includes the existing
+Bearer insufficient-scope challenge. Matching remains case-sensitive, with JSON
+escapes decoded; prefixes and forged group headers confer no membership. Either
+empty configured name returns 503 after the caller's authentication check.
+
+The JIT and relocated-native matrix checks allow/deny overlap, order, repeated
+names and memberships, malformed arrays, escaping, wrong signatures/claims and
+duplicate Authorization. Native tests remove source and imported modules before
+execution. See the `/active-reports` route in
+[jwt-group-policies.rut](../examples/jwt-group-policies.rut). This is signed-claim
+authorization, not live group revocation: token contents remain valid until the
+existing signature/time/revocation policy rejects them.
