@@ -31,6 +31,7 @@ struct Origin {
     bool mtls = false;
     bool stall = false;
     bool hold_after_response = false;
+    bool reject_early = false;
     u32 stopping = 0;
     u32 requests = 0;
     u32 uploaded = 0;
@@ -88,6 +89,17 @@ struct Origin {
                 }
                 if (const char* end = strstr(s.request, "\r\n\r\n")) {
                     __atomic_fetch_add(&s.headers, 1u, __ATOMIC_RELEASE);
+                    if (s.reject_early) {
+                        static constexpr char kRejected[] =
+                            "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n"
+                            "Connection: close\r\n\r\n";
+                        __atomic_fetch_add(&s.requests, 1u, __ATOMIC_RELEASE);
+                        if (SSL_write(ssl, kRejected, sizeof(kRejected) - 1) > 0)
+                            (void)SSL_shutdown(ssl);
+                        if (ssl) SSL_free(ssl);
+                        close(client);
+                        continue;
+                    }
                     if (const char* length = strstr(s.request, "Content-Length: ")) {
                         u32 expected = 0;
                         for (length += 16; *length >= '0' && *length <= '9'; ++length)
@@ -162,6 +174,17 @@ void h1_tls_plaintext_probe(void*, Connection& owner, IoEvent ev) {
     owner.on_upstream_recv = nullptr;
 }
 
+bool g_h1_tls_close_send_failed = false;
+bool g_h1_tls_close_response_preserved = false;
+void h1_tls_close_send_probe(void*, Connection& owner, IoEvent ev) {
+    static constexpr char kExpected[] = "HTTP/1.1 413 Payload Too Large\r\n\r\n";
+    g_h1_tls_close_send_failed = ev.type == IoEventType::UpstreamSend && ev.result < 0;
+    g_h1_tls_close_response_preserved =
+        owner.upstream_recv_buf.len() == sizeof(kExpected) - 1 &&
+        memcmp(owner.upstream_recv_buf.data(), kExpected, sizeof(kExpected) - 1) == 0;
+    owner.on_upstream_send = nullptr;
+}
+
 bool finish_memory_tls_handshake(TlsEngine& engine, SSL* client) {
     u8 client_to_server[16384];
     u8 server_to_client[16384];
@@ -225,12 +248,14 @@ void exercise(rut::test::TestCase* _tc,
               bool invalid_ca = false,
               bool response_timeout = false,
               bool hold_after_response = false,
-              bool slow_client = false) {
+              bool slow_client = false,
+              bool reject_early = false) {
     signal(SIGPIPE, SIG_IGN);
     Origin origin;
     origin.mtls = mtls;
     origin.stall = cancel || response_timeout;
     origin.hold_after_response = hold_after_response;
+    origin.reject_early = reject_early;
     if (hold_after_response) origin.body_size = 16384;
     if (slow_client) origin.body_size = 2 * 1024 * 1024;
     REQUIRE(origin.start());
@@ -335,7 +360,7 @@ void exercise(rut::test::TestCase* _tc,
             const auto written = ssl ? SSL_write(ssl, body, static_cast<int>(n))
                                      : send(client, body, n, MSG_NOSIGNAL);
             if (written <= 0) {
-                CHECK(false);
+                if (!reject_early) CHECK(false);
                 break;
             }
             sent += static_cast<u32>(written);
@@ -375,6 +400,9 @@ void exercise(rut::test::TestCase* _tc,
         if (bad_name || invalid_ca) {
             CHECK(strstr(prefix, " 502 ") || strstr(prefix, " 503 "));
             CHECK_EQ(__atomic_load_n(&origin.requests, __ATOMIC_ACQUIRE), 0u);
+        } else if (reject_early) {
+            CHECK(strstr(prefix, " 413 "));
+            CHECK_EQ(__atomic_load_n(&origin.requests, __ATOMIC_ACQUIRE), 1u);
         } else if (response_timeout) {
             CHECK(strstr(prefix, " 504 "));
         } else {
@@ -429,6 +457,68 @@ void exercise(rut::test::TestCase* _tc,
         shard.value->loop->tls_server = nullptr;
         destroy_tls_server_context(inbound);
     }
+}
+
+struct VoidQuiesceBackend {
+    bool called = false;
+    void quiesce_recv(u32, bool, u32) { called = true; }
+};
+
+struct VoidQuiesceLoop {
+    VoidQuiesceBackend backend;
+};
+
+TEST(h1_tls_upstream, void_quiesce_backend_pause_contract) {
+    Connection owner{};
+    Connection transport{};
+    H1TlsUpstream state{};
+    state.owner = &owner;
+    state.transport = &transport;
+    owner.h1_tls_upstream = &state;
+    VoidQuiesceLoop loop{};
+    CHECK(h1_tls_pause(&loop, owner));
+    CHECK(loop.backend.called);
+    CHECK_FALSE(state.receiving);
+    owner.h1_tls_upstream = nullptr;
+}
+
+TEST(h1_tls_upstream, close_preserves_tls_response_before_send_failure) {
+    Mapped<EpollEventLoop> mapped;
+    REQUIRE(mapped.value != nullptr);
+    EpollEventLoop& loop = *mapped.value;
+    REQUIRE(loop.pool.init(4).has_value());
+
+    Connection owner{};
+    Connection transport{};
+    owner.id = 1;
+    owner.upstream_fd = 7;
+    static constexpr char kResponse[] = "HTTP/1.1 413 Payload Too Large\r\n\r\n";
+    u8 owner_storage[128]{};
+    u8 transport_storage[128]{};
+    owner.upstream_recv_buf.bind(owner_storage, sizeof(owner_storage));
+    transport.recv_buf.bind(transport_storage, sizeof(transport_storage));
+    REQUIRE_EQ(
+        transport.recv_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1),
+        sizeof(kResponse) - 1);
+    H1TlsUpstream* state = reinterpret_cast<H1TlsUpstream*>(loop.pool.alloc());
+    REQUIRE(state != nullptr);
+    ::new (state) H1TlsUpstream{};
+    state->owner = &owner;
+    state->transport = &transport;
+    state->ready = true;
+    owner.h1_tls_upstream = state;
+    owner.on_upstream_send = &h1_tls_close_send_probe;
+    transport.h1_tls_transport = state;
+    transport.on_send = &h1_tls_sent<EpollEventLoop>;
+    g_h1_tls_close_send_failed = false;
+    g_h1_tls_close_response_preserved = false;
+
+    h1_tls_closed<EpollEventLoop>(&loop, transport);
+    CHECK(g_h1_tls_close_send_failed);
+    CHECK(g_h1_tls_close_response_preserved);
+    CHECK_EQ(owner.h1_tls_upstream, nullptr);
+    CHECK_EQ(owner.upstream_recv_buf.len(), sizeof(kResponse) - 1);
+    loop.pool.destroy();
 }
 }  // namespace
 
@@ -571,6 +661,14 @@ TEST(h1_tls_upstream, epoll_post_upload) {
 }
 TEST(h1_tls_upstream, iouring_post_upload) {
     exercise<IoUringEventLoop>(_tc, false, false, false, false, 48000);
+}
+TEST(h1_tls_upstream, epoll_tls_early_413_during_upload) {
+    exercise<EpollEventLoop>(
+        _tc, false, false, false, false, 2 * 1024 * 1024, false, false, false, false, true);
+}
+TEST(h1_tls_upstream, iouring_tls_early_413_during_upload) {
+    exercise<IoUringEventLoop>(
+        _tc, false, false, false, false, 2 * 1024 * 1024, false, false, false, false, true);
 }
 TEST(h1_tls_upstream, epoll_bad_ca) {
     exercise<EpollEventLoop>(_tc, false, false, false, false, 0, true);

@@ -47,9 +47,14 @@ bool h1_tls_pause(Loop* loop, Connection& owner) {
     auto& transport = *state->transport;
     if constexpr (requires { loop->pause_recv(transport); })
         return loop->pause_recv(transport);
-    else if constexpr (requires { loop->backend.quiesce_recv(transport.id, false, 0); })
-        return loop->backend.quiesce_recv(transport.id, false, 0);
-    else if constexpr (requires { loop->backend.pause_recv(transport.id, true); }) {
+    else if constexpr (requires {
+                           static_cast<bool>(loop->backend.quiesce_recv(transport.id, false, 0));
+                       })
+        return static_cast<bool>(loop->backend.quiesce_recv(transport.id, false, 0));
+    else if constexpr (requires { loop->backend.quiesce_recv(transport.id, false, 0); }) {
+        loop->backend.quiesce_recv(transport.id, false, 0);
+        return true;
+    } else if constexpr (requires { loop->backend.pause_recv(transport.id, true); }) {
         loop->backend.pause_recv(transport.id, true);
         return true;
     } else
@@ -77,6 +82,18 @@ void h1_tls_closed(void* lp, Connection& transport) {
     const bool clean = state->ready && ssl && (SSL_get_shutdown(ssl) & SSL_RECEIVED_SHUTDOWN);
     const bool ready = state->ready;
     const bool send_inflight = transport.on_send == &h1_tls_sent<Loop>;
+    bool buffered_response_preserved = true;
+    if (owner && ready && send_inflight && transport.recv_buf.len()) {
+        if (!owner->upstream_recv_buf.write_avail() && !loop->alloc_upstream_buf(*owner)) {
+            buffered_response_preserved = false;
+        } else if (transport.recv_buf.len() > owner->upstream_recv_buf.write_avail()) {
+            buffered_response_preserved = false;
+        } else {
+            const u32 buffered_len = transport.recv_buf.len();
+            owner->upstream_recv_buf.write(transport.recv_buf.data(), buffered_len);
+            transport.recv_buf.consume(buffered_len);
+        }
+    }
     transport.h1_tls_transport = nullptr;
     if (transport.tls_engine.ssl) tls_engine_free(transport.tls_engine);
     if (transport.tls) {
@@ -104,7 +121,8 @@ void h1_tls_closed(void* lp, Connection& transport) {
     failure.result = clean && failure.type == IoEventType::UpstreamRecv ? 0 : -ECONNRESET;
     // A failed handshake belongs to the connect continuation. After handshake,
     // a pending upload owns send failure; otherwise the response owns EOF.
-    if (!h1_tls_dispatch_owner_event(loop, *owner, failure)) loop->close_conn(*owner);
+    if (!buffered_response_preserved || !h1_tls_dispatch_owner_event(loop, *owner, failure))
+        loop->close_conn(*owner);
 }
 
 template <typename Loop>
