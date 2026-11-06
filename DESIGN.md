@@ -10272,3 +10272,19 @@ exclusion wins for overlap and identical names. Signature and claims verificatio
 remain mandatory caller responsibilities. The
 [language card](docs/language-card.md#jwt-group-exclusion-policy) defines the
 fail-closed behavior. No keyword, runtime ABI or dependency changes are needed.
+
+### OPA authorization library and callout frame scope
+
+The ordinary `middleware/opa.rut` library composes `httpCall` with OPA Data API
+request envelopes and exact Boolean or structured decisions. Authentication
+precedes explicitly selected input construction; undefined/false decisions deny,
+and malformed/unavailable decisions fail closed. No OPA configuration syntax or
+Rego engine is added. See [the executable contract](docs/opa-authorization.md).
+
+MIR reserves 32 blocks for the existing eight route guards, call continuations
+and terminal control. Callout codegen conservatively persists values preceding
+a reachable later call, all Phi results, and cross-block operands. Block-local
+values created after the last reachable call use ordinary LLVM SSA storage.
+This keeps response JSON validation out of the suspension frame without raising
+its 8 KiB runtime bound or replaying earlier effects. Cross-block storage retains
+support for RIR block IDs that are not in producer order.

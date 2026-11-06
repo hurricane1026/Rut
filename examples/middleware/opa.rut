@@ -1,0 +1,46 @@
+// OPA Data API over a caller-selected, configuration-owned httpCall endpoint.
+// Supply authenticated identity and explicitly selected request context as input.
+// No client headers, credentials or identity fields are copied implicitly.
+func request(_ input: Json) -> Json {
+    guard let envelope = json.value({input: input}) else { nil }
+    guard let body = json(envelope) else { nil }
+    guard let headers = json.parse("{\"Content-Type\":\"application/json\"}") else { nil }
+    json.value({method: "POST", headers: headers, body: body})
+}
+
+// Internal transport validation. HTTP success alone never grants access.
+// Pass only a result from httpCall, not JSON supplied by the downstream client.
+func document(_ reply: Json) -> Json {
+    guard json.bool(json.get(reply, "/ok").or(reply)).or(false) &&
+        json.int(json.get(reply, "/status").or(reply)).or(0) == 200 else { nil }
+    guard let parsed = json.parse(json.string(json.get(reply, "/body").or(reply)).or("")) else { nil }
+    guard json.kind(parsed).or("") == "object" else { nil }
+    parsed
+}
+
+// Boolean rule: {"result": true}. OPA omits result for undefined rules.
+// Explicit false / undefined => 403; malformed or unavailable service => 503.
+func booleanStatus(_ parsed: Json) -> i32 {
+    guard let result = json.get(parsed, "/result") else { 403 }
+    guard let allow = json.bool(result) else { 503 }
+    if allow { 200 } else { 403 }
+}
+
+func requireAllow(_ reply: Json) -> Json {
+    guard let parsed = document(reply) else { respond 503 }
+    let status = booleanStatus(parsed)
+    guard status != 503 else { respond 503 }
+    guard status == 200 else { respond 403 }
+    parsed
+}
+
+// Structured rule: {"result": {"allow": true, ...}}. Return the decision
+// object only after allow succeeds; callers explicitly validate/map other fields.
+func requireDecision(_ reply: Json) -> Json {
+    guard let parsed = document(reply) else { respond 503 }
+    guard let result = json.get(parsed, "/result") else { respond 403 }
+    // parsed is an object, so the fallback can never decode as Boolean.
+    guard let allow = json.bool(json.get(result, "/allow").or(parsed)) else { respond 503 }
+    guard allow else { respond 403 }
+    result
+}

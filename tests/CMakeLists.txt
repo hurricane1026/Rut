@@ -4400,6 +4400,11 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
     foreach(backend epoll io_uring)
+        add_test(NAME test_opa_auth_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_opa_auth.py
+                --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
+        set_tests_properties(test_opa_auth_${backend} PROPERTIES
+            LABELS "integration" TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME test_http_call_${backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_http_call.py
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})

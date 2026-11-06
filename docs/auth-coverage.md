@@ -23,7 +23,7 @@ whether a competing open-source edition includes them.
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Fixed-profile five-claim HS256 issuance through native and Rut/JIT APIs; six-claim `jti` variant through native and Rut/JIT; static two-ID revocation helper | General token re-signing, arbitrary claims, non-HS256 signing, live or durable revocation |
-| Forward auth / OPA | **Partial** | `forwardAuthHeader`: fixed verified HTTPS, one allowlisted identity field, credential stripping, bounded response, explicit deny/unavailable/timeout and cancellation. OPA envelopes and multi-field mapping remain pending; see [language card](language-card.md#forward-auth-prefix). |
+| Forward auth / OPA | **Bounded profiles implemented** | `forwardAuthHeader` retains its specialized fixed HTTPS prefix. Composable `httpCall` plus `opa.request`, `opa.requireAllow` and `opa.requireDecision` implement OPA Data API Boolean/structured authorization, explicit JSON input and decision-field consumption, fail-closed deny/undefined/error handling and native-loaded two-backend TLS tests. See [OPA authorization](opa-authorization.md). Embedded Rego, automatic arbitrary field mapping and distributed decision caching are outside this slice. |
 | OAuth2 introspection | Pending | RFC 7662 active/expiry/audience checks, authenticated TLS endpoint, bounded cache, invalidation and fail-closed outage policy |
 | OIDC login / session | Pending | Discovery validation, authorization-code + PKCE, state/nonce, redirect validation, ID-token verification, secure cookies, logout and refresh |
 | Gateway OAuth2 endpoints | Pending | Authorization/token grants, client authentication, consent/redirect binding, code single use, token expiry/revocation and persistent state |
@@ -60,9 +60,10 @@ The 2026-10-27 audit separates these layers:
   return nil for both absence and duplicates. Falling back on nil would turn
   malformed duplicate credentials into anonymous access. No anonymous helper is
   advertised until absence can be distinguished safely.
-- External authorization needs bounded response-consuming callouts with tested
-  cancellation/close behavior; redirects or fire-and-forget proxying do not
-  implement forward-auth, OPA or introspection.
+- External authorization now has bounded response-consuming `httpCall` with
+  cancellation/close tests, and an OPA Data API authorization library. OAuth2
+  introspection remains separate protocol work; generic callouts alone do not
+  implement its active/claims/cache contract.
 
 The Standard Webhooks identity middleware is integrated here; its freshness
 checks do not implement persistent replay protection. The bounded Consumer

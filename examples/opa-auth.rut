@@ -1,0 +1,26 @@
+// RUT_API_KEY authenticates the caller locally. OPA_ENDPOINT is a fixed HTTPS
+// httpCall policy whose path selects a Boolean OPA rule, e.g. /v1/data/rut/allow.
+import "middleware/auth.rut"
+import "middleware/opa.rut"
+listen :8080
+upstream backend at "127.0.0.1:9000"
+
+route GET "/reports/:id" {
+    let identity = auth.apiKey(req.authorization.or(""), env("RUT_API_KEY"), "report-reader", "primary")
+    let subject = identity.consumerId
+    let resource = req.param("id").or("")
+    guard let input = json.value({subject: subject, action: "read", resource: resource}) else { return 503 }
+    guard let request = opa.request(input) else { return 503 }
+    let pending = httpCall(env("OPA_ENDPOINT"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let allowed = opa.requireAllow(reply)
+    // Identity still comes from authentication, never from a client/OPA header.
+    match subject {
+        "report-reader" => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", subject)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => { return 403 }
+    }
+}

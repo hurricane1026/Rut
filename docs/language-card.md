@@ -2776,3 +2776,17 @@ JSON document; authenticate signature and claims first, and publish identity
 after success. This ordinary library helper adds no language syntax or runtime
 ABI. See [auth coverage](auth-coverage.md#jwt-required-group-with-exclusion) and
 [jwt-group-policies.rut](../examples/jwt-group-policies.rut).
+
+### OPA authorization composition
+
+Import `middleware/opa.rut`. `opa.request(input)` constructs an optional OPA Data
+API POST request with a serialized `input` envelope; send it with `httpCall` to
+a trusted fixed HTTPS policy. Pass the unwrapped callout result to
+`opa.requireAllow` for a Boolean `result`, or `opa.requireDecision` for an object
+`result` with Boolean `allow`. Explicit false or an undefined result responds
+403; malformed/type-mismatched replies, non-200 status and transport failures
+respond 503. Success returns the parsed document or authorized decision object,
+respectively. Additional fields require explicit validation and mapping. These
+are ordinary library functions, not new syntax or implicit authentication. See
+[the contract and example](opa-authorization.md). MIR has 32 bounded blocks to
+accommodate the existing eight route guards plus continuations and match arms.
