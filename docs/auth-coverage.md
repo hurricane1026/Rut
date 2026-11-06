@@ -18,7 +18,7 @@ whether a competing open-source edition includes them.
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
-| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
+| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
@@ -1237,3 +1237,28 @@ intersection on epoll/io_uring after source removal. Signed narrower claims
 cannot acquire the other permission through spoofed headers; invalid issuer
 configuration emits no token. This does not add OAuth grants, requested-scope
 negotiation, arbitrary claims or persistent sessions.
+
+## JWT group union and intersection policies
+
+Import `middleware/jwt_groups.rut` alongside the existing auth library.
+`jwt_groups.requireAny(document, first, second)` permits either exact signed
+`groups` membership; `jwt_groups.requireAll` requires both in the same document.
+Both return that document unchanged. A repeated name requires that group once.
+They authorize only: first verify the signature and issuer/audience/subject/time
+claims, for example with `auth.jwtDocumentHs256` followed by `auth.jwtIdentity`.
+Use the same verified JSON for the group check, and publish identity only after
+it succeeds. RS256/ES256 verified documents can use the same helpers.
+
+Missing, empty, non-array or malformed `groups` and insufficient memberships
+return 403 with `Bearer error="insufficient_scope"`. An invalid array element
+rejects the entire membership check even after a match. Empty configured group
+names return 503. Matching is case-sensitive; neither a `scope` claim nor client
+identity/group headers supply membership. Authentication remains separate: the
+example rejects invalid signatures/claims and duplicate Authorization with 401
+before evaluating group authorization. These helpers do not prove JSON origin.
+
+See [jwt-group-policies.rut](../examples/jwt-group-policies.rut). The focused
+`test_jwt_group_policies` matrix exercises JIT and relocated native artifacts,
+including deletion of the importing source and helper modules before execution.
+The policy is configuration-owned; no dynamic group registry, OIDC session or
+persistent membership lifecycle is added.

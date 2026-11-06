@@ -1,0 +1,20 @@
+// Authorization only: pass the same document used for successful signature,
+// issuer/audience/time and identity verification. These helpers do not authenticate.
+// Group names are exact and case-sensitive; empty policy slots are errors.
+func requireAny(_ document: Json, _ first: str, _ second: str) -> Json {
+    guard first != "" && second != "" else { respond 503 }
+    let forbidden = response(403)
+    forbidden.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasGroup(document, first) || jwtHasGroup(document, second) else { respond forbidden }
+    document
+}
+
+// Both memberships must occur in this one verified document. Repeating a group
+// requires that group once. Invalid array elements reject the entire check.
+func requireAll(_ document: Json, _ first: str, _ second: str) -> Json {
+    guard first != "" && second != "" else { respond 503 }
+    let forbidden = response(403)
+    forbidden.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasGroup(document, first) && jwtHasGroup(document, second) else { respond forbidden }
+    document
+}

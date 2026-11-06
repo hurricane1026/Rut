@@ -2650,3 +2650,28 @@ views are never retained by the worker. HTTP/2 keeps its existing single
 suspended-stream restriction. This profile does not implement OAuth introspection,
 OPA JSON envelopes, multiple identity fields, response challenges or auth caching.
 See [the example](../examples/forward-auth.rut).
+
+## JWT group union and intersection policies
+
+Import `middleware/jwt_groups.rut` alongside the existing auth library.
+`jwt_groups.requireAny(document, first, second)` permits either exact signed
+`groups` membership; `jwt_groups.requireAll` requires both in the same document.
+Both return that document unchanged. A repeated name requires that group once.
+They authorize only: first verify the signature and issuer/audience/subject/time
+claims, for example with `auth.jwtDocumentHs256` followed by `auth.jwtIdentity`.
+Use the same verified JSON for the group check, and publish identity only after
+it succeeds. RS256/ES256 verified documents can use the same helpers.
+
+Missing, empty, non-array or malformed `groups` and insufficient memberships
+return 403 with `Bearer error="insufficient_scope"`. An invalid array element
+rejects the entire membership check even after a match. Empty configured group
+names return 503. Matching is case-sensitive; neither a `scope` claim nor client
+identity/group headers supply membership. Authentication remains separate: the
+example rejects invalid signatures/claims and duplicate Authorization with 401
+before evaluating group authorization. These helpers do not prove JSON origin.
+
+See [jwt-group-policies.rut](../examples/jwt-group-policies.rut). The focused
+`test_jwt_group_policies` matrix exercises JIT and relocated native artifacts,
+including deletion of the importing source and helper modules before execution.
+The policy is configuration-owned; no dynamic group registry, OIDC session or
+persistent membership lifecycle is added.
