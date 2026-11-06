@@ -34,6 +34,11 @@ struct Text {
     bool valid = true;
     Text() = default;
     Text(const char* s) { append(s); }
+    static Text invalid() {
+        Text value;
+        value.valid = false;
+        return value;
+    }
     bool append(Str s) {
         if (s.len >= sizeof(value) - len) {
             valid = false;
@@ -97,12 +102,12 @@ Text num(u32 n) {
 }
 Text base64url(const unsigned char* p, u32 n) {
     Text out;
-    if (n > static_cast<u32>(INT_MAX) - 2) return Text();
+    if (n > static_cast<u32>(INT_MAX) - 2) return Text::invalid();
     const u32 kRequired = 4 * ((n + 2) / 3);
-    if (kRequired + 1 > sizeof(out.value)) return Text();
+    if (kRequired + 1 > sizeof(out.value)) return Text::invalid();
     const int kEncoded =
         EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.value), p, static_cast<int>(n));
-    if (kEncoded <= 0 || static_cast<u32>(kEncoded) != kRequired) return Text();
+    if (kEncoded <= 0 || static_cast<u32>(kEncoded) != kRequired) return Text::invalid();
     out.len = static_cast<u32>(kEncoded);
     out.value[out.len] = 0;
     for (u32 i = 0; i < out.len; i++) {
@@ -115,12 +120,12 @@ Text base64url(const unsigned char* p, u32 n) {
     return out;
 }
 Text token(const Text& claims) {
-    if (!claims.good()) return Text();
+    if (!claims.good()) return Text::invalid();
     const Text kHeader("{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
     Text x = base64url((const unsigned char*)kHeader.data(), kHeader.size());
     x += '.';
     x += base64url((const unsigned char*)claims.data(), claims.size());
-    if (!x.good()) return Text();
+    if (!x.good()) return Text::invalid();
     unsigned char sig[EVP_MAX_MD_SIZE]{};
     unsigned int n = 0;
     if (!HMAC(EVP_sha256(),
@@ -130,25 +135,26 @@ Text token(const Text& claims) {
               x.size(),
               sig,
               &n))
-        return Text();
+        return Text::invalid();
     x += '.';
     x += base64url(sig, n);
-    if (!x.good()) return Text();
+    if (!x.good()) return Text::invalid();
     return x;
 }
 Text auth_path() {
     char b[4096];
     const int kInitial = snprintf(b, sizeof(b), "%s", __FILE__);
-    if (kInitial < 0 || static_cast<u32>(kInitial) >= sizeof(b)) return Text();
+    if (kInitial < 0 || static_cast<u32>(kInitial) >= sizeof(b)) return Text::invalid();
     char* s = strrchr(b, '/');
     if (s) *s = 0;
     const size_t kUsed = strlen(b);
     const int kWritten = snprintf(b + kUsed, sizeof(b) - kUsed, "/../examples/middleware/auth.rut");
-    if (kWritten < 0 || static_cast<size_t>(kWritten) >= sizeof(b) - kUsed) return Text();
+    if (kWritten < 0 || static_cast<size_t>(kWritten) >= sizeof(b) - kUsed) return Text::invalid();
     return Text(b);
 }
 Text sibling(const char* name) {
     Text p = auth_path();
+    if (!p.good()) return Text::invalid();
     const u32 kSlash = p.find_last_of('/');
     p.len = kSlash;
     p.value[kSlash] = 0;
@@ -200,6 +206,7 @@ void matrix(test::TestCase* _tc, Invoke invoke) {
     auto check_headers = [&](u32 route, const Text& headers, u16 expected) {
         const Text kRequest =
             "GET /" + num(route) + " HTTP/1.1\r\nHost: localhost\r\n" + headers + "\r\n";
+        REQUIRE(kRequest.good());
         CHECK_EQ(invoke(route, kRequest).status_code, expected);
     };
     auto check = [&](const Text& document, u16 any, u16 all) {
@@ -290,7 +297,7 @@ struct TempSource {
             return;
         fd = mkstemp(path);
     }
-    bool append(const Text& value) { return append(value.data(), value.size()); }
+    bool append(const Text& value) { return value.good() && append(value.data(), value.size()); }
     bool append(const char* data, u32 length) {
         u32 offset = 0;
         while (offset < length) {
@@ -301,6 +308,7 @@ struct TempSource {
         return true;
     }
     bool copy_from(const Text& path) {
+        if (!path.good()) return false;
         const int kInput = open(path.data(), O_RDONLY);
         if (kInput < 0) return false;
         char buffer[4096];
@@ -325,6 +333,23 @@ struct TempSource {
         if (path[0]) unlink(path);
     }
 };
+TEST(jwt_group_policies, bounded_helpers_reject_overflow_before_consuming_text) {
+    char too_large[8192]{};
+    Text overflow_text;
+    CHECK(!overflow_text.append({too_large, sizeof(too_large)}));
+    CHECK(!overflow_text.good());
+
+    TempSource temp;
+    CHECK(temp.fd >= 0);
+    CHECK(!temp.append(overflow_text));
+
+    const unsigned char kBytes[6142]{};
+    const Text kLargest = base64url(kBytes, 6141);
+    CHECK(kLargest.good());
+    CHECK_EQ(kLargest.size(), 8188u);
+    const Text kTooLarge = base64url(kBytes, sizeof(kBytes));
+    CHECK(!kTooLarge.good());
+}
 struct SlicePoolGuard {
     SlicePool* value;
     ~SlicePoolGuard() { value->destroy(); }
@@ -353,6 +378,7 @@ struct RirGuard {
 
 TEST(jwt_group_policies, jit_authenticates_before_group_union_and_intersection) {
     const auto kSource = policy_source(auth_path(), sibling("jwt_groups.rut"));
+    REQUIRE(kSource.good());
     auto tokens = lex({kSource.data(), kSource.size()});
     REQUIRE(tokens);
     auto ast = parse_file(tokens.value());
@@ -361,7 +387,8 @@ TEST(jwt_group_policies, jit_authenticates_before_group_union_and_intersection) 
         AstFile* p;
         ~AstOwner() { delete p; }
     } const kAstOwner{ast.value()};
-    const auto kSourcePath = sibling("../jwt-group-kPolicies.rut");
+    const auto kSourcePath = sibling("../jwt-group-policies.rut");
+    REQUIRE(kSourcePath.good());
     auto hir = analyze_file(*ast.value(), {kSourcePath.data(), kSourcePath.size()});
     REQUIRE(hir);
     struct HirOwner {
