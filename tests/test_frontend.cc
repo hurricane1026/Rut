@@ -47158,3 +47158,71 @@ TEST(frontend, forward_auth_prefix_is_verified_and_rejects_replay_effects) {
         CHECK(!analyze_file_heap(a.value()));
     }
 }
+
+TEST(frontend, http_call_profile_requires_static_destinations_and_rejects_ambiguous_resume) {
+    const std::string call =
+        R"rut(httpCall("{\"address\":\"127.0.0.1\",\"serverName\":\"localhost\",\"caFile\":\"/ca.pem\",\"path\":\"/auth\"}", request, 100))rut";
+    const std::string prefix =
+        R"(route POST "/" { guard let request = json.parse(req.body) else { return 400 } )";
+    const auto source = prefix + "let reply = " + call + " return 200 }";
+    auto tokens = lex(lit(source.c_str()));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto& fn = rir.module.functions[0];
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE(rir::function_uses_http_call(fn));
+    CHECK(!rir::function_uses_password(fn));
+    rir::Instruction* operation = nullptr;
+    for (u32 b = 0; b < fn.block_count; ++b)
+        for (u32 i = 0; i < fn.blocks[b].inst_count; ++i)
+            if (rir::is_http_call(fn.blocks[b].insts[i])) operation = &fn.blocks[b].insts[i];
+    REQUIRE(operation);
+    const auto count = operation->operand_count;
+    operation->operand_count = 2;
+    CHECK(!rir::http_call_profile_valid(fn));
+    CHECK(!rir::verify_module(rir.module).ok);
+    operation->operand_count = count;
+    const auto id = operation->operand(0);
+    auto& definition = fn.blocks[fn.values[id.id].def_block.id].insts[fn.values[id.id].def_inst];
+    const auto op = definition.op;
+    definition.op = rir::Opcode::ReqBody;
+    CHECK(!rir::http_call_profile_valid(fn));
+    definition.op = op;
+    const auto yields = fn.yield_count;
+    fn.yield_count = 1;
+    CHECK(!rir::http_call_profile_valid(fn));
+    fn.yield_count = yields;
+    auto& unrelated = fn.blocks[0].insts[0];
+    const auto unrelated_op = unrelated.op;
+    unrelated.op = rir::Opcode::CtxStoreSlotI32;
+    CHECK(!rir::http_call_profile_valid(fn));
+    unrelated.op = unrelated_op;
+    rir.destroy();
+    const std::string invalid[] = {
+        prefix + "guard let reply = " + call + " else { return 503 } return 200 }",
+        prefix + "let reply = " + call + " wait(1ms) return 200 }",
+        prefix +
+            "let reply = httpCall(req.header(\"X-URL\").or(\"{}\"), request, 100) return 200 }",
+        prefix + "let reply = httpCall(\"{}\", request, 100) return 200 }",
+        prefix + "let reply = httpCall(\"{}\", request, 0) return 200 }"};
+    for (const auto& bad : invalid) {
+        auto t = lex(lit(bad.c_str()));
+        REQUIRE(t);
+        auto a = parse_file_heap(t.value());
+        REQUIRE(a);
+        auto h = analyze_file_heap(a.value());
+        if (!h) continue;
+        auto m = build_mir_heap(h.value());
+        if (!m) continue;
+        FrontendRirModule rejected{};
+        CHECK(!lower_to_rir(m.value(), rejected));
+        rejected.destroy();
+    }
+}

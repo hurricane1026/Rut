@@ -10234,3 +10234,31 @@ and identity mapping remain explicit in the calling route. The
 [language card](docs/language-card.md#jwt-group-union-and-intersection-policies)
 defines rejection status, trust boundary and configuration behavior. No syntax,
 keyword, runtime ABI, allocation strategy or dependency changes are required.
+
+### Composable bounded HTTPS calls
+
+`httpCall(policy, request, timeoutMs)` is a normal function expression over the
+existing optional-Json carrier. Configuration fixes an authenticated IPv4/TLS
+endpoint; ordinary Rut code supplies a bounded method/header/body document and
+consumes a complete status/header-array/body envelope. It adds no grammar,
+plugin runtime, dependency or LLVM dependency to rut_runtime. The language card
+specifies the exact admission, framing, UTF-8 and failure limits.
+
+Unlike the constant-only authentication replay prefix, callout handlers have a
+request-arena value frame and an immutable request snapshot. Generated code
+resumes at the pending call site and loads previously evaluated values; it does
+not rerun the route prelude. Compiler lowering retains lexical guard order for
+locals and lowers selected callout branches as control flow. Phi inputs are
+stored at incoming edges. This preserves request views across H2's initial
+stack-built request and subsequent synthesized-buffer parking. Explicit event
+waits, specialized authentication prefixes and non-HTTP callbacks remain outside
+this first profile. Separate verifier and codegen checks enforce that boundary.
+
+Each requiring shard owns a fixed-capacity HTTPS worker through the existing
+asynchronous-service lifecycle host. Cold worker storage is allocated from the
+existing mmap arena, never embedded as a large per-Shard array; request-path
+values use slice arenas. A generation/stream fences each task. A per-call
+monotonic deadline includes queueing and all network phases; terminal results
+are copied into request-owned storage before a slot can be reused. Cancellation
+and worker shutdown precede storage release. No response field changes identity,
+request routing or downstream output without explicit Rut code.

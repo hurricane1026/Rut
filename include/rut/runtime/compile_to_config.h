@@ -309,7 +309,7 @@ inline bool register_verified_jit_routes(RouteConfig& cfg,
                                                  fn.preflight_forward_policy_bundle_id))
                 return false;
             target.routes[target.route_count - 1].needs_password_gateway =
-                rir::function_uses_password(fn) ? 1 : 0;
+                (rir::function_uses_password(fn) || rir::function_uses_http_call(fn)) ? 1 : 0;
             // @rateLimit decorators → stacked token-bucket rules, each with its own
             // metering key (the route just added is at index route_count - 1).
             if (fn.rate_limit.count > 0) {

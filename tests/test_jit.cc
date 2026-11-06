@@ -29868,3 +29868,54 @@ TEST(jit, cache_codegen_requires_a_valid_declaration_binding) {
     CHECK_FALSE(codegen(tc.mod).ok);
     tc.destroy();
 }
+
+TEST(jit, http_call_is_an_ordinary_optional_json_expression_with_owned_frame) {
+    const auto source = lit_str(R"rut(
+func invoke(_ request: Json) -> Json {
+    httpCall("{\"address\":\"127.0.0.1\",\"serverName\":\"localhost\",\"caFile\":\"/missing.pem\",\"path\":\"/check\"}", request, 100)
+}
+route GET "/call" {
+    guard let request = json.parse("{\"method\":\"GET\"}") else { return 400 }
+    let result = invoke(request)
+    guard let reply = result else { return 503 }
+    guard let value = json.get(reply, "/error") else { return 501 }
+    guard let reason = json.string(value) else { return 502 }
+    if reason == "transport" { return 204 } else { return 500 }
+}
+)rut");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto conn = std::make_unique<Connection>();
+    conn->json_arena.backend.pool = &pool;
+    auto* ctx = conn->reset_jit_ctx();
+    const auto request = lit_str("GET /call HTTP/1.1\r\nHost: test\r\n\r\n");
+    auto result = HandlerResult::unpack(
+        handler(conn.get(), ctx, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    REQUIRE(ctx->load_slot<u64>(0) != 0);
+    auto* frame = reinterpret_cast<HttpCallFrameHeader*>(ctx->load_slot<u64>(0));
+    CHECK(frame->request != reinterpret_cast<const u8*>(request.ptr));
+    CHECK_EQ(frame->length, request.len);
+    conn->json_arena.destroy();
+    engine.shutdown();
+    rir.destroy();
+    pool.destroy();
+}

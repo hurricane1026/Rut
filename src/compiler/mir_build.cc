@@ -5,6 +5,7 @@
 #include "rut/common/ws_message.h"
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/hir.h"
+#include "rut/runtime/json.h"
 #include "rut/runtime/route_method.h"
 #include <memory>
 #include <vector>
@@ -19,6 +20,19 @@ static_assert(MirModule::kMaxFunctions >= HirModule::kMaxRoutes + HirModule::kMa
               "MIR function capacity must cover all HIR routes plus timers");
 
 namespace {
+static bool hir_has_http_call(const HirExpr& expr, u32 depth = 0) {
+    if (depth > 128) return true;
+    if (expr.kind == HirExprKind::JsonOp && expr.int_value == static_cast<i64>(json::Op::HttpCall))
+        return true;
+    if (expr.lhs && hir_has_http_call(*expr.lhs, depth + 1)) return true;
+    if (expr.rhs && hir_has_http_call(*expr.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < expr.args.len; ++i)
+        if (expr.args[i] && hir_has_http_call(*expr.args[i], depth + 1)) return true;
+    for (u32 i = 0; i < expr.field_inits.len; ++i)
+        if (expr.field_inits[i].value && hir_has_http_call(*expr.field_inits[i].value, depth + 1))
+            return true;
+    return false;
+}
 
 static Str entry_label() {
     return {"entry", 5};
@@ -1161,7 +1175,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         MirValue* else_ptr = &fn->values[fn->values.len - 1];
         v.kind = MirValueKind::IfElse;
         v.is_branch_conditional =
-            !expr.is_eager_fallback && (fn->is_ws_callback || hir_has_string_construction(expr));
+            !expr.is_eager_fallback &&
+            (fn->is_ws_callback || hir_has_string_construction(expr) || hir_has_http_call(expr));
         v.type = mir_type_kind(expr.type);
         v.lhs = cond_ptr;
         v.rhs = then_ptr;
