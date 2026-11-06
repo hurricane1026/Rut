@@ -14,6 +14,7 @@
 #include "rut/runtime/es256_policy.h"
 #include "rut/runtime/forward_auth.h"
 #include "rut/runtime/hash.h"
+#include "rut/runtime/http_call.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/password.h"
 #include "rut/runtime/route_method.h"
@@ -12759,6 +12760,36 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
+    if (expr.name.eq(lit_str("httpCall")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr auto detail = lit_str(
+            "httpCall expects a fixed HTTPS policy, Json request and timeoutMs (1...60000)");
+        if (!route || route->is_timer || expr.args.len != 3 || pipe_lhs || first_arg_override)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        HirExpr values[3];
+        for (u32 i = 0; i < 3; ++i) {
+            if (!expr.args[i])
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+            auto value = analyze_expr(*expr.args[i], route, mod, locals, local_count, binding);
+            if (!value) return core::make_unexpected(value.error());
+            values[i] = value.value();
+        }
+        HttpsEndpoint endpoint;
+        if (values[0].kind != HirExprKind::StrLit ||
+            !http_call_policy(values[0].str_value, endpoint) ||
+            values[1].type != HirTypeKind::Json || values[1].may_nil || values[1].may_error ||
+            values[2].kind != HirExprKind::IntLit || values[2].int_value < 1 ||
+            values[2].int_value > 60000)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        return make_json_op(json::Op::HttpCall,
+                            HirTypeKind::Json,
+                            true,
+                            &values[0],
+                            &values[1],
+                            &values[2],
+                            expr.span,
+                            route);
+    }
     if ((expr.name.eq(lit_str("passwordVerifyHeader")) ||
          expr.name.eq(lit_str("forwardAuthHeader"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {

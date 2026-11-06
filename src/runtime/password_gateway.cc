@@ -38,10 +38,19 @@ core::Expected<void, Error> PasswordGateway::start() {
     auto result = worker.start();
     if (!result) return result;
     auto auth = forward_auth.start();
-    if (!auth) worker.stop();
-    return auth;
+    if (!auth) {
+        worker.stop();
+        return auth;
+    }
+    auto calls = http_calls.start();
+    if (!calls) {
+        forward_auth.stop();
+        worker.stop();
+    }
+    return calls;
 }
 void PasswordGateway::stop() {
+    http_calls.stop();
     forward_auth.stop();
     for (auto& entry : entries) {
         entry.request.reset();
@@ -50,6 +59,7 @@ void PasswordGateway::stop() {
     worker.stop();
 }
 void PasswordGateway::cancel(u32 connection) {
+    http_calls.cancel(connection);
     forward_auth.cancel(connection);
     for (auto& entry : entries) {
         if (!entry.active || entry.connection != connection) continue;
@@ -58,6 +68,7 @@ void PasswordGateway::cancel(u32 connection) {
     }
 }
 void PasswordGateway::cancel_request(u32 connection, u64 generation) {
+    http_calls.cancel(connection, generation);
     forward_auth.cancel(connection, generation);
     for (auto& entry : entries) {
         if (!entry.active || entry.connection != connection || entry.generation != generation)
@@ -160,5 +171,15 @@ PasswordGatewayReply verify_password_for_request(void* connection,
     auto& conn = *static_cast<ConnectionBase*>(connection);
     return current_gateway->verify(
         conn.id, kGeneration, password, record, monotonic_us() / 1000, timeout_ms);
+}
+HttpCallReply http_call_for_request(void* connection,
+                                    const HttpsEndpoint& endpoint,
+                                    Str request,
+                                    u32 timeout_ms) {
+    const auto generation = auth_request_generation(connection);
+    if (!generation) return {};
+    const auto& conn = *static_cast<ConnectionBase*>(connection);
+    return current_gateway->http_calls.call(
+        conn.id, generation, endpoint, request, monotonic_us() / 1000, timeout_ms);
 }
 }  // namespace rut

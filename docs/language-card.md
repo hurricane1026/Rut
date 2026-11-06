@@ -2675,3 +2675,92 @@ See [jwt-group-policies.rut](../examples/jwt-group-policies.rut). The focused
 including deletion of the importing source and helper modules before execution.
 The policy is configuration-owned; no dynamic group registry, OIDC session or
 persistent membership lifecycle is added.
+
+## Composable HTTPS calls
+
+`httpCall(policy, request, timeoutMs)` returns optional `Json`. It is an ordinary
+function call, with no new keyword or `await`. Bind its result with `let` before
+an optional guard. It can occur after earlier guards, inside ordinary helpers,
+and in selected helper branches. Later calls can consume earlier results. A
+suspended call resumes at its own continuation: completed calls, random values,
+request mutations and other earlier computations are not replayed.
+
+```rut
+func authorize(_ request: Json) -> Json {
+    httpCall(env("AUTH_ENDPOINT"), request, 1000)
+}
+route POST "/check" {
+    guard let request = json.parse(req.body) else { return 400 }
+    let result = authorize(request)
+    guard let reply = result else { return 503 }
+    guard let encoded = json(reply) else { return 503 }
+    return response(200, body: encoded)
+}
+```
+
+`policy` must resolve at compilation/load time to a JSON string:
+
+```json
+{"address":"127.0.0.1","port":9443,"serverName":"auth.example.com","caFile":"/certs/ca.pem","path":"/authorize"}
+```
+
+The path, address and TLS trust/identity are fixed; `port` defaults to 443.
+Unknown/duplicate fields, invalid IPv4 addresses, unsafe paths, missing CA or
+identity, and literal timeouts outside 1–60000 ms are rejected. Requests cannot
+choose a URL, Host, CA, SNI, redirect destination or framing. This profile has no
+DNS/discovery, redirects, HTTP fallback, client certificates or connection pool.
+
+The request is an unwrapped `Json` object:
+
+```json
+{"method":"POST","headers":{"Authorization":"Bearer explicitly-selected-token","Content-Type":"application/json"},"body":"{\"resource\":\"orders\"}"}
+```
+
+`method` is required: GET, POST, PUT, PATCH, DELETE or OPTIONS. `headers` and
+`body` are optional (empty by default). Header values and body are strings.
+At most 16 fields, 128 bytes per name, 2048 bytes per value, 4096 body bytes and
+6144 complete wire bytes are accepted. Header names must be unique ignoring
+case. Transport/framing fields are forbidden; the worker produces Host,
+Content-Length, Accept-Encoding: identity and Connection: close. No client
+credentials, cookies, identity fields or request body are forwarded implicitly.
+
+A fully framed HTTP response, including 3xx/4xx/5xx, produces:
+
+```json
+{"ok":true,"status":403,"headers":{"x-role":["reader","writer"]},"body":"denied"}
+```
+
+Names are lowercase, values are arrays preserving duplicates and their order;
+applications decide which duplicate/empty fields to accept. `ok` means the HTTP
+exchange completed, not that authorization succeeded. Response headers/body are
+never automatically applied to the downstream response or forwarded request.
+Use existing `json.get`, `json.string`, `json.parse`/`json.decode` and request
+mutation APIs to map multiple fields or interpret a JSON response body. The
+[composition example](../examples/http-call.rut) feeds two selected identity
+fields into a second call. Existing request-mutation placement rules still apply.
+
+Failures return `{"ok":false,"status":0,"error":"..."}` with `timeout`,
+`capacity`, `invalidRequest` or `transport`. `nil` means result storage
+could not be published. A timeout does not prove that a remote POST had no
+side effects; there is no automatic retry. One monotonic deadline per call covers
+queueing, connect, verified TLS, send and complete response, and cannot be
+extended by progress. HTTP headers/body are bounded to 8192 bytes each, wire to
+16384 and the complete UTF-8 JSON envelope to 8192. Invalid/ambiguous framing,
+compression, informational responses, invalid UTF-8 or excessive envelope size
+fail with `transport`; close-delimited bodies require authenticated close_notify.
+
+HTTP/1 and HTTP/2 downstreams use the same eight-slot per-shard service. Network,
+TLS allocation and CA loading run on a bounded worker; the shard uses existing
+Timer yields (up to 10 ms) without blocking. Close/reset cancels the matching
+request generation/stream, and shutdown joins the worker before reclaiming its
+storage. Immutable request bytes and live values belong to a bounded request
+arena, including across HTTP/2 synthesis and sequential calls. The original
+request snapshot and generated value frame are each limited to 8192 bytes,
+within the shared 256 KiB request budget; frame exhaustion returns 503 before a
+call. HTTP/2 retains its single suspended-stream restriction.
+
+This slice supports sequential calls and conditional selection, not parallel
+fan-out, streaming callout bodies, explicit `wait` mixed with calls, timer or
+WebSocket callbacks, or the specialized password/forward-auth prefix in the same
+handler. Direct `guard let x = httpCall(...)` and equivalent unbound calls in
+conditions are rejected: use `let result = ...` then `guard let x = result`.

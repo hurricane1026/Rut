@@ -54,11 +54,16 @@ bool HttpsEndpoint::valid() const {
 
 void BoundedJsonResponse::reset(bool authorization) {
     authorization_ = authorization;
+    callout_ = false;
     status_ = 0;
     wire_len_ = body_len_ = offset_ = expected_ = 0;
     headers_ = chunked_ = sized_ = false;
     chunks_.reset();
     result_ = Result::More;
+}
+void BoundedJsonResponse::reset_callout() {
+    reset(true);
+    callout_ = true;
 }
 
 BoundedJsonResponse::Result BoundedJsonResponse::append(Str bytes) {
@@ -79,10 +84,11 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         if (kStatus == ParseStatus::Incomplete)
             return wire_len_ >= 8192 ? Result::Error : Result::More;
         if (parser.header_end > 8192 || (!authorization_ && response.status_code != 200) ||
-            (authorization_ && response.status_code != 200 && response.status_code != 401 &&
-             response.status_code != 403) ||
+            (callout_ && (response.status_code < 200 || response.status_code > 599)) ||
+            (authorization_ && !callout_ && response.status_code != 200 &&
+             response.status_code != 401 && response.status_code != 403) ||
             response.headers_truncated || response.content_length_count > 1 ||
-            response.content_length > kMaxBody)
+            (response.content_length > kMaxBody && !(callout_ && response.status_code == 304)))
             return Result::Error;
         u32 transfer_count = 0, type_count = 0, encoding_count = 0;
         for (u32 i = 0; i < response.header_count; ++i) {
@@ -117,6 +123,11 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         chunked_ = transfer_count != 0;
         sized_ = response.has_content_length;
         expected_ = response.content_length;
+        if (callout_ && (status_ == 204 || status_ == 205 || status_ == 304)) {
+            if (chunked_ || (status_ != 304 && expected_ != 0)) return Result::Error;
+            sized_ = true;
+            expected_ = 0;
+        }
         offset_ = parser.header_end;
         chunks_.reset();
     }
@@ -173,6 +184,13 @@ Str BoundedJsonResponse::unique_header(Str name) const {
     }
     return count == 1 ? value : Str{};
 }
+bool BoundedJsonResponse::headers(ParsedResponse& response) const {
+    response.reset();
+    HttpResponseParser parser{};
+    return result_ == Result::Complete &&
+           parser.parse(reinterpret_cast<const u8*>(wire_), wire_len_, &response) ==
+               ParseStatus::Complete;
+}
 
 HttpsFetch::~HttpsFetch() {
     close();
@@ -224,10 +242,16 @@ bool HttpsFetch::init_authorization(const HttpsEndpoint& endpoint, Str request) 
     authorization_ = true;
     return true;
 }
+bool HttpsFetch::init_callout(const HttpsEndpoint& endpoint, Str request) {
+    if (!init_authorization(endpoint, request)) return false;
+    callout_ = true;
+    return true;
+}
 bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
     if (!context_.ssl_ctx || state_ == State::Busy || !monotonic_ms || !timeout_ms) return false;
     close();
     response_.reset(authorization_);
+    if (callout_) response_.reset_callout();
     started_ = monotonic_ms;
     timeout_ms_ = timeout_ms;
     sent_ = 0;

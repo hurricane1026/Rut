@@ -25,8 +25,10 @@ public:
     static constexpr u32 kMaxBody = 8192;
     static constexpr u32 kMaxWire = 16384;
     void reset(bool authorization = false);
+    void reset_callout();
     u16 status() const { return status_; }
     Str unique_header(Str name) const;
+    bool headers(ParsedResponse& response) const;
     Result append(Str bytes);
     Result finish();  // authenticated TLS close_notify, not a bare TCP EOF
     Result result() const { return result_; }
@@ -40,6 +42,7 @@ private:
     u32 offset_ = 0;
     u32 expected_ = 0;
     bool authorization_ = false;
+    bool callout_ = false;
     u16 status_ = 0;
     bool headers_ = false;
     bool chunked_ = false;
@@ -62,6 +65,8 @@ public:
     bool init(const HttpsEndpoint& endpoint);
     // Authorization profile: caller supplies a complete bounded HTTP request.
     bool init_authorization(const HttpsEndpoint& endpoint, Str request);
+    bool init_callout(const HttpsEndpoint& endpoint, Str request);
+    bool headers(ParsedResponse& response) const { return response_.headers(response); }
     u16 status() const { return state_ == State::Done ? response_.status() : 0; }
     Str unique_header(Str name) const { return response_.unique_header(name); }
     bool start(u64 monotonic_ms, u32 timeout_ms);
@@ -76,6 +81,7 @@ private:
     SSL* ssl_ = nullptr;
     i32 fd_ = -1;
     bool authorization_ = false;
+    bool callout_ = false;
     char request_[6144]{};
     u32 request_len_ = 0;
     u32 sent_ = 0;

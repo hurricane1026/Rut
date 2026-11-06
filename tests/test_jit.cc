@@ -22,6 +22,7 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/crypto_c.h"
+#include "rut/runtime/http_call.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/rate_limit_key.h"
@@ -8198,6 +8199,39 @@ TEST(helpers, req_param_from_handler_ctx) {
     rut_helper_req_param(&frame.ctx, "missing", 7, &ptr, &len);
     CHECK(ptr != nullptr);
     CHECK_EQ(len, 0u);
+}
+
+TEST(helpers, http_call_frame_reanchors_only_request_backed_route_params) {
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    Connection conn;
+    conn.json_arena.backend.pool = &pool;
+    TestHandlerCtxFrame frame{};
+    static const char external[] = "configured";
+    char request[] = "GET /items/42 HTTP/1.1\r\nHost: test\r\n\r\n";
+    const u32 length = static_cast<u32>(sizeof(request) - 1);
+    const char* route_value = request + 11;
+    frame.ctx.route_param_count = 2;
+    frame.ctx.route_params[0] = {"id", 2, route_value, 2};
+    frame.ctx.route_params[1] = {"fixed", 5, external, sizeof(external) - 1};
+
+    auto* call_frame = static_cast<HttpCallFrameHeader*>(
+        rut_helper_http_call_frame(&conn,
+                                   &frame.ctx,
+                                   sizeof(HttpCallFrameHeader),
+                                   reinterpret_cast<const u8*>(request),
+                                   length));
+    REQUIRE(call_frame != nullptr);
+    CHECK(call_frame->request != reinterpret_cast<const u8*>(request));
+    CHECK(frame.ctx.route_params[0].value ==
+          reinterpret_cast<const char*>(call_frame->request + (route_value - request)));
+    CHECK((Str{frame.ctx.route_params[0].value, frame.ctx.route_params[0].value_len}.eq(
+        lit_str("42"))));
+    CHECK(frame.ctx.route_params[1].value == external);
+    CHECK((Str{frame.ctx.route_params[1].value, frame.ctx.route_params[1].value_len}.eq(
+        lit_str("configured"))));
+    conn.json_arena.destroy();
+    pool.destroy();
 }
 
 TEST(helpers, req_cookie_from_request_bytes) {
@@ -29867,4 +29901,55 @@ TEST(jit, cache_codegen_requires_a_valid_declaration_binding) {
     tc.mod.cache_instances[0].name = lit("a_name_that_exceeds_thirty_one_bytes");
     CHECK_FALSE(codegen(tc.mod).ok);
     tc.destroy();
+}
+
+TEST(jit, http_call_is_an_ordinary_optional_json_expression_with_owned_frame) {
+    const auto source = lit_str(R"rut(
+func invoke(_ request: Json) -> Json {
+    httpCall("{\"address\":\"127.0.0.1\",\"serverName\":\"localhost\",\"caFile\":\"/missing.pem\",\"path\":\"/check\"}", request, 100)
+}
+route GET "/call" {
+    guard let request = json.parse("{\"method\":\"GET\"}") else { return 400 }
+    let result = invoke(request)
+    guard let reply = result else { return 503 }
+    guard let value = json.get(reply, "/error") else { return 501 }
+    guard let reason = json.string(value) else { return 502 }
+    if reason == "transport" { return 204 } else { return 500 }
+}
+)rut");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto conn = std::make_unique<Connection>();
+    conn->json_arena.backend.pool = &pool;
+    auto* ctx = conn->reset_jit_ctx();
+    const auto request = lit_str("GET /call HTTP/1.1\r\nHost: test\r\n\r\n");
+    auto result = HandlerResult::unpack(
+        handler(conn.get(), ctx, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    REQUIRE(ctx->load_slot<u64>(0) != 0);
+    auto* frame = reinterpret_cast<HttpCallFrameHeader*>(ctx->load_slot<u64>(0));
+    CHECK(frame->request != reinterpret_cast<const u8*>(request.ptr));
+    CHECK_EQ(frame->length, request.len);
+    conn->json_arena.destroy();
+    engine.shutdown();
+    rir.destroy();
+    pool.destroy();
 }

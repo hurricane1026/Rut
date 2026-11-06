@@ -1,0 +1,28 @@
+// CALL_AUTH / CALL_AUDIT are fixed HTTPS endpoint policies; see language card.
+// External services receive only the fields explicitly put into request JSON.
+func callAuth(_ request: Json) -> Json {
+    httpCall(env("CALL_AUTH"), request, 1000)
+}
+func field(_ reply: Json, _ path: str) -> str {
+    guard let value = json.get(reply, path) else { nil }
+    json.string(value)
+}
+func succeeded(_ reply: Json) -> bool {
+    guard let value = json.get(reply, "/status") else { false }
+    guard let status = json.int(value) else { false }
+    status == 200
+}
+
+route POST "/authorize-and-audit" {
+    guard let request = json.parse(req.body) else { return 400 }
+    let authResult = callAuth(request)
+    guard let authorized = authResult else { return 503 }
+    guard succeeded(authorized) else { return 403 }
+    let consumer = field(authorized, "/headers/x-consumer-id/0").or("")
+    let group = field(authorized, "/headers/x-consumer-group/0").or("")
+    guard consumer != "" && group != "" else { return 503 }
+    guard let auditRequest = json.value({method: "POST", body: consumer + ":" + group}) else { return 503 }
+    let auditResult = httpCall(env("CALL_AUDIT"), auditRequest, 1000)
+    guard let audit = auditResult else { return 503 }
+    if succeeded(audit) { return 204 } else { return 502 }
+}

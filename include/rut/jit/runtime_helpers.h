@@ -17,6 +17,17 @@ inline constexpr u32 kMaxConstantTimeEqualBytes = 16 * 1024;
 // data. JIT'd code passes raw request bytes; helpers parse as needed.
 
 extern "C" {
+void* rut_helper_http_call_frame(
+    void* conn, void* ctx, rut::u64 size, const rut::u8* request, rut::u32 length);
+rut::u64 rut_helper_http_call(void* conn,
+                              const char* policy,
+                              rut::u32 policy_len,
+                              const char* request,
+                              rut::u32 request_len,
+                              rut::u32 timeout,
+                              rut::u8* has,
+                              const char** out,
+                              rut::u32* length);
 
 // ── Request Access ─────────────────────────────────────────────────
 rut::u8 rut_helper_sha256_hex_valid(const char* value, rut::u32 len);

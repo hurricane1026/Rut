@@ -140,6 +140,13 @@ struct Ctx {
     // by redirecting disabled writes and missing-slot reads to an internal
     // i64 sink.
     LLVMValueRef ctx_store_sink = nullptr;
+    // Only callout handlers use a request-owned value frame. It preserves SSA
+    // values and the exact continuation without replaying earlier effects.
+    LLVMValueRef call_frame = nullptr;
+    LLVMTypeRef call_frame_type = nullptr;
+    LLVMValueRef call_dispatch = nullptr;
+    u32 call_state = 0;
+    u32 current_block = 0;
 
     // Cache for map_type: LLVM literal structs (Optional<composite>, Struct
     // with a StructDef) are identity-compared, so emitting a fresh
@@ -808,9 +815,19 @@ struct Ctx {
 
     void set_value(rir::ValueId id, LLVMValueRef val) {
         if (id.id < value_map_cap) value_map[id.id] = val;
+        if (call_frame && id.id < cur_fn->value_count) {
+            auto ptr = LLVMBuildStructGEP2(
+                builder, call_frame_type, call_frame, id.id + 3, "call.value.ptr");
+            LLVMBuildStore(builder, val, ptr);
+        }
     }
 
     LLVMValueRef get_value(rir::ValueId id) {
+        if (call_frame && id.id < cur_fn->value_count) {
+            auto ptr = LLVMBuildStructGEP2(
+                builder, call_frame_type, call_frame, id.id + 3, "call.value.ptr");
+            return LLVMBuildLoad2(builder, map_type(cur_fn->values[id.id].type), ptr, "call.value");
+        }
         if (id.id < value_map_cap) return value_map[id.id];
         return nullptr;
     }
@@ -818,6 +835,18 @@ struct Ctx {
     LLVMBasicBlockRef get_block(rir::BlockId id) {
         if (id.id < block_map_cap) return block_map[id.id];
         return nullptr;
+    }
+    void call_edge_values(rir::BlockId target) {
+        if (!call_frame) return;
+        const auto& block = cur_fn->blocks[target.id];
+        for (u32 i = 0; i < block.inst_count; ++i) {
+            const auto& inst = block.insts[i];
+            if (inst.op != rir::Opcode::Phi) continue;
+            for (u32 incoming = 0; incoming < 2; ++incoming) {
+                if (inst.imm.block_targets[incoming].id != current_block) continue;
+                set_value(inst.result, get_value(inst.operands[incoming]));
+            }
+        }
     }
 
     // ── HandlerResult construction ─────────────────────────────────
@@ -2036,6 +2065,89 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+            if (kJsonOp == json::Op::HttpCall) {
+                auto parent = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+                auto poll = LLVMAppendBasicBlockInContext(c.llvm_ctx, parent, "http.call.poll");
+                auto pending =
+                    LLVMAppendBasicBlockInContext(c.llvm_ctx, parent, "http.call.pending");
+                auto ready = LLVMAppendBasicBlockInContext(c.llvm_ctx, parent, "http.call.ready");
+                const u32 state = ++c.call_state;
+                LLVMAddCase(c.call_dispatch, LLVMConstInt(c.i32_ty, state, 0), poll);
+                LLVMBuildBr(c.builder, poll);
+                LLVMPositionBuilderAtEnd(c.builder, poll);
+                auto policy = c.get_value(inst.operand(0));
+                auto request = c.get_value(inst.operand(1));
+                auto timeout = c.get_value(inst.operand(2));
+                auto has = LLVMBuildAlloca(c.builder, c.i8_ty, "call.has");
+                auto out = LLVMBuildAlloca(c.builder, c.ptr_ty, "call.out");
+                auto length = LLVMBuildAlloca(c.builder, c.i32_ty, "call.length");
+                LLVMTypeRef params[] = {c.ptr_ty,
+                                        c.ptr_ty,
+                                        c.i32_ty,
+                                        c.ptr_ty,
+                                        c.i32_ty,
+                                        c.i32_ty,
+                                        c.ptr_ty,
+                                        c.ptr_ty,
+                                        c.ptr_ty};
+                auto type = LLVMFunctionType(c.i64_ty, params, 9, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_http_call");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_http_call", type);
+                LLVMValueRef args[] = {
+                    c.param_conn,
+                    LLVMBuildExtractValue(c.builder, policy, 0, "call.policy.ptr"),
+                    LLVMBuildExtractValue(c.builder, policy, 1, "call.policy.len"),
+                    LLVMBuildExtractValue(c.builder, request, 0, "call.request.ptr"),
+                    LLVMBuildExtractValue(c.builder, request, 1, "call.request.len"),
+                    timeout,
+                    has,
+                    out,
+                    length};
+                auto reply = LLVMBuildCall2(c.builder, type, helper, args, 9, "call.reply");
+                auto status = LLVMBuildTrunc(c.builder, reply, c.i32_ty, "call.status");
+                auto waiting = LLVMBuildICmp(c.builder,
+                                             LLVMIntEQ,
+                                             status,
+                                             LLVMConstInt(c.i32_ty, 0x80000000u, 0),
+                                             "call.waiting");
+                LLVMBuildCondBr(c.builder, waiting, pending, ready);
+                LLVMPositionBuilderAtEnd(c.builder, pending);
+                auto pc =
+                    LLVMBuildStructGEP2(c.builder, c.call_frame_type, c.call_frame, 0, "call.pc");
+                LLVMBuildStore(c.builder, LLVMConstInt(c.i32_ty, state, 0), pc);
+                auto ms =
+                    LLVMBuildLShr(c.builder, reply, LLVMConstInt(c.i64_ty, 32, 0), "call.retry");
+                auto packed = LLVMBuildOr(
+                    c.builder,
+                    LLVMBuildShl(c.builder, ms, LLVMConstInt(c.i64_ty, 8, 0), "call.ms"),
+                    c.make_result_yield(0, static_cast<u8>(YieldKind::Timer), 0),
+                    "call.yield");
+                c.emit_parse_unprime();
+                c.emit_time_unlatch();
+                LLVMBuildRet(c.builder, packed);
+                LLVMPositionBuilderAtEnd(c.builder, ready);
+                auto result = LLVMGetUndef(c.opt_str_ty);
+                result =
+                    LLVMBuildInsertValue(c.builder,
+                                         result,
+                                         LLVMBuildLoad2(c.builder, c.i8_ty, has, "call.has.value"),
+                                         0,
+                                         "call.result");
+                result =
+                    LLVMBuildInsertValue(c.builder,
+                                         result,
+                                         LLVMBuildLoad2(c.builder, c.ptr_ty, out, "call.out.value"),
+                                         1,
+                                         "call.result");
+                result = LLVMBuildInsertValue(
+                    c.builder,
+                    result,
+                    LLVMBuildLoad2(c.builder, c.i32_ty, length, "call.length.value"),
+                    2,
+                    "call.result");
+                c.set_value(inst.result, result);
+                break;
+            }
             if (kJsonOp == json::Op::PasswordVerifyHeader ||
                 kJsonOp == json::Op::ForwardAuthHeader) {
                 const char* helper_name = kJsonOp == json::Op::ForwardAuthHeader
@@ -2646,6 +2758,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::Phi: {
+            if (c.call_frame) break;  // incoming edges store the selected value
             LLVMValueRef value = LLVMBuildPhi(
                 c.builder, c.map_type(c.cur_fn->values[inst.result.id].type), "merge.value");
             c.set_value(inst.result, value);
@@ -2714,11 +2827,14 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef cond = c.get_value(inst.operands[0]);
             LLVMBasicBlockRef then_bb = c.get_block(inst.imm.block_targets[0]);
             LLVMBasicBlockRef else_bb = c.get_block(inst.imm.block_targets[1]);
+            c.call_edge_values(inst.imm.block_targets[0]);
+            c.call_edge_values(inst.imm.block_targets[1]);
             LLVMBuildCondBr(c.builder, cond, then_bb, else_bb);
             break;
         }
         case rir::Opcode::Jmp: {
             LLVMBasicBlockRef target = c.get_block(inst.imm.block_targets[0]);
+            c.call_edge_values(inst.imm.block_targets[0]);
             LLVMBuildBr(c.builder, target);
             break;
         }
@@ -3105,7 +3221,52 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // state 0 enters the original entry block so decorator guards run before
     // the first timer yield, yield_0 is omitted from the prologue, and
     // resumed states dispatch to the recorded terminal block by default.
-    if (fn.yield_count > 0) {
+    c.call_frame = nullptr;
+    c.call_frame_type = nullptr;
+    c.call_dispatch = nullptr;
+    c.call_state = 0;
+    if (rir::function_uses_http_call(fn)) {
+        LLVMTypeRef fields[1027]{};
+        fields[0] = c.i32_ty;
+        fields[1] = c.ptr_ty;
+        fields[2] = c.i32_ty;
+        for (u32 i = 0; i < fn.value_count; ++i) fields[i + 3] = c.map_type(fn.values[i].type);
+        c.call_frame_type = LLVMStructTypeInContext(c.llvm_ctx, fields, fn.value_count + 3, 0);
+        auto entry = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, "call.entry");
+        LLVMMoveBasicBlockBefore(entry, c.block_map[fn.blocks[0].id.id]);
+        auto dispatch = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, "call.dispatch");
+        auto failed = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, "call.frame.failed");
+        LLVMPositionBuilderAtEnd(c.builder, entry);
+        c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.i64_ty, c.ptr_ty, c.i32_ty};
+        auto type = LLVMFunctionType(c.ptr_ty, params, 5, 0);
+        auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_http_call_frame");
+        if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_http_call_frame", type);
+        LLVMValueRef args[] = {c.param_conn,
+                               c.param_ctx,
+                               LLVMSizeOf(c.call_frame_type),
+                               c.param_req_data,
+                               c.param_req_len};
+        c.call_frame = LLVMBuildCall2(c.builder, type, helper, args, 5, "call.frame");
+        auto valid = LLVMBuildICmp(
+            c.builder, LLVMIntNE, c.call_frame, LLVMConstNull(c.ptr_ty), "call.frame.valid");
+        LLVMBuildCondBr(c.builder, valid, dispatch, failed);
+        LLVMPositionBuilderAtEnd(c.builder, failed);
+        LLVMBuildRet(c.builder, c.make_result_status(503));
+        LLVMPositionBuilderAtEnd(c.builder, dispatch);
+        auto request =
+            LLVMBuildStructGEP2(c.builder, c.call_frame_type, c.call_frame, 1, "call.snapshot.ptr");
+        auto length =
+            LLVMBuildStructGEP2(c.builder, c.call_frame_type, c.call_frame, 2, "call.snapshot.len");
+        c.param_req_data = LLVMBuildLoad2(c.builder, c.ptr_ty, request, "call.snapshot");
+        c.param_req_len = LLVMBuildLoad2(c.builder, c.i32_ty, length, "call.snapshot.size");
+        if (kNeedsParse) c.emit_parse_prime();
+        if (kNeedsTimeUnlatch) c.emit_time_unlatch();
+        auto pc = LLVMBuildStructGEP2(c.builder, c.call_frame_type, c.call_frame, 0, "call.pc");
+        auto state = LLVMBuildLoad2(c.builder, c.i32_ty, pc, "call.state");
+        c.call_dispatch = LLVMBuildSwitch(c.builder, state, failed, 17);
+        LLVMAddCase(c.call_dispatch, LLVMConstInt(c.i32_ty, 0, 0), c.block_map[fn.blocks[0].id.id]);
+    } else if (fn.yield_count > 0) {
         LLVMBasicBlockRef dispatch_bb = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, "dispatch");
         // Move dispatch to be the first block; it will become the function's
         // entry point automatically because LLVM uses block-append order and
@@ -3181,6 +3342,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // Emit instructions block by block.
     for (u32 i = 0; i < fn.block_count; i++) {
         auto& blk = fn.blocks[i];
+        c.current_block = blk.id.id;
         LLVMBasicBlockRef bb = c.block_map[blk.id.id];
         LLVMPositionBuilderAtEnd(c.builder, bb);
 
@@ -3202,7 +3364,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         const auto& block = fn.blocks[bi];
         for (u32 ii = 0; ii < block.inst_count; ++ii) {
             const auto& inst = block.insts[ii];
-            if (inst.op != rir::Opcode::Phi) continue;
+            if (inst.op != rir::Opcode::Phi || c.call_frame) continue;
             LLVMValueRef values[] = {c.get_value(inst.operands[0]), c.get_value(inst.operands[1])};
             LLVMBasicBlockRef incoming[] = {exits[inst.imm.block_targets[0].id],
                                             exits[inst.imm.block_targets[1].id]};
@@ -3227,7 +3389,8 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
     for (u32 fi = 0; fi < rir_mod.func_count; ++fi) {
         const rir::Function& fn = rir_mod.functions[fi];
         bool has_phi = false;
-        if (ws_body_mode && (fn.yield_count != 0 || fn.is_timer || rir_function_uses_parse(fn)))
+        if (ws_body_mode && (fn.yield_count != 0 || fn.is_timer || rir_function_uses_parse(fn) ||
+                             rir::function_uses_http_call(fn)))
             return {nullptr, nullptr, false};
         if (fn.block_count > 0 && fn.blocks == nullptr) return {nullptr, nullptr, false};
         for (u32 bi = 0; bi < fn.block_count; ++bi) {
@@ -3363,10 +3526,13 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 }
             }
         }
-        if (has_phi && !rir::verify_function(&fn).ok) return {nullptr, nullptr, false};
+        if ((has_phi || rir::function_uses_http_call(fn)) && !rir::verify_function(&fn).ok)
+            return {nullptr, nullptr, false};
     }
     for (u32 i = 0; i < rir_mod.func_count; ++i)
-        if (!rir::password_prefix_valid(rir_mod.functions[i])) return {nullptr, nullptr, false};
+        if (!rir::password_prefix_valid(rir_mod.functions[i]) ||
+            !rir::http_call_profile_valid(rir_mod.functions[i]))
+            return {nullptr, nullptr, false};
     static std::atomic<u32> next_regex_module_id{1};
     Ctx c{};
     c.ws_body_mode = ws_body_mode;

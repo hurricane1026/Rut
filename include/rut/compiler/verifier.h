@@ -2,6 +2,7 @@
 
 #include "rut/common/request_policy.h"
 #include "rut/common/ws_message.h"
+#include "rut/compiler/http_call_profile.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_printer.h"
@@ -48,6 +49,7 @@ enum class VerifyIssueCode : u8 {
     InvalidPreRoutePolicyId,
     InvalidJwtClaimsLifetime,
     InvalidPasswordPrefix,
+    InvalidHttpCallProfile,
     InvalidStrLength,
     InvalidStringOperation,
     InvalidWsMessageField,
@@ -848,6 +850,8 @@ inline VerifyResult verify_function(const Function* fn,
 
     if (!password_prefix_valid(*fn))
         return verify_fail(summary, VerifyIssueCode::InvalidPasswordPrefix, function_index);
+    if (!http_call_profile_valid(*fn))
+        return verify_fail(summary, VerifyIssueCode::InvalidHttpCallProfile, function_index);
 
     summary.block_count = fn->block_count;
 
@@ -1813,6 +1817,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidForwardPreflight";
         case VerifyIssueCode::InvalidPasswordPrefix:
             return "InvalidPasswordPrefix";
+        case VerifyIssueCode::InvalidHttpCallProfile:
+            return "InvalidHttpCallProfile";
         case VerifyIssueCode::InvalidJwtClaimsLifetime:
             return "InvalidJwtClaimsLifetime";
         case VerifyIssueCode::InvalidPhi:

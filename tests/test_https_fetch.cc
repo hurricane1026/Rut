@@ -2,6 +2,7 @@
 #include "rs256_fixture.h"
 #include "rut/runtime/es256_policy.h"
 #include "rut/runtime/forward_auth.h"
+#include "rut/runtime/http_call.h"
 #include "rut/runtime/https_fetch.h"
 #include "rut/runtime/rs256_policy.h"
 #include "test.h"
@@ -715,5 +716,122 @@ TEST(https_fetch, forward_auth_worker_bounds_deadline_cancellation_and_generatio
     CHECK_EQ(worker.authorize(1, 3, {}, policy, {}, {}, {}, jwt_monotonic_ms(), 3000).status, -1);
     REQUIRE(worker.start().has_value());
     worker.cancel(1);
+    worker.stop();
+}
+
+TEST(https_fetch, callout_request_rejects_transport_injection_and_preserves_body) {
+    HttpsEndpoint endpoint;
+    REQUIRE(http_call_policy(
+        lit_str(
+            R"({"address":"127.0.0.1","serverName":"localhost","caFile":"/ca.pem","path":"/check?x=1"})"),
+        endpoint));
+    char wire[6144];
+    u32 length = 0;
+    REQUIRE(http_call_request(
+        endpoint,
+        lit_str(
+            R"({"method":"POST","headers":{"Authorization":"Bearer secret","Content-Type":"application/json"},"body":"{\"user\":\"alice\"}"})"),
+        wire,
+        sizeof(wire),
+        length));
+    wire[length] = 0;
+    CHECK(strstr(wire, "POST /check?x=1 HTTP/1.1\r\n") != nullptr);
+    CHECK(strstr(wire, "Content-Length: 16\r\n") != nullptr);
+    CHECK(strstr(wire, "\r\n\r\n{\"user\":\"alice\"}") != nullptr);
+    const Str bad[] = {lit_str(R"({"method":"CONNECT"})"),
+                       lit_str(R"({"method":"GET","url":"http://attacker"})"),
+                       lit_str(R"({"method":"GET","headers":{"Host":"attacker"}})"),
+                       lit_str(R"({"method":"GET","headers":{"Content-Length":"99"}})"),
+                       lit_str(R"({"method":"GET","headers":{"X-A":"one","x-a":"two"}})"),
+                       lit_str(R"({"method":"GET","headers":{"X-A":"one\r\nInjected: yes"}})"),
+                       lit_str(R"({"method":"GET","method":"POST"})")};
+    for (auto input : bad) CHECK(!http_call_request(endpoint, input, wire, sizeof(wire), length));
+    CHECK(!http_call_policy(
+        lit_str(
+            R"({"address":"example.com","serverName":"localhost","caFile":"/ca.pem","path":"/"})"),
+        endpoint));
+}
+
+TEST(https_fetch, callout_profile_admits_http_errors_but_not_ambiguous_or_partial_messages) {
+    BoundedJsonResponse response;
+    response.reset_callout();
+    CHECK(response.append(lit_str(
+              "HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\nX-A: one\r\nX-A: two\r\n\r\nno!")) ==
+          BoundedJsonResponse::Result::Complete);
+    CHECK_EQ(response.status(), 403u);
+    CHECK(response.body().eq(lit_str("no!")));
+    ParsedResponse headers{};
+    REQUIRE(response.headers(headers));
+    CHECK_EQ(headers.header_count, 3u);
+    response.reset_callout();
+    CHECK(response.append(lit_str(
+              "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Complete);
+    CHECK(response.body().eq(lit_str("ok")));
+    const Str bad[] = {
+        lit_str("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"),
+        lit_str("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\nx"),
+        lit_str("HTTP/1.1 101 Switching Protocols\r\nContent-Length: 0\r\n\r\n"),
+        lit_str("HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\nx")};
+    for (auto message : bad) {
+        response.reset_callout();
+        CHECK(response.append(message) == BoundedJsonResponse::Result::Error);
+    }
+    response.reset_callout();
+    CHECK(response.append(lit_str("HTTP/1.1 204 No Content\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Complete);
+    response.reset_callout();
+    CHECK(response.append(lit_str("HTTP/1.1 304 Not Modified\r\nContent-Length: 100000\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Complete);
+    CHECK(response.body().empty());
+    response.reset_callout();
+    CHECK(
+        response.append(lit_str("HTTP/1.1 304 Not Modified\r\nContent-Length: 100000\r\n\r\nx")) ==
+        BoundedJsonResponse::Result::Error);
+    response.reset_callout();
+    CHECK(response.append(lit_str("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Error);
+    response.reset_callout();
+    CHECK(response.append(lit_str("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nx")) ==
+          BoundedJsonResponse::Result::More);
+    CHECK(response.finish() == BoundedJsonResponse::Result::Error);
+    // Existing authorization and JWKS profiles retain their narrower domains.
+    response.reset(true);
+    CHECK(response.append(lit_str("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Error);
+}
+
+TEST(https_fetch, callout_worker_deadline_capacity_cancellation_and_owned_results) {
+    TlsOrigin origin;
+    origin.responses[0] = lit_str(
+        "HTTP/1.1 403 Forbidden\r\nX-User: alice\r\nX-Role: reader\r\nX-Role: "
+        "writer\r\nContent-Length: 2\r\n\r\n{}");
+    origin.count = 1;
+    REQUIRE(origin.init());
+    HttpCallWorker worker;
+    REQUIRE(worker.start().has_value());
+    const auto endpoint = origin.endpoint();
+    const auto request = lit_str(R"({"method":"GET"})");
+    const auto now = jwt_monotonic_ms();
+    for (u32 i = 1; i <= HttpCallWorker::kCapacity; ++i)
+        CHECK_EQ(worker.call(i, 1, endpoint, request, now, 3000).status,
+                 static_cast<i32>(0x80000000u));
+    CHECK_EQ(worker.call(100, 1, endpoint, request, now, 3000).status, -3);
+    CHECK_EQ(worker.call(1, 1, endpoint, {}, now + 3000, 60000).status, -2);
+    for (u32 i = 2; i <= HttpCallWorker::kCapacity; ++i) worker.cancel(i);
+    HttpCallReply reply;
+    for (u32 i = 0; i < 3000; ++i) {
+        reply = worker.call(1, 2, endpoint, request, jwt_monotonic_ms(), 3000);
+        if (reply.status == 0) break;
+        CHECK(reply.status == -3 || reply.status == static_cast<i32>(0x80000000u));
+        usleep(1000);
+    }
+    CHECK_EQ(reply.status, 0);
+    reply.document[reply.length] = 0;
+    CHECK(strstr(reply.document, "\"status\":403") != nullptr);
+    CHECK(strstr(reply.document, "\"x-role\":[\"reader\",\"writer\"]") != nullptr);
+    worker.stop();
+    CHECK_EQ(worker.call(1, 3, endpoint, request, jwt_monotonic_ms(), 3000).status, -1);
+    REQUIRE(worker.start().has_value());
     worker.stop();
 }

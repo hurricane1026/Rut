@@ -50,6 +50,7 @@ enum class Op : u8 {
     PasswordVerifyHeader,  // compiler-only asynchronous prefix, not generic JSON dispatch
     JwtVerifyEs256,
     ForwardAuthHeader,  // compiler-only asynchronous authorization prefix
+    HttpCall,           // compiler-only resumable HTTP expression
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

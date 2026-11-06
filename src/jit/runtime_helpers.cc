@@ -6,6 +6,7 @@
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
 #include "rut/common/ws_message.h"
+#include "rut/jit/handler_abi.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/auth.h"
@@ -14,11 +15,13 @@
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
+#include "rut/runtime/http_call.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/jwt_hs256.h"
 #include "rut/runtime/password_gateway.h"
+#include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/signed_request.h"
 #include "rut/runtime/uuid.h"
@@ -34,6 +37,7 @@
 #include <hs.h>
 #include <hs_common.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -335,6 +339,84 @@ i32 rut_helper_req_header_count(const u8* req_data, u32 req_len, const char* nam
         if (http_header_name_eq_ci(header.name.ptr, header.name.len, name, name_len)) ++count;
     }
     return count;
+}
+
+extern "C" void* rut_helper_http_call_frame(
+    void* connection, void* context, u64 size, const u8* request, u32 length) {
+    if (!connection || !context || !request || !length || length > 8192 ||
+        size < sizeof(HttpCallFrameHeader) || size > 8192)
+        return nullptr;
+    auto& conn = *static_cast<ConnectionBase*>(connection);
+    auto& ctx = *static_cast<jit::HandlerCtx*>(context);
+    if (!ctx.slot_count) return nullptr;
+    HttpCallFrameHeader* saved = nullptr;
+    __builtin_memcpy(static_cast<void*>(&saved), ctx.slots(), sizeof(HttpCallFrameHeader*));
+    if (saved) return saved;
+    auto& arena = conn.json_arena;
+    if (!arena.backend.pool || (!arena.current && !arena.init(arena.backend.pool)) ||
+        arena.space_used() > 262144 - size - length)
+        return nullptr;
+    auto* frame = static_cast<HttpCallFrameHeader*>(arena.alloc(size));
+    auto* snapshot = static_cast<u8*>(arena.alloc(length));
+    if (!frame || !snapshot) return nullptr;
+    __builtin_memset(frame, 0, size);
+    __builtin_memcpy(snapshot, request, length);
+    frame->request = snapshot;
+    frame->length = length;
+    const uintptr_t kRequestStart = reinterpret_cast<uintptr_t>(request);
+    const uintptr_t kRequestEnd = kRequestStart + length;
+    const u32 kParamCount =
+        ctx.route_param_count > kMaxRouteParams ? kMaxRouteParams : ctx.route_param_count;
+    for (u32 i = 0; i < kParamCount; ++i) {
+        auto& param = ctx.route_params[i];
+        const uintptr_t kValueStart = reinterpret_cast<uintptr_t>(param.value);
+        if (!param.value || kValueStart < kRequestStart || kValueStart > kRequestEnd ||
+            param.value_len > kRequestEnd - kValueStart)
+            continue;
+        param.value = reinterpret_cast<const char*>(snapshot + (kValueStart - kRequestStart));
+    }
+    __builtin_memcpy(ctx.slots(), static_cast<const void*>(&frame), sizeof(HttpCallFrameHeader*));
+    return frame;
+}
+extern "C" u64 rut_helper_http_call(void* connection,
+                                    const char* policy,
+                                    u32 policy_len,
+                                    const char* request,
+                                    u32 request_len,
+                                    u32 timeout,
+                                    u8* has,
+                                    const char** out,
+                                    u32* length) {
+    *has = 0;
+    *out = nullptr;
+    *length = 0;
+    if (!connection) return 0;
+    HttpsEndpoint endpoint;
+    HttpCallReply reply;
+    if (http_call_policy({policy, policy_len}, endpoint))
+        reply = http_call_for_request(connection, endpoint, {request, request_len}, timeout);
+    if (reply.status == static_cast<i32>(0x80000000u))
+        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+    Str result{reply.document, reply.length};
+    if (reply.status != 0) {
+        result = reply.status == -2 ? lit_str("{\"ok\":false,\"status\":0,\"error\":\"timeout\"}")
+                 : reply.status == -3
+                     ? lit_str("{\"ok\":false,\"status\":0,\"error\":\"capacity\"}")
+                 : reply.status == -4
+                     ? lit_str("{\"ok\":false,\"status\":0,\"error\":\"invalidRequest\"}")
+                     : lit_str("{\"ok\":false,\"status\":0,\"error\":\"transport\"}");
+    }
+    auto& arena = static_cast<ConnectionBase*>(connection)->json_arena;
+    if (!arena.backend.pool || (!arena.current && !arena.init(arena.backend.pool)) ||
+        arena.space_used() > 262144 - result.len)
+        return 0;
+    auto* storage = static_cast<char*>(arena.alloc(result.len));
+    if (!storage) return 0;
+    __builtin_memcpy(storage, result.ptr, result.len);
+    *has = 1;
+    *out = storage;
+    *length = result.len;
+    return 0;
 }
 
 extern "C" u64 rut_helper_forward_auth_header(void* connection,

@@ -4065,6 +4065,20 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
            policy_bundle_valid;
 }
 
+static bool mir_has_http_call(const MirValue& value, u32 depth = 0) {
+    if (depth > 128) return true;
+    if (value.kind == MirValueKind::JsonOp &&
+        value.int_value == static_cast<i64>(json::Op::HttpCall))
+        return true;
+    if (value.lhs && mir_has_http_call(*value.lhs, depth + 1)) return true;
+    if (value.rhs && mir_has_http_call(*value.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && mir_has_http_call(*value.args[i], depth + 1)) return true;
+    for (u32 i = 0; i < value.field_inits.len; ++i)
+        if (value.field_inits[i].value && mir_has_http_call(*value.field_inits[i].value, depth + 1))
+            return true;
+    return false;
+}
 static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
                                               FrontendRirModule& out,
                                               bool internal_strict_local_response_propagation) {
@@ -5483,6 +5497,42 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
             if (local_needs_error_prelude(mir.functions[i].locals[li])) error_local_count++;
         }
         const bool has_error_prelude = error_local_count != 0;
+        bool callout_locals = false;
+        for (u32 j = 0; j < mir.functions[i].locals.len; ++j)
+            callout_locals |= mir_has_http_call(mir.functions[i].locals[j].init);
+        for (u32 j = 0; j < mir.functions[i].values.len; ++j)
+            callout_locals |= mir_has_http_call(mir.functions[i].values[j]);
+        u32 local_blocks[MirFunction::kMaxLocals]{};
+        if (callout_locals) {
+            constexpr auto detail = lit_str(
+                "httpCall requires a let binding before optional guards; explicit waits, implicit "
+                "error propagation and non-HTTP callbacks are outside this callout profile");
+            if (has_error_prelude || mir.functions[i].waits.len || mir.functions[i].is_timer ||
+                mir.functions[i].is_ws_callback)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, mir.functions[i].span, detail);
+            for (u32 j = 0; j < mir.functions[i].blocks.len; ++j) {
+                const auto& block = mir.functions[i].blocks[j];
+                if (mir_has_http_call(block.term.cond) || mir_has_http_call(block.term.lhs) ||
+                    mir_has_http_call(block.term.rhs))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, block.term.span, detail);
+            }
+            // Pure routes historically hoist their locals. Callouts have effects:
+            // bind each local at the next lexical control boundary instead, so a
+            // failed guard cannot run later calls or their request construction.
+            for (u32 li = 0; li < mir.functions[i].locals.len; ++li) {
+                const auto start = mir.functions[i].locals[li].span.start;
+                u32 nearest = 0xffffffffu;
+                for (u32 bi = 0; bi < mir.functions[i].blocks.len; ++bi) {
+                    const auto at = mir.functions[i].blocks[bi].term.span.start;
+                    if (at >= start && at < nearest) {
+                        nearest = at;
+                        local_blocks[li] = bi;
+                    }
+                }
+            }
+        }
         if (mir.functions[i].is_ws_callback && has_error_prelude)
             return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
         rir::BlockId prelude_block{};
@@ -5559,6 +5609,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
 
         rir::ValueId local_vals[MirFunction::kMaxLocals]{};
         for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+            if (callout_locals) continue;
             auto val = materialize_local_init(mir.functions[i].locals[li],
                                               mir,
                                               variant_infos,
@@ -5637,6 +5688,32 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
                                        !mir.functions[i].has_explicit_resume_blocks
                                    ? kLocalContinuation
                                    : block_ids[bi]);
+            if (callout_locals) {
+                for (u32 li = 0; li < mir.functions[i].locals.len; ++li) {
+                    if (local_blocks[li] != bi) continue;
+                    const auto& local = mir.functions[i].locals[li];
+                    auto val = materialize_local_init(local,
+                                                      mir,
+                                                      variant_infos,
+                                                      tuple_infos,
+                                                      &tuple_info_count,
+                                                      error_scalar_infos,
+                                                      error_variant_infos,
+                                                      error_struct_infos,
+                                                      error_struct_def.value(),
+                                                      user_struct_defs,
+                                                      b,
+                                                      local_vals,
+                                                      MirFunction::kMaxLocals,
+                                                      mir.functions[i].name,
+                                                      out.module.name);
+                    if (!val) {
+                        out.destroy();
+                        return core::make_unexpected(val.error());
+                    }
+                    local_vals[local.ref_index] = val.value();
+                }
+            }
             if (mir.functions[i].has_explicit_resume_blocks) {
                 const Span store_span = mir.functions[i].blocks[bi].term.span;
                 for (u32 wi = 0; wi < mir.functions[i].waits.len; wi++) {

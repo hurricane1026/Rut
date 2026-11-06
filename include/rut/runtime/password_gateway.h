@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/forward_auth.h"
+#include "rut/runtime/http_call.h"
 #include "rut/runtime/password_request.h"
 
 namespace rut {
@@ -33,6 +34,7 @@ public:
     // Shared async authentication lifecycle host; keeps the existing native feature flag.
     core::Expected<void, Error> start();
     ForwardAuthWorker forward_auth;
+    HttpCallWorker http_calls;
     void stop();
     PasswordGatewayReply verify(
         u32 connection, u64 generation, Str password, Str record, u64 now_ms, u32 timeout_ms);
@@ -84,6 +86,10 @@ ForwardAuthReply forward_auth_for_request(void* connection,
                                           Str method,
                                           Str target,
                                           u32 timeout_ms);
+HttpCallReply http_call_for_request(void* connection,
+                                    const HttpsEndpoint& endpoint,
+                                    Str request,
+                                    u32 timeout_ms);
 
 // Native HandlerFn API, also used by the bounded Rut/JIT header helper.
 // First call copies credentials; subsequent calls for this request only poll the
