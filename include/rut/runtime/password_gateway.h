@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/runtime/forward_auth.h"
 #include "rut/runtime/password_request.h"
 
 namespace rut {
@@ -29,7 +30,9 @@ public:
     ~PasswordGateway() { stop(); }
     PasswordGateway(const PasswordGateway&) = delete;
     PasswordGateway& operator=(const PasswordGateway&) = delete;
-    core::Expected<void, Error> start() { return worker.start(); }
+    // Shared async authentication lifecycle host; keeps the existing native feature flag.
+    core::Expected<void, Error> start();
+    ForwardAuthWorker forward_auth;
     void stop();
     PasswordGatewayReply verify(
         u32 connection, u64 generation, Str password, Str record, u64 now_ms, u32 timeout_ms);
@@ -71,6 +74,16 @@ private:
     u32 previous_stream = 0;
     bool engaged = false;
 };
+
+// Authenticated request/stream binding; returns explicit denial/unavailable or a
+// bounded pending timer yield. Only status 1 authorizes forwarding.
+ForwardAuthReply forward_auth_for_request(void* connection,
+                                          Str header,
+                                          const ForwardAuthPolicy& policy,
+                                          Str credential,
+                                          Str method,
+                                          Str target,
+                                          u32 timeout_ms);
 
 // Native HandlerFn API, also used by the bounded Rut/JIT header helper.
 // First call copies credentials; subsequent calls for this request only poll the

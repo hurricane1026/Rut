@@ -83,6 +83,7 @@
     X(rut_helper_bearer_matches)                      \
     X(rut_helper_standard_webhook_valid)              \
     X(rut_helper_signed_request_valid)                \
+    X(rut_helper_forward_auth_header)                 \
     X(rut_helper_password_verify_header)              \
     X(rut_helper_jwt_claims_valid_with_lifetime)      \
     X(rut_helper_hmac_sha256_matches)                 \

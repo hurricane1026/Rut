@@ -1,6 +1,7 @@
 #include "es256_fixture.h"
 #include "rs256_fixture.h"
 #include "rut/runtime/es256_policy.h"
+#include "rut/runtime/forward_auth.h"
 #include "rut/runtime/https_fetch.h"
 #include "rut/runtime/rs256_policy.h"
 #include "test.h"
@@ -584,4 +585,135 @@ TEST(https_fetch, only_authenticated_tls_eof_completes_a_close_delimited_body) {
         else
             CHECK(fetch.body().ptr == nullptr);
     }
+}
+
+TEST(https_fetch, authorization_profile_is_bounded_and_does_not_relax_jwks) {
+    const char* valid[] = {
+        "HTTP/1.1 200 OK\r\nX-Consumer-ID: alice\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    };
+    for (const auto* response : valid) {
+        BoundedJsonResponse auth, jwks;
+        auth.reset(true);
+        jwks.reset();
+        CHECK_EQ(auth.append(text(response)), BoundedJsonResponse::Result::Complete);
+        CHECK_EQ(jwks.append(text(response)), BoundedJsonResponse::Result::Error);
+    }
+    const char* invalid[] = {
+        "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 8193\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection: X-Consumer-ID\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n",
+    };
+    for (const auto* response : invalid) {
+        BoundedJsonResponse auth;
+        auth.reset(true);
+        CHECK_EQ(auth.append(text(response)), BoundedJsonResponse::Result::Error);
+    }
+    BoundedJsonResponse duplicate;
+    duplicate.reset(true);
+    REQUIRE_EQ(duplicate.append(lit_str("HTTP/1.1 200 OK\r\nX-Consumer-ID: a\r\nx-consumer-id: "
+                                        "b\r\nContent-Length: 0\r\n\r\n")),
+               BoundedJsonResponse::Result::Complete);
+    CHECK_EQ(duplicate.unique_header(lit_str("X-Consumer-ID")).len, 0u);
+}
+
+TEST(https_fetch, forward_auth_policy_rejects_unsafe_identity_and_endpoint) {
+    char bytes[2048];
+    const char* identities[] = {"X-Consumer-ID",
+                                "Authorization",
+                                "Host",
+                                "Connection",
+                                "X-Original-URI",
+                                "X-Original-Method",
+                                "X-Bad Header",
+                                "X-"};
+    for (const char* identity : identities) {
+        const int length =
+            snprintf(bytes,
+                     sizeof(bytes),
+                     "{\"address\":\"127.0.0.1\",\"serverName\":\"localhost\",\"caFile\":\"/"
+                     "ca.pem\",\"path\":\"/auth\",\"identityHeader\":\"%s\"}",
+                     identity);
+        CHECK_EQ(forward_auth_policy_valid(
+                     lit_str("Authorization"), {bytes, static_cast<u32>(length)}, 5000),
+                 __builtin_strcmp(identity, "X-Consumer-ID") == 0);
+    }
+    const Str policy = lit_str(
+        R"json({"address":"127.0.0.1","serverName":"localhost","caFile":"/ca.pem","path":"/auth","identityHeader":"X-Consumer-ID"})json");
+    CHECK(forward_auth_policy_valid(lit_str("Authorization"), policy, 5000));
+    CHECK(!forward_auth_policy_valid(lit_str("Authorization"), policy, 0));
+    CHECK(!forward_auth_policy_valid(lit_str("Authorization"), policy, 60001));
+    CHECK(!forward_auth_policy_valid(lit_str("x-consumer-id"), policy, 5000));
+    ForwardAuthPolicy config;
+    CHECK(!config.load(lit_str(
+        R"json({"address":"127.0.0.1","address":"127.0.0.2","serverName":"localhost","caFile":"/ca.pem","path":"/auth","identityHeader":"X-Consumer-ID"})json")));
+    CHECK(!config.load(lit_str(
+        R"json({"address":"127.0.0.1","serverName":"localhost","caFile":"/ca.pem","path":"/auth\u0000ignored","identityHeader":"X-Consumer-ID"})json")));
+}
+
+TEST(https_fetch, forward_auth_worker_bounds_deadline_cancellation_and_generation) {
+    TlsOrigin origin;
+    origin.responses[0] =
+        lit_str("HTTP/1.1 200 OK\r\nX-Consumer-ID: alice\r\nContent-Length: 0\r\n\r\n");
+    origin.count = 1;
+    REQUIRE(origin.init());
+    ForwardAuthPolicy policy;
+    policy.endpoint = origin.endpoint();
+    __builtin_memcpy(policy.identity_header, "X-Consumer-ID", 14);
+    ForwardAuthWorker worker;
+    REQUIRE(worker.start().has_value());
+    const auto now = jwt_monotonic_ms();
+    for (u32 i = 0; i < ForwardAuthWorker::kCapacity; ++i) {
+        auto reply = worker.authorize(i + 1,
+                                      1,
+                                      lit_str("Authorization"),
+                                      policy,
+                                      lit_str("Bearer secret"),
+                                      lit_str("GET"),
+                                      lit_str("/resource"),
+                                      now,
+                                      3000);
+        CHECK_EQ(reply.status, static_cast<i32>(0x80000000u));
+    }
+    CHECK_EQ(worker
+                 .authorize(100,
+                            1,
+                            lit_str("Authorization"),
+                            policy,
+                            lit_str("x"),
+                            lit_str("GET"),
+                            lit_str("/"),
+                            now,
+                            3000)
+                 .status,
+             -1);
+    // Expiry wins over a queued/running/completed authorization decision.
+    CHECK_EQ(worker.authorize(1, 1, {}, policy, {}, {}, {}, now + 3000, 60000).status, -2);
+    for (u32 i = 2; i <= ForwardAuthWorker::kCapacity; ++i) worker.cancel(i);
+    ForwardAuthReply reply;
+    for (u32 i = 0; i < 3000; ++i) {
+        reply = worker.authorize(1,
+                                 2,
+                                 lit_str("Authorization"),
+                                 policy,
+                                 lit_str("Bearer fresh"),
+                                 lit_str("GET"),
+                                 lit_str("/new"),
+                                 jwt_monotonic_ms(),
+                                 3000);
+        if (reply.status == 1) break;
+        CHECK(reply.status == -1 || reply.status == static_cast<i32>(0x80000000u));
+        usleep(1000);
+    }
+    CHECK_EQ(reply.status, 1);
+    CHECK((Str{reply.identity, reply.identity_length}.eq(lit_str("alice"))));
+    worker.stop();
+    CHECK_EQ(worker.authorize(1, 3, {}, policy, {}, {}, {}, jwt_monotonic_ms(), 3000).status, -1);
+    REQUIRE(worker.start().has_value());
+    worker.cancel(1);
+    worker.stop();
 }

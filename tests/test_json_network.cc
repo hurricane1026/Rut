@@ -3229,3 +3229,49 @@ TEST(json_network, rotating_mtls_pins_validate_configuration_and_map_only_verifi
     loop->free_conn(*conn);
     pool.destroy();
 }
+
+TEST(json_network, forward_auth_jit_suspends_before_effects_and_fails_closed) {
+    JsonProgram program;
+    REQUIRE(program.init(R"rut(route GET "/private" {
+        let decision = forwardAuthHeader("Authorization", "{\"address\":\"127.0.0.1\",\"serverName\":\"localhost\",\"caFile\":\"/missing/rut-forward-auth-ca.pem\",\"path\":\"/authorize\",\"identityHeader\":\"X-Consumer-ID\"}", 1000)
+        match decision {
+            1 => {
+                req.set("X-Should-Not-Run", "yes")
+                return 200
+            }
+            _ => return 503
+        }
+    })rut"));
+    REQUIRE(program.config->requires_password_gateway());
+    PasswordGateway gateway;
+    REQUIRE(gateway.start().has_value());
+    ConnectionBase conn{};
+    conn.reset();
+    conn.fd = 42;
+    conn.id = 1;
+    conn.handler_gen = 1;
+    conn.transition_to_exec_handler_wait();
+    jit::HandlerCtx ctx{};
+    const char request[] =
+        "GET /private HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer secret\r\n\r\n";
+    const auto handler = program.handler();
+    REQUIRE(handler != nullptr);
+    const auto deadline = monotonic_us() + 2000000;
+    u32 yields = 0;
+    for (;;) {
+        PasswordHandlerScope scope(&gateway, &conn);
+        const auto reply = jit::HandlerResult::unpack(handler(
+            &conn, &ctx, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+        CHECK_EQ(conn.req_header_override_count, 0u);
+        if (reply.action != jit::HandlerAction::Yield) {
+            CHECK_EQ(reply.status_code, 503u);
+            break;
+        }
+        ++yields;
+        CHECK(reply.yield_kind == jit::YieldKind::Timer);
+        CHECK_EQ(reply.next_state, 0u);
+        REQUIRE(monotonic_us() < deadline);
+        usleep(1000);
+    }
+    CHECK(yields > 0);
+}

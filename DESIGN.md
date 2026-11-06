@@ -10175,3 +10175,26 @@ or allocation mechanism. TLS verification, fingerprint ownership/reset, HTTP/2
 propagation and RCU lifetimes remain the existing runtime contracts. Pin rotation
 is separate from certificate issuance, CA reload, CRL/OCSP, timer-based rotation
 and distributed revocation. See the language card and rotation example.
+
+### Implemented bounded Forward-auth prefix
+
+`forwardAuthHeader(header, policy, timeoutMs) -> i32` is a direct-route first-let
+asynchronous prefix with the same constant-only RIR replay verifier and native
+feature requirement as password verification. The strict compile-time JSON policy
+pins IPv4, TLS hostname/CA, path and one `X-*` identity response field. It sends a
+bounded credential and trusted original method/URI to the fixed HTTPS service;
+200 with one valid identity permits forwarding, 401/403 deny, and timeout or
+unavailable service fail closed. Successful identity mutation owns its bytes and
+replaces client spoofing; credentials are stripped from the forwarded request.
+No arbitrary response headers or body are propagated.
+
+Eight owned task slots and one background worker per requiring shard keep TLS
+allocation and CA/network work off the request shard. Existing timer yields poll
+without extending the original monotonic deadline. Connection generations and
+HTTP/2 stream IDs, cancellation on request retirement, worker-owned transport
+state and joined shutdown protect reuse/reload lifetimes. The existing shared
+asynchronous authentication gateway retains its historical PasswordGateway and
+native metadata names; password task admission and callout admission are separate.
+The HTTPS parser has an explicit authorization profile; its default JWKS profile
+still requires HTTP 200 JSON. See the language card's Forward-auth contract for
+bounds and the currently unsupported protocol extensions.

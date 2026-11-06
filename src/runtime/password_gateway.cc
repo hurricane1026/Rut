@@ -1,8 +1,11 @@
 #include "rut/runtime/password_gateway.h"
 
+#include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/error.h"
+#include "rut/runtime/forward_auth.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/password_request.h"
 #include "rut/runtime/password_worker.h"
@@ -31,7 +34,15 @@ PasswordHandlerScope::~PasswordHandlerScope() {
     current_connection = previous_connection;
     current_stream = previous_stream;
 }
+core::Expected<void, Error> PasswordGateway::start() {
+    auto result = worker.start();
+    if (!result) return result;
+    auto auth = forward_auth.start();
+    if (!auth) worker.stop();
+    return auth;
+}
 void PasswordGateway::stop() {
+    forward_auth.stop();
     for (auto& entry : entries) {
         entry.request.reset();
         entry.active = false;
@@ -39,6 +50,7 @@ void PasswordGateway::stop() {
     worker.stop();
 }
 void PasswordGateway::cancel(u32 connection) {
+    forward_auth.cancel(connection);
     for (auto& entry : entries) {
         if (!entry.active || entry.connection != connection) continue;
         entry.request.reset();
@@ -46,6 +58,7 @@ void PasswordGateway::cancel(u32 connection) {
     }
 }
 void PasswordGateway::cancel_request(u32 connection, u64 generation) {
+    forward_auth.cancel(connection, generation);
     for (auto& entry : entries) {
         if (!entry.active || entry.connection != connection || entry.generation != generation)
             continue;
@@ -97,29 +110,55 @@ PasswordGatewayReply PasswordGateway::verify(
     found->active = false;
     return {kResult, 0};
 }
-PasswordGatewayReply verify_password_for_request(void* connection,
-                                                 Str password,
-                                                 Str record,
-                                                 u32 timeout_ms) {
-    if (!connection || !current_gateway || connection != current_connection) return {};
+static u64 auth_request_generation(void* connection) {
+    if (!connection || !current_gateway || connection != current_connection) return 0;
     auto& conn = *static_cast<ConnectionBase*>(connection);
-    if (conn.fd < 0) return {};
+    if (conn.fd < 0) return 0;
     u64 generation = 0;
     if (conn.protocol == ConnProtocol::Http11) {
         if (current_stream != 0 || conn.state != ConnState::ExecHandler || conn.handler_gen == 0)
-            return {};
+            return 0;
         generation = conn.handler_gen;
     } else if (conn.protocol == ConnProtocol::Http2) {
         if (!conn.h2 || current_stream == 0 || (current_stream & 1u) == 0 ||
             current_stream > 0x7fffffffu ||
             (conn.h2->async_stream != 0 && conn.h2->async_stream != current_stream))
-            return {};
+            return 0;
         const auto* stream = conn.h2->find_stream(current_stream);
-        if (!stream || stream->state == Http2StreamState::Closed) return {};
+        if (!stream || stream->state == Http2StreamState::Closed) return 0;
         generation = password_h2_generation(current_stream);
     } else
-        return {};
+        return 0;
+    return generation;
+}
+ForwardAuthReply forward_auth_for_request(void* connection,
+                                          Str header,
+                                          const ForwardAuthPolicy& policy,
+                                          Str credential,
+                                          Str method,
+                                          Str target,
+                                          u32 timeout_ms) {
+    const auto kGeneration = auth_request_generation(connection);
+    if (!kGeneration) return {};
+    const auto& conn = *static_cast<ConnectionBase*>(connection);
+    return current_gateway->forward_auth.authorize(conn.id,
+                                                   kGeneration,
+                                                   header,
+                                                   policy,
+                                                   credential,
+                                                   method,
+                                                   target,
+                                                   monotonic_us() / 1000,
+                                                   timeout_ms);
+}
+PasswordGatewayReply verify_password_for_request(void* connection,
+                                                 Str password,
+                                                 Str record,
+                                                 u32 timeout_ms) {
+    const auto kGeneration = auth_request_generation(connection);
+    if (!kGeneration) return {};
+    auto& conn = *static_cast<ConnectionBase*>(connection);
     return current_gateway->verify(
-        conn.id, generation, password, record, monotonic_us() / 1000, timeout_ms);
+        conn.id, kGeneration, password, record, monotonic_us() / 1000, timeout_ms);
 }
 }  // namespace rut

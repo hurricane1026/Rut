@@ -1072,7 +1072,7 @@ add_test(NAME test_route_select COMMAND test_route_select)
 set_tests_properties(test_route_select PROPERTIES LABELS "unit")
 
 add_executable(test_rir test_rir.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
-target_link_libraries(test_rir rut_compiler)
+target_link_libraries(test_rir rut_compiler rut_runtime)
 target_include_directories(test_rir PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -4355,4 +4355,14 @@ endif()
 
 if(TARGET check)
     add_dependencies(check check_password_cli)
+endif()
+
+if(RUT_ENABLE_JIT AND Python3_Interpreter_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(backend epoll io_uring)
+        add_test(NAME test_forward_auth_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_forward_auth.py
+                --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
+        set_tests_properties(test_forward_auth_${backend} PROPERTIES
+            LABELS "integration" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
 endif()

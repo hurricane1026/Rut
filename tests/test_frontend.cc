@@ -47117,3 +47117,44 @@ route GET "/" { return websocket(ws) { msg in )rut";
     }
 }
 #endif
+
+TEST(frontend, forward_auth_prefix_is_verified_and_rejects_replay_effects) {
+    const std::string call =
+        R"rut(forwardAuthHeader("Authorization", "{\"address\":\"127.0.0.1\",\"serverName\":\"localhost\",\"caFile\":\"/ca.pem\",\"path\":\"/auth\",\"identityHeader\":\"X-Consumer-ID\"}", 5000))rut";
+    const auto source = "route GET \"/\" { let result = " + call +
+                        " guard result == 1 else { return 401 } return 200 }";
+    auto tokens = lex(lit(source.c_str()));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    CHECK(rir::function_uses_password(fn));
+    REQUIRE(fn.blocks[0].inst_count > 0);
+    const auto old = fn.blocks[0].insts[0].op;
+    fn.blocks[0].insts[0].op = rir::Opcode::TimeNowMicros;
+    CHECK(!rir::password_prefix_valid(fn));
+    fn.blocks[0].insts[0].op = old;
+    rir.destroy();
+    const std::string invalid[] = {
+        "route GET \"/\" { guard " + call + " == 1 else { return 401 } return 200 }",
+        "route GET \"/\" { let prior = 1 let result = " + call + " return 200 }",
+        "route GET \"/\" { let result = " + call + " wait(1ms) return 200 }",
+        "func check() -> i32 => " + call + "\nroute GET \"/\" { return 200 }",
+        "route GET \"/\" { let result = forwardAuthHeader(\"Authorization\", \"{}\", 5000) return "
+        "200 }",
+    };
+    for (const auto& bad : invalid) {
+        auto t = lex(lit(bad.c_str()));
+        REQUIRE(t);
+        auto a = parse_file_heap(t.value());
+        REQUIRE(a);
+        CHECK(!analyze_file_heap(a.value()));
+    }
+}
