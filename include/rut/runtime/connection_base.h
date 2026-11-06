@@ -33,6 +33,8 @@
 
 namespace rut {
 
+struct H1TlsUpstream;
+
 #ifdef __linux__
 using IoTimespec = __kernel_timespec;
 #else
@@ -401,6 +403,9 @@ struct ConnectionBase {
 
     // Upstream (only when proxying)
     i32 upstream_fd;
+    // A dedicated pooled Connection owns outbound H1 TLS I/O and cancellation.
+    H1TlsUpstream* h1_tls_upstream = nullptr;
+    H1TlsUpstream* h1_tls_transport = nullptr;
     ForwardLoadBalance forward_load_balance{};
     u32* backend_active = nullptr;
     void release_backend_active() {
@@ -2131,6 +2136,8 @@ struct ConnectionBase {
         timer_node.init();
         idle_node.init();
         upstream_fd = -1;
+        h1_tls_upstream = nullptr;
+        h1_tls_transport = nullptr;
         forward_load_balance = {};
         backend_active = nullptr;
         upstream_idx = 0;

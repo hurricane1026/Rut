@@ -34,6 +34,14 @@ using NativeReactorEventLoop = KqueueEventLoop;
 using NativeReactorEventLoop = EpollEventLoop;
 #endif
 
+// EventLoopCRTP calls h1_tls_detach directly from headers that are also used
+// by no-JIT rut builds. Emit the backend instances here, where the callback
+// implementation is visible, so those builds do not rely on JIT-only users.
+template void h1_tls_detach<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
+template bool h1_tls_dispatch_owner_event<NativeReactorEventLoop>(NativeReactorEventLoop*,
+                                                                  Connection&,
+                                                                  IoEvent);
+
 bool h2_apply_forward_request_overrides(Connection& conn) {
     return rewrite_request_line_path(conn) && apply_request_header_overrides(conn);
 }
@@ -1248,6 +1256,10 @@ template void record_probe_if_current<NativeReactorEventLoop>(NativeReactorEvent
                                                               u64);
 
 #ifdef __linux__
+template void h1_tls_detach<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+template bool h1_tls_dispatch_owner_event<IoUringEventLoop>(IoUringEventLoop*,
+                                                            Connection&,
+                                                            IoEvent);
 template void on_request_complete<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16, u32);
 template void pipeline_dispatch<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void on_header_received<IoUringEventLoop>(void*, Connection&, IoEvent);

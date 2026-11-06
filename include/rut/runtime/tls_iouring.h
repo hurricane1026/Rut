@@ -23,6 +23,8 @@
 #include "rut/common/types.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/h1_tls_upstream.h"
+#include "rut/runtime/http2_conn.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/slice_pool.h"
@@ -436,6 +438,10 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
             if (!c.tls_active || c.tls_out_inflight) return;
         }
     }
+    if (c.h1_tls_transport && c.tls_engine.handshake_done) {
+        h1_tls_ready(loop, c);
+        if (!c.h1_tls_transport || !c.tls_active || c.tls_out_inflight) return;
+    }
     if (c.tls_engine.ssl && c.pending_handler_fn &&
         yield_kind_matches_event(c.pending_yield_kind, IoEventType::Recv))
         c.tls_pending_on_recv = &tls_resume_pending_handler_recv<Self>;
@@ -505,6 +511,10 @@ void tls_process(Self* loop, Connection& c) {
             return;
         }
         c.tls_handshake_complete = true;
+        if (c.h1_tls_transport) {
+            h1_tls_ready(loop, c);
+            if (!c.h1_tls_transport || !c.tls_active) return;
+        }
         if constexpr (requires { loop->grpc_upstreams; }) {
             if (c.h2 && c.h2->grpc.upstream) {
                 if (!tls_client_peer_valid(c.tls_engine.ssl, !c.h2->grpc.websocket_http1)) {
@@ -559,7 +569,8 @@ void tls_process(Self* loop, Connection& c) {
             if (st == TlsOp::WantRead) break;  // drained all complete records
             if (st == TlsOp::Closed) {
                 const bool kBridge =
-                    c.h2 && (c.h2->grpc.websocket_http1 || c.h2->grpc.websocket_http1_downstream);
+                    c.h1_tls_transport ||
+                    (c.h2 && (c.h2->grpc.websocket_http1 || c.h2->grpc.websocket_http1_downstream));
                 if (c.recv_buf.len() == 0 && !kBridge && !(c.is_ws_terminate && c.ws_closing)) {
                     loop->close_conn(c);
                     return;
@@ -581,6 +592,17 @@ void tls_process(Self* loop, Connection& c) {
         c.tls_in_buf.consume(kConsumed);
         const bool kHasControlOutput = tls_engine_output_len(c.tls_engine) > 0;
         if (kHasControlOutput) c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));
+        if (saw_close_notify && c.h1_tls_transport) {
+            c.h1_tls_transport->eof = true;
+            if (c.recv_buf.len() == 0 && c.tls_pending_on_recv &&
+                c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>) {
+                IoEvent eof{};
+                eof.conn_id = c.id;
+                eof.type = IoEventType::Recv;
+                c.tls_pending_on_recv(loop, c, eof);
+                return;
+            }
+        }
         if (saw_close_notify && c.h2 &&
             (c.h2->grpc.websocket_http1 || c.h2->grpc.websocket_http1_downstream)) {
             c.h2->grpc.websocket_http1_eof = true;

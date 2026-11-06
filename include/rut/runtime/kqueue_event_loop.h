@@ -489,7 +489,8 @@ public:
     // Returns false (no live idle socket) → caller connects fresh. kqueue is
     // synchronous, so detach/reattach is a plain EV_DELETE/EV_ADD pair.
     bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
-        if (!upstream) return false;
+        if (!upstream || (c.request_config && c.request_config->upstreams[upstream_id].tls.enabled))
+            return false;
         const i32 fd = upstream->take_idle(upstream_id, backend_idx);
         if (fd < 0) return false;
         // Establish a new owner before publishing the borrowed fd in the map.
@@ -634,7 +635,10 @@ public:
         free_stack[free_top++] = cid;
     }
 
-    bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
+    bool submit_recv_impl(Connection& c) {
+        if (c.h1_tls_transport && c.tls_active) return backend.add_recv_tls(c);
+        return backend.add_recv(c.fd, c.id);
+    }
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {
@@ -1010,8 +1014,8 @@ public:
                         // (least blast radius: no ConnState semantics touched, so
                         // the proxy-timeout 504 / traffic-capture paths that key off
                         // Proxying stay untouched for a probe with fd == -1).
-                        if (!conn.throttle_paused && !conn.is_health_probe &&
-                            !conn.ws_shutdown_deadline_armed) {
+                        if (!conn.h1_tls_transport && !conn.throttle_paused &&
+                            !conn.is_health_probe && !conn.ws_shutdown_deadline_armed) {
                             timer.refresh(
                                 &conn,
                                 conn.h2 && (conn.h2->grpc.active || conn.h2->grpc.upstream) ? 1

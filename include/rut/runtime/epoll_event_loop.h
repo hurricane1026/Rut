@@ -578,7 +578,8 @@ public:
     // Returns false (no live idle socket) → caller connects fresh. epoll is
     // synchronous, so detach/reattach is a plain EPOLL_CTL_DEL/ADD pair.
     bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
-        if (!upstream) return false;
+        if (!upstream || (c.request_config && c.request_config->upstreams[upstream_id].tls.enabled))
+            return false;
         const i32 fd = upstream->take_idle(upstream_id, backend_idx);
         if (fd < 0) return false;
         // Establish a new owner before publishing the borrowed fd in the map.
@@ -744,8 +745,9 @@ public:
     // Admit only the current, fully framed plaintext GET response. No history,
     // route-size inference or body-inspection policy is bypassed.
     bool response_splice_eligible(const Connection& c) const {
-        return c.id < connection_capacity && c.fd >= 0 && c.upstream_fd >= 0 &&
-               c.fd != c.upstream_fd && valid_upstream_episode(c.upstream_episode) &&
+        return !c.h1_tls_upstream && c.id < connection_capacity && c.fd >= 0 &&
+               c.upstream_fd >= 0 && c.fd != c.upstream_fd &&
+               valid_upstream_episode(c.upstream_episode) &&
                backend.active_upstream_episode[c.id] == c.upstream_episode &&
                backend.upstream_fd_map[c.id] == c.upstream_fd &&
                backend.downstream_fd_map[c.id] == c.fd && !c.tls_active &&
@@ -756,7 +758,7 @@ public:
                c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
                !c.request_body_fully_buffered && !c.req_body_streamed &&
                c.request_upload_complete && c.throttle_down_bps == 0 && c.http_cache_ttl == 0 &&
-               c.http_cache_mutation_host == 0 && !c.is_ws_terminate_route &&
+               c.http_cache_mutation_host == 0 && !c.is_ws_terminate_route && !c.h1_tls_upstream &&
                c.resp_body_remaining >= 64 * 1024 && c.upstream_recv_buf.len() == 0 &&
                !c.upstream_recv_armed && !c.upstream_recv_direct_armed && !c.upstream_send_armed &&
                !c.send_armed && c.upstream_relay_send_len == 0 && !c.relay_owner.active() &&
@@ -948,7 +950,8 @@ public:
     void release_completed_proxy_receive_buffer(Connection& c) { release_upstream_relay_slice(c); }
 
     bool submit_recv_impl(Connection& c) {
-        if (c.tls_active && c.h2 && c.h2->grpc.upstream) return backend.add_recv_tls(c);
+        if (c.tls_active && (c.h1_tls_transport || (c.h2 && c.h2->grpc.upstream)))
+            return backend.add_recv_tls(c);
         return backend.add_recv(c.fd, c.id);
     }
 
@@ -1338,7 +1341,8 @@ public:
                         break;
                     }
                     if (ev.aux == kEpollSendProgressAux && ev.type == IoEventType::Send) {
-                        if (!conn.throttle_paused && !conn.ws_shutdown_deadline_armed)
+                        if (!conn.h1_tls_transport && !conn.throttle_paused &&
+                            !conn.ws_shutdown_deadline_armed)
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);
@@ -1360,8 +1364,8 @@ public:
                         // (least blast radius: no ConnState semantics touched, so
                         // the proxy-timeout 504 / traffic-capture paths that key off
                         // Proxying stay untouched for a probe with fd == -1).
-                        if (!conn.throttle_paused && !conn.is_health_probe &&
-                            !conn.ws_shutdown_deadline_armed) {
+                        if (!conn.h1_tls_transport && !conn.throttle_paused &&
+                            !conn.is_health_probe && !conn.ws_shutdown_deadline_armed) {
                             timer.refresh(
                                 &conn,
                                 conn.h2 && (conn.h2->grpc.active || conn.h2->grpc.upstream) ? 1

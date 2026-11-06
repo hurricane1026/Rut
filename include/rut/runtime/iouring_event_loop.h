@@ -2311,7 +2311,7 @@ public:
         c.send_armed = false;
         // These are generic terminal Send-dispatch side effects. Apply them
         // before either the TLS continuation or fail-closed error handling.
-        if (!c.throttle_paused && !c.ws_shutdown_deadline_armed &&
+        if (!c.h1_tls_transport && !c.throttle_paused && !c.ws_shutdown_deadline_armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
             c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
@@ -2916,7 +2916,8 @@ public:
     // submit_send_upstream arms a send SQE tagged with this conn. Returns false
     // (no live idle socket) → caller connects fresh.
     bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
-        if (!upstream) return false;
+        if (!upstream || (c.request_config && c.request_config->upstreams[upstream_id].tls.enabled))
+            return false;
         const i32 fd = upstream->take_idle(upstream_id, backend_idx);
         if (fd < 0) return false;
         c.upstream_fd = fd;
@@ -3532,10 +3533,12 @@ public:
             if (c.recv_pause_cancel_pending) c.recv_pause_rearm_pending = true;
             return true;
         }
-        const bool kBoundedWs = c.is_ws_tunnel && c.is_ws_terminate &&
-                                (c.ws_max_message_size > kWsTerminateMessageCapacity ||
-                                 c.ws_downstream_codec || c.ws_upstream_codec);
+        const bool kBoundedWs =
+            c.h1_tls_transport || (c.is_ws_tunnel && c.is_ws_terminate &&
+                                   (c.ws_max_message_size > kWsTerminateMessageCapacity ||
+                                    c.ws_downstream_codec || c.ws_upstream_codec));
         const u32 kAvailable = c.tls_active ? c.tls_in_buf.write_avail() : c.recv_buf.write_avail();
+        if (c.h1_tls_transport && kAvailable == 0) return true;
         const bool kSubmitted = kBoundedWs ? backend.add_recv_once(c.fd, c.id, kAvailable)
                                            : backend.add_recv(c.fd, c.id);
         if (kSubmitted) {
@@ -4000,9 +4003,10 @@ public:
     // upstream recv fills a second slice. Every other owner keeps the
     // serialized recv -> send -> recv body pump.
     [[nodiscard]] bool upstream_body_relay_eligible(const Connection& c) const {
-        return !c.tls_active && c.response_policy_id == 0 && c.throttle_down_bps == 0 &&
-               c.http_cache_ttl == 0 && c.http_cache_mutation_host == 0 &&
-               c.resp_body_mode == BodyMode::ContentLength && c.upstream_relay_send_len == 0 &&
+        return !c.h1_tls_upstream && !c.tls_active && c.response_policy_id == 0 &&
+               c.throttle_down_bps == 0 && c.http_cache_ttl == 0 &&
+               c.http_cache_mutation_host == 0 && c.resp_body_mode == BodyMode::ContentLength &&
+               c.upstream_relay_send_len == 0 &&
                c.on_upstream_recv == &on_response_body_recvd<Self> && use_one_shot_upstream_recv(c);
     }
 
@@ -4036,7 +4040,7 @@ public:
                c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
                !c.request_body_fully_buffered && !c.req_body_streamed &&
                c.request_upload_complete && c.throttle_down_bps == 0 && c.http_cache_ttl == 0 &&
-               c.http_cache_mutation_host == 0 && !c.is_ws_terminate_route &&
+               c.http_cache_mutation_host == 0 && !c.is_ws_terminate_route && !c.h1_tls_upstream &&
                c.resp_body_remaining >= 64 * 1024 && c.upstream_recv_buf.len() == 0 &&
                c.upstream_recv_armed == false && c.upstream_recv_direct_armed == false &&
                c.upstream_send_armed == false && c.send_armed == false &&
@@ -4055,8 +4059,8 @@ public:
     bool start_response_splice_after_header(Connection& c) { return start_response_splice(c); }
 
     bool arm_response_splice_after_prefix(Connection& c, u32 send_len) {
-        if (send_len == 0 || c.upstream_recv_buf.len() != send_len || c.fd < 0 ||
-            c.upstream_fd < 0 || c.tls_active || c.protocol != ConnProtocol::Http11 ||
+        if (c.h1_tls_upstream || send_len == 0 || c.upstream_recv_buf.len() != send_len ||
+            c.fd < 0 || c.upstream_fd < 0 || c.tls_active || c.protocol != ConnProtocol::Http11 ||
             c.response_policy_id != 0 || c.resp_body_mode != BodyMode::ContentLength ||
             c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
             c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
@@ -8878,7 +8882,8 @@ public:
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
-                        if (!conn.throttle_paused && !conn.ws_shutdown_deadline_armed &&
+                        if (!conn.h1_tls_transport && !conn.throttle_paused &&
+                            !conn.ws_shutdown_deadline_armed &&
                             conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
                             conn.response_read_deadline_state !=
                                 ResponseReadDeadlineState::ExpiryPending &&

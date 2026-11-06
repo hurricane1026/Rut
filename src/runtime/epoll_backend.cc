@@ -363,6 +363,33 @@ void EpollBackend::add_accept() {
 // SSL_write may finish the client handshake while retaining an application
 // record internally. Such plaintext has no corresponding kernel readiness.
 bool EpollBackend::add_recv_tls(Connection& c) {
+    if (c.h1_tls_transport && !c.tls_handshake_complete) {
+        if (c.id >= connection_capacity || pending_count >= kPendingCap || !c.tls) return false;
+        downstream_fd_map[c.id] = c.fd;
+        ERR_clear_error();
+        const i32 rc = SSL_do_handshake(c.tls);
+        if (rc == 1) {
+            c.tls_handshake_complete = true;
+            return queue_pending_completion(
+                pending_completions, pending_count, c.id, IoEventType::Recv, 1);
+        }
+        const i32 error = SSL_get_error(c.tls, rc);
+        if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+            const i32 result = set_fd_interest(fd_interest.data(),
+                                               connection_capacity,
+                                               epoll_fd,
+                                               c.fd,
+                                               c.id,
+                                               IoEventType::Recv,
+                                               tls_interest_for_error(error),
+                                               0);
+            return result >= 0 ||
+                   queue_pending_completion(
+                       pending_completions, pending_count, c.id, IoEventType::Recv, result);
+        }
+        return queue_pending_completion(
+            pending_completions, pending_count, c.id, IoEventType::Recv, map_tls_error(c.tls, rc));
+    }
     if (!c.tls || SSL_pending(c.tls) <= 0) return add_recv(c.fd, c.id);
     if (pending_count >= kPendingCap || !add_recv(c.fd, c.id)) return false;
     if (!c.recv_buf.write_avail())
@@ -1166,7 +1193,8 @@ u32 EpollBackend::wait(
                 } else {
                     if (!conn.tls_handshake_complete) {
                         errno = 0;
-                        i32 rc = get_tls_hooks()->ssl_accept(ssl);
+                        i32 rc = conn.h1_tls_transport ? SSL_do_handshake(ssl)
+                                                       : get_tls_hooks()->ssl_accept(ssl);
                         if (rc == 1) {
                             const auto kCapture = get_tls_hooks()->capture_client_fingerprint;
                             if (!kCapture || !kCapture(ssl,
@@ -1186,6 +1214,14 @@ u32 EpollBackend::wait(
                                 continue;
                             }
                             conn.tls_handshake_complete = true;
+                            if (conn.h1_tls_transport) {
+                                events[out] = {};
+                                events[out].conn_id = conn_id;
+                                events[out].type = IoEventType::Recv;
+                                events[out].result = 1;  // handshake notification, no plaintext
+                                out++;
+                                continue;
+                            }
                             // Fix the wire protocol from the ALPN result. Hook
                             // may be null in older test tables → keep Http11.
                             auto alpn_fn = get_tls_hooks()->alpn_negotiated;

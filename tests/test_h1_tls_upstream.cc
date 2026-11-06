@@ -1,0 +1,689 @@
+#include "rut/runtime/callbacks_h2.h"
+#include "rut/runtime/callbacks_impl.h"
+#include "rut/runtime/epoll_event_loop.h"
+#include "rut/runtime/iouring_event_loop.h"
+#include "rut/runtime/shard.h"
+#include "test.h"
+#include "test_helpers.h"
+#include <new>
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <openssl/ssl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+using namespace rut;
+
+namespace {
+struct Origin {
+    SSL_CTX* context = nullptr;
+    i32 fd = -1;
+    u16 port = 0;
+    pthread_t thread{};
+    bool started = false;
+    bool mtls = false;
+    bool stall = false;
+    bool hold_after_response = false;
+    bool reject_early = false;
+    u32 stopping = 0;
+    u32 requests = 0;
+    u32 uploaded = 0;
+    u32 headers = 0;
+    u32 response_started = 0;
+    u32 body_size = 256 * 1024;
+    char request[1024]{};
+    bool start() {
+        context = SSL_CTX_new(TLS_server_method());
+        if (!context ||
+            SSL_CTX_use_certificate_chain_file(context, RUT_TLS_FIXTURES "/localhost_cert.pem") !=
+                1 ||
+            SSL_CTX_use_PrivateKey_file(
+                context, RUT_TLS_FIXTURES "/localhost_key.pem", SSL_FILETYPE_PEM) != 1)
+            return false;
+        if (mtls) {
+            if (SSL_CTX_load_verify_locations(
+                    context, RUT_TLS_FIXTURES "/localhost_cert.pem", nullptr) != 1)
+                return false;
+            SSL_CTX_set_verify(context, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+        }
+        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (fd < 0 || bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(fd, 8) != 0)
+            return false;
+        socklen_t n = sizeof(addr);
+        if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &n) != 0) return false;
+        port = ntohs(addr.sin_port);
+        started = pthread_create(&thread, nullptr, run, this) == 0;
+        return started;
+    }
+    static void* run(void* arg) {
+        auto& s = *static_cast<Origin*>(arg);
+        while (!__atomic_load_n(&s.stopping, __ATOMIC_ACQUIRE)) {
+            pollfd event{s.fd, POLLIN, 0};
+            if (poll(&event, 1, 20) <= 0) continue;
+            const i32 client = accept(s.fd, nullptr, nullptr);
+            if (client < 0) continue;
+            timeval timeout{2, 0};
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            SSL* ssl = SSL_new(s.context);
+            if (ssl && SSL_set_fd(ssl, client) == 1 && SSL_accept(ssl) == 1) {
+                u32 used = 0;
+                while (used < sizeof(s.request) - 1) {
+                    const i32 n = SSL_read(
+                        ssl, s.request + used, static_cast<int>(sizeof(s.request) - 1 - used));
+                    if (n <= 0) break;
+                    used += static_cast<u32>(n);
+                    s.request[used] = 0;
+                    if (strstr(s.request, "\r\n\r\n")) break;
+                }
+                if (const char* end = strstr(s.request, "\r\n\r\n")) {
+                    __atomic_fetch_add(&s.headers, 1u, __ATOMIC_RELEASE);
+                    if (s.reject_early) {
+                        static constexpr char kRejected[] =
+                            "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n"
+                            "Connection: close\r\n\r\n";
+                        __atomic_fetch_add(&s.requests, 1u, __ATOMIC_RELEASE);
+                        if (SSL_write(ssl, kRejected, sizeof(kRejected) - 1) > 0)
+                            (void)SSL_shutdown(ssl);
+                        if (ssl) SSL_free(ssl);
+                        close(client);
+                        continue;
+                    }
+                    if (const char* length = strstr(s.request, "Content-Length: ")) {
+                        u32 expected = 0;
+                        for (length += 16; *length >= '0' && *length <= '9'; ++length)
+                            expected = expected * 10 + static_cast<u32>(*length - '0');
+                        u32 received = used - static_cast<u32>(end + 4 - s.request);
+                        char input[4096];
+                        while (received < expected) {
+                            const i32 n = SSL_read(ssl, input, sizeof(input));
+                            if (n <= 0) break;
+                            received += static_cast<u32>(n);
+                        }
+                        __atomic_store_n(&s.uploaded, received, __ATOMIC_RELEASE);
+                    }
+                    __atomic_fetch_add(&s.requests, 1u, __ATOMIC_RELEASE);
+                    if (!s.stall) {
+                        char header[128];
+                        const i32 length = snprintf(header,
+                                                    sizeof(header),
+                                                    "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n"
+                                                    "Connection: %s\r\n\r\n",
+                                                    s.body_size,
+                                                    s.hold_after_response ? "keep-alive" : "close");
+                        if (SSL_write(ssl, header, length) > 0) {
+                            char body[16384];
+                            memset(body, 'x', sizeof(body));
+                            for (u32 offset = 0; offset < s.body_size;) {
+                                const u32 n = s.body_size - offset < sizeof(body)
+                                                  ? s.body_size - offset
+                                                  : sizeof(body);
+                                const i32 written = SSL_write(ssl, body, static_cast<int>(n));
+                                if (written <= 0) break;
+                                offset += static_cast<u32>(written);
+                                __atomic_store_n(&s.response_started, 1u, __ATOMIC_RELEASE);
+                            }
+                            if (s.hold_after_response) {
+                                while (!__atomic_load_n(&s.stopping, __ATOMIC_ACQUIRE))
+                                    usleep(1000);
+                            } else {
+                                (void)SSL_shutdown(ssl);
+                            }
+                        }
+                    } else {
+                        while (!__atomic_load_n(&s.stopping, __ATOMIC_ACQUIRE)) {
+                            pollfd wait{client, POLLIN, 0};
+                            if (poll(&wait, 1, 20) > 0) break;
+                        }
+                    }
+                }
+            }
+            if (ssl) SSL_free(ssl);
+            close(client);
+        }
+        return nullptr;
+    }
+    ~Origin() {
+        __atomic_store_n(&stopping, 1u, __ATOMIC_RELEASE);
+        if (started) pthread_join(thread, nullptr);
+        if (fd >= 0) close(fd);
+        if (context) SSL_CTX_free(context);
+    }
+};
+
+u32 g_h1_tls_plaintext_len = 0;
+u8 g_h1_tls_plaintext[256]{};
+
+void h1_tls_plaintext_probe(void*, Connection& owner, IoEvent ev) {
+    g_h1_tls_plaintext_len = ev.result > 0 ? static_cast<u32>(ev.result) : 0;
+    const u32 n = owner.upstream_recv_buf.len() < sizeof(g_h1_tls_plaintext)
+                      ? owner.upstream_recv_buf.len()
+                      : sizeof(g_h1_tls_plaintext);
+    if (n) memcpy(g_h1_tls_plaintext, owner.upstream_recv_buf.data(), n);
+    owner.on_upstream_recv = nullptr;
+}
+
+bool g_h1_tls_close_send_failed = false;
+bool g_h1_tls_close_response_preserved = false;
+void h1_tls_close_send_probe(void*, Connection& owner, IoEvent ev) {
+    static constexpr char kExpected[] = "HTTP/1.1 413 Payload Too Large\r\n\r\n";
+    g_h1_tls_close_send_failed = ev.type == IoEventType::UpstreamSend && ev.result < 0;
+    g_h1_tls_close_response_preserved =
+        owner.upstream_recv_buf.len() == sizeof(kExpected) - 1 &&
+        memcmp(owner.upstream_recv_buf.data(), kExpected, sizeof(kExpected) - 1) == 0;
+    owner.on_upstream_send = nullptr;
+}
+
+bool finish_memory_tls_handshake(TlsEngine& engine, SSL* client) {
+    u8 client_to_server[16384];
+    u8 server_to_client[16384];
+    bool client_done = false;
+    for (u32 attempt = 0; attempt < 64 && !(client_done && engine.handshake_done); ++attempt) {
+        if (!client_done) {
+            const int rc = SSL_do_handshake(client);
+            if (rc == 1) {
+                client_done = true;
+            } else {
+                const int error = SSL_get_error(client, rc);
+                if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) return false;
+            }
+        }
+        int client_len = BIO_read(SSL_get_wbio(client), client_to_server, sizeof(client_to_server));
+        if (client_len < 0) client_len = 0;
+        tls_engine_set_input(engine, client_to_server, static_cast<u32>(client_len));
+        tls_engine_set_output(engine, server_to_client, sizeof(server_to_client));
+        if (tls_engine_handshake(engine) == TlsOp::Error) return false;
+        const u32 server_len = tls_engine_output_len(engine);
+        if (server_len > 0 &&
+            BIO_write(SSL_get_rbio(client), server_to_client, static_cast<int>(server_len)) !=
+                static_cast<int>(server_len))
+            return false;
+    }
+    return client_done && engine.handshake_done;
+}
+
+template <typename T>
+struct Mapped {
+    T* value = nullptr;
+    Mapped() {
+        void* region =
+            mmap(nullptr, sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (region != MAP_FAILED) {
+            value = static_cast<T*>(region);
+            ::new (value) T{};
+        }
+    }
+    ~Mapped() {
+        if (value) {
+            value->~T();
+            munmap(value, sizeof(T));
+        }
+    }
+};
+
+u16 socket_port(i32 fd) {
+    sockaddr_in addr{};
+    socklen_t n = sizeof(addr);
+    return getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &n) == 0 ? ntohs(addr.sin_port) : 0;
+}
+
+template <typename Loop>
+void exercise(rut::test::TestCase* _tc,
+              bool bad_name = false,
+              bool mtls = false,
+              bool downstream_tls = false,
+              bool cancel = false,
+              u32 upload = 0,
+              bool invalid_ca = false,
+              bool response_timeout = false,
+              bool hold_after_response = false,
+              bool slow_client = false,
+              bool reject_early = false) {
+    signal(SIGPIPE, SIG_IGN);
+    Origin origin;
+    origin.mtls = mtls;
+    origin.stall = cancel || response_timeout;
+    origin.hold_after_response = hold_after_response;
+    origin.reject_early = reject_early;
+    if (hold_after_response) origin.body_size = 16384;
+    if (slow_client) origin.body_size = 2 * 1024 * 1024;
+    REQUIRE(origin.start());
+    Mapped<Shard<Loop>> shard;
+    Mapped<RouteConfig> cfg;
+    REQUIRE(shard.value && cfg.value);
+    const i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (slow_client) {
+        int send_buffer = 4096;
+        setsockopt(listener, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
+    }
+    if (!shard.value->init(0, listener).has_value()) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(cfg.value->add_upstream("origin", 0x7f000001, origin.port).has_value());
+    auto& spec = cfg.value->upstreams[0].tls;
+    spec.enabled = true;
+    snprintf(
+        spec.ca,
+        sizeof(spec.ca),
+        "%s",
+        invalid_ca ? "/nonexistent/rut-upstream-ca.pem" : RUT_TLS_FIXTURES "/localhost_cert.pem");
+    snprintf(
+        spec.server_name, sizeof(spec.server_name), "%s", bad_name ? "wrong.example" : "localhost");
+    if (mtls) {
+        snprintf(spec.cert, sizeof(spec.cert), "%s", RUT_TLS_FIXTURES "/localhost_cert.pem");
+        snprintf(spec.key, sizeof(spec.key), "%s", RUT_TLS_FIXTURES "/localhost_key.pem");
+    }
+    REQUIRE(cfg.value->add_proxy("/", upload ? 'P' : 'G', 0));
+    shard.value->route_config = cfg.value;
+    if (response_timeout) shard.value->loop->upstream_timeout = 1;
+    TlsServerContext* inbound = nullptr;
+    if (downstream_tls) {
+        auto context = create_tls_server_context(RUT_TLS_FIXTURES "/localhost_cert.pem",
+                                                 RUT_TLS_FIXTURES "/localhost_key.pem");
+        REQUIRE(context.has_value());
+        inbound = context.value();
+        shard.value->loop->tls_server = inbound;
+    }
+    REQUIRE(shard.value->spawn(-1).has_value());
+    const i32 client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (slow_client && client >= 0) {
+        int receive_buffer = 4096;
+        setsockopt(client, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer));
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(socket_port(listener));
+    const bool connected =
+        client >= 0 && connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    CHECK(connected);
+    timeval timeout{5, 0};
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    SSL_CTX* client_context = nullptr;
+    SSL* ssl = nullptr;
+    if (downstream_tls && connected) {
+        client_context = SSL_CTX_new(TLS_client_method());
+        ssl = SSL_new(client_context);
+        CHECK(SSL_set_fd(ssl, client) == 1 && SSL_connect(ssl) == 1);
+    }
+    constexpr char request[] =
+        "GET /hello?query=yes HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n";
+    if (connected) {
+        char post[160];
+        const i32 post_length =
+            snprintf(post,
+                     sizeof(post),
+                     "POST /hello?query=yes HTTP/1.1\r\nHost: example\r\nContent-Length: "
+                     "%u\r\nConnection: close\r\n\r\n",
+                     upload);
+        const char* header = upload ? post : request;
+        const u32 length = upload ? static_cast<u32>(post_length) : sizeof(request) - 1;
+        CHECK((ssl ? SSL_write(ssl, header, static_cast<int>(length))
+                   : send(client, header, length, MSG_NOSIGNAL)) > 0);
+        if (hold_after_response) {
+            for (u32 i = 0; i < 500 && !__atomic_load_n(&origin.response_started, __ATOMIC_ACQUIRE);
+                 ++i)
+                usleep(1000);
+            CHECK_EQ(__atomic_load_n(&origin.response_started, __ATOMIC_ACQUIRE), 1u);
+        }
+        if (slow_client) {
+            for (u32 i = 0; i < 500 && !__atomic_load_n(&origin.response_started, __ATOMIC_ACQUIRE);
+                 ++i)
+                usleep(1000);
+            CHECK_EQ(__atomic_load_n(&origin.response_started, __ATOMIC_ACQUIRE), 1u);
+            usleep(100000);
+        }
+        if (upload) {
+            // Deliberately exercise streaming after header admission; request
+            // admission overflow is covered by the existing HTTP tests.
+            for (u32 i = 0; i < 200 && __atomic_load_n(&origin.headers, __ATOMIC_ACQUIRE) == 0; ++i)
+                usleep(10000);
+            CHECK_EQ(__atomic_load_n(&origin.headers, __ATOMIC_ACQUIRE), 1u);
+        }
+        char body[4096];
+        memset(body, 'b', sizeof(body));
+        for (u32 sent = 0; sent < upload;) {
+            const u32 n = upload - sent < sizeof(body) ? upload - sent : sizeof(body);
+            const auto written = ssl ? SSL_write(ssl, body, static_cast<int>(n))
+                                     : send(client, body, n, MSG_NOSIGNAL);
+            if (written <= 0) {
+                if (!reject_early) CHECK(false);
+                break;
+            }
+            sent += static_cast<u32>(written);
+            usleep(2000);  // Stream beyond one receive slice without overflowing request admission.
+        }
+    }
+    if (cancel) {
+        for (u32 i = 0; i < 200 && __atomic_load_n(&origin.requests, __ATOMIC_ACQUIRE) == 0; i++)
+            usleep(10000);
+        CHECK_EQ(__atomic_load_n(&origin.requests, __ATOMIC_ACQUIRE), 1u);
+    } else {
+        char block[8192];
+        char prefix[512]{};
+        u32 total = 0;
+        bool body_valid = true;
+        for (;;) {
+            const auto n =
+                ssl ? SSL_read(ssl, block, sizeof(block)) : recv(client, block, sizeof(block), 0);
+            if (n <= 0) break;
+            const u32 room =
+                sizeof(prefix) - 1 - (total < sizeof(prefix) - 1 ? total : sizeof(prefix) - 1);
+            const u32 take = static_cast<u32>(n) < room ? static_cast<u32>(n) : room;
+            if (take) memcpy(prefix + total, block, take);
+            if (const char* start = strstr(prefix, "\r\n\r\n")) {
+                const u32 offset = static_cast<u32>(start + 4 - prefix);
+                for (u32 i = total < offset ? offset - total : 0; i < static_cast<u32>(n); ++i)
+                    if (block[i] != 'x') body_valid = false;
+            }
+            total += static_cast<u32>(n);
+            if (hold_after_response) {
+                const char* response_body = strstr(prefix, "\r\n\r\n");
+                if (response_body &&
+                    total >= static_cast<u32>(response_body + 4 - prefix) + origin.body_size)
+                    break;
+            }
+        }
+        if (bad_name || invalid_ca) {
+            CHECK(strstr(prefix, " 502 ") || strstr(prefix, " 503 "));
+            CHECK_EQ(__atomic_load_n(&origin.requests, __ATOMIC_ACQUIRE), 0u);
+        } else if (reject_early) {
+            CHECK(strstr(prefix, " 413 "));
+            CHECK_EQ(__atomic_load_n(&origin.requests, __ATOMIC_ACQUIRE), 1u);
+        } else if (response_timeout) {
+            CHECK(strstr(prefix, " 504 "));
+        } else {
+            CHECK(strstr(prefix, " 200 "));
+            CHECK(body_valid);
+            const char* body = strstr(prefix, "\r\n\r\n");
+            CHECK(body);
+            if (body) {
+                if (total - static_cast<u32>(body + 4 - prefix) != origin.body_size)
+                    fprintf(stderr,
+                            "body bytes: %u expected %u prefix %.90s\n",
+                            total - static_cast<u32>(body + 4 - prefix),
+                            origin.body_size,
+                            prefix);
+                CHECK_EQ(total - static_cast<u32>(body + 4 - prefix), origin.body_size);
+            }
+            CHECK(strstr(
+                origin.request,
+                upload ? "POST /hello?query=yes HTTP/1.1" : "GET /hello?query=yes HTTP/1.1"));
+            CHECK_EQ(__atomic_load_n(&origin.uploaded, __ATOMIC_ACQUIRE), upload);
+        }
+    }
+    if (ssl) SSL_free(ssl);
+    if (client_context) SSL_CTX_free(client_context);
+    if (client >= 0) close(client);
+    shard.value->stop();
+    shard.value->join();
+    shard.value->loop->force_close_all();
+    if constexpr (requires { shard.value->loop->backend.failure_code(); }) {
+        auto& loop = *shard.value->loop;
+        IoEvent events[64];
+        for (u32 attempt = 0; attempt < 100 && loop.free_top < loop.connection_capacity;
+             ++attempt) {
+            const u32 count =
+                loop.backend.wait(events, 64, loop.conns, loop.slots_initialized, false);
+            for (u32 i = 0; i < count; ++i) loop.dispatch(events[i]);
+            loop.reclaim_pending();
+            usleep(1000);
+        }
+        for (u32 i = 0; i < loop.slots_initialized; ++i)
+            if (loop.conns[i].pending_ops)
+                fprintf(stderr,
+                        "retained conn %u pending %u fd %d upstream %d\n",
+                        i,
+                        loop.conns[i].pending_ops,
+                        loop.conns[i].fd,
+                        loop.conns[i].upstream_fd);
+    }
+    // Both the accepted client and dedicated TLS transport must be retired.
+    CHECK_EQ(shard.value->loop->free_top, shard.value->loop->connection_capacity);
+    if (inbound) {
+        shard.value->loop->tls_server = nullptr;
+        destroy_tls_server_context(inbound);
+    }
+}
+
+struct VoidQuiesceBackend {
+    bool called = false;
+    void quiesce_recv(u32, bool, u32) { called = true; }
+};
+
+struct VoidQuiesceLoop {
+    VoidQuiesceBackend backend;
+};
+
+TEST(h1_tls_upstream, void_quiesce_backend_pause_contract) {
+    Connection owner{};
+    Connection transport{};
+    H1TlsUpstream state{};
+    state.owner = &owner;
+    state.transport = &transport;
+    owner.h1_tls_upstream = &state;
+    VoidQuiesceLoop loop{};
+    CHECK(h1_tls_pause(&loop, owner));
+    CHECK(loop.backend.called);
+    CHECK_FALSE(state.receiving);
+    owner.h1_tls_upstream = nullptr;
+}
+
+TEST(h1_tls_upstream, close_preserves_tls_response_before_send_failure) {
+    Mapped<EpollEventLoop> mapped;
+    REQUIRE(mapped.value != nullptr);
+    EpollEventLoop& loop = *mapped.value;
+    REQUIRE(loop.pool.init(4).has_value());
+
+    Connection owner{};
+    Connection transport{};
+    owner.id = 1;
+    owner.upstream_fd = 7;
+    static constexpr char kResponse[] = "HTTP/1.1 413 Payload Too Large\r\n\r\n";
+    u8 owner_storage[128]{};
+    u8 transport_storage[128]{};
+    owner.upstream_recv_buf.bind(owner_storage, sizeof(owner_storage));
+    transport.recv_buf.bind(transport_storage, sizeof(transport_storage));
+    REQUIRE_EQ(
+        transport.recv_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1),
+        sizeof(kResponse) - 1);
+    H1TlsUpstream* state = reinterpret_cast<H1TlsUpstream*>(loop.pool.alloc());
+    REQUIRE(state != nullptr);
+    ::new (state) H1TlsUpstream{};
+    state->owner = &owner;
+    state->transport = &transport;
+    state->ready = true;
+    owner.h1_tls_upstream = state;
+    owner.on_upstream_send = &h1_tls_close_send_probe;
+    transport.h1_tls_transport = state;
+    transport.on_send = &h1_tls_sent<EpollEventLoop>;
+    g_h1_tls_close_send_failed = false;
+    g_h1_tls_close_response_preserved = false;
+
+    h1_tls_closed<EpollEventLoop>(&loop, transport);
+    CHECK(g_h1_tls_close_send_failed);
+    CHECK(g_h1_tls_close_response_preserved);
+    CHECK_EQ(owner.h1_tls_upstream, nullptr);
+    CHECK_EQ(owner.upstream_recv_buf.len(), sizeof(kResponse) - 1);
+    loop.pool.destroy();
+}
+}  // namespace
+
+TEST(h1_tls_upstream, epoll_large_response) {
+    exercise<EpollEventLoop>(_tc);
+}
+TEST(h1_tls_upstream, iouring_large_response) {
+    exercise<IoUringEventLoop>(_tc);
+}
+TEST(h1_tls_upstream, iouring_keepalive_response_has_no_followup_origin_read) {
+    exercise<IoUringEventLoop>(_tc, false, false, false, false, 0, false, false, true);
+}
+TEST(h1_tls_upstream, iouring_ssl_pending_resume_drains_plaintext_without_ciphertext) {
+    auto context_result = create_tls_server_context(RUT_TLS_FIXTURES "/localhost_cert.pem",
+                                                    RUT_TLS_FIXTURES "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    TlsServerContext* server_context = context_result.value();
+    REQUIRE_EQ(SSL_CTX_set_min_proto_version(server_context->ssl_ctx, TLS1_2_VERSION), 1);
+    REQUIRE_EQ(SSL_CTX_set_max_proto_version(server_context->ssl_ctx, TLS1_2_VERSION), 1);
+
+    Mapped<IoUringEventLoop> mapped;
+    REQUIRE(mapped.value != nullptr);
+    IoUringEventLoop& loop = *mapped.value;
+    REQUIRE(loop.init_slot_storage(2).has_value());
+    test_initialize_slots(loop, 2);
+    REQUIRE(loop.pool.init(12).has_value());
+    loop.timer.init();
+    loop.tls_server = server_context;
+    Connection* owner = loop.alloc_conn();
+    Connection* transport = loop.alloc_conn();
+    REQUIRE(owner && transport);
+    REQUIRE(loop.alloc_upstream_buf(*owner));
+    REQUIRE(loop.tls_setup(*transport));
+
+    SSL_CTX* client_context = SSL_CTX_new(TLS_client_method());
+    REQUIRE(client_context != nullptr);
+    REQUIRE_EQ(SSL_CTX_set_min_proto_version(client_context, TLS1_2_VERSION), 1);
+    REQUIRE_EQ(SSL_CTX_set_max_proto_version(client_context, TLS1_2_VERSION), 1);
+    SSL_CTX_set_verify(client_context, SSL_VERIFY_NONE, nullptr);
+    SSL* client = SSL_new(client_context);
+    REQUIRE(client != nullptr);
+    BIO* client_read = BIO_new(BIO_s_mem());
+    BIO* client_write = BIO_new(BIO_s_mem());
+    REQUIRE(client_read && client_write);
+    SSL_set_bio(client, client_read, client_write);
+    SSL_set_connect_state(client);
+    REQUIRE(finish_memory_tls_handshake(transport->tls_engine, client));
+    transport->tls_handshake_complete = true;
+
+    static constexpr u32 kPayloadLen = 256;
+    static constexpr u32 kFirstReadLen = 156;
+    u8 source[kPayloadLen];
+    for (u32 i = 0; i < kPayloadLen; ++i) source[i] = static_cast<u8>(i ^ 0xA5u);
+    REQUIRE_EQ(SSL_write(client, source, sizeof(source)), static_cast<int>(sizeof(source)));
+    u8 ciphertext[1024];
+    const int ciphertext_len = BIO_read(SSL_get_wbio(client), ciphertext, sizeof(ciphertext));
+    REQUIRE_GT(ciphertext_len, 0);
+    REQUIRE_EQ(transport->tls_in_buf.write(ciphertext, static_cast<u32>(ciphertext_len)),
+               static_cast<u32>(ciphertext_len));
+
+    u8 first_plaintext[kFirstReadLen];
+    u8 tls_output[1024];
+    tls_engine_set_input(
+        transport->tls_engine, transport->tls_in_buf.data(), transport->tls_in_buf.len());
+    tls_engine_set_output(transport->tls_engine, tls_output, sizeof(tls_output));
+    TlsOp status = TlsOp::Error;
+    REQUIRE_EQ(
+        tls_engine_read(transport->tls_engine, first_plaintext, sizeof(first_plaintext), status),
+        static_cast<i32>(kFirstReadLen));
+    transport->tls_in_buf.consume(tls_engine_input_consumed(transport->tls_engine));
+    CHECK_EQ(transport->tls_in_buf.len(), 0u);
+    CHECK_EQ(SSL_pending(transport->tls_engine.ssl), 100);
+
+    H1TlsUpstream sidecar{};
+    sidecar.owner = owner;
+    sidecar.transport = transport;
+    sidecar.ready = true;
+    owner->h1_tls_upstream = &sidecar;
+    transport->h1_tls_transport = &sidecar;
+    owner->on_upstream_recv = &h1_tls_plaintext_probe;
+    u8 delivered[kPayloadLen]{};
+    owner->upstream_recv_buf.bind(delivered, sizeof(delivered));
+    u8 transport_plaintext[SlicePool::kSliceSize]{};
+    transport->recv_buf.bind(transport_plaintext, sizeof(transport_plaintext));
+    g_h1_tls_plaintext_len = 0;
+    const u32 sq_tail_before = loop.backend.sq_tail ? *loop.backend.sq_tail : 0;
+    REQUIRE(h1_tls_recv(&loop, *owner));
+    CHECK_EQ(g_h1_tls_plaintext_len, 100u);
+    CHECK_EQ(memcmp(g_h1_tls_plaintext, source + kFirstReadLen, 100), 0);
+    CHECK_EQ(transport->tls_in_buf.len(), 0u);
+    CHECK_FALSE(transport->recv_armed);
+    if (loop.backend.sq_tail) CHECK_EQ(*loop.backend.sq_tail, sq_tail_before);
+
+    owner->h1_tls_upstream = nullptr;
+    transport->h1_tls_transport = nullptr;
+    sidecar.owner = nullptr;
+    sidecar.transport = nullptr;
+    owner->on_upstream_recv = nullptr;
+    loop.timer.remove(owner);
+    loop.timer.remove(transport);
+    loop.free_conn(*transport);
+    loop.free_conn(*owner);
+    loop.tls_server = nullptr;
+    loop.pool.destroy();
+    loop.destroy_slot_storage();
+    SSL_free(client);
+    SSL_CTX_free(client_context);
+    destroy_tls_server_context(server_context);
+}
+TEST(h1_tls_upstream, epoll_slow_client_drains_large_response_after_upstream_fin) {
+    exercise<EpollEventLoop>(_tc, false, false, false, false, 0, false, false, false, true);
+}
+TEST(h1_tls_upstream, epoll_verify_name_before_request) {
+    exercise<EpollEventLoop>(_tc, true);
+}
+TEST(h1_tls_upstream, iouring_verify_name_before_request) {
+    exercise<IoUringEventLoop>(_tc, true);
+}
+TEST(h1_tls_upstream, epoll_mtls) {
+    exercise<EpollEventLoop>(_tc, false, true);
+}
+TEST(h1_tls_upstream, iouring_mtls) {
+    exercise<IoUringEventLoop>(_tc, false, true);
+}
+TEST(h1_tls_upstream, epoll_tls_downstream) {
+    exercise<EpollEventLoop>(_tc, false, false, true);
+}
+TEST(h1_tls_upstream, iouring_tls_downstream) {
+    exercise<IoUringEventLoop>(_tc, false, false, true);
+}
+TEST(h1_tls_upstream, epoll_cancel) {
+    exercise<EpollEventLoop>(_tc, false, false, false, true);
+}
+TEST(h1_tls_upstream, iouring_cancel) {
+    exercise<IoUringEventLoop>(_tc, false, false, false, true);
+}
+
+TEST(h1_tls_upstream, epoll_post_upload) {
+    exercise<EpollEventLoop>(_tc, false, false, false, false, 48000);
+}
+TEST(h1_tls_upstream, iouring_post_upload) {
+    exercise<IoUringEventLoop>(_tc, false, false, false, false, 48000);
+}
+TEST(h1_tls_upstream, epoll_tls_early_413_during_upload) {
+    exercise<EpollEventLoop>(
+        _tc, false, false, false, false, 2 * 1024 * 1024, false, false, false, false, true);
+}
+TEST(h1_tls_upstream, iouring_tls_early_413_during_upload) {
+    exercise<IoUringEventLoop>(
+        _tc, false, false, false, false, 2 * 1024 * 1024, false, false, false, false, true);
+}
+TEST(h1_tls_upstream, epoll_bad_ca) {
+    exercise<EpollEventLoop>(_tc, false, false, false, false, 0, true);
+}
+TEST(h1_tls_upstream, iouring_bad_ca) {
+    exercise<IoUringEventLoop>(_tc, false, false, false, false, 0, true);
+}
+
+TEST(h1_tls_upstream, epoll_response_timeout) {
+    exercise<EpollEventLoop>(_tc, false, false, false, false, 0, false, true);
+}
+TEST(h1_tls_upstream, iouring_response_timeout) {
+    exercise<IoUringEventLoop>(_tc, false, false, false, false, 0, false, true);
+}
+
+int main(int argc, char** argv) {
+    return rut::test::run_all(argc, argv);
+}

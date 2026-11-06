@@ -367,6 +367,13 @@ bool KqueueBackend::add_send_upstream(i32 fd, u32 id, const u8* buf, u32 len, u3
     return start_send(fd, id, buf, len, true, episode);
 }
 
+bool KqueueBackend::add_recv_tls(Connection& conn) {
+    if (pending_count == kPendingCap || !add_recv(conn.fd, conn.id)) return false;
+    IoEvent event{};
+    if (receive(conn, false, event)) pending_[pending_count++] = event;
+    return true;
+}
+
 bool KqueueBackend::add_send_tls(Connection& conn, const u8* buf, u32 len) {
     const u32 id = conn.id;
     if (id >= kMaxFdMap || pending_count == kPendingCap || send_state[id].remaining) return false;
@@ -451,6 +458,10 @@ bool KqueueBackend::receive(Connection& conn, bool upstream, IoEvent& event) {
                 return true;
             }
             conn.tls_handshake_complete = true;
+            if (conn.h1_tls_transport) {
+                event = completion(id, type, 1);
+                return true;
+            }
             if (tls_negotiated_protocol(ssl) == AlpnProtocol::H2)
                 conn.protocol = ConnProtocol::Http2;
         }
