@@ -10224,3 +10224,13 @@ native metadata names; password task admission and callout admission are separat
 The HTTPS parser has an explicit authorization profile; its default JWKS profile
 still requires HTTP 200 JSON. See the language card's Forward-auth contract for
 bounds and the currently unsupported protocol extensions.
+
+### JWT group authorization composition
+
+The ordinary `jwt_groups.requireAny` and `jwt_groups.requireAll` library helpers
+compose the existing exact JWT group checks into a union or intersection of two
+configured names. They return the same verified JSON; signature/claims policy
+and identity mapping remain explicit in the calling route. The
+[language card](docs/language-card.md#jwt-group-union-and-intersection-policies)
+defines rejection status, trust boundary and configuration behavior. No syntax,
+keyword, runtime ABI, allocation strategy or dependency changes are required.

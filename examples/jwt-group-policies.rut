@@ -1,0 +1,21 @@
+// Set JWT_SECRET (at least 32 bytes), JWT_ISSUER and JWT_AUDIENCE before loading.
+// Serve behind TLS; authenticate before checking signed group memberships.
+import "middleware/auth.rut"
+import "middleware/jwt_groups.rut"
+listen :8080
+
+route GET "/reports" {
+    let claims = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(claims, env("JWT_ISSUER"), env("JWT_AUDIENCE"), "report-policy")
+    let allowed = jwt_groups.requireAny(claims, "analysts", "auditors")
+    let subject = identity.consumerId
+    return response(200, body: subject)
+}
+
+route GET "/sensitive-reports" {
+    let claims = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(claims, env("JWT_ISSUER"), env("JWT_AUDIENCE"), "sensitive-policy")
+    let allowed = jwt_groups.requireAll(claims, "analysts", "approved")
+    let subject = identity.consumerId
+    return response(200, body: subject)
+}
