@@ -22,6 +22,7 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/crypto_c.h"
+#include "rut/runtime/http_call.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/rate_limit_key.h"
@@ -8198,6 +8199,39 @@ TEST(helpers, req_param_from_handler_ctx) {
     rut_helper_req_param(&frame.ctx, "missing", 7, &ptr, &len);
     CHECK(ptr != nullptr);
     CHECK_EQ(len, 0u);
+}
+
+TEST(helpers, http_call_frame_reanchors_only_request_backed_route_params) {
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    Connection conn;
+    conn.json_arena.backend.pool = &pool;
+    TestHandlerCtxFrame frame{};
+    static const char external[] = "configured";
+    char request[] = "GET /items/42 HTTP/1.1\r\nHost: test\r\n\r\n";
+    const u32 length = static_cast<u32>(sizeof(request) - 1);
+    const char* route_value = request + 11;
+    frame.ctx.route_param_count = 2;
+    frame.ctx.route_params[0] = {"id", 2, route_value, 2};
+    frame.ctx.route_params[1] = {"fixed", 5, external, sizeof(external) - 1};
+
+    auto* call_frame = static_cast<HttpCallFrameHeader*>(
+        rut_helper_http_call_frame(&conn,
+                                   &frame.ctx,
+                                   sizeof(HttpCallFrameHeader),
+                                   reinterpret_cast<const u8*>(request),
+                                   length));
+    REQUIRE(call_frame != nullptr);
+    CHECK(call_frame->request != reinterpret_cast<const u8*>(request));
+    CHECK(frame.ctx.route_params[0].value ==
+          reinterpret_cast<const char*>(call_frame->request + (route_value - request)));
+    CHECK((Str{frame.ctx.route_params[0].value, frame.ctx.route_params[0].value_len}.eq(
+        lit_str("42"))));
+    CHECK(frame.ctx.route_params[1].value == external);
+    CHECK((Str{frame.ctx.route_params[1].value, frame.ctx.route_params[1].value_len}.eq(
+        lit_str("configured"))));
+    conn.json_arena.destroy();
+    pool.destroy();
 }
 
 TEST(helpers, req_cookie_from_request_bytes) {

@@ -88,7 +88,7 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
             (authorization_ && !callout_ && response.status_code != 200 &&
              response.status_code != 401 && response.status_code != 403) ||
             response.headers_truncated || response.content_length_count > 1 ||
-            response.content_length > kMaxBody)
+            (response.content_length > kMaxBody && !(callout_ && response.status_code == 304)))
             return Result::Error;
         u32 transfer_count = 0, type_count = 0, encoding_count = 0;
         for (u32 i = 0; i < response.header_count; ++i) {

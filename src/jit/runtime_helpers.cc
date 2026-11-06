@@ -21,6 +21,7 @@
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/jwt_hs256.h"
 #include "rut/runtime/password_gateway.h"
+#include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/signed_request.h"
 #include "rut/runtime/uuid.h"
@@ -36,6 +37,7 @@
 #include <hs.h>
 #include <hs_common.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -361,6 +363,18 @@ extern "C" void* rut_helper_http_call_frame(
     __builtin_memcpy(snapshot, request, length);
     frame->request = snapshot;
     frame->length = length;
+    const uintptr_t kRequestStart = reinterpret_cast<uintptr_t>(request);
+    const uintptr_t kRequestEnd = kRequestStart + length;
+    const u32 kParamCount =
+        ctx.route_param_count > kMaxRouteParams ? kMaxRouteParams : ctx.route_param_count;
+    for (u32 i = 0; i < kParamCount; ++i) {
+        auto& param = ctx.route_params[i];
+        const uintptr_t kValueStart = reinterpret_cast<uintptr_t>(param.value);
+        if (!param.value || kValueStart < kRequestStart || kValueStart > kRequestEnd ||
+            param.value_len > kRequestEnd - kValueStart)
+            continue;
+        param.value = reinterpret_cast<const char*>(snapshot + (kValueStart - kRequestStart));
+    }
     __builtin_memcpy(ctx.slots(), static_cast<const void*>(&frame), sizeof(HttpCallFrameHeader*));
     return frame;
 }

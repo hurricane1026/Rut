@@ -781,6 +781,17 @@ TEST(https_fetch, callout_profile_admits_http_errors_but_not_ambiguous_or_partia
     CHECK(response.append(lit_str("HTTP/1.1 204 No Content\r\n\r\n")) ==
           BoundedJsonResponse::Result::Complete);
     response.reset_callout();
+    CHECK(response.append(lit_str("HTTP/1.1 304 Not Modified\r\nContent-Length: 100000\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Complete);
+    CHECK(response.body().empty());
+    response.reset_callout();
+    CHECK(
+        response.append(lit_str("HTTP/1.1 304 Not Modified\r\nContent-Length: 100000\r\n\r\nx")) ==
+        BoundedJsonResponse::Result::Error);
+    response.reset_callout();
+    CHECK(response.append(lit_str("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Error);
+    response.reset_callout();
     CHECK(response.append(lit_str("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nx")) ==
           BoundedJsonResponse::Result::More);
     CHECK(response.finish() == BoundedJsonResponse::Result::Error);

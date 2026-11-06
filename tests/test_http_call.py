@@ -141,7 +141,7 @@ route POST "/untrusted" {
     return response(200, body: body)
 }
 '''
-    source += """
+    source += r"""
 func choose(_ request: Json, _ first: bool) -> Json {
     if first {
         httpCall(env("CALLOUT_FIRST"), request, 300)
@@ -170,6 +170,13 @@ route POST "/proxy" {
         }
         _ => { return 403 }
     }
+}
+route POST "/param/:id" {
+    let saved = req.param("id").or("missing")
+    guard let request = json.parse("{\"method\":\"POST\",\"headers\":{\"X-Mode\":\"slow\"}}") else { return 400 }
+    let pending = httpCall(env("CALLOUT_FIRST"), request, 300)
+    guard let reply = pending else { return 503 }
+    return response(200, body: saved)
 }
 """
     source += ('upstream backend { host: "127.0.0.1", port: ' + str(origin.server_port) +
@@ -219,17 +226,21 @@ route POST "/proxy" {
                 def frame(kind, flags, stream, payload=b''):
                     return len(payload).to_bytes(3, 'big') + bytes((kind, flags)) + stream.to_bytes(4, 'big') + payload
 
-                def h2_send(sock, stream, path='/compose', mode='', saved='h2-snapshot'):
+                def h2_send(sock, stream, path='/compose', mode='', saved='h2-snapshot',
+                            end_stream=False):
                     data = json.dumps(dict(method='POST', headers={'X-Mode': mode}, body='input')).encode()
                     # Literal HPACK fields without Huffman or a dynamic table.
+                    content_length = 0 if end_stream else len(data)
                     fields = [(':method', 'POST'), (':scheme', 'http'), (':path', path),
-                              (':authority', 'localhost'), ('content-length', str(len(data))), ('x-saved', saved)]
+                              (':authority', 'localhost'), ('content-length', str(content_length)), ('x-saved', saved)]
                     block = b''
                     for name, value in fields:
                         name, value = name.encode(), value.encode()
                         assert len(name) < 127 and len(value) < 127
                         block += bytes((0, len(name))) + name + bytes((len(value),)) + value
-                    sock.sendall(frame(1, 4, stream, block) + frame(0, 1, stream, data))
+                    flags = 5 if end_stream else 4
+                    sock.sendall(frame(1, flags, stream, block) +
+                                 (b'' if end_stream else frame(0, 1, stream, data)))
 
                 def h2_body(sock, target):
                     def exact(size):
@@ -329,6 +340,26 @@ route POST "/proxy" {
                     assert len(received) == before + 2, received
                     h2_send(sock, 3, saved='next-stream')
                     assert h2_body(sock, 3) == b'accepted:next-stream:writer'
+                # Keep the first callout pending while another H2 connection
+                # reuses the synthesized-request stack with a different capture.
+                entered.clear(); release.clear()
+                before = len(received)
+                with h2_open() as first, h2_open() as second:
+                    h2_send(first, 1, path='/param/original', end_stream=True)
+                    assert entered.wait(4)
+                    h2_send(second, 1, path='/param/replacement', end_stream=True)
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        with lock:
+                            if len(received) >= before + 2:
+                                break
+                        time.sleep(.01)
+                    assert len(received) >= before + 2, received
+                    release.set()
+                    second_body = h2_body(second, 1)
+                    assert second_body == b'replacement', (second_body, received[before:])
+                    first_body = h2_body(first, 1)
+                    assert first_body == b'original', (first_body, received[before:])
                 # Reset a suspended H2 stream and reuse its connection for a fresh call.
                 entered.clear(); release.clear()
                 with h2_open() as sock:
