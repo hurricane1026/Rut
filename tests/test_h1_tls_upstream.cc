@@ -4,6 +4,7 @@
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "test.h"
+#include "test_helpers.h"
 #include <new>
 
 #include <arpa/inet.h>
@@ -122,7 +123,8 @@ struct Origin {
                                 __atomic_store_n(&s.response_started, 1u, __ATOMIC_RELEASE);
                             }
                             if (s.hold_after_response) {
-                                while (!__atomic_load_n(&s.stopping, __ATOMIC_ACQUIRE)) usleep(1000);
+                                while (!__atomic_load_n(&s.stopping, __ATOMIC_ACQUIRE))
+                                    usleep(1000);
                             } else {
                                 (void)SSL_shutdown(ssl);
                             }
@@ -147,6 +149,46 @@ struct Origin {
         if (context) SSL_CTX_free(context);
     }
 };
+
+u32 g_h1_tls_plaintext_len = 0;
+u8 g_h1_tls_plaintext[256]{};
+
+void h1_tls_plaintext_probe(void*, Connection& owner, IoEvent ev) {
+    g_h1_tls_plaintext_len = ev.result > 0 ? static_cast<u32>(ev.result) : 0;
+    const u32 n = owner.upstream_recv_buf.len() < sizeof(g_h1_tls_plaintext)
+                      ? owner.upstream_recv_buf.len()
+                      : sizeof(g_h1_tls_plaintext);
+    if (n) memcpy(g_h1_tls_plaintext, owner.upstream_recv_buf.data(), n);
+    owner.on_upstream_recv = nullptr;
+}
+
+bool finish_memory_tls_handshake(TlsEngine& engine, SSL* client) {
+    u8 client_to_server[16384];
+    u8 server_to_client[16384];
+    bool client_done = false;
+    for (u32 attempt = 0; attempt < 64 && !(client_done && engine.handshake_done); ++attempt) {
+        if (!client_done) {
+            const int rc = SSL_do_handshake(client);
+            if (rc == 1) {
+                client_done = true;
+            } else {
+                const int error = SSL_get_error(client, rc);
+                if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) return false;
+            }
+        }
+        int client_len = BIO_read(SSL_get_wbio(client), client_to_server, sizeof(client_to_server));
+        if (client_len < 0) client_len = 0;
+        tls_engine_set_input(engine, client_to_server, static_cast<u32>(client_len));
+        tls_engine_set_output(engine, server_to_client, sizeof(server_to_client));
+        if (tls_engine_handshake(engine) == TlsOp::Error) return false;
+        const u32 server_len = tls_engine_output_len(engine);
+        if (server_len > 0 &&
+            BIO_write(SSL_get_rbio(client), server_to_client, static_cast<int>(server_len)) !=
+                static_cast<int>(server_len))
+            return false;
+    }
+    return client_done && engine.handshake_done;
+}
 
 template <typename T>
 struct Mapped {
@@ -325,8 +367,8 @@ void exercise(rut::test::TestCase* _tc,
             total += static_cast<u32>(n);
             if (hold_after_response) {
                 const char* response_body = strstr(prefix, "\r\n\r\n");
-                if (response_body && total >= static_cast<u32>(response_body + 4 - prefix) +
-                                                  origin.body_size)
+                if (response_body &&
+                    total >= static_cast<u32>(response_body + 4 - prefix) + origin.body_size)
                     break;
             }
         }
@@ -398,6 +440,103 @@ TEST(h1_tls_upstream, iouring_large_response) {
 }
 TEST(h1_tls_upstream, iouring_keepalive_response_has_no_followup_origin_read) {
     exercise<IoUringEventLoop>(_tc, false, false, false, false, 0, false, false, true);
+}
+TEST(h1_tls_upstream, iouring_ssl_pending_resume_drains_plaintext_without_ciphertext) {
+    auto context_result = create_tls_server_context(RUT_TLS_FIXTURES "/localhost_cert.pem",
+                                                    RUT_TLS_FIXTURES "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    TlsServerContext* server_context = context_result.value();
+    REQUIRE_EQ(SSL_CTX_set_min_proto_version(server_context->ssl_ctx, TLS1_2_VERSION), 1);
+    REQUIRE_EQ(SSL_CTX_set_max_proto_version(server_context->ssl_ctx, TLS1_2_VERSION), 1);
+
+    Mapped<IoUringEventLoop> mapped;
+    REQUIRE(mapped.value != nullptr);
+    IoUringEventLoop& loop = *mapped.value;
+    REQUIRE(loop.init_slot_storage(2).has_value());
+    test_initialize_slots(loop, 2);
+    REQUIRE(loop.pool.init(12).has_value());
+    loop.timer.init();
+    loop.tls_server = server_context;
+    Connection* owner = loop.alloc_conn();
+    Connection* transport = loop.alloc_conn();
+    REQUIRE(owner && transport);
+    REQUIRE(loop.alloc_upstream_buf(*owner));
+    REQUIRE(loop.tls_setup(*transport));
+
+    SSL_CTX* client_context = SSL_CTX_new(TLS_client_method());
+    REQUIRE(client_context != nullptr);
+    REQUIRE_EQ(SSL_CTX_set_min_proto_version(client_context, TLS1_2_VERSION), 1);
+    REQUIRE_EQ(SSL_CTX_set_max_proto_version(client_context, TLS1_2_VERSION), 1);
+    SSL_CTX_set_verify(client_context, SSL_VERIFY_NONE, nullptr);
+    SSL* client = SSL_new(client_context);
+    REQUIRE(client != nullptr);
+    BIO* client_read = BIO_new(BIO_s_mem());
+    BIO* client_write = BIO_new(BIO_s_mem());
+    REQUIRE(client_read && client_write);
+    SSL_set_bio(client, client_read, client_write);
+    SSL_set_connect_state(client);
+    REQUIRE(finish_memory_tls_handshake(transport->tls_engine, client));
+    transport->tls_handshake_complete = true;
+
+    static constexpr u32 kPayloadLen = 256;
+    static constexpr u32 kFirstReadLen = 156;
+    u8 source[kPayloadLen];
+    for (u32 i = 0; i < kPayloadLen; ++i) source[i] = static_cast<u8>(i ^ 0xA5u);
+    REQUIRE_EQ(SSL_write(client, source, sizeof(source)), static_cast<int>(sizeof(source)));
+    u8 ciphertext[1024];
+    const int ciphertext_len = BIO_read(SSL_get_wbio(client), ciphertext, sizeof(ciphertext));
+    REQUIRE_GT(ciphertext_len, 0);
+    REQUIRE_EQ(transport->tls_in_buf.write(ciphertext, static_cast<u32>(ciphertext_len)),
+               static_cast<u32>(ciphertext_len));
+
+    u8 first_plaintext[kFirstReadLen];
+    u8 tls_output[1024];
+    tls_engine_set_input(
+        transport->tls_engine, transport->tls_in_buf.data(), transport->tls_in_buf.len());
+    tls_engine_set_output(transport->tls_engine, tls_output, sizeof(tls_output));
+    TlsOp status = TlsOp::Error;
+    REQUIRE_EQ(
+        tls_engine_read(transport->tls_engine, first_plaintext, sizeof(first_plaintext), status),
+        static_cast<i32>(kFirstReadLen));
+    transport->tls_in_buf.consume(tls_engine_input_consumed(transport->tls_engine));
+    CHECK_EQ(transport->tls_in_buf.len(), 0u);
+    CHECK_EQ(SSL_pending(transport->tls_engine.ssl), 100);
+
+    H1TlsUpstream sidecar{};
+    sidecar.owner = owner;
+    sidecar.transport = transport;
+    sidecar.ready = true;
+    owner->h1_tls_upstream = &sidecar;
+    transport->h1_tls_transport = &sidecar;
+    owner->on_upstream_recv = &h1_tls_plaintext_probe;
+    u8 delivered[kPayloadLen]{};
+    owner->upstream_recv_buf.bind(delivered, sizeof(delivered));
+    u8 transport_plaintext[SlicePool::kSliceSize]{};
+    transport->recv_buf.bind(transport_plaintext, sizeof(transport_plaintext));
+    g_h1_tls_plaintext_len = 0;
+    const u32 sq_tail_before = loop.backend.sq_tail ? *loop.backend.sq_tail : 0;
+    REQUIRE(h1_tls_recv(&loop, *owner));
+    CHECK_EQ(g_h1_tls_plaintext_len, 100u);
+    CHECK_EQ(memcmp(g_h1_tls_plaintext, source + kFirstReadLen, 100), 0);
+    CHECK_EQ(transport->tls_in_buf.len(), 0u);
+    CHECK_FALSE(transport->recv_armed);
+    if (loop.backend.sq_tail) CHECK_EQ(*loop.backend.sq_tail, sq_tail_before);
+
+    owner->h1_tls_upstream = nullptr;
+    transport->h1_tls_transport = nullptr;
+    sidecar.owner = nullptr;
+    sidecar.transport = nullptr;
+    owner->on_upstream_recv = nullptr;
+    loop.timer.remove(owner);
+    loop.timer.remove(transport);
+    loop.free_conn(*transport);
+    loop.free_conn(*owner);
+    loop.tls_server = nullptr;
+    loop.pool.destroy();
+    loop.destroy_slot_storage();
+    SSL_free(client);
+    SSL_CTX_free(client_context);
+    destroy_tls_server_context(server_context);
 }
 TEST(h1_tls_upstream, epoll_slow_client_drains_large_response_after_upstream_fin) {
     exercise<EpollEventLoop>(_tc, false, false, false, false, 0, false, false, false, true);
