@@ -569,6 +569,10 @@ canonical spelling for common gateway tasks.
 
 ### M0：建立可执行基线与逐项映射
 
+- [x] 建立 Kong OSS 3.9.1 固定镜像的首批路由/策略差分：两个后端各 21 项，
+  16 项观察一致、5 项精确记录差异；覆盖范围与 P0 路径差异见
+  [Kong 差分基线](docs/kong-compatibility-baseline.md)。这不关闭下方 140 项总体验收。
+
 场景固定编号及当前证据见 [场景审计索引](docs/scenario-audit-index.md)；编号本身不表示已完成验收。
 
 - [ ] 为上节 140 项建立稳定编号及对应表，记录：Rut 当前入口、实现文件、现有测试、

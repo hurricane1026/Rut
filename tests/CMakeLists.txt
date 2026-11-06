@@ -1302,6 +1302,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     )
 endif()
 
+# Independent fixtures compare real forwarded traffic with pinned Kong OSS.
+# Known divergences are exact expectations, not claims of compatibility.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
+    foreach(kong_backend epoll io_uring)
+        add_test(NAME test_kong_differential_${kong_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_kong_differential.py
+                --server $<TARGET_FILE:rut> --backend ${kong_backend}
+                --report ${CMAKE_BINARY_DIR}/kong-differential-${kong_backend}.json)
+        set_tests_properties(test_kong_differential_${kong_backend} PROPERTIES
+            LABELS "docker;kong;network" TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+    endforeach()
+endif()
+
 add_executable(test_drain test_drain.cc)
 target_link_libraries(test_drain rut_runtime)
 target_include_directories(test_drain PRIVATE

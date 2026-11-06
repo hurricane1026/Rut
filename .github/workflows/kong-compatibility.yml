@@ -1,0 +1,56 @@
+name: Kong compatibility baseline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: kong-baseline-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  routing-baseline:
+    name: Pinned Kong routing baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install build tools
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel
+      - name: Provision immutable Kong OSS oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t images < tests/pinned-kong-image.txt
+          if (( ${#images[@]} != 1 )) || [[ ! "${images[0]}" =~ ^kong@sha256:[0-9a-f]{64}$ ]]; then
+            echo "expected one immutable Kong image reference" >&2
+            exit 1
+          fi
+          docker pull "${images[0]}"
+          docker image inspect "${images[0]}" > /dev/null
+      - name: Build Rut
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRUT_ENABLE_JIT=ON -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
+          cmake --build build --target rut --parallel 2
+          git rev-parse HEAD > build/kong-rut-revision.txt
+      - name: Compare both I/O backends
+        env:
+          RUT_KONG_DIFFERENTIAL_REQUIRED: "1"
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120 -L kong
+      - name: Upload actual observations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kong-routing-observations
+          path: |
+            build/kong-differential-*.json
+            build/kong-rut-revision.txt
+          if-no-files-found: ignore
