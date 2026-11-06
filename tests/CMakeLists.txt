@@ -1072,7 +1072,7 @@ add_test(NAME test_route_select COMMAND test_route_select)
 set_tests_properties(test_route_select PROPERTIES LABELS "unit")
 
 add_executable(test_rir test_rir.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
-target_link_libraries(test_rir rut_compiler)
+target_link_libraries(test_rir rut_compiler rut_runtime)
 target_include_directories(test_rir PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
