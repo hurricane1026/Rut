@@ -93,6 +93,14 @@ rut::u64 rut_helper_password_verify_header(void* connection,
                                            const char* record,
                                            rut::u32 record_length,
                                            rut::u32 timeout_ms);
+rut::u64 rut_helper_forward_auth_header(void* connection,
+                                        const rut::u8* data,
+                                        rut::u32 length,
+                                        const char* header,
+                                        rut::u32 header_length,
+                                        const char* record,
+                                        rut::u32 record_length,
+                                        rut::u32 timeout_ms);
 
 // Absent unless exactly one field with this name exists (case-insensitive).
 void rut_helper_req_unique_header(const rut::u8* req_data,

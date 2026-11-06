@@ -1,0 +1,16 @@
+// Configure the fixed TLS authorization service before loading this program:
+// RUT_FORWARD_AUTH_POLICY='{"address":"127.0.0.1","port":9443,"serverName":"auth.example.com","caFile":"/etc/rut/auth-ca.pem","path":"/authorize","identityHeader":"X-Consumer-ID"}'
+// Serve client credential traffic over TLS (or a trusted local TLS terminator).
+listen :8080
+upstream backend at "127.0.0.1:8081"
+
+route GET "/private" {
+    let decision = forwardAuthHeader("Authorization", env("RUT_FORWARD_AUTH_POLICY"), 1000)
+    guard decision != -2 else { return 504 }
+    guard decision != -1 else { return 503 }
+    guard decision != -3 else { return 403 }
+    guard decision == 1 else { return 401 }
+    // Success replaces all client X-Consumer-ID fields with the service's
+    // allowlisted identity, and removes every original Authorization field.
+    return forward(backend, load_balance: .roundRobin)
+}

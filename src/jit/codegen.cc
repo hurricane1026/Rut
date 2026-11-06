@@ -2036,13 +2036,16 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
-            if (kJsonOp == json::Op::PasswordVerifyHeader) {
+            if (kJsonOp == json::Op::PasswordVerifyHeader ||
+                kJsonOp == json::Op::ForwardAuthHeader) {
+                const char* helper_name = kJsonOp == json::Op::ForwardAuthHeader
+                                              ? "rut_helper_forward_auth_header"
+                                              : "rut_helper_password_verify_header";
                 LLVMTypeRef params[] = {
                     c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty, c.i32_ty};
                 LLVMTypeRef ft = LLVMFunctionType(c.i64_ty, params, 8, 0);
-                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_password_verify_header");
-                if (!helper)
-                    helper = LLVMAddFunction(c.llvm_mod, "rut_helper_password_verify_header", ft);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, helper_name);
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, helper_name, ft);
                 const auto header = c.get_value(inst.operand(0));
                 const auto record = c.get_value(inst.operand(1));
                 LLVMValueRef args[] = {

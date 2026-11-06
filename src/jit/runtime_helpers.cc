@@ -337,6 +337,62 @@ i32 rut_helper_req_header_count(const u8* req_data, u32 req_len, const char* nam
     return count;
 }
 
+extern "C" u64 rut_helper_forward_auth_header(void* connection,
+                                              const u8* data,
+                                              u32 length,
+                                              const char* header,
+                                              u32 header_length,
+                                              const char* configuration,
+                                              u32 configuration_length,
+                                              u32 timeout_ms) {
+    if (!connection || !data || !length ||
+        !forward_auth_policy_valid(
+            {header, header_length}, {configuration, configuration_length}, timeout_ms))
+        return 0xffffffffu;
+    ForwardAuthPolicy policy;
+    if (!policy.load({configuration, configuration_length})) return 0xffffffffu;
+    const auto& parsed = parse_cached(data, length);
+    if (!parsed.ok) return 0xffffffffu;
+    u8 present = 0;
+    const char* credential = nullptr;
+    u32 credential_length = 0;
+    rut_helper_req_unique_header(
+        data, length, header, header_length, &present, &credential, &credential_length);
+    if (!present || !credential_length || credential_length > 2048) return 0;
+    // The parser keeps path and query separate; preserve the exact request target
+    // by taking the bytes between the first two spaces in the validated start line.
+    u32 start = 0;
+    while (start < length && data[start] != ' ') ++start;
+    const Str method{reinterpret_cast<const char*>(data), start};
+    ++start;
+    u32 end = start;
+    while (end < length && data[end] != ' ') ++end;
+    if (end == length) return 0xffffffffu;
+    const auto reply =
+        forward_auth_for_request(connection,
+                                 {header, header_length},
+                                 policy,
+                                 {credential, credential_length},
+                                 method,
+                                 {reinterpret_cast<const char*>(data + start), end - start},
+                                 timeout_ms);
+    if (reply.status == static_cast<i32>(0x80000000u))
+        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+    if (reply.status == 1) {
+        const u32 name_length = static_cast<u32>(__builtin_strlen(policy.identity_header));
+        rut_helper_req_set_owned_header(connection,
+                                        nullptr,
+                                        policy.identity_header,
+                                        name_length,
+                                        reply.identity,
+                                        reply.identity_length);
+        rut_helper_req_remove_header(connection, header, header_length);
+        if (static_cast<ConnectionBase*>(connection)->req_header_override_overflow)
+            return 0xffffffffu;
+    }
+    return static_cast<u32>(reply.status);
+}
+
 extern "C" u64 rut_helper_password_verify_header(void* connection,
                                                  const u8* data,
                                                  u32 length,

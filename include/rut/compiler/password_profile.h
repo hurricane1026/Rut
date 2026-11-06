@@ -1,13 +1,15 @@
 #pragma once
 
 #include "rut/compiler/rir.h"
+#include "rut/runtime/forward_auth.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/password.h"
 
 namespace rut::rir {
 inline bool is_password_prefix(const Instruction& inst) {
     return inst.op == Opcode::JsonOp &&
-           inst.imm.i32_val == static_cast<i32>(json::Op::PasswordVerifyHeader);
+           (inst.imm.i32_val == static_cast<i32>(json::Op::PasswordVerifyHeader) ||
+            inst.imm.i32_val == static_cast<i32>(json::Op::ForwardAuthHeader));
 }
 inline bool function_uses_password(const Function& fn) {
     if (!fn.blocks) return false;
@@ -60,9 +62,13 @@ inline bool password_prefix_valid(const Function& fn) {
                     return false;
             }
             if (args[2]->imm.i32_val < 1 ||
-                !password_header_policy_valid(args[0]->imm.str_val,
-                                              args[1]->imm.str_val,
-                                              static_cast<u32>(args[2]->imm.i32_val)))
+                !(inst.imm.i32_val == static_cast<i32>(json::Op::ForwardAuthHeader)
+                      ? forward_auth_policy_valid(args[0]->imm.str_val,
+                                                  args[1]->imm.str_val,
+                                                  static_cast<u32>(args[2]->imm.i32_val))
+                      : password_header_policy_valid(args[0]->imm.str_val,
+                                                     args[1]->imm.str_val,
+                                                     static_cast<u32>(args[2]->imm.i32_val))))
                 return false;
         }
     }

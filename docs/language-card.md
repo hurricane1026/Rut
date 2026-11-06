@@ -2566,3 +2566,74 @@ A bearer token remains replayable by anyone holding it until other policy reject
 it. `Json` has no compiler-enforced verification provenance: never pass arbitrary
 parsed request JSON. All policy arguments must come from trusted configuration,
 not request fields. See [the runnable example](../examples/jwt-client-auth.rut).
+
+## Forward-auth prefix
+
+`forwardAuthHeader(header, policy, timeoutMs) -> i32` consumes an external HTTPS
+response before continuing a direct route. Like `passwordVerifyHeader`, it must
+initialize the first direct route `let`, with compile-time arguments and no
+explicit `wait`, helper wrapping or pipeline. User functions may shadow it.
+No keyword or dependency is added. JIT and exported native handlers use the same
+verified, constant-only replay prefix and asynchronous authentication service.
+
+```rut
+route GET "/private" {
+    let decision = forwardAuthHeader("Authorization", env("RUT_FORWARD_AUTH_POLICY"), 1000)
+    guard decision != -2 else { return 504 }
+    guard decision != -1 else { return 503 }
+    guard decision != -3 else { return 403 }
+    guard decision == 1 else { return 401 }
+    return forward(backend, load_balance: .roundRobin)
+}
+```
+
+`policy` is a strict JSON object, resolved at load/compile time:
+
+```json
+{"address":"127.0.0.1","port":9443,"serverName":"auth.example.com","caFile":"/etc/rut/auth-ca.pem","path":"/authorize","identityHeader":"X-Consumer-ID"}
+```
+
+All fields except `port` (default 443) are required. Unknown/duplicate fields,
+invalid fixed IPv4/HTTPS endpoint, unsafe header names, identical credential and
+identity fields, and timeouts outside 1–60000 ms are rejected. `identityHeader`
+is exactly one allowlisted `X-*` response/request field, excluding transport and
+original-context fields. There is no DNS, discovery, redirect, HTTP fallback,
+client-supplied URL or fail-open mode.
+
+The service receives `GET` at the fixed path, exactly one selected credential
+field (maximum 2048 bytes), and gateway-produced `X-Original-Method` and
+`X-Original-URI` (including query, maximum 2048 bytes). Client-supplied original
+context and identity fields are never copied to this request. Other headers,
+cookies, body and forwarding IP/host claims are not sent. Protect the configured
+service and avoid putting secrets in query strings. Missing, empty, oversized or
+duplicate credentials return `0` without a callout.
+
+Result `1` requires a completely framed HTTP 200 response with exactly one
+nonempty, valid allowlisted identity field (maximum 1024 bytes). The field name
+and value are copied into request-owned storage, replacing every client field
+of that name; the selected credential field is removed before upstream
+forwarding. Other response headers, cookies and response body are not propagated.
+Reads such as `req.header` still observe the original client request; do not use
+them as authenticated identity. Applications must trust only the configured
+identity field downstream and strip any other identity conventions themselves.
+Always gate forwarding on the actual result being `1`; ordinary integers carry
+no authentication provenance.
+
+A complete 401 returns `0`, 403 returns `-3`, timeout returns `-2`; TLS failure,
+capacity exhaustion, invalid/missing identity, other status codes or malformed
+responses return `-1`. No external response body is exposed. Framing remains
+bounded to 8 KiB headers/body and 16 KiB wire, with ambiguous lengths,
+compression and hop-by-hop identity nomination rejected. Close-delimited bodies
+require authenticated TLS close_notify. The JWKS JSON-only profile is unchanged.
+
+Each requiring shard's existing asynchronous authentication service owns eight
+callout slots and a background worker. TLS allocation, CA loading and nonblocking
+network progression occur off-shard. The shard copies bounded inputs and polls
+via existing timer yields (at most 10 ms); one original monotonic deadline covers
+queueing, connect, TLS and response. Exact expiry rejects even completed allows.
+Request generations and HTTP/2 stream IDs fence abandoned results; close/reset
+cancels work, worker shutdown joins before storage is released, and configuration
+views are never retained by the worker. HTTP/2 keeps its existing single
+suspended-stream restriction. This profile does not implement OAuth introspection,
+OPA JSON envelopes, multiple identity fields, response challenges or auth caching.
+See [the example](../examples/forward-auth.rut).

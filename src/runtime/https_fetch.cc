@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509_vfy.h>
@@ -51,7 +52,9 @@ bool HttpsEndpoint::valid() const {
     return true;
 }
 
-void BoundedJsonResponse::reset() {
+void BoundedJsonResponse::reset(bool authorization) {
+    authorization_ = authorization;
+    status_ = 0;
     wire_len_ = body_len_ = offset_ = expected_ = 0;
     headers_ = chunked_ = sized_ = false;
     chunks_.reset();
@@ -75,12 +78,19 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         if (kStatus == ParseStatus::Error) return Result::Error;
         if (kStatus == ParseStatus::Incomplete)
             return wire_len_ >= 8192 ? Result::Error : Result::More;
-        if (parser.header_end > 8192 || response.status_code != 200 || response.headers_truncated ||
-            response.content_length_count > 1 || response.content_length > kMaxBody)
+        if (parser.header_end > 8192 || (!authorization_ && response.status_code != 200) ||
+            (authorization_ && response.status_code != 200 && response.status_code != 401 &&
+             response.status_code != 403) ||
+            response.headers_truncated || response.content_length_count > 1 ||
+            response.content_length > kMaxBody)
             return Result::Error;
         u32 transfer_count = 0, type_count = 0, encoding_count = 0;
         for (u32 i = 0; i < response.header_count; ++i) {
             const auto& header = response.headers[i];
+            if (authorization_ && equal_ci(header.name, lit_str("Connection")) &&
+                !equal_ci(header.value, lit_str("close")) &&
+                !equal_ci(header.value, lit_str("keep-alive")))
+                return Result::Error;
             if (equal_ci(header.name, lit_str("Transfer-Encoding"))) {
                 if (++transfer_count != 1 || !equal_ci(header.value, lit_str("chunked")))
                     return Result::Error;
@@ -95,13 +105,14 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
                        (header.value.ptr[end - 1] == ' ' || header.value.ptr[end - 1] == '\t'))
                     --end;
                 const Str kType{header.value.ptr, end};
-                if (!equal_ci(kType, lit_str("application/json")) &&
+                if (!authorization_ && !equal_ci(kType, lit_str("application/json")) &&
                     !equal_ci(kType, lit_str("application/jwk-set+json")))
                     return Result::Error;
             }
         }
-        if (type_count != 1 || (transfer_count && response.has_content_length))
+        if ((!authorization_ && type_count != 1) || (transfer_count && response.has_content_length))
             return Result::Error;
+        status_ = response.status_code;
         headers_ = true;
         chunked_ = transfer_count != 0;
         sized_ = response.has_content_length;
@@ -145,9 +156,28 @@ BoundedJsonResponse::Result BoundedJsonResponse::finish() {
                                                                                  : Result::Error;
 }
 
+Str BoundedJsonResponse::unique_header(Str name) const {
+    if (result_ != Result::Complete) return {};
+    HttpResponseParser parser{};
+    ParsedResponse response{};
+    response.reset();
+    if (parser.parse(reinterpret_cast<const u8*>(wire_), wire_len_, &response) !=
+        ParseStatus::Complete)
+        return {};
+    Str value{};
+    u32 count = 0;
+    for (u32 i = 0; i < response.header_count; ++i) {
+        if (!equal_ci(response.headers[i].name, name)) continue;
+        value = response.headers[i].value;
+        ++count;
+    }
+    return count == 1 ? value : Str{};
+}
+
 HttpsFetch::~HttpsFetch() {
     close();
     destroy_tls_client_context(context_);
+    if (authorization_) OPENSSL_cleanse(request_, sizeof(request_));
 }
 void HttpsFetch::close() {
     if (ssl_) SSL_free(ssl_);
@@ -186,10 +216,18 @@ bool HttpsFetch::init(const HttpsEndpoint& endpoint) {
     request_len_ = static_cast<u32>(kSize);
     return true;
 }
+bool HttpsFetch::init_authorization(const HttpsEndpoint& endpoint, Str request) {
+    if (!request.ptr || !request.len || request.len > sizeof(request_) || !init(endpoint))
+        return false;
+    __builtin_memcpy(request_, request.ptr, request.len);
+    request_len_ = request.len;
+    authorization_ = true;
+    return true;
+}
 bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
     if (!context_.ssl_ctx || state_ == State::Busy || !monotonic_ms || !timeout_ms) return false;
     close();
-    response_.reset();
+    response_.reset(authorization_);
     started_ = monotonic_ms;
     timeout_ms_ = timeout_ms;
     sent_ = 0;

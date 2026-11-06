@@ -17,13 +17,16 @@ struct HttpsEndpoint {
 };
 
 // Bounded response-consuming profile, reusable outside JWT policy. No redirects,
-// compression or informational responses. Only 200 JSON with unambiguous framing.
+// compression or informational responses. Default: 200 JSON. The explicit auth
+// profile admits 200/401/403 without a JSON requirement; framing stays strict.
 class BoundedJsonResponse {
 public:
     enum class Result : u8 { More, Complete, Error };
     static constexpr u32 kMaxBody = 8192;
     static constexpr u32 kMaxWire = 16384;
-    void reset();
+    void reset(bool authorization = false);
+    u16 status() const { return status_; }
+    Str unique_header(Str name) const;
     Result append(Str bytes);
     Result finish();  // authenticated TLS close_notify, not a bare TCP EOF
     Result result() const { return result_; }
@@ -36,6 +39,8 @@ private:
     u32 body_len_ = 0;
     u32 offset_ = 0;
     u32 expected_ = 0;
+    bool authorization_ = false;
+    u16 status_ = 0;
     bool headers_ = false;
     bool chunked_ = false;
     bool sized_ = false;
@@ -55,6 +60,10 @@ public:
     HttpsFetch& operator=(const HttpsFetch&) = delete;
     ~HttpsFetch();
     bool init(const HttpsEndpoint& endpoint);
+    // Authorization profile: caller supplies a complete bounded HTTP request.
+    bool init_authorization(const HttpsEndpoint& endpoint, Str request);
+    u16 status() const { return state_ == State::Done ? response_.status() : 0; }
+    Str unique_header(Str name) const { return response_.unique_header(name); }
     bool start(u64 monotonic_ms, u32 timeout_ms);
     void advance(u64 monotonic_ms);
     void cancel();
@@ -66,7 +75,8 @@ private:
     TlsClientContext context_{};
     SSL* ssl_ = nullptr;
     i32 fd_ = -1;
-    char request_[1536]{};
+    bool authorization_ = false;
+    char request_[6144]{};
     u32 request_len_ = 0;
     u32 sent_ = 0;
     u64 started_ = 0;

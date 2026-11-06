@@ -4356,3 +4356,13 @@ endif()
 if(TARGET check)
     add_dependencies(check check_password_cli)
 endif()
+
+if(RUT_ENABLE_JIT AND Python3_Interpreter_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(backend epoll io_uring)
+        add_test(NAME test_forward_auth_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_forward_auth.py
+                --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
+        set_tests_properties(test_forward_auth_${backend} PROPERTIES
+            LABELS "integration" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()

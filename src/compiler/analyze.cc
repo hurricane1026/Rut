@@ -12,6 +12,7 @@
 #include "rut/compiler/node_pool.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/es256_policy.h"
+#include "rut/runtime/forward_auth.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/password.h"
@@ -12758,10 +12759,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
-    if (expr.name.eq(lit_str("passwordVerifyHeader")) &&
+    if ((expr.name.eq(lit_str("passwordVerifyHeader")) ||
+         expr.name.eq(lit_str("forwardAuthHeader"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr auto kDetail = lit_str(
-            "passwordVerifyHeader requires the first route let, fixed header/hash/timeoutMs, and "
+            "asynchronous auth requires the first route let, fixed header/policy/timeoutMs, and "
             "no explicit wait");
         if (!route || !route->password_init_ok || binding != nullptr || expr.args.len != 3 ||
             pipe_lhs || first_arg_override)
@@ -12777,11 +12779,18 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (values[0].kind != HirExprKind::StrLit || values[1].kind != HirExprKind::StrLit ||
             values[2].kind != HirExprKind::IntLit || values[2].int_value < 1 ||
             values[2].int_value > 60000 ||
-            !password_header_policy_valid(
-                values[0].str_value, values[1].str_value, static_cast<u32>(values[2].int_value)))
+            !(expr.name.eq(lit_str("forwardAuthHeader"))
+                  ? forward_auth_policy_valid(values[0].str_value,
+                                              values[1].str_value,
+                                              static_cast<u32>(values[2].int_value))
+                  : password_header_policy_valid(values[0].str_value,
+                                                 values[1].str_value,
+                                                 static_cast<u32>(values[2].int_value))))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
         route->has_password_prefix = true;
-        return make_json_op(json::Op::PasswordVerifyHeader,
+        return make_json_op(expr.name.eq(lit_str("forwardAuthHeader"))
+                                ? json::Op::ForwardAuthHeader
+                                : json::Op::PasswordVerifyHeader,
                             HirTypeKind::I32,
                             false,
                             &values[0],
@@ -24329,7 +24338,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.password_init_ok =
                     si == 0 && route.locals.len == 0 && route.guards.len == 0 && !route.is_timer &&
                     !route.is_helper_scratch && stmt.expr.kind == AstExprKind::Call &&
-                    stmt.expr.name.eq(lit_str("passwordVerifyHeader"));
+                    (stmt.expr.name.eq(lit_str("passwordVerifyHeader")) ||
+                     stmt.expr.name.eq(lit_str("forwardAuthHeader")));
                 route.uuid_init_ok = !used_for_iter && !seen_for && !seen_wait && !route.is_timer &&
                                      !route.is_helper_scratch &&
                                      stmt.expr.kind == AstExprKind::Call &&
@@ -24976,10 +24986,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
 
         if (route.has_password_prefix && route.waits.len != 0)
-            return frontend_error(
-                FrontendError::UnsupportedSyntax,
-                route.span,
-                lit_str("passwordVerifyHeader routes cannot contain explicit wait"));
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  route.span,
+                                  lit_str("asynchronous auth routes cannot contain explicit wait"));
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /
         // kCacheWaitDetail above) catch direct spellings, but not
         // TimeNowMicros or CacheGet/CacheSet trees inlined from helper
