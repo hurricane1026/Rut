@@ -1,0 +1,33 @@
+// REVOCATION_ENDPOINT and INTROSPECTION_ENDPOINT are trusted fixed HTTPS policies.
+// OAUTH_SERVICE_AUTH is the configured client's pre-encoded Basic credential.
+// The AS must verify that submitted tokens belong to this client. Serve over TLS.
+import "middleware/oauth_revocation.rut"
+import "middleware/introspection.rut"
+listen :8080
+
+route POST "/logout" {
+    guard req.method == POST else { return 405 }
+    guard req.path == "/logout" else { return 404 }
+    let message = oauth_revocation.revokeRequest(req.authorization.or(""), env("OAUTH_SERVICE_AUTH"))
+    let pending = httpCall(env("REVOCATION_ENDPOINT"), message, 1000)
+    guard let reply = pending else { return 503 }
+    let completed = oauth_revocation.requireSuccess(reply)
+    return response(204, headers: {"Cache-Control": "no-store"})
+}
+
+// Explicitly reject GET rather than using the gateway's unmatched-route default.
+route GET "/logout" { return 405 }
+
+// No local cached allow: the AS's revoked state is checked on every request.
+route GET "/protected" {
+    guard req.method == GET && req.path == "/protected" else { return 404 }
+    let message = introspection.request(req.authorization.or(""), env("OAUTH_SERVICE_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), message, 1000)
+    guard let reply = pending else { return 503 }
+    let document = introspection.requireActive(reply, "reports-api")
+    let subject = introspection.subject(document)
+    guard jwtHasScope(document, "reports:read") else {
+        return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})
+    }
+    return response(200, body: subject)
+}
