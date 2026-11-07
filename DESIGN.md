@@ -10305,3 +10305,13 @@ only after the checks. No cached allow is retained: policy updates or revocation
 at the AS are visible on the next request. Required expiry/audience are local
 resource policy; optional issuer, subject and issuance time are not fabricated
 to make the response resemble JWT claims. See [the contract](docs/oauth-introspection.md).
+
+### Introspection issuer/client binding
+
+The ordinary introspection library optionally binds already validated AS metadata
+to exact configured issuer and OAuth client identifiers. The base active/expiry/
+audience profile remains unchanged; route policy chooses whether the optional
+fields are required. Binding composes with existing scope and subject validation
+before identity forwarding, without raising compiler guard limits or adding a
+builtin, ABI, dependency or allocation path. See
+[the contract](docs/oauth-introspection.md#optional-issuer-and-oauth-client-binding).

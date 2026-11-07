@@ -38,3 +38,20 @@ func requireScope(_ document: Json, _ scope: str) -> Json {
     guard jwtHasScope(document, scope) else { respond denied }
     document
 }
+
+// Exact metadata comparison only: this cannot authenticate caller-supplied JSON.
+func bindingMatches(_ document: Json, _ issuer: str, _ clientId: str) -> bool {
+    issuer != "" && clientId != "" && json.kind(document).or("") == "object" &&
+        json.string(json.get(document, "/iss").or(document)).or("") == issuer &&
+        json.string(json.get(document, "/client_id").or(document)).or("") == clientId
+}
+
+// Optional resource policy, after requireActive over the authenticated AS reply.
+// Token issuer/client metadata is distinct from introspection service credentials.
+func requireBinding(_ document: Json, _ issuer: str, _ clientId: str) -> Json {
+    guard issuer != "" && clientId != "" else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard bindingMatches(document, issuer, clientId) else { respond denied }
+    document
+}

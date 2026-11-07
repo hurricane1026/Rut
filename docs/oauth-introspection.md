@@ -95,3 +95,37 @@ HTTP/1 and HTTP/2 forwarding, authenticated form encoding, expiry/audience/scope
 AS outage, wrong certificate identity, immediate revocation, concurrency and
 credential/identity non-propagation on epoll and io_uring. It does not run a full
 OAuth provider. Existing callout tests cover reset/disconnect cancellation.
+
+## Optional issuer and OAuth client binding
+
+`introspection.requireBinding(document, expectedIssuer, expectedClientId)` adds
+an explicit resource policy after `requireActive`. It returns the same metadata
+document only when its top-level `iss` and `client_id` decode as strings exactly
+matching the nonempty trusted configuration. JSON escapes are decoded, but case,
+URI spelling, trailing slashes and prefixes are not normalized. Missing, empty,
+wrong-type or mismatching fields produce 401 with the Bearer invalid-token
+challenge; either empty configured value produces 503. Duplicate decoded JSON
+names are already rejected by the response parser (503).
+
+These fields are optional in [RFC 7662 section 2.2](https://www.rfc-editor.org/rfc/rfc7662#section-2.2).
+This opt-in helper makes them mandatory for a selected route, without changing
+`requireActive` or other routes. The token's `client_id` identifies the OAuth
+client for which it was issued; it is independent of the resource server's
+service credential used to access the introspection endpoint. Client request
+headers, the AS's HTTP headers, and the token-type hint cannot supply this binding.
+Callers must still trust the fixed HTTPS endpoint and validate active state,
+expiry, audience and scope. Binding is metadata policy, not sender authentication.
+
+The `/bound-reports` example reads `TOKEN_ISSUER` and `TOKEN_CLIENT_ID` from trusted
+configuration, calls `requireActive`, applies the binding and validates the
+subject. Its fixed scope is checked with `jwtHasScope` in a `match` so this full
+composition fits the existing route guard budget. Failure still returns the
+insufficient-scope challenge (403). Only the successful arm strips Authorization
+and forwards the checked subject. The original `/reports` route is unchanged.
+
+The native-loaded TLS integration matrix tests both routes on HTTP/1 and HTTP/2,
+source/module removal, escaped names/values, exact matching and malformed metadata,
+empty binding configuration, subject/audience/expiry/scope failures, service
+credential separation, spoofed headers and upstream non-forwarding on rejection.
+It runs on epoll and io_uring with existing timeout/revocation/isolation cases.
+No builtin, runtime ABI, dependency, cache or provider-specific discovery is added.

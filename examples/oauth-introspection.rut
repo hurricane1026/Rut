@@ -21,3 +21,23 @@ route GET "/reports" {
         _ => { return 401 }
     }
 }
+
+// Opt-in issuer/client binding. Configure both from trusted resource policy.
+route GET "/bound-reports" {
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let document = introspection.requireActive(reply, "reports-api")
+    let bound = introspection.requireBinding(document, env("TOKEN_ISSUER"), env("TOKEN_CLIENT_ID"))
+    let subject = introspection.subject(bound)
+    match jwtHasScope(bound, "reports:read") {
+        true => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", subject)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => {
+            return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})
+        }
+    }
+}
