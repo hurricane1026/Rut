@@ -6,6 +6,10 @@
 #include "rut/runtime/json.h"
 #include "rut/runtime/jwt_claims.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 namespace rut {
 namespace {
 bool string_value(json::Document& doc, u32 node, json::Writer& output) {
@@ -26,6 +30,91 @@ bool service_authorization_valid(Str authorization, bool allow_bearer) {
     for (u32 i = 0; i < authorization.len; ++i) {
         const auto kByte = static_cast<u8>(authorization.ptr[i]);
         if (kByte < 0x20 || kByte > 0x7e) return false;
+    }
+    return true;
+}
+
+bool hex_byte(char byte) {
+    return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f') ||
+           (byte >= 'A' && byte <= 'F');
+}
+
+bool resource_identifier_valid(Str resource) {
+    if (!resource.ptr || resource.len > 1024 || resource.len <= 8 ||
+        !http_header_name_eq_ci(resource.ptr, 8, "https://", 8))
+        return false;
+    u32 end = 8;
+    while (end < resource.len && resource.ptr[end] != '/' && resource.ptr[end] != '?') ++end;
+    if (end == 8) return false;
+    u32 port;
+    if (resource.ptr[8] == '[') {
+        u32 close = 9;
+        while (close < end && resource.ptr[close] != ']') ++close;
+        char address[INET6_ADDRSTRLEN];
+        if (close == end || close == 9 || close - 9 >= sizeof(address)) return false;
+        for (u32 i = 9; i < close; ++i) {
+            const char kByte = resource.ptr[i];
+            if (!hex_byte(kByte) && kByte != ':' && kByte != '.') return false;
+            address[i - 9] = kByte;
+        }
+        address[close - 9] = 0;
+        struct in6_addr parsed{};
+        if (inet_pton(AF_INET6, address, &parsed) != 1) return false;
+        port = close + 1;
+        if (port != end && resource.ptr[port] != ':') return false;
+    } else {
+        u32 host_end = 8;
+        while (host_end < end && resource.ptr[host_end] != ':') ++host_end;
+        if (host_end == 8 || host_end - 8 > 253) return false;
+        u32 label = 0;
+        for (u32 i = 8; i < host_end; ++i) {
+            const char kByte = resource.ptr[i];
+            if (kByte == '.') {
+                if (!label || resource.ptr[i - 1] == '-') return false;
+                label = 0;
+            } else {
+                const bool kLetter =
+                    (kByte >= 'a' && kByte <= 'z') || (kByte >= 'A' && kByte <= 'Z');
+                const bool kDigit = kByte >= '0' && kByte <= '9';
+                if (!kLetter && !kDigit && kByte != '-') return false;
+                if (!label && kByte == '-') return false;
+                ++label;
+                if (label > 63) return false;
+            }
+        }
+        if (!label || resource.ptr[host_end - 1] == '-') return false;
+        port = host_end;
+    }
+    if (port < end) {
+        if (++port == end) return false;
+        u32 number = 0;
+        for (; port < end; ++port) {
+            const char kByte = resource.ptr[port];
+            if (kByte < '0' || kByte > '9') return false;
+            number = number * 10 + static_cast<u32>(kByte - '0');
+            if (number > 65535) return false;
+        }
+        if (!number) return false;
+    }
+    // RFC 3986 pchar plus path/query separators; percent escapes are preserved,
+    // not decoded. No userinfo, fragment, raw control, Unicode or backslash.
+    for (u32 i = end; i < resource.len; ++i) {
+        const char kByte = resource.ptr[i];
+        if (kByte == '%') {
+            if (resource.len - i < 3 || !hex_byte(resource.ptr[i + 1]) ||
+                !hex_byte(resource.ptr[i + 2]))
+                return false;
+            i += 2;
+        } else {
+            const bool kAllowed =
+                (kByte >= 'a' && kByte <= 'z') || (kByte >= 'A' && kByte <= 'Z') ||
+                (kByte >= '0' && kByte <= '9') || kByte == '-' || kByte == '.' || kByte == '_' ||
+                kByte == '~' || kByte == '!' || kByte == '$' || kByte == '&' || kByte == '\'' ||
+                kByte == '(' || kByte == ')' || kByte == '*' || kByte == '+' || kByte == ',' ||
+                kByte == ';' || kByte == '=' || kByte == ':' || kByte == '@' || kByte == '/' ||
+                kByte == '?';
+            if (!kAllowed) return false;
+        }
     }
     return true;
 }
@@ -79,6 +168,23 @@ bool oauth_client_credentials_request(Str scopes, Str service_authorization, jso
     json::Writer form{body, sizeof(body)};
     form.text(lit_str("grant_type=client_credentials&scope="));
     form_value(scopes, form);
+    return form.ok && form_request({body, form.len}, service_authorization, output);
+}
+
+bool oauth_client_credentials_request(Str scopes,
+                                      Str service_authorization,
+                                      Str resource,
+                                      json::Writer& output) {
+    if (scopes.len > 1024 || !jwt_scope_list_valid(scopes) ||
+        !service_authorization_valid(service_authorization, false) ||
+        !resource_identifier_valid(resource))
+        return false;
+    char body[4096];
+    json::Writer form{body, sizeof(body)};
+    form.text(lit_str("grant_type=client_credentials&scope="));
+    form_value(scopes, form);
+    form.text(lit_str("&resource="));
+    form_value(resource, form);
     return form.ok && form_request({body, form.len}, service_authorization, output);
 }
 

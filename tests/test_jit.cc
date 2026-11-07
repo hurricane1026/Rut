@@ -30142,3 +30142,86 @@ TEST(jit, scoped_oauth_request_executes_and_validates_shapes) {
         CHECK(!hir);
     }
 }
+
+TEST(jit, resource_oauth_request_executes_and_validates_shapes) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder builder;
+    builder.init(&tc.mod);
+    auto* fn = V(builder.create_function(lit("resource_oauth"), lit("/"), 'G'));
+    const auto kEntry = V(builder.create_block(fn, lit("entry")));
+    builder.set_insert_point(fn, kEntry);
+    const auto kScopes = V(builder.emit_const_str(lit("read write a+b&x=y")));
+    const auto kAuth = V(builder.emit_const_str(lit("Basic YTpi")));
+    const auto kResource = V(builder.emit_const_str(lit("https://api.example.test/a?b=c+d&x=%2F")));
+    const ValueId kArgs[] = {kScopes, kAuth, kResource};
+    const auto kOp = static_cast<u32>(json::Op::OauthClientCredentialsResourceRequest);
+    CHECK(!builder.emit_json(kOp, TypeKind::Str, true, kArgs, 1));
+    CHECK(!builder.emit_json(kOp, TypeKind::Bool, false, kArgs, 3));
+    CHECK(!builder.emit_json(kOp, TypeKind::Str, false, kArgs, 3));
+    const auto kNumber = V(builder.emit_const_i32(1));
+    const ValueId kWrong[] = {kScopes, kAuth, kNumber};
+    CHECK(!builder.emit_json(kOp, TypeKind::Str, true, kWrong, 3));
+    const auto kRequest = V(builder.emit_json(kOp, TypeKind::Str, true, kArgs, 3));
+    const auto kType = V(builder.make_type(TypeKind::Str));
+    const auto kMessage = V(builder.emit_opt_unwrap(kRequest, kType));
+    V(builder.emit_resp_body(kMessage));
+    VOK(builder.emit_ret_status(200));
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_resource_oauth"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    MmapArena storage;
+    REQUIRE(storage.init(sizeof(Connection) + 4096));
+    auto* conn = storage.alloc_t<Connection>();
+    REQUIRE(conn);
+    ::new (static_cast<void*>(conn)) Connection{};
+    conn->json_arena.backend.pool = &pool;
+    const auto kWire = lit("GET / HTTP/1.1\r\nHost: test\r\n\r\n");
+    const auto kResult = HandlerResult::unpack(
+        handler(conn, nullptr, reinterpret_cast<const u8*>(kWire.ptr), kWire.len, nullptr));
+    CHECK_EQ(kResult.status_code, 200u);
+    REQUIRE(conn->jit_response_body_valid);
+    json::Document document;
+    REQUIRE(document.parse(conn->jit_response_body));
+    char decoded[256];
+    json::Writer body{decoded, sizeof(decoded)};
+    REQUIRE(document.string(document.pointer(lit_str("/body")), body));
+    CHECK((Str{decoded, body.len}.eq(
+        lit_str("grant_type=client_credentials&scope=read%20write%20a%2Bb%26x%3Dy&resource=https%"
+                "3A%2F%2Fapi.example.test%2Fa%3Fb%3Dc%2Bd%26x%3D%252F"))));
+    auto& malformed = fn->blocks[kEntry.id].insts[4];
+    REQUIRE_EQ(malformed.op, Opcode::JsonOp);
+    malformed.operand_count = 1;
+    CHECK(!codegen(tc.mod).ok);
+    malformed.operand_count = 3;
+    conn->json_arena.destroy();
+    conn->~Connection();
+    storage.destroy();
+    engine.shutdown();
+    pool.destroy();
+    tc.destroy();
+
+    const Str kInvalid[] = {
+        lit_str(
+            R"(route GET "/" { let x = oauthClientCredentialsRequest("read", "Basic YTpi", 1) return 204 })"),
+        lit_str(
+            R"(route GET "/" { let x = oauthClientCredentialsRequest("read", "Basic YTpi", req.header("X-Resource")) return 204 })"),
+        lit_str(
+            R"(route GET "/" { let x = oauthClientCredentialsRequest("read", "Basic YTpi", "https://api.test", "extra") return 204 })"),
+        lit_str(
+            R"(route GET "/" { let x = oauthIntrospectionRequest("token", "Basic YTpi", "extra") return 204 })")};
+    for (const Str kSource : kInvalid) {
+        auto tokens = lex(kSource);
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(!hir);
+    }
+}

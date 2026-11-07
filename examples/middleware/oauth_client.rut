@@ -21,6 +21,12 @@ func clientCredentialsForScope(_ serviceAuthorization: str, _ scopes: str) -> Js
     built
 }
 
+// Single trusted HTTPS resource identifier, never a caller-selected URL.
+func clientCredentialsForResource(_ serviceAuthorization: str, _ scopes: str, _ resource: str) -> Json {
+    guard let built = oauthClientCredentialsRequest(scopes, serviceAuthorization, resource) else { respond 503 }
+    built
+}
+
 // Only consume a completed httpCall response from the configured HTTPS AS.
 // No caching: expiry is checked as positive integer lifetime metadata at receipt.
 func authorization(_ reply: Json, _ requiredScope: str) -> str {

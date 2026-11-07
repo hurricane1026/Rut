@@ -28,7 +28,12 @@ def main():
     requested_scope = 'reports:read reports:write a+b/x=%&'
     scoped_body = (b'grant_type=client_credentials&scope=reports%3Aread%20'
                    b'reports%3Awrite%20a%2Bb%2Fx%3D%25%26')
+    resource = 'https://api.example.test/reports?tenant=a+b&scope=write%2Fread'
+    other_resource = 'https://api.example.test/other'
+    resource_body = scoped_body + (b'&resource=https%3A%2F%2Fapi.example.test%2Freports'
+                                   b'%3Ftenant%3Da%2Bb%26scope%3Dwrite%252Fread')
     calls, forwarded, issued = [], [], []
+    token_resources = {}
     lock = threading.Lock()
     mode = 'valid'
 
@@ -64,6 +69,9 @@ def main():
                 'escaped-token': dict(access_token='special+/=='),
             }
             body.update(updates.get(selected, {}))
+            requested_resource = parameters.get('resource', [None])[0]
+            if requested_resource not in (None, resource, other_resource) or selected == 'invalid-target':
+                body['error'] = 'invalid_target'
             for name, field in (('no-token', 'access_token'), ('no-type', 'token_type'),
                                 ('no-expiry', 'expires_in'), ('no-scope', 'scope')):
                 if selected == name:
@@ -81,12 +89,15 @@ def main():
                 data = b'[]'
             elif selected == 'large':
                 data = b'x' * 9000
-            status = {'redirect': 302, 'unavailable': 503, 'denied': 403}.get(selected, 200)
+            status = {'redirect': 302, 'unavailable': 503, 'denied': 403, 'invalid-target': 400}.get(selected, 200)
+            if body.get('error') == 'invalid_target':
+                status = 400
             if self.headers.get('Authorization') != service_auth:
                 status = 401
-            if status == 200 and selected in ('valid', 'mixed-type', 'escaped-token', 'concurrent', 'narrow-scope'):
+            if status == 200 and selected in ('valid', 'mixed-type', 'escaped-token', 'concurrent', 'narrow-scope', 'ignore-resource'):
                 with lock:
                     issued.append(body['access_token'])
+                    token_resources[body['access_token']] = None if selected == 'ignore-resource' else requested_resource
             time.sleep(.20 if selected == 'slow' else .01)
             try:
                 if selected == 'truncated':
@@ -113,8 +124,12 @@ def main():
         def do_GET(self):
             with lock:
                 forwarded.append((self.path, dict(self.headers)))
-            body = b'upstream-ok'
-            self.send_response(200)
+            token = self.headers.get('Authorization', '').removeprefix('Bearer ')
+            bound = token_resources.get(token)
+            protected = self.path.startswith(('/resource-reports', '/mismatched-resource'))
+            accepted = not protected or bound == resource
+            body = b'upstream-ok' if accepted else b'wrong-resource'
+            self.send_response(200 if accepted else 403)
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -167,10 +182,28 @@ def main():
                     'env("UPSTREAM_SCOPE")', json.dumps(value, ensure_ascii=False).replace('\\u0000', '\\u{0}'))
             source += scoped.replace('/scoped-reports', '/scoped-bearer').replace(
                 'env("TOKEN_SERVICE_AUTH")', '"Bearer forbidden"')
+            resource_route = (examples / 'upstream-oauth-resource.rut').read_text()
+            resource_route = resource_route[resource_route.index('route GET'):]
+            source += resource_route
+            source += resource_route.replace('/resource-reports', '/mismatched-resource').replace(
+                'env("UPSTREAM_RESOURCE")', json.dumps(other_resource))
+            source += resource_route.replace('/resource-reports', '/unknown-resource').replace(
+                'env("UPSTREAM_RESOURCE")', '"https://unknown.example.test/"')
+            invalid_resources = ('', '/relative', 'http://api.example.test/', 'https://',
+                                 'https://user:secret@api.example.test/', 'https://host/#fragment',
+                                 'https://host/space here', 'https://host/%zz', 'https://host/\\path',
+                                 'https://host/\r\n', 'https://host/ré', 'https://host/\x00',
+                                 'https://[bad]/', 'https://[::1\x00evil]/', 'https://host:65536/', 'https://host/' + 'x' * 1024)
+            for index, value in enumerate(invalid_resources):
+                source += resource_route.replace('/resource-reports', f'/invalid-resource-{index}').replace(
+                    'env("UPSTREAM_RESOURCE")', json.dumps(value, ensure_ascii=False).replace('\\u0000', '\\u{0}'))
+            source += resource_route.replace('/resource-reports', '/encoded-overflow').replace(
+                'env("UPSTREAM_SCOPE")', json.dumps('&' * 1024)).replace(
+                'env("UPSTREAM_RESOURCE")', json.dumps('https://host/' + '&' * 1011))
             program, log = root / 'gateway.rut', root / 'gateway.log'
             program.write_text(source)
             env = dict(os.environ, TOKEN_SERVICE_AUTH=service_auth, DOWNSTREAM_KEY=caller_key,
-                       UPSTREAM_SCOPE=requested_scope,
+                       UPSTREAM_SCOPE=requested_scope, UPSTREAM_RESOURCE=resource,
                        TOKEN_ENDPOINT=json.dumps(endpoint), UNSAFE_AUTH=service_auth + '\r\nInjected: yes',
                        WRONG_TLS=json.dumps(dict(endpoint, serverName='wrong.invalid')))
             with log.open('wb') as output:
@@ -202,14 +235,14 @@ def main():
                             connection.request('GET', path, headers={
                                 'Authorization': 'Bearer ' + caller_key if authorization is None else authorization,
                                 'Cookie': 'caller-secret', 'X-Consumer-ID': 'forged',
-                                'Scope': 'admin&grant_type=password'})
+                                'Scope': 'admin&grant_type=password', 'Resource': 'https://attacker.invalid/'})
                             response = connection.getresponse()
                             return response.status, dict(response.headers), response.read()
                         finally:
                             connection.close()
 
                     for authorization in ('', 'Basic YTpi', 'Bearer wrong', 'Bearer a b'):
-                        for path in ('/service-reports', '/scoped-reports'):
+                        for path in ('/service-reports', '/scoped-reports', '/resource-reports'):
                             assert request(path, authorization=authorization)[0] == 401
                         assert not calls and not forwarded
                     for selected in ('valid', 'mixed-type', 'escaped-token'):
@@ -227,6 +260,29 @@ def main():
                         assert len(calls) == before + 1 and calls[-1][2] == scoped_body
                     mode = 'narrow-scope'
                     assert request('/scoped-reports')[::2] == (200, b'upstream-ok')
+                    mode = 'valid'
+                    for path in ('/resource-reports', '/resource-reports?resource=https://attacker.invalid/'):
+                        before = len(calls)
+                        assert request(path)[::2] == (200, b'upstream-ok')
+                        assert len(calls) == before + 1 and calls[-1][2] == resource_body
+                    for path in [f'/invalid-resource-{i}' for i in range(len(invalid_resources))] + ['/encoded-overflow']:
+                        before = (len(calls), len(forwarded))
+                        assert request(path)[0] == 503, path
+                        assert (len(calls), len(forwarded)) == before
+                    for selected in ('invalid-target', 'wrong-scope'):
+                        mode = selected
+                        before = len(forwarded)
+                        assert request('/resource-reports')[0] == 503
+                        assert len(forwarded) == before
+                    mode = 'valid'
+                    before = len(forwarded)
+                    assert request('/unknown-resource')[0] == 503
+                    assert len(forwarded) == before
+                    # The upstream enforces the AS token's resource restriction.
+                    assert request('/mismatched-resource')[0] == 403
+                    mode = 'ignore-resource'
+                    assert request('/resource-reports')[0] == 403
+                    mode = 'valid'
                     for path in [f'/invalid-scope-{i}' for i in range(len(invalid_scopes))] + ['/scoped-bearer']:
                         before = (len(calls), len(forwarded))
                         assert request(path)[0] == 503, path
@@ -266,7 +322,7 @@ def main():
                     before_forwarded = len(forwarded)
                     before_issued = len(issued)
                     with ThreadPoolExecutor(max_workers=4) as workers:
-                        results = list(workers.map(lambda i: request('/scoped-reports' if i % 2 else '/service-reports'), range(4)))
+                        results = list(workers.map(lambda i: request(('/service-reports', '/scoped-reports', '/resource-reports')[i % 3]), range(4)))
                     assert all((status, body) == (200, b'upstream-ok') for status, _, body in results), results
                     assert len(calls) == before + 4  # Every request gets a new token; no cached allow.
                     actual = {headers['Authorization'] for _, headers in forwarded[before_forwarded:]}
@@ -277,7 +333,7 @@ def main():
                     before = len(calls)
                     before_forwarded = len(forwarded)
                     with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
-                        sock.sendall(('GET /service-reports HTTP/1.1\r\nHost: test\r\n'
+                        sock.sendall(('GET /resource-reports HTTP/1.1\r\nHost: test\r\n'
                                       'Authorization: Bearer ' + caller_key + '\r\n\r\n').encode())
                         deadline = time.monotonic() + 2
                         while len(calls) == before and time.monotonic() < deadline:
@@ -292,7 +348,7 @@ def main():
                         return len(data).to_bytes(3, 'big') + bytes((kind, flags)) + stream.to_bytes(4, 'big') + data
 
                     # The same native policy also resumes into HTTP/2 forwarding.
-                    for path in (b'/service-reports', b'/scoped-reports'):
+                    for path in (b'/service-reports', b'/scoped-reports', b'/resource-reports'):
                         with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
                             auth = ('Bearer ' + caller_key).encode()
                             block = (b'\x82\x86\x04' + bytes((len(path),)) + path +
@@ -335,19 +391,25 @@ def main():
                     assert len(calls) == before
                     for path, headers, raw in calls:
                         assert path == '/token'
-                        assert raw in (b'grant_type=client_credentials', scoped_body)
+                        assert raw in (b'grant_type=client_credentials', scoped_body, resource_body,
+                                       scoped_body + b'&resource=https%3A%2F%2Fapi.example.test%2Fother',
+                                       scoped_body + b'&resource=https%3A%2F%2Funknown.example.test%2F')
                         expected = {'grant_type': ['client_credentials']}
-                        if raw == scoped_body:
+                        if raw != b'grant_type=client_credentials':
                             expected['scope'] = [requested_scope]
+                        if b'&resource=' in raw:
+                            actual_resource = parse_qs(raw.decode())['resource']
+                            assert actual_resource in ([resource], [other_resource], ['https://unknown.example.test/'])
+                            expected['resource'] = actual_resource
                         assert parse_qs(raw.decode(), strict_parsing=True) == expected
                         assert headers['Authorization'] in (service_auth, 'Basic d3Jvbmc6c2VjcmV0')
                         assert headers['Content-Type'] == 'application/x-www-form-urlencoded'
                         assert headers['Accept'] == 'application/json'
-                        assert not any(name.lower() in ('cookie', 'x-consumer-id') for name in headers)
+                        assert not any(name.lower() in ('cookie', 'x-consumer-id', 'scope', 'resource') for name in headers)
                     logged = log.read_bytes()
                     assert service_auth.encode() not in logged and caller_key.encode() not in logged
                     assert b'upstream-private-' not in logged and b'unused-refresh-secret' not in logged
-                    print(f'PASS: {args.backend} client credentials, configured scopes, strict token policy and isolation')
+                    print(f'PASS: {args.backend} client credentials, configured scopes/resources, strict token policy and isolation')
                 finally:
                     if process.poll() is None:
                         process.terminate()

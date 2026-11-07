@@ -2846,6 +2846,18 @@ scope check remains mandatory. No keyword, dependency, token cache or refresh fl
 is added. See [the contract](upstream-oauth.md), [default example](../examples/upstream-oauth.rut)
 and [scoped example](../examples/upstream-oauth-scoped.rut).
 
+`oauth_client.clientCredentialsForResource(auth, scopes, resource)` uses the
+three-string overload `oauthClientCredentialsRequest(scopes, auth, resource) -> Json?`.
+It adds exactly one independently encoded `resource` form field. The resource is a
+trusted HTTPS identifier, not a fetch destination: at most 1024 ASCII bytes, DNS
+labels or bracketed IPv6, optional port 1–65535, no userinfo or fragment, and valid
+path/query bytes and percent escapes. Combined encoded body is bounded to 4096 bytes.
+Malformed inputs return nil; the source helper responds 503 before a call. The AS
+and upstream own token audience enforcement; sending the parameter is not proof
+of a valid audience. Other schemes and multiple resource parameters are unsupported.
+See [the resource contract](upstream-oauth.md#configured-target-resource) and
+[example](../examples/upstream-oauth-resource.rut).
+
 ### OAuth authorization-server revocation client
 
 `oauth_revocation.revokeRequest(authorization, serviceAuthorization)` builds the

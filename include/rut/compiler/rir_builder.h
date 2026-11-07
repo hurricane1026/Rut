@@ -1091,13 +1091,16 @@ struct Builder {
                               const ValueId* args,
                               u32 count,
                               SourceLoc loc = {}) {
+        const bool kResource =
+            op == static_cast<u32>(json::Op::OauthClientCredentialsResourceRequest);
         const bool kIntrospectionRequest =
             op == static_cast<u32>(json::Op::OauthIntrospectionRequest) ||
-            op == static_cast<u32>(json::Op::OauthClientCredentialsRequest);
+            op == static_cast<u32>(json::Op::OauthClientCredentialsRequest) || kResource;
         const bool kIntrospectionValid = op == static_cast<u32>(json::Op::OauthIntrospectionValid);
         if (kIntrospectionRequest || kIntrospectionValid) {
-            if (count != 2 || !args || !val_has_type(args[0], TypeKind::Str) ||
+            if (count != (kResource ? 3u : 2u) || !args || !val_has_type(args[0], TypeKind::Str) ||
                 !val_has_type(args[1], TypeKind::Str) ||
+                (kResource && !val_has_type(args[2], TypeKind::Str)) ||
                 result != (kIntrospectionRequest ? TypeKind::Str : TypeKind::Bool) ||
                 optional != kIntrospectionRequest)
                 return err(RirError::InvalidState);

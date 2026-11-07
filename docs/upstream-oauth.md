@@ -24,7 +24,8 @@ verification, fixed deadlines and queue capacity are the existing callout policy
 The request carries no client cookie or downstream authentication credential.
 The default scope must be configured for this client at the AS: this slice omits
 the optional request scope. For an explicit scope list, use the scoped helper below.
-Resource indicators, audience parameters and token exchange remain outside this profile.
+A single HTTPS resource indicator is supported as described below. Provider-specific
+`audience` parameters and token exchange remain outside this profile.
 
 ## Explicit configured scopes
 
@@ -52,6 +53,47 @@ The AS may grant fewer scopes than requested. Both helpers still require
 `oauth_client.authorization(reply, requiredScope)` to check the explicit response
 scope against the route's configured permission. Requesting a scope is not proof
 that it was granted; the helper does not require the whole requested list back.
+
+## Configured target resource
+
+`oauth_client.clientCredentialsForResource(serviceAuthorization, scopes, resource)`
+adds one [RFC 8707 resource indicator](https://www.rfc-editor.org/rfc/rfc8707#section-2.2)
+to the scoped request. It uses the three-string overload
+`oauthClientCredentialsRequest(scopes, serviceAuthorization, resource) -> Json?`;
+the existing two-string overload and default-scope helper retain their behavior.
+See [the resource example](../examples/upstream-oauth-resource.rut).
+
+`UPSTREAM_RESOURCE` is trusted configuration, separate from both `TOKEN_ENDPOINT`
+and the fixed forwarding upstream. It is an identifier sent to the AS; Rut never
+fetches it or uses it to select a connection destination. Caller `Resource` headers
+and query parameters do not control it. Provision an identifier recognized by the
+AS for the configured upstream API.
+
+This bounded profile accepts one HTTPS URI of at most 1024 ASCII bytes, with a
+nonempty DNS-label hostname (labels at most 63 bytes, total at most 253, no trailing
+dot), or a bracketed IPv6 address. Optional ports are 1–65535. Scheme matching is
+case-insensitive; identifier bytes, case, port and percent-escape spelling are
+preserved. Userinfo, fragments (including an empty `#`), raw whitespace/controls,
+non-ASCII bytes, backslashes, invalid path/query characters and malformed percent
+escapes fail. Queries are supported when required by the deployment, though RFC
+8707 recommends omitting them. URNs, HTTP and other schemes, IPvFuture/zone IDs,
+multiple resources and provider-specific `audience` parameters are outside this
+profile. Do not put secrets in the identifier.
+
+Scope, Basic authorization and output bounds still apply; the combined encoded
+form body must fit the existing 4096-byte callout limit. Each field is encoded
+separately: an existing `%2F` in the identifier becomes `%252F` in the form and
+decodes back to the original `%2F`, never to `/`. `&`, `+` and `=` cannot introduce
+additional form fields. Invalid configuration/construction produces 503 before I/O;
+`invalid_target` and other AS errors also fail with 503 without forwarding.
+
+Sending `resource` does not validate an opaque token's audience. The AS must bind
+the issued token to the resource, and the upstream must enforce that restriction.
+Rut continues to validate the token response's type, lifetime and required granted
+scope, and forwards the token only to the configured backend. It neither derives
+an `aud` claim from this parameter nor trusts a nonstandard echoed resource field.
+The fixture demonstrates upstream rejection of both a token for another resource
+and an AS response that ignores the requested binding.
 
 ## Token response policy
 
@@ -107,9 +149,10 @@ completed-response parsing; it does not introspect the acquired access token.
 `test_upstream_oauth_epoll` and `test_upstream_oauth_io_uring` use an independent
 TLS token endpoint fixture and real upstream through a two-shard native-loaded
 server. Source and both imported modules are deleted before requests execute.
-The matrix covers HTTP/1 and HTTP/2 with default and explicit scopes; exact
+The matrix covers HTTP/1 and HTTP/2 with default/explicit scopes and a configured resource; exact
 percent-encoded form bodies, invalid scope bounds/grammar, caller scope injection
-isolation, grant/service headers; strict token,
+isolation, resource URI/body bounds, invalid-target responses, upstream audience
+enforcement, grant/service headers; strict token,
 expiry, scope and error fields; duplicate JSON/Authorization; missing caller
 credentials; wrong TLS identity; AS denial/outage/redirect/truncation; unsafe
 configuration; timeout; disconnected callers; fresh concurrent tokens and no

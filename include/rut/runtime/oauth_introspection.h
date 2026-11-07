@@ -17,6 +17,13 @@ bool oauth_introspection_request(Str token, Str service_authorization, json::Wri
 // Caller-owned output; no I/O, allocation or retained input views.
 bool oauth_client_credentials_request(Str scopes, Str service_authorization, json::Writer& output);
 
+// Single configured HTTPS resource identifier, at most 1024 bytes. It is never
+// fetched. Invalid URI syntax/fragments or combined encoded body >4096 fail.
+bool oauth_client_credentials_request(Str scopes,
+                                      Str service_authorization,
+                                      Str resource,
+                                      json::Writer& output);
+
 // Metadata validation, not signature verification. Accept only a trusted HTTPS
 // introspection response: active=true, future integer exp, exact aud membership,
 // optional nonfuture nbf/iat, optional valid scope list and Bearer token_type.
