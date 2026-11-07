@@ -13689,6 +13689,33 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    if ((expr.name.eq(lit_str("oauthIntrospectionRequest")) ||
+         expr.name.eq(lit_str("oauthIntrospectionValid"))) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 2 || !expr.args[0] || !expr.args[1])
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        const bool kRequest = expr.name.eq(lit_str("oauthIntrospectionRequest"));
+        HirExpr values[2]{};
+        for (u32 i = 0; i < 2; ++i) {
+            auto value = analyze_builtin_arg(*expr.args[i]);
+            if (!value) return core::make_unexpected(value.error());
+            const auto kExpected = i == 0 && !kRequest ? HirTypeKind::Json : HirTypeKind::Str;
+            if (value->type != kExpected || value->may_nil || value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, expr.name);
+            values[i] = value.value();
+        }
+        return make_json_op(
+            kRequest ? json::Op::OauthIntrospectionRequest : json::Op::OauthIntrospectionValid,
+            kRequest ? HirTypeKind::Json : HirTypeKind::Bool,
+            kRequest,
+            &values[0],
+            &values[1],
+            nullptr,
+            expr.span,
+            route);
+    }
+
     if (expr.name.eq(lit_str("jwtHasScope")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)

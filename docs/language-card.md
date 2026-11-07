@@ -2790,3 +2790,24 @@ respectively. Additional fields require explicit validation and mapping. These
 are ordinary library functions, not new syntax or implicit authentication. See
 [the contract and example](opa-authorization.md). MIR has 32 bounded blocks to
 accommodate the existing eight route guards plus continuations and match arms.
+
+
+### OAuth2 introspection composition
+
+Import `middleware/introspection.rut` and follow
+[the executable profile](oauth-introspection.md). `introspection.request` constructs
+a bounded RFC 7662 form POST with separate configured service authorization.
+Bind its `httpCall` result before unwrapping; `introspection.requireActive` checks
+a completed HTTP 200 and exact active/expiry/audience policy, then returns metadata.
+`introspection.requireScope` applies existing exact OAuth scope membership.
+Missing/invalid client credentials and inactive/invalid metadata produce 401;
+missing permission produces 403; service/transport or request-storage errors
+produce 503. There is no local allow cache.
+
+The native operations `oauthIntrospectionRequest(token, serviceAuthorization)`
+return optional Json; `oauthIntrospectionValid(document, audience)` returns Bool
+and uses the current Unix clock. Both retain the existing lexical function-call
+syntax and Json carrier. The validator requires `exp`/audience as a local resource
+policy, while `iss`, `sub` and `iat` need not be present. Callers must trust the
+response source before validating or projecting its identity. No OAuth grants,
+OIDC session, automatic identity propagation or new language keyword is added.

@@ -51,6 +51,8 @@ enum class Op : u8 {
     JwtVerifyEs256,
     ForwardAuthHeader,  // compiler-only asynchronous authorization prefix
     HttpCall,           // compiler-only resumable HTTP expression
+    OauthIntrospectionRequest,
+    OauthIntrospectionValid,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

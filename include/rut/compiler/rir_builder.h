@@ -1091,6 +1091,16 @@ struct Builder {
                               const ValueId* args,
                               u32 count,
                               SourceLoc loc = {}) {
+        const bool kIntrospectionRequest =
+            op == static_cast<u32>(json::Op::OauthIntrospectionRequest);
+        const bool kIntrospectionValid = op == static_cast<u32>(json::Op::OauthIntrospectionValid);
+        if (kIntrospectionRequest || kIntrospectionValid) {
+            if (count != 2 || !args || !val_has_type(args[0], TypeKind::Str) ||
+                !val_has_type(args[1], TypeKind::Str) ||
+                result != (kIntrospectionRequest ? TypeKind::Str : TypeKind::Bool) ||
+                optional != kIntrospectionRequest)
+                return err(RirError::InvalidState);
+        }
         const bool kJwtIssue = op == static_cast<u32>(json::Op::JwtIssueHs256);
         const bool kJwtIssueWithId = op == static_cast<u32>(json::Op::JwtIssueHs256WithId);
         const bool kJwtIssueWithIdAndScope =

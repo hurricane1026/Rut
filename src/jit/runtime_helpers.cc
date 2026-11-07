@@ -20,6 +20,7 @@
 #include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/jwt_hs256.h"
+#include "rut/runtime/oauth_introspection.h"
 #include "rut/runtime/password_gateway.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
@@ -2764,7 +2765,9 @@ extern "C" void rut_helper_json(void* conn,
     *out_len = 0;
     *out_number = 0;
     if (op > static_cast<u32>(json::Op::Sha256HexValid) &&
-        op != static_cast<u32>(json::Op::JwtVerifyEs256))
+        op != static_cast<u32>(json::Op::JwtVerifyEs256) &&
+        op != static_cast<u32>(json::Op::OauthIntrospectionRequest) &&
+        op != static_cast<u32>(json::Op::OauthIntrospectionValid))
         return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
@@ -2772,7 +2775,19 @@ extern "C" void rut_helper_json(void* conn,
     Str view{};
     i64 scalar = 0;
     const auto operation = static_cast<json::Op>(op);
-    if (operation == json::Op::Sha256HexValid) {
+    if (operation == json::Op::OauthIntrospectionRequest) {
+        if (!oauth_introspection_request({a, a_len}, {b, b_len}, writer)) return;
+    } else if (operation == json::Op::OauthIntrospectionValid) {
+        struct timespec now{};
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+            now.tv_nsec >= 1000000000)
+            return;
+        scalar = oauth_introspection_valid(
+                     document, {a, a_len}, {b, b_len}, static_cast<i64>(now.tv_sec))
+                     ? 1
+                     : 0;
+        view = {"", 0};
+    } else if (operation == json::Op::Sha256HexValid) {
         scalar = rut_helper_sha256_hex_valid(a, a_len);
         view = {"", 0};
     } else if (operation == json::Op::JwtHasScope) {

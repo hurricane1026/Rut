@@ -3524,6 +3524,31 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 }
                 if (inst.op == rir::Opcode::JsonOp) {
                     const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+                    if (kJsonOp == json::Op::OauthIntrospectionRequest ||
+                        kJsonOp == json::Op::OauthIntrospectionValid) {
+                        if (inst.operand_count != 2 || inst.extra_operands ||
+                            inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
+                            !fn.values || !fn.values[inst.result.id].type)
+                            return {nullptr, nullptr, false};
+                        for (u32 oi = 0; oi < 2; ++oi) {
+                            const auto kId = inst.operand(oi);
+                            if (kId == rir::kNoValue || kId.id >= fn.value_count ||
+                                !fn.values[kId.id].type ||
+                                fn.values[kId.id].type->kind != rir::TypeKind::Str ||
+                                fn.values[kId.id].type->inner || fn.values[kId.id].type->struct_def)
+                                return {nullptr, nullptr, false};
+                        }
+                        const auto* result = fn.values[inst.result.id].type;
+                        if (kJsonOp == json::Op::OauthIntrospectionRequest) {
+                            if (result->kind != rir::TypeKind::Optional || !result->inner ||
+                                result->struct_def || result->inner->kind != rir::TypeKind::Str ||
+                                result->inner->inner || result->inner->struct_def)
+                                return {nullptr, nullptr, false};
+                        } else if (result->kind != rir::TypeKind::Bool || result->inner ||
+                                   result->struct_def) {
+                            return {nullptr, nullptr, false};
+                        }
+                    }
                     if (kJsonOp == json::Op::Sha256HexValid) {
                         if (inst.operand_count != 1 || inst.extra_operands != nullptr ||
                             inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
