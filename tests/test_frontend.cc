@@ -47295,3 +47295,94 @@ route GET "/check" {
         CHECK(!analyze_file_heap(bad_ast.value()));
     }
 }
+
+TEST(frontend, tcp_udp_typed_handles_use_bounded_resumable_profile) {
+    const char* source = R"rut(
+func line(_ connection: TcpConnection) -> Bytes {
+    let pending = connection.readLine(128, 100)
+    guard let reply = pending else { nil }
+    reply
+}
+route GET "/tcp" {
+    let pending = tcp("{\"address\":\"127.0.0.1\",\"port\":1234}", 100)
+    guard let connection = pending else { return 503 }
+    let pendingSend = connection.send(b"PING\r\n", 100)
+    guard let count = pendingSend else { return 503 }
+    let pendingLine = line(connection)
+    guard let reply = pendingLine else { return 503 }
+    let closed = connection.close()
+    return response(200, body: reply)
+}
+route GET "/udp" {
+    let pending = udp("{\"address\":\"127.0.0.1\",\"port\":1234}", 100)
+    guard let socket = pending else { return 503 }
+    let pendingSend = socket.send(b"\x00\xff", 100)
+    guard let count = pendingSend else { return 503 }
+    let pendingRead = socket.receive(8192, 100)
+    guard let reply = pendingRead else { return 503 }
+    return response(200, body: reply)
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    for (u32 f = 0; f < 2; ++f) CHECK(rir::function_uses_http_call(rir.module.functions[f]));
+    auto& fn = rir.module.functions[0];
+    u32 line_calls = 0;
+    for (u32 b = 0; b < fn.block_count; ++b)
+        for (u32 i = 0; i < fn.blocks[b].inst_count; ++i) {
+            auto& inst = fn.blocks[b].insts[i];
+            if (inst.op == rir::Opcode::JsonOp &&
+                inst.imm.i32_val == static_cast<i32>(json::Op::NetReadLine))
+                ++line_calls;
+            if (!rir::is_net_call(inst)) continue;
+            const auto count = inst.operand_count;
+            inst.operand_count = 0;
+            CHECK(!rir::http_call_profile_valid(fn));
+            inst.operand_count = count;
+        }
+    CHECK_EQ(line_calls, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, tcp_udp_reject_dynamic_destinations_and_wrong_handle_operations) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { let c = tcp(req.header("X-Destination").or("{}"), 100) return 200 })rut",
+        R"rut(route GET "/" { let c = tcp("{\"address\":\"127.0.0.1\",\"port\":1234}", 0) return 200 })rut",
+        R"rut(route GET "/" { let c = udp("{\"address\":\"127.0.0.1\",\"port\":1234,\"tls\":true}", 100) return 200 })rut",
+        R"rut(route GET "/" { let c = udp("{\"address\":\"127.0.0.1\",\"port\":1234}", 100) guard let s = c else { return 503 } let r = s.readLine(64, 100) return 200 })rut",
+        R"rut(route GET "/" { let c = tcp("{\"address\":\"127.0.0.1\",\"port\":1234}", 100) let r = c.send("x", 100) return 200 })rut",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, network_method_probe_preserves_ordinary_helper_effects) {
+    const char* source = R"rut(
+func label(_ allowed: bool) -> str { guard allowed else { respond 403 } "x" }
+protocol Closer { func close() -> i32 }
+str impl Closer { func close(self: str) -> i32 => 1 }
+route GET "/" { let result = label(req.http11).close() return 200 }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->routes.len == 1);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}

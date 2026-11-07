@@ -304,6 +304,8 @@ enum class HirTypeKind : u8 {
     // source typing keeps these separate from text and JSON.
     Bytes,
     WebSocketClose,
+    TcpConnection,
+    UdpSocket,
 };
 
 constexpr bool is_ws_enum_type(HirTypeKind type) {

@@ -54,6 +54,14 @@ enum class Op : u8 {
     OauthIntrospectionRequest,
     OauthIntrospectionValid,
     OauthClientCredentialsRequest,
+    NetTcp,
+    NetUdp,
+    NetSend,
+    NetReceive,
+    NetReadExactly,
+    NetReadLine,
+    NetClose,
+    NetError,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

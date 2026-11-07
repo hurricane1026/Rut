@@ -1,0 +1,9 @@
+// Minimal RESP2 client operation, implemented entirely with generic TCP I/O.
+// The caller owns connection setup and may compose other commands on it.
+func ping(_ connection: TcpConnection) -> Bytes {
+    let pendingSend = connection.send(b"*1\r\n$4\r\nPING\r\n", 1000)
+    guard let sent = pendingSend else { nil }
+    let pendingRead = connection.readLine(64, 1000)
+    guard let reply = pendingRead else { nil }
+    reply
+}

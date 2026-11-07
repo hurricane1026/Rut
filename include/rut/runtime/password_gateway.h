@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/forward_auth.h"
 #include "rut/runtime/http_call.h"
+#include "rut/runtime/net_client.h"
 #include "rut/runtime/password_request.h"
 
 namespace rut {
@@ -35,6 +36,7 @@ public:
     core::Expected<void, Error> start();
     ForwardAuthWorker forward_auth;
     HttpCallWorker http_calls;
+    NetClientWorker net_clients;
     void stop();
     PasswordGatewayReply verify(
         u32 connection, u64 generation, Str password, Str record, u64 now_ms, u32 timeout_ms);
@@ -75,6 +77,8 @@ private:
     void* previous_connection;
     u32 previous_stream = 0;
     bool engaged = false;
+    bool previous_pending = false;
+    i32 previous_net_error = 0;
 };
 
 // Authenticated request/stream binding; returns explicit denial/unavailable or a
@@ -90,6 +94,16 @@ HttpCallReply http_call_for_request(void* connection,
                                     const HttpsEndpoint& endpoint,
                                     Str request,
                                     u32 timeout_ms);
+
+NetReply net_call_for_request(void* connection,
+                              NetOp operation,
+                              u32 handle,
+                              const NetEndpoint* endpoint,
+                              Str bytes,
+                              i32 amount,
+                              u32 timeout_ms);
+i32 net_error_for_request(void* connection);
+void net_set_error_for_request(void* connection, i32 status);
 
 // Native HandlerFn API, also used by the bounded Rut/JIT header helper.
 // First call copies credentials; subsequent calls for this request only poll the

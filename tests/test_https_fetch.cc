@@ -4,6 +4,7 @@
 #include "rut/runtime/forward_auth.h"
 #include "rut/runtime/http_call.h"
 #include "rut/runtime/https_fetch.h"
+#include "rut/runtime/net_client.h"
 #include "rut/runtime/rs256_policy.h"
 #include "test.h"
 
@@ -832,6 +833,87 @@ TEST(https_fetch, callout_worker_deadline_capacity_cancellation_and_owned_result
     CHECK(strstr(reply.document, "\"x-role\":[\"reader\",\"writer\"]") != nullptr);
     worker.stop();
     CHECK_EQ(worker.call(1, 3, endpoint, request, jwt_monotonic_ms(), 3000).status, -1);
+    REQUIRE(worker.start().has_value());
+    worker.stop();
+}
+
+TEST(net_client, fixed_endpoint_policy_rejects_unknown_duplicate_and_unsafe_tls_fields) {
+    NetEndpoint endpoint;
+    CHECK(net_endpoint(lit_str(R"({"address":"127.0.0.1","port":6379})"), false, endpoint));
+    CHECK(!endpoint.tls.enabled);
+    CHECK(net_endpoint(
+        lit_str(
+            R"({"address":"127.0.0.1","port":6379,"tls":true,"caFile":"/ca.pem","serverName":"localhost"})"),
+        false,
+        endpoint));
+    CHECK(endpoint.tls.enabled);
+    const char* invalid[] = {
+        "{}",
+        R"({"address":"localhost","port":1})",
+        R"({"address":"127.0.0.1","port":0})",
+        R"({"address":"127.0.0.1","port":65536})",
+        R"({"address":"127.0.0.1","port":1,"p\u006frt":2})",
+        R"({"address":"127.0.0.1","port":1,"tls":true})",
+        R"({"address":"127.0.0.1","port":1,"caFile":"/ca.pem"})",
+        R"({"address":"127.0.0.1","port":1,"path":"/"})",
+        R"({"address":"127.0.0.1","port":1,"tls":"false"})",
+        R"({"address":"127.0.0.1\u0000","port":1})",
+    };
+    for (const char* input : invalid) CHECK(!net_endpoint(text(input), false, endpoint));
+    CHECK(
+        !net_endpoint(lit_str(R"({"address":"127.0.0.1","port":1,"tls":false})"), true, endpoint));
+}
+
+TEST(net_client, bounded_sessions_validate_owner_generation_close_and_cancel) {
+    NetClientWorker worker;
+    REQUIRE(worker.start().has_value());
+    NetEndpoint endpoint;
+    REQUIRE(net_endpoint(lit_str(R"({"address":"127.0.0.1","port":6379})"), true, endpoint));
+    u32 handles[NetClientWorker::kCapacity]{};
+    for (u32 i = 0; i < NetClientWorker::kCapacity; ++i) {
+        NetReply reply;
+        for (u32 attempt = 0; attempt < 1000; ++attempt) {
+            reply =
+                worker.call(i + 1, 1, NetOp::Udp, 0, &endpoint, {}, 0, jwt_monotonic_ms(), 3000);
+            if (reply.status != NetReply::kPending) break;
+            usleep(1000);
+        }
+        REQUIRE(reply.status == 0);
+        REQUIRE(reply.scalar != 0);
+        handles[i] = reply.scalar;
+    }
+    CHECK_EQ(worker.call(100, 1, NetOp::Udp, 0, &endpoint, {}, 0, jwt_monotonic_ms(), 3000).status,
+             -3);
+    CHECK_EQ(
+        worker.call(100, 1, NetOp::Close, handles[0], nullptr, {}, 0, jwt_monotonic_ms(), 1).status,
+        -4);
+    CHECK_EQ(
+        worker.call(1, 2, NetOp::Close, handles[0], nullptr, {}, 0, jwt_monotonic_ms(), 1).status,
+        -4);
+    const auto closed =
+        worker.call(1, 1, NetOp::Close, handles[0], nullptr, {}, 0, jwt_monotonic_ms(), 1);
+    CHECK_EQ(closed.status, 0);
+    CHECK_EQ(closed.scalar, 1u);
+    CHECK_EQ(
+        worker
+            .call(1, 1, NetOp::Send, handles[0], nullptr, lit_str("x"), 0, jwt_monotonic_ms(), 100)
+            .status,
+        -4);
+    for (u32 i = 1; i < NetClientWorker::kCapacity; ++i) worker.cancel(i + 1, 1);
+    NetReply reply;
+    for (u32 attempt = 0; attempt < 1000; ++attempt) {
+        reply = worker.call(1, 2, NetOp::Udp, 0, &endpoint, {}, 0, jwt_monotonic_ms(), 3000);
+        if (reply.status == 0) break;
+        CHECK(reply.status == -3 || reply.status == NetReply::kPending);
+        usleep(1000);
+    }
+    CHECK_EQ(reply.status, 0);
+    CHECK(reply.scalar != handles[0]);
+    CHECK_EQ(
+        worker.call(1, 2, NetOp::Receive, reply.scalar, nullptr, {}, 8193, jwt_monotonic_ms(), 100)
+            .status,
+        -4);
+    worker.stop();
     REQUIRE(worker.start().has_value());
     worker.stop();
 }

@@ -22,7 +22,10 @@ static_assert(MirModule::kMaxFunctions >= HirModule::kMaxRoutes + HirModule::kMa
 namespace {
 static bool hir_has_http_call(const HirExpr& expr, u32 depth = 0) {
     if (depth > 128) return true;
-    if (expr.kind == HirExprKind::JsonOp && expr.int_value == static_cast<i64>(json::Op::HttpCall))
+    if (expr.kind == HirExprKind::JsonOp &&
+        (expr.int_value == static_cast<i64>(json::Op::HttpCall) ||
+         (expr.int_value >= static_cast<i64>(json::Op::NetTcp) &&
+          expr.int_value <= static_cast<i64>(json::Op::NetClose))))
         return true;
     if (expr.lhs && hir_has_http_call(*expr.lhs, depth + 1)) return true;
     if (expr.rhs && hir_has_http_call(*expr.rhs, depth + 1)) return true;
@@ -296,9 +299,11 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
 }
 
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
-    return kind == HirTypeKind::Bool                             ? MirTypeKind::Bool
-           : (kind == HirTypeKind::I32 || is_ws_enum_type(kind)) ? MirTypeKind::I32
-           : kind == HirTypeKind::I64                            ? MirTypeKind::I64
+    return kind == HirTypeKind::Bool ? MirTypeKind::Bool
+           : (kind == HirTypeKind::I32 || kind == HirTypeKind::TcpConnection ||
+              kind == HirTypeKind::UdpSocket || is_ws_enum_type(kind))
+               ? MirTypeKind::I32
+           : kind == HirTypeKind::I64 ? MirTypeKind::I64
            : (kind == HirTypeKind::Str || kind == HirTypeKind::Json || kind == HirTypeKind::Bytes)
                ? MirTypeKind::Str
            : kind == HirTypeKind::Method   ? MirTypeKind::Method
