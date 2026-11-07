@@ -10315,3 +10315,14 @@ fields are required. Binding composes with existing scope and subject validation
 before identity forwarding, without raising compiler guard limits or adding a
 builtin, ABI, dependency or allocation path. See
 [the contract](docs/oauth-introspection.md#optional-issuer-and-oauth-client-binding).
+
+### Upstream OAuth service-token acquisition
+
+An ordinary source library composes existing fixed HTTPS calls with the OAuth
+client-credentials grant, strict token response validation and explicit upstream
+Authorization replacement. Caller authentication, AS service credentials and
+upstream tokens have separate ownership. Per-request acquisition avoids adding
+cache expiry, refresh or distributed state; existing request arenas and callout
+cancellation own temporary secrets. No compiler/runtime ABI, builtin or dependency
+is added. See [the profile](docs/upstream-oauth.md) for its default-scope contract,
+relative lifetime limits and two-backend native validation.
