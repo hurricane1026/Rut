@@ -1,0 +1,23 @@
+// INTROSPECTION_ENDPOINT: a fixed httpCall HTTPS policy for the token endpoint.
+// INTROSPECTION_AUTH: trusted Basic/Bearer service authorization, never a client header.
+// Serve client traffic over TLS or through a trusted TLS-terminating frontend.
+import "middleware/introspection.rut"
+listen :8080
+upstream backend at "127.0.0.1:9000"
+
+route GET "/reports" {
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let document = introspection.requireActive(reply, "reports-api")
+    let authorized = introspection.requireScope(document, "reports:read")
+    let subject = introspection.subject(authorized)
+    match subject != "" {
+        true => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", subject)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => { return 401 }
+    }
+}

@@ -29996,3 +29996,66 @@ TEST(jit, http_call_frame_excludes_block_local_values_after_last_call) {
     pool.destroy();
     tc.destroy();
 }
+
+TEST(jit, oauth_introspection_builtins_execute_and_reject_malformed_rir) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("introspection"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto token = V(b.emit_const_str(lit("opaque+/==")));
+    auto service = V(b.emit_const_str(lit("Basic YTpi")));
+    const ValueId args[] = {token, service};
+    auto request = V(b.emit_json(
+        static_cast<u32>(json::Op::OauthIntrospectionRequest), TypeKind::Str, true, args, 2));
+    auto claims = V(b.emit_const_str(lit("{\"active\":true,\"exp\":9999999999,\"aud\":\"api\"}")));
+    auto audience = V(b.emit_const_str(lit("api")));
+    const ValueId validation_args[] = {claims, audience};
+    auto valid = V(b.emit_json(static_cast<u32>(json::Op::OauthIntrospectionValid),
+                               TypeKind::Bool,
+                               false,
+                               validation_args,
+                               2));
+    CHECK(!b.emit_json(
+        static_cast<u32>(json::Op::OauthIntrospectionRequest), TypeKind::Str, false, args, 2));
+    CHECK(!b.emit_json(
+        static_cast<u32>(json::Op::OauthIntrospectionValid), TypeKind::Bool, true, args, 2));
+    auto str_type = V(b.make_type(TypeKind::Str));
+    auto unwrapped = V(b.emit_opt_unwrap(request, str_type));
+    V(b.emit_resp_body(unwrapped));
+    auto accepted = V(b.create_block(fn, lit("accepted")));
+    auto rejected = V(b.create_block(fn, lit("rejected")));
+    VOK(b.emit_br(valid, accepted, rejected));
+    b.set_insert_point(fn, accepted);
+    VOK(b.emit_ret_status(200));
+    b.set_insert_point(fn, rejected);
+    VOK(b.emit_ret_status(401));
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_introspection"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto conn = std::make_unique<Connection>();
+    conn->json_arena.backend.pool = &pool;
+    const auto wire = lit("GET / HTTP/1.1\r\nHost: test\r\n\r\n");
+    auto result = HandlerResult::unpack(
+        handler(conn.get(), nullptr, reinterpret_cast<const u8*>(wire.ptr), wire.len, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK(conn->jit_response_body_valid);
+    CHECK(std::string(conn->jit_response_body.ptr, conn->jit_response_body.len)
+              .find("token=opaque%2B%2F%3D%3D&token_type_hint=access_token") != std::string::npos);
+    auto& malformed = fn->blocks[entry.id].insts[2];
+    malformed.operand_count = 1;
+    CHECK(!codegen(tc.mod).ok);
+    malformed.operand_count = 2;
+    conn->json_arena.destroy();
+    engine.shutdown();
+    pool.destroy();
+    tc.destroy();
+}

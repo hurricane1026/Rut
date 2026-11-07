@@ -1,5 +1,6 @@
 #include "rut/runtime/json.h"
 #include "rut/runtime/jwt_claims.h"
+#include "rut/runtime/oauth_introspection.h"
 #include "test.h"
 
 using namespace rut;
@@ -265,4 +266,102 @@ TEST(jwt_claims, scope_list_grammar_and_membership_share_strict_boundaries) {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(introspection, active_expiry_audience_and_optional_metadata) {
+    json::Document scratch;
+    const auto valid = [&](Str value, i64 now = 1000) {
+        return oauth_introspection_valid(scratch, value, lit_str("reports-api"), now);
+    };
+    CHECK(valid(lit_str(R"({"active":true,"exp":1001,"aud":"reports-api"})")));
+    CHECK(valid(lit_str(
+        R"({"active":true,"exp":1001,"aud":["other","reports-api"],"nbf":1000,"iat":0,"scope":"read write","token_type":"bearer"})")));
+    CHECK(valid(lit_str(R"({"active":true,"exp":9223372036854775807,"aud":"reports-api"})")));
+    CHECK(valid(lit_str(R"({"act\u0069ve":true,"exp":1001,"aud":"reports\u002dapi"})")));
+    const Str bad[] = {
+        lit_str(R"({"active":false})"),
+        lit_str(R"({"active":"true","exp":1001,"aud":"reports-api"})"),
+        lit_str(R"({"active":1,"exp":1001,"aud":"reports-api"})"),
+        lit_str(R"({"exp":1001,"aud":"reports-api"})"),
+        lit_str(R"({"active":true,"aud":"reports-api"})"),
+        lit_str(R"({"active":true,"exp":1000,"aud":"reports-api"})"),
+        lit_str(R"({"active":true,"exp":-1,"aud":"reports-api"})"),
+        lit_str(R"({"active":true,"exp":"1001","aud":"reports-api"})"),
+        lit_str(R"({"active":true,"exp":1001.0,"aud":"reports-api"})"),
+        lit_str(R"({"active":true,"exp":1e9,"aud":"reports-api"})"),
+        lit_str(R"({"active":true,"exp":9223372036854775808,"aud":"reports-api"})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"Reports-api"})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api-other"})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":[]})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":["reports-api",4]})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":["reports-api",""]})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":["reports-api",["other"]]})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api\u0000"})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","nbf":1001})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","iat":1001})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","iat":-1})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","nbf":null})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","scope":["read"]})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","scope":"read  write"})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","token_type":"MAC"})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","token_type":true})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","act\u0069ve":false})"),
+        lit_str(R"({"active":true,"exp":1001,"aud":"reports-api","\u0065xp":1002})"),
+        lit_str("[]"),
+        lit_str("null"),
+        lit_str("true"),
+        lit_str("{}"),
+        lit_str("{")};
+    for (Str value : bad) CHECK(!valid(value));
+    const auto claims = lit_str(R"({"active":true,"exp":1001,"aud":"reports-api"})");
+    CHECK(!valid(claims, 0));
+    CHECK(!valid(claims, -1));
+    CHECK(!oauth_introspection_valid(scratch, claims, lit_str(""), 1000));
+}
+
+TEST(introspection, authenticated_request_form_encoding_and_bounds) {
+    char bytes[8192];
+    json::Writer output{bytes};
+    REQUIRE(oauth_introspection_request(
+        lit_str("ab+/=="), lit_str("Basic Y2xpZW50OnNlY3JldA=="), output));
+    json::Document doc;
+    REQUIRE(doc.parse({bytes, output.len}));
+    char decoded[4096];
+    json::Writer body{decoded, sizeof(decoded)};
+    REQUIRE(doc.string(doc.pointer(lit_str("/body")), body));
+    CHECK(
+        (Str{decoded, body.len}.eq(lit_str("token=ab%2B%2F%3D%3D&token_type_hint=access_token"))));
+    json::Writer auth{decoded, sizeof(decoded)};
+    REQUIRE(doc.string(doc.pointer(lit_str("/headers/Authorization")), auth));
+    CHECK((Str{decoded, auth.len}.eq(lit_str("Basic Y2xpZW50OnNlY3JldA=="))));
+    const Str invalid[] = {lit_str(""),
+                           lit_str("a&token=stolen"),
+                           lit_str("a=b"),
+                           lit_str("a b"),
+                           lit_str("a\r\nb"),
+                           {nullptr, 1}};
+    for (Str token : invalid) {
+        json::Writer writer{bytes};
+        CHECK(!oauth_introspection_request(token, lit_str("Bearer service"), writer));
+    }
+    const Str bad_auth[] = {lit_str(""),
+                            lit_str("Basic "),
+                            lit_str("Bearer "),
+                            lit_str("Digest abc"),
+                            lit_str("Bearer a\r\nInjected: true"),
+                            {nullptr, 8}};
+    for (Str value : bad_auth) {
+        json::Writer writer{bytes};
+        CHECK(!oauth_introspection_request(lit_str("token"), value, writer));
+    }
+    char maximum[1025];
+    for (auto& byte : maximum) byte = '+';
+    json::Writer accepted{bytes};
+    CHECK(oauth_introspection_request({maximum, 1024}, lit_str("Bearer service"), accepted));
+    CHECK(doc.parse({bytes, accepted.len}));
+    json::Writer rejected{bytes};
+    CHECK(!oauth_introspection_request({maximum, 1025}, lit_str("Bearer service"), rejected));
+    char tiny[8];
+    json::Writer full{tiny, sizeof(tiny)};
+    CHECK(!oauth_introspection_request(lit_str("token"), lit_str("Bearer service"), full));
 }

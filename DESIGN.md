@@ -10288,3 +10288,20 @@ values created after the last reachable call use ordinary LLVM SSA storage.
 This keeps response JSON validation out of the suspension frame without raising
 its 8 KiB runtime bound or replaying earlier effects. Cross-block storage retains
 support for RIR block IDs that are not in producer order.
+
+
+### OAuth2 introspection resource policy
+
+Opaque access-token authentication composes `httpCall` with authenticated RFC 7662
+form construction and active/expiry/audience validation. Two ordinary builtins
+reuse the existing JSON helper ABI; the runtime implementation uses caller-owned
+JSON scratch/output, bounded stack form storage and the existing Bearer/scope
+parsers. It performs no I/O or heap allocation itself. Endpoint trust and the
+monotonic call deadline remain owned by the existing callout worker.
+
+The ordinary library separates AS/transport errors (503), rejected token metadata
+(401) and missing permissions (403). Identity fields are projected explicitly
+only after the checks. No cached allow is retained: policy updates or revocation
+at the AS are visible on the next request. Required expiry/audience are local
+resource policy; optional issuer, subject and issuance time are not fabricated
+to make the response resemble JWT claims. See [the contract](docs/oauth-introspection.md).

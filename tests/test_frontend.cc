@@ -47256,3 +47256,42 @@ route GET "/x" {
     CHECK(rir::verify_module(rir.module).ok);
     rir.destroy();
 }
+
+TEST(frontend, oauth_introspection_builtins_preserve_json_and_boolean_types) {
+    const char* source = R"rut(
+func build(_ token: str) -> Json { oauthIntrospectionRequest(token, "Basic YTpi") }
+route GET "/check" {
+    guard let request = build("opaque+/==") else { return 503 }
+    guard let document = json.parse("{\"active\":true,\"exp\":9999999999,\"aud\":\"api\"}") else { return 503 }
+    if oauthIntrospectionValid(document, "api") { return 204 } else { return 401 }
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+    const char* invalid[] = {
+        "route GET \"/\" { let value = oauthIntrospectionRequest(1, \"Basic x\") return 200 }",
+        "route GET \"/\" { let value = oauthIntrospectionRequest(\"x\") return 200 }",
+        "route GET \"/\" { let value = oauthIntrospectionRequest(req.header(\"X-Token\"), \"Basic "
+        "x\") return 200 }",
+        "route GET \"/\" { let value = oauthIntrospectionValid(\"{}\", \"api\") return 200 }",
+        "route GET \"/\" { let value = oauthIntrospectionValid(json.parse(\"{}\"), \"api\") return "
+        "200 }",
+    };
+    for (const auto* text : invalid) {
+        auto bad_tokens = lex(lit(text));
+        REQUIRE(bad_tokens);
+        auto bad_ast = parse_file_heap(bad_tokens.value());
+        REQUIRE(bad_ast);
+        CHECK(!analyze_file_heap(bad_ast.value()));
+    }
+}
