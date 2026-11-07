@@ -15,6 +15,12 @@ func clientCredentials(_ serviceAuthorization: str) -> Json {
     built
 }
 
+// Explicit trusted scope list; form metacharacters are encoded by the builtin.
+func clientCredentialsForScope(_ serviceAuthorization: str, _ scopes: str) -> Json {
+    guard let built = oauthClientCredentialsRequest(scopes, serviceAuthorization) else { respond 503 }
+    built
+}
+
 // Only consume a completed httpCall response from the configured HTTPS AS.
 // No caching: expiry is checked as positive integer lifetime metadata at receipt.
 func authorization(_ reply: Json, _ requiredScope: str) -> str {

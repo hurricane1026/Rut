@@ -53,6 +53,7 @@ enum class Op : u8 {
     HttpCall,           // compiler-only resumable HTTP expression
     OauthIntrospectionRequest,
     OauthIntrospectionValid,
+    OauthClientCredentialsRequest,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

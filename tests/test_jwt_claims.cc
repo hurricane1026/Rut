@@ -1,3 +1,4 @@
+#include "rut/common/types.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/oauth_introspection.h"
@@ -364,4 +365,89 @@ TEST(introspection, authenticated_request_form_encoding_and_bounds) {
     char tiny[8];
     json::Writer full{tiny, sizeof(tiny)};
     CHECK(!oauth_introspection_request(lit_str("token"), lit_str("Bearer service"), full));
+}
+
+TEST(oauth_client, scoped_form_encoding_rejects_injection_and_bounds) {
+    char output_bytes[8192];
+    json::Writer output{output_bytes};
+    REQUIRE(oauth_client_credentials_request(lit_str("reports:read reports:write a+b/x=%&"),
+                                             lit_str("Basic Y2xpZW50OnNlY3JldA=="),
+                                             output));
+    json::Document document;
+    REQUIRE(document.parse({output_bytes, output.len}));
+    char decoded[4096];
+    json::Writer body{decoded, sizeof(decoded)};
+    REQUIRE(document.string(document.pointer(lit_str("/body")), body));
+    CHECK(
+        (Str{decoded, body.len}.eq(lit_str("grant_type=client_credentials&scope=reports%3Aread%"
+                                           "20reports%3Awrite%20a%2Bb%2Fx%3D%25%26"))));
+    json::Writer authorization{decoded, sizeof(decoded)};
+    REQUIRE(document.string(document.pointer(lit_str("/headers/Authorization")), authorization));
+    CHECK((Str{decoded, authorization.len}.eq(lit_str("Basic Y2xpZW50OnNlY3JldA=="))));
+    json::Writer preserved{output_bytes};
+    REQUIRE(oauth_client_credentials_request(
+        lit_str("Write read Write"), lit_str("bAsIc YTpi"), preserved));
+    REQUIRE(document.parse({output_bytes, preserved.len}));
+    json::Writer ordered{decoded, sizeof(decoded)};
+    REQUIRE(document.string(document.pointer(lit_str("/body")), ordered));
+    CHECK((Str{decoded, ordered.len}.eq(
+        lit_str("grant_type=client_credentials&scope=Write%20read%20Write"))));
+    const Str kInvalid[] = {lit_str(""),
+                            lit_str(" read"),
+                            lit_str("read "),
+                            lit_str("read  write"),
+                            lit_str("read\twrite"),
+                            lit_str("read\nwrite"),
+                            lit_str("read\"write"),
+                            lit_str("read\\write"),
+                            lit_str("r\xc3\xa9"),
+                            {"read\0write", 10},
+                            {nullptr, 1}};
+    for (const Str kScopes : kInvalid) {
+        json::Writer writer{output_bytes};
+        CHECK(!oauth_client_credentials_request(kScopes, lit_str("Basic YTpi"), writer));
+        CHECK_EQ(writer.len, 0u);
+    }
+    const Str kBadAuthorization[] = {lit_str(""),
+                                     lit_str("Basic "),
+                                     lit_str("Bearer service"),
+                                     lit_str("Basic a\r\nInjected: yes"),
+                                     lit_str("Basic a\x7f"),
+                                     {nullptr, 8}};
+    for (const Str kAuth : kBadAuthorization) {
+        json::Writer writer{output_bytes};
+        CHECK(!oauth_client_credentials_request(lit_str("read"), kAuth, writer));
+        CHECK_EQ(writer.len, 0u);
+    }
+    char scopes[1025];
+    for (auto& byte : scopes) byte = '&';
+    json::Writer maximum{output_bytes};
+    REQUIRE(oauth_client_credentials_request({scopes, 1024}, lit_str("Basic YTpi"), maximum));
+    REQUIRE(document.parse({output_bytes, maximum.len}));
+    json::Writer encoded{decoded, sizeof(decoded)};
+    REQUIRE(document.string(document.pointer(lit_str("/body")), encoded));
+    CHECK_EQ(encoded.len, 36u + 3u * 1024u);
+    for (u32 i = 36; i < encoded.len; i += 3) {
+        CHECK_EQ(decoded[i], '%');
+        CHECK_EQ(decoded[i + 1], '2');
+        CHECK_EQ(decoded[i + 2], '6');
+    }
+    json::Writer oversized{output_bytes};
+    CHECK(!oauth_client_credentials_request({scopes, 1025}, lit_str("Basic YTpi"), oversized));
+    char auth[2049];
+    for (auto& byte : auth) byte = 'a';
+    auth[0] = 'B';
+    auth[1] = 'a';
+    auth[2] = 's';
+    auth[3] = 'i';
+    auth[4] = 'c';
+    auth[5] = ' ';
+    json::Writer accepted_auth{output_bytes};
+    CHECK(oauth_client_credentials_request(lit_str("read"), {auth, 2048}, accepted_auth));
+    json::Writer rejected_auth{output_bytes};
+    CHECK(!oauth_client_credentials_request(lit_str("read"), {auth, 2049}, rejected_auth));
+    char tiny[8];
+    json::Writer short_output{tiny, sizeof(tiny)};
+    CHECK(!oauth_client_credentials_request(lit_str("read"), lit_str("Basic YTpi"), short_output));
+    CHECK(!short_output.ok);
 }

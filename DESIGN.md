@@ -10323,9 +10323,16 @@ client-credentials grant, strict token response validation and explicit upstream
 Authorization replacement. Caller authentication, AS service credentials and
 upstream tokens have separate ownership. Per-request acquisition avoids adding
 cache expiry, refresh or distributed state; existing request arenas and callout
-cancellation own temporary secrets. No compiler/runtime ABI, builtin or dependency
-is added. See [the profile](docs/upstream-oauth.md) for its default-scope contract,
-relative lifetime limits and two-backend native validation.
+cancellation own temporary secrets. The default-scope helper remains unchanged.
+An explicit-scope variant adds `oauthClientCredentialsRequest` through the existing
+JSON operation ABI: the source language has no general callable form encoder, and
+raw concatenation could turn scope bytes into additional form fields. The native
+builder reuses strict scope-list validation and bounded percent-encoding, accepting
+1024 scope bytes and 2048 Basic authorization bytes. It preserves order, duplicate
+tokens and case; the response policy still checks the route's required granted
+scope. The append-only operation preserves previous operation IDs and the generic
+C ABI. No keyword or dependency is added. See [the profile](docs/upstream-oauth.md)
+for ownership, relative lifetime limits and two-backend native validation.
 
 ### Authorization-server revocation client
 

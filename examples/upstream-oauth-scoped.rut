@@ -1,0 +1,24 @@
+// UPSTREAM_SCOPE: trusted OAuth scope list, never a request header or query.
+// TOKEN_ENDPOINT: fixed verified HTTPS httpCall policy for the AS token endpoint.
+// TOKEN_SERVICE_AUTH: pre-encoded Basic service credential, never a client header.
+// DOWNSTREAM_KEY authenticates callers separately. Use TLS for client traffic.
+import "middleware/oauth_client.rut"
+listen :8080
+upstream backend at "127.0.0.1:9000"
+
+route GET "/scoped-reports" {
+    guard bearerMatches(req.authorization.or(""), env("DOWNSTREAM_KEY")) else {
+        return response(401, headers: {"WWW-Authenticate": "Bearer"})
+    }
+    let message = oauth_client.clientCredentialsForScope(env("TOKEN_SERVICE_AUTH"), env("UPSTREAM_SCOPE"))
+    let pending = httpCall(env("TOKEN_ENDPOINT"), message, 1000)
+    guard let reply = pending else { return 503 }
+    let authorization = oauth_client.authorization(reply, "reports:read")
+    match authorization.isEmpty {
+        false => {
+            req.set("Authorization", authorization)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => { return 503 }
+    }
+}

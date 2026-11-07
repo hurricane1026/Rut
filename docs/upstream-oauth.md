@@ -23,8 +23,35 @@ The caller cannot choose these through request headers, URL or body. TLS
 verification, fixed deadlines and queue capacity are the existing callout policy.
 The request carries no client cookie or downstream authentication credential.
 The default scope must be configured for this client at the AS: this slice omits
-the optional request scope and does not negotiate an arbitrary scope list,
-resource indicator, audience parameter or token exchange.
+the optional request scope. For an explicit scope list, use the scoped helper below.
+Resource indicators, audience parameters and token exchange remain outside this profile.
+
+## Explicit configured scopes
+
+`oauth_client.clientCredentialsForScope(serviceAuthorization, scopes)` builds the
+same request with an additional `scope` field. The
+[scoped example](../examples/upstream-oauth-scoped.rut) reads `UPSTREAM_SCOPE` from
+trusted configuration, separately from downstream caller authentication. Never
+populate it from an untrusted request header or query parameter.
+
+The native `oauthClientCredentialsRequest(scopes, serviceAuthorization) -> Json?`
+uses the [RFC 6749 scope-list grammar](https://www.rfc-editor.org/rfc/rfc6749#section-3.3):
+a nonempty list of ASCII scope tokens separated by single spaces, excluding
+quotes, backslashes and control bytes. Scope input is bounded to 1024 bytes;
+Basic service authorization is bounded to 2048 visible ASCII bytes with a
+nonempty payload. The scheme is case-insensitive; the AS validates the credential.
+Invalid input or exhausted output storage returns nil; the source helper responds
+503 before contacting the AS.
+
+The form encoder preserves token order, duplicates and case. It percent-encodes
+spaces and reserved characters, including `+`, `&`, `=`, `/` and `%`, so they
+cannot introduce additional form parameters. For example, `read a+b&x=y` becomes
+`scope=read%20a%2Bb%26x%3Dy`. The original default-scope helper is unchanged.
+
+The AS may grant fewer scopes than requested. Both helpers still require
+`oauth_client.authorization(reply, requiredScope)` to check the explicit response
+scope against the route's configured permission. Requesting a scope is not proof
+that it was granted; the helper does not require the whole requested list back.
 
 ## Token response policy
 
@@ -70,8 +97,9 @@ Do not reuse the returned header in a cache without a separate expiry design.
 
 Storage remains bounded by existing JSON/callout/request-header limits. All values
 belong to the current request and existing cancellation/generation handling fences
-late responses after disconnect. No builtin, runtime ABI, grammar or dependency
-change is introduced. The source library reuses `introspection.replyDocument` for
+late responses after disconnect. The scoped constructor adds a builtin through
+the existing JSON operation ABI, without a new syntax keyword or dependency.
+The source library reuses `introspection.replyDocument` for
 completed-response parsing; it does not introspect the acquired access token.
 
 ## Validation
@@ -79,7 +107,9 @@ completed-response parsing; it does not introspect the acquired access token.
 `test_upstream_oauth_epoll` and `test_upstream_oauth_io_uring` use an independent
 TLS token endpoint fixture and real upstream through a two-shard native-loaded
 server. Source and both imported modules are deleted before requests execute.
-The matrix covers HTTP/1 and HTTP/2; exact grant/service headers; strict token,
+The matrix covers HTTP/1 and HTTP/2 with default and explicit scopes; exact
+percent-encoded form bodies, invalid scope bounds/grammar, caller scope injection
+isolation, grant/service headers; strict token,
 expiry, scope and error fields; duplicate JSON/Authorization; missing caller
 credentials; wrong TLS identity; AS denial/outage/redirect/truncation; unsafe
 configuration; timeout; disconnected callers; fresh concurrent tokens and no

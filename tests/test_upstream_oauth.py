@@ -25,6 +25,9 @@ def main():
     args = parser.parse_args()
     service_auth = 'Basic Y2xpZW50OnNlY3JldA=='
     caller_key = 'downstream-caller-key'
+    requested_scope = 'reports:read reports:write a+b/x=%&'
+    scoped_body = (b'grant_type=client_credentials&scope=reports%3Aread%20'
+                   b'reports%3Awrite%20a%2Bb%2Fx%3D%25%26')
     calls, forwarded, issued = [], [], []
     lock = threading.Lock()
     mode = 'valid'
@@ -38,9 +41,10 @@ def main():
                 selected = mode
                 serial = len(calls)
                 calls.append((self.path, dict(self.headers), raw))
+            parameters = parse_qs(raw.decode(), strict_parsing=True)
             token = 'upstream-private-' + str(serial)
             body = dict(access_token=token, token_type='Bearer', expires_in=3600,
-                        scope='reports:read reports:write', refresh_token='unused-refresh-secret')
+                        scope=parameters.get('scope', ['reports:read reports:write'])[0], refresh_token='unused-refresh-secret')
             updates = {
                 'wrong-type': dict(token_type='MAC'), 'typed-type': dict(token_type=True),
                 'spaced-type': dict(token_type='Bearer '), 'mixed-type': dict(token_type='bEaReR'),
@@ -53,6 +57,7 @@ def main():
                 'expired': dict(expires_in=0), 'negative-expiry': dict(expires_in=-1),
                 'typed-expiry': dict(expires_in='3600'), 'bool-expiry': dict(expires_in=True),
                 'fractional-expiry': dict(expires_in=1.5), 'overflow-expiry': dict(expires_in=2**63),
+                'narrow-scope': dict(scope='reports:read'),
                 'wrong-scope': dict(scope='reports:reader'), 'typed-scope': dict(scope=['reports:read']),
                 'bad-scope': dict(scope='reports:read  reports:write'),
                 'error-field': dict(error='invalid_client'), 'null-error': dict(error=None),
@@ -79,7 +84,7 @@ def main():
             status = {'redirect': 302, 'unavailable': 503, 'denied': 403}.get(selected, 200)
             if self.headers.get('Authorization') != service_auth:
                 status = 401
-            if status == 200 and selected in ('valid', 'mixed-type', 'escaped-token', 'concurrent'):
+            if status == 200 and selected in ('valid', 'mixed-type', 'escaped-token', 'concurrent', 'narrow-scope'):
                 with lock:
                     issued.append(body['access_token'])
             time.sleep(.20 if selected == 'slow' else .01)
@@ -151,9 +156,21 @@ def main():
                     'env("TOKEN_SERVICE_AUTH")', auth).replace('env("TOKEN_ENDPOINT")',
                     f'env("{policy}")').replace(', 1000)', f', {timeout})').replace(
                     'reply, "reports:read"', 'reply, ' + json.dumps(scope))
+            scoped = (examples / 'upstream-oauth-scoped.rut').read_text()
+            scoped = scoped[scoped.index('route GET'):]
+            source += scoped
+            invalid_scopes = ('', ' reports:read', 'reports:read ', 'reports:read  write',
+                              'reports:read\twrite', 'reports:read\nwrite', 'reports:read"',
+                              'reports:read\\', 'réad', 'reports:read\x00', 'x' * 1025)
+            for index, value in enumerate(invalid_scopes):
+                source += scoped.replace('/scoped-reports', f'/invalid-scope-{index}').replace(
+                    'env("UPSTREAM_SCOPE")', json.dumps(value, ensure_ascii=False).replace('\\u0000', '\\u{0}'))
+            source += scoped.replace('/scoped-reports', '/scoped-bearer').replace(
+                'env("TOKEN_SERVICE_AUTH")', '"Bearer forbidden"')
             program, log = root / 'gateway.rut', root / 'gateway.log'
             program.write_text(source)
             env = dict(os.environ, TOKEN_SERVICE_AUTH=service_auth, DOWNSTREAM_KEY=caller_key,
+                       UPSTREAM_SCOPE=requested_scope,
                        TOKEN_ENDPOINT=json.dumps(endpoint), UNSAFE_AUTH=service_auth + '\r\nInjected: yes',
                        WRONG_TLS=json.dumps(dict(endpoint, serverName='wrong.invalid')))
             with log.open('wb') as output:
@@ -184,14 +201,16 @@ def main():
                         try:
                             connection.request('GET', path, headers={
                                 'Authorization': 'Bearer ' + caller_key if authorization is None else authorization,
-                                'Cookie': 'caller-secret', 'X-Consumer-ID': 'forged'})
+                                'Cookie': 'caller-secret', 'X-Consumer-ID': 'forged',
+                                'Scope': 'admin&grant_type=password'})
                             response = connection.getresponse()
                             return response.status, dict(response.headers), response.read()
                         finally:
                             connection.close()
 
                     for authorization in ('', 'Basic YTpi', 'Bearer wrong', 'Bearer a b'):
-                        assert request(authorization=authorization)[0] == 401
+                        for path in ('/service-reports', '/scoped-reports'):
+                            assert request(path, authorization=authorization)[0] == 401
                         assert not calls and not forwarded
                     for selected in ('valid', 'mixed-type', 'escaped-token'):
                         mode = selected
@@ -201,6 +220,21 @@ def main():
                         assert len(calls) == before + 1
                         assert forwarded[-1][1]['Authorization'] == 'Bearer ' + issued[-1]
                         assert 'Authorization' not in headers and 'Set-Cookie' not in headers
+                    for path in ('/scoped-reports', '/scoped-reports?scope=admin'):
+                        mode = 'valid'
+                        before = len(calls)
+                        assert request(path)[::2] == (200, b'upstream-ok')
+                        assert len(calls) == before + 1 and calls[-1][2] == scoped_body
+                    mode = 'narrow-scope'
+                    assert request('/scoped-reports')[::2] == (200, b'upstream-ok')
+                    for path in [f'/invalid-scope-{i}' for i in range(len(invalid_scopes))] + ['/scoped-bearer']:
+                        before = (len(calls), len(forwarded))
+                        assert request(path)[0] == 503, path
+                        assert (len(calls), len(forwarded)) == before, path
+                    mode = 'wrong-scope'
+                    before = len(forwarded)
+                    assert request('/scoped-reports')[0] == 503
+                    assert len(forwarded) == before
                     bad = ('wrong-type', 'typed-type', 'spaced-type', 'empty-token', 'typed-token',
                            'space-token', 'leading-token', 'trailing-token', 'newline-token',
                            'nul-token', 'unicode-token', 'bad-padding', 'expired', 'negative-expiry',
@@ -232,7 +266,7 @@ def main():
                     before_forwarded = len(forwarded)
                     before_issued = len(issued)
                     with ThreadPoolExecutor(max_workers=4) as workers:
-                        results = list(workers.map(lambda _: request(), range(4)))
+                        results = list(workers.map(lambda i: request('/scoped-reports' if i % 2 else '/service-reports'), range(4)))
                     assert all((status, body) == (200, b'upstream-ok') for status, _, body in results), results
                     assert len(calls) == before + 4  # Every request gets a new token; no cached allow.
                     actual = {headers['Authorization'] for _, headers in forwarded[before_forwarded:]}
@@ -258,39 +292,39 @@ def main():
                         return len(data).to_bytes(3, 'big') + bytes((kind, flags)) + stream.to_bytes(4, 'big') + data
 
                     # The same native policy also resumes into HTTP/2 forwarding.
-                    with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
-                        path = b'/service-reports'
-                        auth = ('Bearer ' + caller_key).encode()
-                        block = (b'\x82\x86\x04' + bytes((len(path),)) + path +
-                                 b'\x01\x09localhost\x0f\x08' + bytes((len(auth),)) + auth)
-                        sock.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + frame(4, 0, 0) + frame(1, 5, 1, block))
+                    for path in (b'/service-reports', b'/scoped-reports'):
+                        with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
+                            auth = ('Bearer ' + caller_key).encode()
+                            block = (b'\x82\x86\x04' + bytes((len(path),)) + path +
+                                     b'\x01\x09localhost\x0f\x08' + bytes((len(auth),)) + auth)
+                            sock.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + frame(4, 0, 0) + frame(1, 5, 1, block))
 
-                        def exact(length):
+                            def exact(length):
+                                data = b''
+                                while len(data) < length:
+                                    part = sock.recv(length - len(data))
+                                    assert part, 'HTTP/2 closed before upstream token forwarding'
+                                    data += part
+                                return data
+
                             data = b''
-                            while len(data) < length:
-                                part = sock.recv(length - len(data))
-                                assert part, 'HTTP/2 closed before upstream token forwarding'
-                                data += part
-                            return data
-
-                        data = b''
-                        while True:
-                            header = exact(9)
-                            payload = exact(int.from_bytes(header[:3], 'big'))
-                            kind, flags = header[3], header[4]
-                            stream = int.from_bytes(header[5:], 'big') & 0x7fffffff
-                            if kind == 4 and not flags & 1:
-                                sock.sendall(frame(4, 1, 0))
-                            assert kind != 7, payload
-                            if stream != 1:
-                                continue
-                            assert kind != 3, payload
-                            if kind == 0:
-                                data += payload
-                            if kind in (0, 1) and flags & 1:
-                                break
-                        assert data == b'upstream-ok', data
-                    assert forwarded[-1][1]['Authorization'] == 'Bearer ' + issued[-1]
+                            while True:
+                                header = exact(9)
+                                payload = exact(int.from_bytes(header[:3], 'big'))
+                                kind, flags = header[3], header[4]
+                                stream = int.from_bytes(header[5:], 'big') & 0x7fffffff
+                                if kind == 4 and not flags & 1:
+                                    sock.sendall(frame(4, 1, 0))
+                                assert kind != 7, payload
+                                if stream != 1:
+                                    continue
+                                assert kind != 3, payload
+                                if kind == 0:
+                                    data += payload
+                                if kind in (0, 1) and flags & 1:
+                                    break
+                            assert data == b'upstream-ok', data
+                        assert forwarded[-1][1]['Authorization'] == 'Bearer ' + issued[-1]
                     mode = 'valid'
                     before = len(calls)
                     with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
@@ -301,8 +335,11 @@ def main():
                     assert len(calls) == before
                     for path, headers, raw in calls:
                         assert path == '/token'
-                        assert raw == b'grant_type=client_credentials'
-                        assert parse_qs(raw.decode(), strict_parsing=True) == {'grant_type': ['client_credentials']}
+                        assert raw in (b'grant_type=client_credentials', scoped_body)
+                        expected = {'grant_type': ['client_credentials']}
+                        if raw == scoped_body:
+                            expected['scope'] = [requested_scope]
+                        assert parse_qs(raw.decode(), strict_parsing=True) == expected
                         assert headers['Authorization'] in (service_auth, 'Basic d3Jvbmc6c2VjcmV0')
                         assert headers['Content-Type'] == 'application/x-www-form-urlencoded'
                         assert headers['Accept'] == 'application/json'
@@ -310,7 +347,7 @@ def main():
                     logged = log.read_bytes()
                     assert service_auth.encode() not in logged and caller_key.encode() not in logged
                     assert b'upstream-private-' not in logged and b'unused-refresh-secret' not in logged
-                    print(f'PASS: {args.backend} client credentials, strict token policy, isolation and fail-closed forwarding')
+                    print(f'PASS: {args.backend} client credentials, configured scopes, strict token policy and isolation')
                 finally:
                     if process.poll() is None:
                         process.terminate()
