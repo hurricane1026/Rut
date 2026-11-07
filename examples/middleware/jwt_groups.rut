@@ -18,3 +18,14 @@ func requireAll(_ document: Json, _ first: str, _ second: str) -> Json {
     guard jwtHasGroup(document, first) && jwtHasGroup(document, second) else { respond forbidden }
     document
 }
+
+// Positive membership validates the entire groups array before excluding a name.
+// Never negate jwtHasGroup alone: malformed or absent groups also return false.
+// A repeated required/excluded name denies: exclusion always wins.
+func requireExcept(_ document: Json, _ required: str, _ excluded: str) -> Json {
+    guard required != "" && excluded != "" else { respond 503 }
+    let forbidden = response(403)
+    forbidden.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasGroup(document, required) && !jwtHasGroup(document, excluded) else { respond forbidden }
+    document
+}
