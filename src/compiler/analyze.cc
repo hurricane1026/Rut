@@ -5950,8 +5950,11 @@ struct LexicalCallArguments {
     FixedVec<HirExpr*, AstExpr::kMaxArgs + 1> initializers;
 
     FrontendResult<void> bind(HirExpr& value) {
+        // Resumable operations need a lexical initializer in ordinary routes
+        // too, so helper substitution cannot discard or duplicate their effects.
         if (route == nullptr ||
-            (!uses_lexical_values(route) && !hir_has_string_construction(value)))
+            (!uses_lexical_values(route) && !hir_has_string_construction(value) &&
+             !hir_has_resumable_call(value)))
             return {};
         const bool kEvaluated = call_argument_needs_evaluation(value);
         if (is_ws_borrowed_type(value.type) && kEvaluated)

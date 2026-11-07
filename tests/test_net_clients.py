@@ -167,6 +167,11 @@ func closeUnused(_ connection: TcpConnection) -> bool {
     let closed = connection.close()
     true
 }
+func ignore(_ result: bool) -> bool { true }
+func twice(_ result: bool) -> bool { result && result }
+func first(_ left: bool, _ right: bool) -> bool {
+    if right { left } else { left }
+}
 '''
             for path, policy in (('tcp', 'TCP'), ('tls', 'TLS')):
                 source += f'''
@@ -220,6 +225,38 @@ route GET "/close-helper" {
     guard let connection = pending else { return 503 }
     let alias = connection
     let result = closeUnused(connection)
+    let pendingRead = alias.receive(64, 1000)
+    let failure = netError()
+    guard failure != -4 else { return 204 }
+    return 500
+}
+route GET "/ignored-close-argument" {
+    let pending = tcp(env("TCP"), 1000)
+    guard let connection = pending else { return 503 }
+    let alias = connection
+    let result = ignore(connection.close())
+    let pendingRead = alias.receive(64, 1000)
+    let failure = netError()
+    guard failure != -4 else { return 204 }
+    return 500
+}
+route GET "/reused-close-argument" {
+    let pending = tcp(env("TCP"), 1000)
+    guard let connection = pending else { return 503 }
+    let alias = connection
+    let result = twice(connection.close())
+    guard result else { return 500 }
+    let pendingRead = alias.receive(64, 1000)
+    let failure = netError()
+    guard failure != -4 else { return 204 }
+    return 500
+}
+route GET "/ordered-close-arguments" {
+    let pending = tcp(env("TCP"), 1000)
+    guard let connection = pending else { return 503 }
+    let alias = connection
+    let result = first(connection.close(), connection.close())
+    guard result else { return 500 }
     let pendingRead = alias.receive(64, 1000)
     let failure = netError()
     guard failure != -4 else { return 204 }
@@ -355,6 +392,9 @@ route GET "/limit" {
                 assert request('/udp-helper') == (204, b'')
                 assert b'helper' in received_datagrams, received_datagrams
                 assert request('/close-helper') == (204, b'')
+                assert request('/ignored-close-argument') == (204, b'')
+                assert request('/reused-close-argument') == (204, b'')
+                assert request('/ordered-close-arguments') == (204, b'')
                 assert request('/mixed') == (200, b'TAIL')
                 assert request('/wrong-tls')[0] == 503
                 assert request('/timeout')[0] == 504
